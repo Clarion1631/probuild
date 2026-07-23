@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalProjectTabs, { type PortalTab } from "@/components/PortalProjectTabs";
-import { getPortalVisibility, getScheduleTasks } from "@/lib/actions";
+import { getPortalScheduleTasks, getPortalVisibility } from "@/lib/actions";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
 import { resolveSessionClientId } from "@/lib/portal-auth";
@@ -90,7 +90,7 @@ export default async function PortalProjectDetail(props: {
     const [settings, visibility, scheduleTasks, sharedRooms] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
         getPortalVisibility(projectId),
-        getScheduleTasks(projectId).catch(() => [] as any[]),
+        getPortalScheduleTasks(projectId).catch(() => [] as any[]),
         prisma.roomDesign.findMany({
             where: { projectId, shareEnabled: true, shareToken: { not: null } },
             select: { id: true, name: true, shareToken: true, thumbnail: true, updatedAt: true },

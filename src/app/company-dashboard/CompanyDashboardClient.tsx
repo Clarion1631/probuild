@@ -417,7 +417,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
                                                                 <div className="text-xs text-hui-textMuted">
                                                                     {task.assignments.length === 0
                                                                         ? "No task crew"
-                                                                        : task.assignments.map(a => `${a.name}${a.role === "FINANCE" ? " (finance)" : a.status === "ACTIVATED" ? "" : " (inactive)"}`).join(", ")}
+                                                                        : task.assignments.map(a => `${a.name}${a.userRole === "FINANCE" ? " (finance)" : a.status === "ACTIVATED" ? "" : " (inactive)"}`).join(", ")}
                                                                 </div>
                                                                 {canEdit && teamMembers && <TaskCrewPicker task={task} teamMembers={teamMembers} />}
                                                             </div>

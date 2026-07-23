@@ -1,3 +1,4 @@
+// Usage: set ALLOW_PROD_VERIFY=1 when DATABASE_URL targets Supabase; this verifier creates and deletes fixtures.
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
@@ -36,6 +37,16 @@ function withoutTaskDates(value: Record<string, unknown>): string {
 }
 
 async function main() {
+    const databaseUrl = process.env.DATABASE_URL ?? "";
+    if (databaseUrl.includes("supabase.c") && process.env.ALLOW_PROD_VERIFY !== "1") {
+        console.error(
+            "[verify-schedule-board] REFUSING TO RUN: DATABASE_URL points at Supabase.\n" +
+            "This script creates and deletes verification fixtures in the target database.\n" +
+            "Set ALLOW_PROD_VERIFY=1 to opt in."
+        );
+        process.exit(1);
+    }
+
     const checks: Check[] = [];
     const check = (label: string, passed: boolean) => checks.push([label, passed]);
     const tag = randomUUID();

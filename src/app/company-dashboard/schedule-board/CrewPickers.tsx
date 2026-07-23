@@ -205,7 +205,7 @@ export function TaskCrewPicker({
     const unlisted = task.assignments.filter(a => !teamMembers.some(m => m.id === a.userId));
     const options = [
         ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
-        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.status !== "ACTIVATED" ? "inactive" : a.role.toLowerCase().replace("_", " ")})` })),
+        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.status !== "ACTIVATED" ? "inactive" : a.userRole.toLowerCase().replace("_", " ")})` })),
     ];
     const legend = `Task crew — ${selected.length} assigned`;
 
