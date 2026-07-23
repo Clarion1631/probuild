@@ -167,7 +167,7 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         expect(num(paid!.amount)).toBe(400); // unchanged
     });
 
-    test("QB-linked row: keeps its link and reports a warning when QuickBooks is unreachable", async () => {
+    test("QB-linked row: aborts with NO changes when QuickBooks is unreachable (preflight)", async () => {
         await ensureClientAndProject();
         const suffix = "qblinked";
         const invoiceId = `${PFX}-inv-${suffix}`;
@@ -182,21 +182,33 @@ test.describe.serial("updatePendingMilestoneAmountsCore", () => {
         });
         await prisma.paymentSchedule.create({ data: { id: psOther, invoiceId, name: "Final", amount: 600, status: "Pending" } });
 
-        const res = await updatePendingMilestoneAmountsCore(invoiceId, [
-            { scheduleId: psQB, name: "Deposit", amount: 350 },
-            { scheduleId: psOther, name: "Final", amount: 650 },
-        ]);
-        expect(res.success).toBe(true);
-        expect(res.warnings.length).toBeGreaterThan(0); // no QuickBooks connection to replace the staged invoice
+        // The preflight must verify the staged QBO invoice is reachable and
+        // payment-free BEFORE any DB write. This env has no QuickBooks
+        // connection, so the whole rebalance aborts and NOTHING changes — a
+        // payment sitting unpulled on the old QBO invoice can therefore never be
+        // settled against a silently repriced milestone.
+        await expect(
+            updatePendingMilestoneAmountsCore(invoiceId, [
+                { scheduleId: psQB, name: "Deposit", amount: 350 },
+                { scheduleId: psOther, name: "Final", amount: 650 },
+            ]),
+        ).rejects.toThrow(/QuickBooks is unreachable/i);
 
-        // Amounts update locally, but the QB link is deliberately KEPT: unlinking
-        // only happens after the old QBO invoice is confirmed deleted, and this
-        // env can never reach QBO — so the payment poller keeps watching the old
-        // invoice instead of stranding any payment behind a cleared link.
         const qbRow = await prisma.paymentSchedule.findUnique({ where: { id: psQB } });
-        expect(num(qbRow!.amount)).toBe(350);
+        const other = await prisma.paymentSchedule.findUnique({ where: { id: psOther } });
+        expect(num(qbRow!.amount)).toBe(400); // untouched
         expect(qbRow!.qbInvoiceId).toBe("fake-qbo-1");
         expect(qbRow!.qbInvoiceLink).toBe("https://qbo.example/fake-1");
+        expect(num(other!.amount)).toBe(600); // untouched
+
+        // A rebalance that does NOT touch the QB-linked row's content sails
+        // through without needing QuickBooks at all.
+        const res = await updatePendingMilestoneAmountsCore(invoiceId, [
+            { scheduleId: psQB, name: "Deposit", amount: 400 },
+            { scheduleId: psOther, name: "Final", amount: 600 },
+        ]);
+        expect(res.success).toBe(true);
+        expect(res.warnings).toEqual([]);
     });
 
     test("rejects moving money between estimate-mirrored rows and extras", async () => {
