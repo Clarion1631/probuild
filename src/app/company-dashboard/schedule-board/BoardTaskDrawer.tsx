@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
+import { motion } from "framer-motion";
 import { toast } from "sonner";
 import {
     addTaskComment,
@@ -149,9 +150,18 @@ export function BoardTaskDrawer({ taskId, hasDraft, teamMembers, onClose, onSele
     if (!taskId || typeof document === "undefined") return null;
 
     const content = (
-        <div className="pointer-events-none fixed inset-0 z-[180] bg-slate-950/15" aria-hidden={false}>
-            <aside
+        <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.16 }}
+            className="pointer-events-none fixed inset-0 z-[180] bg-slate-950/15"
+            aria-hidden={false}
+        >
+            <motion.aside
                 ref={drawerRef}
+                initial={{ x: 20, opacity: 0 }}
+                animate={{ x: 0, opacity: 1 }}
+                transition={{ duration: 0.18, ease: "easeOut" }}
                 role="dialog"
                 aria-modal="false"
                 aria-label="Task details"
@@ -229,8 +239,8 @@ export function BoardTaskDrawer({ taskId, hasDraft, teamMembers, onClose, onSele
                         </div>
                     </div>
                 )}
-            </aside>
-        </div>
+            </motion.aside>
+        </motion.div>
     );
 
     return createPortal(content, document.body);

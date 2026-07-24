@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, type DragEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
 import Link from "next/link";
 import type { DashboardProjectRow } from "@/lib/schedule-core";
+import { beginNativeScheduleDragActivity } from "./dragVisualLayer";
 
 export const PROJECT_DRAG_MIME = "application/x-gtr-project-id";
 
@@ -54,6 +55,9 @@ function ProjectActions({
 }
 
 export function UnscheduledTray({ projects, canEdit, pendingProjectIds, onMoveProject }: UnscheduledTrayProps) {
+    const dragActivityCleanupRef = useRef<(() => void) | null>(null);
+    useEffect(() => () => dragActivityCleanupRef.current?.(), []);
+
     function handleDragStart(project: DashboardProjectRow, event: DragEvent<HTMLElement>) {
         if (!canEdit || pendingProjectIds.has(project.id)) {
             event.preventDefault();
@@ -61,6 +65,13 @@ export function UnscheduledTray({ projects, canEdit, pendingProjectIds, onMovePr
         }
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData(PROJECT_DRAG_MIME, project.id);
+        dragActivityCleanupRef.current?.();
+        dragActivityCleanupRef.current = beginNativeScheduleDragActivity();
+    }
+
+    function handleDragEnd() {
+        dragActivityCleanupRef.current?.();
+        dragActivityCleanupRef.current = null;
     }
 
     return (
@@ -82,6 +93,7 @@ export function UnscheduledTray({ projects, canEdit, pendingProjectIds, onMovePr
                                 key={project.id}
                                 draggable={canEdit && !pending ? true : undefined}
                                 onDragStart={event => handleDragStart(project, event)}
+                                onDragEnd={handleDragEnd}
                                 aria-busy={pending}
                                 className={`group flex min-w-52 items-center gap-2 rounded-md border border-indigo-200 bg-white px-3 py-2 shadow-sm ${canEdit && !pending ? "cursor-grab active:cursor-grabbing" : "opacity-60"}`}
                             >

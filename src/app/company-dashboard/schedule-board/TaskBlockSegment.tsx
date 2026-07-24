@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { DashboardTaskRow } from "@/lib/schedule-core";
 import { addTaskComment, deleteScheduleTask } from "@/lib/actions";
-import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
 import { FloatingPopover } from "./FloatingPopover";
 import { TaskCrewPicker } from "./CrewPickers";
@@ -81,20 +81,6 @@ function initials(name: string): string {
 
 // Hover-card notes (owner-feedback round, item 3).
 const HOVER_CARD_OPEN_DELAY_MS = 300;
-const NOTE_TRUNCATE_LENGTH = 140;
-
-function relativeDayLabel(iso: string): string {
-    const createdDay = parseUTCDate(iso.slice(0, 10));
-    const diffDays = getDaysBetween(createdDay, todayUTC());
-    if (diffDays <= 0) return "Today";
-    if (diffDays === 1) return "Yesterday";
-    if (diffDays < 7) return `${diffDays} days ago`;
-    return formatDate(createdDay);
-}
-
-function truncateNote(text: string): string {
-    return text.length > NOTE_TRUNCATE_LENGTH ? `${text.slice(0, NOTE_TRUNCATE_LENGTH)}…` : text;
-}
 
 // Readability pass (2026-07-22): a task chip only shows its text label once
 // it's wide enough for roughly 3 characters at the bumped 11px label font —
@@ -566,20 +552,8 @@ export function TaskBlockSegment({
             <FloatingPopover open={hoverCardOpen} anchorRef={rootRef} onClose={closeHoverCard} width={220} pointerEventsNone>
                 <div className="space-y-1">
                     <p className="text-xs font-semibold text-hui-textMain">{isMilestone ? `◆ ${task.name}` : task.name}</p>
-                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)}</p>
+                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)} · {task.status} · {progress}%</p>
                     <p className="text-[10px] text-hui-textMuted">Crew: {crew}</p>
-                    {task.latestComments.length > 0 && (
-                        <div className="space-y-1 border-t border-hui-border pt-1">
-                            {task.latestComments.map((comment, index) => (
-                                <p key={index} className="text-[10px] text-hui-textMain">
-                                    <span className="font-semibold">{comment.authorName}</span>{" "}
-                                    <span className="text-hui-textMuted">{relativeDayLabel(comment.createdAt)}</span>
-                                    {" — "}
-                                    {truncateNote(comment.text)}
-                                </p>
-                            ))}
-                        </div>
-                    )}
                 </div>
             </FloatingPopover>
         </div>

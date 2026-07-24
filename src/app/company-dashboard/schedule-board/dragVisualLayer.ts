@@ -44,6 +44,7 @@ interface SavedTargetStyle {
 }
 
 let activeVisualLayerCount = 0;
+let savedScheduleTargetStyle: SavedTargetStyle | null = null;
 
 export function isDragVisualLayerActive(): boolean {
     return activeVisualLayerCount > 0;
@@ -54,6 +55,27 @@ function publishDragVisualActivity(active: boolean) {
     window.dispatchEvent(new CustomEvent(DRAG_VISUAL_ACTIVE_EVENT, {
         detail: { active: activeVisualLayerCount > 0 },
     }));
+}
+
+export function clearScheduleTargetHighlight() {
+    if (!savedScheduleTargetStyle) return;
+    const { element, backgroundColor, boxShadow, outline, outlineOffset } = savedScheduleTargetStyle;
+    element.style.backgroundColor = backgroundColor;
+    element.style.boxShadow = boxShadow;
+    element.style.outline = outline;
+    element.style.outlineOffset = outlineOffset;
+    savedScheduleTargetStyle = null;
+}
+
+export function beginNativeScheduleDragActivity(): () => void {
+    let active = true;
+    publishDragVisualActivity(true);
+    return () => {
+        if (!active) return;
+        active = false;
+        clearScheduleTargetHighlight();
+        publishDragVisualActivity(false);
+    };
 }
 
 function escapeAttributeValue(value: string): string {
@@ -110,6 +132,36 @@ function findScheduleTarget(clientX: number, clientY: number, targetDate: string
     return nearest;
 }
 
+export function highlightScheduleTarget({
+    clientX,
+    clientY,
+    targetDate,
+}: {
+    clientX: number;
+    clientY: number;
+    targetDate: string | null;
+}) {
+    if (!targetDate) {
+        clearScheduleTargetHighlight();
+        return;
+    }
+    const nextTarget = findScheduleTarget(clientX, clientY, targetDate);
+    if (savedScheduleTargetStyle?.element === nextTarget) return;
+    clearScheduleTargetHighlight();
+    if (!nextTarget) return;
+    savedScheduleTargetStyle = {
+        element: nextTarget,
+        backgroundColor: nextTarget.style.backgroundColor,
+        boxShadow: nextTarget.style.boxShadow,
+        outline: nextTarget.style.outline,
+        outlineOffset: nextTarget.style.outlineOffset,
+    };
+    nextTarget.style.backgroundColor = "rgba(224, 231, 255, 0.82)";
+    nextTarget.style.boxShadow = "inset 0 0 0 2px rgb(79, 70, 229)";
+    nextTarget.style.outline = "2px solid transparent";
+    nextTarget.style.outlineOffset = "-2px";
+}
+
 export function createDragVisualLayer({
     sourceElement,
     sourceSelector,
@@ -130,7 +182,6 @@ export function createDragVisualLayer({
     const ghost = document.createElement("div");
     const label = document.createElement("div");
     const savedSourceStyles = new Map<HTMLElement, SavedSourceStyle>();
-    let savedTargetStyle: SavedTargetStyle | null = null;
     let latestUpdate: DragVisualUpdate = { clientX: startClientX, clientY: startClientY };
     let cleaned = false;
 
@@ -206,37 +257,12 @@ export function createDragVisualLayer({
         });
     }
 
-    function restoreTarget() {
-        if (!savedTargetStyle) return;
-        const { element, backgroundColor, boxShadow, outline, outlineOffset } = savedTargetStyle;
-        element.style.backgroundColor = backgroundColor;
-        element.style.boxShadow = boxShadow;
-        element.style.outline = outline;
-        element.style.outlineOffset = outlineOffset;
-        savedTargetStyle = null;
-    }
-
     function refreshTarget() {
-        const targetDate = latestUpdate.targetDate;
-        if (!targetDate) {
-            restoreTarget();
-            return;
-        }
-        const nextTarget = findScheduleTarget(latestUpdate.clientX, latestUpdate.clientY, targetDate);
-        if (savedTargetStyle?.element === nextTarget) return;
-        restoreTarget();
-        if (!nextTarget) return;
-        savedTargetStyle = {
-            element: nextTarget,
-            backgroundColor: nextTarget.style.backgroundColor,
-            boxShadow: nextTarget.style.boxShadow,
-            outline: nextTarget.style.outline,
-            outlineOffset: nextTarget.style.outlineOffset,
-        };
-        nextTarget.style.backgroundColor = "rgba(224, 231, 255, 0.82)";
-        nextTarget.style.boxShadow = "inset 0 0 0 2px rgb(79, 70, 229)";
-        nextTarget.style.outline = "2px solid transparent";
-        nextTarget.style.outlineOffset = "-2px";
+        highlightScheduleTarget({
+            clientX: latestUpdate.clientX,
+            clientY: latestUpdate.clientY,
+            targetDate: latestUpdate.targetDate ?? null,
+        });
     }
 
     const observer = new MutationObserver(() => {
@@ -276,7 +302,7 @@ export function createDragVisualLayer({
             if (cleaned) return;
             cleaned = true;
             observer.disconnect();
-            restoreTarget();
+            clearScheduleTargetHighlight();
             for (const [element, style] of savedSourceStyles) element.style.opacity = style.opacity;
             savedSourceStyles.clear();
             ghost.remove();
