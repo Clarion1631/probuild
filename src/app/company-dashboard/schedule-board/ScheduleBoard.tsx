@@ -37,6 +37,13 @@ import {
 } from "./useBarLayout";
 import type { TaskPointerEditStart } from "./TaskBlockSegment";
 import type { ProjectEndResizePointerStart, ProjectPointerEditStart } from "./ProjectBar";
+import {
+    createDragVisualLayer,
+    projectDragSourceSelector,
+    projectMarkerDragSourceSelector,
+    taskDragSourceSelector,
+    type DragVisualLayer,
+} from "./dragVisualLayer";
 
 export type { ProjectMoveChoice } from "./ShiftConfirmDialog";
 export type { ProjectDropIntent } from "./useBarLayout";
@@ -51,6 +58,14 @@ const PROJECT_TOUCH_DRAG_THRESHOLD_PX = 8;
 const EDGE_AUTOSCROLL_THRESHOLD_PX = 48;
 const MAX_AUTOSCROLL_PX_PER_FRAME = 16;
 const EMPTY_PROJECT_IDS: ReadonlySet<string> = new Set();
+
+let scheduleBoardRenderCount = 0;
+
+declare global {
+    interface Window {
+        __boardRenderCount?: number;
+    }
+}
 
 interface ScheduleBoardProps {
     data: CompanyDashboardData;
@@ -83,9 +98,11 @@ interface ActiveTaskPointerEdit {
     latestClientX: number;
     latestClientY: number;
     grabDate: string | null;
+    monthDayWidth: number | null;
     mode: TaskEditMode;
     active: boolean;
     currentCandidate: TaskDateOverride | null;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -110,6 +127,7 @@ interface ActiveProjectPointerEdit {
     grabDate: string;
     originalStart: string;
     active: boolean;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -118,10 +136,9 @@ interface ActiveProjectPointerEdit {
 }
 
 // Right-edge resize drag (item 2) — a SEPARATE pointer-drag from
-// ActiveProjectPointerEdit above: it previews via the SAME projectPreviewOverrides
-// slot (only one project edit can be active at a time — see cancelActiveProjectEdit)
-// but commits immediately (updateProjectEndDateAction), never joining the
-// draft/Save system.
+// ActiveProjectPointerEdit above. Its active preview lives in the detached
+// visual layer, but its final valid candidate still commits immediately through
+// updateProjectEndDateAction and never joins the draft/Save system.
 interface ActiveProjectEndResizeEdit {
     projectId: string;
     project: DashboardProjectRow;
@@ -140,6 +157,7 @@ interface ActiveProjectEndResizeEdit {
     monthDayWidth: number | null;
     active: boolean;
     currentCandidate: string | null;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -207,6 +225,10 @@ export function ScheduleBoard({
     onEffectivePendingProjectIdsChange,
     externalShiftEvents,
 }: ScheduleBoardProps) {
+    if (process.env.NODE_ENV !== "production") {
+        scheduleBoardRenderCount += 1;
+        if (typeof window !== "undefined") window.__boardRenderCount = scheduleBoardRenderCount;
+    }
     const router = useRouter();
     const { month, isAdmin, overlays } = data;
     const [showIncome, setShowIncome] = useState(true);
@@ -255,11 +277,6 @@ export function ScheduleBoard({
     // it participates in the SAME isPending gating as every other lock).
     const activeProjectEndResizeRef = useRef<ActiveProjectEndResizeEdit | null>(null);
     const [endResizeSavingProjectIds, setEndResizeSavingProjectIds] = useState<ReadonlySet<string>>(EMPTY_PROJECT_IDS);
-    // True for the duration of ANY pointer drag whose threshold has been
-    // crossed (project move, project end-resize, task move/resize) —
-    // combined with the keyboard-edit states below to gate task hover cards
-    // off while an edit is in progress (item 3).
-    const [pointerDragActive, setPointerDragActive] = useState(false);
     const previousExternallyPendingProjectIdsRef = useRef<ReadonlySet<string>>(new Set(externallyPendingProjectIds));
     const [confirmIntent, setConfirmIntent] = useState<ProjectDropIntent | null>(null);
     // Bumped on every "Today" click so TimelineView re-scrolls to today even
@@ -353,9 +370,9 @@ export function ScheduleBoard({
         () => mergeProjectPendingIds(externallyPendingProjectIds, endResizeSavingProjectIds),
         [externallyPendingProjectIds, endResizeSavingProjectIds],
     );
-    // Hover cards go quiet the moment ANY drag — pointer or keyboard, project
-    // or task — is in progress (item 3).
-    const isAnyDragActive = pointerDragActive || projectKeyboardEdit !== null || taskKeyboardEdit !== null;
+    // Keyboard edits still gate hover cards through React. Active pointer edits
+    // publish below this root from dragVisualLayer, avoiding a board render.
+    const isAnyDragActive = projectKeyboardEdit !== null || taskKeyboardEdit !== null;
 
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
     // ONE derived publisher for the page-wide lock: the live union of the
@@ -984,6 +1001,7 @@ export function ScheduleBoard({
             grabDate: hitTestScheduleDate(start.clientX, start.clientY) ?? start.fallbackGrabDate,
             originalStart: start.originalStart,
             active: false,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -1030,8 +1048,15 @@ export function ScheduleBoard({
                 drag.originX -= container.scrollLeft - before;
             }
             const candidate = calculateProjectPointerCandidate();
-            if (candidate) setProjectPreview(drag.project, candidate);
-            else clearProjectPreview(drag.projectId);
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    label: candidate ? `UTC start ${candidate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
+            }
             if (getProjectAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runProjectPointerFrame);
             }
@@ -1048,7 +1073,16 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: drag.project.status === "In Progress"
+                        ? projectMarkerDragSourceSelector(project.id)
+                        : projectDragSourceSelector(project.id),
+                    kind: drag.project.status === "In Progress" ? "project-marker-move" : "project-move",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                    cloneSelector: drag.project.status === "In Progress" ? '[data-drag-project-title="true"]' : undefined,
+                });
             }
             event.preventDefault();
             requestProjectPointerFrame();
@@ -1076,20 +1110,27 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
         drag.cleanup = () => {
             if (activeProjectPointerRef.current === drag) activeProjectPointerRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // The optimistic preview may re-key the originating segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeProjectPointerRef.current = drag;
@@ -1102,6 +1143,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     // Immediate server write for a released end-resize drag (item 2) — NOT
@@ -1163,6 +1205,7 @@ export function ScheduleBoard({
             monthDayWidth: start.timelineDayWidth ? null : measureMonthDayWidth(start.clientX, start.clientY),
             active: false,
             currentCandidate: null,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -1203,17 +1246,24 @@ export function ScheduleBoard({
                 maxStep: MAX_AUTOSCROLL_PX_PER_FRAME,
             });
         };
-        const applyEndResizeCandidate = () => {
+        const updateEndResizeVisual = () => {
             const candidate = calculateEndResizeCandidate();
             drag.currentCandidate = candidate;
-            if (!candidate || candidate === drag.originalEnd) {
-                clearProjectPreview(drag.projectId);
-                return;
+            const dayWidth = drag.start.timelineDayWidth ?? drag.monthDayWidth;
+            const deltaX = candidate && dayWidth
+                ? getDaysBetween(parseUTCDate(drag.originalEnd), parseUTCDate(candidate)) * dayWidth
+                : undefined;
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    deltaX,
+                    sourceOffsetX: drag.originX - drag.startX,
+                    label: candidate ? `UTC end ${candidate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
             }
-            setProjectPreviewOverrides(current => ({
-                ...current,
-                [drag.projectId]: { ...drag.project, endDate: `${candidate}T00:00:00.000Z` },
-            }));
         };
         const runEndResizeFrame = () => {
             drag.animationFrameId = null;
@@ -1225,7 +1275,7 @@ export function ScheduleBoard({
                 container.scrollLeft += scrollDelta;
                 drag.originX -= container.scrollLeft - before;
             }
-            applyEndResizeCandidate();
+            updateEndResizeVisual();
             if (getEndResizeAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
             }
@@ -1239,7 +1289,13 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: projectDragSourceSelector(project.id),
+                    kind: "project-end-resize",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                });
             }
             event.preventDefault();
             if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
@@ -1257,6 +1313,10 @@ export function ScheduleBoard({
                 clearProjectPreview(drag.projectId);
                 return;
             }
+            setProjectPreviewOverrides(current => ({
+                ...current,
+                [drag.projectId]: { ...drag.project, endDate: `${candidate}T00:00:00.000Z` },
+            }));
             commitProjectEndResize(drag.project, candidate);
         };
         const onPointerUp = (event: PointerEvent) => {
@@ -1266,20 +1326,27 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
         drag.cleanup = () => {
             if (activeProjectEndResizeRef.current === drag) activeProjectEndResizeRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // The optimistic preview may re-key the originating segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeProjectEndResizeRef.current = drag;
@@ -1292,6 +1359,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     function handleProjectKeyboardStart(project: DashboardProjectRow, sourceElement: HTMLElement) {
@@ -1387,9 +1455,11 @@ export function ScheduleBoard({
             latestClientX: start.clientX,
             latestClientY: start.clientY,
             grabDate: hitTestScheduleDate(start.clientX, start.clientY),
+            monthDayWidth: start.timelineDayWidth ? null : measureMonthDayWidth(start.clientX, start.clientY),
             mode,
             active: false,
             currentCandidate: originalDates,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -1410,18 +1480,27 @@ export function ScheduleBoard({
             }
             return previewTaskPointerCandidate(canonicalTask, mode, deltaDays);
         };
-        const applyPointerCandidate = (): TaskDateOverride | null => {
+        const updateTaskVisual = (): TaskDateOverride | null => {
             const candidate = calculatePointerCandidate();
-            const previousCandidate = drag.currentCandidate;
             drag.currentCandidate = candidate;
-            if (!candidate) {
-                drag.currentCandidate = null;
-                clearTaskPreview(task.id);
-                return null;
+            let deltaX: number | undefined;
+            const dayWidth = start.timelineDayWidth ?? drag.monthDayWidth;
+            if (candidate && dayWidth && mode !== "move") {
+                const originalBoundary = mode === "resize-left" ? originalDates.startDate : originalDates.endDate;
+                const candidateBoundary = mode === "resize-left" ? candidate.startDate : candidate.endDate;
+                deltaX = getDaysBetween(parseUTCDate(originalBoundary), parseUTCDate(candidateBoundary)) * dayWidth;
             }
-            if (previousCandidate?.startDate === candidate.startDate && previousCandidate.endDate === candidate.endDate) return candidate;
-            if (candidate.startDate === originalDates.startDate && candidate.endDate === originalDates.endDate) clearTaskPreview(task.id);
-            else setTaskPreview(task.id, candidate);
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    deltaX,
+                    sourceOffsetX: drag.originX - drag.startX,
+                    label: candidate ? `UTC ${candidate.startDate} to ${candidate.endDate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
+            }
             return candidate;
         };
         const getTaskAutoscrollStep = () => {
@@ -1450,7 +1529,7 @@ export function ScheduleBoard({
                 container.scrollLeft += scrollDelta;
                 drag.originX -= container.scrollLeft - before;
             }
-            applyPointerCandidate();
+            updateTaskVisual();
             if (getTaskAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runTaskPointerFrame);
             }
@@ -1464,7 +1543,13 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: taskDragSourceSelector(task.id),
+                    kind: mode === "move" ? "task-move" : mode === "resize-left" ? "task-resize-left" : "task-resize-right",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                });
             }
             event.preventDefault();
             if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runTaskPointerFrame);
@@ -1494,21 +1579,28 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
 
         drag.cleanup = () => {
             if (activeTaskPointerRef.current === drag) activeTaskPointerRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // A task preview can unmount its original weekly segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeTaskPointerRef.current = drag;
@@ -1521,6 +1613,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     function handleTaskKeyboardStart(task: DashboardTaskRow, mode: TaskEditMode, sourceElement: HTMLElement) {

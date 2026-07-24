@@ -25,6 +25,7 @@ const dispatchExceptionsSource = src("../src/app/company-dashboard/schedule-boar
 const traySource = src("../src/app/company-dashboard/schedule-board/UnscheduledTray.tsx");
 const dialogSource = src("../src/app/company-dashboard/schedule-board/ShiftConfirmDialog.tsx");
 const layoutSource = src("../src/app/company-dashboard/schedule-board/useBarLayout.ts");
+const dragVisualSource = src("../src/app/company-dashboard/schedule-board/dragVisualLayer.ts");
 const popoverSource = src("../src/app/company-dashboard/schedule-board/FloatingPopover.tsx");
 const actionsSource = src("../src/lib/actions.ts");
 const coreSource = src("../src/lib/schedule-core.ts");
@@ -114,6 +115,115 @@ assert.match(projectBarSource, /isDraft \? "border-dashed border-2 border-white\
 assert.doesNotMatch(projectBarSource, /canMoveProject && !isPending && !isDraft/, "a drafted project bar must stay as interactive as a saved one");
 assert.match(taskBlockSource, /isDraft\?: boolean/);
 assert.match(taskBlockSource, /isDraft \? "border-dashed border-2 border-white\/90 saturate-\[\.55\] brightness-95"/);
+
+// PR-A3 step 1: characterize pointer and draft behavior before replacing
+// React-rendered drag previews with the detached visual layer. These checks
+// pin the user-visible gates and final writer calls, not transient preview
+// implementation details.
+assert.match(boardSource, /const TASK_MOUSE_DRAG_THRESHOLD_PX = 5;/, "task mouse drag activation stays at 5px");
+assert.match(boardSource, /const TASK_TOUCH_DRAG_THRESHOLD_PX = 8;/, "task touch drag activation stays at 8px");
+assert.match(boardSource, /const PROJECT_MOUSE_DRAG_THRESHOLD_PX = 5;/, "project mouse and end-resize activation stays at 5px");
+assert.match(boardSource, /const PROJECT_TOUCH_DRAG_THRESHOLD_PX = 8;/, "project touch and end-resize activation stays at 8px");
+
+const characterizedTaskPointerStart = boardSource.indexOf("function handleTaskPointerEditStart(");
+const characterizedTaskPointerEnd = boardSource.indexOf("function handleTaskKeyboardStart(", characterizedTaskPointerStart);
+const characterizedTaskPointerBody = boardSource.slice(characterizedTaskPointerStart, characterizedTaskPointerEnd);
+assert.ok(characterizedTaskPointerStart >= 0, "task pointer edit machine must exist");
+assert.match(characterizedTaskPointerBody, /drag\.pointerType === "touch" \? TASK_TOUCH_DRAG_THRESHOLD_PX : TASK_MOUSE_DRAG_THRESHOLD_PX/, "task pointer threshold remains pointer-type specific");
+assert.match(characterizedTaskPointerBody, /Math\.hypot\(event\.clientX - drag\.startX, event\.clientY - drag\.startY\) < threshold/, "task threshold uses two-dimensional pointer distance");
+assert.match(characterizedTaskPointerBody, /return previewTaskPointerCandidate\(canonicalTask, mode, deltaDays\);/, "task drop candidates keep using the shared pure date helper");
+assert.match(characterizedTaskPointerBody, /drag\.latestClientX = releaseEvent\.clientX;\s*\n\s*drag\.latestClientY = releaseEvent\.clientY;[\s\S]*?const candidate = drag\.active && !cancelled \? calculatePointerCandidate\(\) : null;/, "task drop recomputes its final candidate from pointer-up coordinates");
+assert.match(characterizedTaskPointerBody, /if \(!drag\.active \|\| cancelled \|\| !candidate\) \{[\s\S]*?return;\s*\n\s*\}\s*\n\s*draftTaskChange\(task\.id, candidate\);/, "task cancel or outside-grid release never reaches the existing draft writer");
+assert.match(characterizedTaskPointerBody, /const onPointerCancel = \(event: PointerEvent\) => \{[\s\S]*?finish\(true\);/, "task pointercancel routes through cancellation");
+assert.match(characterizedTaskPointerBody, /const onWindowBlur = \(\) => finish\(true\);/, "task blur routes through cancellation");
+
+const characterizedProjectPointerStart = boardSource.indexOf("function handleProjectPointerEditStart(");
+const characterizedProjectPointerEnd = boardSource.indexOf("function commitProjectEndResize(", characterizedProjectPointerStart);
+const characterizedProjectPointerBody = boardSource.slice(characterizedProjectPointerStart, characterizedProjectPointerEnd);
+assert.ok(characterizedProjectPointerStart >= 0, "project pointer edit machine must exist");
+assert.match(characterizedProjectPointerBody, /drag\.pointerType === "touch" \? PROJECT_TOUCH_DRAG_THRESHOLD_PX : PROJECT_MOUSE_DRAG_THRESHOLD_PX/, "project pointer threshold remains pointer-type specific");
+assert.match(characterizedProjectPointerBody, /formatDate\(addDays\(parseUTCDate\(drag\.originalStart\), deltaDays\)\)/, "project drop candidates remain based on the original start plus the snapped signed delta");
+assert.match(characterizedProjectPointerBody, /drag\.latestClientX = releaseEvent\.clientX;\s*\n\s*drag\.latestClientY = releaseEvent\.clientY;[\s\S]*?const candidate = drag\.active && !cancelled \? calculateProjectPointerCandidate\(\) : null;/, "project drop recomputes its final candidate from pointer-up coordinates");
+assert.match(characterizedProjectPointerBody, /if \(cancelled \|\| !candidate\) \{[\s\S]*?return;\s*\n\s*\}\s*\n\s*draftProjectMove\(drag\.project, candidate\);/, "project cancel or outside-grid release never reaches the existing draft writer");
+assert.match(characterizedProjectPointerBody, /const onWindowBlur = \(\) => finish\(true\);/, "project blur routes through cancellation");
+
+const characterizedEndResizeStart = boardSource.indexOf("function handleProjectEndResizeStart(");
+const characterizedEndResizeEnd = boardSource.indexOf("function handleProjectKeyboardStart(", characterizedEndResizeStart);
+const characterizedEndResizeBody = boardSource.slice(characterizedEndResizeStart, characterizedEndResizeEnd);
+assert.ok(characterizedEndResizeStart >= 0, "project end-resize pointer machine must exist");
+assert.match(characterizedEndResizeBody, /drag\.pointerType === "touch" \? PROJECT_TOUCH_DRAG_THRESHOLD_PX : PROJECT_MOUSE_DRAG_THRESHOLD_PX/, "project end-resize shares the project pointer thresholds");
+assert.match(characterizedEndResizeBody, /computeProjectEndResizeCandidate\(/, "end-resize candidates keep using the shared clamp helper");
+assert.match(characterizedEndResizeBody, /!drag\.active \|\| cancelled \|\| !candidate \|\| candidate === drag\.originalEnd/, "cancelled, invalid, and origin end-resize releases stay no-ops");
+assert.match(characterizedEndResizeBody, /commitProjectEndResize\(drag\.project, candidate\);/, "a changed end-resize release keeps using the immediate end writer");
+assert.match(characterizedEndResizeBody, /const onWindowBlur = \(\) => finish\(true\);/, "project end-resize blur routes through cancellation");
+
+const characterizedDiscardStart = boardSource.indexOf("function discardAllDrafts()");
+const characterizedDiscardEnd = boardSource.indexOf("function waitForConfirmChoice(", characterizedDiscardStart);
+const characterizedDiscardBody = boardSource.slice(characterizedDiscardStart, characterizedDiscardEnd);
+assert.match(characterizedDiscardBody, /cancelActiveTaskEdit\(\);\s*\n\s*cancelActiveProjectEdit\(\);/, "Discard cancels every active edit before clearing unsaved state");
+assert.match(characterizedDiscardBody, /awaitingTaskRefreshIds\.has\(taskId\)/, "Discard preserves saved-awaiting task overrides");
+assert.match(saveAllDraftsBody, /if \(awaitingTaskRefreshIds\.has\(taskId\)\) return false;/, "Save never resubmits saved-awaiting task overrides");
+assert.match(boardSource, /rewriteAwaitingOverridesFromShift\(unseen\.flatMap\(event => event\.taskDates\)\)/, "all unseen external shifts keep rebasing saved-awaiting overrides");
+
+// PR-A3 steps 2-4: the new architecture must make active pointer frames an
+// imperative DOM-only path. These assertions intentionally start RED after
+// characterization passes and before production code changes.
+assert.ok(dragVisualSource.length > 0, "the isolated dragVisualLayer module must exist");
+assert.doesNotMatch(dragVisualSource, /@\/lib\/actions|schedule-core|router|toast|draftTaskChange|draftProjectMove|updateProjectEndDateAction/, "the visual layer must have no schedule persistence knowledge");
+assert.match(dragVisualSource, /export function createDragVisualLayer\(/, "the visual layer exposes one focused controller factory");
+assert.match(dragVisualSource, /cloneNode\(true\)/, "move ghosts clone the rendered task or project visual");
+assert.match(dragVisualSource, /document\.body\.appendChild\(/, "the detached ghost mounts outside React-owned schedule geometry");
+assert.match(dragVisualSource, /position = "fixed"/, "ghost positioning is viewport-fixed");
+assert.match(dragVisualSource, /pointerEvents = "none"/, "the ghost never interferes with hit testing");
+assert.match(dragVisualSource, /new MutationObserver\(/, "the controller re-applies source/target visuals across refresh remounts");
+assert.match(dragVisualSource, /querySelectorAll<HTMLElement>\(sourceSelector\)/, "stable data hooks reacquire every remounted source fragment");
+assert.match(dragVisualSource, /export function projectMarkerDragSourceSelector\(/, "marker-only project drags can target title strips without dimming task visuals");
+assert.match(dragVisualSource, /document\.elementsFromPoint\(/, "target highlighting is reacquired from the live DOM at the last pointer position");
+assert.match(dragVisualSource, /data-schedule-date/, "the visual layer owns schedule-date target highlighting");
+assert.match(dragVisualSource, /transform = `translate3d\(/, "active pointer frames update detached ghost geometry imperatively");
+assert.match(dragVisualSource, /sourceOffsetX\?: number;/, "resize ghosts can track source movement caused by timeline autoscroll");
+assert.match(dragVisualSource, /observer\.disconnect\(\)/, "visual cleanup stops refresh observation");
+assert.match(dragVisualSource, /ghost\.remove\(\)/, "visual cleanup removes the detached ghost");
+assert.match(dragVisualSource, /ghost\.setAttribute\("aria-hidden", "true"\)/, "detached visual clones stay out of the accessibility tree");
+assert.match(dragVisualSource, /dispatchEvent\(new CustomEvent\(DRAG_VISUAL_ACTIVE_EVENT/, "pointer-drag activity is published below ScheduleBoard instead of root state");
+
+assert.match(taskBlockSource, /data-drag-visual-kind="task"/, "task roots expose a stable visual kind hook");
+assert.match(taskBlockSource, /data-drag-task-id=\{task\.id\}/, "task roots expose a stable task-id hook");
+assert.match(projectBarSource, /data-drag-visual-kind="project"/, "project roots expose a stable visual kind hook");
+assert.match(projectBarSource, /data-drag-project-id=\{project\.id\}/, "project roots expose a stable project-id hook");
+assert.match(projectBarSource, /data-drag-project-title="true"/, "In-Progress marker-only ghosts have a stable title-strip hook");
+assert.match(taskBlockSource, /isDragVisualLayerActive\(\)/, "task hover opening reads pointer-drag activity without a board-root render");
+assert.match(taskBlockSource, /DRAG_VISUAL_ACTIVE_EVENT/, "active pointer drags close existing task hover cards below the board root");
+
+assert.match(boardSource, /let scheduleBoardRenderCount = 0;/, "a module-level development render counter must exist");
+assert.match(boardSource, /process\.env\.NODE_ENV !== "production"/, "the render counter must be development-only");
+assert.match(boardSource, /window\.__boardRenderCount = scheduleBoardRenderCount/, "the browser test can read the ScheduleBoard render count");
+assert.match(boardSource, /import \{\s*createDragVisualLayer[,\s\S]*?\} from "\.\/dragVisualLayer"/, "ScheduleBoard must consume the isolated visual controller");
+assert.doesNotMatch(boardSource, /setPointerDragActive/, "threshold crossing and pointer-up must not write board-root drag state");
+const taskRafBody = characterizedTaskPointerBody.slice(
+    characterizedTaskPointerBody.indexOf("const runTaskPointerFrame ="),
+    characterizedTaskPointerBody.indexOf("const onPointerMove ="),
+);
+const projectRafBody = characterizedProjectPointerBody.slice(
+    characterizedProjectPointerBody.indexOf("const runProjectPointerFrame ="),
+    characterizedProjectPointerBody.indexOf("const requestProjectPointerFrame ="),
+);
+const endResizeRafBody = characterizedEndResizeBody.slice(
+    characterizedEndResizeBody.indexOf("const runEndResizeFrame ="),
+    characterizedEndResizeBody.indexOf("const onPointerMove ="),
+);
+assert.doesNotMatch(taskRafBody, /setTaskPreview\(|clearTaskPreview\(|setTaskDateOverrides\(/, "task pointer RAFs must not write React preview state");
+assert.doesNotMatch(projectRafBody, /setProjectPreview\(|clearProjectPreview\(|setProjectPreviewOverrides\(|setProjectIncomeOverrides\(/, "project pointer RAFs must not write React preview state");
+assert.doesNotMatch(endResizeRafBody, /setProjectPreview\(|clearProjectPreview\(|setProjectPreviewOverrides\(/, "project end-resize RAFs must not write React preview state");
+assert.match(characterizedTaskPointerBody, /createDragVisualLayer\(/, "task move and resize paths use the detached controller");
+assert.match(characterizedEndResizeBody, /createDragVisualLayer\(/, "project end-resize uses the detached controller");
+assert.match(characterizedProjectPointerBody, /createDragVisualLayer\(/, "project move uses the detached controller");
+assert.match(characterizedProjectPointerBody, /sourceSelector: drag\.project\.status === "In Progress"\s*\n\s*\? projectMarkerDragSourceSelector\(project\.id\)\s*\n\s*: projectDragSourceSelector\(project\.id\)/, "In-Progress moves dim only marker/title fragments while Waiting-to-Start moves dim the full composite");
+assert.match(characterizedTaskPointerBody, /visualLayer\.update\(/, "task RAF updates only the visual controller");
+assert.match(characterizedEndResizeBody, /visualLayer\.update\(/, "end-resize RAF updates only the visual controller");
+assert.match(characterizedProjectPointerBody, /visualLayer\.update\(/, "project-move RAF updates only the visual controller");
+assert.match(characterizedTaskPointerBody, /sourceOffsetX: drag\.originX - drag\.startX/, "task resize ghosts stay anchored to their autoscrolled source");
+assert.match(characterizedEndResizeBody, /sourceOffsetX: drag\.originX - drag\.startX/, "project end-resize ghosts stay anchored to their autoscrolled source");
 
 // ── Item 1: crew ACTIVATED validation is added-only ──
 const setProjectCrewStart = coreSource.indexOf("export async function setProjectCrew");
@@ -394,9 +504,9 @@ assert.match(projectBarSource, /opacity-0 transition group-hover\/project:opacit
 // 16px grab zone with a 4px overhang past the bar edge (a 6px sliver was
 // unhittable in practice) — still confined to the title strip's 18px band.
 assert.match(projectBarSource, /className="absolute -right-1 top-0 z-20 h-\[18px\] w-4/, "the edge-resize handle must be a findable-width target confined to the title strip's 18px band, never the task strip");
-// ScheduleBoard: a SEPARATE drag machine from the whole-bar move, live local
-// preview via the SAME projectPreviewOverrides mechanism the move-drag/item-3
-// preview already uses, immediate commit (never draftProjectMove).
+// ScheduleBoard: a SEPARATE drag machine from the whole-bar move. Its active
+// visual stays detached; drop installs one final projectPreviewOverride before
+// the immediate commit (never draftProjectMove).
 assert.match(layoutSource, /export function computeProjectEndResizeCandidate\(originalEnd: Date, startDate: Date, deltaDays: number\): Date \{/, "the resize-preview clamp must be an exported PURE helper (testable, reused by both views)");
 assert.match(layoutSource, /candidate < minEnd \? minEnd : candidate/, "the clamp must floor the candidate at start+1, never at or before the start");
 assert.match(boardSource, /function measureMonthDayWidth\(clientX: number, clientY: number\): number \| null \{/, "Month's day width must be measured from the underlying week-grid day cell, not hardcoded");
@@ -605,3 +715,13 @@ assert.match(coreSource, /scheduledTime: string \| null;/, "dispatch appointment
 assert.match(coreSource, /confirmationStatus: string \| null;/, "dispatch appointments need confirmation status");
 assert.match(coreSource, /doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true/, "the dashboard task query must select every dispatch field");
 console.log("schedule-board render contract verification: PASS");
+
+// A3 reviewer-approved deltas, pinned so they stay deliberate:
+// 1. Escape cancels an active POINTER drag (all three pointer machines wire a
+//    window keydown handler) — additive UX approved in the A3 review round.
+const escapeWirings = boardSource.match(/window\.addEventListener\("keydown", onWindowKeyDown\)/g) ?? [];
+assert.ok(escapeWirings.length >= 3, "all three pointer-drag machines must wire the Escape-cancel keydown handler");
+// 2. Drag sourceElement is the block/bar ROOT (not the resize handle) so the
+//    ghost gets block geometry and touch-action:none covers the whole block.
+assert.match(taskBlockSource, /sourceElement: rootRef\.current \?\? event\.currentTarget/, "task drags must source from the block root");
+assert.match(projectBarSource, /sourceElement: rootRef\.current \?\? event\.currentTarget/, "project drags must source from the bar root");
