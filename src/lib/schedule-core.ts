@@ -2043,6 +2043,9 @@ export interface DashboardTaskRow {
     blockedReason: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
+    pendingMaterials: number;
+    stagedMaterials: number;
+    missingMaterials: number;
     assignments: DashboardTaskAssignment[];
     // Hover-card notes (owner-feedback round, item 3): most recent 2 task
     // comments, newest first — same TaskComment source the project schedule
@@ -2302,7 +2305,7 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject] = await Promise.all([
+    const [taskRows, qualifying, unappliedByProject, materialCounts] = await Promise.all([
         prisma.scheduleTask.findMany({
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
@@ -2325,11 +2328,28 @@ export async function getCompanyDashboardData(
         }),
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
         getUnappliedChangeOrders(rowIds),
+        prisma.taskMaterial.groupBy({
+            by: ["taskId", "status"],
+            where: {
+                task: { projectId: { in: rowIds } },
+                status: { in: ["pending", "staged", "missing"] },
+            },
+            _count: { id: true },
+        }),
     ]);
+    const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
+    for (const count of materialCounts) {
+        const current = materialCountsByTask.get(count.taskId) ?? { pending: 0, staged: 0, missing: 0 };
+        if (count.status === "pending" || count.status === "staged" || count.status === "missing") {
+            current[count.status] = count._count.id;
+        }
+        materialCountsByTask.set(count.taskId, current);
+    }
     const tasksByProject = new Map<string, DashboardTaskRow[]>();
     for (const task of taskRows) {
         if (!task.projectId) continue;
         const rows = tasksByProject.get(task.projectId) ?? [];
+        const taskMaterialCounts = materialCountsByTask.get(task.id) ?? { pending: 0, staged: 0, missing: 0 };
         rows.push({
             id: task.id,
             name: task.name,
@@ -2345,6 +2365,9 @@ export async function getCompanyDashboardData(
             blockedReason: task.blockedReason,
             scheduledTime: task.scheduledTime,
             confirmationStatus: task.confirmationStatus,
+            pendingMaterials: taskMaterialCounts.pending,
+            stagedMaterials: taskMaterialCounts.staged,
+            missingMaterials: taskMaterialCounts.missing,
             assignments: task.assignments.map(a => ({
                 id: a.id,
                 userId: a.userId,
