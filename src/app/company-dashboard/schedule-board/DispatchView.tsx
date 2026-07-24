@@ -24,6 +24,9 @@ interface DispatchViewProps {
     weather: VancouverForecastDay[];
     onActivate: (taskId: string) => void;
     onCreateTask: (defaults: DispatchTaskCreationDefaults) => void;
+    onReviewDispatch: () => void;
+    draftCount: number;
+    isReviewingDispatch: boolean;
 }
 
 interface WeekChip {
@@ -61,7 +64,15 @@ function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, d
     return chips;
 }
 
-export function DispatchView({ data, weather, onActivate, onCreateTask }: DispatchViewProps) {
+export function DispatchView({
+    data,
+    weather,
+    onActivate,
+    onCreateTask,
+    onReviewDispatch,
+    draftCount,
+    isReviewingDispatch,
+}: DispatchViewProps) {
     const [mode, setMode] = useState<DispatchMode>("today");
     const currentMonday = useMemo(() => getMonday(todayUTC()), []);
     const [weekStart, setWeekStart] = useState(currentMonday);
@@ -166,18 +177,34 @@ export function DispatchView({ data, weather, onActivate, onCreateTask }: Dispat
                         Vancouver forecast{headerForecast ? ` \u00B7 ${headerForecast.glyph} ${headerForecast.precipitationProbability}% rain \u00B7 ${headerForecast.high}\u00B0/${headerForecast.low}\u00B0` : " unavailable"}
                     </p>
                 </div>
-                <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Dispatch range">
-                    {(["today", "week"] as const).map(nextMode => (
+                <div className="flex flex-wrap items-center gap-2">
+                    {data.canEdit && (
                         <button
-                            key={nextMode}
                             type="button"
-                            onClick={() => selectMode(nextMode)}
-                            aria-pressed={mode === nextMode}
-                            className={`rounded px-3 py-1.5 text-xs font-semibold capitalize transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${mode === nextMode ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                            onClick={onReviewDispatch}
+                            disabled={draftCount === 0 || isReviewingDispatch}
+                            className="hui-btn hui-btn-green text-xs disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                            {nextMode}
+                            {isReviewingDispatch
+                                ? "Reviewing..."
+                                : draftCount > 0
+                                    ? `Review dispatch (${draftCount})`
+                                    : "Review dispatch"}
                         </button>
-                    ))}
+                    )}
+                    <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Dispatch range">
+                        {(["today", "week"] as const).map(nextMode => (
+                            <button
+                                key={nextMode}
+                                type="button"
+                                onClick={() => selectMode(nextMode)}
+                                aria-pressed={mode === nextMode}
+                                className={`rounded px-3 py-1.5 text-xs font-semibold capitalize transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${mode === nextMode ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                            >
+                                {nextMode}
+                            </button>
+                        ))}
+                    </div>
                 </div>
             </div>
 

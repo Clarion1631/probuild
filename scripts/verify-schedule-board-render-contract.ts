@@ -19,6 +19,7 @@ const taskBlockSource = src("../src/app/company-dashboard/schedule-board/TaskBlo
 const availabilityPanelSource = src("../src/app/company-dashboard/schedule-board/AvailabilityPanel.tsx");
 const availabilityHelpersSource = src("../src/app/company-dashboard/schedule-board/availability.ts");
 const dispatchViewSource = src("../src/app/company-dashboard/schedule-board/DispatchView.tsx");
+const dispatchReviewDialogSource = src("../src/app/company-dashboard/schedule-board/DispatchReviewDialog.tsx");
 const dispatchJobCardSource = src("../src/app/company-dashboard/schedule-board/DispatchJobCard.tsx");
 const dispatchStripSource = src("../src/app/company-dashboard/schedule-board/DispatchExceptions.tsx");
 const dispatchExceptionsSource = src("../src/app/company-dashboard/schedule-board/dispatch-exceptions.ts");
@@ -30,6 +31,8 @@ const cellActivationSource = src("../src/app/company-dashboard/schedule-board/em
 const popoverSource = src("../src/app/company-dashboard/schedule-board/FloatingPopover.tsx");
 const actionsSource = src("../src/lib/actions.ts");
 const coreSource = src("../src/lib/schedule-core.ts");
+const dispatchIntentSource = src("../src/lib/dispatch-intent.ts");
+const dispatchPublicationSource = src("../src/lib/dispatch-publication.ts");
 const weatherSource = src("../src/lib/weather.ts");
 const companyDashboardPageSource = src("../src/app/company-dashboard/page.tsx");
 const companyDashboardSource = src("../src/app/company-dashboard/CompanyDashboardClient.tsx");
@@ -80,9 +83,10 @@ assert.doesNotMatch(boardSource, /updateCompanyScheduleTaskDatesAction/, "the bo
 // assertions further down.)
 assert.match(boardSource, /import \{ saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction \} from "@\/lib\/actions"/);
 const saveAllDraftsStart = boardSource.indexOf("async function saveAllDrafts()");
-const saveAllDraftsEnd = boardSource.indexOf("function cancelProjectEditsForProjects", saveAllDraftsStart);
+const saveAllDraftsEnd = boardSource.indexOf("async function publishDispatchDrafts()", saveAllDraftsStart);
 const saveAllDraftsBody = boardSource.slice(saveAllDraftsStart, saveAllDraftsEnd);
 assert.ok(saveAllDraftsStart >= 0, "saveAllDrafts must exist");
+assert.ok(saveAllDraftsEnd > saveAllDraftsStart, "the legacy Save body must end before the atomic Dispatch gesture");
 assert.match(saveAllDraftsBody, /const chunk = changes\.slice\(offset, offset \+ 200\);\s*\n\s*try \{\s*\n\s*const batchResult = await saveCompanyScheduleTaskDatesAction\(chunk\)/, "Save batches task changes through the one canonical action, chunked to the server cap with per-chunk isolation");
 assert.match(saveAllDraftsBody, /updateProjectStartDateAction\(/);
 assert.match(saveAllDraftsBody, /shiftNotStartedTasksAction\(/);
@@ -824,6 +828,49 @@ assert.match(coreSource, /blockedReason: string \| null;/, "dispatch cards need 
 assert.match(coreSource, /scheduledTime: string \| null;/, "dispatch appointments need their scheduled time");
 assert.match(coreSource, /confirmationStatus: string \| null;/, "dispatch appointments need confirmation status");
 assert.match(coreSource, /doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true/, "the dashboard task query must select every dispatch field");
+
+// PR-B1: Month/Timeline retain the intentionally-partial chunked Save path,
+// while Dispatch owns one atomic review-and-queue gesture.
+assert.ok(dispatchIntentSource.length > 0, "the pure dispatch intent/diff module must exist");
+assert.ok(dispatchPublicationSource.length > 0, "the atomic dispatch publication core must exist");
+assert.ok(dispatchReviewDialogSource.length > 0, "the Dispatch review dialog must exist");
+assert.match(actionsSource, /export async function publishDispatchAction\(/, "actions.ts must expose one authenticated Dispatch publication wrapper");
+assert.match(actionsSource, /return publishDispatch\(/, "the wrapper must delegate to the session-free atomic core");
+
+const publishDispatchStart = boardSource.indexOf("async function publishDispatchDrafts()");
+const publishDispatchEnd = boardSource.indexOf("function cancelProjectEditsForProjects", publishDispatchStart);
+const publishDispatchBody = boardSource.slice(publishDispatchStart, publishDispatchEnd);
+assert.ok(publishDispatchStart >= 0, "ScheduleBoard must own the atomic Dispatch publication gesture");
+assert.match(publishDispatchBody, /publishDispatchAction\(/, "Dispatch must call the atomic action");
+assert.doesNotMatch(
+    publishDispatchBody,
+    /saveCompanyScheduleTaskDatesAction|updateProjectStartDateAction|shiftNotStartedTasksAction/,
+    "Dispatch must never compose the existing partial Save actions",
+);
+assert.equal(
+    (publishDispatchBody.match(/publishDispatchAction\(/g) ?? []).length,
+    1,
+    "one Dispatch confirmation must issue exactly one atomic action call",
+);
+assert.match(boardSource, /interface DispatchReconciliationExpectation \{[\s\S]*publicationId: string;[\s\S]*projects: Record<[\s\S]*tasks: Record<[\s\S]*assignments: Record</, "publication-scoped reconciliation must cover projects, tasks, and assignments");
+assert.match(boardSource, /setDispatchReconciliationExpectation\(/, "successful publication must pin one publication expectation");
+assert.match(boardSource, /Dispatch changed while you were reviewing\. Nothing was queued\. Your drafts are still here\./, "stale UX must preserve and explain drafts");
+assert.match(boardSource, /boardView !== "dispatch"[\s\S]{0,400}saveAllDrafts/, "Month/Timeline must retain the existing Save gesture");
+assert.match(boardSource, /boardView === "dispatch"[\s\S]{0,500}<DispatchView/, "Dispatch must receive its own view-scoped publication control");
+assert.match(boardSource, /<DispatchReviewDialog/, "ScheduleBoard must own the review dialog beside its draft maps");
+
+assert.match(dispatchViewSource, /onReviewDispatch: \(\) => void;/, "DispatchView must accept the CTA callback without owning draft state");
+assert.match(dispatchViewSource, /Review dispatch/, "Dispatch CTA copy must not use Publish");
+assert.doesNotMatch(dispatchViewSource, /taskDateOverrides|projectDrafts|DispatchIntent/, "DispatchView must not own or construct drafts");
+assert.match(dispatchReviewDialogSource, /Confirm & queue dispatch/, "B1 confirmation copy must describe queueing");
+assert.match(dispatchReviewDialogSource, /Dispatch recorded [—-] delivery pending/, "the success state must be honest about deferred delivery");
+assert.doesNotMatch(dispatchReviewDialogSource, />\s*Publish\s*</, "Dispatch UI must not use the ambiguous Publish label");
+
+// Revisions are serialized so previews can carry complete optimistic snapshots.
+assert.match(coreSource, /updatedAt: string;/, "dashboard project/task contracts must expose revisions");
+assert.match(coreSource, /id: true, projectId: true, name: true, startDate: true, endDate: true,[^\n]*updatedAt: true/, "the dashboard task query must select updatedAt");
+assert.match(coreSource, /updatedAt: task\.updatedAt\.toISOString\(\)/, "task revisions must serialize as ISO strings");
+
 console.log("schedule-board render contract verification: PASS");
 
 // A3 reviewer-approved deltas, pinned so they stay deliberate:

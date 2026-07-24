@@ -25,6 +25,55 @@ export const CONTRACT_ESTIMATE_STATUSES = ["Approved", "Invoiced", "Partially Pa
 
 export type ScheduleActor = { type: "TEAM" | "SYSTEM"; name: string };
 
+export interface LockedTaskAssignmentParent {
+    id: string;
+    projectId: string;
+    name: string;
+}
+
+/**
+ * Canonical lock order for every TaskAssignment writer: parent Project first,
+ * then the ScheduleTask row. The final read verifies the task did not move
+ * between the caller's access check and lock acquisition.
+ */
+export async function lockTaskAssignmentParent(
+    tx: Prisma.TransactionClient,
+    taskId: string,
+    expectedProjectId?: string,
+): Promise<LockedTaskAssignmentParent> {
+    const reference = expectedProjectId
+        ? { projectId: expectedProjectId }
+        : await tx.scheduleTask.findUnique({
+            where: { id: taskId },
+            select: { projectId: true },
+        });
+    if (!reference?.projectId) throw new Error("Task is not attached to a project");
+    await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${reference.projectId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+    const locked = await tx.scheduleTask.findUnique({
+        where: { id: taskId },
+        select: { id: true, projectId: true, name: true },
+    });
+    if (!locked || locked.projectId !== reference.projectId) {
+        throw new Error("Task moved to another project; refresh and retry");
+    }
+    return {
+        id: locked.id,
+        projectId: locked.projectId,
+        name: locked.name,
+    };
+}
+
+export async function touchTaskAssignmentRevision(
+    tx: Prisma.TransactionClient,
+    taskId: string,
+): Promise<void> {
+    await tx.scheduleTask.update({
+        where: { id: taskId },
+        data: { updatedAt: new Date() },
+    });
+}
+
 // The company shop — 5305 NE 121st Ave, Vancouver WA — anchor point for the
 // crew-availability panel's "how far is this job" distance (not money; safe
 // to serialize for every role).
@@ -72,6 +121,7 @@ export interface PipelineCrewMember {
 export interface PipelineProject {
     id: string;
     name: string;
+    updatedAt: string;
     client: string | null;
     location: string | null;
     status: string;
@@ -136,7 +186,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true, endDate: true, color: true,
+                id: true, name: true, status: true, startDate: true, endDate: true, updatedAt: true, color: true,
                 location: true,
                 locationLat: true, locationLng: true,
                 client: { select: { name: true } },
@@ -154,6 +204,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
     const bucket = (p: (typeof projects)[number]): PipelineProject => ({
         id: p.id,
         name: p.name,
+        updatedAt: p.updatedAt.toISOString(),
         client: p.client?.name ?? null,
         location: p.location,
         status: p.status,
@@ -345,18 +396,28 @@ export interface SetProjectStartDateResult {
  *
  * Every call writes an ActivityLog row (actorType TEAM for UI, SYSTEM for MCP).
  */
-export async function setProjectStartDate(input: {
+export interface SetProjectStartDateInput {
     projectId: string;
     startDate: Date | null;
     shiftJobTasks?: boolean;
     actor: ScheduleActor;
-}): Promise<SetProjectStartDateResult> {
+}
+
+interface InternalSetProjectStartDateInput extends SetProjectStartDateInput {
+    transaction?: Prisma.TransactionClient;
+    writeActivityLog?: boolean;
+    skipAutoGenerate?: boolean;
+}
+
+async function runSetProjectStartDate(
+    input: InternalSetProjectStartDateInput,
+): Promise<SetProjectStartDateResult> {
     const { projectId, startDate, actor } = input;
     const shiftJobTasks = input.shiftJobTasks !== false; // default true
 
     // Retry wrapper per the repo's money-path convention (see tx-retry.ts): a
     // rolled-back write-conflict on the shared pooler re-runs against fresh state.
-    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Serialize concurrent start-date moves: lock the project row BEFORE
         // reading the current marker, so two moves can never compute their
         // deltas from the same stale startDate (lost-update / double-shift race).
@@ -579,25 +640,27 @@ export async function setProjectStartDate(input: {
             }
         }
 
-        await tx.activityLog.create({
-            data: {
-                projectId,
-                actorType: actor.type,
-                actorName: actor.name,
-                action: "moved_project_start",
-                entityType: "project",
-                entityId: projectId,
-                entityName: project.name,
-                metadata: JSON.stringify({
-                    previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
-                    startDate: startDate ? startDate.toISOString() : null,
-                    shiftedTasks,
-                    shiftedMilestones,
-                    skippedQbMilestones: skippedQbMilestones.length,
-                    notes,
-                }),
-            },
-        });
+        if (input.writeActivityLog !== false) {
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: actor.type,
+                    actorName: actor.name,
+                    action: "moved_project_start",
+                    entityType: "project",
+                    entityId: projectId,
+                    entityName: project.name,
+                    metadata: JSON.stringify({
+                        previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
+                        startDate: startDate ? startDate.toISOString() : null,
+                        shiftedTasks,
+                        shiftedMilestones,
+                        skippedQbMilestones: skippedQbMilestones.length,
+                        notes,
+                    }),
+                },
+            });
+        }
 
         return {
             projectId,
@@ -609,13 +672,16 @@ export async function setProjectStartDate(input: {
             skippedQbMilestones,
             notes,
         };
-    }));
+    };
+    const result = input.transaction
+        ? await execute(input.transaction)
+        : await withTxRetry(() => prisma.$transaction(execute));
 
     // Post-commit best-effort generation hook (PB-pipeline-003): sign first,
     // date later ⇒ the schedule appears by itself. Fires when the project ends
     // up dated with zero tasks and a qualifying estimate; failures are caught
     // and surface in notes[], never fail the date move.
-    if (startDate !== null) {
+    if (!input.skipAutoGenerate && startDate !== null) {
         try {
             const [taskCount, qualifying] = await Promise.all([
                 prisma.scheduleTask.count({ where: { projectId } }),
@@ -642,6 +708,24 @@ export async function setProjectStartDate(input: {
     return result;
 }
 
+export async function setProjectStartDate(
+    input: SetProjectStartDateInput,
+): Promise<SetProjectStartDateResult> {
+    return runSetProjectStartDate(input);
+}
+
+export async function setProjectStartDateInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetProjectStartDateInput & { writeActivityLog?: boolean },
+): Promise<SetProjectStartDateResult> {
+    return runSetProjectStartDate({
+        ...input,
+        transaction: tx,
+        writeActivityLog: input.writeActivityLog,
+        skipAutoGenerate: true,
+    });
+}
+
 export interface ShiftNotStartedTasksInput {
     projectId: string;
     deltaDays: number;
@@ -662,8 +746,13 @@ export interface ShiftNotStartedTasksResult {
  * Pending payment milestones stay fixed and are returned as operator notes;
  * this path never changes the project marker or any payment/money row.
  */
-export async function shiftNotStartedTasks(
-    input: ShiftNotStartedTasksInput,
+interface InternalShiftNotStartedTasksInput extends ShiftNotStartedTasksInput {
+    transaction?: Prisma.TransactionClient;
+    writeActivityLog?: boolean;
+}
+
+async function runShiftNotStartedTasks(
+    input: InternalShiftNotStartedTasksInput,
 ): Promise<ShiftNotStartedTasksResult> {
     const { projectId, deltaDays, actor } = input;
     if (!Number.isSafeInteger(deltaDays) || deltaDays === 0) {
@@ -676,7 +765,7 @@ export async function shiftNotStartedTasks(
         throw new Error("deltaDays cannot exceed 365 days in a single shift");
     }
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Keep this lock first: all schedule moves serialize on Project before
         // selecting child tasks, matching setProjectStartDate's lock family.
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
@@ -758,23 +847,25 @@ export async function shiftNotStartedTasks(
             }
         }
 
-        await tx.activityLog.create({
-            data: {
-                projectId,
-                actorType: actor.type,
-                actorName: actor.name,
-                action: "shift_not_started_tasks",
-                entityType: "project",
-                entityId: projectId,
-                entityName: project.name,
-                metadata: JSON.stringify({
-                    deltaDays,
-                    shiftedTasks: shiftedTaskIds.length,
-                    shiftedTaskIds,
-                    explicitDueDateMilestones: notes.length,
-                }),
-            },
-        });
+        if (input.writeActivityLog !== false) {
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: actor.type,
+                    actorName: actor.name,
+                    action: "shift_not_started_tasks",
+                    entityType: "project",
+                    entityId: projectId,
+                    entityName: project.name,
+                    metadata: JSON.stringify({
+                        deltaDays,
+                        shiftedTasks: shiftedTaskIds.length,
+                        shiftedTaskIds,
+                        explicitDueDateMilestones: notes.length,
+                    }),
+                },
+            });
+        }
 
         return {
             projectId,
@@ -784,7 +875,27 @@ export async function shiftNotStartedTasks(
             shiftedTasks: shiftedTaskIds.length,
             notes,
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function shiftNotStartedTasks(
+    input: ShiftNotStartedTasksInput,
+): Promise<ShiftNotStartedTasksResult> {
+    return runShiftNotStartedTasks(input);
+}
+
+export async function shiftNotStartedTasksInTransaction(
+    tx: Prisma.TransactionClient,
+    input: ShiftNotStartedTasksInput & { writeActivityLog?: boolean },
+): Promise<ShiftNotStartedTasksResult> {
+    return runShiftNotStartedTasks({
+        ...input,
+        transaction: tx,
+        writeActivityLog: input.writeActivityLog,
+    });
 }
 
 export interface CashflowBucket {
@@ -1902,6 +2013,7 @@ export interface DashboardTaskComment {
 export interface DashboardTaskRow {
     id: string;
     name: string;
+    updatedAt: string;
     startDate: string;
     endDate: string;
     color: string | null;
@@ -2177,7 +2289,7 @@ export async function getCompanyDashboardData(
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
-                id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
+                id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
                 doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
@@ -2203,6 +2315,7 @@ export async function getCompanyDashboardData(
         rows.push({
             id: task.id,
             name: task.name,
+            updatedAt: task.updatedAt.toISOString(),
             startDate: task.startDate.toISOString(),
             endDate: task.endDate.toISOString(),
             color: task.color,
@@ -2860,14 +2973,7 @@ export async function setTaskCrew(input: {
     actor: ScheduleActor;
 }): Promise<{ taskId: string; projectId: string; assignments: { id: string; userId: string; name: string }[] }> {
     return withTxRetry(() => prisma.$transaction(async (tx) => {
-        const taskRef = await tx.scheduleTask.findUnique({
-            where: { id: input.taskId },
-            select: { projectId: true },
-        });
-        if (!taskRef) throw new Error("Task not found");
-        if (!taskRef.projectId) throw new Error("Task is not attached to a project");
-        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${taskRef.projectId} FOR UPDATE`;
-        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${input.taskId} FOR UPDATE`;
+        const lockedParent = await lockTaskAssignmentParent(tx, input.taskId);
         const task = await tx.scheduleTask.findUnique({
             where: { id: input.taskId },
             select: {
@@ -2878,7 +2984,7 @@ export async function setTaskCrew(input: {
         });
         if (!task) throw new Error("Task not found");
         if (!task.projectId) throw new Error("Task is not attached to a project");
-        if (task.projectId !== taskRef.projectId) throw new Error("Task moved to another project; refresh and retry");
+        if (task.projectId !== lockedParent.projectId) throw new Error("Task moved to another project; refresh and retry");
 
         const wanted = [...new Set(input.userIds)];
         const users = wanted.length
@@ -2905,6 +3011,9 @@ export async function setTaskCrew(input: {
         for (const userId of toAdd) {
             // Lead assignment is intentionally not settable here yet; task crew changes remain assigned until the later lead-management PR.
             await tx.taskAssignment.create({ data: { taskId: input.taskId, userId, role: "assigned" } });
+        }
+        if (toAdd.length > 0 || toRemove.length > 0) {
+            await touchTaskAssignmentRevision(tx, input.taskId);
         }
 
         await tx.activityLog.create({

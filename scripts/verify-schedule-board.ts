@@ -494,7 +494,11 @@ async function main() {
         check("withTxRetry retries one P2034 conflict and succeeds on attempt two", retryProbe === "retried" && retryAttempts === 2);
 
         const scheduleCoreSource = readFileSync(new URL("../src/lib/schedule-core.ts", import.meta.url), "utf8");
-        const shiftStart = scheduleCoreSource.indexOf("export async function shiftNotStartedTasks");
+        // B1 moved the shift core into the private runShiftNotStartedTasks
+        // (the export is now a thin delegator so Publish can run it inside
+        // its own transaction) — the invariant lives in the runner's body.
+        const shiftRunnerStart = scheduleCoreSource.indexOf("async function runShiftNotStartedTasks");
+        const shiftStart = shiftRunnerStart >= 0 ? shiftRunnerStart : scheduleCoreSource.indexOf("export async function shiftNotStartedTasks");
         const shiftEnd = scheduleCoreSource.indexOf("export interface CashflowBucket", shiftStart);
         const shiftBody = scheduleCoreSource.slice(shiftStart, shiftEnd);
         const projectLockIndex = shiftBody.indexOf('SELECT id FROM "Project"');

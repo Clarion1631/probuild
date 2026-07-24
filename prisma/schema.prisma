@@ -35,6 +35,7 @@ model User {
   clippedImports   ClippedImport[]
   officeTasks        OfficeTask[]      @relation("OfficeTaskAssignee")
   createdOfficeTasks OfficeTask[]      @relation("OfficeTaskCreator")
+  dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
 }
 
 model Client {
@@ -214,6 +215,7 @@ model Project {
   lead                Lead?                        @relation(fields: [leadId], references: [id], onDelete: Restrict)
   viewedAt            DateTime                     @default(now())
   createdAt           DateTime                     @default(now())
+  updatedAt           DateTime                     @default(now()) @updatedAt
   location            String?
   // Geofencing for mobile time-clock (added for gtr-probuild-mobile integration)
   locationLat            Float?
@@ -1696,6 +1698,66 @@ model ActivityLog {
   @@index([projectId, createdAt])
   @@index([entityType, entityId])
   @@index([leadId, createdAt])
+}
+
+model DispatchPublication {
+  id              String   @id @default(cuid())
+  clientRequestId String   @unique
+  requestHash     String
+
+  publishedById   String?
+  publishedBy     User?    @relation("DispatchPublisher", fields: [publishedById], references: [id], onDelete: SetNull)
+  publishedByName String
+  publishedAt     DateTime @default(now())
+
+  changes         DispatchPublicationChange[]
+  deliveries      ChatDelivery[]
+
+  @@index([publishedById])
+  @@index([publishedAt])
+}
+
+model DispatchPublicationChange {
+  id            String              @id @default(cuid())
+  publicationId String
+  publication   DispatchPublication @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+
+  position      Int
+  projectId     String
+  targetType    String // PROJECT | TASK
+  targetId      String
+  kind          String // PROJECT_START | TASK_DATES | TASK_CREW
+  before        Json
+  after         Json
+  summary       String
+
+  @@unique([publicationId, position], map: "DispatchChange_pub_position_key")
+  @@unique([publicationId, kind, targetType, targetId], map: "DispatchChange_pub_target_kind_key")
+  @@index([projectId])
+  @@index([targetType, targetId])
+}
+
+model ChatDelivery {
+  id            String              @id @default(cuid())
+  publicationId String
+  publication   DispatchPublication @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+
+  destination String
+  kind        String @default("dispatch_publication")
+  payload     Json
+
+  status              String   @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
+  attempts            Int      @default(0)
+  lastError           String?
+  claimToken          String?
+  processingStartedAt DateTime?
+  providerMessageId   String?
+  createdAt           DateTime @default(now())
+  processedAt         DateTime?
+
+  @@unique([publicationId, destination, kind], map: "ChatDelivery_pub_dest_kind_key")
+  @@index([status, createdAt])
+  @@index([status, processingStartedAt])
 }
 
 model Integration {

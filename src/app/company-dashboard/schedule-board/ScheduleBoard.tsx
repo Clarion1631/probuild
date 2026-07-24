@@ -5,14 +5,23 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { toast } from "sonner";
+import { publishDispatchAction } from "@/lib/actions";
 import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction } from "@/lib/actions";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
+import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
+import type {
+    DispatchAssignment,
+    DispatchIntent,
+    PersistedDispatchProjectState,
+    PersistedDispatchTaskState,
+} from "@/lib/dispatch-intent";
 import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { DispatchView } from "./DispatchView";
 import type { DispatchTaskCreationDefaults } from "./DispatchView";
+import { DispatchReviewDialog } from "./DispatchReviewDialog";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
@@ -175,6 +184,20 @@ interface ProjectDraftMove {
     deltaDays: number;
 }
 
+interface DispatchReconciliationExpectation {
+    publicationId: string;
+    projects: Record<string, PersistedDispatchProjectState>;
+    tasks: Record<string, PersistedDispatchTaskState>;
+    assignments: Record<string, DispatchAssignment[]>;
+}
+
+interface DispatchReviewState {
+    clientRequestId: string;
+    intents: DispatchIntent[];
+    preview: PublishDispatchSuccess;
+    published: boolean;
+}
+
 function hitTestScheduleDate(clientX: number, clientY: number): string | null {
     for (const element of document.elementsFromPoint(clientX, clientY)) {
         const cell = element instanceof HTMLElement ? element.closest<HTMLElement>("[data-schedule-date]") : null;
@@ -221,6 +244,27 @@ function shiftMonth(month: string, delta: number): string {
     return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+function dashboardTaskAssignments(task: DashboardTaskRow): DispatchAssignment[] {
+    return task.assignments
+        .map(assignment => ({
+            userId: assignment.userId,
+            role: assignment.assignmentRole === "lead" ? "lead" as const : "assigned" as const,
+        }))
+        .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role));
+}
+
+function dashboardAssignmentsMatch(
+    task: DashboardTaskRow,
+    expected: DispatchAssignment[],
+): boolean {
+    const actual = dashboardTaskAssignments(task);
+    return actual.length === expected.length
+        && actual.every((assignment, index) =>
+            assignment.userId === expected[index]?.userId
+            && assignment.role === expected[index]?.role,
+        );
+}
+
 export function ScheduleBoard({
     data,
     weather,
@@ -252,6 +296,11 @@ export function ScheduleBoard({
     const [projectPreviewOverrides, setProjectPreviewOverrides] = useState<Record<string, DashboardProjectRow>>({});
     const [projectIncomeOverrides, setProjectIncomeOverrides] = useState<Record<string, OverlayIncomeItem[]>>({});
     const [projectRefreshExpectations, setProjectRefreshExpectations] = useState<Record<string, ProjectRefreshExpectation>>({});
+    const [dispatchReconciliationExpectation, setDispatchReconciliationExpectation] = useState<DispatchReconciliationExpectation | null>(null);
+    const [dispatchReview, setDispatchReview] = useState<DispatchReviewState | null>(null);
+    const [dispatchConflictTargetIds, setDispatchConflictTargetIds] = useState<Set<string>>(() => new Set());
+    const [isDispatchReviewing, setIsDispatchReviewing] = useState(false);
+    const [isDispatchPublishing, setIsDispatchPublishing] = useState(false);
     // Drafts accumulate here — the SAME map drives the live visual preview AND
     // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
@@ -342,9 +391,15 @@ export function ScheduleBoard({
     // A saved-but-not-yet-refreshed task keeps its override (pinned to the
     // persisted dates) purely for rendering/reconciliation — it is NOT an
     // unsaved draft and must not count toward or re-enter a Save.
+    const dispatchAwaitingTaskIds = useMemo(
+        () => new Set(Object.keys(dispatchReconciliationExpectation?.tasks ?? {})),
+        [dispatchReconciliationExpectation],
+    );
     const draftTaskIds = useMemo(
-        () => new Set(Object.keys(taskDateOverrides).filter(taskId => !awaitingTaskRefreshIds.has(taskId))),
-        [taskDateOverrides, awaitingTaskRefreshIds],
+        () => new Set(Object.keys(taskDateOverrides).filter(taskId =>
+            !awaitingTaskRefreshIds.has(taskId) && !dispatchAwaitingTaskIds.has(taskId),
+        )),
+        [taskDateOverrides, awaitingTaskRefreshIds, dispatchAwaitingTaskIds],
     );
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
     const draftCount = draftTaskIds.size + draftProjectIds.size;
@@ -359,13 +414,13 @@ export function ScheduleBoard({
     // committing) or an externally-locked project (the legacy StartDateRow
     // mutating that same project directly) ever blocks an edit.
     const isProjectLocked = useCallback((projectId: string) => (
-        isSaving || isProjectExternallyPending(projectId)
-    ), [isSaving, isProjectExternallyPending]);
+        (isSaving || isProjectExternallyPending(projectId)) || isDispatchReviewing || isDispatchPublishing
+    ), [isDispatchPublishing, isDispatchReviewing, isSaving, isProjectExternallyPending]);
     const isTaskLocked = useCallback((taskId: string) => {
-        if (isSaving) return true;
+        if (isSaving || isDispatchReviewing || isDispatchPublishing) return true;
         const projectId = canonicalTaskProjectById.get(taskId);
         return Boolean(projectId && isProjectExternallyPending(projectId));
-    }, [isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
+    }, [isDispatchPublishing, isDispatchReviewing, isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
 
     // End-resize saves are a SECOND source of "externally" pending, alongside
     // the legacy StartDateRow (item 2) — merged so both views' isPending gate
@@ -380,12 +435,24 @@ export function ScheduleBoard({
 
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
     // ONE derived publisher for the page-wide lock: the live union of the
-    // running batch save's locked projects and every in-flight end-resize
-    // save. Snapshot-based inline publications left windows where a resize
+    // running batch save's locked projects, every in-flight end-resize
+    // save, and — while a dispatch review/publish is in flight — every
+    // draft-affected project (the publish transaction will touch exactly
+    // those rows; sibling writers like StartDateRow must see them pending).
+    // Snapshot-based inline publications left windows where a resize
     // starting mid-batch went unpublished.
     useEffect(() => {
-        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds));
-    }, [saveLockedProjectIds, endResizeSavingProjectIds, onEffectivePendingProjectIdsChange]);
+        let pending = mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds);
+        if (isDispatchReviewing || isDispatchPublishing) {
+            const dispatchAffected = new Set(draftProjectIds);
+            for (const taskId of draftTaskIds) {
+                const projectId = canonicalTaskProjectById.get(taskId);
+                if (projectId) dispatchAffected.add(projectId);
+            }
+            pending = mergeProjectPendingIds(pending, dispatchAffected);
+        }
+        onEffectivePendingProjectIdsChange(pending);
+    }, [saveLockedProjectIds, endResizeSavingProjectIds, isDispatchReviewing, isDispatchPublishing, draftProjectIds, draftTaskIds, canonicalTaskProjectById, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -428,6 +495,36 @@ export function ScheduleBoard({
         setTaskDateOverrides(current => ({ ...current, [taskId]: dates }));
     }
 
+    function detachDispatchExpectationTargets(input: {
+        projectIds?: ReadonlySet<string>;
+        taskIds?: ReadonlySet<string>;
+    }) {
+        setDispatchConflictTargetIds(current => {
+            const next = new Set([...current].filter(targetId =>
+                !input.projectIds?.has(targetId) && !input.taskIds?.has(targetId),
+            ));
+            return next.size === current.size ? current : next;
+        });
+        setDispatchReconciliationExpectation(current => {
+            if (!current) return current;
+            const projects = Object.fromEntries(Object.entries(current.projects).filter(([projectId]) =>
+                !input.projectIds?.has(projectId),
+            ));
+            const tasks = Object.fromEntries(Object.entries(current.tasks).filter(([taskId]) =>
+                !input.taskIds?.has(taskId),
+            ));
+            const assignments = Object.fromEntries(Object.entries(current.assignments).filter(([taskId]) =>
+                !input.taskIds?.has(taskId),
+            ));
+            if (Object.keys(projects).length === 0
+                && Object.keys(tasks).length === 0
+                && Object.keys(assignments).length === 0) {
+                return null;
+            }
+            return { ...current, projects, tasks, assignments };
+        });
+    }
+
     // Shared by the board's own save loop AND external (legacy StartDateRow)
     // shifts: saved-awaiting overrides pinned to pre-shift dates can never
     // reconcile — rewrite them to the persisted shifted dates.
@@ -464,6 +561,7 @@ export function ScheduleBoard({
         // refresh — cancelling a speculative edit must restore it, never
         // delete it (deleting strands the awaiting id and the refresh poll).
         if (awaitingTaskRefreshIds.has(taskId)) return;
+        if (dispatchAwaitingTaskIds.has(taskId)) return;
         setTaskDateOverrides(current => {
             if (!(taskId in current)) return current;
             const next = { ...current };
@@ -540,10 +638,59 @@ export function ScheduleBoard({
     }, [canonicalProjectById, projectRefreshExpectations]);
 
     useEffect(() => {
-        if (Object.keys(projectRefreshExpectations).length === 0 && awaitingTaskRefreshIds.size === 0) return;
+        const expectation = dispatchReconciliationExpectation;
+        if (!expectation) return;
+        const projectsMatch = Object.entries(expectation.projects).every(([projectId, expected]) => {
+            const canonical = canonicalProjectById.get(projectId);
+            return Boolean(
+                canonical
+                && (canonical.startDate ? canonical.startDate.slice(0, 10) : null) === expected.startDate
+                && (canonical.endDate ? canonical.endDate.slice(0, 10) : null) === expected.endDate,
+            );
+        });
+        const tasksMatch = Object.entries(expectation.tasks).every(([taskId, expected]) => {
+            const canonical = canonicalTaskById.get(taskId);
+            return Boolean(
+                canonical
+                && canonical.startDate.slice(0, 10) === expected.startDate
+                && canonical.endDate.slice(0, 10) === expected.endDate,
+            );
+        });
+        const assignmentsMatch = Object.entries(expectation.assignments).every(([taskId, expected]) => {
+            const canonical = canonicalTaskById.get(taskId);
+            return Boolean(canonical && dashboardAssignmentsMatch(canonical, expected));
+        });
+        if (!projectsMatch || !tasksMatch || !assignmentsMatch) return;
+
+        const projectIds = new Set(Object.keys(expectation.projects));
+        const taskIds = new Set([
+            ...Object.keys(expectation.tasks),
+            ...Object.keys(expectation.assignments),
+        ]);
+        const timeoutId = window.setTimeout(() => {
+            setProjectPreviewOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !projectIds.has(projectId)),
+            ));
+            setProjectIncomeOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !projectIds.has(projectId)),
+            ));
+            setTaskDateOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([taskId]) => !taskIds.has(taskId)),
+            ));
+            setDispatchReconciliationExpectation(current =>
+                current?.publicationId === expectation.publicationId ? null : current,
+            );
+        }, 0);
+        return () => window.clearTimeout(timeoutId);
+    }, [canonicalProjectById, canonicalTaskById, dispatchReconciliationExpectation]);
+
+    useEffect(() => {
+        if (Object.keys(projectRefreshExpectations).length === 0
+            && awaitingTaskRefreshIds.size === 0
+            && !dispatchReconciliationExpectation) return;
         const intervalId = window.setInterval(() => router.refresh(), 2_000);
         return () => window.clearInterval(intervalId);
-    }, [awaitingTaskRefreshIds.size, projectRefreshExpectations, router]);
+    }, [awaitingTaskRefreshIds.size, dispatchReconciliationExpectation, projectRefreshExpectations, router]);
 
     useEffect(() => () => {
         activeProjectPointerRef.current?.cleanup();
@@ -663,7 +810,8 @@ export function ScheduleBoard({
         // would delete the pinned override and strand the awaiting id.
         if (!awaitingTaskRefreshIds.has(taskId)
             && normalizedDates.startDate === originalDates.startDate
-            && normalizedDates.endDate === originalDates.endDate) {
+            && normalizedDates.endDate === originalDates.endDate
+            && !dispatchAwaitingTaskIds.has(taskId)) {
             clearTaskPreview(taskId);
             return;
         }
@@ -672,6 +820,7 @@ export function ScheduleBoard({
             if (!current.has(taskId)) return current;
             return new Set([...current].filter(id => id !== taskId));
         });
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
         setTaskPreview(taskId, normalizedDates);
     }
 
@@ -701,6 +850,10 @@ export function ScheduleBoard({
             clearProjectDraft(project.id);
             return;
         }
+        detachDispatchExpectationTargets({
+            projectIds: new Set([project.id]),
+            taskIds: new Set(canonicalProject.tasks.map(task => task.id)),
+        });
         setProjectPreview(canonicalProject, intent.targetStart);
         // Rebase this project's existing task drafts by the CHANGE in project
         // delta (full-shift projects only — the preview shifts their tasks, so
@@ -737,9 +890,11 @@ export function ScheduleBoard({
         // Discard clears UNSAVED drafts only. Saved-awaiting overrides are
         // committed state pending refresh — removing them here would strand
         // their awaiting ids and the refresh poll forever.
-        setTaskDateOverrides(current => Object.fromEntries(
-            Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId)),
-        ));
+        setTaskDateOverrides(current => {
+            const savedAwaitingEntries = Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId));
+            const dispatchAwaitingEntries = Object.entries(current).filter(([taskId]) => dispatchAwaitingTaskIds.has(taskId));
+            return Object.fromEntries([...savedAwaitingEntries, ...dispatchAwaitingEntries]);
+        });
     }
 
     function waitForConfirmChoice(): Promise<ProjectMoveChoice | "cancel"> {
@@ -756,6 +911,134 @@ export function ScheduleBoard({
     function cancelConfirmedMove() {
         confirmResolverRef.current?.("cancel");
         confirmResolverRef.current = null;
+    }
+
+    function handleDispatchFailure(result: Exclude<Awaited<ReturnType<typeof publishDispatchAction>>, { ok: true }>) {
+        if (result.code === "STALE_DISPATCH") {
+            setDispatchConflictTargetIds(new Set(result.conflicts.map(conflict => conflict.targetId)));
+            setDispatchReview(null);
+            toast.error("Dispatch changed while you were reviewing. Nothing was queued. Your drafts are still here.");
+            router.refresh();
+            return;
+        }
+        if (result.code === "NO_CHANGES") {
+            toast.info(result.message);
+            return;
+        }
+        toast.error(result.message);
+    }
+
+    async function collectDispatchIntents(): Promise<DispatchIntent[] | null> {
+        const projectEntries = Object.entries(projectDrafts);
+        const taskEntries = [...draftTaskIds].map(taskId => [taskId, taskDateOverrides[taskId]!] as const);
+        if (projectEntries.length === 0 && taskEntries.length === 0) return [];
+
+        const affectedProjectIds = new Set([
+            ...projectEntries.map(([projectId]) => projectId),
+            ...taskEntries
+                .map(([taskId]) => canonicalTaskProjectById.get(taskId))
+                .filter((projectId): projectId is string => Boolean(projectId)),
+        ]);
+        const lockedNames = [...affectedProjectIds]
+            .filter(projectId => combinedPendingProjectIds.has(projectId))
+            .map(projectId => canonicalProjectById.get(projectId)?.name ?? projectId);
+        if (lockedNames.length > 0) {
+            toast.info(`Review will be available after another edit finishes: ${lockedNames.join(", ")}`);
+            return null;
+        }
+
+        const inProgressChoices = new Map<string, ProjectMoveChoice>();
+        for (const [projectId, draft] of projectEntries) {
+            const project = canonicalProjectById.get(projectId);
+            if (!project) {
+                toast.error(`Project ${projectId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            if (project.status !== "In Progress") continue;
+            const refreshedIntent = createProjectDropIntent(project, draft.targetStart);
+            if (!refreshedIntent) {
+                toast.error(`${project.name} no longer has a movable schedule range. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            setConfirmIntent(refreshedIntent);
+            const choice = await waitForConfirmChoice();
+            setConfirmIntent(null);
+            if (choice === "cancel") return null;
+            inProgressChoices.set(projectId, choice);
+        }
+
+        const intents: DispatchIntent[] = [];
+        for (const [projectId, draft] of projectEntries) {
+            const project = canonicalProjectById.get(projectId);
+            if (!project) return null;
+            intents.push({
+                kind: "PROJECT_START",
+                projectId,
+                expectedUpdatedAt: project.updatedAt,
+                expectedTasks: project.tasks.map(task => ({
+                    taskId: task.id,
+                    expectedUpdatedAt: task.updatedAt,
+                    expectedAssignments: dashboardTaskAssignments(task),
+                })),
+                startDate: draft.targetStart,
+                shiftMode: project.status === "In Progress"
+                    ? inProgressChoices.get(projectId) === "marker-only"
+                        ? "MARKER_ONLY"
+                        : "NOT_STARTED_TASKS"
+                    : "ALL_TASKS",
+            });
+        }
+        for (const [taskId, dates] of taskEntries) {
+            const task = canonicalTaskById.get(taskId);
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!task || !projectId) {
+                toast.error(`Task ${taskId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            intents.push({
+                kind: "TASK_DATES",
+                projectId,
+                taskId,
+                expectedUpdatedAt: task.updatedAt,
+                expectedAssignments: dashboardTaskAssignments(task),
+                startDate: dates.startDate,
+                endDate: dates.endDate,
+            });
+        }
+        return intents;
+    }
+
+    async function reviewDispatchDrafts() {
+        if (isDispatchReviewing || isDispatchPublishing || isSaving || draftCount === 0) return;
+        cancelActiveTaskEdit();
+        cancelActiveProjectEdit();
+        setIsDispatchReviewing(true);
+        try {
+            const intents = await collectDispatchIntents();
+            if (!intents || intents.length === 0) return;
+            const clientRequestId = crypto.randomUUID();
+            const result = await publishDispatchAction({
+                clientRequestId,
+                intents,
+                dryRun: true,
+            });
+            if (!result.ok) {
+                handleDispatchFailure(result);
+                return;
+            }
+            setDispatchReview({
+                clientRequestId,
+                intents,
+                preview: result,
+                published: false,
+            });
+        } finally {
+            setConfirmIntent(null);
+            setIsDispatchReviewing(false);
+        }
     }
 
     // Commits every drafted change in one Save gesture: project-start moves
@@ -940,6 +1223,75 @@ export function ScheduleBoard({
                 `${totalFailed} change${totalFailed === 1 ? "" : "s"} failed to save: ${failedNames.join(", ")}`,
                 totalSucceeded > 0 ? { description: `${totalSucceeded} other change${totalSucceeded === 1 ? "" : "s"} saved.` } : undefined,
             );
+        }
+    }
+
+    async function publishDispatchDrafts() {
+        if (!dispatchReview || dispatchReview.published || isDispatchPublishing) return;
+        setIsDispatchPublishing(true);
+        try {
+            const result = await publishDispatchAction({
+                clientRequestId: dispatchReview.clientRequestId,
+                intents: dispatchReview.intents,
+                dryRun: false,
+            });
+            if (!result.ok) {
+                handleDispatchFailure(result);
+                return;
+            }
+            if (!result.publicationId) {
+                toast.error("Dispatch committed without a publication ID. Refresh before trying again.");
+                return;
+            }
+
+            const publishedProjectIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "PROJECT_START")
+                .map(intent => intent.projectId));
+            const explicitlyDraftedTaskIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "TASK_DATES")
+                .map(intent => intent.taskId));
+
+            setProjectDrafts(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !publishedProjectIds.has(projectId)),
+            ));
+            setProjectPreviewOverrides(current => {
+                const next = { ...current };
+                for (const [projectId, expected] of Object.entries(result.reconciliation.projects)) {
+                    const row = next[projectId] ?? canonicalProjectById.get(projectId);
+                    if (!row) continue;
+                    next[projectId] = {
+                        ...row,
+                        startDate: expected.startDate ? `${expected.startDate}T00:00:00.000Z` : null,
+                        endDate: expected.endDate ? `${expected.endDate}T00:00:00.000Z` : null,
+                    };
+                }
+                return next;
+            });
+            setTaskDateOverrides(current => {
+                const next = Object.fromEntries(
+                    Object.entries(current).filter(([taskId]) => !explicitlyDraftedTaskIds.has(taskId)),
+                );
+                for (const [taskId, dates] of Object.entries(result.reconciliation.tasks)) {
+                    next[taskId] = dates;
+                }
+                return next;
+            });
+            setDispatchReconciliationExpectation({
+                publicationId: result.publicationId,
+                projects: result.reconciliation.projects,
+                tasks: result.reconciliation.tasks,
+                assignments: result.reconciliation.assignments,
+            });
+            setDispatchConflictTargetIds(new Set());
+            setDispatchReview({
+                ...dispatchReview,
+                preview: result,
+                published: true,
+            });
+            toast.success("Dispatch recorded — delivery pending");
+            router.refresh();
+        } finally {
+            setIsDispatchPublishing(false);
         }
     }
 
@@ -1757,6 +2109,7 @@ export function ScheduleBoard({
     const pendingRefreshKinds = [
         Object.keys(projectRefreshExpectations).length > 0 ? "project" : null,
         awaitingTaskRefreshIds.size > 0 ? "task" : null,
+        dispatchReconciliationExpectation ? "dispatch" : null,
     ].filter((kind): kind is string => Boolean(kind));
 
     return (
@@ -1828,12 +2181,14 @@ export function ScheduleBoard({
                 >
                     <span>{draftCount} unsaved change{draftCount === 1 ? "" : "s"}</span>
                     <div className="flex items-center gap-2">
-                        <button type="button" onClick={discardAllDrafts} disabled={isSaving} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
+                        <button type="button" onClick={discardAllDrafts} disabled={isSaving || isDispatchReviewing || isDispatchPublishing} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
                             Discard
                         </button>
-                        <button type="button" onClick={() => void saveAllDrafts()} disabled={isSaving} className="hui-btn hui-btn-green text-xs disabled:cursor-wait disabled:opacity-60">
-                            {isSaving ? "Saving..." : "Save"}
-                        </button>
+                        {boardView !== "dispatch" && (
+                            <button type="button" onClick={() => void saveAllDrafts()} disabled={isSaving} className="hui-btn hui-btn-green text-xs disabled:cursor-wait disabled:opacity-60">
+                                {isSaving ? "Saving..." : "Save"}
+                            </button>
+                        )}
                     </div>
                 </motion.div>
             )}
@@ -1845,7 +2200,7 @@ export function ScheduleBoard({
                 onMoveProject={scheduleUnscheduledProject}
             />
             <AnimatePresence initial={false}>
-            {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0) && (
+            {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0 || dispatchReconciliationExpectation) && (
                 <motion.div
                     key="refresh-status"
                     data-motion-scope="status-change"
@@ -1873,6 +2228,9 @@ export function ScheduleBoard({
                     weather={weather}
                     onActivate={handleBlockActivate}
                     onCreateTask={openTaskCreation}
+                    onReviewDispatch={() => void reviewDispatchDrafts()}
+                    draftCount={draftCount}
+                    isReviewingDispatch={isDispatchReviewing || isDispatchPublishing}
                 />
             ) : boardView === "month" ? (
                 <MonthBarsView
@@ -1954,6 +2312,14 @@ export function ScheduleBoard({
                 isPending={false}
                 onChoice={handleMoveChoice}
                 onCancel={cancelConfirmedMove}
+            />
+            <DispatchReviewDialog
+                result={dispatchReview?.preview ?? null}
+                published={dispatchReview?.published ?? false}
+                isPending={isDispatchPublishing}
+                conflictTargetIds={dispatchConflictTargetIds}
+                onConfirm={() => void publishDispatchDrafts()}
+                onClose={() => setDispatchReview(null)}
             />
             <BoardTaskDrawer
                 taskId={openTaskId}
