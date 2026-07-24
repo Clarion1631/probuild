@@ -17,7 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
-import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES } from "./schedule-core";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
@@ -32,6 +32,9 @@ import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { publishDispatch } from "./dispatch-publication";
+import type { DispatchIntent } from "./dispatch-intent";
+import type { PublishDispatchResult } from "./dispatch-publication";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -7305,32 +7308,40 @@ export async function getTaskPunchItems(taskId: string) {
 // ========== TASK ASSIGNMENTS ==========
 
 export async function assignUserToTask(taskId: string, userId: string) {
-    await assertScheduleTaskAccess(taskId);
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-    if (!user || user.status !== "ACTIVATED") throw new Error("Task crew members must be ACTIVATED users");
-    const assignment = await prisma.taskAssignment.create({
-        data: { taskId, userId },
-        include: { user: { select: { id: true, name: true, email: true } } },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    const assignment = await withTxRetry(() => prisma.$transaction(async tx => {
+        await lockTaskAssignmentParent(tx, taskId, projectId);
+        const user = await tx.user.findUnique({ where: { id: userId }, select: { status: true } });
+        if (!user || user.status !== "ACTIVATED") throw new Error("Task crew members must be ACTIVATED users");
+        const created = await tx.taskAssignment.create({
+            data: { taskId, userId },
+            include: { user: { select: { id: true, name: true, email: true } } },
+        });
+        await touchTaskAssignmentRevision(tx, taskId);
+        return created;
+    }));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
     return assignment;
 }
 
 export async function unassignUserFromTask(taskId: string, userId: string) {
-    await assertScheduleTaskAccess(taskId);
-    await prisma.taskAssignment.deleteMany({
-        where: { taskId, userId },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    await withTxRetry(() => prisma.$transaction(async tx => {
+        await lockTaskAssignmentParent(tx, taskId, projectId);
+        const deleted = await tx.taskAssignment.deleteMany({
+            where: { taskId, userId },
+        });
+        if (deleted.count > 0) await touchTaskAssignmentRevision(tx, taskId);
+    }));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
 }
 
 export async function setTaskLead(taskId: string, userId: string | null) {
     const { user, projectId } = await assertScheduleTaskAccess(taskId);
     const assignments = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
-        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+        await lockTaskAssignmentParent(tx, taskId, projectId);
         const task = await tx.scheduleTask.findUnique({
             where: { id: taskId },
             select: {
@@ -7355,6 +7366,7 @@ export async function setTaskLead(taskId: string, userId: string | null) {
                 data: { role: "lead" },
             });
         }
+        await touchTaskAssignmentRevision(tx, taskId);
         await tx.activityLog.create({
             data: {
                 projectId,
@@ -7592,11 +7604,33 @@ export async function getScheduleCrewMembers() {
 }
 
 export async function clearAllTasks(projectId: string) {
-    // Delete all related data first (dependencies, comments, punch items, assignments)
-    const taskIds = (await prisma.scheduleTask.findMany({ where: { projectId }, select: { id: true } })).map(t => t.id);
-    if (taskIds.length === 0) return;
-    await prisma.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
-    await prisma.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
+    await assertScheduleProjectAccess(projectId);
+    await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const taskRows = await tx.$queryRaw<{ id: string }[]>`
+            SELECT "id"
+            FROM "ScheduleTask"
+            WHERE "projectId" = ${projectId}
+            ORDER BY "id"
+            FOR UPDATE
+        `;
+        const taskIds = taskRows.map(task => task.id);
+        if (taskIds.length === 0) return;
+        const assignedTaskIds = (await tx.taskAssignment.findMany({
+            where: { taskId: { in: taskIds } },
+            distinct: ["taskId"],
+            select: { taskId: true },
+        })).map(row => row.taskId);
+        await tx.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
+        if (assignedTaskIds.length > 0) {
+            await tx.scheduleTask.updateMany({
+                where: { id: { in: assignedTaskIds } },
+                data: { updatedAt: new Date() },
+            });
+        }
+        await tx.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
+    }));
+    revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${projectId}/schedule`);
 }
 
@@ -7805,6 +7839,57 @@ export interface SaveCompanyScheduleTaskDatesInput {
     taskId: string;
     startDate: string; // YYYY-MM-DD
     endDate: string;   // YYYY-MM-DD
+}
+
+export interface PublishDispatchActionInput {
+    clientRequestId: string;
+    intents: DispatchIntent[];
+    dryRun?: boolean;
+}
+
+export async function publishDispatchAction(
+    input: PublishDispatchActionInput,
+): Promise<PublishDispatchResult> {
+    // Same session helper as every other hardened schedule mutation — the
+    // dev fallback only exists under NODE_ENV=development.
+    const session = await getSessionOrDev();
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { id: true, role: true, status: true, name: true, email: true },
+        })
+        : null;
+    if (!caller || caller.status !== "ACTIVATED" || !["ADMIN", "MANAGER"].includes(caller.role)) {
+        return {
+            ok: false,
+            code: "FORBIDDEN",
+            message: "You do not have permission to queue a dispatch.",
+            conflicts: [],
+        };
+    }
+
+    return publishDispatch({
+        clientRequestId: input.clientRequestId,
+        intents: input.intents,
+        dryRun: input.dryRun,
+        actor: {
+            userId: caller.id,
+            name: caller.name || caller.email,
+        },
+    }).then(result => {
+        if (result.ok && result.publicationId) {
+            revalidatePath("/company-dashboard");
+        }
+        return result;
+    }).catch(error => {
+        console.error("Dispatch publication failed", error);
+        return {
+            ok: false as const,
+            code: "DISPATCH_FAILED" as const,
+            message: "Nothing was queued. Please try again with the same review.",
+            conflicts: [],
+        };
+    });
 }
 
 export interface SaveCompanyScheduleTaskDateResult {
@@ -10974,5 +11059,3 @@ export async function restoreOfficeTask(id: string) {
     revalidatePath("/tasks");
     return task;
 }
-
-
