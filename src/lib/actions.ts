@@ -48,6 +48,12 @@ import {
     type TaskMaterialUpdateInput,
     type TaskMaterialStatus,
 } from "./task-materials-core";
+import { assertPortalProjectAccess } from "./portal-project-access";
+import {
+    computeDailyLogSharedContentHash,
+    getPortalScheduleTasksCore,
+    setDailyLogPortalShareCore,
+} from "./portal-tracker";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -6778,81 +6784,9 @@ export async function getStagingQueue(dayISO: string) {
 }
 
 export async function getPortalScheduleTasks(projectId: string) {
-    // Hardened (dispatch-arc foundation): portal schedule details require staff access or an owning client with schedule visibility.
-    const session = await getSessionOrDev();
-    const role = ((session?.user as any)?.role as string | null) ?? null;
-    const isStaff = role === "ADMIN" || role === "MANAGER";
-
-    if (!isStaff) {
-        const sessionClientId = await resolveSessionClientId();
-        if (!sessionClientId) throw new Error("Unauthorized");
-
-        const project = await prisma.project.findFirst({
-            where: { id: projectId, clientId: sessionClientId },
-            select: { id: true },
-        });
-        if (!project) throw new Error("Unauthorized");
-
-        const visibility = await prisma.portalVisibility.findUnique({
-            where: { projectId },
-        });
-        // Match getPortalVisibility defaults: a missing record enables the portal and schedule.
-        if (visibility && (!visibility.isPortalEnabled || !visibility.showSchedule)) {
-            throw new Error("Unauthorized");
-        }
-    }
-
-    const tasks = await prisma.scheduleTask.findMany({
-        where: { projectId },
-        orderBy: { order: "asc" },
-        select: {
-            id: true,
-            name: true,
-            startDate: true,
-            endDate: true,
-            color: true,
-            progress: true,
-            status: true,
-            type: true,
-            order: true,
-            dependencies: { select: { id: true, predecessorId: true, dependentId: true } },
-            assignments: {
-                select: {
-                    id: true,
-                    userId: true,
-                    user: { select: { name: true } },
-                },
-            },
-            subAssignments: {
-                select: {
-                    id: true,
-                    subcontractor: { select: { companyName: true } },
-                },
-            },
-        },
-    });
-
-    return tasks.map(task => ({
-        id: task.id,
-        name: task.name,
-        startDate: task.startDate,
-        endDate: task.endDate,
-        color: task.color,
-        progress: task.progress,
-        status: task.status,
-        type: task.type,
-        order: task.order,
-        dependencies: task.dependencies,
-        assignments: task.assignments.map(assignment => ({
-            id: assignment.id,
-            userId: assignment.userId,
-            firstName: assignment.user.name?.trim().split(/\s+/)[0] || "Crew",
-        })),
-        subAssignments: task.subAssignments.map(assignment => ({
-            id: assignment.id,
-            companyName: assignment.subcontractor.companyName,
-        })),
-    }));
+    // Client-safe allowlist shared by the simple tracker and the full schedule.
+    await assertPortalProjectAccess(projectId, "showSchedule");
+    return getPortalScheduleTasksCore(projectId);
 }
 
 export async function getDashboardTasks(projectId: string) {
@@ -9836,13 +9770,29 @@ async function assertDailyLogAccess(projectId: string) {
 export async function getDailyLogs(projectId: string) {
     // Hardened (dispatch-arc foundation): require daily-log permission and project access before reading logs.
     await assertDailyLogAccess(projectId);
-    return await prisma.dailyLog.findMany({
+    const logs = await prisma.dailyLog.findMany({
         where: { projectId },
         orderBy: { date: "desc" },
         include: {
             createdBy: { select: { id: true, name: true, email: true } },
             photos: { orderBy: { createdAt: "asc" } },
         },
+    });
+    return logs.map(log => {
+        const sharedPhotoIds = log.photos
+            .filter(photo => photo.sharedToPortal)
+            .map(photo => photo.id);
+        const currentHash = computeDailyLogSharedContentHash(
+            log.workPerformed,
+            sharedPhotoIds,
+        );
+        return {
+            ...log,
+            sharedPhotoIds,
+            portalShareValid: log.sharedToPortal
+                && Boolean(log.sharedContentHash)
+                && log.sharedContentHash === currentHash,
+        };
     });
 }
 
@@ -9912,7 +9862,12 @@ export async function updateDailyLog(id: string, data: {
     if (data.date !== undefined) updateData.date = new Date(data.date);
     if (data.weather !== undefined) updateData.weather = data.weather || null;
     if (data.crewOnSite !== undefined) updateData.crewOnSite = data.crewOnSite || null;
-    if (data.workPerformed !== undefined) updateData.workPerformed = data.workPerformed;
+    if (data.workPerformed !== undefined) {
+        updateData.workPerformed = data.workPerformed;
+        // Content approval is a snapshot. Any work-text edit requires a
+        // manager to re-share, even if the new string happens to be similar.
+        updateData.sharedContentHash = null;
+    }
     if (data.materialsDelivered !== undefined) updateData.materialsDelivered = data.materialsDelivered || null;
     if (data.issues !== undefined) updateData.issues = data.issues || null;
 
@@ -9958,14 +9913,54 @@ export async function deleteDailyLogPhoto(photoId: string) {
     // Hardened (dispatch-arc foundation): authorize against the photo's persisted log project before deleting.
     const photo = await prisma.dailyLogPhoto.findUnique({
         where: { id: photoId },
-        include: { dailyLog: { select: { projectId: true } } },
+        include: { dailyLog: { select: { id: true, projectId: true } } },
     });
     if (!photo) return { success: false };
     await assertDailyLogAccess(photo.dailyLog.projectId);
 
-    await prisma.dailyLogPhoto.delete({ where: { id: photoId } });
+    await prisma.$transaction(async tx => {
+        await tx.dailyLogPhoto.delete({ where: { id: photoId } });
+        if (photo.sharedToPortal) {
+            await tx.dailyLog.update({
+                where: { id: photo.dailyLog.id },
+                data: { sharedContentHash: null },
+            });
+        }
+    });
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
     return { success: true };
+}
+
+export async function setDailyLogPortalShare(
+    logId: string,
+    input: { shared: boolean; photoIds: string[] },
+) {
+    const session = await getSessionOrDev();
+    const role = ((session?.user as any)?.role as string | null) ?? null;
+    if (!role || !["ADMIN", "MANAGER"].includes(role)) throw new Error("Forbidden");
+
+    const target = await prisma.dailyLog.findUnique({
+        where: { id: logId },
+        select: { projectId: true },
+    });
+    if (!target) throw new Error("Daily log not found");
+    await assertDailyLogAccess(target.projectId);
+
+    const userId = ((session?.user as any)?.id as string | null) ?? null;
+    const actorName = session?.user?.name || session?.user?.email || "Team member";
+    const result = await setDailyLogPortalShareCore(
+        logId,
+        input,
+        {
+            userId: userId || "session",
+            role,
+            name: actorName,
+        },
+    );
+
+    revalidatePath(`/projects/${target.projectId}/dailylogs`);
+    revalidatePath(`/portal/projects/${target.projectId}`);
+    return result;
 }
 
 // =============================================

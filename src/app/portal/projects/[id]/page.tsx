@@ -4,12 +4,18 @@ import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalProjectTabs, { type PortalTab } from "@/components/PortalProjectTabs";
-import { getPortalScheduleTasks, getPortalVisibility } from "@/lib/actions";
+import { getPortalVisibility } from "@/lib/actions";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
+import PortalProjectTracker from "./PortalProjectTracker";
+import PortalUpdatesFeed from "./PortalUpdatesFeed";
+import {
+    getPortalProjectTracker,
+    getPortalUpdatesFeed,
+} from "@/lib/portal-tracker";
 
 const ALLOWED_TABS = [
     "overview", "estimates", "schedule", "invoices",
@@ -74,23 +80,21 @@ export default async function PortalProjectDetail(props: {
                 where: { status: { not: 'Draft' } },
                 orderBy: { createdAt: 'desc' },
                 include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true } } }
-            },
-            dailyLogs: {
-                orderBy: { date: 'desc' },
-                include: {
-                    photos: { orderBy: { createdAt: 'asc' } },
-                    createdBy: { select: { name: true, email: true } }
-                }
             }
         }
     });
 
     if (!project) return notFound();
 
-    const [settings, visibility, scheduleTasks, sharedRooms] = await Promise.all([
+    const visibility = await getPortalVisibility(projectId);
+    const [settings, trackerData, updatesFeed, sharedRooms] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
-        getPortalVisibility(projectId),
-        getPortalScheduleTasks(projectId).catch(() => [] as any[]),
+        visibility.showSchedule
+            ? getPortalProjectTracker(projectId)
+            : Promise.resolve(null),
+        visibility.showDailyLogs
+            ? getPortalUpdatesFeed(projectId)
+            : Promise.resolve([]),
         prisma.roomDesign.findMany({
             where: { projectId, shareEnabled: true, shareToken: { not: null } },
             select: { id: true, name: true, shareToken: true, thumbnail: true, updatedAt: true },
@@ -107,7 +111,7 @@ export default async function PortalProjectDetail(props: {
                     </div>
                     <h2 className="text-2xl font-bold text-slate-800 mb-2">Access Suspended</h2>
                     <p className="text-slate-500 mb-6 max-w-md mx-auto">
-                        Your contractor has currently paused access to this project's dashboard. Please contact them directly if you need to review any project materials or estimates.
+                        Your contractor has currently paused access to this project&apos;s dashboard. Please contact them directly if you need to review any project materials or estimates.
                     </p>
                     <Link href="/portal" className="inline-flex justify-center items-center gap-2 hui-btn hui-btn-primary">
                         Return to My Hub
@@ -120,7 +124,7 @@ export default async function PortalProjectDetail(props: {
     // ---- Compute counts and tab config ----
     const estimateCount = project.estimates.filter((e: any) => e.approvedAt || ['Approved', 'Invoiced', 'Partially Paid', 'Paid'].includes(e.status)).length;
     const invoiceCount = project.invoices.length;
-    const updateCount = (project.dailyLogs || []).length;
+    const updateCount = updatesFeed.length;
     const changeOrderCount = (project.changeOrders || []).length;
 
     // All overview-derived data must respect the same visibility flag as the section it surfaces.
@@ -148,7 +152,7 @@ export default async function PortalProjectDetail(props: {
         { id: "estimates", label: "Estimates", count: estimateCount, visible: visibility.showEstimates && estimateCount > 0 },
         { id: "schedule", label: "Schedule", visible: visibility.showSchedule },
         { id: "invoices", label: "Invoices", count: invoiceCount, visible: visibility.showInvoices && invoiceCount > 0 },
-        { id: "updates", label: "Updates", count: updateCount, visible: visibility.showDailyLogs && updateCount > 0 },
+        { id: "updates", label: "Updates", count: updateCount || undefined, visible: visibility.showDailyLogs },
         { id: "files", label: "Files", visible: visibility.showFiles },
         { id: "selections", label: "Selections", visible: visibility.showSelections },
         { id: "designs", label: "Designs", visible: visibility.showMoodBoards || sharedRooms.length > 0 },
@@ -169,27 +173,6 @@ export default async function PortalProjectDetail(props: {
             ? `/portal/projects/${projectId}`
             : `/portal/projects/${projectId}?tab=${t.id}`,
     }));
-
-    // ---- Schedule summary for Overview + Schedule tab ----
-    const isTaskComplete = (t: any) => (t.progress ?? 0) >= 100 || t.status === 'Complete';
-    const totalTasks = scheduleTasks.length;
-    const completedTasks = scheduleTasks.filter(isTaskComplete).length;
-    const inProgressTask = scheduleTasks.find((t: any) =>
-        !isTaskComplete(t) && ((t.progress ?? 0) > 0 || t.status === 'In Progress')
-    );
-    const upcomingTasks = scheduleTasks
-        .filter((t: any) => !isTaskComplete(t))
-        .slice()
-        .sort((a: any, b: any) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime())
-        .slice(0, 4);
-    const overallProgress = totalTasks > 0
-        ? Math.round((completedTasks / totalTasks) * 100)
-        : 0;
-
-    const latestLog = (visibility.showDailyLogs && project.dailyLogs && project.dailyLogs.length > 0)
-        ? project.dailyLogs[0]
-        : null;
-    const hasScheduleData = visibility.showSchedule && totalTasks > 0;
 
     return (
         <div className="max-w-5xl mx-auto">
@@ -238,6 +221,14 @@ export default async function PortalProjectDetail(props: {
             >
                 {activeTab === "overview" && (
                     <div className="space-y-6">
+                        {trackerData && (
+                            <PortalProjectTracker
+                                projectId={projectId}
+                                projectName={project.name}
+                                data={trackerData}
+                            />
+                        )}
+
                         {/* Payment Due callout */}
                         {pendingPayments.length > 0 && (
                             <div className="bg-green-50 border border-green-200 rounded-xl p-5 md:p-6">
@@ -307,71 +298,11 @@ export default async function PortalProjectDetail(props: {
                             </div>
                         )}
 
-                        {/* Schedule + Latest Update row */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            {/* Schedule mini summary */}
-                            {hasScheduleData && (
-                                <Link
-                                    href={`/portal/projects/${projectId}?tab=schedule`}
-                                    className="hui-card p-5 hover:shadow-md hover:border-blue-300 transition"
-                                >
-                                    <div className="flex items-center justify-between mb-3">
-                                        <h3 className="font-semibold text-hui-textMain flex items-center gap-2">
-                                            <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                                            Schedule
-                                        </h3>
-                                        <span className="text-xs font-semibold text-blue-500">{overallProgress}%</span>
-                                    </div>
-                                    <div className="w-full bg-slate-100 rounded-full h-2 mb-3">
-                                        <div className="bg-blue-500 h-2 rounded-full transition-all" style={{ width: `${overallProgress}%` }} />
-                                    </div>
-                                    <p className="text-sm text-hui-textMuted">
-                                        {completedTasks} of {totalTasks} tasks complete
-                                        {inProgressTask && <> · Now: <span className="text-hui-textMain font-medium">{inProgressTask.name}</span></>}
-                                    </p>
-                                </Link>
-                            )}
-
-                            {/* Latest update preview */}
-                            {visibility.showDailyLogs && latestLog && (
-                                <Link
-                                    href={`/portal/projects/${projectId}?tab=updates`}
-                                    className="hui-card p-5 hover:shadow-md hover:border-purple-300 transition"
-                                >
-                                    <div className="flex items-center justify-between mb-2">
-                                        <h3 className="font-semibold text-hui-textMain flex items-center gap-2">
-                                            <svg className="w-5 h-5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                            Latest Update
-                                        </h3>
-                                        <span className="text-xs text-hui-textMuted">{new Date(latestLog.date).toLocaleDateString()}</span>
-                                    </div>
-                                    <p className="text-sm text-hui-textMain line-clamp-2 mb-3">
-                                        {latestLog.workPerformed}
-                                    </p>
-                                    {latestLog.photos && latestLog.photos.length > 0 && (
-                                        <div className="flex gap-2">
-                                            {latestLog.photos.slice(0, 4).map((photo: any) => (
-                                                <div key={photo.id} className="w-12 h-12 rounded overflow-hidden border border-slate-200 shrink-0">
-                                                    <img src={photo.url} alt="" className="w-full h-full object-cover" />
-                                                </div>
-                                            ))}
-                                            {latestLog.photos.length > 4 && (
-                                                <div className="w-12 h-12 rounded bg-slate-50 border border-slate-200 flex items-center justify-center text-xs font-semibold text-slate-500">
-                                                    +{latestLog.photos.length - 4}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
-                                </Link>
-                            )}
-                        </div>
-
                         {/* Empty overview fallback — based on what would actually render */}
                         {pendingPayments.length === 0
                             && sentEstimatesAwaitingSignature.length === 0
                             && pendingChangeOrders.length === 0
-                            && !latestLog
-                            && !hasScheduleData
+                            && !trackerData
                             && (
                                 <div className="hui-card p-8 text-center">
                                     <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-3">
@@ -416,60 +347,17 @@ export default async function PortalProjectDetail(props: {
                 )}
 
                 {activeTab === "schedule" && (
-                    <div className="space-y-4">
-                        {totalTasks === 0 ? (
-                            <div className="bg-hui-background border border-hui-border rounded-lg p-6 text-center text-hui-textMuted text-sm">
-                                No schedule shared yet.
-                            </div>
-                        ) : (
-                            <>
-                                <div className="hui-card p-5">
-                                    <div className="flex items-center justify-between mb-2">
-                                        <h3 className="font-semibold text-hui-textMain">Overall Progress</h3>
-                                        <span className="text-sm font-semibold text-blue-600">{overallProgress}%</span>
-                                    </div>
-                                    <div className="w-full bg-slate-100 rounded-full h-3 mb-2">
-                                        <div className="bg-blue-500 h-3 rounded-full transition-all" style={{ width: `${overallProgress}%` }} />
-                                    </div>
-                                    <p className="text-sm text-hui-textMuted">
-                                        {completedTasks} of {totalTasks} tasks complete
-                                        {inProgressTask && (
-                                            <> · Now: <span className="text-hui-textMain font-medium">{inProgressTask.name}</span></>
-                                        )}
-                                    </p>
-                                </div>
-
-                                {upcomingTasks.length > 0 && (
-                                    <div className="hui-card p-5">
-                                        <h3 className="font-semibold text-hui-textMain mb-3">Upcoming Tasks</h3>
-                                        <ul className="divide-y divide-hui-border">
-                                            {upcomingTasks.map((task: any) => (
-                                                <li key={task.id} className="py-3 flex items-center justify-between gap-3">
-                                                    <div className="min-w-0">
-                                                        <p className="text-sm font-medium text-hui-textMain truncate">{task.name}</p>
-                                                        <p className="text-xs text-hui-textMuted">
-                                                            {new Date(task.startDate).toLocaleDateString()} – {new Date(task.endDate).toLocaleDateString()}
-                                                        </p>
-                                                    </div>
-                                                    <span className="text-xs px-2 py-1 rounded-full font-medium bg-slate-100 text-slate-600 shrink-0">
-                                                        {task.status || "Not Started"}
-                                                    </span>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                )}
-
-                                <Link
-                                    href={`/portal/projects/${projectId}/schedule`}
-                                    className="inline-flex items-center gap-1.5 text-sm font-semibold text-blue-600 hover:text-blue-700 transition"
-                                >
-                                    View full timeline
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-                                </Link>
-                            </>
-                        )}
-                    </div>
+                    trackerData ? (
+                        <PortalProjectTracker
+                            projectId={projectId}
+                            projectName={project.name}
+                            data={trackerData}
+                        />
+                    ) : (
+                        <div className="hui-card p-8 text-center text-sm text-hui-textMuted">
+                            No schedule shared yet.
+                        </div>
+                    )
                 )}
 
                 {activeTab === "invoices" && (
@@ -536,74 +424,10 @@ export default async function PortalProjectDetail(props: {
                 )}
 
                 {activeTab === "updates" && (
-                    <div className="space-y-4">
-                        {project.dailyLogs.map((log: any) => (
-                            <div key={log.id} className="hui-card p-5 border-l-4 border-l-purple-500">
-                                <div className="flex items-start justify-between mb-3 border-b border-slate-100 pb-3 flex-wrap gap-2">
-                                    <div>
-                                        <h3 className="font-bold text-hui-textMain text-base md:text-lg">
-                                            {new Date(log.date).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}
-                                        </h3>
-                                        <p className="text-xs text-hui-textMuted mt-1">
-                                            Logged by {log.createdBy.name || log.createdBy.email}
-                                        </p>
-                                    </div>
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                        {log.weather && (
-                                            <span className="inline-flex items-center gap-1 text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded-full border border-blue-100">
-                                                ☁️ {log.weather}
-                                            </span>
-                                        )}
-                                        {log.crewOnSite && (
-                                            <span className="inline-flex items-center gap-1 text-xs bg-green-50 text-green-700 px-2 py-1 rounded-full border border-green-100">
-                                                👥 Crew on Site
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <div>
-                                        <p className="text-xs font-bold text-hui-textMuted uppercase tracking-wider mb-1">Work Performed</p>
-                                        <div className="text-sm text-hui-textMain bg-slate-50 p-3 rounded-lg border border-slate-100 whitespace-pre-wrap leading-relaxed">
-                                            {log.workPerformed}
-                                        </div>
-                                    </div>
-
-                                    {log.materialsDelivered && (
-                                        <div>
-                                            <p className="text-xs font-bold text-amber-600 uppercase tracking-wider mb-1">Materials Delivered</p>
-                                            <div className="text-sm text-hui-textMain bg-amber-50/50 p-3 rounded-lg border border-amber-100/50 whitespace-pre-wrap">
-                                                {log.materialsDelivered}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {log.issues && (
-                                        <div>
-                                            <p className="text-xs font-bold text-red-600 uppercase tracking-wider mb-1">⚠️ Issues / Delays</p>
-                                            <div className="text-sm text-hui-textMain bg-red-50/50 p-3 rounded-lg border border-red-100/50 whitespace-pre-wrap">
-                                                {log.issues}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {log.photos && log.photos.length > 0 && (
-                                        <div>
-                                            <p className="text-xs font-bold text-hui-textMuted uppercase tracking-wider mb-2">Photos</p>
-                                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                                                {log.photos.map((photo: any) => (
-                                                    <div key={photo.id} className="relative aspect-square rounded-lg overflow-hidden border border-slate-200">
-                                                        <img src={photo.url} alt="Daily Log Image" className="w-full h-full object-cover" />
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        ))}
-                    </div>
+                    <PortalUpdatesFeed
+                        updates={updatesFeed}
+                        projectColor={trackerData?.projectColor ?? project.color ?? "#4c9a2a"}
+                    />
                 )}
 
                 {activeTab === "files" && (
