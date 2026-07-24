@@ -16,6 +16,9 @@ type TaskCreationDialogProps = {
     lockProject?: boolean;
     defaultStartDate?: string;
     defaultCrewIds?: string[];
+    defaultName?: string;
+    defaultEstimatedHours?: number | null;
+    estimateItemId?: string;
     projects: { id: string; name: string; color: string }[];
 };
 
@@ -28,6 +31,9 @@ export default function TaskCreationDialog({
     lockProject = false,
     defaultStartDate,
     defaultCrewIds,
+    defaultName,
+    defaultEstimatedHours,
+    estimateItemId,
     projects,
 }: TaskCreationDialogProps) {
     const router = useRouter();
@@ -58,7 +64,7 @@ export default function TaskCreationDialog({
         if (initializedOpenRef.current) return;
         initializedOpenRef.current = true;
         const initialStart = defaultStartDate ?? formatDate(todayUTC());
-        setName("");
+        setName(defaultName ?? "");
         setProjectId(defaultProjectId && projects.some(project => project.id === defaultProjectId) ? defaultProjectId : (projects[0]?.id ?? ""));
         setType("task");
         setStartDate(initialStart);
@@ -68,9 +74,9 @@ export default function TaskCreationDialog({
         setCrewIds([...new Set(defaultCrewValues)]);
         setLeadUserId(null);
         setDoneWhen("");
-        setEstimatedHours("");
+        setEstimatedHours(defaultEstimatedHours == null ? "" : String(defaultEstimatedHours));
         setNote("");
-    }, [open, defaultProjectId, defaultStartDate, defaultCrewValues, projects]);
+    }, [open, defaultProjectId, defaultStartDate, defaultCrewValues, defaultName, defaultEstimatedHours, projects]);
 
     useEffect(() => {
         if (!open || projectId || !projects[0]) return;
@@ -119,6 +125,7 @@ export default function TaskCreationDialog({
                     endDate: type === "milestone" ? startDate : endDate,
                     color: selectedProject?.color,
                     type,
+                    estimateItemId: estimateItemId ?? null,
                     crewIds,
                     leadUserId,
                     estimatedHours: hours,
@@ -166,6 +173,7 @@ export default function TaskCreationDialog({
                         <div>
                             <label className="text-xs font-semibold uppercase tracking-wider text-hui-textMuted" htmlFor="create-task-name">Name</label>
                             <input id="create-task-name" value={name} onChange={event => setName(event.target.value)} className="hui-input mt-1.5 w-full text-sm" placeholder="e.g. Electrical rough-in walkthrough" autoFocus />
+                            {estimateItemId && <p className="mt-1.5 text-xs text-hui-textMuted">Linked to this contract estimate item.</p>}
                         </div>
 
                         <div className="grid gap-4 sm:grid-cols-2">

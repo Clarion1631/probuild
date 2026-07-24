@@ -6,7 +6,8 @@ export type DragVisualKind =
     | "task-resize-right"
     | "project-move"
     | "project-marker-move"
-    | "project-end-resize";
+    | "project-end-resize"
+    | "crew-chip";
 
 export interface DragVisualLayerOptions {
     sourceElement: HTMLElement;
@@ -92,6 +93,10 @@ export function projectDragSourceSelector(projectId: string): string {
 
 export function projectMarkerDragSourceSelector(projectId: string): string {
     return `${projectDragSourceSelector(projectId)} [data-drag-project-title="true"]`;
+}
+
+export function crewChipDragSourceSelector(userId: string): string {
+    return `[data-dispatch-crew-chip][data-dispatch-user-id="${escapeAttributeValue(userId)}"]`;
 }
 
 function stripCloneInteractivity(root: HTMLElement) {

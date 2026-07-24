@@ -33,6 +33,7 @@ import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinato
 type BoardTaskDrawerProps = {
     taskId: string | null;
     hasDraft: boolean;
+    hasCrewDraft: boolean;
     teamMembers: TeamMember[];
     onClose: () => void;
     onSelectTask: (taskId: string) => void;
@@ -43,7 +44,7 @@ function messageFromError(error: unknown, fallback: string) {
     return error instanceof Error && error.message ? error.message : fallback;
 }
 
-export function BoardTaskDrawer({ taskId, hasDraft, teamMembers, onClose, onSelectTask, onDeleted }: BoardTaskDrawerProps) {
+export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, onClose, onSelectTask, onDeleted }: BoardTaskDrawerProps) {
     const router = useRouter();
     const drawerRef = useRef<HTMLElement | null>(null);
     const requestRef = useRef(0);
@@ -226,6 +227,8 @@ export function BoardTaskDrawer({ taskId, hasDraft, teamMembers, onClose, onSele
                         onAppointmentChange={(id, data) => { void mutate(() => updateScheduleTask(id, data), "Could not update appointment"); }}
                         datesReadOnly={hasDraft}
                         dateReadOnlyNote="This task has unsaved changes on the board — Save or Discard them first."
+                        crewReadOnly={hasCrewDraft}
+                        crewReadOnlyNote="Crew changes are drafted for dispatch — Review or Discard them first."
                         embedded
                     />
                 ) : (

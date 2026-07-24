@@ -2,7 +2,8 @@
 //
 // This script intentionally exercises the session-free transaction core rather
 // than the authenticated Server Action wrapper. It creates isolated fixtures,
-// verifies all 15 design-review cases, and removes every row it creates.
+// verifies all B1 design-review cases plus B2 crew-draft publication cases,
+// and removes every row it creates.
 //
 // Run only after scripts/apply-dispatch-b1-schema.mjs has been applied by the
 // release orchestrator and the Prisma client has been regenerated:
@@ -533,6 +534,121 @@ async function main() {
         );
         assert.deepEqual(await assignmentsForTask(fixture.taskA.id), [{ userId: fixture.crewA.id, role: "lead" }]);
         assert.equal(await prisma.dispatchPublication.count({ where: { clientRequestId: id } }), 0);
+    });
+
+    // 16. One crew draft can atomically add and remove people on one task.
+    await withFixture("16-crew-add-remove", async fixture => {
+        const intent = await taskCrewIntent(fixture.taskA.id, [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
+        const result = await publish(fixture, "crew-add-remove", [intent]);
+        assert.equal(result.ok, true);
+        assert.ok(result.publicationId);
+        assert.deepEqual(await assignmentsForTask(fixture.taskA.id), [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
+
+        const change = await prisma.dispatchPublicationChange.findFirstOrThrow({
+            where: {
+                publicationId: result.publicationId!,
+                targetId: fixture.taskA.id,
+                kind: "TASK_CREW",
+            },
+        });
+        assert.deepEqual(change.before, {
+            assignments: [{ userId: fixture.crewA.id, role: "lead" }],
+        });
+        assert.deepEqual(change.after, {
+            assignments: [{ userId: fixture.crewB.id, role: "assigned" }],
+        });
+        assert.match(change.summary, new RegExp(`${fixture.crewB.name} \u2192 ${fixture.taskA.name} \\(add\\)`));
+        assert.match(change.summary, new RegExp(`${fixture.crewA.name} removed from ${fixture.taskA.name}`));
+
+        const deliveries = await prisma.chatDelivery.findMany({
+            where: { publicationId: result.publicationId! },
+            orderBy: { destination: "asc" },
+            select: { destination: true },
+        });
+        assert.deepEqual(
+            new Set(deliveries.map(row => row.destination)),
+            new Set([`user:${fixture.crewA.id}`, `user:${fixture.crewB.id}`]),
+        );
+        assert.deepEqual(result.reconciliation.assignments[fixture.taskA.id], [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
+    });
+
+    // 17. A stale crew snapshot rolls back a separate valid date change too.
+    await withFixture("17-crew-stale-rolls-back-date", async fixture => {
+        const id = requestId("crew-stale-rolls-back-date");
+        const beforeTaskB = await prisma.scheduleTask.findUniqueOrThrow({
+            where: { id: fixture.taskB.id },
+        });
+        const dateIntent = await taskDatesIntent(fixture.taskB.id, dayKey(7), dayKey(9));
+        const crewIntent = await taskCrewIntent(fixture.taskA.id, [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
+        await setTaskCrew({
+            taskId: fixture.taskA.id,
+            userIds: [fixture.crewA.id, fixture.crewB.id],
+            actor: { type: "TEAM", name: "Concurrent crew editor" },
+        });
+
+        const failure = expectFailure(
+            await publish(fixture, "crew-stale-rolls-back-date", [dateIntent, crewIntent], { clientRequestId: id }),
+            "STALE_DISPATCH",
+        );
+        assert.ok(failure.conflicts.some(conflict =>
+            conflict.targetId === fixture.taskA.id && conflict.reason === "ASSIGNMENTS_CHANGED",
+        ));
+
+        const afterTaskB = await prisma.scheduleTask.findUniqueOrThrow({
+            where: { id: fixture.taskB.id },
+        });
+        assert.equal(afterTaskB.startDate.getTime(), beforeTaskB.startDate.getTime());
+        assert.equal(afterTaskB.endDate.getTime(), beforeTaskB.endDate.getTime());
+        const concurrentAssignments = await assignmentsForTask(fixture.taskA.id);
+        assert.deepEqual(
+            new Set(concurrentAssignments.map(assignment => assignment.userId)),
+            new Set([fixture.crewA.id, fixture.crewB.id]),
+        );
+        const concurrentRoles = new Map(concurrentAssignments.map(assignment => [
+            assignment.userId,
+            assignment.role,
+        ]));
+        assert.equal(concurrentRoles.get(fixture.crewA.id), "lead");
+        assert.equal(concurrentRoles.get(fixture.crewB.id), "assigned");
+        assert.equal(await prisma.dispatchPublication.count({ where: { clientRequestId: id } }), 0);
+    });
+
+    // 18. Replaying an old crew intent resolves by request ID before staleness.
+    await withFixture("18-crew-idempotent-replay", async fixture => {
+        const id = requestId("crew-idempotent-replay");
+        const intent = await taskCrewIntent(fixture.taskA.id, [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
+        const first = await publish(fixture, "crew-idempotent-replay", [intent], { clientRequestId: id });
+        assert.equal(first.ok, true);
+        assert.ok(first.publicationId);
+        const before = await prisma.dispatchPublication.findUniqueOrThrow({
+            where: { clientRequestId: id },
+            include: { changes: true, deliveries: true },
+        });
+
+        const replay = await publish(fixture, "crew-idempotent-replay", [intent], { clientRequestId: id });
+        assert.equal(replay.ok, true);
+        assert.equal(replay.publicationId, first.publicationId);
+        assert.equal(replay.replayed, true);
+        assert.equal(await prisma.dispatchPublication.count({ where: { clientRequestId: id } }), 1);
+        const after = await prisma.dispatchPublication.findUniqueOrThrow({
+            where: { clientRequestId: id },
+            include: { changes: true, deliveries: true },
+        });
+        assert.equal(after.changes.length, before.changes.length);
+        assert.equal(after.deliveries.length, before.deliveries.length);
+        assert.deepEqual(await assignmentsForTask(fixture.taskA.id), [
+            { userId: fixture.crewB.id, role: "assigned" },
+        ]);
     });
 
     console.log("dispatch publication verification: PASS");

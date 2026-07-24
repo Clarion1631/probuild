@@ -17,7 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
-import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, CONTRACT_ESTIMATE_STATUSES, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
@@ -6531,6 +6531,68 @@ export async function getScheduleTasks(projectId: string) {
     });
 }
 
+export interface TaskBankResult {
+    estimate: { id: string; code: string } | null;
+    items: {
+        estimateItemId: string;
+        name: string;
+        estimatedHours: number | null;
+    }[];
+    scheduledCount: number;
+    totalCount: number;
+}
+
+export async function getTaskBank(projectId: string): Promise<TaskBankResult> {
+    const session = await getSessionOrDev();
+    if (!session?.user) throw new Error("Unauthorized");
+
+    const estimate = await prisma.estimate.findFirst({
+        ...canonicalContractEstimateQuery(projectId),
+        select: {
+            id: true,
+            code: true,
+            items: {
+                where: { type: { not: "Section" } },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
+                select: {
+                    id: true,
+                    name: true,
+                    quantity: true,
+                    budgetUnit: true,
+                    _count: { select: { subItems: true } },
+                    scheduleTask: { select: { id: true } },
+                },
+            },
+        },
+    });
+    if (!estimate) {
+        return {
+            estimate: null,
+            items: [],
+            scheduledCount: 0,
+            totalCount: 0,
+        };
+    }
+
+    const scheduledCount = estimate.items.filter(item => Boolean(item.scheduleTask)).length;
+    return {
+        estimate: { id: estimate.id, code: estimate.code },
+        items: estimate.items
+            .filter(item => !item.scheduleTask)
+            .map(item => ({
+                estimateItemId: item.id,
+                name: item.name,
+                estimatedHours: deriveEstimateItemHours({
+                    quantity: item.quantity,
+                    budgetUnit: item.budgetUnit,
+                    childCount: item._count.subItems,
+                }),
+            })),
+        scheduledCount,
+        totalCount: estimate.items.length,
+    };
+}
+
 function serializeScheduleTaskForDetail(task: any) {
     return {
         id: task.id,
@@ -6784,6 +6846,7 @@ export async function createScheduleTask(projectId: string, data: {
     assignee?: string;
     parentId?: string;
     type?: ScheduleTaskType;
+    estimateItemId?: string | null;
     crewIds?: string[];
     leadUserId?: string | null;
     estimatedHours?: number | null;
@@ -6812,6 +6875,7 @@ export async function createScheduleTask(projectId: string, data: {
         throw new Error("Scheduled time and confirmation status are appointment-only fields");
     }
     const confirmationStatus = type === "appointment" ? (data.confirmationStatus ?? "planned") : null;
+    const estimateItemId = data.estimateItemId?.trim() || null;
     const crewIds = [...new Set((data.crewIds ?? []).filter(Boolean))];
     const leadUserId = data.leadUserId ?? null;
     if (leadUserId && !crewIds.includes(leadUserId)) throw new Error("Task lead must be assigned to the crew");
@@ -6819,6 +6883,31 @@ export async function createScheduleTask(projectId: string, data: {
     const commentAuthor = note ? await resolveTaskCommentAuthor() : null;
     const task = await withTxRetry(() => prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const estimateItem = estimateItemId
+            ? await tx.estimateItem.findUnique({
+                where: { id: estimateItemId },
+                select: {
+                    id: true,
+                    type: true,
+                    quantity: true,
+                    budgetUnit: true,
+                    estimate: { select: { projectId: true } },
+                    scheduleTask: { select: { id: true, name: true } },
+                    _count: { select: { subItems: true } },
+                },
+            })
+            : null;
+        if (estimateItemId) {
+            if (!estimateItem || estimateItem.estimate.projectId !== projectId) {
+                throw new Error("Estimate item does not belong to this project");
+            }
+            if (estimateItem.type === "Section") {
+                throw new Error("Estimate sections cannot be scheduled as tasks");
+            }
+            if (estimateItem.scheduleTask) {
+                throw new Error(`Already linked to "${estimateItem.scheduleTask.name}"`);
+            }
+        }
         const maxOrder = await tx.scheduleTask.aggregate({
             where: { projectId },
             _max: { order: true },
@@ -6841,7 +6930,14 @@ export async function createScheduleTask(projectId: string, data: {
             parentId: data.parentId || null,
             order: (maxOrder._max.order ?? -1) + 1,
             type,
-            estimatedHours: data.estimatedHours ?? null,
+            estimateItemId,
+            estimatedHours: data.estimatedHours ?? (estimateItem
+                ? deriveEstimateItemHours({
+                    quantity: estimateItem.quantity,
+                    budgetUnit: estimateItem.budgetUnit,
+                    childCount: estimateItem._count.subItems,
+                })
+                : null),
             doneWhen: data.doneWhen?.trim() || null,
             scheduledTime,
             confirmationStatus,
@@ -6871,6 +6967,7 @@ export async function createScheduleTask(projectId: string, data: {
                     color: createData.color,
                     status: createData.status,
                     type,
+                    estimateItemId,
                     crewIds,
                     leadUserId,
                     estimatedHours: createData.estimatedHours,
@@ -7769,8 +7866,7 @@ export async function generateProjectScheduleAction(projectId: string) {
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
 
     const estimate = await prisma.estimate.findFirst({
-        where: { projectId, status: { in: CONTRACT_ESTIMATE_STATUSES } },
-        orderBy: { createdAt: "desc" },
+        ...canonicalContractEstimateQuery(projectId),
         select: { id: true },
     });
     if (!estimate) throw new Error("No Approved, Invoiced, Partially Paid, or Paid estimate on this project yet — approve an estimate first.");

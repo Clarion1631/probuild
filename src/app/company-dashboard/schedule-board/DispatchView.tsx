@@ -1,13 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getFallbackProjectColor, getMonday, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { isConflictedDay } from "./availability";
 import { getCrewlessJobs, isTaskActiveOnDay } from "./dispatch-exceptions";
 import { DispatchExceptions } from "./DispatchExceptions";
+import { DispatchCrewTaskChooser, type DispatchCrewTaskChoice } from "./DispatchCrewTaskChooser";
 import { DispatchJobCard } from "./DispatchJobCard";
+import { DispatchTaskBank, type DispatchTaskBankItem } from "./DispatchTaskBank";
+import { createDragVisualLayer, crewChipDragSourceSelector, type DragVisualLayer } from "./dragVisualLayer";
 
 export type DispatchMode = "today" | "week";
 export const DISPATCH_MODE_STORAGE_KEY = "gtr-company-schedule-dispatch-mode";
@@ -17,6 +21,9 @@ export interface DispatchTaskCreationDefaults {
     lockProject?: boolean;
     defaultStartDate: string;
     defaultCrewIds?: string[];
+    defaultName?: string;
+    defaultEstimatedHours?: number | null;
+    estimateItemId?: string;
 }
 
 interface DispatchViewProps {
@@ -27,6 +34,9 @@ interface DispatchViewProps {
     onReviewDispatch: () => void;
     draftCount: number;
     isReviewingDispatch: boolean;
+    crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
+    onDraftCrewAdd: (taskId: string, userId: string) => boolean;
+    onDraftCrewRemove: (taskId: string, userId: string) => void;
 }
 
 interface WeekChip {
@@ -35,6 +45,20 @@ interface WeekChip {
     solid: boolean;
     lead: boolean;
 }
+
+interface CrewIdentity {
+    id: string;
+    name: string;
+}
+
+interface CrewChooserState {
+    crew: CrewIdentity;
+    choices: DispatchCrewTaskChoice[];
+    anchorPoint: { x: number; y: number } | null;
+}
+
+const CREW_MOUSE_DRAG_THRESHOLD_PX = 5;
+const CREW_TOUCH_DRAG_THRESHOLD_PX = 8;
 
 function initials(name: string): string {
     return name.split(/\s+/).filter(Boolean).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
@@ -64,6 +88,18 @@ function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, d
     return chips;
 }
 
+function taskChoicesForDay(projects: DashboardProjectRow[], dayKey: string): DispatchCrewTaskChoice[] {
+    return projects.flatMap(project => project.tasks
+        .filter(task => isTaskActiveOnDay(task, dayKey))
+        .map(task => ({
+            projectId: project.id,
+            projectName: project.name,
+            taskId: task.id,
+            taskName: task.name,
+            dayLabel: dayKey,
+        })));
+}
+
 export function DispatchView({
     data,
     weather,
@@ -72,11 +108,24 @@ export function DispatchView({
     onReviewDispatch,
     draftCount,
     isReviewingDispatch,
+    crewDrafts,
+    onDraftCrewAdd,
+    onDraftCrewRemove,
 }: DispatchViewProps) {
     const [mode, setMode] = useState<DispatchMode>("today");
     const currentMonday = useMemo(() => getMonday(todayUTC()), []);
     const [weekStart, setWeekStart] = useState(currentMonday);
     const [highlightedProjectId, setHighlightedProjectId] = useState<string | null>(null);
+    const [taskBankProjectId, setTaskBankProjectId] = useState(
+        () => data.pipeline.inProgress[0]?.id
+            ?? data.pipeline.scheduled[0]?.id
+            ?? data.pipeline.waitingToStart[0]?.id
+            ?? data.pipeline.substantialCompletion[0]?.id
+            ?? "",
+    );
+    const [crewChooser, setCrewChooser] = useState<CrewChooserState | null>(null);
+    const crewChooserAnchorRef = useRef<HTMLElement | null>(null);
+    const activeCrewDragCleanupRef = useRef<(() => void) | null>(null);
 
     useEffect(() => {
         let restoreFrame: number | null = null;
@@ -108,6 +157,9 @@ export function DispatchView({
         ...data.pipeline.inProgress,
         ...data.pipeline.substantialCompletion,
     ], [data.pipeline]);
+
+    useEffect(() => () => activeCrewDragCleanupRef.current?.(), []);
+
     const today = todayUTC();
     const todayKey = formatDate(today);
     const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
@@ -135,6 +187,10 @@ export function DispatchView({
     const showSaturday = projects.some(project => project.tasks.some(task => isTaskActiveOnDay(task, formatDate(saturday))));
     const showSunday = projects.some(project => project.tasks.some(task => isTaskActiveOnDay(task, formatDate(sunday))));
     const visibleWeekDays = [...mondayToFriday, ...(showSaturday ? [saturday] : []), ...(showSunday ? [sunday] : [])];
+    const selectedTaskBankProjectId = projects.some(project => project.id === taskBankProjectId)
+        ? taskBankProjectId
+        : data.pipeline.inProgress[0]?.id ?? projects[0]?.id ?? "";
+    const taskBankRefreshKey = projects.reduce((sum, project) => sum + project.tasks.length, 0);
     const crewConflicts = data.crewConflicts;
     const headerForecast = mode === "today"
         ? weatherByDate.get(todayKey)
@@ -157,6 +213,151 @@ export function DispatchView({
     function focusProject(projectId: string) {
         selectMode("today");
         setHighlightedProjectId(projectId);
+    }
+
+    function openCrewChooser(
+        crew: CrewIdentity,
+        choices: DispatchCrewTaskChoice[],
+        anchorElement: HTMLElement | null,
+        anchorPoint: { x: number; y: number } | null,
+    ) {
+        crewChooserAnchorRef.current = anchorElement;
+        setCrewChooser({ crew, choices, anchorPoint });
+    }
+
+    function closeCrewChooser() {
+        setCrewChooser(null);
+        crewChooserAnchorRef.current = null;
+    }
+
+    function applyCrewChoice(taskId: string) {
+        if (!crewChooser) return;
+        const added = onDraftCrewAdd(taskId, crewChooser.crew.id);
+        if (added) closeCrewChooser();
+    }
+
+    function resolveCrewDrop(crew: CrewIdentity, clientX: number, clientY: number) {
+        const elements = document.elementsFromPoint(clientX, clientY);
+        const taskTarget = elements
+            .map(element => element instanceof HTMLElement ? element.closest<HTMLElement>("[data-dispatch-task-id]") : null)
+            .find((element): element is HTMLElement => Boolean(element));
+        const directTaskId = taskTarget?.dataset.dispatchTaskId;
+        if (directTaskId) {
+            onDraftCrewAdd(directTaskId, crew.id);
+            return;
+        }
+
+        const weekCell = elements
+            .map(element => element instanceof HTMLElement ? element.closest<HTMLElement>("[data-dispatch-week-cell]") : null)
+            .find((element): element is HTMLElement => Boolean(element));
+        if (!weekCell) {
+            toast.info("Drop crew onto a task or a Week day cell.");
+            return;
+        }
+        if (weekCell.dataset.dispatchMemberId !== crew.id) {
+            toast.info(`Drop ${crew.name} on ${crew.name}'s own Week row.`);
+            return;
+        }
+        const dayKey = weekCell.dataset.dispatchDay;
+        if (!dayKey) return;
+        const choices = taskChoicesForDay(projects, dayKey);
+        if (choices.length === 1) {
+            onDraftCrewAdd(choices[0].taskId, crew.id);
+        } else {
+            openCrewChooser(crew, choices, null, { x: clientX, y: clientY });
+        }
+    }
+
+    function handleCrewPointerDragStart(event: ReactPointerEvent<HTMLElement>, crew: CrewIdentity) {
+        if (!data.canEdit || event.button !== 0) return;
+        activeCrewDragCleanupRef.current?.();
+        const sourceElement = event.currentTarget;
+        const pointerId = event.pointerId;
+        const startClientX = event.clientX;
+        const startClientY = event.clientY;
+        const threshold = event.pointerType === "touch" ? CREW_TOUCH_DRAG_THRESHOLD_PX : CREW_MOUSE_DRAG_THRESHOLD_PX;
+        let dragVisual: DragVisualLayer | null = null;
+        let lastClientX = startClientX;
+        let lastClientY = startClientY;
+        let cleaned = false;
+
+        sourceElement.setPointerCapture?.(pointerId);
+
+        function cleanup() {
+            if (cleaned) return;
+            cleaned = true;
+            dragVisual?.cleanup();
+            if (sourceElement.hasPointerCapture?.(pointerId)) sourceElement.releasePointerCapture(pointerId);
+            window.removeEventListener("pointermove", onWindowPointerMove);
+            window.removeEventListener("pointerup", onWindowPointerUp);
+            window.removeEventListener("pointercancel", onWindowPointerCancel);
+            window.removeEventListener("keydown", onWindowKeyDown);
+            if (activeCrewDragCleanupRef.current === cleanup) activeCrewDragCleanupRef.current = null;
+        }
+
+        function onWindowPointerMove(moveEvent: PointerEvent) {
+            if (moveEvent.pointerId !== pointerId) return;
+            lastClientX = moveEvent.clientX;
+            lastClientY = moveEvent.clientY;
+            if (!dragVisual && Math.hypot(lastClientX - startClientX, lastClientY - startClientY) >= threshold) {
+                dragVisual = createDragVisualLayer({
+                    sourceElement,
+                    sourceSelector: crewChipDragSourceSelector(crew.id),
+                    kind: "crew-chip",
+                    startClientX,
+                    startClientY,
+                });
+            }
+            if (!dragVisual) return;
+            moveEvent.preventDefault();
+            dragVisual.update({ clientX: lastClientX, clientY: lastClientY, label: crew.name });
+        }
+
+        function onWindowPointerUp(upEvent: PointerEvent) {
+            if (upEvent.pointerId !== pointerId) return;
+            const didDrag = Boolean(dragVisual);
+            lastClientX = upEvent.clientX;
+            lastClientY = upEvent.clientY;
+            if (didDrag) upEvent.preventDefault();
+            cleanup();
+            if (didDrag) resolveCrewDrop(crew, lastClientX, lastClientY);
+        }
+
+        function onWindowPointerCancel(cancelEvent: PointerEvent) {
+            if (cancelEvent.pointerId === pointerId) cleanup();
+        }
+
+        function onWindowKeyDown(keyEvent: KeyboardEvent) {
+            if (keyEvent.key !== "Escape") return;
+            keyEvent.preventDefault();
+            cleanup();
+        }
+
+        window.addEventListener("pointermove", onWindowPointerMove, { passive: false });
+        window.addEventListener("pointerup", onWindowPointerUp);
+        window.addEventListener("pointercancel", onWindowPointerCancel);
+        window.addEventListener("keydown", onWindowKeyDown);
+        activeCrewDragCleanupRef.current = cleanup;
+    }
+
+    function handleCrewKeyboardActivate(event: ReactKeyboardEvent<HTMLElement>, crew: CrewIdentity) {
+        if (!data.canEdit || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        const choices = mode === "today"
+            ? taskChoicesForDay(projects, todayKey)
+            : visibleWeekDays.flatMap(day => taskChoicesForDay(projects, formatDate(day)));
+        openCrewChooser(crew, choices, event.currentTarget, null);
+    }
+
+    function scheduleTaskBankItem(item: DispatchTaskBankItem) {
+        onCreateTask({
+            defaultProjectId: selectedTaskBankProjectId,
+            lockProject: true,
+            defaultStartDate: todayKey,
+            defaultName: item.name,
+            defaultEstimatedHours: item.estimatedHours,
+            estimateItemId: item.estimateItemId,
+        });
     }
 
     return (
@@ -208,16 +409,27 @@ export function DispatchView({
                 </div>
             </div>
 
+            <div className="min-w-0 xl:flex">
+            <div className="min-w-0 flex-1">
             {mode === "today" ? (
                 <div className="space-y-4 p-4">
                     <div className="rounded-lg border border-hui-border bg-slate-50 px-3 py-2.5">
                         <div className="flex flex-wrap items-center gap-2">
                             <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Available</span>
                             {available.length === 0 ? <span className="text-xs text-slate-400">No unassigned field crew</span> : available.map(member => (
-                                <span key={member.id} className="inline-flex items-center gap-1.5 rounded-full border border-green-200 bg-white px-2 py-1 text-xs font-semibold text-green-700" title={`${member.name} has no task assignment today`}>
+                                <button
+                                    key={member.id}
+                                    type="button"
+                                    data-dispatch-crew-chip="true"
+                                    data-dispatch-user-id={member.id}
+                                    onPointerDown={event => handleCrewPointerDragStart(event, member)}
+                                    onKeyDown={event => handleCrewKeyboardActivate(event, member)}
+                                    className="inline-flex touch-none items-center gap-1.5 rounded-full border border-green-200 bg-white px-2 py-1 text-xs font-semibold text-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                    title={`${member.name} has no task assignment today. Drag onto a task or press Enter.`}
+                                >
                                     <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-green-100 text-[9px] font-bold">{initials(member.name)}</span>
                                     {member.name}
-                                </span>
+                                </button>
                             ))}
                         </div>
                         {managerSupport.length > 0 && (
@@ -242,7 +454,11 @@ export function DispatchView({
                                     tasks={activeTodayByProject.get(project.id) ?? []}
                                     highlighted={highlightedProjectId === project.id}
                                     canCreate={data.canEdit}
+                                    crewDrafts={crewDrafts}
                                     onActivate={onActivate}
+                                    onCrewPointerDown={handleCrewPointerDragStart}
+                                    onCrewKeyboardActivate={handleCrewKeyboardActivate}
+                                    onDraftCrewRemove={onDraftCrewRemove}
                                     onAddTask={() => onCreateTask({
                                         defaultProjectId: project.id,
                                         lockProject: true,
@@ -293,13 +509,32 @@ export function DispatchView({
                                 const weekdayAssignedCount = mondayToFriday.filter(day => weekChipsForMember(projects, member.id, formatDate(day)).some(chip => chip.solid)).length;
                                 return (
                                     <div key={member.id} className="grid" role="row" style={{ gridTemplateColumns: `180px repeat(${visibleWeekDays.length}, minmax(140px, 1fr)) 110px` }}>
-                                        <div role="rowheader" className="border-b border-r border-hui-border bg-white px-3 py-3 text-xs font-semibold text-hui-textMain">{member.name}</div>
+                                        <div role="rowheader" className="border-b border-r border-hui-border bg-white px-3 py-3 text-xs font-semibold text-hui-textMain">
+                                            <button
+                                                type="button"
+                                                data-dispatch-crew-chip="true"
+                                                data-dispatch-user-id={member.id}
+                                                onPointerDown={event => handleCrewPointerDragStart(event, member)}
+                                                onKeyDown={event => handleCrewKeyboardActivate(event, member)}
+                                                className="touch-none rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                                title={`Drag ${member.name} to a Week day, or press Enter to choose a task`}
+                                            >
+                                                {member.name}
+                                            </button>
+                                        </div>
                                         {visibleWeekDays.map(day => {
                                             const dayKey = formatDate(day);
                                             const chips = weekChipsForMember(projects, member.id, dayKey);
                                             const conflicted = isConflictedDay(crewConflicts, member.id, dayKey, true);
                                             return (
-                                                <div key={`${member.id}-${dayKey}`} role="cell" className="min-h-16 border-b border-r border-hui-border bg-white p-1.5">
+                                                <div
+                                                    key={`${member.id}-${dayKey}`}
+                                                    role="cell"
+                                                    data-dispatch-week-cell="true"
+                                                    data-dispatch-member-id={member.id}
+                                                    data-dispatch-day={dayKey}
+                                                    className="min-h-16 border-b border-r border-hui-border bg-white p-1.5"
+                                                >
                                                     <div className={`flex min-h-12 flex-col gap-1 rounded ${conflicted ? "ring-2 ring-red-500 ring-inset" : ""}`}>
                                                         {chips.map(chip => {
                                                             const color = chip.project.color || getFallbackProjectColor(chip.project.id);
@@ -307,6 +542,7 @@ export function DispatchView({
                                                                 <button
                                                                     key={`${chip.task.id}-${chip.solid ? "solid" : "soft"}`}
                                                                     type="button"
+                                                                    data-dispatch-task-id={chip.task.id}
                                                                     onClick={() => onActivate(chip.task.id)}
                                                                     title={`${chip.project.name} \u2014 ${taskLabel(chip.task)}`}
                                                                     className={`block truncate rounded px-1.5 py-1 text-left text-[11px] font-semibold leading-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${chip.solid ? "text-white" : "border-2 bg-white"}`}
@@ -338,6 +574,25 @@ export function DispatchView({
                     </div>
                 </div>
             )}
+            </div>
+            <DispatchTaskBank
+                projects={projects.map(project => ({ id: project.id, name: project.name, taskCount: project.taskCount }))}
+                selectedProjectId={selectedTaskBankProjectId}
+                refreshKey={taskBankRefreshKey}
+                canSchedule={data.canEdit}
+                onProjectChange={setTaskBankProjectId}
+                onSchedule={scheduleTaskBankItem}
+            />
+            </div>
+            <DispatchCrewTaskChooser
+                open={Boolean(crewChooser)}
+                crewName={crewChooser?.crew.name ?? ""}
+                choices={crewChooser?.choices ?? []}
+                anchorPoint={crewChooser?.anchorPoint ?? null}
+                anchorRef={crewChooserAnchorRef}
+                onChoose={applyCrewChoice}
+                onClose={closeCrewChooser}
+            />
         </div>
     );
 }
