@@ -3,12 +3,15 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
+import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
     published: boolean;
     isPending: boolean;
     conflictTargetIds: ReadonlySet<string>;
+    taskNamesById: ReadonlyMap<string, string>;
+    memberNamesById: ReadonlyMap<string, string>;
     onConfirm: () => void;
     onClose: () => void;
 }
@@ -19,15 +22,71 @@ function changeLabel(kind: string): string {
     return "Dates";
 }
 
+function assignmentsFromChange(value: unknown): DispatchAssignment[] {
+    if (!Array.isArray(value)) return [];
+    return value.filter((row): row is DispatchAssignment =>
+        Boolean(row)
+        && typeof row === "object"
+        && "userId" in row
+        && "role" in row
+        && typeof row.userId === "string"
+        && (row.role === "assigned" || row.role === "lead"),
+    );
+}
+
+function crewChangeRows(
+    change: DispatchChange,
+    taskNamesById: ReadonlyMap<string, string>,
+    memberNamesById: ReadonlyMap<string, string>,
+): { key: string; summary: string }[] {
+    const before = assignmentsFromChange(change.before.assignments);
+    const after = assignmentsFromChange(change.after.assignments);
+    const beforeByUser = new Map(before.map(assignment => [assignment.userId, assignment]));
+    const afterByUser = new Map(after.map(assignment => [assignment.userId, assignment]));
+    const taskName = taskNamesById.get(change.targetId) ?? "task";
+    const rows: { key: string; summary: string }[] = [];
+    for (const assignment of after) {
+        const previous = beforeByUser.get(assignment.userId);
+        const memberName = memberNamesById.get(assignment.userId) ?? assignment.userId;
+        if (!previous) {
+            rows.push({
+                key: `add-${assignment.userId}`,
+                summary: `${memberName} \u2192 ${taskName} (add)`,
+            });
+        } else if (previous.role !== assignment.role) {
+            rows.push({
+                key: `role-${assignment.userId}`,
+                summary: `${memberName} on ${taskName}: ${previous.role} \u2192 ${assignment.role}`,
+            });
+        }
+    }
+    for (const assignment of before) {
+        if (afterByUser.has(assignment.userId)) continue;
+        const memberName = memberNamesById.get(assignment.userId) ?? assignment.userId;
+        rows.push({
+            key: `remove-${assignment.userId}`,
+            summary: `${memberName} removed from ${taskName}`,
+        });
+    }
+    return rows.length > 0 ? rows : [{ key: "crew", summary: change.summary }];
+}
+
 export function DispatchReviewDialog({
     result,
     published,
     isPending,
     conflictTargetIds,
+    taskNamesById,
+    memberNamesById,
     onConfirm,
     onClose,
 }: DispatchReviewDialogProps) {
-    const changeCount = result?.changes.length ?? 0;
+    const reviewRows = result?.changes.flatMap(change =>
+        change.kind === "TASK_CREW"
+            ? crewChangeRows(change, taskNamesById, memberNamesById).map(row => ({ ...row, change }))
+            : [{ key: "change", summary: change.summary, change }],
+    ) ?? [];
+    const changeCount = reviewRows.length;
     const deliveryCount = result?.deliveryCount ?? 0;
 
     return (
@@ -93,11 +152,11 @@ export function DispatchReviewDialog({
 
                                 <div className="min-h-0 flex-1 overflow-y-auto p-4">
                                     <div className="space-y-2" role="list" aria-label="Dispatch changes">
-                                        {result?.changes.map((change, index) => {
+                                        {reviewRows.map(({ change, key, summary }, index) => {
                                             const conflicted = conflictTargetIds.has(change.targetId);
                                             return (
                                                 <div
-                                                    key={`${change.kind}-${change.targetId}`}
+                                                    key={`${change.kind}-${change.targetId}-${key}`}
                                                     role="listitem"
                                                     className={`grid grid-cols-[auto_1fr] gap-3 rounded-lg border px-3 py-3 ${conflicted ? "border-amber-300 bg-amber-50" : "border-hui-border bg-white"}`}
                                                 >
@@ -105,7 +164,7 @@ export function DispatchReviewDialog({
                                                         {changeLabel(change.kind)}
                                                     </span>
                                                     <div className="min-w-0">
-                                                        <p className="text-sm font-medium leading-5 text-hui-textMain">{change.summary}</p>
+                                                        <p className="text-sm font-medium leading-5 text-hui-textMain">{summary}</p>
                                                         {conflicted && (
                                                             <p className="mt-1 text-xs font-medium text-amber-800">Changed since the previous review — check this line again.</p>
                                                         )}

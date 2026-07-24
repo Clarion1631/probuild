@@ -53,6 +53,8 @@ export type TaskDetailPanelProps = {
     onAppointmentChange: (taskId: string, data: { scheduledTime?: string | null; confirmationStatus?: "planned" | "requested" | "confirmed" | null }) => void;
     datesReadOnly?: boolean;
     dateReadOnlyNote?: string;
+    crewReadOnly?: boolean;
+    crewReadOnlyNote?: string;
     embedded?: boolean;
 };
 
@@ -65,7 +67,9 @@ export default function TaskDetailPanel({
     comments, onAddComment,
     showCriticalPath, criticalPathIds,
     allTasks, onLinkPredecessor, onUnlinkPredecessor, onSelectTask, onAppointmentChange,
-    datesReadOnly = false, dateReadOnlyNote, embedded = false,
+    datesReadOnly = false, dateReadOnlyNote,
+    crewReadOnly = false, crewReadOnlyNote,
+    embedded = false,
 }: TaskDetailPanelProps) {
     const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
@@ -552,11 +556,16 @@ export default function TaskDetailPanel({
                                 {hasTeam && <span className="text-xs text-slate-400 ml-1">({(task.assignments || []).length + (task.subAssignments || []).length})</span>}
                             </summary>
                             <div className="pb-4 pl-5.5">
+                                {crewReadOnly && crewReadOnlyNote && (
+                                    <p className="mb-3 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-medium text-indigo-800">
+                                        {crewReadOnlyNote}
+                                    </p>
+                                )}
                                 <div className="flex items-center justify-between mb-2">
                                     <label className={SECTION_LABEL}>Assigned</label>
                                     <div className="relative">
-                                        <button onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
-                                        {showAssignMenu && (
+                                        <button disabled={crewReadOnly} onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition disabled:cursor-not-allowed disabled:text-slate-300">+ Add</button>
+                                        {showAssignMenu && !crewReadOnly && (
                                             <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in max-h-60 overflow-y-auto">
                                                 <div className="px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider bg-slate-50">Team Members</div>
                                                 {teamMembers.filter(m => !(task.assignments || []).some(a => a.userId === m.id)).map(m => (
@@ -584,15 +593,16 @@ export default function TaskDetailPanel({
                                             <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.user.name || a.user.email}</span>
                                             <button
                                                 type="button"
+                                                disabled={crewReadOnly}
                                                 onClick={() => onSetLead(a.role === "lead" ? null : a.userId)}
                                                 aria-label={a.role === "lead" ? `Remove ${a.user.name || a.user.email} as lead` : `Set ${a.user.name || a.user.email} as lead`}
                                                 aria-pressed={a.role === "lead"}
                                                 title={a.role === "lead" ? "Task lead — click to remove" : "Make task lead"}
-                                                className={`shrink-0 rounded p-1 transition ${a.role === "lead" ? "text-amber-500 bg-amber-50" : "text-slate-300 hover:text-amber-500 hover:bg-amber-50"}`}
+                                                className={`shrink-0 rounded p-1 transition disabled:cursor-not-allowed disabled:opacity-40 ${a.role === "lead" ? "text-amber-500 bg-amber-50" : "text-slate-300 hover:text-amber-500 hover:bg-amber-50"}`}
                                             >
                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill={a.role === "lead" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8"><path d="m12 2.75 2.84 5.75 6.35.92-4.6 4.48 1.09 6.32L12 17.24l-5.68 2.98 1.09-6.32-4.6-4.48 6.35-.92L12 2.75Z" /></svg>
                                             </button>
-                                            <button onClick={() => onUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
+                                            <button disabled={crewReadOnly} onClick={() => onUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0 disabled:cursor-not-allowed disabled:opacity-40" aria-label={`Remove ${a.user.name || a.user.email} from task`}>
                                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                             </button>
                                         </div>

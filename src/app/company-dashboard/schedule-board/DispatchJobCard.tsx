@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import type { DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import { getFallbackProjectColor } from "@/app/projects/[id]/schedule/schedule-utils";
 
@@ -20,11 +21,26 @@ interface DispatchJobCardProps {
     tasks: DashboardTaskRow[];
     highlighted: boolean;
     canCreate: boolean;
+    crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
     onActivate: (taskId: string) => void;
     onAddTask: () => void;
+    onCrewPointerDown: (event: ReactPointerEvent<HTMLElement>, member: { id: string; name: string }) => void;
+    onCrewKeyboardActivate: (event: ReactKeyboardEvent<HTMLElement>, member: { id: string; name: string }) => void;
+    onDraftCrewRemove: (taskId: string, userId: string) => void;
 }
 
-export function DispatchJobCard({ project, tasks, highlighted, canCreate, onActivate, onAddTask }: DispatchJobCardProps) {
+export function DispatchJobCard({
+    project,
+    tasks,
+    highlighted,
+    canCreate,
+    crewDrafts,
+    onActivate,
+    onAddTask,
+    onCrewPointerDown,
+    onCrewKeyboardActivate,
+    onDraftCrewRemove,
+}: DispatchJobCardProps) {
     const projectColor = project.color || getFallbackProjectColor(project.id);
 
     return (
@@ -61,7 +77,7 @@ export function DispatchJobCard({ project, tasks, highlighted, canCreate, onActi
                         const statusTitle = task.status === "Blocked" && task.blockedReason ? `Blocked \u2014 ${task.blockedReason}` : task.status;
                         const progress = Math.max(0, Math.min(100, task.progress));
                         return (
-                            <section key={task.id} className="px-4 py-3">
+                            <section key={task.id} data-dispatch-task-id={task.id} className="px-4 py-3">
                                 <div className="flex flex-wrap items-start justify-between gap-2">
                                     <div className="min-w-0 flex-1">
                                         <div className="flex flex-wrap items-center gap-2">
@@ -81,25 +97,52 @@ export function DispatchJobCard({ project, tasks, highlighted, canCreate, onActi
                                         </div>
                                         {task.doneWhen && <p className="mt-2 text-xs text-hui-textMuted"><span className="font-semibold text-slate-600">Done when:</span> {task.doneWhen}</p>}
                                         <div className="mt-2 flex flex-wrap items-center gap-1.5" aria-label={`${task.name} crew`}>
-                                            {solidAssignments.map(assignment => (
-                                                <span
-                                                    key={assignment.id}
-                                                    className="inline-flex h-7 min-w-7 items-center justify-center rounded-full px-1.5 text-[10px] font-bold text-white shadow-sm"
-                                                    style={{ backgroundColor: projectColor }}
-                                                    title={`${assignment.name}${assignment.assignmentRole === "lead" ? " \u2014 lead" : " \u2014 task assigned"}`}
-                                                >
-                                                    {assignment.assignmentRole === "lead" && <span aria-hidden="true">{"\u2605"}</span>}{initials(assignment.name)}
-                                                </span>
-                                            ))}
+                                            {solidAssignments.map(assignment => {
+                                                const draftedAddition = crewDrafts[task.id]?.addUserIds.includes(assignment.userId) ?? false;
+                                                return (
+                                                    <span key={assignment.id} className="group relative inline-flex">
+                                                        <button
+                                                            type="button"
+                                                            data-dispatch-crew-chip="true"
+                                                            data-dispatch-user-id={assignment.userId}
+                                                            onPointerDown={event => onCrewPointerDown(event, { id: assignment.userId, name: assignment.name })}
+                                                            onKeyDown={event => onCrewKeyboardActivate(event, { id: assignment.userId, name: assignment.name })}
+                                                            className={`inline-flex h-7 min-w-7 touch-none items-center justify-center rounded-full px-1.5 text-[10px] font-bold text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary focus-visible:ring-offset-2 ${draftedAddition ? "border-2 border-dashed border-white ring-2 ring-indigo-400 ring-offset-1" : ""}`}
+                                                            style={{ backgroundColor: projectColor }}
+                                                            title={`${assignment.name}${assignment.assignmentRole === "lead" ? " \u2014 lead" : draftedAddition ? " \u2014 drafted assignment" : " \u2014 task assigned"}`}
+                                                            aria-label={`${assignment.name}. Press Enter to choose another task, or drag onto a task.`}
+                                                        >
+                                                            {assignment.assignmentRole === "lead" && <span aria-hidden="true">{"\u2605"}</span>}{initials(assignment.name)}
+                                                        </button>
+                                                        {canCreate && (
+                                                            <button
+                                                                type="button"
+                                                                onPointerDown={event => event.stopPropagation()}
+                                                                onClick={() => onDraftCrewRemove(task.id, assignment.userId)}
+                                                                className="absolute -right-1.5 -top-1.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-700 text-[10px] font-bold leading-none text-white opacity-0 shadow transition hover:bg-red-600 focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+                                                                aria-label={`Remove ${assignment.name} from ${task.name}`}
+                                                            >
+                                                                {"\u00D7"}
+                                                            </button>
+                                                        )}
+                                                    </span>
+                                                );
+                                            })}
                                             {outlinedCrew.map(member => (
-                                                <span
+                                                <button
                                                     key={member.id}
-                                                    className="inline-flex h-7 min-w-7 items-center justify-center rounded-full border-2 bg-white px-1.5 text-[10px] font-bold"
+                                                    type="button"
+                                                    data-dispatch-crew-chip="true"
+                                                    data-dispatch-user-id={member.id}
+                                                    onPointerDown={event => onCrewPointerDown(event, member)}
+                                                    onKeyDown={event => onCrewKeyboardActivate(event, member)}
+                                                    className="inline-flex h-7 min-w-7 touch-none items-center justify-center rounded-full border-2 bg-white px-1.5 text-[10px] font-bold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary focus-visible:ring-offset-2"
                                                     style={{ borderColor: projectColor, color: projectColor }}
                                                     title={`${member.name} \u2014 project crew only`}
+                                                    aria-label={`${member.name}. Press Enter to choose a task, or drag onto a task.`}
                                                 >
                                                     {initials(member.name)}
-                                                </span>
+                                                </button>
                                             ))}
                                             {solidAssignments.length === 0 && outlinedCrew.length === 0 && <span className="text-[10px] text-slate-400">No crew</span>}
                                         </div>

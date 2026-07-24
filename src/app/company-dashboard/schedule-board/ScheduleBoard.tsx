@@ -184,6 +184,12 @@ interface ProjectDraftMove {
     deltaDays: number;
 }
 
+interface CrewDraft {
+    addUserIds: string[];
+    removeUserIds: string[];
+    expectedAssignments: DispatchAssignment[];
+}
+
 interface DispatchReconciliationExpectation {
     publicationId: string;
     projects: Record<string, PersistedDispatchProjectState>;
@@ -305,6 +311,7 @@ export function ScheduleBoard({
     // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
     const [projectDrafts, setProjectDrafts] = useState<Record<string, ProjectDraftMove>>({});
+    const [crewDrafts, setCrewDrafts] = useState<Record<string, CrewDraft>>({});
     // Read at reconciliation-timeout FIRE time (an effect-render snapshot can
     // miss a just-added draft or resurrect a just-discarded one).
     const projectDraftsRef = useRef(projectDrafts);
@@ -383,11 +390,25 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
+    const dispatchTaskNamesById = useMemo(
+        () => new Map(canonicalProjects.flatMap(project => project.tasks.map(task => [task.id, task.name] as const))),
+        [canonicalProjects],
+    );
+    const dispatchMemberNamesById = useMemo(() => new Map([
+        ...(data.teamMembers ?? []).map(member => [member.id, member.name || member.email] as const),
+        ...canonicalProjects.flatMap(project => project.tasks.flatMap(task =>
+            task.assignments.map(assignment => [assignment.userId, assignment.name] as const),
+        )),
+    ]), [canonicalProjects, data.teamMembers]);
     const activeProjectOptions = useMemo(() => canonicalProjects.map(project => ({
         id: project.id,
         name: project.name,
         color: project.color || "#4c9a2a",
     })), [canonicalProjects]);
+    const teamMemberById = useMemo(
+        () => new Map((data.teamMembers ?? []).map(member => [member.id, member])),
+        [data.teamMembers],
+    );
     // A saved-but-not-yet-refreshed task keeps its override (pinned to the
     // persisted dates) purely for rendering/reconciliation — it is NOT an
     // unsaved draft and must not count toward or re-enter a Save.
@@ -401,13 +422,15 @@ export function ScheduleBoard({
         )),
         [taskDateOverrides, awaitingTaskRefreshIds, dispatchAwaitingTaskIds],
     );
+    const crewDraftTaskIds = useMemo(() => new Set(Object.keys(crewDrafts)), [crewDrafts]);
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
-    const draftCount = draftTaskIds.size + draftProjectIds.size;
+    const draftCount = draftTaskIds.size + draftProjectIds.size + crewDraftTaskIds.size;
     const openTaskProjectId = openTaskId ? canonicalTaskProjectById.get(openTaskId) : null;
     const openTaskHasDraft = Boolean(openTaskId && (
         draftTaskIds.has(openTaskId)
         || (openTaskProjectId && draftProjectIds.has(openTaskProjectId))
     ));
+    const openTaskHasCrewDraft = Boolean(openTaskId && crewDrafts[openTaskId]);
 
     // Locking during draft mode: a drafted item stays fully interactive.
     // Only an in-flight Save (global — the whole board pauses while
@@ -445,14 +468,14 @@ export function ScheduleBoard({
         let pending = mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds);
         if (isDispatchReviewing || isDispatchPublishing) {
             const dispatchAffected = new Set(draftProjectIds);
-            for (const taskId of draftTaskIds) {
+            for (const taskId of [...draftTaskIds, ...crewDraftTaskIds]) {
                 const projectId = canonicalTaskProjectById.get(taskId);
                 if (projectId) dispatchAffected.add(projectId);
             }
             pending = mergeProjectPendingIds(pending, dispatchAffected);
         }
         onEffectivePendingProjectIdsChange(pending);
-    }, [saveLockedProjectIds, endResizeSavingProjectIds, isDispatchReviewing, isDispatchPublishing, draftProjectIds, draftTaskIds, canonicalTaskProjectById, onEffectivePendingProjectIdsChange]);
+    }, [saveLockedProjectIds, endResizeSavingProjectIds, isDispatchReviewing, isDispatchPublishing, draftProjectIds, draftTaskIds, crewDraftTaskIds, canonicalTaskProjectById, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -460,7 +483,29 @@ export function ScheduleBoard({
             ...projectPreview,
             tasks: projectPreview.tasks.map(task => {
                 const dates = taskDateOverrides[task.id];
-                return dates ? { ...task, ...dates } : task;
+                const draft = crewDrafts[task.id];
+                const reconciledAssignments = dispatchReconciliationExpectation?.assignments[task.id];
+                const expectedAssignments = draft
+                    ? draft.expectedAssignments
+                        .filter(assignment => !draft.removeUserIds.includes(assignment.userId))
+                        .concat(draft.addUserIds.map(userId => ({ userId, role: "assigned" as const })))
+                        .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role))
+                    : reconciledAssignments;
+                const assignments = expectedAssignments
+                    ? expectedAssignments.map(assignment => {
+                        const existing = task.assignments.find(row => row.userId === assignment.userId);
+                        const member = teamMemberById.get(assignment.userId);
+                        return {
+                            id: existing?.id ?? `crew-draft:${task.id}:${assignment.userId}`,
+                            userId: assignment.userId,
+                            name: existing?.name ?? member?.name ?? member?.email ?? "Crew member",
+                            status: existing?.status ?? "ACTIVATED",
+                            userRole: existing?.userRole ?? member?.role ?? "FIELD_CREW",
+                            assignmentRole: assignment.role,
+                        };
+                    })
+                    : task.assignments;
+                return { ...task, ...(dates ?? {}), assignments };
             }),
         };
     };
@@ -739,6 +784,12 @@ export function ScheduleBoard({
             next.delete(taskId);
             return next;
         });
+        setCrewDrafts(current => {
+            if (!(taskId in current)) return current;
+            const next = { ...current };
+            delete next[taskId];
+            return next;
+        });
         setOpenTaskId(null);
     }, []);
 
@@ -781,6 +832,76 @@ export function ScheduleBoard({
     }
 
     // ── Draft-mode writers: accumulate locally, never touch the server. ──
+
+    function queueCrewAddition(taskId: string, userId: string): boolean {
+        const task = canonicalTaskById.get(taskId);
+        if (!data.canEdit || isTaskLocked(taskId) || !task) return false;
+        const existingDraft = crewDrafts[taskId];
+        const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
+        const addUserIds = new Set(existingDraft?.addUserIds ?? []);
+        const removeUserIds = new Set(existingDraft?.removeUserIds ?? []);
+        const isExpected = expectedAssignments.some(assignment => assignment.userId === userId);
+        const isEffectivelyAssigned = (isExpected && !removeUserIds.has(userId)) || addUserIds.has(userId);
+        if (isEffectivelyAssigned) {
+            toast.info(`${teamMemberById.get(userId)?.name ?? "Crew member"} is already on ${task.name}.`);
+            return false;
+        }
+
+        if (isExpected) removeUserIds.delete(userId);
+        else addUserIds.add(userId);
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
+        if (addUserIds.size === 0 && removeUserIds.size === 0) {
+            setCrewDrafts(current => {
+                if (!(taskId in current)) return current;
+                const next = { ...current };
+                delete next[taskId];
+                return next;
+            });
+            return true;
+        }
+        setCrewDrafts(current => ({
+            ...current,
+            [taskId]: {
+                expectedAssignments,
+                addUserIds: [...addUserIds].sort(),
+                removeUserIds: [...removeUserIds].sort(),
+            },
+        }));
+        return true;
+    }
+
+    function queueCrewRemoval(taskId: string, userId: string) {
+        const task = canonicalTaskById.get(taskId);
+        if (!data.canEdit || isTaskLocked(taskId) || !task) return;
+        const existingDraft = crewDrafts[taskId];
+        const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
+        const addUserIds = new Set(existingDraft?.addUserIds ?? []);
+        const removeUserIds = new Set(existingDraft?.removeUserIds ?? []);
+        const isExpected = expectedAssignments.some(assignment => assignment.userId === userId);
+        const isEffectivelyAssigned = (isExpected && !removeUserIds.has(userId)) || addUserIds.has(userId);
+        if (!isEffectivelyAssigned) return;
+
+        if (addUserIds.has(userId)) addUserIds.delete(userId);
+        else if (isExpected) removeUserIds.add(userId);
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
+        if (addUserIds.size === 0 && removeUserIds.size === 0) {
+            setCrewDrafts(current => {
+                if (!(taskId in current)) return current;
+                const next = { ...current };
+                delete next[taskId];
+                return next;
+            });
+            return;
+        }
+        setCrewDrafts(current => ({
+            ...current,
+            [taskId]: {
+                expectedAssignments,
+                addUserIds: [...addUserIds].sort(),
+                removeUserIds: [...removeUserIds].sort(),
+            },
+        }));
+    }
 
     function draftTaskChange(taskId: string, dates: TaskDateOverride) {
         const canonicalTask = canonicalTaskById.get(taskId);
@@ -887,6 +1008,7 @@ export function ScheduleBoard({
         cancelActiveProjectEdit();
         for (const projectId of Object.keys(projectDrafts)) clearProjectPreview(projectId);
         setProjectDrafts({});
+        setCrewDrafts({});
         // Discard clears UNSAVED drafts only. Saved-awaiting overrides are
         // committed state pending refresh — removing them here would strand
         // their awaiting ids and the refresh poll forever.
@@ -931,11 +1053,15 @@ export function ScheduleBoard({
     async function collectDispatchIntents(): Promise<DispatchIntent[] | null> {
         const projectEntries = Object.entries(projectDrafts);
         const taskEntries = [...draftTaskIds].map(taskId => [taskId, taskDateOverrides[taskId]!] as const);
-        if (projectEntries.length === 0 && taskEntries.length === 0) return [];
+        const crewEntries = Object.entries(crewDrafts);
+        if (projectEntries.length === 0 && taskEntries.length === 0 && crewEntries.length === 0) return [];
 
         const affectedProjectIds = new Set([
             ...projectEntries.map(([projectId]) => projectId),
             ...taskEntries
+                .map(([taskId]) => canonicalTaskProjectById.get(taskId))
+                .filter((projectId): projectId is string => Boolean(projectId)),
+            ...crewEntries
                 .map(([taskId]) => canonicalTaskProjectById.get(taskId))
                 .filter((projectId): projectId is string => Boolean(projectId)),
         ]);
@@ -1006,6 +1132,28 @@ export function ScheduleBoard({
                 expectedAssignments: dashboardTaskAssignments(task),
                 startDate: dates.startDate,
                 endDate: dates.endDate,
+            });
+        }
+        for (const [taskId, draft] of crewEntries) {
+            const task = canonicalTaskById.get(taskId);
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!task || !projectId) {
+                toast.error(`Task ${taskId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            const removeIds = new Set(draft.removeUserIds);
+            const assignments = draft.expectedAssignments
+                .filter(assignment => !removeIds.has(assignment.userId))
+                .concat(draft.addUserIds.map(userId => ({ userId, role: "assigned" as const })))
+                .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role));
+            intents.push({
+                kind: "TASK_CREW",
+                projectId,
+                taskId,
+                expectedUpdatedAt: task.updatedAt,
+                expectedAssignments: draft.expectedAssignments,
+                assignments,
             });
         }
         return intents;
@@ -1250,6 +1398,9 @@ export function ScheduleBoard({
             const explicitlyDraftedTaskIds = new Set(dispatchReview.intents
                 .filter(intent => intent.kind === "TASK_DATES")
                 .map(intent => intent.taskId));
+            const publishedCrewTaskIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "TASK_CREW")
+                .map(intent => intent.taskId));
 
             setProjectDrafts(current => Object.fromEntries(
                 Object.entries(current).filter(([projectId]) => !publishedProjectIds.has(projectId)),
@@ -1276,6 +1427,9 @@ export function ScheduleBoard({
                 }
                 return next;
             });
+            setCrewDrafts(current => Object.fromEntries(
+                Object.entries(current).filter(([taskId]) => !publishedCrewTaskIds.has(taskId)),
+            ));
             setDispatchReconciliationExpectation({
                 publicationId: result.publicationId,
                 projects: result.reconciliation.projects,
@@ -2231,6 +2385,9 @@ export function ScheduleBoard({
                     onReviewDispatch={() => void reviewDispatchDrafts()}
                     draftCount={draftCount}
                     isReviewingDispatch={isDispatchReviewing || isDispatchPublishing}
+                    crewDrafts={crewDrafts}
+                    onDraftCrewAdd={queueCrewAddition}
+                    onDraftCrewRemove={queueCrewRemoval}
                 />
             ) : boardView === "month" ? (
                 <MonthBarsView
@@ -2318,12 +2475,15 @@ export function ScheduleBoard({
                 published={dispatchReview?.published ?? false}
                 isPending={isDispatchPublishing}
                 conflictTargetIds={dispatchConflictTargetIds}
+                taskNamesById={dispatchTaskNamesById}
+                memberNamesById={dispatchMemberNamesById}
                 onConfirm={() => void publishDispatchDrafts()}
                 onClose={() => setDispatchReview(null)}
             />
             <BoardTaskDrawer
                 taskId={openTaskId}
                 hasDraft={openTaskHasDraft}
+                hasCrewDraft={openTaskHasCrewDraft}
                 teamMembers={data.teamMembers ?? []}
                 onClose={closeTaskDrawer}
                 onSelectTask={selectDrawerTask}
@@ -2336,6 +2496,9 @@ export function ScheduleBoard({
                 lockProject={taskCreationDefaults.lockProject}
                 defaultStartDate={taskCreationDefaults.defaultStartDate}
                 defaultCrewIds={taskCreationDefaults.defaultCrewIds}
+                defaultName={taskCreationDefaults.defaultName}
+                defaultEstimatedHours={taskCreationDefaults.defaultEstimatedHours}
+                estimateItemId={taskCreationDefaults.estimateItemId}
                 projects={activeProjectOptions}
             />
         </div>

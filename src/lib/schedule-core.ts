@@ -23,6 +23,16 @@ import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTask
 // for schedule generation (same selection rule, PB-pipeline-002 R1 fix 6).
 export const CONTRACT_ESTIMATE_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
 
+export function canonicalContractEstimateQuery(projectId: string) {
+    return {
+        where: {
+            projectId,
+            status: { in: CONTRACT_ESTIMATE_STATUSES },
+        },
+        orderBy: { createdAt: "desc" as const },
+    };
+}
+
 export type ScheduleActor = { type: "TEAM" | "SYSTEM"; name: string };
 
 export interface LockedTaskAssignmentParent {
@@ -686,8 +696,7 @@ async function runSetProjectStartDate(
             const [taskCount, qualifying] = await Promise.all([
                 prisma.scheduleTask.count({ where: { projectId } }),
                 prisma.estimate.findFirst({
-                    where: { projectId, status: { in: CONTRACT_ESTIMATE_STATUSES } },
-                    orderBy: { createdAt: "desc" },
+                    ...canonicalContractEstimateQuery(projectId),
                     select: { id: true, code: true },
                 }),
             ]);
@@ -977,6 +986,15 @@ function isLaborLine(line: { type: string; costTypeName: string | null }): boole
 const HOUR_LIKE_BUDGET_UNITS = new Set(["hr", "hrs", "hour", "hours"]);
 function isHourLikeBudgetUnit(budgetUnit: string | null): boolean {
     return !!budgetUnit && HOUR_LIKE_BUDGET_UNITS.has(budgetUnit.toLowerCase());
+}
+
+export function deriveEstimateItemHours(item: {
+    quantity: number;
+    budgetUnit: string | null;
+    childCount?: number;
+}): number | null {
+    if ((item.childCount ?? 0) > 0) return null;
+    return isHourLikeBudgetUnit(item.budgetUnit) ? item.quantity : null;
 }
 
 interface EstimateLine {
@@ -1318,7 +1336,7 @@ export async function generateScheduleFromEstimate(input: {
                     color: colorFor(line),
                     order: nextOrder++,
                     type: "task",
-                    estimatedHours: isHourLikeBudgetUnit(line.budgetUnit) ? line.quantity : null,
+                    estimatedHours: deriveEstimateItemHours(line),
                     estimateItemId: line.id,
                     parentId: parentTaskId,
                 });

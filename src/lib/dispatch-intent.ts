@@ -296,6 +296,34 @@ function assignmentSummary(
     }).join(", ");
 }
 
+function taskCrewSummary(
+    task: DispatchTaskSnapshot,
+    before: DispatchAssignment[],
+    after: DispatchAssignment[],
+    usersById: Map<string, DispatchUserSnapshot>,
+): string {
+    const beforeByUser = new Map(before.map(assignment => [assignment.userId, assignment]));
+    const afterByUser = new Map(after.map(assignment => [assignment.userId, assignment]));
+    const rows: string[] = [];
+    for (const assignment of after) {
+        const previous = beforeByUser.get(assignment.userId);
+        const name = usersById.get(assignment.userId)?.name ?? assignment.userId;
+        if (!previous) {
+            rows.push(`${name} \u2192 ${task.name} (add)`);
+        } else if (previous.role !== assignment.role) {
+            rows.push(`${name} on ${task.name}: ${previous.role} \u2192 ${assignment.role}`);
+        }
+    }
+    for (const assignment of before) {
+        if (afterByUser.has(assignment.userId)) continue;
+        const name = usersById.get(assignment.userId)?.name ?? assignment.userId;
+        rows.push(`${name} removed from ${task.name}`);
+    }
+    return rows.length > 0
+        ? rows.join("; ")
+        : `${task.name}: ${assignmentSummary(before, usersById)} \u2192 ${assignmentSummary(after, usersById)}`;
+}
+
 function taskDateSummary(
     task: DispatchTaskSnapshot,
     before: PersistedDispatchTaskState,
@@ -543,7 +571,7 @@ export function buildDispatchPlan(input: {
                 kind: "TASK_CREW",
                 before: { assignments: beforeCrew },
                 after: { assignments: afterCrew },
-                summary: `${task.name}: ${assignmentSummary(beforeCrew, usersById)} → ${assignmentSummary(afterCrew, usersById)}`,
+                summary: taskCrewSummary(task, beforeCrew, afterCrew, usersById),
             });
             changedTaskIds.add(task.id);
         }

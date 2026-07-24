@@ -21,6 +21,8 @@ const availabilityHelpersSource = src("../src/app/company-dashboard/schedule-boa
 const dispatchViewSource = src("../src/app/company-dashboard/schedule-board/DispatchView.tsx");
 const dispatchReviewDialogSource = src("../src/app/company-dashboard/schedule-board/DispatchReviewDialog.tsx");
 const dispatchJobCardSource = src("../src/app/company-dashboard/schedule-board/DispatchJobCard.tsx");
+const dispatchCrewTaskChooserSource = src("../src/app/company-dashboard/schedule-board/DispatchCrewTaskChooser.tsx");
+const dispatchTaskBankSource = src("../src/app/company-dashboard/schedule-board/DispatchTaskBank.tsx");
 const dispatchStripSource = src("../src/app/company-dashboard/schedule-board/DispatchExceptions.tsx");
 const dispatchExceptionsSource = src("../src/app/company-dashboard/schedule-board/dispatch-exceptions.ts");
 const traySource = src("../src/app/company-dashboard/schedule-board/UnscheduledTray.tsx");
@@ -870,6 +872,96 @@ assert.doesNotMatch(dispatchReviewDialogSource, />\s*Publish\s*</, "Dispatch UI 
 assert.match(coreSource, /updatedAt: string;/, "dashboard project/task contracts must expose revisions");
 assert.match(coreSource, /id: true, projectId: true, name: true, startDate: true, endDate: true,[^\n]*updatedAt: true/, "the dashboard task query must select updatedAt");
 assert.match(coreSource, /updatedAt: task\.updatedAt\.toISOString\(\)/, "task revisions must serialize as ISO strings");
+
+// PR-B2: crew assignment drafts are Dispatch-only and ride the existing
+// atomic review/publication path. Month/Timeline retain immediate crew writes.
+assert.match(boardSource, /interface CrewDraft \{[\s\S]*addUserIds: string\[\];[\s\S]*removeUserIds: string\[\];[\s\S]*expectedAssignments: DispatchAssignment\[\];/, "ScheduleBoard must define the complete crew-draft snapshot");
+assert.match(boardSource, /const \[crewDrafts, setCrewDrafts\] = useState<Record<string, CrewDraft>>\(\{\}\)/, "ScheduleBoard must own crew drafts beside its existing draft maps");
+assert.match(boardSource, /function queueCrewAddition\(taskId: string, userId: string\)/, "crew additions must route through the board-owned draft writer");
+assert.match(boardSource, /function queueCrewRemoval\(taskId: string, userId: string\)/, "crew removals must route through the board-owned draft writer");
+assert.match(boardSource, /setCrewDrafts\(\{\}\)/, "Discard must clear unsaved crew drafts");
+assert.match(boardSource, /crewDraftTaskIds/, "crew-drafted task owners must join draft counting and project unions");
+assert.match(boardSource, /kind: "TASK_CREW"/, "dispatch intent collection must emit crew intents");
+assert.match(publishDispatchBody, /intent\.kind === "TASK_CREW"/, "successful publication must identify and clear published crew drafts");
+assert.match(boardSource, /onDraftCrewAdd=\{queueCrewAddition\}/, "DispatchView must receive the board-owned crew add callback");
+assert.match(boardSource, /onDraftCrewRemove=\{queueCrewRemoval\}/, "DispatchView must receive the board-owned crew remove callback");
+
+assert.match(dispatchViewSource, /function handleCrewPointerDragStart\(/, "Dispatch must use the board-style pointer drag machine for crew chips");
+assert.match(dispatchViewSource, /const CREW_MOUSE_DRAG_THRESHOLD_PX = 5;/);
+assert.match(dispatchViewSource, /const CREW_TOUCH_DRAG_THRESHOLD_PX = 8;/);
+assert.match(dispatchViewSource, /createDragVisualLayer\(/, "crew drag must use the detached visual layer");
+assert.match(dispatchViewSource, /window\.addEventListener\("keydown", onWindowKeyDown\)/, "Escape must cancel crew pointer drags");
+assert.match(dispatchViewSource, /data-dispatch-crew-chip/, "Dispatch crew sources need stable drag metadata");
+assert.match(dispatchJobCardSource, /data-dispatch-crew-chip/, "solid and outlined job-card crew chips must be drag sources");
+assert.match(dispatchJobCardSource, /data-dispatch-task-id=\{task\.id\}/, "Today task rows must be direct crew drop targets");
+assert.match(dispatchViewSource, /data-dispatch-week-cell/, "Week person/day cells must expose crew drop context");
+assert.match(dispatchJobCardSource, /border-dashed/, "drafted additions must preserve solid chips with a dashed ring");
+assert.match(dispatchJobCardSource, /\[@media\(hover:none\)\]:opacity-100/, "crew remove affordances must remain visible on no-hover devices");
+assert.ok(dispatchCrewTaskChooserSource.length > 0, "the shared crew task chooser must exist");
+assert.match(dispatchCrewTaskChooserSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/, "pointer and keyboard crew choices must reuse FloatingPopover");
+assert.match(dispatchCrewTaskChooserSource, /anchorPoint=/, "drop ambiguity must anchor the chooser at the release point");
+assert.match(dispatchCrewTaskChooserSource, /anchorRef=/, "Enter must anchor the same chooser to the focused chip");
+for (const [name, source] of [["Month", monthSource], ["Timeline", timelineSource]] as const) {
+    assert.doesNotMatch(source, /crewDrafts|onDraftCrewAdd|onDraftCrewRemove|data-dispatch-crew-chip|handleCrewPointerDragStart/, `${name} must not gain Dispatch crew drafting`);
+}
+
+const projectCrewPickerStart = crewPickersSource.indexOf("export function CrewPicker(");
+const projectCrewPickerEnd = crewPickersSource.indexOf("export function TaskCrewPicker(", projectCrewPickerStart);
+const projectCrewPickerBody = crewPickersSource.slice(projectCrewPickerStart, projectCrewPickerEnd);
+const taskCrewPickerStart = projectCrewPickerEnd;
+const taskCrewPickerBody = crewPickersSource.slice(taskCrewPickerStart);
+assert.match(projectCrewPickerBody, /await updateProjectCrewAction\(projectId, ids\)/, "Month/Timeline project crew remains immediate");
+assert.match(taskCrewPickerBody, /await updateTaskCrewAction\(task\.id, ids\)/, "Month/Timeline task crew remains immediate");
+assert.match(projectCrewPickerBody, /router\.refresh\(\)/);
+assert.match(taskCrewPickerBody, /router\.refresh\(\)/);
+assert.doesNotMatch(crewPickersSource, /crewDrafts|TASK_CREW|queueCrewAddition|queueCrewRemoval/, "shared Month/Timeline pickers must not know about Dispatch drafts");
+
+// Task Bank must import, not re-derive, the canonical contract-estimate scope.
+assert.match(coreSource, /export function canonicalContractEstimateQuery\(projectId: string\)/, "schedule-core must export the canonical estimate selector");
+assert.match(coreSource, /export function deriveEstimateItemHours\(/, "Task Bank and generation must share the hours rule");
+assert.match(actionsSource, /canonicalContractEstimateQuery[\s\S]*from "\.\/schedule-core"/, "actions must import the canonical estimate selector");
+const getTaskBankStart = actionsSource.indexOf("export async function getTaskBank(");
+const getTaskBankEnd = actionsSource.indexOf("export async function", getTaskBankStart + 1);
+const getTaskBankBody = actionsSource.slice(getTaskBankStart, getTaskBankEnd);
+assert.ok(getTaskBankStart >= 0, "the authenticated Task Bank read action must exist");
+assert.match(getTaskBankBody, /canonicalContractEstimateQuery\(projectId\)/);
+assert.match(getTaskBankBody, /deriveEstimateItemHours\(/);
+assert.doesNotMatch(getTaskBankBody, /CONTRACT_ESTIMATE_STATUSES|orderBy:\s*\{\s*createdAt/, "Task Bank must not re-derive canonical estimate selection");
+const generateProjectScheduleStart = actionsSource.indexOf("export async function generateProjectScheduleAction(");
+const generateProjectScheduleEnd = actionsSource.indexOf("export async function", generateProjectScheduleStart + 1);
+const generateProjectScheduleBody = actionsSource.slice(generateProjectScheduleStart, generateProjectScheduleEnd);
+assert.match(generateProjectScheduleBody, /canonicalContractEstimateQuery\(projectId\)/, "manual generation must use the same canonical selector as Task Bank");
+assert.doesNotMatch(generateProjectScheduleBody, /CONTRACT_ESTIMATE_STATUSES|orderBy:\s*\{\s*createdAt/, "manual generation must not keep a second selector");
+assert.ok(dispatchTaskBankSource.length > 0, "the collapsible Dispatch Task Bank rail must exist");
+assert.match(dispatchTaskBankSource, /getTaskBank\(/);
+assert.match(dispatchTaskBankSource, /Task bank/);
+assert.match(dispatchTaskBankSource, /scheduledCount/);
+assert.match(dispatchTaskBankSource, /totalCount/);
+assert.match(dispatchTaskBankSource, /estimateItemId/);
+assert.match(dispatchViewSource, /data\.pipeline\.inProgress\[0\]\?\.id/, "Task Bank selection must default to the first In Progress project");
+assert.match(taskCreationDialogSource, /defaultName\?: string/);
+assert.match(taskCreationDialogSource, /defaultEstimatedHours\?: number \| null/);
+assert.match(taskCreationDialogSource, /estimateItemId\?: string/);
+const createScheduleTaskStart = actionsSource.indexOf("export async function createScheduleTask(");
+const createScheduleTaskEnd = actionsSource.indexOf("export async function updateScheduleTask(", createScheduleTaskStart);
+const createScheduleTaskBody = actionsSource.slice(createScheduleTaskStart, createScheduleTaskEnd);
+assert.match(createScheduleTaskBody, /estimateItemId\?: string \| null/);
+assert.match(createScheduleTaskBody, /estimateItemId,/, "Task Bank creation must persist its normalized estimate-item back-link");
+
+// A crew draft gates only immediate user-assignment controls in the drawer.
+assert.match(boardSource, /const openTaskHasCrewDraft = Boolean\(openTaskId && crewDrafts\[openTaskId\]\)/);
+assert.match(boardSource, /hasCrewDraft=\{openTaskHasCrewDraft\}/);
+assert.match(drawerSource, /hasCrewDraft: boolean;/);
+assert.match(drawerSource, /crewReadOnly=\{hasCrewDraft\}/);
+assert.match(drawerSource, /crewReadOnlyNote="Crew changes are drafted for dispatch/, "the drawer must explain why immediate crew controls are disabled");
+assert.match(detailPanelSource, /crewReadOnly\?: boolean;/);
+assert.match(detailPanelSource, /crewReadOnlyNote\?: string;/);
+assert.match(detailPanelSource, /\{crewReadOnly && crewReadOnlyNote && \(/, "the Team section must show the crew draft hint");
+assert.match(detailPanelSource, /disabled=\{crewReadOnly\}/, "immediate add/lead/remove controls must be disabled by the crew draft gate");
+
+assert.match(dispatchReviewDialogSource, /function crewChangeRows\(/, "crew audit changes must expand into person-level review rows");
+assert.match(dispatchReviewDialogSource, /\(add\)/);
+assert.match(dispatchReviewDialogSource, /removed from/);
 
 console.log("schedule-board render contract verification: PASS");
 
