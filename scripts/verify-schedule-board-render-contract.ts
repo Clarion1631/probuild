@@ -122,6 +122,12 @@ assert.match(popoverSource, /event\.key !== "Escape"/);
 // anchorRef is now optional (item 1 — an anchorPoint-only context menu has
 // no trigger element to refocus), hence the extra `?.` before `.current`.
 assert.match(popoverSource, /anchorRef\?\.current\?\.focus\(\)/);
+// Interactive popovers expose an explicit close button, while non-interactive
+// hover cards do not. The button sits before/outside contentRef so it never
+// participates in the content ResizeObserver's measurements.
+assert.match(popoverSource, /\{!pointerEventsNone && \(\s*<button[\s\S]{0,500}type="button"[\s\S]{0,500}aria-label="Close"[\s\S]{0,500}onClick=\{onClose\}/, "interactive popovers must render an explicit Close button");
+assert.match(popoverSource, /aria-label="Close"[\s\S]{0,800}<\/button>\s*\)\}\s*\{\/\* Content wrapper:[\s\S]{0,300}<div ref=\{contentRef\}/, "the Close button must live outside and above the observed content wrapper");
+assert.match(popoverSource, /<div ref=\{contentRef\} className=\{pointerEventsNone \? undefined : "pr-6"\}>/, "interactive popover content must reserve minimal right-side room for the Close button");
 // Vertical placement must handle the neither-side-fits case (open on the
 // larger side, capped + scrollable) and the horizontal floor must be applied
 // last so narrow viewports pin to the margin instead of going negative.
@@ -241,11 +247,31 @@ assert.match(taskBlockSource, /import \{ TaskCrewPicker \} from "\.\/CrewPickers
 assert.match(taskBlockSource, /<TaskCrewPicker task=\{task\} teamMembers=\{teamMembers\} variant="inline" \/>/);
 
 // ── Item 6: a bar click toggles its menu, never navigates ──
+// PR-0 activation seam: block/bar chrome is replaced by root activation.
+assert.doesNotMatch(taskBlockSource, /aria-label=\{`Task actions for /, "TaskBlockSegment must not render the old ellipsis action button");
+assert.doesNotMatch(taskBlockSource, />\s*\u22ef\s*<\/button>/, "TaskBlockSegment must not render a vertical-ellipsis button");
+assert.doesNotMatch(taskBlockSource, /actionTriggerRef/, "the removed task action button must not leave a trigger ref behind");
+assert.match(taskBlockSource, /function handleBlockActivate\(event: ReactMouseEvent<HTMLDivElement> \| KeyboardEvent<HTMLElement>\) \{/);
+assert.match(taskBlockSource, /if \(!canEdit \|\| isPending\) return;\s*\n\s*if \(\(event\.target as HTMLElement\)\.closest\("a,button,input,summary,form,details"\)\) return;/, "task block activation must reuse the old action-button edit gates and ignore interactive descendants");
+assert.match(taskBlockSource, /onClick=\{handleBlockActivate\}/, "the task block root click must route through the named activation seam");
+assert.match(taskBlockSource, /handleBlockActivate[\s\S]{0,400}event\.stopPropagation\(\);/, "block activation must stop propagation — the parent bar's click opens the PROJECT menu and would instantly replace the task menu via the exclusive-menu coordinator");
+assert.match(taskBlockSource, /mode === "move" && activeMode === null && \(event\.key === " " \|\| event\.key === "Enter"\)[\s\S]{0,250}handleBlockActivate\(event\);/, "Enter/Space on a non-editing task block must route through the activation seam");
+assert.match(taskBlockSource, /<FloatingPopover open=\{menuOpen\} anchorRef=\{rootRef\} anchorPoint=\{menuAnchorPoint\}/, "keyboard-opened task menus must anchor to the block rect while pointer-opened menus may use a point");
+
+assert.doesNotMatch(projectBarSource, /aria-label=\{`Project actions for /, "ProjectBar must not render the redundant Actions chip");
+assert.doesNotMatch(projectBarSource, />\s*Actions\s*<\/button>/, "ProjectBar must not render the redundant Actions chip");
+assert.doesNotMatch(projectBarSource, /actionTriggerRef/, "the removed project Actions chip must not leave a trigger ref behind");
+assert.match(projectBarSource, /const rootRef = useRef<HTMLDivElement>\(null\)/);
+assert.match(projectBarSource, /ref=\{rootRef\}[\s\S]{0,1200}onClick=\{handleBarClick\}/, "ProjectBar's root ref and existing click activation must stay wired");
+assert.match(projectBarSource, /<FloatingPopover open=\{menuOpen\} anchorRef=\{rootRef\} anchorPoint=\{menuAnchorPoint\}/, "keyboard-opened project menus must anchor to the bar rect while pointer-opened menus may use a point");
+
+// A bar click still toggles its menu and never navigates; pointer activation
+// opens at the click point, while keyboard activation falls back to rootRef.
 assert.match(projectBarSource, /function handleBarClick\(/);
 // Item 1 (2026-07-22) replaced the bare `setMenuOpen(value => !value)` toggle
 // with explicit open/close (via `openMenu`, which also resets the menu's
 // view/anchor state) — still a toggle in effect, just no longer a one-liner.
-assert.match(projectBarSource, /if \(menuOpen\) \{\s*setMenuOpen\(false\);\s*\} else \{\s*openMenu\(null\);\s*\}/, "a bar click must still toggle the menu open/closed");
+assert.match(projectBarSource, /if \(menuOpen\) \{\s*setMenuOpen\(false\);\s*\} else \{\s*openMenu\(\{ x: event\.clientX, y: event\.clientY \}\);\s*\}/, "a bar click must still toggle the menu open/closed and pointer-open at the click point");
 assert.doesNotMatch(projectBarSource, /onClick=\{.*router\.push|onClick=\{.*navigate/, "the bar itself must never navigate on click");
 assert.match(projectBarSource, />\s*Open project\s*<\/Link>/, "Open project must be a menu item inside the Actions dropdown");
 
