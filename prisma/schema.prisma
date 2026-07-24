@@ -1560,6 +1560,8 @@ model DailyLog {
   workPerformed      String          @db.Text
   materialsDelivered String?         @db.Text
   issues             String?         @db.Text
+  sharedToPortal     Boolean         @default(false)
+  sharedContentHash  String?
   photos             DailyLogPhoto[]
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
@@ -1573,6 +1575,7 @@ model DailyLogPhoto {
   dailyLog   DailyLog @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
   url        String
   caption    String?
+  sharedToPortal Boolean @default(false)
   createdAt  DateTime @default(now())
 }
 
