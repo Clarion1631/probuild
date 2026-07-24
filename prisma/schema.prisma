@@ -844,7 +844,11 @@ model ScheduleTask {
   children       ScheduleTask[] @relation("SubTasks")
   order          Int            @default(0)
   status         String         @default("Not Started")
-  type           String         @default("task") // "task" | "milestone"
+  type           String         @default("task") // "task" | "milestone" | "appointment"
+  doneWhen       String?        // Completion criteria shown to the field crew
+  blockedReason  String?        // Required explanation while status is "Blocked"
+  scheduledTime  String?        // "HH:MM" in America/Los_Angeles; appointment tasks only
+  confirmationStatus String?    // "planned" | "requested" | "confirmed"; appointment tasks only
   estimateItemId String?        @unique
   estimateItem   EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
   // Generation provenance: set on every task kind created by

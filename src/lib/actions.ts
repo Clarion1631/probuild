@@ -6485,6 +6485,30 @@ export async function countersignContractAsCompany(contractId: string, signerNam
 // Schedule Tasks
 // ────────────────────────────────────────────────
 
+const SCHEDULE_TASK_TYPES = ["task", "milestone", "appointment"] as const;
+const SCHEDULE_CONFIRMATION_STATUSES = ["planned", "requested", "confirmed"] as const;
+const SCHEDULE_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+type ScheduleTaskType = typeof SCHEDULE_TASK_TYPES[number];
+type ScheduleConfirmationStatus = typeof SCHEDULE_CONFIRMATION_STATUSES[number];
+
+function assertScheduleTaskType(type: string): asserts type is ScheduleTaskType {
+    if (!(SCHEDULE_TASK_TYPES as readonly string[]).includes(type)) throw new Error("Invalid schedule task type");
+}
+
+function normalizeScheduledTime(value: string | null | undefined): string | null {
+    const normalized = value?.trim() || null;
+    if (normalized && !SCHEDULE_TIME_PATTERN.test(normalized)) {
+        throw new Error("Scheduled time must use 24-hour HH:MM format");
+    }
+    return normalized;
+}
+
+function assertConfirmationStatus(value: string): asserts value is ScheduleConfirmationStatus {
+    if (!(SCHEDULE_CONFIRMATION_STATUSES as readonly string[]).includes(value)) {
+        throw new Error("Invalid appointment confirmation status");
+    }
+}
+
 export async function getScheduleTasks(projectId: string) {
     // Hardened (dispatch-arc foundation): internal schedule details require an authenticated team session.
     const session = await getSessionOrDev();
@@ -6502,6 +6526,58 @@ export async function getScheduleTasks(projectId: string) {
             estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
         },
     });
+}
+
+function serializeScheduleTaskForDetail(task: any) {
+    return {
+        id: task.id,
+        projectId: task.projectId,
+        name: task.name,
+        startDate: task.startDate.toISOString().slice(0, 10),
+        endDate: task.endDate.toISOString().slice(0, 10),
+        color: task.color,
+        progress: task.progress,
+        estimatedHours: task.estimatedHours,
+        assignee: task.assignee,
+        parentId: task.parentId,
+        estimateItemId: task.estimateItemId ?? null,
+        order: task.order,
+        status: task.status,
+        type: task.type,
+        doneWhen: task.doneWhen ?? null,
+        blockedReason: task.blockedReason ?? null,
+        scheduledTime: task.scheduledTime ?? null,
+        confirmationStatus: task.confirmationStatus ?? null,
+        actualHours: task.timeEntries.reduce((sum: number, entry: { durationHours: number }) => sum + entry.durationHours, 0),
+        dependencies: task.dependencies,
+        dependents: task.dependents,
+        timeEntries: task.timeEntries,
+        assignments: task.assignments,
+        subAssignments: task.subAssignments,
+        estimateItem: task.estimateItem ? { ...task.estimateItem, total: Number(task.estimateItem.total) } : null,
+    };
+}
+
+export async function getScheduleTaskDetail(taskId: string) {
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    const tasks = await prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { order: "asc" },
+        include: {
+            dependencies: true,
+            dependents: true,
+            timeEntries: { select: { durationHours: true } },
+            assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
+            subAssignments: { include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
+        },
+    });
+    const task = tasks.find((candidate: any) => candidate.id === taskId);
+    if (!task) throw new Error("Task not found");
+    return {
+        ...serializeScheduleTaskForDetail(task),
+        allTasks: tasks.map(serializeScheduleTaskForDetail),
+    };
 }
 
 export async function getPortalScheduleTasks(projectId: string) {
@@ -6668,6 +6744,34 @@ export async function updateTaskStatusAsSub(taskId: string, subcontractorId: str
     return task;
 }
 
+type TaskCommentAuthor = {
+    userId: string | null;
+    fallbackLabel: string;
+};
+
+async function resolveTaskCommentAuthor(): Promise<TaskCommentAuthor> {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionName = (session?.user?.name as string | null) ?? null;
+    const sessionEmail = (session?.user?.email as string | null) ?? null;
+    let userId: string | null = null;
+    if (sessionUserId) {
+        userId = (await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true } }))?.id ?? null;
+    }
+    return { userId, fallbackLabel: sessionName ?? sessionEmail ?? "Unknown" };
+}
+
+function buildTaskCommentCreateData(taskId: string, text: string, author: TaskCommentAuthor, photoUrls?: string[]) {
+    const cleanPhotoUrls = (photoUrls ?? []).filter(url => typeof url === "string" && url.length > 0).slice(0, 10);
+    return {
+        taskId,
+        text,
+        userId: author.userId,
+        subcontractorName: author.userId ? null : author.fallbackLabel,
+        photos: cleanPhotoUrls.length > 0 ? { create: cleanPhotoUrls.map(url => ({ url })) } : undefined,
+    };
+}
+
 export async function createScheduleTask(projectId: string, data: {
     name: string;
     startDate: string;
@@ -6676,28 +6780,107 @@ export async function createScheduleTask(projectId: string, data: {
     status?: string;
     assignee?: string;
     parentId?: string;
-    type?: string;
+    type?: ScheduleTaskType;
+    crewIds?: string[];
+    leadUserId?: string | null;
+    estimatedHours?: number | null;
+    doneWhen?: string | null;
+    note?: string;
+    scheduledTime?: string | null;
+    confirmationStatus?: ScheduleConfirmationStatus | null;
 }) {
-    await assertScheduleProjectAccess(projectId);
-    const maxOrder = await prisma.scheduleTask.aggregate({
-        where: { projectId },
-        _max: { order: true },
-    });
-    const isMilestone = data.type === "milestone";
-    const task = await prisma.scheduleTask.create({
-        data: {
+    const user = await assertScheduleProjectAccess(projectId);
+    const type = data.type ?? "task";
+    assertScheduleTaskType(type);
+    if (data.status === "Blocked") throw new Error("Blocked tasks require a reason");
+    const startDate = parseStartDateInput(data.startDate);
+    const requestedEndDate = parseStartDateInput(data.endDate);
+    const endDate = type === "milestone" ? startDate : requestedEndDate;
+    if (type !== "milestone" && endDate < startDate) {
+        throw new Error("Task end date cannot be before its start date");
+    }
+    if (data.estimatedHours != null && (!Number.isFinite(data.estimatedHours) || data.estimatedHours < 0)) {
+        throw new Error("Estimated hours must be zero or greater");
+    }
+
+    const scheduledTime = normalizeScheduledTime(data.scheduledTime);
+    if (data.confirmationStatus) assertConfirmationStatus(data.confirmationStatus);
+    if (type !== "appointment" && (scheduledTime || data.confirmationStatus)) {
+        throw new Error("Scheduled time and confirmation status are appointment-only fields");
+    }
+    const confirmationStatus = type === "appointment" ? (data.confirmationStatus ?? "planned") : null;
+    const crewIds = [...new Set((data.crewIds ?? []).filter(Boolean))];
+    const leadUserId = data.leadUserId ?? null;
+    if (leadUserId && !crewIds.includes(leadUserId)) throw new Error("Task lead must be assigned to the crew");
+    const note = data.note?.trim() || null;
+    const commentAuthor = note ? await resolveTaskCommentAuthor() : null;
+    const task = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const maxOrder = await tx.scheduleTask.aggregate({
+            where: { projectId },
+            _max: { order: true },
+        });
+        if (crewIds.length > 0) {
+            const activeCrew = await tx.user.findMany({
+                where: { id: { in: crewIds }, status: "ACTIVATED" },
+                select: { id: true },
+            });
+            if (activeCrew.length !== crewIds.length) throw new Error("Task crew members must be ACTIVATED users");
+        }
+        const createData: any = {
             projectId,
             name: data.name,
-            startDate: new Date(data.startDate),
-            endDate: isMilestone ? new Date(data.startDate) : new Date(data.endDate),
+            startDate,
+            endDate,
             color: data.color || getDefaultColorForTaskName(data.name) || "#4c9a2a",
             status: data.status || "Not Started",
             assignee: data.assignee || null,
             parentId: data.parentId || null,
             order: (maxOrder._max.order ?? -1) + 1,
-            type: data.type || "task",
-        },
-    });
+            type,
+            estimatedHours: data.estimatedHours ?? null,
+            doneWhen: data.doneWhen?.trim() || null,
+            scheduledTime,
+            confirmationStatus,
+        };
+        const created = await tx.scheduleTask.create({ data: createData });
+        if (crewIds.length > 0) {
+            await tx.taskAssignment.createMany({
+                data: crewIds.map(userId => ({ taskId: created.id, userId, role: userId === leadUserId ? "lead" : "assigned" })),
+            });
+        }
+        if (note && commentAuthor) {
+            await tx.taskComment.create({ data: buildTaskCommentCreateData(created.id, note, commentAuthor) });
+        }
+        await tx.activityLog.create({
+            data: {
+                projectId,
+                actorType: "TEAM",
+                actorName: user.name || user.email,
+                action: "created_schedule_task",
+                entityType: "task",
+                entityId: created.id,
+                entityName: created.name,
+                metadata: JSON.stringify({
+                    name: data.name,
+                    startDate: startDate.toISOString().slice(0, 10),
+                    endDate: endDate.toISOString().slice(0, 10),
+                    color: createData.color,
+                    status: createData.status,
+                    type,
+                    crewIds,
+                    leadUserId,
+                    estimatedHours: createData.estimatedHours,
+                    doneWhen: createData.doneWhen,
+                    note,
+                    scheduledTime,
+                    confirmationStatus,
+                }),
+            },
+        });
+        return created;
+    }));
+    revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${projectId}/schedule`);
     return task;
 }
@@ -6712,11 +6895,23 @@ export async function updateScheduleTask(taskId: string, data: {
     assignee?: string;
     order?: number;
     estimatedHours?: number | null;
-    type?: string;
+    type?: ScheduleTaskType;
     estimateItemId?: string | null;
+    doneWhen?: string | null;
+    blockedReason?: string | null;
+    scheduledTime?: string | null;
+    confirmationStatus?: ScheduleConfirmationStatus | null;
 }) {
     const hasDatePatch = data.startDate !== undefined || data.endDate !== undefined;
     const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const persistedDispatchState = await prisma.scheduleTask.findUnique({
+        where: { id: taskId },
+        select: { type: true, status: true, blockedReason: true },
+    });
+    if (!persistedDispatchState) throw new Error("Task not found");
+    if (data.type !== undefined) assertScheduleTaskType(data.type);
+    const nextType = data.type ?? persistedDispatchState.type;
+    const nextStatus = data.status ?? persistedDispatchState.status;
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.color !== undefined) updateData.color = data.color;
@@ -6726,6 +6921,35 @@ export async function updateScheduleTask(taskId: string, data: {
     if (data.order !== undefined) updateData.order = data.order;
     if (data.estimatedHours !== undefined) updateData.estimatedHours = data.estimatedHours;
     if (data.type !== undefined) updateData.type = data.type;
+    if (data.doneWhen !== undefined) updateData.doneWhen = data.doneWhen?.trim() || null;
+    if (data.status !== undefined || data.blockedReason !== undefined) {
+        if (nextStatus === "Blocked") {
+            const reasonSource = data.blockedReason !== undefined ? data.blockedReason : persistedDispatchState.blockedReason;
+            const reason = reasonSource?.trim();
+            if (!reason) throw new Error("Blocked tasks require a reason");
+            updateData.blockedReason = reason;
+        } else {
+            updateData.blockedReason = null;
+        }
+    }
+    if (data.scheduledTime !== undefined) {
+        const scheduledTime = normalizeScheduledTime(data.scheduledTime);
+        if (nextType !== "appointment" && scheduledTime) {
+            throw new Error("Scheduled time is only available for appointments");
+        }
+        updateData.scheduledTime = scheduledTime;
+    }
+    if (data.confirmationStatus !== undefined) {
+        if (data.confirmationStatus) assertConfirmationStatus(data.confirmationStatus);
+        if (nextType !== "appointment" && data.confirmationStatus) {
+            throw new Error("Confirmation status is only available for appointments");
+        }
+        updateData.confirmationStatus = data.confirmationStatus;
+    }
+    if (data.type !== undefined && data.type !== "appointment") {
+        updateData.scheduledTime = null;
+        updateData.confirmationStatus = null;
+    }
     if (data.estimateItemId !== undefined) {
         updateData.estimateItemId = data.estimateItemId;
         if (data.estimateItemId) {
@@ -6810,6 +7034,7 @@ export async function updateScheduleTask(taskId: string, data: {
         where: { id: taskId },
         data: updateData,
     });
+    revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
 }
@@ -6900,29 +7125,10 @@ export async function addTaskComment(taskId: string, text: string, photoUrls?: s
     // hover-card "Add note…".
     await assertScheduleTaskAccess(taskId);
     // Derive identity from the session — never trust a client-supplied userId.
-    const session = await getSessionOrDev();
-    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
-    const sessionName = (session?.user?.name as string | null) ?? null;
-    const sessionEmail = (session?.user?.email as string | null) ?? null;
-
-    let resolvedUser: { id: string; name: string | null; email: string } | null = null;
-    if (sessionUserId) {
-        resolvedUser = await prisma.user.findUnique({
-            where: { id: sessionUserId },
-            select: { id: true, name: true, email: true },
-        });
-    }
-    const fallbackLabel = sessionName ?? sessionEmail ?? "Unknown";
-    const cleanPhotoUrls = (photoUrls ?? []).filter(u => typeof u === "string" && u.length > 0).slice(0, 10);
+    const author = await resolveTaskCommentAuthor();
 
     const comment = await prisma.taskComment.create({
-        data: {
-            taskId,
-            text,
-            userId: resolvedUser?.id ?? null,
-            subcontractorName: resolvedUser ? null : fallbackLabel,
-            photos: cleanPhotoUrls.length > 0 ? { create: cleanPhotoUrls.map(url => ({ url })) } : undefined,
-        },
+        data: buildTaskCommentCreateData(taskId, text, author, photoUrls),
         include: {
             user: { select: { id: true, name: true, email: true } },
             photos: { orderBy: { createdAt: "asc" } },
@@ -7118,6 +7324,58 @@ export async function unassignUserFromTask(taskId: string, userId: string) {
     });
     const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
     if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+}
+
+export async function setTaskLead(taskId: string, userId: string | null) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const assignments = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+        const task = await tx.scheduleTask.findUnique({
+            where: { id: taskId },
+            select: {
+                id: true,
+                name: true,
+                projectId: true,
+                assignments: { select: { userId: true, role: true } },
+            },
+        });
+        if (!task || task.projectId !== projectId) throw new Error("Task not found");
+        if (userId && !task.assignments.some(assignment => assignment.userId === userId)) {
+            throw new Error("Task lead must be assigned to the crew");
+        }
+        const previousLeadUserId = task.assignments.find(assignment => assignment.role === "lead")?.userId ?? null;
+        await tx.taskAssignment.updateMany({
+            where: { taskId, role: "lead" },
+            data: { role: "assigned" },
+        });
+        if (userId) {
+            await tx.taskAssignment.update({
+                where: { taskId_userId: { taskId, userId } },
+                data: { role: "lead" },
+            });
+        }
+        await tx.activityLog.create({
+            data: {
+                projectId,
+                actorType: "TEAM",
+                actorName: user.name || user.email,
+                action: "set_task_lead",
+                entityType: "task",
+                entityId: taskId,
+                entityName: task.name,
+                metadata: JSON.stringify({ previousLeadUserId, leadUserId: userId }),
+            },
+        });
+        return tx.taskAssignment.findMany({
+            where: { taskId },
+            orderBy: { createdAt: "asc" },
+            include: { user: { select: { id: true, name: true, email: true } } },
+        });
+    }));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return assignments;
 }
 
 export async function assignSubToTask(taskId: string, subcontractorId: string) {
@@ -7320,6 +7578,16 @@ export async function getTeamMembers() {
     return prisma.user.findMany({
         orderBy: { name: "asc" },
         select: { id: true, name: true, email: true, role: true },
+    });
+}
+
+export async function getScheduleCrewMembers() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules")) throw new Error("Forbidden");
+    return prisma.user.findMany({
+        where: { status: "ACTIVATED", role: "FIELD_CREW" },
+        orderBy: { name: "asc" },
+        select: { id: true, name: true, email: true },
     });
 }
 

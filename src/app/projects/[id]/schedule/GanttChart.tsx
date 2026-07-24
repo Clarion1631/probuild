@@ -543,6 +543,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         setPanelTab={actions.setPanelTab}
                         onStatusChange={actions.handleStatusChange}
                         onNameChange={actions.handleNameSave}
+                        onDoneWhenChange={actions.handleDoneWhenChange}
                         onDateChange={actions.handleDateChange}
                         onEstimatedHoursChange={actions.handleEstimatedHoursSave}
                         onColorChange={actions.handleColorChange}
@@ -555,6 +556,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         subcontractors={subcontractors}
                         onAssign={actions.handleAssign}
                         onUnassign={actions.handleUnassign}
+                        onSetLead={actions.handleSetLead}
                         onAssignSub={actions.handleAssignSub}
                         onUnassignSub={actions.handleUnassignSub}
                         punchItems={actions.punchItems}
@@ -571,6 +573,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         onLinkPredecessor={actions.handleLinkPredecessor}
                         onUnlinkPredecessor={actions.handleUnlinkPredecessor}
                         onSelectTask={actions.selectTask}
+                        onAppointmentChange={actions.handleAppointmentChange}
                     />
                 )}
             </div>
