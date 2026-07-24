@@ -33,6 +33,7 @@ const cellActivationSource = src("../src/app/company-dashboard/schedule-board/em
 const popoverSource = src("../src/app/company-dashboard/schedule-board/FloatingPopover.tsx");
 const actionsSource = src("../src/lib/actions.ts");
 const coreSource = src("../src/lib/schedule-core.ts");
+const taskCoreSource = src("../src/lib/schedule-task-core.ts");
 const dispatchIntentSource = src("../src/lib/dispatch-intent.ts");
 const dispatchPublicationSource = src("../src/lib/dispatch-publication.ts");
 const weatherSource = src("../src/lib/weather.ts");
@@ -274,12 +275,12 @@ assert.match(characterizedTaskPointerBody, /sourceOffsetX: drag\.originX - drag\
 assert.match(characterizedEndResizeBody, /sourceOffsetX: drag\.originX - drag\.startX/, "project end-resize ghosts stay anchored to their autoscrolled source");
 
 // ── Item 1: crew ACTIVATED validation is added-only ──
-const setProjectCrewStart = coreSource.indexOf("export async function setProjectCrew");
+const setProjectCrewStart = coreSource.indexOf("async function runSetProjectCrew");
 const setProjectCrewEnd = coreSource.indexOf("export interface CrewConflictPair", setProjectCrewStart);
 const setProjectCrewBody = coreSource.slice(setProjectCrewStart, setProjectCrewEnd);
 assert.match(setProjectCrewBody, /toConnect\.map\(id => byId\.get\(id\)!\)\.filter\(u => u\.status !== "ACTIVATED"\)/);
 assert.ok(setProjectCrewBody.indexOf("toConnect = wanted.filter") < setProjectCrewBody.indexOf("notActivated ="), "toConnect must be computed before the ACTIVATED check runs against it");
-const setTaskCrewBody = coreSource.slice(coreSource.indexOf("export async function setTaskCrew"));
+const setTaskCrewBody = coreSource.slice(coreSource.indexOf("async function runSetTaskCrew"));
 assert.match(setTaskCrewBody, /toAdd\.map\(id => byId\.get\(id\)!\)\.filter\(u => u\.status !== "ACTIVATED"\)/);
 
 // ── Item 3: floating popovers escape clipping via a portal ──
@@ -680,9 +681,10 @@ assert.match(getTaskDetailBody, /await assertScheduleTaskAccess\(taskId\);/, "ta
 const updateTaskStart = actionsSource.indexOf("export async function updateScheduleTask(");
 const updateTaskEnd = actionsSource.indexOf("export async function", updateTaskStart + 1);
 const updateTaskBody = actionsSource.slice(updateTaskStart, updateTaskEnd);
-assert.match(updateTaskBody, /nextStatus === "Blocked"/, "the mutation core must enforce Blocked as a domain invariant");
-assert.match(updateTaskBody, /Blocked tasks require a reason/, "Blocked must reject an empty reason server-side");
-assert.match(updateTaskBody, /updateData\.blockedReason = null/, "moving away from Blocked must clear its reason");
+assert.match(updateTaskBody, /updateScheduleTaskInTransaction\(/, "the authenticated action must delegate to the canonical mutation core");
+assert.match(taskCoreSource, /nextStatus === "Blocked"/, "the mutation core must enforce Blocked as a domain invariant");
+assert.match(taskCoreSource, /Blocked tasks require a reason/, "Blocked must reject an empty reason server-side");
+assert.match(taskCoreSource, /updateData\.blockedReason = null/, "moving away from Blocked must clear its reason");
 
 // Board creation is one proper shared modal and reuses the exact crew checklist
 // presentation used by the quick menus, including the lead-star affordance.
@@ -945,8 +947,9 @@ assert.match(taskCreationDialogSource, /estimateItemId\?: string/);
 const createScheduleTaskStart = actionsSource.indexOf("export async function createScheduleTask(");
 const createScheduleTaskEnd = actionsSource.indexOf("export async function updateScheduleTask(", createScheduleTaskStart);
 const createScheduleTaskBody = actionsSource.slice(createScheduleTaskStart, createScheduleTaskEnd);
-assert.match(createScheduleTaskBody, /estimateItemId\?: string \| null/);
-assert.match(createScheduleTaskBody, /estimateItemId,/, "Task Bank creation must persist its normalized estimate-item back-link");
+assert.match(createScheduleTaskBody, /createScheduleTaskInTransaction\(/, "the authenticated action must delegate to the canonical transaction-aware creator");
+assert.match(taskCoreSource, /estimateItemId\?: string \| null/);
+assert.match(taskCoreSource, /estimateItemId,/, "Task Bank creation must persist its normalized estimate-item back-link");
 
 // A crew draft gates only immediate user-assignment controls in the drawer.
 assert.match(boardSource, /const openTaskHasCrewDraft = Boolean\(openTaskId && crewDrafts\[openTaskId\]\)/);

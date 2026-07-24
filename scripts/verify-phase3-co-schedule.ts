@@ -153,7 +153,7 @@ async function main() {
         pass("(a) approveEstimate wires the post-commit auto-generator", approveBody.includes("autoGenerateScheduleForApprovedEstimate"));
         pass("(a) dashboard generation passes requireEmptyProject true", /generateProjectScheduleAction[\s\S]*?requireEmptyProject:\s*true/.test(actionsSource));
         const scheduleCoreSource = fs.readFileSync(new URL("../src/lib/schedule-core.ts", import.meta.url), "utf8");
-        const setDateBody = scheduleCoreSource.slice(scheduleCoreSource.indexOf("export async function setProjectStartDate"), scheduleCoreSource.indexOf("export interface CashflowBucket"));
+        const setDateBody = scheduleCoreSource.slice(scheduleCoreSource.indexOf("async function runSetProjectStartDate"), scheduleCoreSource.indexOf("export interface CashflowBucket"));
         const autoBody = scheduleCoreSource.slice(scheduleCoreSource.indexOf("export async function autoGenerateScheduleForApprovedEstimate"), scheduleCoreSource.indexOf("export class CoSchedulePreconditionError"));
         const importerBody = actionsSource.slice(actionsSource.indexOf("export async function importEstimateToSchedule"), actionsSource.indexOf("export async function generateProjectScheduleAction"));
         pass("(a) every automatic caller requires an empty project", setDateBody.includes("requireEmptyProject: true") && autoBody.includes("requireEmptyProject: true"));
@@ -370,6 +370,7 @@ async function main() {
         const billingSource = fs.readFileSync(new URL("../src/lib/billing-core.ts", import.meta.url), "utf8");
         const mcpSource = fs.readFileSync(new URL("../src/app/api/mcp/[transport]/route.ts", import.meta.url), "utf8");
         const dashboardSource = fs.readFileSync(new URL("../src/app/company-dashboard/CompanyDashboardClient.tsx", import.meta.url), "utf8");
+        const crewPickersSource = fs.readFileSync(new URL("../src/app/company-dashboard/schedule-board/CrewPickers.tsx", import.meta.url), "utf8");
         const coApplyStart = scheduleSource.indexOf("export async function applyChangeOrderToSchedule");
         const coApplyEnd = scheduleSource.indexOf("export async function setTaskCrew", coApplyStart);
         const coApplyBody = scheduleSource.slice(coApplyStart, coApplyEnd);
@@ -384,9 +385,9 @@ async function main() {
         const mcpGeneratorBody = mcpSource.slice(mcpSource.indexOf('"generate_project_schedule"'), mcpSource.indexOf('"assign_project_crew"'));
         pass("(f) MCP generator preserves explicit merge semantics", !mcpGeneratorBody.includes("requireEmptyProject"));
         pass("(f) MCP schedule read exposes unapplied CO details", mcpSource.includes("unappliedChangeOrders"));
-        pass("(f) MCP advertises contract version 1.9.0", mcpSource.includes('version: "1.9.0"'));
+        pass("(f) MCP advertises contract version 1.11.0", mcpSource.includes('version: "1.11.0"'));
         pass("(f) MCP instructions explain automatic and explicit CO application", mcpSource.includes("change orders adjust the schedule") && mcpSource.includes("deductions never auto-remove tasks"));
-        pass("(f) dashboard includes expandable task rows and task crew action", dashboardSource.includes("aria-expanded") && dashboardSource.includes("updateTaskCrewAction"));
+        pass("(f) dashboard includes expandable task rows and task crew action", dashboardSource.includes("aria-expanded") && crewPickersSource.includes("updateTaskCrewAction"));
         pass("(f) dashboard includes Apply CO control", dashboardSource.includes("applyChangeOrderToScheduleAction") && dashboardSource.includes("Apply CO"));
         pass("(f) hover controls are keyboard/touch accessible", dashboardSource.includes("focus:opacity-100") && dashboardSource.includes("[@media(hover:none)]:opacity-100") && dashboardSource.includes("pointer-events-none") && dashboardSource.includes("focus:pointer-events-auto"));
         pass("(f) ADMIN views distinguish projected CO money", dashboardSource.includes("coProjected") && dashboardSource.includes("Projected CO"));
