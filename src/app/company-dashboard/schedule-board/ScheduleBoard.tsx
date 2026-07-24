@@ -9,6 +9,8 @@ import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, Overl
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
+import { DispatchView } from "./DispatchView";
+import type { DispatchTaskCreationDefaults } from "./DispatchView";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
@@ -38,7 +40,7 @@ import type { ProjectEndResizePointerStart, ProjectPointerEditStart } from "./Pr
 
 export type { ProjectMoveChoice } from "./ShiftConfirmDialog";
 export type { ProjectDropIntent } from "./useBarLayout";
-export type BoardView = "month" | "timeline";
+export type BoardView = "month" | "timeline" | "dispatch";
 
 const MONTH_LABELS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const BOARD_VIEW_STORAGE_KEY = "gtr-company-schedule-board-view";
@@ -214,6 +216,7 @@ export function ScheduleBoard({
     const [boardView, setBoardView] = useState<BoardView>("month");
     const [openTaskId, setOpenTaskId] = useState<string | null>(null);
     const [taskCreationOpen, setTaskCreationOpen] = useState(false);
+    const [taskCreationDefaults, setTaskCreationDefaults] = useState<Partial<DispatchTaskCreationDefaults>>({});
     // Lifted from TimelineView (see CREW_MODE_STORAGE_KEY) so the
     // availability panel's drill-down can force crew mode on even when
     // Timeline is already mounted — writing localStorage alone wouldn't
@@ -269,7 +272,7 @@ export function ScheduleBoard({
     useEffect(() => {
         try {
             const stored = localStorage.getItem(BOARD_VIEW_STORAGE_KEY);
-            if (stored === "month" || stored === "timeline") setBoardView(stored);
+            if (stored === "month" || stored === "timeline" || stored === "dispatch") setBoardView(stored);
         } catch {
             // Storage can be unavailable in privacy-restricted browser contexts.
         }
@@ -539,6 +542,11 @@ export function ScheduleBoard({
             // The selected view still applies for this session when persistence fails.
         }
     }
+
+    const openTaskCreation = useCallback((defaults: Partial<DispatchTaskCreationDefaults> = {}) => {
+        setTaskCreationDefaults(defaults);
+        setTaskCreationOpen(true);
+    }, []);
 
     const handleBlockActivate = useCallback((taskId: string) => {
         setOpenTaskId(taskId);
@@ -1681,9 +1689,17 @@ export function ScheduleBoard({
                         >
                             Timeline
                         </button>
+                        <button
+                            type="button"
+                            onClick={() => selectBoardView("dispatch")}
+                            aria-pressed={boardView === "dispatch"}
+                            className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "dispatch" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                        >
+                            Dispatch
+                        </button>
                     </div>
                     {data.canEdit && (
-                        <button type="button" onClick={() => setTaskCreationOpen(true)} className="hui-btn hui-btn-primary text-sm">
+                        <button type="button" onClick={() => openTaskCreation()} className="hui-btn hui-btn-primary text-sm">
                             + Task
                         </button>
                     )}
@@ -1731,7 +1747,13 @@ export function ScheduleBoard({
             <span ref={taskKeyboardSentinelRef} tabIndex={-1} className="sr-only" aria-live="polite" data-task-keyboard-sentinel="true">
                 {taskKeyboardEdit ? `Keyboard editing ${taskKeyboardEdit.mode}` : ""}
             </span>
-            {boardView === "month" ? (
+            {boardView === "dispatch" ? (
+                <DispatchView
+                    data={boardData}
+                    onActivate={handleBlockActivate}
+                    onCreateTask={openTaskCreation}
+                />
+            ) : boardView === "month" ? (
                 <MonthBarsView
                     data={boardData}
                     showIncome={showIncome}
@@ -1819,6 +1841,10 @@ export function ScheduleBoard({
             <TaskCreationDialog
                 open={taskCreationOpen}
                 onClose={() => setTaskCreationOpen(false)}
+                defaultProjectId={taskCreationDefaults.defaultProjectId}
+                lockProject={taskCreationDefaults.lockProject}
+                defaultStartDate={taskCreationDefaults.defaultStartDate}
+                defaultCrewIds={taskCreationDefaults.defaultCrewIds}
                 projects={activeProjectOptions}
             />
         </div>
