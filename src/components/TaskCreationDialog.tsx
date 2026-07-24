@@ -3,6 +3,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { createScheduleTask, getScheduleCrewMembers } from "@/lib/actions";
 import { CrewChecklist, type CrewOption } from "@/app/company-dashboard/schedule-board/CrewPickers";
@@ -138,8 +139,17 @@ export default function TaskCreationDialog({
     return (
         <Dialog.Root open={open} onOpenChange={nextOpen => { if (!nextOpen && !isPending) onClose(); }}>
             <Dialog.Portal>
-                <Dialog.Overlay className="fixed inset-0 z-[190] bg-slate-950/45 backdrop-blur-[1px] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in data-[state=closed]:fade-out" />
-                <Dialog.Content className="fixed left-1/2 top-1/2 z-[200] flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-1.5rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-hui-border bg-white shadow-2xl outline-none data-[state=open]:animate-in data-[state=open]:fade-in data-[state=open]:zoom-in-95 sm:w-full">
+                <Dialog.Overlay asChild>
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.16 }} className="fixed inset-0 z-[190] bg-slate-950/45 backdrop-blur-[1px]" />
+                </Dialog.Overlay>
+                <Dialog.Content asChild>
+                <motion.div
+                    data-motion-scope="dialog-enter"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ duration: 0.18 }}
+                    className="fixed left-1/2 top-1/2 z-[200] flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-1.5rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-hui-border bg-white shadow-2xl outline-none sm:w-full"
+                >
                     <div className="flex items-start justify-between border-b border-hui-border bg-slate-50 px-5 py-4">
                         <div>
                             <Dialog.Title className="text-base font-bold text-hui-textMain">Create schedule item</Dialog.Title>
@@ -216,6 +226,7 @@ export default function TaskCreationDialog({
                         <Dialog.Close asChild><button type="button" disabled={isPending} className="hui-btn hui-btn-secondary text-sm">Cancel</button></Dialog.Close>
                         <button type="button" onClick={submit} disabled={isPending || projects.length === 0} className="hui-btn hui-btn-green text-sm">{isPending ? "Creating…" : "Create item"}</button>
                     </div>
+                </motion.div>
                 </Dialog.Content>
             </Dialog.Portal>
         </Dialog.Root>

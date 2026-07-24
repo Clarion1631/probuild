@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
+import type { VancouverForecastDay } from "@/lib/weather";
 import { PROJECT_STATUSES } from "@/lib/project-status";
 import { applyChangeOrderToScheduleAction, generateProjectScheduleAction, updateProjectStartDateAction } from "@/lib/actions";
 import { formatCurrency, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
@@ -169,7 +170,7 @@ function StartDateRow({
     );
 }
 
-export default function CompanyDashboardClient({ data }: { data: CompanyDashboardData }) {
+export default function CompanyDashboardClient({ data, weather }: { data: CompanyDashboardData; weather: VancouverForecastDay[] }) {
     const router = useRouter();
     const { month, canEdit, isAdmin, canSeeFinancials, pipeline, cashflow, teamMembers, crewConflicts, strip } = data;
 
@@ -307,6 +308,7 @@ export default function CompanyDashboardClient({ data }: { data: CompanyDashboar
 
             <ScheduleBoard
                 data={data}
+                weather={weather}
                 externallyPendingProjectIds={legacyPendingProjectIds}
                 isProjectExternallyPending={isPageProjectPending}
                 onEffectivePendingProjectIdsChange={publishBoardPendingProjectIds}

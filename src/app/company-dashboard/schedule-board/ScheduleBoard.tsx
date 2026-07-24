@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { toast } from "sonner";
 import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction } from "@/lib/actions";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
+import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
@@ -69,6 +71,7 @@ declare global {
 
 interface ScheduleBoardProps {
     data: CompanyDashboardData;
+    weather: VancouverForecastDay[];
     externallyPendingProjectIds: ReadonlySet<string>;
     isProjectExternallyPending: (projectId: string) => boolean;
     onEffectivePendingProjectIdsChange: (projectIds: ReadonlySet<string>) => void;
@@ -220,6 +223,7 @@ function shiftMonth(month: string, delta: number): string {
 
 export function ScheduleBoard({
     data,
+    weather,
     externallyPendingProjectIds,
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
@@ -1756,6 +1760,7 @@ export function ScheduleBoard({
     ].filter((kind): kind is string => Boolean(kind));
 
     return (
+        <MotionConfig reducedMotion="user">
         <div ref={boardContainerRef} className="hui-card mb-6 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-hui-border">
                 <div className="flex items-baseline gap-3">
@@ -1809,8 +1814,18 @@ export function ScheduleBoard({
                     <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
                 </div>
             </div>
+            <AnimatePresence initial={false}>
             {draftCount > 0 && (
-                <div role="status" className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
+                <motion.div
+                    key="draft-status"
+                    data-motion-scope="status-change"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.16 }}
+                    role="status"
+                    className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900"
+                >
                     <span>{draftCount} unsaved change{draftCount === 1 ? "" : "s"}</span>
                     <div className="flex items-center gap-2">
                         <button type="button" onClick={discardAllDrafts} disabled={isSaving} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
@@ -1820,20 +1835,32 @@ export function ScheduleBoard({
                             {isSaving ? "Saving..." : "Save"}
                         </button>
                     </div>
-                </div>
+                </motion.div>
             )}
+            </AnimatePresence>
             <UnscheduledTray
                 projects={data.pipeline.waitingToStart}
                 canEdit={data.canEdit}
                 pendingProjectIds={externallyPendingProjectIds}
                 onMoveProject={scheduleUnscheduledProject}
             />
+            <AnimatePresence initial={false}>
             {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0) && (
-                <div className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">
+                <motion.div
+                    key="refresh-status"
+                    data-motion-scope="status-change"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.16 }}
+                    className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+                    role="status"
+                >
                     <span>Refreshing saved {pendingRefreshKinds.join(" and ")} schedule changes...</span>
                     <button type="button" className="font-semibold underline" onClick={() => router.refresh()}>Retry now</button>
-                </div>
+                </motion.div>
             )}
+            </AnimatePresence>
             <span ref={projectKeyboardSentinelRef} tabIndex={-1} className="sr-only" aria-live="polite" data-project-keyboard-sentinel="true">
                 {projectKeyboardEdit ? `Moving project to ${projectKeyboardEdit.targetStart}. Use arrow keys, Enter to save, or Escape to cancel.` : ""}
             </span>
@@ -1843,12 +1870,14 @@ export function ScheduleBoard({
             {boardView === "dispatch" ? (
                 <DispatchView
                     data={boardData}
+                    weather={weather}
                     onActivate={handleBlockActivate}
                     onCreateTask={openTaskCreation}
                 />
             ) : boardView === "month" ? (
                 <MonthBarsView
                     data={boardData}
+                    weather={weather}
                     showIncome={showIncome}
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
@@ -1860,6 +1889,7 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    onCreateTask={openTaskCreation}
                     teamMembers={data.teamMembers ?? []}
                     isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
@@ -1882,6 +1912,7 @@ export function ScheduleBoard({
             ) : (
                 <TimelineView
                     data={boardData}
+                    weather={weather}
                     showIncome={showIncome}
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
@@ -1893,6 +1924,7 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    onCreateTask={openTaskCreation}
                     groupByCrew={groupByCrew}
                     onToggleGroupByCrew={() => setGroupByCrewMode(!groupByCrew)}
                     scrollToTodayNonce={scrollToTodayNonce}
@@ -1941,5 +1973,6 @@ export function ScheduleBoard({
                 projects={activeProjectOptions}
             />
         </div>
+        </MotionConfig>
     );
 }

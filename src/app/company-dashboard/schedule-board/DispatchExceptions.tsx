@@ -1,5 +1,6 @@
 "use client";
 
+import { motion } from "framer-motion";
 import type { CrewConflict, DashboardProjectRow } from "@/lib/schedule-core";
 import { getDispatchExceptions } from "./dispatch-exceptions";
 
@@ -57,7 +58,14 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
     ].filter(pill => pill.count > 0);
 
     return (
-        <div className="border-b border-hui-border bg-slate-50/80 px-4 py-2.5" aria-label="Dispatch exceptions">
+        <motion.div
+            data-motion-scope="exceptions-strip"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.16 }}
+            className="border-b border-hui-border bg-slate-50/80 px-4 py-2.5"
+            aria-label="Dispatch exceptions"
+        >
             {pills.length === 0 ? (
                 <p className="text-xs font-medium text-slate-500">{"Day clear \u2713"}</p>
             ) : (
@@ -77,6 +85,6 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
                     ))}
                 </div>
             )}
-        </div>
+        </motion.div>
     );
 }

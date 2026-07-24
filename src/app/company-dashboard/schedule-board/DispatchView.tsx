@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
+import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getFallbackProjectColor, getMonday, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { isConflictedDay } from "./availability";
 import { getCrewlessJobs, isTaskActiveOnDay } from "./dispatch-exceptions";
@@ -20,6 +21,7 @@ export interface DispatchTaskCreationDefaults {
 
 interface DispatchViewProps {
     data: CompanyDashboardData;
+    weather: VancouverForecastDay[];
     onActivate: (taskId: string) => void;
     onCreateTask: (defaults: DispatchTaskCreationDefaults) => void;
 }
@@ -59,7 +61,7 @@ function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, d
     return chips;
 }
 
-export function DispatchView({ data, onActivate, onCreateTask }: DispatchViewProps) {
+export function DispatchView({ data, weather, onActivate, onCreateTask }: DispatchViewProps) {
     const [mode, setMode] = useState<DispatchMode>("today");
     const currentMonday = useMemo(() => getMonday(todayUTC()), []);
     const [weekStart, setWeekStart] = useState(currentMonday);
@@ -97,6 +99,7 @@ export function DispatchView({ data, onActivate, onCreateTask }: DispatchViewPro
     ], [data.pipeline]);
     const today = todayUTC();
     const todayKey = formatDate(today);
+    const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
     const fieldCrew = (data.teamMembers ?? []).filter(member => member.role === "FIELD_CREW");
     const activeTodayByProject = new Map(projects.map(project => [
         project.id,
@@ -122,6 +125,11 @@ export function DispatchView({ data, onActivate, onCreateTask }: DispatchViewPro
     const showSunday = projects.some(project => project.tasks.some(task => isTaskActiveOnDay(task, formatDate(sunday))));
     const visibleWeekDays = [...mondayToFriday, ...(showSaturday ? [saturday] : []), ...(showSunday ? [sunday] : [])];
     const crewConflicts = data.crewConflicts;
+    const headerForecast = mode === "today"
+        ? weatherByDate.get(todayKey)
+        : visibleWeekDays
+            .map(day => weatherByDate.get(formatDate(day)))
+            .find((forecast): forecast is VancouverForecastDay => Boolean(forecast));
 
     useEffect(() => {
         if (!highlightedProjectId || mode !== "today") return;
@@ -154,6 +162,9 @@ export function DispatchView({ data, onActivate, onCreateTask }: DispatchViewPro
                 <div>
                     <h3 className="text-sm font-semibold text-hui-textMain">Dispatch</h3>
                     <p className="mt-0.5 text-xs text-hui-textMuted">Jobs first today. People first across the week.</p>
+                    <p className="mt-1 text-[10px] font-medium text-slate-500">
+                        Vancouver forecast{headerForecast ? ` \u00B7 ${headerForecast.glyph} ${headerForecast.precipitationProbability}% rain \u00B7 ${headerForecast.high}\u00B0/${headerForecast.low}\u00B0` : " unavailable"}
+                    </p>
                 </div>
                 <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Dispatch range">
                     {(["today", "week"] as const).map(nextMode => (
@@ -236,7 +247,16 @@ export function DispatchView({ data, onActivate, onCreateTask }: DispatchViewPro
                         >
                             <div className="grid bg-slate-50" role="row" style={{ gridTemplateColumns: `180px repeat(${visibleWeekDays.length}, minmax(140px, 1fr)) 110px` }}>
                                 <div role="columnheader" className="border-b border-r border-hui-border px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Crew</div>
-                                {visibleWeekDays.map(day => <div key={formatDate(day)} role="columnheader" className="border-b border-r border-hui-border px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-500">{dayLabel(day)}</div>)}
+                                {visibleWeekDays.map(day => {
+                                    const dayKey = formatDate(day);
+                                    const forecast = weatherByDate.get(dayKey);
+                                    return (
+                                        <div key={dayKey} role="columnheader" className="border-b border-r border-hui-border px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                                            <div>{dayLabel(day)}</div>
+                                            {forecast && <div className="mt-0.5 normal-case tracking-normal text-slate-600">{forecast.glyph} {forecast.precipitationProbability}% {forecast.high}{"\u00B0"}</div>}
+                                        </div>
+                                    );
+                                })}
                                 <div role="columnheader" className="border-b border-hui-border px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-500">Assigned</div>
                             </div>
 

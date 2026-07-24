@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 
 // Owner-feedback round (2026-07-22) rewrote the company schedule board from
 // per-drag auto-save + project locking to local draft-mode + one explicit
@@ -26,9 +26,12 @@ const traySource = src("../src/app/company-dashboard/schedule-board/UnscheduledT
 const dialogSource = src("../src/app/company-dashboard/schedule-board/ShiftConfirmDialog.tsx");
 const layoutSource = src("../src/app/company-dashboard/schedule-board/useBarLayout.ts");
 const dragVisualSource = src("../src/app/company-dashboard/schedule-board/dragVisualLayer.ts");
+const cellActivationSource = src("../src/app/company-dashboard/schedule-board/emptyCellCreation.ts");
 const popoverSource = src("../src/app/company-dashboard/schedule-board/FloatingPopover.tsx");
 const actionsSource = src("../src/lib/actions.ts");
 const coreSource = src("../src/lib/schedule-core.ts");
+const weatherSource = src("../src/lib/weather.ts");
+const companyDashboardPageSource = src("../src/app/company-dashboard/page.tsx");
 const companyDashboardSource = src("../src/app/company-dashboard/CompanyDashboardClient.tsx");
 // CrewPicker/TaskCrewPicker moved out of CompanyDashboardClient.tsx into their
 // own module (item 1) so ProjectBar/TaskBlockSegment can reuse them from the
@@ -38,6 +41,11 @@ const crewPickersSource = src("../src/app/company-dashboard/schedule-board/CrewP
 const drawerSource = src("../src/app/company-dashboard/schedule-board/BoardTaskDrawer.tsx");
 const taskCreationDialogSource = src("../src/components/TaskCreationDialog.tsx");
 const detailPanelSource = src("../src/app/projects/[id]/schedule/TaskDetailPanel.tsx");
+const scheduleBoardDirectory = new URL("../src/app/company-dashboard/schedule-board/", import.meta.url);
+const scheduleBoardSourceTree = readdirSync(scheduleBoardDirectory, { recursive: true })
+    .filter(path => typeof path === "string" && /\.(?:ts|tsx)$/.test(path))
+    .map(path => readFileSync(new URL(path.replaceAll("\\", "/"), scheduleBoardDirectory), "utf8"))
+    .join("\n");
 
 // ── Item 2: draft mode replaces per-drag auto-save ──
 
@@ -186,6 +194,40 @@ assert.match(dragVisualSource, /observer\.disconnect\(\)/, "visual cleanup stops
 assert.match(dragVisualSource, /ghost\.remove\(\)/, "visual cleanup removes the detached ghost");
 assert.match(dragVisualSource, /ghost\.setAttribute\("aria-hidden", "true"\)/, "detached visual clones stay out of the accessibility tree");
 assert.match(dragVisualSource, /dispatchEvent\(new CustomEvent\(DRAG_VISUAL_ACTIVE_EVENT/, "pointer-drag activity is published below ScheduleBoard instead of root state");
+
+// PR-A3 step 5: the native Unscheduled tray drag must reuse the imperative
+// visual layer rather than writing React state in Month/Timeline. Empty-cell
+// creation shares one click/keyboard guard and reaches the existing dialog
+// seam with view-specific defaults.
+assert.match(dragVisualSource, /export function highlightScheduleTarget\(/, "native HTML drag targets must use the shared imperative highlighter");
+assert.match(dragVisualSource, /export function clearScheduleTargetHighlight\(/, "native drag target cleanup must be explicit");
+assert.match(dragVisualSource, /export function beginNativeScheduleDragActivity\(/, "native tray drags must publish the same below-root activity signal");
+assert.match(traySource, /beginNativeScheduleDragActivity\(\)/, "UnscheduledTray must publish native drag activity without React state");
+assert.match(traySource, /onDragEnd=\{handleDragEnd\}/, "UnscheduledTray must clean up activity/highlighting when a native drag ends");
+for (const [name, source] of [["Month", monthSource], ["Timeline", timelineSource]] as const) {
+    assert.match(source, /highlightScheduleTarget\(/, `${name} native drop targets must highlight imperatively`);
+    assert.match(source, /clearScheduleTargetHighlight\(\)/, `${name} native drop targets must clean up imperatively`);
+    assert.doesNotMatch(source, /dragOverDate|setDragOverDate/, `${name} must not render from native drag-over state`);
+    assert.match(source, /isDragVisualLayerActive\(\)/, `${name} empty-cell creation must ignore every active drag`);
+    assert.match(source, /isPrimaryUnmodifiedClick\(/, `${name} empty-cell creation must require an unmodified primary click`);
+    assert.match(source, /isScheduleCellBackgroundTarget\(/, `${name} empty-cell creation must ignore blocks and controls`);
+}
+assert.match(cellActivationSource, /event\.button === 0/, "the shared empty-cell guard must require the primary button");
+assert.match(cellActivationSource, /!event\.altKey && !event\.ctrlKey && !event\.metaKey && !event\.shiftKey/, "the shared empty-cell guard must reject modified clicks");
+assert.match(cellActivationSource, /data-task-edit-block/, "the shared empty-cell guard must reject task blocks");
+assert.match(cellActivationSource, /data-drag-visual-kind/, "the shared empty-cell guard must reject dragged schedule geometry");
+assert.match(monthSource, /role=\{data\.canEdit \? "button" : undefined\}[\s\S]{0,220}tabIndex=\{data\.canEdit \? 0 : undefined\}/, "editable Month day cells need a keyboard-equivalent activation path without exposing button semantics to read-only users");
+assert.match(monthSource, /onKeyDown=\{event => handleDayKeyDown\(dayKey, event\)\}/, "Month day cells must implement Enter/Space activation");
+assert.equal((timelineSource.match(/onKeyDown=\{event => handleEmptyCellKeyDown\(/g) ?? []).length, 2, "both Timeline cell modes must implement Enter/Space activation");
+assert.match(timelineSource, /const \[focusedCell, setFocusedCell\] = useState<TimelineCellFocus \| null>\(null\)/, "Timeline creation cells must use one roving focus owner");
+assert.match(timelineSource, /event\.key === "ArrowLeft"[\s\S]{0,500}event\.key === "ArrowRight"[\s\S]{0,500}event\.key === "ArrowUp"[\s\S]{0,500}event\.key === "ArrowDown"/, "Timeline roving focus must navigate dates and rows with arrow keys");
+assert.equal((timelineSource.match(/tabIndex=\{data\.canEdit \? \(isTimelineCellTabbable\(/g) ?? []).length, 2, "both Timeline modes must expose only the current roving cell in the tab order");
+assert.doesNotMatch(timelineSource, /tabIndex=\{data\.canEdit \? 0 : undefined\}/, "Timeline must not create one tab stop per day per row");
+assert.equal((timelineSource.match(/role=\{data\.canEdit \? "button" : undefined\}/g) ?? []).length, 2, "read-only Timeline cells must not expose button semantics");
+assert.match(monthSource, /onCreateTask\(\{ defaultStartDate: dayKey \}\)/, "Month creation must default only the date and leave project selection unlocked");
+assert.match(timelineSource, /defaultProjectId: project\.id,[\s\S]{0,100}lockProject: true,[\s\S]{0,100}defaultStartDate: dayKey/, "Timeline project cells must lock the row project and default the date");
+assert.match(timelineSource, /defaultStartDate: dayKey, defaultCrewIds: \[row\.userId\]/, "Timeline crew cells must default the date and row crew member");
+assert.equal((boardSource.match(/onCreateTask=\{openTaskCreation\}/g) ?? []).length, 3, "Dispatch, Month, and Timeline must share the one task-creation dialog seam");
 
 assert.match(taskBlockSource, /data-drag-visual-kind="task"/, "task roots expose a stable visual kind hook");
 assert.match(taskBlockSource, /data-drag-task-id=\{task\.id\}/, "task roots expose a stable task-id hook");
@@ -545,9 +587,13 @@ assert.match(addTaskCommentBody, /await assertScheduleTaskAccess\(taskId\);/, "a
 assert.match(taskBlockSource, /import \{ addTaskComment, deleteScheduleTask \} from "@\/lib\/actions"/);
 assert.match(taskBlockSource, /Add note…/, "the task context menu must offer Add note…");
 assert.match(taskBlockSource, /await addTaskComment\(task\.id, text\);/, "Add note must go through the existing (now hardened) addTaskComment action");
-assert.match(taskBlockSource, /task\.latestComments\.map\(\(comment, index\) => \(/, "the hover card must render latestComments");
-assert.match(taskBlockSource, /truncateNote\(comment\.text\)/, "note text in the hover card must be truncated");
-assert.match(taskBlockSource, /const NOTE_TRUNCATE_LENGTH = 140;/);
+const hoverCardStart = taskBlockSource.indexOf('<FloatingPopover open={hoverCardOpen}');
+const hoverCardBody = taskBlockSource.slice(hoverCardStart);
+assert.ok(hoverCardStart >= 0, "the task hover card must exist");
+assert.equal((hoverCardBody.match(/<p className=/g) ?? []).length, 3, "the hover card must have exactly three text lines");
+assert.match(hoverCardBody, /formatDate\(taskStart\)[\s\S]{0,120}formatDate\(isMilestone \? taskStart : taskEnd\)[\s\S]{0,120}\{task\.status\}[\s\S]{0,100}\{progress\}%/, "the second hover-card line must combine dates, status, and progress");
+assert.match(hoverCardBody, /\{crew\}/, "the third hover-card line must show crew or Unassigned");
+assert.doesNotMatch(hoverCardBody, /latestComments|comment\.|relativeDayLabel|truncateNote|estimatedHours|href=/, "comments, timestamps, hours, and links must stay out of the slim hover card");
 assert.match(taskBlockSource, /isAnyDragActive: boolean;/, "TaskBlockSegmentProps must accept the cross-board drag-active flag");
 assert.match(taskBlockSource, /if \(!isAnyDragActive && !menuOpen\) return;[\s\S]{0,300}setHoverCardOpen\(false\);/, "an active drag (or the click/context menu) must force-close an already-open hover card");
 assert.match(taskBlockSource, /if \(isAnyDragActive \|\| menuOpen(?: \|\| hoverOpenTimeoutRef\.current != null)?\) return;/, "opening the hover card must be gated on isAnyDragActive");
@@ -656,10 +702,74 @@ for (const [name, source] of [
     ["dispatchExceptions", dispatchExceptionsSource],
 ] as const) {
     assert.ok(source.length > 0, `${name} must exist`);
-    assert.doesNotMatch(source, /framer-motion/, `${name} must not add the deferred animation pass`);
+    if (name !== "DispatchExceptions") {
+        assert.doesNotMatch(source, /framer-motion/, `${name} must keep Motion out of schedule geometry and derivation`);
+    }
     assert.doesNotMatch(source, /FloatingPopover|openMenu|contextmenu/i, `${name} must use the shared drawer seam, not a new menu system`);
     if (/opacity-0/.test(source)) assert.match(source, /\[@media\(hover:none\)\]:opacity-100/, `${name} hover-reveal controls must stay visible on no-hover devices`);
 }
+
+// Motion is confined to status surfaces, drawer/dialog entrance, and the
+// Dispatch exceptions strip. Schedule geometry remains plain React/DOM.
+assert.match(boardSource, /<MotionConfig reducedMotion="user">/, "the schedule board must honor the user's reduced-motion preference");
+assert.match(boardSource, /data-motion-scope="status-change"/, "draft/refresh status changes must use the narrow status transition scope");
+assert.match(drawerSource, /<motion\.aside/, "the shared task drawer must animate its entrance");
+assert.match(dialogSource, /<motion\.div[\s\S]{0,220}data-motion-scope="dialog-enter"/, "the save-time confirmation dialog must animate its entrance");
+assert.match(taskCreationDialogSource, /<motion\.div[\s\S]{0,220}data-motion-scope="dialog-enter"/, "the shared creation dialog must animate its entrance");
+assert.match(dispatchStripSource, /<motion\.div[\s\S]{0,220}data-motion-scope="exceptions-strip"/, "the exceptions strip must use its narrow transition scope");
+assert.doesNotMatch(scheduleBoardSourceTree, /\s(?:layout|layoutId)=/, "layout and layoutId props are forbidden everywhere under schedule-board/");
+assert.doesNotMatch(scheduleBoardSourceTree, /<motion\.[^>]*\sdrag(?:=|\s)/, "Motion drag props are forbidden everywhere under schedule-board/");
+for (const [name, source] of [
+    ["TaskBlockSegment", taskBlockSource],
+    ["ProjectBar", projectBarSource],
+    ["MonthBarsView", monthSource],
+    ["TimelineView", timelineSource],
+    ["UnscheduledTray", traySource],
+] as const) {
+    assert.doesNotMatch(source, /from "framer-motion"|<motion\./, `${name} dragged schedule geometry must never be a Motion component`);
+}
+
+// PR-A3 step 7: Vancouver weather is a separate, failure-safe payload. It is
+// cached for one hour, fetched concurrently with core dashboard data, and
+// rendered by date in all three schedule views without widening schedule-core.
+assert.ok(weatherSource.length > 0, "src/lib/weather.ts must exist");
+for (const [name, source] of [["weather", weatherSource], ["Month", monthSource], ["Timeline", timelineSource], ["Dispatch", dispatchViewSource]] as const) {
+    assert.doesNotMatch(source, /Â|Ã|â€“|ðŸ/, `${name} weather copy and glyphs must not contain mojibake`);
+}
+assert.match(weatherSource, /import \{ unstable_cache \} from "next\/cache"/);
+assert.match(weatherSource, /latitude=45\.6617&longitude=-122\.5484/, "the forecast must stay pinned to Vancouver, WA");
+for (const dailyField of ["weather_code", "temperature_2m_max", "temperature_2m_min", "precipitation_probability_max"]) {
+    assert.match(weatherSource, new RegExp(dailyField), `Open-Meteo daily field ${dailyField} must be requested`);
+}
+assert.match(weatherSource, /forecast_days=10/);
+assert.match(weatherSource, /temperature_unit=fahrenheit/);
+assert.match(weatherSource, /const controller = new AbortController\(\);[\s\S]{0,180}controller\.abort\(\), 3_000\)/, "weather fetches must abort after about three seconds");
+const weatherFetchStart = weatherSource.indexOf("async function fetchVancouverWeather(");
+const weatherFetchEnd = weatherSource.indexOf("const getCachedVancouverWeather", weatherFetchStart);
+const weatherFetchBody = weatherSource.slice(weatherFetchStart, weatherFetchEnd);
+assert.ok(weatherFetchStart >= 0, "the uncached weather fetcher must exist");
+assert.match(weatherFetchBody, /try \{[\s\S]*await fetch\(/, "the provider fetch must be wrapped");
+assert.match(weatherFetchBody, /catch \{[\s\S]{0,80}return null;/, "provider failures must return null");
+assert.match(weatherFetchBody, /finally \{[\s\S]{0,100}clearTimeout\(timeoutId\)/, "the abort timer must always be cleared");
+assert.match(weatherSource, /unstable_cache\([\s\S]*\["vancouver-wa-weather"\][\s\S]*revalidate: 3_600/, "weather must use a stable one-hour cache");
+assert.match(weatherSource, /export async function getVancouverWeather\(\)[\s\S]*try \{[\s\S]*getCachedVancouverWeather\(\)[\s\S]*catch \{[\s\S]*return null;/, "cache-layer failures must also degrade to null");
+assert.match(weatherSource, /export function weatherCodeToGlyph\(/, "WMO weather codes must map through one glyph helper");
+assert.doesNotMatch(coreSource, /VancouverForecastDay|weatherForecast/, "weather must not widen the core scheduling contract");
+
+assert.match(companyDashboardPageSource, /Promise\.all\(\[[\s\S]*getCompanyDashboardData\([\s\S]*getVancouverWeather\(\)[\s\S]*\]\)/, "dashboard data and weather must fetch concurrently");
+assert.match(companyDashboardPageSource, /<CompanyDashboardClient data=\{data\} weather=\{weather \?\? \[\]\}/, "weather must be passed separately and failure must become an empty list");
+assert.match(companyDashboardSource, /weather: VancouverForecastDay\[\]/, "the client boundary must carry the small separate weather array");
+assert.match(companyDashboardSource, /<ScheduleBoard[\s\S]{0,180}weather=\{weather\}/, "the client must thread weather separately to ScheduleBoard");
+assert.match(boardSource, /weather: VancouverForecastDay\[\]/, "ScheduleBoard must accept weather outside CompanyDashboardData");
+assert.equal((boardSource.match(/weather=\{weather\}/g) ?? []).length, 3, "all three schedule views must receive the separate weather array");
+
+assert.match(monthSource, /weatherByDate\.get\(dayKey\)/);
+assert.match(monthSource, /absolute right-1\.5 top-1\.5/, "Month weather glyphs must stay quiet in the cell's top-right corner");
+assert.match(timelineSource, />Vancouver<\/div>/, "Timeline forecast row must identify Vancouver explicitly");
+assert.match(timelineSource, /aria-label="Vancouver 10-day forecast"/);
+assert.match(dispatchViewSource, /Vancouver forecast/, "Dispatch weather must identify Vancouver");
+assert.match(dispatchViewSource, /visibleWeekDays\s*\.map\(day => weatherByDate\.get\(formatDate\(day\)\)\)\s*\.find\(\(forecast\): forecast is VancouverForecastDay => Boolean\(forecast\)\)/, "Dispatch week summary must use the first visible forecast rather than an elapsed week-start day");
+assert.match(dispatchViewSource, /\{forecast\.glyph\} \{forecast\.precipitationProbability\}% \{forecast\.high\}\{"\\u00B0"\}/, "Dispatch day headers must show glyph, rain probability, and high");
 
 assert.match(boardSource, /import \{ DispatchView \} from "\.\/DispatchView"/, "ScheduleBoard must import the dispatch view");
 assert.match(boardSource, /export type BoardView = "month" \| "timeline" \| "dispatch"/, "the persisted board view union must include dispatch");

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useState, type DragEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import type {
     CalendarOverlays,
     CompanyDashboardData,
@@ -8,6 +8,7 @@ import type {
     OverlayChangeOrderItem,
     OverlayIncomeItem,
 } from "@/lib/schedule-core";
+import type { VancouverForecastDay } from "@/lib/weather";
 import {
     addDays,
     formatCurrency,
@@ -26,6 +27,9 @@ import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks }
 import { MilestoneMarker } from "./MilestoneMarker";
 import { PROJECT_DRAG_MIME } from "./UnscheduledTray";
 import { assignMonthProjectLanes, getEffectiveProjectRange, segmentProjectRange } from "./useBarLayout";
+import type { DispatchTaskCreationDefaults } from "./DispatchView";
+import { clearScheduleTargetHighlight, highlightScheduleTarget, isDragVisualLayerActive } from "./dragVisualLayer";
+import { isPrimaryUnmodifiedClick, isScheduleCellBackgroundTarget } from "./emptyCellCreation";
 
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const EMPTY_INCOME: OverlayIncomeItem[] = [];
@@ -33,6 +37,7 @@ const EMPTY_CHANGE_ORDERS: OverlayChangeOrderItem[] = [];
 
 interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     data: CompanyDashboardData;
+    weather: VancouverForecastDay[];
     showIncome: boolean;
     showProjectedCo: boolean;
     showExpenses: boolean;
@@ -47,6 +52,7 @@ interface MonthBarsViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
+    onCreateTask: (_defaults: DispatchTaskCreationDefaults) => void;
     // team/crew list for the context-menu "Project crew…"/"Task crew…"
     // pickers (item 1) — reuses the exact CrewPicker/TaskCrewPicker the
     // Schedule & crew table uses.
@@ -103,6 +109,7 @@ function buildDayTotals(overlays: CalendarOverlays | null) {
 
 export function MonthBarsView({
     data,
+    weather,
     showIncome,
     showProjectedCo,
     showExpenses,
@@ -114,6 +121,7 @@ export function MonthBarsView({
     isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
+    onCreateTask,
     teamMembers,
     isAnyDragActive,
     onProjectMoveCommit,
@@ -134,7 +142,6 @@ export function MonthBarsView({
     onActivate,
 }: MonthBarsViewProps) {
     const [expandedWeeks, setExpandedWeeks] = useState<Set<number>>(() => new Set());
-    const [dragOverDate, setDragOverDate] = useState<string | null>(null);
     // Empty-day-cell "Schedule here…" context menu (item 1) — one instance
     // for the whole view, point-anchored to the right-click location.
     const [dayContextMenu, setDayContextMenu] = useState<{ date: string; point: { x: number; y: number } } | null>(null);
@@ -226,26 +233,40 @@ export function MonthBarsView({
     }
     const layout = assignMonthProjectLanes(workSegmentsByProject, milestoneDaysByProject, gridStart, gridEnd);
     const dayTotals = buildDayTotals(adminOverlays);
+    const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
 
     function handleDayDragOver(dayKey: string, event: DragEvent<HTMLDivElement>) {
         if (!data.canEdit || !hasProjectDragPayload(event)) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
-        setDragOverDate(dayKey);
+        highlightScheduleTarget({ clientX: event.clientX, clientY: event.clientY, targetDate: dayKey });
     }
 
-    function handleDayDragLeave(dayKey: string, event: DragEvent<HTMLDivElement>) {
+    function handleDayDragLeave(event: DragEvent<HTMLDivElement>) {
         if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
-        setDragOverDate(current => current === dayKey ? null : current);
+        clearScheduleTargetHighlight();
     }
 
     function handleDayDrop(dayKey: string, event: DragEvent<HTMLDivElement>) {
         if (!data.canEdit || !hasProjectDragPayload(event)) return;
         event.preventDefault();
-        setDragOverDate(null);
+        clearScheduleTargetHighlight();
         const projectId = event.dataTransfer.getData(PROJECT_DRAG_MIME);
         const project = data.pipeline.waitingToStart.find(candidate => candidate.id === projectId);
         if (project) onTrayProjectDrop(project, dayKey);
+    }
+
+    function handleDayClick(dayKey: string, event: ReactMouseEvent<HTMLDivElement>) {
+        if (!data.canEdit || isAnyDragActive || isDragVisualLayerActive()) return;
+        if (!isPrimaryUnmodifiedClick(event) || !isScheduleCellBackgroundTarget(event.target, event.currentTarget)) return;
+        onCreateTask({ defaultStartDate: dayKey });
+    }
+
+    function handleDayKeyDown(dayKey: string, event: KeyboardEvent<HTMLDivElement>) {
+        if (!data.canEdit || isAnyDragActive || isDragVisualLayerActive() || event.target !== event.currentTarget) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onCreateTask({ defaultStartDate: dayKey });
     }
 
     return (
@@ -279,17 +300,32 @@ export function MonthBarsView({
                                     const projectedCoTotal = showProjectedCo ? dayTotals?.projectedCo.get(dayKey) : undefined;
                                     const expenseTotal = showExpenses ? dayTotals?.expenses.get(dayKey) : undefined;
                                     const hoursTotal = showHours ? dayTotals?.hours.get(dayKey) : undefined;
+                                    const forecast = weatherByDate.get(dayKey);
                                     return (
                                         <div
                                             key={dayKey}
                                             data-schedule-date={dayKey}
                                             onDragOver={event => handleDayDragOver(dayKey, event)}
-                                            onDragLeave={event => handleDayDragLeave(dayKey, event)}
+                                            onDragLeave={handleDayDragLeave}
                                             onDrop={event => handleDayDrop(dayKey, event)}
+                                            onClick={event => handleDayClick(dayKey, event)}
+                                            onKeyDown={event => handleDayKeyDown(dayKey, event)}
                                             onContextMenu={event => handleDayContextMenu(dayKey, event)}
-                                            className={`min-w-0 border-r border-hui-border p-1.5 last:border-r-0 ${isCurrentMonth ? (isWeekend(day) ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""} ${dragOverDate === dayKey ? "bg-indigo-50 ring-2 ring-inset ring-indigo-500" : ""}`}
+                                            role={data.canEdit ? "button" : undefined}
+                                            tabIndex={data.canEdit ? 0 : undefined}
+                                            aria-label={data.canEdit ? `Create task on ${dayKey}` : undefined}
+                                            className={`relative min-w-0 border-r border-hui-border p-1.5 last:border-r-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 ${isCurrentMonth ? (isWeekend(day) ? "bg-slate-50/60" : "bg-white") : "bg-slate-50/40"} ${isToday ? "ring-1 ring-inset ring-indigo-300" : ""}`}
                                         >
                                             <span className={`text-xs font-semibold ${isToday ? "inline-flex h-6 w-6 items-center justify-center rounded-full bg-indigo-600 text-white" : isCurrentMonth ? "text-hui-textMain" : "text-slate-400"}`}>{day.getUTCDate()}</span>
+                                            {forecast && (
+                                                <span
+                                                    className="pointer-events-none absolute right-1.5 top-1.5 text-xs opacity-70"
+                                                    title={`Vancouver: ${forecast.low}\u00B0\u2013${forecast.high}\u00B0, ${forecast.precipitationProbability}% rain`}
+                                                    aria-hidden="true"
+                                                >
+                                                    {forecast.glyph}
+                                                </span>
+                                            )}
                                             <div className="space-y-0.5 pt-[332px]">
                                                 {incomeTotal != null && incomeTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-green-700" title="Income due this day (effective due date)">{formatCurrency(incomeTotal)} due</div>}
                                                 {projectedCoTotal != null && projectedCoTotal > 0 && <div className="truncate px-1 text-[10px] font-medium text-amber-700" title="Approved, unbilled change-order income projected this day">{formatCurrency(projectedCoTotal)} projected CO</div>}
