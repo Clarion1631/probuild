@@ -17,6 +17,11 @@ const timelineSource = src("../src/app/company-dashboard/schedule-board/Timeline
 const projectBarSource = src("../src/app/company-dashboard/schedule-board/ProjectBar.tsx");
 const taskBlockSource = src("../src/app/company-dashboard/schedule-board/TaskBlockSegment.tsx");
 const availabilityPanelSource = src("../src/app/company-dashboard/schedule-board/AvailabilityPanel.tsx");
+const availabilityHelpersSource = src("../src/app/company-dashboard/schedule-board/availability.ts");
+const dispatchViewSource = src("../src/app/company-dashboard/schedule-board/DispatchView.tsx");
+const dispatchJobCardSource = src("../src/app/company-dashboard/schedule-board/DispatchJobCard.tsx");
+const dispatchStripSource = src("../src/app/company-dashboard/schedule-board/DispatchExceptions.tsx");
+const dispatchExceptionsSource = src("../src/app/company-dashboard/schedule-board/dispatch-exceptions.ts");
 const traySource = src("../src/app/company-dashboard/schedule-board/UnscheduledTray.tsx");
 const dialogSource = src("../src/app/company-dashboard/schedule-board/ShiftConfirmDialog.tsx");
 const layoutSource = src("../src/app/company-dashboard/schedule-board/useBarLayout.ts");
@@ -533,4 +538,70 @@ assert.match(getScheduleCrewBody, /await assertActiveStaff\(\)/, "schedule crew 
 assert.match(getScheduleCrewBody, /hasPermission\(user, "schedules"\)/, "schedule crew lookup must require schedule access");
 assert.match(getScheduleCrewBody, /status: "ACTIVATED", role: "FIELD_CREW"/, "schedule crew lookup must filter before returning roster data");
 
+// Dispatch A2: Today/Week views + compact read-only exceptions strip.
+for (const [name, source] of [
+    ["DispatchView", dispatchViewSource],
+    ["DispatchJobCard", dispatchJobCardSource],
+    ["DispatchExceptions", dispatchStripSource],
+    ["dispatchExceptions", dispatchExceptionsSource],
+] as const) {
+    assert.ok(source.length > 0, `${name} must exist`);
+    assert.doesNotMatch(source, /framer-motion/, `${name} must not add the deferred animation pass`);
+    assert.doesNotMatch(source, /FloatingPopover|openMenu|contextmenu/i, `${name} must use the shared drawer seam, not a new menu system`);
+    if (/opacity-0/.test(source)) assert.match(source, /\[@media\(hover:none\)\]:opacity-100/, `${name} hover-reveal controls must stay visible on no-hover devices`);
+}
+
+assert.match(boardSource, /import \{ DispatchView \} from "\.\/DispatchView"/, "ScheduleBoard must import the dispatch view");
+assert.match(boardSource, /export type BoardView = "month" \| "timeline" \| "dispatch"/, "the persisted board view union must include dispatch");
+assert.match(boardSource, /stored === "month" \|\| stored === "timeline" \|\| stored === "dispatch"/, "stored dispatch selection must restore");
+assert.match(boardSource, /onClick=\{\(\) => selectBoardView\("dispatch"\)\}/, "the board toolbar must expose Dispatch beside Month and Timeline");
+assert.match(boardSource, /boardView === "dispatch" \? \(/, "ScheduleBoard must render DispatchView from the persisted union");
+assert.match(boardSource, /<DispatchView[\s\S]*?onActivate=\{handleBlockActivate\}/, "dispatch task activation must route through the one board drawer handler");
+assert.equal((boardSource.match(/<BoardTaskDrawer/g) ?? []).length, 1, "dispatch must not create a second task drawer");
+assert.equal((boardSource.match(/<TaskCreationDialog/g) ?? []).length, 1, "dispatch must reuse the one shared creation dialog");
+assert.match(boardSource, /defaultProjectId=\{taskCreationDefaults\.defaultProjectId\}/, "dispatch project defaults must reach the shared creation dialog");
+assert.match(boardSource, /defaultCrewIds=\{taskCreationDefaults\.defaultCrewIds\}/, "week-cell crew defaults must reach the shared creation dialog");
+assert.match(boardSource, /lockProject=\{taskCreationDefaults\.lockProject\}/, "job-card creation must lock its project");
+
+assert.match(dispatchViewSource, /const DISPATCH_MODE_STORAGE_KEY = "gtr-company-schedule-dispatch-mode"/, "Today/Week mode must use its own stable storage key");
+assert.match(dispatchViewSource, /localStorage\.getItem\(DISPATCH_MODE_STORAGE_KEY\)/);
+assert.match(dispatchViewSource, /localStorage\.setItem\(DISPATCH_MODE_STORAGE_KEY, nextMode\)/);
+assert.match(dispatchViewSource, /type DispatchMode = "today" \| "week"/);
+assert.match(dispatchViewSource, /overflow-x-auto/, "the week grid must scroll inside its own container");
+assert.match(dispatchViewSource, /member\.role === "FIELD_CREW"/, "the dispatch roster and available bench must be FIELD_CREW-only");
+assert.match(dispatchViewSource, /assignment\.userRole === "ADMIN" \|\| assignment\.userRole === "MANAGER"/, "manager support must be derived separately from task assignments");
+assert.match(dispatchViewSource, /Manager support/, "manager assignments must render on a separate muted line");
+assert.match(dispatchViewSource, /isConflictedDay\(crewConflicts, member\.id, dayKey, true\)/, "week conflict rings must import the canonical conflict-window helper and require two solid assignments");
+assert.match(dispatchViewSource, /defaultCrewIds: \[member\.id\]/, "an empty week cell must prefill that person");
+assert.match(dispatchViewSource, /defaultProjectId: project\.id[\s\S]{0,100}lockProject: true/, "a job-card + Task must prefill and lock its project");
+
+assert.match(dispatchJobCardSource, /onActivate\(task\.id\)/, "task details in a job card must open the shared drawer");
+assert.match(dispatchJobCardSource, /href=\{`\/projects\/\$\{project\.id\}`\}/, "job-card project names must link to the project");
+assert.match(dispatchJobCardSource, /assignmentRole === "lead"/, "today crew chips must mark the task lead");
+assert.match(dispatchJobCardSource, /doneWhen/, "today task rows must show completion criteria");
+assert.match(dispatchJobCardSource, /blockedReason/, "blocked status must expose its reason");
+
+assert.match(dispatchExceptionsSource, /import \{ isConflictedDay \} from "\.\/availability"/, "dispatch conflicts must reuse the extracted canonical helper");
+for (const functionName of ["getUnstaffedToday", "getNoLeadToday", "getTodayConflicts", "getBlockedTasks", "getCrewlessJobs"]) {
+    assert.match(dispatchExceptionsSource, new RegExp(`export function ${functionName}\\(`), `${functionName} must be a pure exported exception derivation`);
+}
+assert.match(dispatchStripSource, /getDispatchExceptions/, "the exceptions strip must derive through the shared pure module");
+assert.match(dispatchStripSource, /Day clear/, "the exceptions strip needs the subtle clear-day empty state");
+assert.match(dispatchStripSource, /Unstaffed today/);
+assert.match(dispatchStripSource, /No lead/);
+assert.match(dispatchStripSource, /Conflict/);
+assert.match(dispatchStripSource, /Blocked/);
+assert.match(dispatchStripSource, /Crewless job/);
+
+assert.match(availabilityPanelSource, /import \{[\s\S]{0,180}buildAvailabilityRows,[\s\S]{0,180}isConflictedDay,[\s\S]{0,180}from "\.\/availability"/, "AvailabilityPanel must consume extracted pure derivation helpers");
+assert.doesNotMatch(availabilityPanelSource, /function buildAvailabilityRows|function isConflictedDay/, "availability derivation must have one shared source");
+assert.match(availabilityHelpersSource, /export function buildAvailabilityRows/);
+assert.match(availabilityHelpersSource, /export function isConflictedDay/);
+
+assert.match(coreSource, /location: string \| null;/, "dispatch cards need a serialized project location");
+assert.match(coreSource, /doneWhen: string \| null;/, "dispatch cards need completion criteria");
+assert.match(coreSource, /blockedReason: string \| null;/, "dispatch cards need blocked reasons");
+assert.match(coreSource, /scheduledTime: string \| null;/, "dispatch appointments need their scheduled time");
+assert.match(coreSource, /confirmationStatus: string \| null;/, "dispatch appointments need confirmation status");
+assert.match(coreSource, /doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true/, "the dashboard task query must select every dispatch field");
 console.log("schedule-board render contract verification: PASS");

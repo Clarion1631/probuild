@@ -9,6 +9,14 @@ import {
     toTimelineRect,
 } from "../src/app/company-dashboard/schedule-board/useBarLayout";
 import * as barLayout from "../src/app/company-dashboard/schedule-board/useBarLayout";
+import {
+    getBlockedTasks,
+    getCrewlessJobs,
+    getNoLeadToday,
+    getTodayConflicts,
+    getUnstaffedToday,
+    type DispatchProjectInput,
+} from "../src/app/company-dashboard/schedule-board/dispatch-exceptions.ts";
 import { addDays, formatDate, parseUTCDate } from "../src/app/projects/[id]/schedule/schedule-utils";
 
 const project = {
@@ -436,4 +444,98 @@ assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart
 assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -10), addDays(resizeStart, 1), "dragging past the start clamps to start+1, never to or before the start");
 assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -3), addDays(resizeStart, 1), "the clamp boundary itself (candidate === start) also clamps to start+1");
 
+// Dispatch A2: pure exception derivation. Every category gets a positive and
+// negative fixture so the strip cannot silently broaden its meaning.
+const dispatchDay = "2037-01-05";
+const dispatchProject = (overrides: Partial<DispatchProjectInput> = {}): DispatchProjectInput => ({
+    id: "dispatch-project",
+    name: "Kitchen",
+    status: "In Progress",
+    crew: [{ id: "crew-1", name: "Ava", status: "ACTIVATED", role: "FIELD_CREW" }],
+    tasks: [],
+    ...overrides,
+});
+const dispatchTask = (overrides: Partial<DispatchProjectInput["tasks"][number]> = {}): DispatchProjectInput["tasks"][number] => ({
+    id: "dispatch-task",
+    name: "Set cabinets",
+    startDate: "2037-01-05T00:00:00.000Z",
+    endDate: "2037-01-06T00:00:00.000Z",
+    status: "In Progress",
+    type: "task",
+    blockedReason: null,
+    assignments: [],
+    ...overrides,
+});
+
+assert.deepEqual(
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask()] })], dispatchDay).map(item => item.taskId),
+    ["dispatch-task"],
+    "an active task with no solid assignment is unstaffed",
+);
+assert.equal(
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).length,
+    0,
+    "an active task with a solid assignment is not unstaffed",
+);
+assert.deepEqual(
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "manager-1", name: "Richard", status: "ACTIVATED", userRole: "ADMIN", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    ["dispatch-task"],
+    "manager support does not count as schedulable field-crew capacity",
+);
+
+assert.deepEqual(
+    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    ["dispatch-task"],
+    "a staffed active task without a lead is flagged",
+);
+assert.equal(
+    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "lead" }] })] })], dispatchDay).length,
+    0,
+    "a staffed active task with a lead is not flagged",
+);
+
+const solidConflict = {
+    userId: "crew-1",
+    name: "Ava",
+    pairs: [{
+        projectA: { id: "project-a", name: "Kitchen" },
+        projectB: { id: "project-b", name: "Bath" },
+        overlapStart: "2037-01-05T00:00:00.000Z",
+        overlapEnd: "2037-01-06T00:00:00.000Z",
+        taskA: { id: "task-a", name: "Cabinets", startDate: "2037-01-05T00:00:00.000Z", endDate: "2037-01-06T00:00:00.000Z" },
+        taskB: { id: "task-b", name: "Tile", startDate: "2037-01-05T00:00:00.000Z", endDate: "2037-01-06T00:00:00.000Z" },
+    }],
+};
+assert.deepEqual(
+    getTodayConflicts([solidConflict], dispatchDay).map(item => item.userId),
+    ["crew-1"],
+    "two solid task assignments on the same day are a true conflict",
+);
+assert.equal(
+    getTodayConflicts([{ ...solidConflict, pairs: [{ ...solidConflict.pairs[0], taskB: undefined }] }], dispatchDay).length,
+    0,
+    "a task assignment overlapping project-crew fallback is not a true dispatch conflict",
+);
+
+assert.deepEqual(
+    getBlockedTasks([dispatchProject({ tasks: [dispatchTask({ status: "Blocked", blockedReason: "Inspection failed" })] })]).map(item => item.reason),
+    ["Inspection failed"],
+    "blocked work on an In Progress project is surfaced with its reason",
+);
+assert.equal(
+    getBlockedTasks([dispatchProject({ status: "Waiting to Start", tasks: [dispatchTask({ status: "Blocked", blockedReason: "Permit" })] })]).length,
+    0,
+    "blocked work outside an In Progress project is not in the dispatch strip",
+);
+
+assert.deepEqual(
+    getCrewlessJobs([dispatchProject()], dispatchDay).map(item => item.projectId),
+    ["dispatch-project"],
+    "an In Progress project with field crew and no active task is crewless today",
+);
+assert.equal(
+    getCrewlessJobs([dispatchProject({ tasks: [dispatchTask()] })], dispatchDay).length,
+    0,
+    "an In Progress project with active work is not crewless today",
+);
 console.log("schedule-board layout verification: PASS");

@@ -73,6 +73,7 @@ export interface PipelineProject {
     id: string;
     name: string;
     client: string | null;
+    location: string | null;
     status: string;
     startDate: string | null;
     // Target end date (PB-schedule-002 item 3). Feeds getEffectiveProjectRange
@@ -136,6 +137,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             orderBy: { createdAt: "desc" },
             select: {
                 id: true, name: true, status: true, startDate: true, endDate: true, color: true,
+                location: true,
                 locationLat: true, locationLng: true,
                 client: { select: { name: true } },
                 crew: { select: { id: true, name: true, email: true, status: true, role: true } },
@@ -153,6 +155,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         id: p.id,
         name: p.name,
         client: p.client?.name ?? null,
+        location: p.location,
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
         endDate: p.endDate ? p.endDate.toISOString() : null,
@@ -1906,6 +1909,10 @@ export interface DashboardTaskRow {
     progress: number;
     status: string;
     type: string;
+    doneWhen: string | null;
+    blockedReason: string | null;
+    scheduledTime: string | null;
+    confirmationStatus: string | null;
     assignments: DashboardTaskAssignment[];
     // Hover-card notes (owner-feedback round, item 3): most recent 2 task
     // comments, newest first — same TaskComment source the project schedule
@@ -2171,6 +2178,7 @@ export async function getCompanyDashboardData(
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
                 id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
+                doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
                     select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true } } },
@@ -2202,6 +2210,10 @@ export async function getCompanyDashboardData(
             progress: task.progress,
             status: task.status,
             type: task.type,
+            doneWhen: task.doneWhen,
+            blockedReason: task.blockedReason,
+            scheduledTime: task.scheduledTime,
+            confirmationStatus: task.confirmationStatus,
             assignments: task.assignments.map(a => ({
                 id: a.id,
                 userId: a.userId,
