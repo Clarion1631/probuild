@@ -444,6 +444,55 @@ assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart
 assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -10), addDays(resizeStart, 1), "dragging past the start clamps to start+1, never to or before the start");
 assert.deepEqual(computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, -3), addDays(resizeStart, 1), "the clamp boundary itself (candidate === start) also clamps to start+1");
 
+// PR-A3 step 1: characterize the pure candidate semantics before replacing
+// React-rendered pointer previews with the detached visual layer. These are
+// release candidates (the values handed to the existing draft/immediate
+// writers), not transient ghost geometry.
+assert.deepEqual(
+    previewTaskPointerCandidate(task, "move", 0),
+    { startDate: "2037-01-03", endDate: "2037-01-06" },
+    "a threshold-crossing task drag that returns to its origin releases the canonical dates",
+);
+assert.deepEqual(
+    previewTaskPointerCandidate(task, "resize-right", 4),
+    { startDate: "2037-01-03", endDate: "2037-01-10" },
+    "task right-resize release candidates preserve the original start and move only the end",
+);
+assert.equal(
+    previewTaskPointerCandidate(task, "resize-left", 99),
+    null,
+    "an invalid task resize never produces a droppable candidate",
+);
+const backwardsProjectIntent = createProjectDropIntent(scheduledProject, "2036-12-30");
+assert.deepEqual(
+    backwardsProjectIntent && {
+        originalStart: backwardsProjectIntent.originalStart,
+        targetStart: backwardsProjectIntent.targetStart,
+        deltaDays: backwardsProjectIntent.deltaDays,
+    },
+    { originalStart: "2037-01-03", targetStart: "2036-12-30", deltaDays: -4 },
+    "project drop candidates retain signed day deltas for task-preview shifting and Save",
+);
+const backwardsProjectPreview = previewProjectMove(scheduledProject, "2036-12-30");
+assert.deepEqual(
+    backwardsProjectPreview.tasks.map(candidate => [candidate.startDate, candidate.endDate]),
+    [
+        ["2036-12-30", "2037-01-02"],
+        ["2037-01-16", "2037-01-16"],
+    ],
+    "Waiting-to-Start project previews shift every task by the exact project candidate delta",
+);
+assert.deepEqual(
+    previewProjectMove({ ...scheduledProject, status: "In Progress" }, "2036-12-30").tasks,
+    scheduledProject.tasks,
+    "In-Progress project previews remain marker-only until the Save-time choice",
+);
+assert.deepEqual(
+    computeProjectEndResizeCandidate(resizeOriginalEnd, resizeStart, 0),
+    resizeOriginalEnd,
+    "an end-resize released at its origin is a no-op candidate",
+);
+
 // Dispatch A2: pure exception derivation. Every category gets a positive and
 // negative fixture so the strip cannot silently broaden its meaning.
 const dispatchDay = "2037-01-05";

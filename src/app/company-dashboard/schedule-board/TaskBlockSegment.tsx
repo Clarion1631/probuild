@@ -10,6 +10,7 @@ import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } f
 import { FloatingPopover } from "./FloatingPopover";
 import { TaskCrewPicker } from "./CrewPickers";
 import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
+import { DRAG_VISUAL_ACTIVE_EVENT, isDragVisualLayerActive } from "./dragVisualLayer";
 
 export interface TaskPointerEditStart {
     pointerId: number;
@@ -208,12 +209,28 @@ export function TaskBlockSegment({
         }
         setHoverCardOpen(false);
     }, [isAnyDragActive, menuOpen]);
+    // Pointer drags no longer update ScheduleBoard state at threshold time.
+    // Listen below the board root so an already-open card still closes while
+    // the root render counter remains unchanged for the full active drag.
+    useEffect(() => {
+        const closeForPointerDrag = () => {
+            if (!isDragVisualLayerActive()) return;
+            if (hoverOpenTimeoutRef.current != null) {
+                window.clearTimeout(hoverOpenTimeoutRef.current);
+                hoverOpenTimeoutRef.current = null;
+            }
+            setHoverCardOpen(false);
+        };
+        window.addEventListener(DRAG_VISUAL_ACTIVE_EVENT, closeForPointerDrag);
+        return () => window.removeEventListener(DRAG_VISUAL_ACTIVE_EVENT, closeForPointerDrag);
+    }, []);
     useEffect(() => () => {
         if (hoverOpenTimeoutRef.current != null) window.clearTimeout(hoverOpenTimeoutRef.current);
     }, []);
 
     function handleHoverCardMouseEnter() {
         if (isAnyDragActive || menuOpen || hoverOpenTimeoutRef.current != null) return;
+        if (isDragVisualLayerActive()) return;
         hoverOpenTimeoutRef.current = window.setTimeout(() => {
             hoverOpenTimeoutRef.current = null;
             setHoverCardOpen(true);
@@ -221,6 +238,7 @@ export function TaskBlockSegment({
     }
     function handleHoverCardFocus() {
         if (isAnyDragActive || menuOpen) return;
+        if (isDragVisualLayerActive()) return;
         if (hoverOpenTimeoutRef.current != null) {
             window.clearTimeout(hoverOpenTimeoutRef.current);
             hoverOpenTimeoutRef.current = null;
@@ -256,7 +274,7 @@ export function TaskBlockSegment({
             pointerType: event.pointerType,
             clientX: event.clientX,
             clientY: event.clientY,
-            sourceElement: event.currentTarget,
+            sourceElement: rootRef.current ?? event.currentTarget,
             timelineDayWidth,
             timelineLeftInset,
             timelineScrollContainerRef,
@@ -405,6 +423,8 @@ export function TaskBlockSegment({
             aria-disabled={!canEdit || isPending}
             aria-busy={isPending}
             data-task-edit-block="true"
+            data-drag-visual-kind="task"
+            data-drag-task-id={task.id}
             data-project-start={formatDate(projectRange.start)}
             data-can-edit={canEdit ? "true" : "false"}
             onPointerDown={event => beginPointerEdit(event, "move")}

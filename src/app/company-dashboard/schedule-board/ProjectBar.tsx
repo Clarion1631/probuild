@@ -277,7 +277,7 @@ export function ProjectBar({
             pointerType: event.pointerType,
             clientX: event.clientX,
             clientY: event.clientY,
-            sourceElement: event.currentTarget,
+            sourceElement: rootRef.current ?? event.currentTarget,
             originalStart: formatDate(projectRange!.start),
             originalEnd: formatDate(projectRange!.end),
             timelineDayWidth,
@@ -420,6 +420,8 @@ export function ProjectBar({
             ref={rootRef}
             className={`group/project relative touch-pan-y select-none overflow-visible rounded-md border text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 ${canMoveProject && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
             style={{ backgroundColor: projectColor, height: barHeight }}
+            data-drag-visual-kind="project"
+            data-drag-project-id={project.id}
             data-can-edit={canEdit ? "true" : "false"}
             role="group"
             aria-label={`${project.name} project bar${isDraft ? " (unsaved change)" : ""}`}
@@ -431,7 +433,7 @@ export function ProjectBar({
             onContextMenu={handleContextMenu}
             onKeyDown={handleKeyboard}
         >
-            <div className="absolute inset-x-0 top-0 z-10 flex h-[18px] min-w-0 items-center gap-1 px-1 text-[10px] leading-none">
+            <div data-drag-project-title="true" className="absolute inset-x-0 top-0 z-10 flex h-[18px] min-w-0 items-center gap-1 px-1 text-[10px] leading-none">
                 {segment.continuesBefore && <span aria-hidden="true">‹</span>}
                 <Link href={`/projects/${project.id}`} title={projectTitle} className="min-w-0 flex-1 truncate font-semibold text-white outline-none hover:underline focus-visible:ring-2 focus-visible:ring-white">
                     {project.name}
