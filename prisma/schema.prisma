@@ -36,6 +36,8 @@ model User {
   officeTasks        OfficeTask[]      @relation("OfficeTaskAssignee")
   createdOfficeTasks OfficeTask[]      @relation("OfficeTaskCreator")
   dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
+  createdTaskMaterials TaskMaterial[] @relation("TaskMaterialCreator")
+  taskMaterialStatusChanges TaskMaterial[] @relation("TaskMaterialStatusChanger")
 }
 
 model Client {
@@ -874,6 +876,7 @@ model ScheduleTask {
 
   // Task details
   comments       TaskComment[]
+  materials      TaskMaterial[]
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
   subAssignments SubTaskAssignment[]
@@ -887,6 +890,33 @@ model ScheduleTask {
   @@index([leadId])
   @@index([generatedFromEstimateId])
   @@index([generatedFromChangeOrderId])
+}
+
+model TaskMaterial {
+  id                   String       @id @default(cuid())
+  taskId               String
+  task                 ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  text                 String
+  quantity             Decimal?
+  unit                 String?
+  location             String?
+  status               String       @default("pending") // pending | staged | missing | resolved
+  sourceKind           String       @default("manual") // manual | estimate | ai
+  sourceEstimateItemId String?
+  resolutionNote       String?
+  order                Int          @default(0)
+  createdById          String?
+  createdBy            User?        @relation("TaskMaterialCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  statusChangedById    String?
+  statusChangedBy      User?        @relation("TaskMaterialStatusChanger", fields: [statusChangedById], references: [id], onDelete: SetNull)
+  statusChangedAt      DateTime?
+
+  @@index([taskId, status])
+  @@index([taskId, sourceEstimateItemId])
+  @@index([createdById])
+  @@index([statusChangedById])
 }
 
 model TaskDependency {

@@ -35,6 +35,19 @@ import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils
 import { publishDispatch } from "./dispatch-publication";
 import type { DispatchIntent } from "./dispatch-intent";
 import type { PublishDispatchResult } from "./dispatch-publication";
+import {
+    addTaskMaterialCore,
+    deleteTaskMaterialCore,
+    getStagingQueueCore,
+    getTaskMaterialsCore,
+    importEstimateMaterialsCore,
+    setTaskMaterialStatusCore,
+    updateTaskMaterialCore,
+    type TaskMaterialActor,
+    type TaskMaterialInput,
+    type TaskMaterialUpdateInput,
+    type TaskMaterialStatus,
+} from "./task-materials-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -4023,6 +4036,29 @@ async function assertScheduleTaskAccess(taskId: string) {
     return { user, projectId: task.projectId };
 }
 
+async function assertStagingQueueAccess() {
+    const user = await assertActiveStaff();
+    if (!["ADMIN", "MANAGER", "FIELD_CREW"].includes(user.role) || !hasPermission(user, "schedules")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+function taskMaterialActor(user: any): TaskMaterialActor {
+    if (!user?.id) throw new Error("Authenticated staff user is required");
+    return {
+        userId: user.id,
+        role: user.role,
+        name: user.name || user.email,
+    };
+}
+
+function revalidateTaskMaterialPaths(projectId: string) {
+    revalidatePath(`/projects/${projectId}/schedule`);
+    revalidatePath("/company-dashboard");
+    revalidatePath("/company-dashboard/staging");
+}
+
 async function assertFinancialPermission() {
     return assertStaffPermission("financialReports");
 }
@@ -6643,6 +6679,102 @@ export async function getScheduleTaskDetail(taskId: string) {
         ...serializeScheduleTaskForDetail(task),
         allTasks: tasks.map(serializeScheduleTaskForDetail),
     };
+}
+
+export async function getTaskMaterials(taskId: string) {
+    const { user } = await assertScheduleTaskAccess(taskId);
+    const rows = await getTaskMaterialsCore(taskId);
+    return rows.map(row => ({
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    }));
+}
+
+export async function addTaskMaterial(taskId: string, input: TaskMaterialInput) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const row = await addTaskMaterialCore({
+        taskId,
+        input,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function updateTaskMaterial(materialId: string, input: TaskMaterialUpdateInput) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const row = await updateTaskMaterialCore({
+        materialId,
+        input,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function setTaskMaterialStatus(
+    materialId: string,
+    status: TaskMaterialStatus,
+    resolutionNote?: string | null,
+) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const row = await setTaskMaterialStatusCore({
+        materialId,
+        status,
+        resolutionNote,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function deleteTaskMaterial(materialId: string) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const result = await deleteTaskMaterialCore({
+        materialId,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return result;
+}
+
+export async function importEstimateMaterials(taskId: string) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const result = await importEstimateMaterialsCore({
+        taskId,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return result;
+}
+
+export async function getStagingQueue(dayISO: string) {
+    await assertStagingQueueAccess();
+    return getStagingQueueCore(dayISO);
 }
 
 export async function getPortalScheduleTasks(projectId: string) {

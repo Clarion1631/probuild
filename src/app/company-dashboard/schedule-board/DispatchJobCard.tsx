@@ -76,6 +76,12 @@ export function DispatchJobCard({
                         const outlinedCrew = project.crew.filter(member => member.status === "ACTIVATED" && member.role === "FIELD_CREW" && !assignedIds.has(member.id));
                         const statusTitle = task.status === "Blocked" && task.blockedReason ? `Blocked \u2014 ${task.blockedReason}` : task.status;
                         const progress = Math.max(0, Math.min(100, task.progress));
+                        const materialCount = task.pendingMaterials + task.stagedMaterials + task.missingMaterials;
+                        const materialBadgeStyle = task.missingMaterials > 0
+                            ? "bg-red-100 text-red-700"
+                            : task.pendingMaterials > 0
+                                ? "bg-amber-100 text-amber-800"
+                                : "bg-green-100 text-green-700";
                         return (
                             <section key={task.id} data-dispatch-task-id={task.id} className="px-4 py-3">
                                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -88,6 +94,14 @@ export function DispatchJobCard({
                                             <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${STATUS_STYLES[task.status] ?? STATUS_STYLES["Not Started"]}`} title={statusTitle}>
                                                 {task.status}
                                             </span>
+                                            {materialCount > 0 && (
+                                                <span
+                                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${materialBadgeStyle}`}
+                                                    title={`${task.stagedMaterials} staged, ${task.pendingMaterials} pending, ${task.missingMaterials} missing`}
+                                                >
+                                                    {"\u{1F4E6}"} {materialCount} {"\u00B7"} {task.missingMaterials} missing
+                                                </span>
+                                            )}
                                         </div>
                                         <div className="mt-2 flex items-center gap-2">
                                             <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100" role="progressbar" aria-label={`${task.name} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>

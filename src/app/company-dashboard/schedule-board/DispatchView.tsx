@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
@@ -379,6 +380,9 @@ export function DispatchView({
                     </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                    <Link href="/company-dashboard/staging" className="hui-btn hui-btn-secondary text-xs">
+                        {"\u{1F4E6}"} Staging queue
+                    </Link>
                     {data.canEdit && (
                         <button
                             type="button"

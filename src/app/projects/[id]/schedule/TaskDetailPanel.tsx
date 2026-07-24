@@ -5,6 +5,7 @@ import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemS
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 import DependencyPicker from "./DependencyPicker";
 import ColorPicker from "./ColorPicker";
+import { TaskMaterialsSection } from "./TaskMaterialsSection";
 
 const ESTIMATE_LINK_STOPWORDS = new Set(["and", "or", "the", "a", "to", "of", "with", "for", "in", "on", "at", "&"]);
 function tokenizeForMatch(s: string): string[] {
@@ -338,6 +339,10 @@ export default function TaskDetailPanel({
                                 )}
                             </div>
                         </details>
+
+                        <div className="border-t border-slate-100" />
+
+                        <TaskMaterialsSection taskId={task.id} estimateItemId={task.estimateItemId ?? null} />
 
                         <div className="border-t border-slate-100" />
 
