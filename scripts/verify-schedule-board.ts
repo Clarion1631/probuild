@@ -518,6 +518,7 @@ async function main() {
             && /UPDATE "ScheduleTask"[\s\S]*?RETURNING "id", "startDate", "endDate"/.test(scheduleCoreSource));
 
         const actionsSource = readFileSync(new URL("../src/lib/actions.ts", import.meta.url), "utf8");
+        const scheduleTaskCoreSource = readFileSync(new URL("../src/lib/schedule-task-core.ts", import.meta.url), "utf8");
         const actionStart = actionsSource.indexOf("export async function shiftNotStartedTasksAction");
         const actionEnd = actionsSource.indexOf("export async function generateProjectScheduleAction", actionStart);
         const actionBody = actionsSource.slice(actionStart, actionEnd);
@@ -533,11 +534,11 @@ async function main() {
         check("canonical task action preserves schedule permission and project access for date mutations", canonicalTaskActionStart >= 0
             && canonicalTaskActionBody.includes("await assertScheduleTaskAccess(taskId)")
             && !canonicalTaskActionBody.includes('["ADMIN", "MANAGER"].includes(user.role)')
-            && canonicalTaskActionBody.includes("parseStartDateInput")
-            && canonicalTaskActionBody.includes('SELECT id FROM "Project"')
-            && canonicalTaskActionBody.includes('SELECT id FROM "ScheduleTask"')
-            && canonicalTaskActionBody.includes("persistedTask.type === \"milestone\"")
-            && canonicalTaskActionBody.includes('revalidatePath("/company-dashboard")'));
+            && canonicalTaskActionBody.includes("updateScheduleTaskInTransaction(")
+            && canonicalTaskActionBody.includes('revalidatePath("/company-dashboard")')
+            && scheduleTaskCoreSource.includes("parseStartDateInput")
+            && scheduleTaskCoreSource.includes("lockTaskAssignmentParent(tx, taskId")
+            && scheduleTaskCoreSource.includes('persisted.type === "milestone"'));
         const companyTaskAdapterStart = actionsSource.indexOf("export async function updateCompanyScheduleTaskDatesAction");
         const companyTaskAdapterEnd = actionsSource.indexOf("export async function updateProjectStatus", companyTaskAdapterStart);
         const companyTaskAdapterBody = actionsSource.slice(companyTaskAdapterStart, companyTaskAdapterEnd);
@@ -721,12 +722,12 @@ async function main() {
         check("teamMembers.burdenedHourlyRate is exactly hourlyRate + burdenRate, rounded to 2dp",
             soloNamedEntry?.role === "FIELD_CREW" && soloNamedEntry?.burdenedHourlyRate === 30.85);
 
-        const scheduleCoreCrewStart = scheduleCoreSource.indexOf("export async function setProjectCrew");
+        const scheduleCoreCrewStart = scheduleCoreSource.indexOf("async function runSetProjectCrew");
         const scheduleCoreCrewEnd = scheduleCoreSource.indexOf("export interface CrewConflictPair", scheduleCoreCrewStart);
         const scheduleCoreCrewBody = scheduleCoreSource.slice(scheduleCoreCrewStart, scheduleCoreCrewEnd);
         check("source validates ACTIVATED only for users being added to project crew",
             scheduleCoreCrewBody.includes("toConnect.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
-        const scheduleCoreTaskCrewStart = scheduleCoreSource.indexOf("export async function setTaskCrew");
+        const scheduleCoreTaskCrewStart = scheduleCoreSource.indexOf("async function runSetTaskCrew");
         const scheduleCoreTaskCrewBody = scheduleCoreSource.slice(scheduleCoreTaskCrewStart);
         check("source validates ACTIVATED only for users being added to task crew",
             scheduleCoreTaskCrewBody.includes("toAdd.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));

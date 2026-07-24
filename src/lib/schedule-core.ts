@@ -1064,16 +1064,24 @@ export interface GenerateScheduleResult {
  * SUBTREE — a protected descendant keeps the whole subtree (never a cascade
  * through protected work).
  */
-export async function generateScheduleFromEstimate(input: {
+export interface GenerateScheduleInput {
     estimateId: string;
     mode?: "merge" | "regenerate";
     requireEmptyProject?: boolean;
     actor: ScheduleActor;
-}): Promise<GenerateScheduleResult> {
+}
+
+interface InternalGenerateScheduleInput extends GenerateScheduleInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runGenerateScheduleFromEstimate(
+    input: InternalGenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
     const mode = input.mode ?? "merge";
     if (mode !== "merge" && mode !== "regenerate") throw new Error(`Unknown generation mode "${mode}"`);
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Lock-then-read, mirroring setProjectStartDate exactly: resolve the
         // project id with a minimal read, take the Project row lock, and ONLY
         // THEN re-read the full estimate (items, paymentSchedules — clones are
@@ -1510,7 +1518,23 @@ export async function generateScheduleFromEstimate(input: {
         });
 
         return { estimateCode: estimate.code, created: createdRows, skipped, milestonesLinked, notes };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function generateScheduleFromEstimate(
+    input: GenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
+    return runGenerateScheduleFromEstimate(input);
+}
+
+export async function generateScheduleFromEstimateInTransaction(
+    tx: Prisma.TransactionClient,
+    input: GenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
+    return runGenerateScheduleFromEstimate({ ...input, transaction: tx });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1528,12 +1552,20 @@ export interface ProjectCrewMember {
  * Every id must be an ACTIVATED user. Idempotent; writes a "set_project_crew"
  * ActivityLog row.
  */
-export async function setProjectCrew(input: {
+export interface SetProjectCrewInput {
     projectId: string;
     userIds: string[];
     actor: ScheduleActor;
-}): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+}
+
+interface InternalSetProjectCrewInput extends SetProjectCrewInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runSetProjectCrew(
+    input: InternalSetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    const execute = async (tx: Prisma.TransactionClient) => {
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${input.projectId} FOR UPDATE`;
         const project = await tx.project.findUnique({
             where: { id: input.projectId },
@@ -1590,7 +1622,23 @@ export async function setProjectCrew(input: {
             projectId: input.projectId,
             crew: wanted.map(id => ({ id, name: byId.get(id)!.name || byId.get(id)!.email })),
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function setProjectCrew(
+    input: SetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    return runSetProjectCrew(input);
+}
+
+export async function setProjectCrewInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    return runSetProjectCrew({ ...input, transaction: tx });
 }
 
 export interface CrewConflictPair {
@@ -2574,15 +2622,23 @@ export interface ApplyChangeOrderResult {
  * tasks exist (linking still converges); "regenerate" rebuilds only
  * provenance-tagged subtrees passing the P2 full eligibility predicate.
  */
-export async function applyChangeOrderToSchedule(input: {
+export interface ApplyChangeOrderScheduleInput {
     changeOrderId: string;
     mode?: "merge" | "regenerate";
     actor: ScheduleActor;
-}): Promise<ApplyChangeOrderResult> {
+}
+
+interface InternalApplyChangeOrderScheduleInput extends ApplyChangeOrderScheduleInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runApplyChangeOrderToSchedule(
+    input: InternalApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
     const mode = input.mode ?? "merge";
     if (mode !== "merge" && mode !== "regenerate") throw new Error(`Unknown mode "${mode}"`);
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Lock-then-read (same discipline as generation and start-date moves).
         const coRef = await tx.changeOrder.findUnique({
             where: { id: input.changeOrderId },
@@ -2996,7 +3052,23 @@ export async function applyChangeOrderToSchedule(input: {
         });
 
         return { changeOrderCode: co.code, projectId, created: createdRows, skipped, milestonesLinked, notes };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function applyChangeOrderToSchedule(
+    input: ApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
+    return runApplyChangeOrderToSchedule(input);
+}
+
+export async function applyChangeOrderToScheduleInTransaction(
+    tx: Prisma.TransactionClient,
+    input: ApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
+    return runApplyChangeOrderToSchedule({ ...input, transaction: tx });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3008,12 +3080,26 @@ export async function applyChangeOrderToSchedule(input: {
  * id must be an ACTIVATED user (same validation as setProjectCrew); role stays
  * "assigned". Idempotent; writes a "set_task_crew" ActivityLog row.
  */
-export async function setTaskCrew(input: {
+export interface SetTaskCrewInput {
     taskId: string;
     userIds: string[];
     actor: ScheduleActor;
-}): Promise<{ taskId: string; projectId: string; assignments: { id: string; userId: string; name: string }[] }> {
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+}
+
+export interface SetTaskCrewResult {
+    taskId: string;
+    projectId: string;
+    assignments: { id: string; userId: string; name: string; role: string }[];
+}
+
+interface InternalSetTaskCrewInput extends SetTaskCrewInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runSetTaskCrew(
+    input: InternalSetTaskCrewInput,
+): Promise<SetTaskCrewResult> {
+    const execute = async (tx: Prisma.TransactionClient) => {
         const lockedParent = await lockTaskAssignmentParent(tx, input.taskId);
         const task = await tx.scheduleTask.findUnique({
             where: { id: input.taskId },
@@ -3072,12 +3158,31 @@ export async function setTaskCrew(input: {
 
         const final = await tx.taskAssignment.findMany({
             where: { taskId: input.taskId },
-            select: { id: true, userId: true, user: { select: { name: true, email: true } } },
+            select: { id: true, userId: true, role: true, user: { select: { name: true, email: true } } },
         });
         return {
             taskId: input.taskId,
             projectId: task.projectId,
-            assignments: final.map(a => ({ id: a.id, userId: a.userId, name: a.user.name || a.user.email })),
+            assignments: final.map(a => ({
+                id: a.id,
+                userId: a.userId,
+                name: a.user.name || a.user.email,
+                role: a.role,
+            })),
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function setTaskCrew(input: SetTaskCrewInput): Promise<SetTaskCrewResult> {
+    return runSetTaskCrew(input);
+}
+
+export async function setTaskCrewInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetTaskCrewInput,
+): Promise<SetTaskCrewResult> {
+    return runSetTaskCrew({ ...input, transaction: tx });
 }

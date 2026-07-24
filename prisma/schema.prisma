@@ -976,6 +976,19 @@ model TaskAssignment {
   @@unique([taskId, userId])
 }
 
+model McpConfirmation {
+  id         String    @id @default(cuid())
+  token      String    @unique
+  toolName   String
+  argsHash   String
+  preview    String
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  @@index([expiresAt])
+}
+
 model Subcontractor {
   id            String  @id @default(cuid())
   companyName   String
