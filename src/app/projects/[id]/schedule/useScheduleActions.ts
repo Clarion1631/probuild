@@ -7,7 +7,7 @@ import {
     aiGenerateSchedule,
     addTaskComment, getTaskComments, addTaskPunchItem, togglePunchItem,
     deletePunchItem, getTaskPunchItems, aiGeneratePunchlist,
-    assignUserToTask, unassignUserFromTask, assignSubToTask, unassignSubFromTask,
+    assignUserToTask, unassignUserFromTask, setTaskLead, assignSubToTask, unassignSubFromTask,
     getEstimateItemsForProject,
 } from "@/lib/actions";
 import { toast } from "sonner";
@@ -95,7 +95,7 @@ export function useScheduleActions(
             const start = newTaskStart;
             const end = newTaskType === "milestone" ? start : newTaskEnd;
             const task = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
-            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
             toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
             setShowNewTaskForm(false);
         } finally { setIsAdding(false); }
@@ -127,9 +127,42 @@ export function useScheduleActions(
         }
     }
 
-    async function handleStatusChange(taskId: string, status: string) {
-        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status } : t));
-        await updateScheduleTask(taskId, { status });
+    async function handleStatusChange(taskId: string, status: string, blockedReason?: string) {
+        if (status === "Blocked" && !blockedReason?.trim()) {
+            const promptedReason = window.prompt("Why is this task blocked?", "");
+            if (!promptedReason?.trim()) return;
+            blockedReason = promptedReason.trim();
+        }
+        const previous = tasksRef.current.find(t => t.id === taskId);
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status, blockedReason: status === "Blocked" ? (blockedReason ?? t.blockedReason) : null } : t));
+        try {
+            await updateScheduleTask(taskId, { status, blockedReason: status === "Blocked" ? blockedReason : null });
+        } catch (error) {
+            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+            toast.error(error instanceof Error ? error.message : "Failed to update status");
+        }
+    }
+
+    async function handleDoneWhenChange(taskId: string, doneWhen: string | null) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.doneWhen ?? null;
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen } : t));
+        try {
+            await updateScheduleTask(taskId, { doneWhen });
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to update completion criteria");
+        }
+    }
+
+    async function handleAppointmentChange(taskId: string, data: { scheduledTime?: string | null; confirmationStatus?: "planned" | "requested" | "confirmed" | null }) {
+        const previous = tasksRef.current.find(t => t.id === taskId);
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...data } : t));
+        try {
+            await updateScheduleTask(taskId, data);
+        } catch (error) {
+            if (previous) setTasks(prev => prev.map(t => t.id === taskId ? previous : t));
+            toast.error(error instanceof Error ? error.message : "Failed to update appointment");
+        }
     }
 
     async function handleColorChange(taskId: string, color: string) {
@@ -223,6 +256,7 @@ export function useScheduleActions(
                 type: "task",
                 assignee: null, order: t.order,
                 estimatedHours: t.estimatedHours, actualHours: 0,
+                doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null,
                 dependencies: [], dependents: [], assignments: [],
                 estimateItemId: null, estimateItem: null,
             }));
@@ -265,6 +299,7 @@ export function useScheduleActions(
                 endDate: formatDate(new Date(t.endDate)),
                 type: "task" as const,
                 actualHours: 0, estimatedHours: null,
+                doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null,
                 dependencies: [], dependents: [], assignments: [],
                 estimateItemId: t.estimateItemId || null, estimateItem: null,
             }))]);
@@ -372,6 +407,17 @@ export function useScheduleActions(
         setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: (t.assignments || []).filter(a => a.userId !== userId) } : t));
     }
 
+    async function handleSetLead(userId: string | null) {
+        if (!selectedTaskId) return;
+        try {
+            const assignments = await setTaskLead(selectedTaskId, userId);
+            setTasks(prev => prev.map(t => t.id === selectedTaskId ? { ...t, assignments: assignments as any } : t));
+            toast.success(userId ? "Task lead updated" : "Task lead removed");
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Failed to update task lead");
+        }
+    }
+
     async function handleAssignSub(subId: string) {
         if (!selectedTaskId) return;
         try {
@@ -404,7 +450,7 @@ export function useScheduleActions(
         openNewTaskForm, handleAddTask,
 
         // Task CRUD
-        handleDateChange, handleStatusChange, handleColorChange,
+        handleDateChange, handleStatusChange, handleDoneWhenChange, handleAppointmentChange, handleColorChange,
         handleDelete, handleNameSave, handleEstimatedHoursSave,
         handleProgressChange, cascadeDependents,
 
@@ -430,7 +476,7 @@ export function useScheduleActions(
         punchItems, handleAddPunch, handleTogglePunch, handleDeletePunch,
         handleAiPunchlist, isAiPunching,
         comments, handleAddComment,
-        handleAssign, handleUnassign, handleAssignSub, handleUnassignSub,
+        handleAssign, handleUnassign, handleSetLead, handleAssignSub, handleUnassignSub,
         selectTask,
     };
 }

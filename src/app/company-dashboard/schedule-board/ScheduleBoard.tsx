@@ -12,6 +12,8 @@ import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
+import { BoardTaskDrawer } from "./BoardTaskDrawer";
+import TaskCreationDialog from "@/components/TaskCreationDialog";
 import {
     computeProjectEndResizeCandidate,
     createProjectDropIntent,
@@ -210,6 +212,8 @@ export function ScheduleBoard({
     const [showExpenses, setShowExpenses] = useState(false);
     const [showHours, setShowHours] = useState(false);
     const [boardView, setBoardView] = useState<BoardView>("month");
+    const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+    const [taskCreationOpen, setTaskCreationOpen] = useState(false);
     // Lifted from TimelineView (see CREW_MODE_STORAGE_KEY) so the
     // availability panel's drill-down can force crew mode on even when
     // Timeline is already mounted — writing localStorage alone wouldn't
@@ -306,6 +310,11 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
+    const activeProjectOptions = useMemo(() => canonicalProjects.map(project => ({
+        id: project.id,
+        name: project.name,
+        color: project.color || "#4c9a2a",
+    })), [canonicalProjects]);
     // A saved-but-not-yet-refreshed task keeps its override (pinned to the
     // persisted dates) purely for rendering/reconciliation — it is NOT an
     // unsaved draft and must not count toward or re-enter a Save.
@@ -315,6 +324,11 @@ export function ScheduleBoard({
     );
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
     const draftCount = draftTaskIds.size + draftProjectIds.size;
+    const openTaskProjectId = openTaskId ? canonicalTaskProjectById.get(openTaskId) : null;
+    const openTaskHasDraft = Boolean(openTaskId && (
+        draftTaskIds.has(openTaskId)
+        || (openTaskProjectId && draftProjectIds.has(openTaskProjectId))
+    ));
 
     // Locking during draft mode: a drafted item stays fully interactive.
     // Only an in-flight Save (global — the whole board pauses while
@@ -525,6 +539,32 @@ export function ScheduleBoard({
             // The selected view still applies for this session when persistence fails.
         }
     }
+
+    const handleBlockActivate = useCallback((taskId: string) => {
+        setOpenTaskId(taskId);
+    }, []);
+    const closeTaskDrawer = useCallback(() => setOpenTaskId(null), []);
+    const selectDrawerTask = useCallback((taskId: string) => setOpenTaskId(taskId), []);
+    const handleDrawerTaskDeleted = useCallback((taskId: string) => {
+        if (activeTaskPointerRef.current?.taskId === taskId) activeTaskPointerRef.current.cleanup();
+        if (taskKeyboardEditRef.current?.taskId === taskId) {
+            taskKeyboardCleanupRef.current?.();
+            setTaskKeyboardState(null);
+        }
+        setTaskDateOverrides(current => {
+            if (!(taskId in current)) return current;
+            const next = { ...current };
+            delete next[taskId];
+            return next;
+        });
+        setAwaitingTaskRefreshIds(current => {
+            if (!current.has(taskId)) return current;
+            const next = new Set(current);
+            next.delete(taskId);
+            return next;
+        });
+        setOpenTaskId(null);
+    }, []);
 
     function setProjectPreview(project: DashboardProjectRow, targetStart: string) {
         const preview = previewProjectMove(project, targetStart);
@@ -1642,6 +1682,11 @@ export function ScheduleBoard({
                             Timeline
                         </button>
                     </div>
+                    {data.canEdit && (
+                        <button type="button" onClick={() => setTaskCreationOpen(true)} className="hui-btn hui-btn-primary text-sm">
+                            + Task
+                        </button>
+                    )}
                     {isAdmin && overlays && (
                         <div className="flex flex-wrap items-center gap-1 mr-1">
                             <button type="button" onClick={() => setShowIncome(value => !value)} className={`text-xs font-semibold px-2 py-1 rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${showIncome ? "bg-green-100 text-green-700 border-green-300" : "bg-white text-hui-textMuted border-hui-border"}`}>Income</button>
@@ -1717,6 +1762,7 @@ export function ScheduleBoard({
                     onTaskKeyboardCancel={handleTaskKeyboardCancel}
                     onTaskDatesCommit={handleTaskDatesCommit}
                     onTaskMoveBy={handleTaskMoveBy}
+                    onActivate={handleBlockActivate}
                 />
             ) : (
                 <TimelineView
@@ -1752,6 +1798,7 @@ export function ScheduleBoard({
                     onTaskKeyboardCancel={handleTaskKeyboardCancel}
                     onTaskDatesCommit={handleTaskDatesCommit}
                     onTaskMoveBy={handleTaskMoveBy}
+                    onActivate={handleBlockActivate}
                 />
             )}
             {data.canEdit && <AvailabilityPanel data={data} onDrillDown={drillDownToCrewTimeline} />}
@@ -1760,6 +1807,19 @@ export function ScheduleBoard({
                 isPending={false}
                 onChoice={handleMoveChoice}
                 onCancel={cancelConfirmedMove}
+            />
+            <BoardTaskDrawer
+                taskId={openTaskId}
+                hasDraft={openTaskHasDraft}
+                teamMembers={data.teamMembers ?? []}
+                onClose={closeTaskDrawer}
+                onSelectTask={selectDrawerTask}
+                onDeleted={handleDrawerTaskDeleted}
+            />
+            <TaskCreationDialog
+                open={taskCreationOpen}
+                onClose={() => setTaskCreationOpen(false)}
+                projects={activeProjectOptions}
             />
         </div>
     );

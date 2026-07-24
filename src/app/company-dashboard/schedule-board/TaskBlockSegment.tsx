@@ -28,6 +28,7 @@ export interface ActiveTaskKeyboardEdit {
 }
 
 export interface TaskEditCallbacks {
+    onActivate: (taskId: string) => void;
     onTaskPointerEditStart: (_task: DashboardTaskRow, _mode: TaskEditMode, _start: TaskPointerEditStart) => void;
     onTaskKeyboardStart: (_task: DashboardTaskRow, _mode: TaskEditMode, _sourceElement: HTMLElement) => void;
     onTaskKeyboardAdjust: (_task: DashboardTaskRow, _mode: TaskEditMode, _deltaDays: number) => void;
@@ -128,6 +129,7 @@ export function TaskBlockSegment({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: TaskBlockSegmentProps) {
     const router = useRouter();
     const observerRef = useRef<ResizeObserver | null>(null);
@@ -267,8 +269,8 @@ export function TaskBlockSegment({
         setMenuOpen(true);
     }
 
-    // Activation seam: a future drawer can replace this one function while
-    // pointer, keyboard, and edit-gating behavior stays at the block boundary.
+    // Plain activation opens the one board-level drawer. The quick menu remains
+    // an explicit right-click / keyboard-context-menu surface.
     function handleBlockActivate(event: ReactMouseEvent<HTMLDivElement> | KeyboardEvent<HTMLElement>) {
         if (!canEdit || isPending) return;
         if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
@@ -276,14 +278,7 @@ export function TaskBlockSegment({
         // PROJECT menu — without this, the bar menu instantly replaces the
         // task menu via the exclusive-menu coordinator.
         event.stopPropagation();
-        const anchorPoint = event.type === "click"
-            ? { x: (event as ReactMouseEvent<HTMLDivElement>).clientX, y: (event as ReactMouseEvent<HTMLDivElement>).clientY }
-            : null;
-        if (menuOpen) {
-            setMenuOpen(false);
-        } else {
-            openMenu(anchorPoint);
-        }
+        onActivate(task.id);
     }
 
     function handleKeyboard(event: KeyboardEvent<HTMLElement>, mode: TaskEditMode) {

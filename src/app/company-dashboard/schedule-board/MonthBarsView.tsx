@@ -131,6 +131,7 @@ export function MonthBarsView({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: MonthBarsViewProps) {
     const [expandedWeeks, setExpandedWeeks] = useState<Set<number>>(() => new Set());
     const [dragOverDate, setDragOverDate] = useState<string | null>(null);
@@ -342,6 +343,7 @@ export function MonthBarsView({
                                                     onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                     onTaskDatesCommit={onTaskDatesCommit}
                                                     onTaskMoveBy={onTaskMoveBy}
+                                                    onActivate={onActivate}
                                                 />
                                             </div>
                                         );
@@ -391,6 +393,7 @@ export function MonthBarsView({
                                                                     onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                                     onTaskDatesCommit={onTaskDatesCommit}
                                                                     onTaskMoveBy={onTaskMoveBy}
+                                                                    onActivate={onActivate}
                                                                 />
                                                             ))}
                                                         </div>

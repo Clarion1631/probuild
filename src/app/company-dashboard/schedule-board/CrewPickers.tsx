@@ -27,7 +27,7 @@ function initials(name: string): string {
     return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
-interface CrewOption {
+export interface CrewOption {
     id: string;
     label: string;
 }
@@ -70,16 +70,20 @@ function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError
     return { submit, isPending };
 }
 
-function CrewChecklist({
+export function CrewChecklist({
     legend,
     options,
     selected,
     onToggle,
+    leadUserId,
+    onLeadChange,
 }: {
     legend: string;
     options: CrewOption[];
     selected: string[];
     onToggle: (userId: string) => void;
+    leadUserId?: string | null;
+    onLeadChange?: (userId: string | null) => void;
 }) {
     return (
         <fieldset className="m-0 min-w-0 border-0 p-0">
@@ -88,17 +92,35 @@ function CrewChecklist({
                 <p className="px-2 py-1 text-xs text-hui-textMuted">No active team members.</p>
             ) : (
                 <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
-                    {options.map(option => (
-                        <label key={option.id} className="flex min-h-11 min-w-0 items-center gap-2 rounded-md px-2 py-2 hover:bg-slate-50 focus-within:ring-2 focus-within:ring-hui-primary">
-                            <input
-                                type="checkbox"
-                                checked={selected.includes(option.id)}
-                                onChange={() => onToggle(option.id)}
-                                className="h-4 w-4 shrink-0 accent-hui-primary"
-                            />
-                            <span className="min-w-0 break-words text-sm text-hui-textMain">{option.label}</span>
-                        </label>
-                    ))}
+                    {options.map(option => {
+                        const isSelected = selected.includes(option.id);
+                        const isLead = leadUserId === option.id;
+                        return (
+                            <div key={option.id} className="flex min-h-11 min-w-0 items-center rounded-md px-2 py-1 hover:bg-slate-50 focus-within:ring-2 focus-within:ring-hui-primary">
+                                <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1">
+                                    <input
+                                        type="checkbox"
+                                        checked={isSelected}
+                                        onChange={() => onToggle(option.id)}
+                                        className="h-4 w-4 shrink-0 accent-hui-primary"
+                                    />
+                                    <span className="min-w-0 break-words text-sm text-hui-textMain">{option.label}</span>
+                                </label>
+                                {isSelected && onLeadChange && (
+                                    <button
+                                        type="button"
+                                        onClick={() => onLeadChange(isLead ? null : option.id)}
+                                        aria-label={isLead ? `Remove ${option.label} as lead` : `Set ${option.label} as lead`}
+                                        aria-pressed={isLead}
+                                        title={isLead ? "Task lead" : "Make task lead"}
+                                        className={`ml-1 shrink-0 rounded p-1 transition ${isLead ? "bg-amber-50 text-amber-500" : "text-slate-300 hover:bg-amber-50 hover:text-amber-500"}`}
+                                    >
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill={isLead ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8"><path d="m12 2.75 2.84 5.75 6.35.92-4.6 4.48 1.09 6.32L12 17.24l-5.68 2.98 1.09-6.32-4.6-4.48 6.35-.92L12 2.75Z" /></svg>
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })}
                 </div>
             )}
         </fieldset>

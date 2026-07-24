@@ -166,6 +166,7 @@ export function ProjectBar({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: ProjectBarProps) {
     const router = useRouter();
     const gridStart = useContext(ProjectBarGridStartContext);
@@ -620,6 +621,7 @@ export function ProjectBar({
                         onTaskKeyboardCancel={onTaskKeyboardCancel}
                         onTaskDatesCommit={onTaskDatesCommit}
                         onTaskMoveBy={onTaskMoveBy}
+                        onActivate={onActivate}
                     />
                 ))}
             </div>

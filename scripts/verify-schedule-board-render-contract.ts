@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 // Owner-feedback round (2026-07-22) rewrote the company schedule board from
 // per-drag auto-save + project locking to local draft-mode + one explicit
@@ -7,7 +7,8 @@ import { readFileSync } from "node:fs";
 // spec items 1-8 — rather than mirroring implementation lines 1:1.
 
 function src(path: string): string {
-    return readFileSync(new URL(path, import.meta.url), "utf8");
+    const url = new URL(path, import.meta.url);
+    return existsSync(url) ? readFileSync(url, "utf8") : "";
 }
 
 const boardSource = src("../src/app/company-dashboard/schedule-board/ScheduleBoard.tsx");
@@ -28,6 +29,9 @@ const companyDashboardSource = src("../src/app/company-dashboard/CompanyDashboar
 // new context menus without a circular import back into
 // CompanyDashboardClient (which imports ScheduleBoard -> …View -> ProjectBar).
 const crewPickersSource = src("../src/app/company-dashboard/schedule-board/CrewPickers.tsx");
+const drawerSource = src("../src/app/company-dashboard/schedule-board/BoardTaskDrawer.tsx");
+const taskCreationDialogSource = src("../src/components/TaskCreationDialog.tsx");
+const detailPanelSource = src("../src/app/projects/[id]/schedule/TaskDetailPanel.tsx");
 
 // ── Item 2: draft mode replaces per-drag auto-save ──
 
@@ -460,5 +464,73 @@ assert.match(popoverSource, /maxWidth: `calc\(100vw - \$\{2 \* VIEWPORT_MARGIN_P
 
 assert.match(popoverSource, /maxHeight: position\?\.maxHeight,/);
 assert.match(popoverSource, /overflowY: "auto",/);
+
+// ── Dispatch A1: shared task drawer + creation core ──
+
+// Plain click / Enter / Space activate the board-level drawer. The quick menu
+// remains available through the existing context-menu path only.
+assert.match(taskBlockSource, /onActivate: \(taskId: string\) => void;/, "TaskBlockSegment must expose the board-level drawer activation callback");
+const blockActivateStart = taskBlockSource.indexOf("function handleBlockActivate(");
+const blockActivateEnd = taskBlockSource.indexOf("function handleKeyboard(", blockActivateStart);
+const blockActivateBody = taskBlockSource.slice(blockActivateStart, blockActivateEnd);
+assert.ok(blockActivateStart >= 0, "handleBlockActivate must exist");
+assert.match(blockActivateBody, /onActivate\(task\.id\)/, "plain activation must open the shared drawer");
+assert.doesNotMatch(blockActivateBody, /openMenu|setMenuOpen/, "plain activation must not open or toggle the quick popover");
+const blockContextStart = taskBlockSource.indexOf("function handleContextMenu(");
+const blockContextEnd = taskBlockSource.indexOf("function handleDateSubmit(", blockContextStart);
+assert.match(taskBlockSource.slice(blockContextStart, blockContextEnd), /openMenu\(/, "right-click must retain the quick popover");
+for (const source of [monthSource, timelineSource, projectBarSource]) {
+    assert.match(source, /onActivate=\{onActivate\}/, "drawer activation must be threaded through every board view");
+}
+assert.equal((boardSource.match(/<BoardTaskDrawer/g) ?? []).length, 1, "ScheduleBoard must own exactly one drawer instance");
+assert.match(boardSource, /onActivate=\{handleBlockActivate\}/, "both board views must receive the shared activation handler");
+const boardBlockActivateStart = boardSource.indexOf("const handleBlockActivate = useCallback(");
+const boardBlockActivateEnd = boardSource.indexOf("const closeTaskDrawer", boardBlockActivateStart);
+assert.match(boardSource.slice(boardBlockActivateStart, boardBlockActivateEnd), /setOpenTaskId\(taskId\)/, "the board activation handler must set the one lifted drawer task id");
+
+// Draft dates are never editable in the drawer, while all other task details
+// remain available. The message is part of the operator-facing safety contract.
+assert.match(drawerSource, /getScheduleTaskDetail\(taskId\)/, "the drawer must load the canonical authorized task detail");
+assert.match(drawerSource, /datesReadOnly=\{hasDraft\}/, "the drawer must gate date editing for an unsaved board draft");
+assert.match(boardSource, /const openTaskHasDraft = Boolean\(/, "ScheduleBoard must derive one drawer date-safety flag");
+assert.match(boardSource, /draftTaskIds\.has\(openTaskId\)/, "direct task drafts must lock drawer date editing");
+assert.match(boardSource, /draftProjectIds\.has\(openTaskProjectId\)/, "project shifts that move the task must lock drawer date editing");
+assert.match(boardSource, /hasDraft=\{openTaskHasDraft\}/, "ScheduleBoard must pass the complete draft-date safety flag to the drawer");
+assert.match(boardSource, /onDeleted=\{handleDrawerTaskDeleted\}/, "drawer deletion must reconcile board-local task state");
+assert.match(drawerSource, /activeElement\.blur\(\)/, "outside-close must flush blur-saved drawer fields before unmounting");
+assert.match(drawerSource, /window\.setTimeout\(onClose, 0\)/, "outside-close must defer unmount until the blur handler runs");
+assert.match(drawerSource, /onDeleted\(id\)/, "successful drawer deletion must notify the board owner");
+assert.match(drawerSource, /This task has unsaved changes on the board — Save or Discard them first\./, "the drawer must explain the draft-date gate exactly");
+assert.match(detailPanelSource, /datesReadOnly\?: boolean;/, "the shared panel must support read-only dates without becoming board-specific");
+assert.match(detailPanelSource, /onStatusChange: \(taskId: string, status: string, blockedReason\?: string\) => void;/, "the shared panel status callback must carry the required blocked reason");
+
+const getTaskDetailStart = actionsSource.indexOf("export async function getScheduleTaskDetail(");
+const getTaskDetailEnd = actionsSource.indexOf("export async function", getTaskDetailStart + 1);
+const getTaskDetailBody = actionsSource.slice(getTaskDetailStart, getTaskDetailEnd);
+assert.ok(getTaskDetailStart >= 0, "getScheduleTaskDetail must exist");
+assert.match(getTaskDetailBody, /await assertScheduleTaskAccess\(taskId\);/, "task detail reads must use the canonical schedule-task authorization gate");
+
+const updateTaskStart = actionsSource.indexOf("export async function updateScheduleTask(");
+const updateTaskEnd = actionsSource.indexOf("export async function", updateTaskStart + 1);
+const updateTaskBody = actionsSource.slice(updateTaskStart, updateTaskEnd);
+assert.match(updateTaskBody, /nextStatus === "Blocked"/, "the mutation core must enforce Blocked as a domain invariant");
+assert.match(updateTaskBody, /Blocked tasks require a reason/, "Blocked must reject an empty reason server-side");
+assert.match(updateTaskBody, /updateData\.blockedReason = null/, "moving away from Blocked must clear its reason");
+
+// Board creation is one proper shared modal and reuses the exact crew checklist
+// presentation used by the quick menus, including the lead-star affordance.
+assert.match(taskCreationDialogSource, /import \{ CrewChecklist/, "TaskCreationDialog must reuse CrewChecklist");
+assert.match(taskCreationDialogSource, /<CrewChecklist/, "TaskCreationDialog must render CrewChecklist instead of a separate crew UI");
+assert.match(taskCreationDialogSource, /getScheduleCrewMembers\(\)/, "TaskCreationDialog must request the server-filtered schedule crew list");
+assert.doesNotMatch(taskCreationDialogSource, /getTeamMembers/, "TaskCreationDialog must not expose the broader staff roster to the client");
+assert.match(taskCreationDialogSource, /value="appointment"/, "TaskCreationDialog must expose appointment creation");
+assert.equal((boardSource.match(/<TaskCreationDialog/g) ?? []).length, 1, "ScheduleBoard must own exactly one shared creation dialog");
+
+const getScheduleCrewStart = actionsSource.indexOf("export async function getScheduleCrewMembers(");
+const getScheduleCrewEnd = actionsSource.indexOf("export async function", getScheduleCrewStart + 1);
+const getScheduleCrewBody = actionsSource.slice(getScheduleCrewStart, getScheduleCrewEnd);
+assert.match(getScheduleCrewBody, /await assertActiveStaff\(\)/, "schedule crew lookup must require an active staff session");
+assert.match(getScheduleCrewBody, /hasPermission\(user, "schedules"\)/, "schedule crew lookup must require schedule access");
+assert.match(getScheduleCrewBody, /status: "ACTIVATED", role: "FIELD_CREW"/, "schedule crew lookup must filter before returning roster data");
 
 console.log("schedule-board render contract verification: PASS");

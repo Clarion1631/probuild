@@ -191,6 +191,7 @@ export function TimelineView({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: TimelineViewProps) {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [dragOverDate, setDragOverDate] = useState<string | null>(null);
@@ -615,6 +616,7 @@ export function TimelineView({
                                                 onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                 onTaskDatesCommit={onTaskDatesCommit}
                                                 onTaskMoveBy={onTaskMoveBy}
+                                                onActivate={onActivate}
                                             />
                                         </div>
                                     )}
@@ -644,6 +646,7 @@ export function TimelineView({
                                                     onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                     onTaskDatesCommit={onTaskDatesCommit}
                                                     onTaskMoveBy={onTaskMoveBy}
+                                                    onActivate={onActivate}
                                                 />
                                             </div>
                                         );
