@@ -8,6 +8,7 @@ import {
     deleteProductLibraryItem,
     addProjectFavorite,
 } from "@/lib/actions";
+import { isHttpUrl } from "@/lib/url-safety";
 import {
     Plus,
     Search,
@@ -332,7 +333,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                             <div key={product.id} className="hui-card overflow-hidden group relative flex flex-col">
                                 {/* Image */}
                                 <div className="h-36 bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center overflow-hidden">
-                                    {product.imageUrl ? (
+                                    {isHttpUrl(product.imageUrl) ? (
                                         <img
                                             src={product.imageUrl}
                                             alt={product.name}
@@ -383,7 +384,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                                     )}
                                     <div className="flex-1" />
                                     <div className="flex items-center gap-2 mt-2">
-                                        {product.vendorUrl && (
+                                        {isHttpUrl(product.vendorUrl) && (
                                             <a
                                                 href={product.vendorUrl}
                                                 target="_blank"
@@ -532,7 +533,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                                         placeholder="https://vendor.com/product/..."
                                     />
                                 </div>
-                                {form.imageUrl && (
+                                {isHttpUrl(form.imageUrl) && (
                                     <div className="h-28 bg-slate-50 border border-hui-border rounded-lg flex items-center justify-center overflow-hidden">
                                         <img src={form.imageUrl} alt="Preview" className="h-full object-contain" onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
                                     </div>

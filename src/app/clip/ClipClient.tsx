@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { createProductLibraryItem, addProjectFavorite } from "@/lib/actions";
+import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Check, RefreshCw } from "lucide-react";
 
 interface ProjectOption {
@@ -188,7 +189,7 @@ export default function ClipClient({ initialUrl, allProjects }: { initialUrl: st
                     )}
 
                     <div className="h-28 bg-slate-50 border border-hui-border rounded-lg flex items-center justify-center overflow-hidden">
-                        {form.imageUrl ? (
+                        {isHttpUrl(form.imageUrl) ? (
                             <img
                                 src={form.imageUrl}
                                 alt="Preview"

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { getProductLibrary, addProjectFavorite, removeProjectFavorite } from "@/lib/actions";
+import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, ExternalLink, Star, Plus, X, Search } from "lucide-react";
 
 interface Product {
@@ -118,7 +119,7 @@ export default function ProjectFavoritesSection({
                         return (
                             <div key={f.id} className="hui-card overflow-hidden group relative flex flex-col">
                                 <div className="h-32 bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center overflow-hidden">
-                                    {f.product.imageUrl ? (
+                                    {isHttpUrl(f.product.imageUrl) ? (
                                         <img src={f.product.imageUrl} alt={f.product.name} className="w-full h-full object-cover" />
                                     ) : (
                                         <ImageOff className="w-7 h-7 text-slate-300" />
@@ -145,7 +146,7 @@ export default function ProjectFavoritesSection({
                                         </span>
                                     )}
                                     <div className="flex-1" />
-                                    {f.product.vendorUrl && (
+                                    {isHttpUrl(f.product.vendorUrl) && (
                                         <a
                                             href={f.product.vendorUrl}
                                             target="_blank"
@@ -201,7 +202,7 @@ export default function ProjectFavoritesSection({
                                     return (
                                         <div key={product.id} className="flex items-center gap-3 p-3">
                                             <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden shrink-0">
-                                                {product.imageUrl ? (
+                                                {isHttpUrl(product.imageUrl) ? (
                                                     <img src={product.imageUrl} alt={product.name} className="w-full h-full object-cover" />
                                                 ) : (
                                                     <ImageOff className="w-4 h-4 text-slate-300" />

@@ -134,6 +134,17 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "Storage not configured" }, { status: 500 });
         }
 
+        // Reject oversized uploads BEFORE buffering the body into memory via
+        // formData() — an absent or missing Content-Length is treated as
+        // oversized too (a chunked/unsized request could otherwise stream past
+        // the cap before formData() ever returns). The per-file size check
+        // below (after parsing) is the real enforcement; this is just to avoid
+        // buffering an unbounded body in the first place.
+        const contentLength = req.headers.get("content-length");
+        if (!contentLength || Number(contentLength) > PORTAL_UPLOAD_MAX_BYTES) {
+            return NextResponse.json({ error: "File is too large (8 MB max)." }, { status: 413 });
+        }
+
         let formData;
         try {
             formData = await req.formData();

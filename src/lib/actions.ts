@@ -13,6 +13,7 @@ import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { parseProductUrl } from "./product-parse";
+import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
@@ -9427,12 +9428,20 @@ export async function getSelectionBoardsForPortal(projectId: string) {
 // =============================================
 
 /**
- * Ownership assertion for the portal-facing product-library actions below.
- * Mirrors the staff-bypass + resolveSessionClientId + project-ownership check
- * used inline by /api/portal/files and the portal selections/files pages —
- * pulled into one helper since several new portal actions need it.
+ * Ownership + visibility assertion for the portal-facing product-library
+ * actions below (all gated on the Selections tab: proposals and favorites).
+ * Mirrors the exact check order the portal selections page.tsx and
+ * /api/portal/files route use — visibility gate first, applied uniformly to
+ * staff AND client (no staff bypass here, matching how this feature area's
+ * own pages/routes read PortalVisibility; that's a different convention from
+ * assertPortalProjectAccessCore's staff-bypass, which is scoped to the
+ * schedule/daily-logs areas) — then staff-bypass + resolveSessionClientId +
+ * project-ownership for the client path.
  */
 async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
+    const visibility = await getPortalVisibility(projectId);
+    if (!visibility.isPortalEnabled || !visibility.showSelections) throw new Error("Unauthorized");
+
     const session = await getSessionOrDev();
     const role = (session?.user as { role?: string } | undefined)?.role;
     const isStaff = role === "ADMIN" || role === "MANAGER";
@@ -9443,6 +9452,17 @@ async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaf
     const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
     if (!project) throw new Error("Unauthorized");
     return { isStaff: false, clientId };
+}
+
+/** Persist boundary for any stored vendorUrl/imageUrl: only a plain http(s)
+ * URL is ever written — a scraped page, Gemini's output, or a client-typed
+ * "Photo URL" field could otherwise smuggle a javascript:/data: URL into the
+ * DB, which would execute if a render site ever put it straight into href/img
+ * src. Render sites additionally guard with the same isHttpUrl() check
+ * (belt-and-suspenders — see ClientSuggestions.tsx etc.), but nothing unsafe
+ * should reach the database in the first place. */
+function safeUrlOrNull(url: string | null | undefined): string | null {
+    return isHttpUrl(url) ? url : null;
 }
 
 // ── Product Library CRUD (team) ─────────────────────────────────────────────
@@ -9465,10 +9485,10 @@ export async function createProductLibraryItem(data: {
         data: {
             name,
             description: data.description?.trim() || null,
-            imageUrl: data.imageUrl || null,
+            imageUrl: safeUrlOrNull(data.imageUrl),
             price: data.price ?? null,
             vendor: data.vendor?.trim() || null,
-            vendorUrl: data.vendorUrl || null,
+            vendorUrl: safeUrlOrNull(data.vendorUrl),
             category: data.category?.trim() || null,
             source: data.source || "manual",
             clippedById: user.id,
@@ -9493,10 +9513,10 @@ export async function updateProductLibraryItem(id: string, data: {
         data: {
             ...(data.name !== undefined && { name: data.name.trim() }),
             ...(data.description !== undefined && { description: data.description?.trim() || null }),
-            ...(data.imageUrl !== undefined && { imageUrl: data.imageUrl || null }),
+            ...(data.imageUrl !== undefined && { imageUrl: safeUrlOrNull(data.imageUrl) }),
             ...(data.price !== undefined && { price: data.price }),
             ...(data.vendor !== undefined && { vendor: data.vendor?.trim() || null }),
-            ...(data.vendorUrl !== undefined && { vendorUrl: data.vendorUrl || null }),
+            ...(data.vendorUrl !== undefined && { vendorUrl: safeUrlOrNull(data.vendorUrl) }),
             ...(data.category !== undefined && { category: data.category?.trim() || null }),
         },
     });
@@ -9599,9 +9619,9 @@ export async function submitSelectionProposal(projectId: string, data: {
             projectId,
             name,
             description: data.description?.trim() || parsed?.description || null,
-            imageUrl: data.imageUrl || parsed?.imageUrl || null,
+            imageUrl: safeUrlOrNull(data.imageUrl) || safeUrlOrNull(parsed?.imageUrl),
             price: parsed?.price ?? null,
-            vendorUrl: url || parsed?.vendorUrl || null,
+            vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
             clientNote: data.clientNote?.trim() || null,
             status: "Pending",
         },
@@ -9687,47 +9707,82 @@ export async function decideSelectionProposal(proposalId: string, input: {
     const newStatus = input.action === "approve" ? "Approved" : "Declined";
     const decidedAt = new Date();
     const pmNote = input.pmNote?.trim() || null;
+    // Re-validated at every persist boundary — proposal.imageUrl/vendorUrl were
+    // already sanitized when the proposal was created (submitSelectionProposal),
+    // but this is the second place they get copied into a new row, so it's
+    // checked again rather than trusted.
+    const safeImageUrl = safeUrlOrNull(proposal.imageUrl);
+    const safeVendorUrl = safeUrlOrNull(proposal.vendorUrl);
 
-    // Status CAS: only a Pending proposal transitions. A duplicate decide call
-    // (double-click, retried request) matches zero rows and no-ops instead of
-    // re-deciding or minting a second ProductLibraryItem/favorite/option.
-    const claim = await prisma.selectionProposal.updateMany({
-        where: { id: proposalId, status: "Pending" },
-        data: {
-            status: newStatus,
-            pmNote,
-            decidedById: user.id,
-            decidedAt,
-            ...(input.action === "approve" ? {
-                price: input.price ?? proposal.price ?? null,
-                boardId: input.boardId || null,
-                categoryId: input.categoryId || null,
-            } : {}),
-        },
-    });
-    if (claim.count === 0) {
-        return { success: false, alreadyDecided: true };
+    // Validate board/category ownership BEFORE the transaction (not inside it —
+    // no point opening a transaction just to discover the board doesn't belong
+    // to this project). A staff user scoped to project A could otherwise pass a
+    // boardId from project B and write a SelectionOption into another
+    // project's board.
+    let validCategoryId: string | null = null;
+    if (input.action === "approve" && input.boardId && input.categoryId) {
+        const board = await prisma.selectionBoard.findFirst({
+            where: { id: input.boardId, projectId: proposal.projectId },
+            select: { id: true },
+        });
+        if (board) {
+            const category = await prisma.selectionCategory.findFirst({
+                where: { id: input.categoryId, boardId: input.boardId },
+                select: { id: true },
+            });
+            if (category) validCategoryId = category.id;
+        }
     }
 
     let productId: string | null = null;
     let favoriteCreated = false;
     let optionCreated = false;
+    let alreadyDecided = false;
 
-    if (input.action === "approve") {
-        const product = await prisma.productLibraryItem.create({
+    // CAS claim + every dependent write (ProductLibraryItem, favorite,
+    // SelectionOption, the proposal's own productId backfill) run inside one
+    // transaction so a mid-sequence failure can't leave a half-approved
+    // proposal (e.g. status flipped to Approved but no ProductLibraryItem).
+    await prisma.$transaction(async (tx) => {
+        // Status CAS: only a Pending proposal transitions. A duplicate decide
+        // call (double-click, retried request) matches zero rows and no-ops
+        // instead of re-deciding or minting a second ProductLibraryItem/
+        // favorite/option.
+        const claim = await tx.selectionProposal.updateMany({
+            where: { id: proposalId, status: "Pending" },
+            data: {
+                status: newStatus,
+                pmNote,
+                decidedById: user.id,
+                decidedAt,
+                ...(input.action === "approve" ? {
+                    price: input.price ?? proposal.price ?? null,
+                    boardId: input.boardId || null,
+                    categoryId: validCategoryId,
+                } : {}),
+            },
+        });
+        if (claim.count === 0) {
+            alreadyDecided = true;
+            return;
+        }
+
+        if (input.action !== "approve") return;
+
+        const product = await tx.productLibraryItem.create({
             data: {
                 name: proposal.name,
                 description: proposal.description,
-                imageUrl: proposal.imageUrl,
+                imageUrl: safeImageUrl,
                 price: input.price ?? proposal.price ?? null,
-                vendorUrl: proposal.vendorUrl,
+                vendorUrl: safeVendorUrl,
                 source: "client_proposal",
                 clippedById: user.id,
             },
         });
         productId = product.id;
 
-        await prisma.selectionProposal.update({
+        await tx.selectionProposal.update({
             where: { id: proposalId },
             data: { productId: product.id },
         });
@@ -9735,7 +9790,7 @@ export async function decideSelectionProposal(proposalId: string, input: {
         // Default true per spec — approving a suggestion pins it to the
         // project's client-visible Favorites list unless explicitly opted out.
         if (input.addToFavorites !== false) {
-            await prisma.projectProductFavorite.upsert({
+            await tx.projectProductFavorite.upsert({
                 where: { projectId_productId: { projectId: proposal.projectId, productId: product.id } },
                 update: {},
                 create: {
@@ -9748,66 +9803,65 @@ export async function decideSelectionProposal(proposalId: string, input: {
             favoriteCreated = true;
         }
 
-        // Optional: also drop it into a board category as a pickable option.
-        // Never touches SelectionBoard.status — approving a suggestion must not
-        // silently flip a board back to an earlier lifecycle state.
-        if (input.boardId && input.categoryId) {
-            // Verify the board itself belongs to this proposal's project — without
-            // this, a staff user scoped to project A could pass a boardId from
-            // project B and write a SelectionOption into another project's board.
-            const board = await prisma.selectionBoard.findFirst({
-                where: { id: input.boardId, projectId: proposal.projectId },
-                select: { id: true },
+        // Optional: also drop it into a board category as a pickable option
+        // (validCategoryId is only set above once board+category ownership is
+        // confirmed). Never touches SelectionBoard.status — approving a
+        // suggestion must not silently flip a board back to an earlier
+        // lifecycle state.
+        if (validCategoryId) {
+            const maxOrder = await tx.selectionOption.aggregate({
+                where: { categoryId: validCategoryId },
+                _max: { order: true },
             });
-            const category = board
-                ? await prisma.selectionCategory.findFirst({
-                    where: { id: input.categoryId, boardId: input.boardId },
-                })
-                : null;
-            if (category) {
-                const maxOrder = await prisma.selectionOption.aggregate({
-                    where: { categoryId: input.categoryId },
-                    _max: { order: true },
-                });
-                await prisma.selectionOption.create({
-                    data: {
-                        categoryId: input.categoryId,
-                        name: proposal.name,
-                        description: proposal.description,
-                        imageUrl: proposal.imageUrl,
-                        price: input.price ?? proposal.price ?? null,
-                        vendorUrl: proposal.vendorUrl,
-                        order: (maxOrder._max.order ?? -1) + 1,
-                    },
-                });
-                optionCreated = true;
-            }
+            await tx.selectionOption.create({
+                data: {
+                    categoryId: validCategoryId,
+                    name: proposal.name,
+                    description: proposal.description,
+                    imageUrl: safeImageUrl,
+                    price: input.price ?? proposal.price ?? null,
+                    vendorUrl: safeVendorUrl,
+                    order: (maxOrder._max.order ?? -1) + 1,
+                },
+            });
+            optionCreated = true;
         }
+    });
+
+    if (alreadyDecided) {
+        return { success: false, alreadyDecided: true };
     }
 
-    // Notify the client of the decision — same portal-link email pattern as
-    // sendSelectionBoardToClient.
-    const clientEmail = proposal.project.client?.email;
-    if (clientEmail) {
-        const settings = await getCachedCompanySettings();
-        const { buildClientPortalUrl } = await import("./client-portal-auth");
-        const portalUrl = await buildClientPortalUrl(proposal.project.clientId, clientEmail, `/portal/projects/${proposal.projectId}/selections`);
-        const cc = buildCc(clientEmail, (proposal.project.client as any)?.additionalEmail);
-        const isApproved = input.action === "approve";
-        await sendNotification(
-            clientEmail,
-            isApproved ? `✅ Your suggestion was approved — ${proposal.project.name}` : `Update on your suggestion — ${proposal.project.name}`,
-            `<div style="font-family: sans-serif; color: #333;">
-                <h2>${isApproved ? "Your Suggestion Was Approved" : "Update on Your Suggestion"}</h2>
-                <p>Hi ${proposal.project.client?.name || "there"},</p>
-                <p>Your suggested item "<strong>${proposal.name}</strong>" for <strong>${proposal.project.name}</strong> ${isApproved ? "has been approved and added to your project." : "was not approved this time."}</p>
-                ${pmNote ? `<p style="color:#555;">Note from your project manager: "${pmNote}"</p>` : ""}
-                <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
-                <p style="color:#666;font-size:13px;">— ${settings.companyName || "Your Project Team"}</p>
-            </div>`,
-            undefined,
-            { cc, copyToInternal: true }
-        );
+    // Notifications + activity log run AFTER the transaction commits, and a
+    // failure here must not throw the whole action into a failed state — the
+    // decision is already durably recorded. Same pattern submitClientSelections
+    // and the other portal notifiers use (sendNotification never throws on its
+    // own, but building the portal link can, so the whole block is wrapped).
+    try {
+        const clientEmail = proposal.project.client?.email;
+        if (clientEmail) {
+            const settings = await getCachedCompanySettings();
+            const { buildClientPortalUrl } = await import("./client-portal-auth");
+            const portalUrl = await buildClientPortalUrl(proposal.project.clientId, clientEmail, `/portal/projects/${proposal.projectId}/selections`);
+            const cc = buildCc(clientEmail, (proposal.project.client as any)?.additionalEmail);
+            const isApproved = input.action === "approve";
+            await sendNotification(
+                clientEmail,
+                isApproved ? `✅ Your suggestion was approved — ${proposal.project.name}` : `Update on your suggestion — ${proposal.project.name}`,
+                `<div style="font-family: sans-serif; color: #333;">
+                    <h2>${isApproved ? "Your Suggestion Was Approved" : "Update on Your Suggestion"}</h2>
+                    <p>Hi ${proposal.project.client?.name || "there"},</p>
+                    <p>Your suggested item "<strong>${proposal.name}</strong>" for <strong>${proposal.project.name}</strong> ${isApproved ? "has been approved and added to your project." : "was not approved this time."}</p>
+                    ${pmNote ? `<p style="color:#555;">Note from your project manager: "${pmNote}"</p>` : ""}
+                    <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
+                    <p style="color:#666;font-size:13px;">— ${settings.companyName || "Your Project Team"}</p>
+                </div>`,
+                undefined,
+                { cc, copyToInternal: true }
+            );
+        }
+    } catch (err) {
+        console.error("[decideSelectionProposal] client notification failed:", err);
     }
 
     await logActivity({

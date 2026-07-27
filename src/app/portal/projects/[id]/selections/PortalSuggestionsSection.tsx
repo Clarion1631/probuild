@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { submitSelectionProposal } from "@/lib/actions";
+import { isHttpUrl } from "@/lib/url-safety";
 
 interface Proposal {
     id: string;
@@ -249,7 +250,7 @@ export default function PortalSuggestionsSection({
                         return (
                             <div key={p.id} className="flex gap-4 border border-slate-200 rounded-lg p-4">
                                 <div className="w-16 h-16 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden shrink-0">
-                                    {p.imageUrl ? (
+                                    {isHttpUrl(p.imageUrl) ? (
                                         <img src={p.imageUrl} alt={p.name} className="w-full h-full object-cover" />
                                     ) : (
                                         <svg className="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -275,7 +276,7 @@ export default function PortalSuggestionsSection({
                                             {p.status === "Declined" ? "From your project manager: " : "Note: "}{p.pmNote}
                                         </p>
                                     )}
-                                    {p.vendorUrl && (
+                                    {isHttpUrl(p.vendorUrl) && (
                                         <a
                                             href={p.vendorUrl}
                                             target="_blank"

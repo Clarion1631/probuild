@@ -4,6 +4,8 @@
 // intentionally never shown here (see docs/specs/product-library-portal-selections.md
 // Phase 3, item 2) — favorites are ideas being explored, not priced selections.
 
+import { isHttpUrl } from "@/lib/url-safety";
+
 interface FavoriteProduct {
     id: string;
     name: string;
@@ -40,7 +42,7 @@ export default function PortalProjectFavorites({ favorites }: { favorites: Favor
                             className="rounded-xl border-2 border-slate-200 overflow-hidden hover:shadow-sm transition-all duration-200"
                         >
                             <div className="h-48 bg-slate-100 flex items-center justify-center overflow-hidden">
-                                {fav.product.imageUrl ? (
+                                {isHttpUrl(fav.product.imageUrl) ? (
                                     <img
                                         src={fav.product.imageUrl}
                                         alt={fav.product.name}
@@ -61,7 +63,7 @@ export default function PortalProjectFavorites({ favorites }: { favorites: Favor
                                 {fav.note && (
                                     <p className="text-sm text-slate-500 mb-3 line-clamp-3">{fav.note}</p>
                                 )}
-                                {fav.product.vendorUrl && (
+                                {isHttpUrl(fav.product.vendorUrl) && (
                                     <a
                                         href={fav.product.vendorUrl}
                                         target="_blank"

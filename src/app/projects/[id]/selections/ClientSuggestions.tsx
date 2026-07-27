@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { decideSelectionProposal } from "@/lib/actions";
+import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, ExternalLink, Lightbulb } from "lucide-react";
 
 interface Proposal {
@@ -49,6 +50,15 @@ export default function ClientSuggestions({
 }) {
     const router = useRouter();
     const [proposals, setProposals] = useState<Proposal[]>(initialProposals);
+
+    // initialProposals is only the INITIAL value for useState — React never
+    // re-derives state from a changed prop on its own. Without this, a
+    // decided proposal keeps rendering as Pending (with live Approve/Decline
+    // buttons) after router.refresh() re-fetches the server component below,
+    // because local state was never told the prop changed.
+    useEffect(() => {
+        setProposals(initialProposals);
+    }, [initialProposals]);
 
     // Approve dialog state
     const [approveFor, setApproveFor] = useState<Proposal | null>(null);
@@ -102,6 +112,10 @@ export default function ClientSuggestions({
                 toast.error("This suggestion was already decided.");
             } else {
                 toast.success("Suggestion approved");
+                // Optimistic: flip status locally so the Approve/Decline buttons
+                // disappear immediately, rather than waiting on the
+                // router.refresh() round-trip below to bring fresh server data.
+                setProposals((prev) => prev.map((p) => (p.id === approveFor.id ? { ...p, status: "Approved" } : p)));
             }
             setApproveFor(null);
             router.refresh();
@@ -124,6 +138,7 @@ export default function ClientSuggestions({
                 toast.error("This suggestion was already decided.");
             } else {
                 toast.success("Suggestion declined");
+                setProposals((prev) => prev.map((p) => (p.id === declineFor.id ? { ...p, status: "Declined" } : p)));
             }
             setDeclineFor(null);
             router.refresh();
@@ -155,7 +170,7 @@ export default function ClientSuggestions({
                     {[...pending, ...decided].map((p) => (
                         <div key={p.id} className="flex gap-4 p-4">
                             <div className="w-16 h-16 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden shrink-0">
-                                {p.imageUrl ? (
+                                {isHttpUrl(p.imageUrl) ? (
                                     <img src={p.imageUrl} alt={p.name} className="w-full h-full object-cover" />
                                 ) : (
                                     <ImageOff className="w-5 h-5 text-slate-300" />
@@ -168,7 +183,7 @@ export default function ClientSuggestions({
                                         {p.clientNote && (
                                             <p className="text-xs text-hui-textMuted mt-0.5">&quot;{p.clientNote}&quot;</p>
                                         )}
-                                        {p.vendorUrl && (
+                                        {isHttpUrl(p.vendorUrl) && (
                                             <a
                                                 href={p.vendorUrl}
                                                 target="_blank"
