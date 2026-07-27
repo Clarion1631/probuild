@@ -279,8 +279,8 @@ export function TaskBlockSegment({
         if (!canEdit || isPending) return;
         if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
         // A block sits inside its project bar, whose own click opens the
-        // PROJECT menu — without this, the bar menu instantly replaces the
-        // task menu via the exclusive-menu coordinator.
+        // PROJECT drawer — without this, the bar activation instantly replaces
+        // the task menu via the exclusive-surface coordinator.
         event.stopPropagation();
         onActivate(task.id);
     }

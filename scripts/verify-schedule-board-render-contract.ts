@@ -45,6 +45,9 @@ const companyDashboardSource = src("../src/app/company-dashboard/CompanyDashboar
 // CompanyDashboardClient (which imports ScheduleBoard -> …View -> ProjectBar).
 const crewPickersSource = src("../src/app/company-dashboard/schedule-board/CrewPickers.tsx");
 const drawerSource = src("../src/app/company-dashboard/schedule-board/BoardTaskDrawer.tsx");
+const projectDrawerSource = src("../src/app/company-dashboard/schedule-board/BoardProjectDrawer.tsx");
+const drawerShellSource = src("../src/app/company-dashboard/schedule-board/BoardDrawerShell.tsx");
+const projectTaskOverflowSource = src("../src/app/company-dashboard/schedule-board/ProjectTaskOverflow.tsx");
 const taskCreationDialogSource = src("../src/components/TaskCreationDialog.tsx");
 const detailPanelSource = src("../src/app/projects/[id]/schedule/TaskDetailPanel.tsx");
 const scheduleBoardDirectory = new URL("../src/app/company-dashboard/schedule-board/", import.meta.url);
@@ -323,7 +326,8 @@ assert.match(boardSource, /catch \(chunkError: any\) \{/, "chunk failures are is
 assert.match(boardSource, /chunk\.map\(change => \(\{ taskId: change\.taskId, ok: false as const, error: message \}\)\)/, "a rejected chunk synthesizes failures for its own tasks only");
 assert.match(boardSource, /const markerResult = await updateProjectStartDateAction\(projectId, draft\.targetStart, false\);\s*\n\s*const shiftResult = await shiftNotStartedTasksAction\(projectId, draft\.deltaDays\)/, "In Progress shift choice moves the marker AND the not-started work");
 assert.match(popoverSource, /VIEWPORT_MARGIN_PX/);
-assert.match(projectBarSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);
+assert.doesNotMatch(projectBarSource, /FloatingPopover/, "ProjectBar must not import or render the removed project popover");
+assert.match(projectTaskOverflowSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/, "the unchanged +N task overflow keeps its popover in an isolated component");
 assert.match(taskBlockSource, /import \{ FloatingPopover \} from "\.\/FloatingPopover"/);
 assert.doesNotMatch(projectBarSource, /<details/, "the project bar's Actions menu must no longer be a clipped native <details>");
 assert.doesNotMatch(taskBlockSource, /<details/, "the task block's date menu must no longer be a clipped native <details>");
@@ -339,7 +343,8 @@ for (const source of [monthSource, timelineSource]) {
 assert.match(layoutSource, /export const MAX_TASK_LANES = 3/);
 assert.match(layoutSource, /export function assignTaskLanes/);
 assert.match(projectBarSource, /assignTaskLanes\(taskLaneInput\)/);
-assert.match(projectBarSource, /hiddenTasks\.length > 0/, "a +N overflow affordance must exist for tasks beyond the lane cap");
+assert.match(projectBarSource, /<ProjectTaskOverflow projectName=\{project\.name\} tasks=\{hiddenTasks\} \/>/, "a +N overflow affordance must exist for tasks beyond the lane cap");
+assert.match(projectTaskOverflowSource, /if \(tasks\.length === 0\) return null;/, "the extracted +N overflow must only render for tasks beyond the lane cap");
 assert.match(taskBlockSource, /laneTop\?: number/);
 assert.match(taskBlockSource, /laneHeight\?: number/);
 
@@ -377,14 +382,17 @@ assert.match(projectBarSource, /function handleContextMenu\(event: ReactMouseEve
 assert.match(taskBlockSource, /onContextMenu=\{handleContextMenu\}/, "TaskBlockSegment must wire a contextmenu handler");
 assert.match(taskBlockSource, /function handleContextMenu\(event: ReactMouseEvent<HTMLDivElement>\) \{\s*\n\s*if \(!canEdit \|\| isPending\) return;/, "TaskBlockSegment's context menu must be canEdit-gated");
 // Keyboard equivalent (ContextMenu key / Shift+F10) on both bar/block.
-assert.match(projectBarSource, /event\.key === "ContextMenu" \|\| \(event\.key === "F10" && event\.shiftKey\)/, "ProjectBar must open its menu on the ContextMenu key / Shift+F10");
+assert.match(projectBarSource, /event\.key === "ContextMenu" \|\| \(event\.key === "F10" && event\.shiftKey\)/, "ProjectBar must open its drawer on the ContextMenu key / Shift+F10");
 assert.match(taskBlockSource, /event\.key === "ContextMenu" \|\| \(event\.key === "F10" && event\.shiftKey\)/, "TaskBlockSegment must open its menu on the ContextMenu key / Shift+F10");
-// Only one schedule-board menu open at a time, including click vs context
-// menu — the shared exclusive-menu coordinator, registered by every menu.
-for (const source of [projectBarSource, taskBlockSource, monthSource, timelineSource]) {
+// Only one schedule-board menu/drawer is open at a time, including click vs
+// context activation — quick menus keep their registrations and both drawers
+// inherit the same coordination through their shared shell.
+for (const source of [taskBlockSource, monthSource, timelineSource, projectTaskOverflowSource]) {
     assert.match(source, /activateExclusiveMenu\(close\)/, "every schedule-board menu must register with the exclusive-menu coordinator on open");
     assert.match(source, /deactivateExclusiveMenu\(close\)/, "every schedule-board menu must deregister with the exclusive-menu coordinator on close");
 }
+assert.match(drawerShellSource, /activateExclusiveMenu\(close\)/, "the shared drawer shell must register with the exclusive-menu coordinator");
+assert.match(drawerShellSource, /deactivateExclusiveMenu\(close\)/, "the shared drawer shell must deregister with the exclusive-menu coordinator");
 // Empty day cell "Schedule here…" routes through the SAME function the tray
 // drop handler calls (onTrayProjectDrop) — never a second scheduling path.
 assert.match(monthSource, /onTrayProjectDrop\(project, dayContextMenu\.date\)/, "Month's Schedule-here must route through the existing tray-drop function");
@@ -396,33 +404,32 @@ assert.match(timelineSource, /No unscheduled projects/, "Timeline's Schedule-her
 assert.match(taskBlockSource, /import \{ addTaskComment, deleteScheduleTask \} from "@\/lib\/actions"/);
 assert.match(taskBlockSource, /await deleteScheduleTask\(task\.id\)/);
 assert.match(taskBlockSource, /Deletes now — not part of unsaved changes/, "Delete task's confirm copy must explicitly say it is immediate, not draft-mode");
-// Project bar: Remove from schedule only for Waiting to Start, through the
+// Project drawer: Remove from schedule only for Waiting to Start, through the
 // existing updateProjectStartDateAction(projectId, null, false) path.
-assert.match(projectBarSource, /project\.status === "Waiting to Start" &&[\s\S]{0,700}Remove from schedule/, "Remove from schedule must only render for Waiting-to-Start projects");
-assert.match(projectBarSource, /await updateProjectStartDateAction\(project\.id, null, false\)/, "Remove from schedule must use the existing updateProjectStartDateAction(projectId, null, false) path");
+assert.match(projectDrawerSource, /project\.status === "Waiting to Start" &&[\s\S]{0,900}Remove from schedule/, "Remove from schedule must only render for Waiting-to-Start projects");
+assert.match(projectDrawerSource, /await updateProjectStartDateAction\(project\.id, null, false\)/, "Remove from schedule must use the existing updateProjectStartDateAction(projectId, null, false) path");
 // Color… reuses the ORIGINAL schedule palette (PRESET_COLORS), not a
 // re-invented swatch list.
-assert.match(projectBarSource, /import \{ addDays, formatDate, parseUTCDate, PRESET_COLORS \} from "@\/app\/projects\/\[id\]\/schedule\/schedule-utils"/);
-assert.match(projectBarSource, /PRESET_COLORS\.map\(swatch =>/, "the Color… grid must be built from PRESET_COLORS");
+assert.match(projectDrawerSource, /PRESET_COLORS[\s\S]*from "@\/app\/projects\/\[id\]\/schedule\/schedule-utils"/);
+assert.match(projectDrawerSource, /PRESET_COLORS\.map\(swatch =>/, "the drawer Color section must be built from PRESET_COLORS");
 // Project crew…/Task crew… reuse the SAME pickers as the Schedule & crew
 // table (via the extracted CrewPickers module), never a rebuilt picker.
 // Crew-picker rebuild (item 5): the schedule-board menu instances render the
 // shared CrewChecklist INLINE (variant="inline") — no nested popover inside
 // the bar/block's own FloatingPopover menu, which was the double-scrollbar bug.
-assert.match(projectBarSource, /import \{ CrewPicker \} from "\.\/CrewPickers"/);
-assert.match(projectBarSource, /<CrewPicker projectId=\{project\.id\} crew=\{project\.crew\} teamMembers=\{teamMembers\} variant="inline" \/>/);
+assert.match(projectDrawerSource, /import \{ CrewPicker \} from "\.\/CrewPickers"/);
+assert.match(projectDrawerSource, /<CrewPicker[\s\S]{0,240}projectId=\{project\.id\}[\s\S]{0,240}variant="inline"[\s\S]{0,240}layout="list"/, "the project drawer must use the shared serialized picker in list layout");
 assert.match(taskBlockSource, /import \{ TaskCrewPicker \} from "\.\/CrewPickers"/);
 assert.match(taskBlockSource, /<TaskCrewPicker task=\{task\} teamMembers=\{teamMembers\} variant="inline" \/>/);
 
-// ── Item 6: a bar click toggles its menu, never navigates ──
-// PR-0 activation seam: block/bar chrome is replaced by root activation.
+// ── Item 6: root activation routes to the right drawer ──
 assert.doesNotMatch(taskBlockSource, /aria-label=\{`Task actions for /, "TaskBlockSegment must not render the old ellipsis action button");
 assert.doesNotMatch(taskBlockSource, />\s*\u22ef\s*<\/button>/, "TaskBlockSegment must not render a vertical-ellipsis button");
 assert.doesNotMatch(taskBlockSource, /actionTriggerRef/, "the removed task action button must not leave a trigger ref behind");
 assert.match(taskBlockSource, /function handleBlockActivate\(event: ReactMouseEvent<HTMLDivElement> \| KeyboardEvent<HTMLElement>\) \{/);
 assert.match(taskBlockSource, /if \(!canEdit \|\| isPending\) return;\s*\n\s*if \(\(event\.target as HTMLElement\)\.closest\("a,button,input,summary,form,details"\)\) return;/, "task block activation must reuse the old action-button edit gates and ignore interactive descendants");
 assert.match(taskBlockSource, /onClick=\{handleBlockActivate\}/, "the task block root click must route through the named activation seam");
-assert.match(taskBlockSource, /handleBlockActivate[\s\S]{0,400}event\.stopPropagation\(\);/, "block activation must stop propagation — the parent bar's click opens the PROJECT menu and would instantly replace the task menu via the exclusive-menu coordinator");
+assert.match(taskBlockSource, /handleBlockActivate[\s\S]{0,400}event\.stopPropagation\(\);/, "block activation must stop propagation so the parent bar's project drawer does not replace the task drawer");
 assert.match(taskBlockSource, /mode === "move" && activeMode === null && \(event\.key === " " \|\| event\.key === "Enter"\)[\s\S]{0,250}handleBlockActivate\(event\);/, "Enter/Space on a non-editing task block must route through the activation seam");
 assert.match(taskBlockSource, /<FloatingPopover open=\{menuOpen\} anchorRef=\{rootRef\} anchorPoint=\{menuAnchorPoint\}/, "keyboard-opened task menus must anchor to the block rect while pointer-opened menus may use a point");
 
@@ -431,17 +438,16 @@ assert.doesNotMatch(projectBarSource, />\s*Actions\s*<\/button>/, "ProjectBar mu
 assert.doesNotMatch(projectBarSource, /actionTriggerRef/, "the removed project Actions chip must not leave a trigger ref behind");
 assert.match(projectBarSource, /const rootRef = useRef<HTMLDivElement>\(null\)/);
 assert.match(projectBarSource, /ref=\{rootRef\}[\s\S]{0,1200}onClick=\{handleBarClick\}/, "ProjectBar's root ref and existing click activation must stay wired");
-assert.match(projectBarSource, /<FloatingPopover open=\{menuOpen\} anchorRef=\{rootRef\} anchorPoint=\{menuAnchorPoint\}/, "keyboard-opened project menus must anchor to the bar rect while pointer-opened menus may use a point");
+assert.doesNotMatch(projectBarSource, /menuOpen|menuView|menuAnchorPoint|openMenu/, "all project-menu state and view switching must be gone");
 
-// A bar click still toggles its menu and never navigates; pointer activation
-// opens at the click point, while keyboard activation falls back to rootRef.
+// Project-bar activation always routes through the lifted drawer seam.
 assert.match(projectBarSource, /function handleBarClick\(/);
-// Item 1 (2026-07-22) replaced the bare `setMenuOpen(value => !value)` toggle
-// with explicit open/close (via `openMenu`, which also resets the menu's
-// view/anchor state) — still a toggle in effect, just no longer a one-liner.
-assert.match(projectBarSource, /if \(menuOpen\) \{\s*setMenuOpen\(false\);\s*\} else \{\s*openMenu\(\{ x: event\.clientX, y: event\.clientY \}\);\s*\}/, "a bar click must still toggle the menu open/closed and pointer-open at the click point");
+assert.match(projectBarSource, /function handleBarClick\([\s\S]{0,500}onProjectActivate\(project\.id\)/, "plain project-bar clicks must open the project drawer");
+assert.match(projectBarSource, /if \(!editing && \(event\.key === " " \|\| event\.key === "Enter"\)\) \{[\s\S]{0,160}onProjectActivate\(project\.id\)/, "Enter/Space must open the project drawer");
+assert.match(projectBarSource, /function handleContextMenu\([\s\S]{0,500}onProjectActivate\(project\.id\)/, "right-click must open the project drawer");
+assert.match(projectBarSource, /event\.key === "ContextMenu" \|\| \(event\.key === "F10" && event\.shiftKey\)[\s\S]{0,220}onProjectActivate\(project\.id\)/, "ContextMenu/Shift+F10 must open the project drawer");
 assert.doesNotMatch(projectBarSource, /onClick=\{.*router\.push|onClick=\{.*navigate/, "the bar itself must never navigate on click");
-assert.match(projectBarSource, />\s*Open project\s*<\/Link>/, "Open project must be a menu item inside the Actions dropdown");
+assert.match(projectDrawerSource, /Open project/, "Open project must move into the project drawer header");
 
 // ── Item 7: crew picker hygiene (FINANCE exclusion + name disambiguation) ──
 // Owner call 2026-07-23: schedulable people = FIELD_CREW only (no admins or
@@ -474,7 +480,7 @@ assert.match(dialogSource, /Move the start marker AND shift all Not Started task
 assert.match(boardSource, /<ShiftConfirmDialog[\s\S]*?intent=\{confirmIntent\}[\s\S]*?onChoice=\{handleMoveChoice\}[\s\S]*?onCancel=\{cancelConfirmedMove\}/);
 
 // ── Money-path invariants: unchanged by this feature round ──
-for (const source of [boardSource, monthSource, timelineSource, projectBarSource, taskBlockSource, popoverSource, availabilityPanelSource, crewPickersSource]) {
+for (const source of [boardSource, monthSource, timelineSource, projectBarSource, projectDrawerSource, drawerShellSource, projectTaskOverflowSource, taskBlockSource, popoverSource, availabilityPanelSource, crewPickersSource]) {
     assert.doesNotMatch(source, /PaymentSchedule\.(update|create|delete)|EstimatePaymentSchedule\.(update|create|delete)|ChangeOrderPaymentSchedule\.(update|create|delete)/);
     assert.doesNotMatch(source, /\bfetch\s*\(/);
 }
@@ -498,8 +504,8 @@ const plannedLabelIndex = availabilityPanelSource.indexOf("Planned $/day");
 assert.ok(plannedRowGuardIndex >= 0 && plannedLabelIndex > plannedRowGuardIndex, "the planned-$/day footer row must be gated behind canSeeFinancials");
 assert.doesNotMatch(availabilityPanelSource, /\bprisma\b|getCashflowOutlook|getChangeOrderOverlayRows|getCalendarOverlays|getCompanyDashboardData/, "the availability panel must derive from serialized CompanyDashboardData only, never a direct query or money-fetch function");
 assert.match(availabilityPanelSource, /distanceMilesFromShop/, "far-job awareness must read the serialized distanceMilesFromShop field");
-assert.match(projectBarSource, /project\.distanceMilesFromShop != null/);
-assert.match(projectBarSource, /mi from shop/, "the Actions popover must surface the shop distance line");
+assert.match(projectDrawerSource, /project\.distanceMilesFromShop != null/);
+assert.match(projectDrawerSource, /mi from shop/, "the project drawer header must surface the shop distance line");
 // The crew-mode toggle is now owned by ScheduleBoard so the panel's
 // drill-down can force it on even when Timeline is already mounted.
 assert.match(timelineSource, /export const CREW_MODE_STORAGE_KEY/);
@@ -511,29 +517,27 @@ assert.match(boardSource, /onDrillDown=\{drillDownToCrewTimeline\}/);
 // "Edit dates…" — the standalone "Set end date…" item and its own menu view
 // are GONE; the "dates" view now carries both fields. ──
 assert.doesNotMatch(projectBarSource, /Set end date…/, "the standalone \"Set end date…\" menu item must be removed");
-assert.doesNotMatch(projectBarSource, /"main" \| "dates" \| "crew" \| "color" \| "end-date"/, "BarMenuView must no longer carry a separate end-date view");
-assert.match(projectBarSource, /type BarMenuView = "main" \| "dates" \| "crew" \| "color";/);
+assert.doesNotMatch(projectBarSource, /BarMenuView|setMenuView/, "ProjectBar must carry no menu view state");
 // "Edit dates…" is no longer canMoveProject-gated at the menu-item level (a
 // Substantial Completion project can't move its start, but must still be
 // able to set an end date) — the Start FIELD inside the view stays gated.
 assert.doesNotMatch(projectBarSource, /\{canMoveProject && \(\s*<button type="button" onClick=\{\(\) => setMenuView\("dates"\)\}/, "the Edit dates… menu item itself must not be canMoveProject-gated");
-assert.match(projectBarSource, /\{menuView === "dates" && \(/, "the merged dates view must not require canMoveProject to render at all");
-assert.match(projectBarSource, /\{canMoveProject && \(\s*<div>\s*<label[\s\S]{0,300}Start date/, "the Start date FIELD inside the merged view stays canMoveProject-gated");
-assert.match(projectBarSource, /htmlFor=\{`bar-project-enddate-\$\{project\.id\}`\}>End date/, "the merged view must contain an End date field");
-assert.match(projectBarSource, /Joins unsaved changes — Save to commit\./, "the Start field needs a caption distinguishing it from the immediate End write");
-assert.match(projectBarSource, /Saves immediately\./, "the End field needs a caption distinguishing it from the draft Start write");
-assert.match(projectBarSource, /Clear end date/, "the merged view keeps a Clear end date affordance");
+assert.match(projectDrawerSource, /\{canMoveProject && \(\s*<div>\s*<label[\s\S]{0,300}Start date/, "the Start date field inside the drawer stays canMoveProject-gated");
+assert.match(projectDrawerSource, />End date<\/label>/, "the drawer Dates section must contain an End date field");
+assert.match(projectDrawerSource, /Joins unsaved changes — Save to commit\./, "the Start field needs a caption distinguishing it from the immediate End write");
+assert.match(projectDrawerSource, /Saves immediately\./, "the End field needs a caption distinguishing it from the draft Start write");
+assert.match(projectDrawerSource, /Clear end date/, "the drawer keeps a Clear end date affordance");
 // Submit behavior: Start routes through the EXISTING draft path
 // (onMoveCommit -> draftProjectMove); End calls updateProjectEndDateAction
 // (via submitEndDate) immediately and ONLY when it actually changed.
-const handleDateSubmitStart = projectBarSource.indexOf("function handleDateSubmit(");
-const handleDateSubmitEnd = projectBarSource.indexOf("function submitColor(", handleDateSubmitStart);
-const handleDateSubmitBody = projectBarSource.slice(handleDateSubmitStart, handleDateSubmitEnd);
+const handleDateSubmitStart = projectDrawerSource.indexOf("function handleDateSubmit(");
+const handleDateSubmitEnd = projectDrawerSource.indexOf("function submitEndDate(", handleDateSubmitStart);
+const handleDateSubmitBody = projectDrawerSource.slice(handleDateSubmitStart, handleDateSubmitEnd);
 assert.ok(handleDateSubmitStart >= 0, "handleDateSubmit must exist");
 assert.match(handleDateSubmitBody, /onMoveCommit\(project, targetStart\)/, "a start change must route through the existing draft path");
 assert.match(handleDateSubmitBody, /if \(endDateValue !== projectEndDate\) \{\s*\n\s*submitEndDate\(endDateValue \|\| null\);/, "an end change must fire submitEndDate ONLY when the value actually changed");
-assert.match(projectBarSource, /await updateProjectEndDateAction\(project\.id, value\);/, "the merged End field still routes through the existing updateProjectEndDateAction — no new action");
-assert.match(projectBarSource, /toast\.error\(err\?\.message \|\| "Failed to update end date"\)/, "end-date validation errors stay toasts");
+assert.match(projectDrawerSource, /await updateProjectEndDateAction\(project\.id, value\);/, "the drawer End field still routes through the existing updateProjectEndDateAction — no new action");
+assert.match(projectDrawerSource, /toast\.error\(err\?\.message \|\| "Failed to update end date"\)/, "end-date validation errors stay toasts");
 
 // ── Item 2: project-bar right-edge resize -> end date ──
 assert.match(projectBarSource, /onProjectEndResizeStart: ProjectEditCallbacks\["onProjectEndResizeStart"\]/, "ProjectBarProps must carry the end-resize callback");
@@ -619,7 +623,9 @@ for (const source of [monthSource, timelineSource, projectBarSource]) {
 assert.doesNotMatch(crewPickersSource, /max-h-64/, "CrewPickers must not bring its own max-height scroller — FloatingPopover owns scrolling");
 assert.doesNotMatch(crewPickersSource, /overflow-y-auto/, "CrewPickers must not bring its own scroll region — double scrollbar was the bug");
 assert.match(crewPickersSource, /function CrewChecklist\(/, "a single shared checklist presentation must exist");
-assert.match(crewPickersSource, /grid grid-cols-1 gap-1 sm:grid-cols-2/, "the checklist must be a two-column grid, not a single vertical list");
+assert.match(crewPickersSource, /layout\?: "compact" \| "list"/, "CrewChecklist must expose a list layout without forking the picker");
+assert.match(crewPickersSource, /layout === "list" \? "grid grid-cols-1 gap-1" : "grid grid-cols-1 gap-1 sm:grid-cols-2"/, "the drawer gets one row per person while compact popovers keep two columns");
+assert.match(crewPickersSource, /option\.tag/, "removable non-crew entries must expose a separate role/status tag in list layout");
 assert.match(crewPickersSource, /variant\?: "inline" \| "popover";/, "CrewPicker/TaskCrewPicker must accept the inline/popover variant");
 assert.match(crewPickersSource, /if \(variant === "inline"\) \{\s*\n\s*return <CrewChecklist/, "the inline variant must render the checklist directly with no nested trigger/popover of its own");
 assert.match(crewPickersSource, /<FloatingPopover open=\{open\} anchorRef=\{triggerRef\} onClose=\{\(\) => setOpen\(false\)\} width=\{320\}>/, "the popover variant (Schedule & crew table) must use FloatingPopover at width 320");
@@ -665,8 +671,8 @@ assert.match(boardSource, /draftTaskIds\.has\(openTaskId\)/, "direct task drafts
 assert.match(boardSource, /draftProjectIds\.has\(openTaskProjectId\)/, "project shifts that move the task must lock drawer date editing");
 assert.match(boardSource, /hasDraft=\{openTaskHasDraft\}/, "ScheduleBoard must pass the complete draft-date safety flag to the drawer");
 assert.match(boardSource, /onDeleted=\{handleDrawerTaskDeleted\}/, "drawer deletion must reconcile board-local task state");
-assert.match(drawerSource, /activeElement\.blur\(\)/, "outside-close must flush blur-saved drawer fields before unmounting");
-assert.match(drawerSource, /window\.setTimeout\(onClose, 0\)/, "outside-close must defer unmount until the blur handler runs");
+assert.match(drawerShellSource, /activeElement\.blur\(\)/, "outside-close must flush blur-saved drawer fields before unmounting");
+assert.match(drawerShellSource, /window\.setTimeout\(onClose, 0\)/, "outside-close must defer unmount until the blur handler runs");
 assert.match(drawerSource, /onDeleted\(id\)/, "successful drawer deletion must notify the board owner");
 assert.match(drawerSource, /This task has unsaved changes on the board — Save or Discard them first\./, "the drawer must explain the draft-date gate exactly");
 assert.match(detailPanelSource, /datesReadOnly\?: boolean;/, "the shared panel must support read-only dates without becoming board-specific");
@@ -677,6 +683,28 @@ const getTaskDetailEnd = actionsSource.indexOf("export async function", getTaskD
 const getTaskDetailBody = actionsSource.slice(getTaskDetailStart, getTaskDetailEnd);
 assert.ok(getTaskDetailStart >= 0, "getScheduleTaskDetail must exist");
 assert.match(getTaskDetailBody, /await assertScheduleTaskAccess\(taskId\);/, "task detail reads must use the canonical schedule-task authorization gate");
+
+// G0 project drawer: lifted project selection, shared shell, and one
+// all-visible list of the former project-menu capabilities.
+assert.match(boardSource, /const \[openProjectId, setOpenProjectId\] = useState<string \| null>\(null\)/, "ScheduleBoard must lift the selected project id beside the task id");
+assert.match(boardSource, /const handleProjectActivate = useCallback\(\(projectId: string\) => \{[\s\S]{0,220}setOpenProjectId\(projectId\)/, "the board must own one project activation handler");
+assert.equal((boardSource.match(/onProjectActivate=\{handleProjectActivate\}/g) ?? []).length, 2, "Month and Timeline must receive the one project activation handler");
+for (const source of [monthSource, timelineSource]) {
+    assert.match(source, /onProjectActivate=\{onProjectActivate\}/, "project drawer activation must be threaded through each ProjectBar render site");
+}
+assert.equal((boardSource.match(/<BoardProjectDrawer/g) ?? []).length, 1, "ScheduleBoard must own exactly one project drawer instance");
+assert.match(boardSource, /project=\{openProject\}/, "the project drawer must receive the selected serialized project");
+assert.match(drawerSource, /import \{ BoardDrawerShell \} from "\.\/BoardDrawerShell"/, "the task drawer must use the extracted shared shell");
+assert.match(projectDrawerSource, /import \{ BoardDrawerShell \} from "\.\/BoardDrawerShell"/, "the project drawer must use the exact same shell");
+assert.match(drawerShellSource, /w-\[min\(420px,calc\(100vw-1rem\)\)\]/, "both drawers must retain the task drawer's 420px responsive width");
+assert.match(drawerShellSource, /event\.key === "Escape"/, "the shared shell must close on Escape");
+assert.match(drawerShellSource, /document\.addEventListener\("pointerdown", onPointerDown, true\)/, "the shared shell must close from captured outside clicks");
+const projectHeaderIndex = projectDrawerSource.indexOf("Open project");
+const projectDatesIndex = projectDrawerSource.indexOf(">Dates<");
+const projectCrewIndex = projectDrawerSource.indexOf(">Project crew<");
+const projectColorIndex = projectDrawerSource.indexOf(">Color<");
+assert.ok(projectHeaderIndex >= 0 && projectDatesIndex > projectHeaderIndex && projectCrewIndex > projectDatesIndex && projectColorIndex > projectCrewIndex, "project drawer sections must stay in Header -> Dates -> Project crew -> Color order");
+assert.doesNotMatch(projectDrawerSource, /Back<\/button>|setMenuView|menuView/, "the project drawer must be one visible scrollable list with no sub-views or Back button");
 
 const updateTaskStart = actionsSource.indexOf("export async function updateScheduleTask(");
 const updateTaskEnd = actionsSource.indexOf("export async function", updateTaskStart + 1);
@@ -721,11 +749,11 @@ for (const [name, source] of [
 // Dispatch exceptions strip. Schedule geometry remains plain React/DOM.
 assert.match(boardSource, /<MotionConfig reducedMotion="user">/, "the schedule board must honor the user's reduced-motion preference");
 assert.match(boardSource, /data-motion-scope="status-change"/, "draft/refresh status changes must use the narrow status transition scope");
-assert.match(drawerSource, /<motion\.aside/, "the shared task drawer must animate its entrance");
+assert.match(drawerShellSource, /<motion\.aside/, "the shared drawer shell must animate both drawers' entrance");
 assert.match(dialogSource, /<motion\.div[\s\S]{0,220}data-motion-scope="dialog-enter"/, "the save-time confirmation dialog must animate its entrance");
 assert.match(taskCreationDialogSource, /<motion\.div[\s\S]{0,220}data-motion-scope="dialog-enter"/, "the shared creation dialog must animate its entrance");
 assert.match(dispatchStripSource, /<motion\.div[\s\S]{0,220}data-motion-scope="exceptions-strip"/, "the exceptions strip must use its narrow transition scope");
-assert.doesNotMatch(scheduleBoardSourceTree, /\s(?:layout|layoutId)=/, "layout and layoutId props are forbidden everywhere under schedule-board/");
+assert.doesNotMatch(scheduleBoardSourceTree, /<motion\.[^>]*\s(?:layout|layoutId)=/, "Framer Motion layout and layoutId props are forbidden everywhere under schedule-board/");
 assert.doesNotMatch(scheduleBoardSourceTree, /<motion\.[^>]*\sdrag(?:=|\s)/, "Motion drag props are forbidden everywhere under schedule-board/");
 for (const [name, source] of [
     ["TaskBlockSegment", taskBlockSource],

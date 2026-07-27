@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
 import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
 import { formatCurrency } from "@/lib/utils";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -56,7 +57,10 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         orderBy: { createdAt: "desc" },
         take: 8,
         select: { id: true, name: true, url: true, mimeType: true, size: true, createdAt: true },
-    }).then(r => { console.timeEnd("[DASHBOARD] recentFiles"); return r; });
+    }).then(async (rows) => {
+        console.timeEnd("[DASHBOARD] recentFiles");
+        return Promise.all(rows.map(async (f) => ({ ...f, url: await resolveDocUrl(f.url) })));
+    });
 
     const [project, tasks, portalVisibility, recentActivity, recentFiles] = await Promise.all([
         projectPromise,
@@ -293,7 +297,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                                             >
                                                 {isImage ? (
                                                     <img
-                                                        src={file.url}
+                                                        src={file.url || ""}
                                                         alt={file.name}
                                                         loading="lazy"
                                                         width={80}

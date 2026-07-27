@@ -2,7 +2,7 @@ import { getContractForPortal, getPublicCompanySettings, getPortalVisibility, ge
 import { notFound } from "next/navigation";
 import PortalContractClient from "./PortalContractClient";
 import Link from "next/link";
-import { getSupabase } from "@/lib/supabase";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -55,19 +55,16 @@ export default async function PortalContractPage({
     });
 
     const serializedContract = JSON.parse(JSON.stringify(contract));
-    if (contract.originalPdfPath) {
-        const supabase = getSupabase();
-        if (supabase) {
-            const { data } = supabase.storage.from("project-files").getPublicUrl(contract.originalPdfPath);
-            serializedContract.originalPdfUrl = data?.publicUrl || null;
-        }
-    }
+    serializedContract.originalPdfUrl = await resolveDocUrl(contract.originalPdfPath);
+    serializedContract.signatureUrl = await resolveDocUrl(contract.signatureUrl);
+    serializedContract.contractorSignatureUrl = await resolveDocUrl(contract.contractorSignatureUrl);
+    serializedContract.companySignatureUrl = await resolveDocUrl(contract.companySignatureUrl);
 
     return (
         <PortalContractClient
             initialContract={serializedContract}
             companySettings={settings}
-            archivedPdfUrl={archivedFile?.url || null}
+            archivedPdfUrl={await resolveDocUrl(archivedFile?.url)}
             accessToken={resolvedSearch.token || null}
         />
     );

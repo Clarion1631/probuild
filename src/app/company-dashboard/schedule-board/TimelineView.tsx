@@ -189,8 +189,8 @@ export function TimelineView({
     scrollToTodayNonce,
     teamMembers,
     isAnyDragActive,
-    onProjectMoveCommit,
     activeProjectKeyboardId,
+    onProjectActivate,
     onProjectPointerEditStart,
     onProjectKeyboardStart,
     onProjectKeyboardAdjust,
@@ -727,6 +727,7 @@ export function TimelineView({
                                                 draftTaskIds={draftTaskIds}
                                                 activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                 activeProjectKeyboardId={activeProjectKeyboardId}
+                                                onProjectActivate={onProjectActivate}
                                                 timelineDayWidth={dayWidth}
                                                 timelineLeftInset={LABEL_WIDTH}
                                                 timelineScrollContainerRef={scrollContainerRef}
@@ -737,7 +738,6 @@ export function TimelineView({
                                                 onProjectKeyboardAdjust={onProjectKeyboardAdjust}
                                                 onProjectKeyboardCommit={onProjectKeyboardCommit}
                                                 onProjectKeyboardCancel={onProjectKeyboardCancel}
-                                                onMoveCommit={onProjectMoveCommit}
                                                 onProjectEndResizeStart={onProjectEndResizeStart}
                                                 onTaskPointerEditStart={onTaskPointerEditStart}
                                                 onTaskKeyboardStart={onTaskKeyboardStart}

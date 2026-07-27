@@ -3,14 +3,25 @@ import { prisma } from './prisma';
 import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
+import { isSecureRef, downloadDocBytes } from './secure-storage';
 import { coTaxRate, coTaxLabel } from './co-tax';
 import { drawRichHtml, type RichTextCtx } from './pdf-richtext';
 
+/** pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so a failed PNG embed
+ *  falls through to a JPG attempt (no content-type header is available once bytes come
+ *  from downloadDocBytes rather than a fetch() Response). */
+async function embedImageBytes(doc: PDFDocument, bytes: Uint8Array): Promise<PDFImage> {
+    try {
+        return await doc.embedPng(bytes);
+    } catch {
+        return await doc.embedJpg(bytes);
+    }
+}
+
 /**
- * Embed a signature image from either a legacy inline data-URL or a migrated http(s)
- * Storage URL. Returns the embedded image, or null if it can't be loaded/decoded.
- * pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so other types fall
- * through to a PNG attempt and are caught.
+ * Embed a signature image from a legacy inline data-URL, a secure ref (private bucket),
+ * or a migrated http(s) Storage URL. Returns the embedded image, or null if it can't be
+ * loaded/decoded.
  */
 async function embedSignatureImage(doc: PDFDocument, value: string): Promise<PDFImage | null> {
     try {
@@ -19,25 +30,17 @@ async function embedSignatureImage(doc: PDFDocument, value: string): Promise<PDF
             const bytes = Buffer.from(dataUrlMatch[2], 'base64');
             return /^jpe?g$/i.test(dataUrlMatch[1]) ? await doc.embedJpg(bytes) : await doc.embedPng(bytes);
         }
+        if (isSecureRef(value)) {
+            const bytes = await downloadDocBytes(value);
+            return bytes ? await embedImageBytes(doc, bytes) : null;
+        }
         if (/^https?:\/\//i.test(value)) {
             // SSRF guard: only fetch URLs that point at our own Supabase Storage signatures
             // dir. A DB-stored signature column must never be able to aim the server at an
             // arbitrary host (e.g. cloud metadata). Anything else is treated as no image.
             if (!isOwnSignatureStorageUrl(value)) return null;
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 4000);
-            let res: Response;
-            try {
-                res = await fetch(value, { signal: controller.signal });
-            } finally {
-                clearTimeout(timeoutId);
-            }
-            if (!res.ok) return null;
-            const bytes = new Uint8Array(await res.arrayBuffer());
-            const contentType = (res.headers.get('content-type') || '').toLowerCase();
-            return contentType.includes('jpeg') || contentType.includes('jpg')
-                ? await doc.embedJpg(bytes)
-                : await doc.embedPng(bytes);
+            const bytes = await downloadDocBytes(value);
+            return bytes ? await embedImageBytes(doc, bytes) : null;
         }
         return null;
     } catch (err) {

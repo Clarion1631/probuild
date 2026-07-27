@@ -124,8 +124,8 @@ export function MonthBarsView({
     onCreateTask,
     teamMembers,
     isAnyDragActive,
-    onProjectMoveCommit,
     activeProjectKeyboardId,
+    onProjectActivate,
     onProjectPointerEditStart,
     onProjectKeyboardStart,
     onProjectKeyboardAdjust,
@@ -363,6 +363,7 @@ export function MonthBarsView({
                                                     draftTaskIds={draftTaskIds}
                                                     activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                     activeProjectKeyboardId={activeProjectKeyboardId}
+                                                    onProjectActivate={onProjectActivate}
                                                     teamMembers={teamMembers}
                                                     isAnyDragActive={isAnyDragActive}
                                                     onProjectPointerEditStart={onProjectPointerEditStart}
@@ -370,7 +371,6 @@ export function MonthBarsView({
                                                     onProjectKeyboardAdjust={onProjectKeyboardAdjust}
                                                     onProjectKeyboardCommit={onProjectKeyboardCommit}
                                                     onProjectKeyboardCancel={onProjectKeyboardCancel}
-                                                    onMoveCommit={onProjectMoveCommit}
                                                     onProjectEndResizeStart={onProjectEndResizeStart}
                                                     onTaskPointerEditStart={onTaskPointerEditStart}
                                                     onTaskKeyboardStart={onTaskKeyboardStart}

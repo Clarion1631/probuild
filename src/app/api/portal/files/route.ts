@@ -8,6 +8,7 @@ import { getPortalVisibility, logActivity } from "@/lib/actions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { PORTAL_UPLOAD_EXTENSIONS } from "@/lib/project-files";
 import { sendNotification } from "@/lib/email";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const maxDuration = 30;
 
@@ -98,7 +99,7 @@ export async function GET(req: NextRequest) {
                 ? { OR: [{ visibility: "shared" }, { visibility: null }] }
                 : { visibility: "shared" }),
         };
-        const files = await prisma.projectFile.findMany({
+        const filesRaw = await prisma.projectFile.findMany({
             where: fileWhere,
             orderBy: { createdAt: "desc" },
             select: {
@@ -111,6 +112,9 @@ export async function GET(req: NextRequest) {
                 uploadedByClient: true,
             },
         });
+        const files = await Promise.all(
+            filesRaw.map(async (f) => ({ ...f, url: await resolveDocUrl(f.url) }))
+        );
 
         return NextResponse.json({ folders, files });
     } catch (err: any) {
