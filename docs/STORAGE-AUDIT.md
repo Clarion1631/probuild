@@ -82,6 +82,34 @@ Run in this order. Steps 1–3 are reversible; step 6 is not.
 
 Rollback before step 6 is a code revert — the public originals are still serving, so nothing is lost.
 
+7. **Sweep orphans** — `node scripts/sweep-orphaned-public-signatures.mjs --dest "<backup dir>" --apply`. The migration only moves objects a DB row points at, so it is blind to **orphans**: sensitive objects in storage that nothing references. These stay public forever otherwise. See below.
+
+## Executed 2026-07-27
+
+All steps ran against production. Result: **0 sensitive objects remain in the public bucket.**
+
+| Step | Outcome |
+|---|---|
+| Migration (`--apply`) | 32 rows → 26 unique objects copied, 0 failed, 0 corrupt |
+| Backup to Drive | 26 files / 9.3 MB + manifest, sha256-verified against live objects |
+| Purge of originals | 26 deleted, 0 refused, 0 failed |
+| Orphan sweep | **202 orphans** swept (14 signatures + 188 PDFs, 52.5 MB), 0 referenced, 0 failed |
+
+Backups live in Google Drive at `Claude/ProBuild-Storage-Backup-2026-07-27` (folder id `1AYDAB4toyYGv8s5nCoL0bPqhgg_bPe9j`), with `MANIFEST.json`, `MANIFEST-orphans.json` and `MANIFEST-orphans-signatures.json` recording table/column/row-id/path/size/sha256 per file. Restore maps 1:1 back to bucket paths.
+
+## Orphans: why the migration alone was not enough
+
+The migration is DB-driven, so it never sees objects that no row references. Sweeping found **202** such objects still world-readable after the purge:
+
+- **14 signature PNGs.** One contract had *five* near-identical 8,502-byte client signatures — the signing action uploads *before* its guarded DB write, so losing an idempotency race or hitting the already-signed retry leaves the upload behind. Re-signing also supersedes an earlier object.
+- **188 sensitive PDFs**, 52 MB. Mostly e2e test artifacts (`EST-MPTEST`, `Automated_Test_Lien_Release`), but including real-looking executed contracts whose `ProjectFile` rows had since been deleted.
+
+**The upstream orphan-generating bug still exists** (upload precedes the guarded write). It is no longer a *privacy* problem, because `persistSignature` now writes to the private bucket, so future orphans are wasted storage rather than exposed documents. A periodic sweep or cleanup-on-throw would close it properly.
+
+## Caveat: CDN cache lag
+
+Supabase serves public objects through Cloudflare with `cacheControl: max-age=3600`. **Deleting an object does not purge edge caches**, so a previously-fetched URL can keep returning the file for up to an hour. This was observed directly during verification: a deleted signature returned HTTP 200 from cache, then 400 once the cache was bypassed. Anyone who fetched a specific URL shortly before the purge may retain access briefly; there is no permanent exposure.
+
 ## Gotchas carried in from prior work
 
 - `isOwnSignatureStorageUrl()` in `src/lib/signature-storage.ts` is an **SSRF allowlist** gating the server-side signature fetch in `pdf.ts`. It is pinned to `project-files`; moving buckets requires updating it. Do not remove it.
