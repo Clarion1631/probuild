@@ -2289,9 +2289,13 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         data: { status: "Invoiced" },
     });
 
-    // 3) Every pending milestone → its own QuickBooks invoice + hosted pay link,
-    //    so the portal can default to QuickBooks for all of them. The first one
-    //    (the deposit) also rides the approval email.
+    // 3) ONLY the deposit gets a QuickBooks invoice + hosted pay link here, so it can
+    //    ride the approval email. The rest of the schedule stays a suggestion until
+    //    someone deliberately bills it ("QuickBooks Link" per milestone today, the
+    //    progress-invoice builder next) — staging the whole schedule up front filled
+    //    QuickBooks with invoices nobody had billed yet and let payments land against
+    //    amounts that had since changed (Mesplay: a $25k check against a staged $40k
+    //    milestone, 2026-07). One approval, one QuickBooks invoice.
     let payLink: string | null = null;
     const pendingMilestones = await prisma.paymentSchedule.findMany({
         where: { invoiceId: invoice.id, status: "Pending" },
@@ -2299,24 +2303,15 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         select: { id: true, name: true, amount: true },
     });
     const deposit = pendingMilestones[0] || null;
-    if (pendingMilestones.length > 0) {
+    if (deposit) {
         try {
             const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            for (const milestone of pendingMilestones) {
-                // Per-milestone catch: one milestone failing (e.g. it changed mid-push
-                // and the conditional link claim refused) must not stop the remaining
-                // milestones from getting their QuickBooks links.
-                try {
-                    const pushed = await pushMilestoneToQuickBooks(milestone.id);
-                    if (milestone.id === deposit?.id) payLink = pushed.payLink;
-                } catch (e) {
-                    console.warn(`[approveEstimate] QuickBooks push skipped for milestone "${milestone.name}":`, e instanceof Error ? e.message : e);
-                }
-            }
+            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            payLink = pushed.payLink;
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
             // manual recording still work; the PM can push links later.
-            console.warn("[approveEstimate] QuickBooks milestone push skipped:", e instanceof Error ? e.message : e);
+            console.warn("[approveEstimate] QuickBooks deposit push skipped:", e instanceof Error ? e.message : e);
         }
     }
 
