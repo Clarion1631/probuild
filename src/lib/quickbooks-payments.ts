@@ -343,6 +343,54 @@ async function settleMilestonePaidInTx(
 }
 
 /**
+ * Settle ONE progress billing (src/lib/progress-billing.ts) from a QuickBooks
+ * payment: claim the billing Paid, then settle every milestone line it
+ * carries (custom/CO lines are materialized into a real PaymentSchedule at
+ * billing-creation time — see createProgressBillingCore — so every line has a
+ * scheduleId here; there is no special case). Exported (not just inlined in
+ * syncQuickBooksPayments below) so it can be driven directly — by a caller
+ * that already has a settlement to record, or by a test with no live
+ * QuickBooks connection.
+ */
+export async function settleProgressBillingPaidCore(
+    billingId: string,
+    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null },
+): Promise<boolean> {
+    const billing = await prisma.progressBilling.findUnique({
+        where: { id: billingId },
+        select: {
+            id: true,
+            invoiceId: true,
+            lines: { select: { scheduleId: true } },
+            invoice: { select: { estimateId: true } },
+        },
+    });
+    if (!billing) return false;
+
+    return withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Every line of
+        // this billing shares the same invoiceId, so one lock covers them all.
+        await lockMoneyParents(t, { estimateId: billing.invoice.estimateId, invoiceId: billing.invoiceId });
+
+        const claim = await t.progressBilling.updateMany({
+            where: { id: billing.id, status: { in: ["Staged", "Sent"] }, qbPaymentId: null },
+            data: { status: "Paid", paidAt: payment.paidAt, qbPaymentId: payment.qbPaymentId, qbSyncedAt: new Date() },
+        });
+        if (claim.count === 0) return false;
+
+        for (const line of billing.lines) {
+            if (!line.scheduleId) continue; // defensive — every line should have one by creation time
+            await settleMilestonePaidInTx(t, line.scheduleId, billing.invoiceId, payment);
+        }
+        // TODO(progress-billing): route paid-billing notifications through
+        // notifyMilestonePaid in the UI pass — deliberately not enqueued here
+        // (this pass ships no customer notifications, per the owner's hard
+        // constraint; see PROGRESS_BILLING_REPORT.md).
+        return true;
+    }));
+}
+
+/**
  * Mark a milestone Paid from a QuickBooks settlement. Mirrors the Stripe
  * webhook's claim-then-recalculate transaction so balances never drift.
  */
@@ -642,11 +690,11 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
 
     // ── Progress billings ───────────────────────────────────────────────────
     // Same probe → settle shape as the milestone loop above, but claims ONE
-    // ProgressBilling row and then settles every milestone line it carries
-    // (custom/change-order lines have no scheduleId and are skipped — there is
-    // no milestone to mark Paid for them) under a single lock+transaction, since
-    // every line of a billing is scoped to the same invoice (createProgressBillingCore
-    // enforces this at build time).
+    // ProgressBilling row and settles it via settleProgressBillingPaidCore,
+    // which walks every line the billing carries under a single lock+transaction
+    // (custom/change-order lines were materialized into a real PaymentSchedule
+    // at billing-creation time — see createProgressBillingCore — so every line
+    // has a scheduleId and settles like any other milestone; no special case).
     for (const billing of pendingBillings) {
         try {
             const probe = await probeQBInvoice(tokens, billing.qbInvoiceId!);
@@ -665,27 +713,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                     if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
                     referenceNumber = p?.referenceNumber || null;
                 }
-                const settled = await withTxRetry(() => prisma.$transaction(async (t) => {
-                    // Canonical lock order: Estimate → Invoice → schedules. Every line of
-                    // this billing shares the same invoiceId, so one lock covers them all.
-                    await lockMoneyParents(t, { estimateId: billing.invoice.estimateId, invoiceId: billing.invoiceId });
-
-                    const claim = await t.progressBilling.updateMany({
-                        where: { id: billing.id, status: { in: ["Staged", "Sent"] }, qbPaymentId: null },
-                        data: { status: "Paid", paidAt, qbPaymentId: paymentId, qbSyncedAt: new Date() },
-                    });
-                    if (claim.count === 0) return false;
-
-                    for (const line of billing.lines) {
-                        if (!line.scheduleId) continue; // custom / change-order line — no milestone to settle
-                        await settleMilestonePaidInTx(t, line.scheduleId, billing.invoiceId, { paidAt, referenceNumber, qbPaymentId: paymentId });
-                    }
-                    // TODO(progress-billing): route paid-billing notifications through
-                    // notifyMilestonePaid in the UI pass — deliberately not enqueued here
-                    // (this pass ships no customer notifications, per the owner's hard
-                    // constraint; see PROGRESS_BILLING_REPORT.md).
-                    return true;
-                }));
+                const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });
                 if (settled) result.progressBillingsSettled++;
             } else if (probe.balance < probe.total) {
                 result.partiallyPaid++;

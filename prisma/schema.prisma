@@ -601,8 +601,12 @@ model PaymentSchedule {
 }
 
 // Progress billing: the billable artifact the user builds by picking
-// milestones and/or approved change orders and/or a custom amount, writing
-// one client-facing description, and staging exactly ONE QuickBooks invoice.
+// milestones and/or a custom amount, writing one client-facing description,
+// and staging exactly ONE QuickBooks invoice. An approved change order is
+// billed by approving it — billChangeOrderCore (src/lib/billing-core.ts)
+// already adds it to the invoice as a normal PaymentSchedule milestone, so it
+// arrives here like any other milestone line rather than as its own line
+// type (a second rail for the same money would be a double-billing hole).
 // Milestones (PaymentSchedule) remain the record of what has been satisfied —
 // see src/lib/progress-billing.ts for the auto-split mechanic that keeps every
 // ProgressBillingLine mapped 1:1 to a whole milestone.
@@ -638,7 +642,6 @@ model ProgressBillingLine {
   billingId     String
   billing       ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
   scheduleId    String?  // PaymentSchedule this line bills (null = custom line)
-  changeOrderId String?  // or an approved ChangeOrder
   description   String
   amount        Decimal  // pre-tax
   order         Int      @default(0)

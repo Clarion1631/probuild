@@ -3,11 +3,19 @@
  *
  * Product model: estimate/invoice milestones (PaymentSchedule/EstimatePaymentSchedule)
  * are SUGGESTIONS. The billable artifact is a "progress billing" (ProgressBilling):
- * the user picks milestones and/or approved change orders and/or a custom amount,
- * writes one client-facing description, confirms tax, and stages exactly ONE
- * QuickBooks invoice. Milestones remain the record of truth for what has been
- * satisfied, so a billing that covers only PART of a milestone AUTO-SPLITS that
- * milestone — every billing line ends up mapped 1:1 to a whole milestone.
+ * the user picks milestones and/or a custom amount, writes one client-facing
+ * description, confirms tax, and stages exactly ONE QuickBooks invoice.
+ * Milestones remain the record of truth for what has been satisfied, so a
+ * billing that covers only PART of a milestone AUTO-SPLITS that milestone —
+ * every billing line ends up mapped 1:1 to a whole milestone.
+ *
+ * Change orders are NOT a line type here. `billChangeOrderCore`
+ * (src/lib/billing-core.ts) already bills an approved change order by adding
+ * it to the invoice as a normal PaymentSchedule milestone (called from
+ * `handleChangeOrderApproved` on approval) — it arrives here like any other
+ * milestone line. A `changeOrderId` field on a progress-billing line would be
+ * a second rail for the same money, so `createProgressBillingCore` rejects
+ * any line that supplies one.
  *
  * Session-free cores (no auth checks) — actions.ts wrappers come in the UI pass,
  * same convention as billing-core.ts.
@@ -26,12 +34,13 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { toNum } from "./prisma-helpers";
 import type { ProgressBilling, ProgressBillingLine } from "@prisma/client";
 
-// Cent-round helper shared by every money computation below.
-const r2 = (n: number) => Math.round(n * 100) / 100;
+// Cent-round helper shared by every money computation below. EPSILON nudges
+// values like 1.005 (which float as 1.00499999999...) up to the cent they were
+// meant to land on instead of truncating down.
+const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 export type ProgressBillingLineInput = {
     scheduleId?: string;
-    changeOrderId?: string;
     description: string;
     amount: number;
 };
@@ -40,8 +49,15 @@ export type CreateProgressBillingInput = {
     description: string;
     lines: ProgressBillingLineInput[];
     taxExempt?: boolean;
-    amountMode: "preTax" | "targetTotal";
-    targetTotal?: number;
+    /**
+     * Optional: when supplied, the client pays exactly this (tax-inclusive)
+     * amount. Cross-checked against what the lines say they add up to
+     * (`expectedGross`, within 2 cents) — a mismatch almost always means the
+     * lines were entered in the wrong units (pre-tax vs gross), not that the
+     * user wants an arbitrary rescale, so it throws rather than silently
+     * redistributing the difference.
+     */
+    grossTotal?: number;
 };
 
 export type ProgressBillingWithLines = ProgressBilling & { lines: ProgressBillingLine[] };
@@ -49,16 +65,25 @@ export type ProgressBillingWithLines = ProgressBilling & { lines: ProgressBillin
 /**
  * Build one progress billing.
  *
- * TWO AMOUNTS, DELIBERATELY DIFFERENT. Every line carries:
- *   • the PERSISTED amount (ProgressBillingLine.amount) — always PRE-TAX, since
- *     it feeds the QuickBooks invoice's taxable line; and
- *   • the SPLIT amount — what gets carved out of the milestone, expressed in
- *     that milestone's own units (see the "Split units" block below).
- * On a legacy tax-inclusive job these differ by exactly the tax and that is
- * correct: a $25,000 check against a $39,998.25 tax-inclusive milestone leaves
- * $14,998.25 behind while the QuickBooks line reads $22,977.94 + $2,022.06 tax.
- * On a pre-tax job they are identical. In "preTax" mode they are always
- * identical regardless of vintage.
+ * UNITS. `lines[].amount` is always expressed in the milestone's OWN units,
+ * which differ by vintage (`Estimate.taxInclusiveMilestones`, defaulting to
+ * legacy/true when the invoice has no estimate):
+ *   • legacy vintage: milestone amounts are GROSS (tax-inclusive) — the line
+ *     amount is literally what the client is paying against that milestone.
+ *   • new vintage: milestone amounts are PRE-TAX — tax rides on top.
+ * This applies uniformly to milestone lines and custom lines (materialized
+ * into a brand-new milestone in the same units).
+ *
+ * TWO AMOUNTS PER LINE, DELIBERATELY DIFFERENT:
+ *   • the PERSISTED amount (ProgressBillingLine.amount) — always PRE-TAX,
+ *     since it feeds the QuickBooks invoice's taxable line; and
+ *   • the SPLIT amount — what gets carved out of the milestone (or, for a
+ *     custom line, what the newly-materialized milestone is sized to),
+ *     expressed in that milestone's own units.
+ * On a legacy tax-inclusive job these differ by exactly the tax: a $25,000
+ * check against a $39,998.25 tax-inclusive milestone leaves $14,998.25
+ * behind, while the QuickBooks line reads $22,977.94 + $2,022.06 tax. On a
+ * pre-tax job they are identical.
  */
 export async function createProgressBillingCore(
     invoiceId: string,
@@ -67,9 +92,6 @@ export async function createProgressBillingCore(
     const description = (input.description || "").trim();
     if (!description) throw new Error("A description is required");
     if (!input.lines?.length) throw new Error("At least one line is required");
-    if (input.amountMode !== "preTax" && input.amountMode !== "targetTotal") {
-        throw new Error(`Unknown amountMode: ${input.amountMode}`);
-    }
 
     const rawAmounts = input.lines.map((l) => r2(Number(l.amount)));
     rawAmounts.forEach((amt, i) => {
@@ -78,18 +100,22 @@ export async function createProgressBillingCore(
         }
     });
 
-    let targetTotal = 0;
-    if (input.amountMode === "targetTotal") {
-        targetTotal = r2(Number(input.targetTotal));
-        if (!Number.isFinite(targetTotal) || targetTotal <= 0) {
-            throw new Error('targetTotal must be greater than zero for amountMode "targetTotal"');
+    let grossTotal: number | undefined;
+    if (input.grossTotal !== undefined && input.grossTotal !== null) {
+        grossTotal = r2(Number(input.grossTotal));
+        if (!Number.isFinite(grossTotal) || grossTotal <= 0) {
+            throw new Error("grossTotal must be greater than zero");
         }
     }
 
     const seenScheduleIds = new Set<string>();
     for (const line of input.lines) {
-        if (line.scheduleId && line.changeOrderId) {
-            throw new Error("A line cannot reference both a milestone and a change order");
+        // Change orders are billed by approving them (billChangeOrderCore adds
+        // a milestone to the invoice on approval) — see this file's top
+        // docstring. A changeOrderId here would be a second rail for the same
+        // money, so it's rejected outright rather than silently accepted.
+        if ((line as { changeOrderId?: unknown }).changeOrderId) {
+            throw new Error("Change orders are billed by approving them, which adds a milestone to the invoice — bill that milestone here.");
         }
         if (line.scheduleId) {
             if (seenScheduleIds.has(line.scheduleId)) {
@@ -110,12 +136,20 @@ export async function createProgressBillingCore(
         const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
         if (!invoice) throw new Error("Invoice not found");
 
+        // Vintage: which units milestone amounts (and therefore every line in
+        // this billing) are expressed in. No estimate (ad-hoc invoice) →
+        // legacy/tax-inclusive, matching how every pre-existing invoice in the
+        // system was priced.
+        const estimateForUnits = invLink?.estimateId
+            ? await tx.estimate.findUnique({ where: { id: invLink.estimateId }, select: { taxInclusiveMilestones: true } })
+            : null;
+        const legacy = estimateForUnits?.taxInclusiveMilestones ?? true;
+
         // Resolve + validate every line under the lock (no writes yet).
         const scheduleCache = new Map<string, NonNullable<Awaited<ReturnType<typeof prisma.paymentSchedule.findUnique>>>>();
 
         for (let i = 0; i < input.lines.length; i++) {
             const line = input.lines[i];
-            const rawAmount = rawAmounts[i];
 
             if (line.scheduleId) {
                 const schedule = await tx.paymentSchedule.findUnique({ where: { id: line.scheduleId } });
@@ -131,17 +165,10 @@ export async function createProgressBillingCore(
                 if (schedule.stripeSessionId || schedule.stripePaymentIntentId) {
                     throw new Error(`A payment is in progress on "${schedule.name}" — wait for it to finish or void it before billing.`);
                 }
-                // Over-billing is checked AFTER the tax math, against the amount
-                // expressed in the milestone's own units (see splitAmounts below).
+                // Over-billing (including double-billing an already-committed
+                // milestone) is checked AFTER the tax math, in the consumption
+                // guard below.
                 scheduleCache.set(line.scheduleId, schedule);
-            } else if (line.changeOrderId) {
-                const co = await tx.changeOrder.findUnique({ where: { id: line.changeOrderId } });
-                if (!co || co.projectId !== invoice.projectId) {
-                    throw new Error(`Change order not found on this invoice's project: ${line.changeOrderId}`);
-                }
-                if (co.status !== "Approved") {
-                    throw new Error(`Change order ${co.code} is "${co.status}" — only Approved change orders can be billed`);
-                }
             }
         }
 
@@ -149,66 +176,96 @@ export async function createProgressBillingCore(
         const taxExempt = !!input.taxExempt;
         const effectiveRate = taxExempt ? 0 : toNum(invoice.taxRate);
 
-        let subtotal: number;
-        let taxAmount: number;
-        let total: number;
-        let finalAmounts: number[];
+        const rawSum = r2(rawAmounts.reduce((s, a) => s + a, 0));
+        const expectedGross = legacy ? rawSum : r2(rawSum * (1 + effectiveRate / 100));
 
-        if (input.amountMode === "preTax") {
-            subtotal = r2(rawAmounts.reduce((s, a) => s + a, 0));
-            taxAmount = taxExempt ? 0 : r2(subtotal * effectiveRate / 100);
-            total = r2(subtotal + taxAmount);
-            finalAmounts = rawAmounts.slice();
-        } else {
-            total = targetTotal;
-            subtotal = taxExempt ? total : r2(total / (1 + effectiveRate / 100));
-            taxAmount = taxExempt ? 0 : r2(total - subtotal);
-
-            const rawSum = rawAmounts.reduce((s, a) => s + a, 0);
-            finalAmounts = rawAmounts.map((a) => r2((a * subtotal) / rawSum));
-            const usedSum = r2(finalAmounts.slice(0, -1).reduce((s, a) => s + a, 0));
-            finalAmounts[finalAmounts.length - 1] = r2(subtotal - usedSum);
-            if (finalAmounts[finalAmounts.length - 1] <= 0) {
-                throw new Error("Rescaling to the target total left the last line at $0 or less — adjust the line amounts.");
-            }
+        if (grossTotal !== undefined && Math.abs(grossTotal - expectedGross) > 0.02) {
+            throw new Error(
+                `The selected amounts total $${expectedGross.toFixed(2)} but the invoice total says $${grossTotal.toFixed(2)} — they must match.`
+            );
         }
+
+        const total = grossTotal ?? expectedGross;
+        const subtotal = taxExempt ? total : r2(total / (1 + effectiveRate / 100));
+        const taxAmount = taxExempt ? 0 : r2(total - subtotal);
 
         if (Math.abs(r2(subtotal + taxAmount) - total) > 0.005) {
             throw new Error("Internal error: subtotal + tax does not equal total");
         }
+
+        // Persisted amounts (ProgressBillingLine.amount) are ALWAYS pre-tax:
+        // each line's proportional share of subtotal, weighted by the raw
+        // line amounts, with the rounding remainder landing on the LAST line.
+        const finalAmounts = rawAmounts.map((a) => r2((a * subtotal) / rawSum));
+        const usedSum = r2(finalAmounts.slice(0, -1).reduce((s, a) => s + a, 0));
+        finalAmounts[finalAmounts.length - 1] = r2(subtotal - usedSum);
+        finalAmounts.forEach((amt, i) => {
+            if (amt <= 0) {
+                throw new Error(
+                    `Line ${i + 1} ("${input.lines[i].description || "untitled"}"): rescaled amount is $0.00 or less — adjust the line amounts or the total.`
+                );
+            }
+        });
         const finalSum = r2(finalAmounts.reduce((s, a) => s + a, 0));
         if (Math.abs(finalSum - subtotal) > 0.005) {
             throw new Error("Internal error: line amounts do not sum to the subtotal");
         }
 
         // ── Split units ─────────────────────────────────────────────────────
-        // A milestone must be carved up in ITS OWN units, which differ by vintage:
-        //   • legacy estimates (taxInclusiveMilestones = true, every job priced
-        //     before progressive billing): milestone amounts INCLUDE tax, so the
-        //     gross amount the client is paying is what comes out of the milestone
-        //     — a $25,000 check against Mesplay's $39,998.25 leaves $14,998.25.
-        //   • new estimates (false): milestone amounts are PRE-TAX, so the pre-tax
-        //     line amount is what comes out; the tax rides on top of the billing.
-        // In "preTax" mode finalAmounts === rawAmounts, so both branches agree and
-        // this reduces to a no-op. Getting this wrong silently mis-splits live
-        // milestones by exactly the tax, which is why over-billing is validated
-        // here against the same units rather than against the caller's raw input.
-        const estimateForUnits = invLink?.estimateId
-            ? await tx.estimate.findUnique({ where: { id: invLink.estimateId }, select: { taxInclusiveMilestones: true } })
-            : null;
-        // No estimate (ad-hoc invoice) → treat as legacy tax-inclusive, matching
-        // how every existing invoice in the system was priced.
-        const milestonesAreTaxInclusive = estimateForUnits?.taxInclusiveMilestones ?? true;
-        const splitAmounts = milestonesAreTaxInclusive ? rawAmounts : finalAmounts;
+        // What gets carved out of a milestone (or sizes a newly-materialized
+        // one), in that milestone's own units:
+        //   • legacy (tax-inclusive): the line's proportional share of TOTAL
+        //     (gross) — a $25,000 check against Mesplay's $39,998.25 leaves
+        //     $14,998.25 behind.
+        //   • new vintage (pre-tax): identical to the persisted amount —
+        //     finalAmounts already IS the milestone's own units.
+        // Getting this wrong silently mis-splits live milestones by exactly
+        // the tax, which is why every downstream check (consumption guard,
+        // AUTO-SPLIT, custom-line materialization) uses splitAmounts rather
+        // than the caller's raw input.
+        let splitAmounts: number[];
+        if (legacy) {
+            splitAmounts = rawAmounts.map((a) => r2((a * total) / rawSum));
+            const usedSplitSum = r2(splitAmounts.slice(0, -1).reduce((s, a) => s + a, 0));
+            splitAmounts[splitAmounts.length - 1] = r2(total - usedSplitSum);
+        } else {
+            splitAmounts = finalAmounts.slice();
+        }
+        const splitCheckTarget = legacy ? total : subtotal;
+        const splitSum = r2(splitAmounts.reduce((s, a) => s + a, 0));
+        if (Math.abs(splitSum - splitCheckTarget) > 0.005) {
+            throw new Error("Internal error: split amounts do not sum to the expected total");
+        }
 
+        // ── Consumption guard ──────────────────────────────────────────────
+        // A milestone can only ever be claimed for its full amount, across
+        // EVERY non-Void progress billing that has referenced it — not just
+        // within this one call. Without this: a milestone billed in FULL
+        // never triggers AUTO-SPLIT (its PaymentSchedule.amount never
+        // changes), and a milestone's post-split ORIGINAL row keeps whatever
+        // amount was billed into it — both stay "Pending" and can be billed
+        // again for up to that same amount, silently double-billing the
+        // client.
         for (let i = 0; i < input.lines.length; i++) {
-            const scheduleId = input.lines[i].scheduleId;
-            if (!scheduleId) continue;
-            const schedule = scheduleCache.get(scheduleId)!;
-            if (splitAmounts[i] > toNum(schedule.amount) + 0.005) {
-                throw new Error(
-                    `"${schedule.name}": billed amount $${splitAmounts[i].toFixed(2)} exceeds the milestone's amount $${toNum(schedule.amount).toFixed(2)}`
-                );
+            const line = input.lines[i];
+            if (line.scheduleId) {
+                const schedule = scheduleCache.get(line.scheduleId)!;
+                const otherLines = await tx.progressBillingLine.findMany({
+                    where: { scheduleId: line.scheduleId, billing: { status: { not: "Void" } } },
+                    select: { amount: true, billing: { select: { code: true, taxRate: true, taxExempt: true } } },
+                });
+                const committed = r2(otherLines.reduce((sum, l) => {
+                    const preTax = toNum(l.amount);
+                    const gross = l.billing.taxExempt ? preTax : r2(preTax * (1 + toNum(l.billing.taxRate) / 100));
+                    return sum + (legacy ? gross : preTax);
+                }, 0));
+                const available = r2(toNum(schedule.amount) - committed);
+                if (splitAmounts[i] > available + 0.005) {
+                    const codes = [...new Set(otherLines.map((l) => l.billing.code))].join(", ");
+                    throw new Error(
+                        `"${schedule.name}": billed amount $${splitAmounts[i].toFixed(2)} exceeds what's left — $${committed.toFixed(2)} of $${toNum(schedule.amount).toFixed(2)} is already billed${codes ? ` on ${codes}` : ""}.`
+                    );
+                }
             }
         }
 
@@ -217,7 +274,11 @@ export async function createProgressBillingCore(
         // milestone's own units — see above). Never deletes a PaymentSchedule /
         // EstimatePaymentSchedule row: the original is reduced in place and a NEW
         // row absorbs the remainder, so the two always sum to what was there
-        // before and the invoice's totalAmount/balanceDue are untouched.
+        // before and the invoice's totalAmount/balanceDue are untouched. Every
+        // update is a conditional claim pinned to the exact amount read at the
+        // top of this transaction, so a concurrent write (e.g. the legacy
+        // pushMilestoneToQuickBooks linking a QBO invoice) between validation
+        // and this write can't be silently overwritten.
         const resolvedScheduleIds = new Map<number, string>(); // line index -> PaymentSchedule.id billed (whole, post-split)
         for (let i = 0; i < input.lines.length; i++) {
             const line = input.lines[i];
@@ -231,19 +292,38 @@ export async function createProgressBillingCore(
 
             const remainder = r2(scheduleAmount - splitAmount);
 
-            await tx.paymentSchedule.update({
-                where: { id: schedule.id },
+            const claim = await tx.paymentSchedule.updateMany({
+                where: {
+                    id: schedule.id,
+                    status: "Pending",
+                    qbInvoiceId: null,
+                    stripeSessionId: null,
+                    stripePaymentIntentId: null,
+                    amount: schedule.amount,
+                },
                 data: { amount: splitAmount },
             });
+            if (claim.count !== 1) {
+                throw new Error(`"${schedule.name}" changed while this billing was being built — refresh and try again.`);
+            }
 
             let newSourceScheduleId: string | null = null;
             if (schedule.sourceScheduleId) {
                 const originalEst = await tx.estimatePaymentSchedule.findUnique({ where: { id: schedule.sourceScheduleId } });
                 if (originalEst) {
-                    await tx.estimatePaymentSchedule.update({
-                        where: { id: originalEst.id },
+                    const estClaim = await tx.estimatePaymentSchedule.updateMany({
+                        where: {
+                            id: originalEst.id,
+                            status: "Pending",
+                            stripeSessionId: null,
+                            stripePaymentIntentId: null,
+                            amount: originalEst.amount,
+                        },
                         data: { amount: splitAmount },
                     });
+                    if (estClaim.count !== 1) {
+                        throw new Error(`"${originalEst.name}" changed while this billing was being built — refresh and try again.`);
+                    }
                     const newEst = await tx.estimatePaymentSchedule.create({
                         data: {
                             estimateId: originalEst.estimateId,
@@ -257,6 +337,15 @@ export async function createProgressBillingCore(
                     });
                     newSourceScheduleId = newEst.id;
                 }
+            } else if (invLink?.estimateId) {
+                // No estimate-side row to mirror even though this invoice HAS an
+                // estimate: this PaymentSchedule has no sourceScheduleId, e.g. it
+                // was materialized by an earlier progress billing's custom line
+                // (see "materialize custom lines" below) or is a legacy ad-hoc
+                // milestone that predates the mirror link. There is nothing on
+                // the estimate side to split, so the split stays invoice-only.
+                // Deliberate, not a bug — documented so the gap stays
+                // reviewable rather than silently missed.
             }
 
             await tx.paymentSchedule.create({
@@ -271,9 +360,58 @@ export async function createProgressBillingCore(
             });
         }
 
+        // ── Materialize custom lines as milestones ─────────────────────────
+        // Every line must end up with a scheduleId. Milestone lines already
+        // have one (resolvedScheduleIds, above); a custom amount (no
+        // scheduleId — change-order lines are rejected up front, see above)
+        // gets a brand-new Pending PaymentSchedule here, sized to its split
+        // amount (milestone units). Unlike a milestone split, this GROWS the
+        // invoice total — the money wasn't already part of the contract until
+        // now — mirroring addInvoiceMilestone's status ladder exactly. This is
+        // what lets a custom line settle through the normal milestone rail
+        // with no special case.
+        let materializedTotal = 0;
+        for (let i = 0; i < input.lines.length; i++) {
+            if (resolvedScheduleIds.has(i)) continue; // milestone line, already resolved
+            const line = input.lines[i];
+            const amount = splitAmounts[i];
+            const newSchedule = await tx.paymentSchedule.create({
+                data: {
+                    invoiceId,
+                    name: line.description.trim(),
+                    amount,
+                    status: "Pending",
+                    sourceScheduleId: null,
+                },
+            });
+            resolvedScheduleIds.set(i, newSchedule.id);
+            materializedTotal = r2(materializedTotal + amount);
+        }
+
+        if (materializedTotal > 0) {
+            const nextStatus = invoice.status === "Paid" ? "Partially Paid" : invoice.status;
+            await tx.invoice.update({
+                where: { id: invoiceId },
+                data: {
+                    totalAmount: { increment: materializedTotal },
+                    balanceDue: { increment: materializedTotal },
+                    ...(nextStatus !== invoice.status ? { status: nextStatus } : {}),
+                },
+            });
+        }
+
         // ── Persist the billing ────────────────────────────────────────────
-        const existingCount = await tx.progressBilling.count({ where: { invoiceId } });
-        const code = `${invoice.code}-P${existingCount + 1}`;
+        // Code numbering: parse existing codes for this invoice and take the
+        // max numeric "-P<n>" suffix + 1, rather than a raw count — a count
+        // reuses a code (and collides with QuickBooks' DocNumber) after a
+        // non-last Draft billing is deleted.
+        const existingBillings = await tx.progressBilling.findMany({ where: { invoiceId }, select: { code: true } });
+        const maxSuffix = existingBillings.reduce((max, b) => {
+            const m = /-P(\d+)$/.exec(b.code);
+            const n = m ? parseInt(m[1], 10) : 0;
+            return Number.isFinite(n) && n > max ? n : max;
+        }, 0);
+        const code = `${invoice.code}-P${maxSuffix + 1}`;
 
         const billing = await tx.progressBilling.create({
             data: {
@@ -283,7 +421,11 @@ export async function createProgressBillingCore(
                 status: "Draft",
                 subtotal,
                 taxExempt,
-                taxRate: effectiveRate,
+                // Always the invoice's real rate, even when taxExempt is true —
+                // taxExempt only zeroes the *computation* above. That way,
+                // un-exempting this billing later (updateProgressBillingCore)
+                // recomputes tax at the correct rate instead of forever at 0.
+                taxRate: toNum(invoice.taxRate),
                 taxAmount,
                 total,
             },
@@ -292,8 +434,7 @@ export async function createProgressBillingCore(
         await tx.progressBillingLine.createMany({
             data: input.lines.map((line, i) => ({
                 billingId: billing.id,
-                scheduleId: resolvedScheduleIds.get(i) || null,
-                changeOrderId: line.changeOrderId || null,
+                scheduleId: resolvedScheduleIds.get(i) ?? null,
                 description: line.description.trim(),
                 amount: finalAmounts[i],
                 order: i,
@@ -315,12 +456,17 @@ export type UpdateProgressBillingInput = {
 
 /**
  * Draft-only edit: description and/or tax-exempt status. Line composition
- * (which milestones/change orders/custom amounts make up the billing) is
- * intentionally NOT re-editable here — re-running AUTO-SPLIT against a changed
+ * (which milestones/custom amounts make up the billing) is intentionally NOT
+ * re-editable here — re-running AUTO-SPLIT against a changed
  * line set is exactly the kind of ambiguous, high-risk money logic this pass
  * avoids (see PROGRESS_BILLING_REPORT.md). To change the lines, delete this
  * Draft (safe — any split it already applied stays applied, see
  * deleteProgressBillingCore below) and create a fresh one.
+ *
+ * `billing.taxRate` always holds the invoice's real rate (see
+ * createProgressBillingCore), so flipping `taxExempt` here correctly
+ * recomputes tax at that rate rather than being stuck at whatever the rate
+ * happened to be the first time the billing was saved exempt.
  */
 export async function updateProgressBillingCore(
     billingId: string,
@@ -366,7 +512,11 @@ export async function updateProgressBillingCore(
  * already applied (see createProgressBillingCore's AUTO-SPLIT) is NOT undone
  * or merged back — the two milestone pieces it created stay as independent
  * Pending rows. This matches the hard constraint that a split, once applied,
- * only ever creates rows; it never deletes or merges them.
+ * only ever creates rows; it never deletes or merges them. Likewise, a
+ * milestone this billing materialized from a custom line (and the invoice
+ * total bump that came with it) is NOT undone either — deleting the Draft
+ * just removes the billing record; the money it already added to the
+ * contract stays.
  */
 export async function deleteProgressBillingCore(
     billingId: string,
@@ -397,6 +547,13 @@ export async function deleteProgressBillingCore(
  * constraint; see PROGRESS_BILLING_REPORT.md). A later UI pass wires an
  * explicit "send" action on top of this, same split as the milestone rail
  * (pushMilestoneToQuickBooks stages; sendMilestoneInvoicesCore sends).
+ *
+ * Compensation: EVERYTHING after createQBMilestoneInvoice (the pay-link
+ * fetch, the conditional link claim, and the claim's own error) runs inside
+ * one try/catch. Any failure in that block attempts to delete the
+ * just-created QBO invoice so it never sits orphaned and unreferenced in
+ * QuickBooks; if the delete also fails, the error names the doc number + QBO
+ * id so it can be removed by hand.
  */
 export async function stageProgressBillingToQuickBooksCore(
     billingId: string,
@@ -441,32 +598,42 @@ export async function stageProgressBillingToQuickBooksCore(
         privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
     });
 
-    const payLink = await getQBInvoicePaymentLink(tokens, qbId);
+    try {
+        const payLink = await getQBInvoicePaymentLink(tokens, qbId);
 
-    // Conditional claim mirroring pushMilestoneToQuickBooks: guards pin id,
-    // Draft status, no existing qbInvoiceId, and the exact content snapshot
-    // (subtotal/total/description) this QBO invoice was created from — a
-    // mid-stage edit or concurrent stage can't silently attach to a row it no
-    // longer describes. On a miss, compensate by deleting the just-created QBO
-    // invoice instead of leaving it orphaned and unattached.
-    const linked = await prisma.progressBilling.updateMany({
-        where: {
-            id: billing.id,
-            status: "Draft",
-            qbInvoiceId: null,
-            subtotal: billing.subtotal,
-            total: billing.total,
-            description: billing.description,
-        },
-        data: { status: "Staged", qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date() },
-    });
-    if (linked.count !== 1) {
+        // Conditional claim mirroring pushMilestoneToQuickBooks: guards pin id,
+        // Draft status, no existing qbInvoiceId, and the exact content snapshot
+        // (subtotal/total/description) this QBO invoice was created from — a
+        // mid-stage edit or concurrent stage can't silently attach to a row it no
+        // longer describes.
+        const linked = await prisma.progressBilling.updateMany({
+            where: {
+                id: billing.id,
+                status: "Draft",
+                qbInvoiceId: null,
+                subtotal: billing.subtotal,
+                total: billing.total,
+                description: billing.description,
+            },
+            data: { status: "Staged", qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date() },
+        });
+        if (linked.count !== 1) {
+            throw new Error("This billing changed while staging its QuickBooks invoice — refresh and try again.");
+        }
+
+        return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: payLink };
+    } catch (err) {
+        // Compensate: never leave a created QBO invoice unreferenced and
+        // unmentioned. Re-throw the informative "changed while staging" error
+        // once compensation succeeds; otherwise name the orphan so a human can
+        // remove it by hand.
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
         if (!compensated) {
-            throw new Error(`This billing changed while staging its QuickBooks invoice, and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks, then retry.`);
+            throw new Error(
+                `Staging this billing's QuickBooks invoice failed (${err instanceof Error ? err.message : String(err)}), and the abandoned QuickBooks invoice ${billing.code} (id ${qbId}) could not be deleted — remove it in QuickBooks by hand, then retry.`
+            );
         }
-        throw new Error("This billing changed while staging its QuickBooks invoice — refresh and try again.");
+        if (err instanceof Error) throw err;
+        throw new Error(`Staging this billing's QuickBooks invoice failed: ${String(err)}`);
     }
-
-    return { success: true as const, qbInvoiceId: qbId, qbInvoiceLink: payLink };
 }

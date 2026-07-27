@@ -73,7 +73,6 @@ const statements = [
      "id" TEXT NOT NULL,
      "billingId" TEXT NOT NULL,
      "scheduleId" TEXT,
-     "changeOrderId" TEXT,
      "description" TEXT NOT NULL,
      "amount" DECIMAL(65,30) NOT NULL,
      "order" INTEGER NOT NULL DEFAULT 0,
