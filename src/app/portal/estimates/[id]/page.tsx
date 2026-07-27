@@ -3,6 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import PortalEstimateClient from "./PortalEstimateClient";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export default async function PortalEstimatePage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -60,5 +61,15 @@ export default async function PortalEstimatePage({ params }: { params: Promise<{
         }
     }
 
-    return <PortalEstimateClient initialEstimate={estimate} companySettings={settings} />;
+    const resolvedEstimate: any = {
+        ...estimate,
+        signatureUrl: await resolveDocUrl((estimate as any).signatureUrl),
+    };
+    if (Array.isArray((estimate as any).files)) {
+        resolvedEstimate.files = await Promise.all(
+            (estimate as any).files.map(async (f: any) => ({ ...f, url: await resolveDocUrl(f.url) }))
+        );
+    }
+
+    return <PortalEstimateClient initialEstimate={resolvedEstimate} companySettings={settings} />;
 }

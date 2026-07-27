@@ -62,13 +62,6 @@ test.describe("Change-order signature object ownership", () => {
         uploadOptions.push(options);
         return { error: null };
       },
-      getPublicUrl(path) {
-        return {
-          data: {
-            publicUrl: `https://example.supabase.co/storage/v1/object/public/project-files/${path}`,
-          },
-        };
-      },
       async remove(paths) {
         removed.push([...paths]);
         return { error: null };
@@ -89,68 +82,20 @@ test.describe("Change-order signature object ownership", () => {
       "signatures/change-orders/test/client/1721218400000_owned-test-id.png",
     ]);
     expect(uploadOptions).toEqual([{ contentType: "image/png", upsert: false }]);
-    expect(owned.url).toContain(uploaded[0]);
+    expect(owned.url).toBe(
+      "secure:signatures/change-orders/test/client/1721218400000_owned-test-id.png",
+    );
 
     await Promise.all([owned.discard(), owned.discard(), owned.discard()]);
 
     expect(removed).toEqual([[uploaded[0]]]);
   });
 
-  test("missing public URL compensating-deletes the uploaded object", async () => {
-    const uploaded: string[] = [];
-    const removed: string[][] = [];
-    const bucket: SignatureStorageBucket = {
-      async upload(path) {
-        uploaded.push(path);
-        return { error: null };
-      },
-      getPublicUrl() {
-        return { data: {} };
-      },
-      async remove(paths) {
-        removed.push([...paths]);
-        return { error: null };
-      },
-    };
-
-    await expect(
-      persistOwnedSignature(signatureDataUrl, "change-orders/test/client", {
-        getBucket: () => bucket,
-        now: () => 1_721_218_400_000,
-        randomId: () => "url-failure-id",
-      }),
-    ).rejects.toThrow("Couldn't save your signature");
-
-    expect(removed).toEqual([[uploaded[0]]]);
-  });
-
-  test("thrown public URL construction compensating-deletes the uploaded object", async () => {
-    const uploaded: string[] = [];
-    const removed: string[][] = [];
-    const bucket: SignatureStorageBucket = {
-      async upload(path) {
-        uploaded.push(path);
-        return { error: null };
-      },
-      getPublicUrl() {
-        throw new Error("url construction failed");
-      },
-      async remove(paths) {
-        removed.push([...paths]);
-        return { error: null };
-      },
-    };
-
-    await expect(
-      persistOwnedSignature(signatureDataUrl, "change-orders/test/client", {
-        getBucket: () => bucket,
-        now: () => 1_721_218_400_000,
-        randomId: () => "url-throw-id",
-      }),
-    ).rejects.toThrow("Couldn't save your signature");
-
-    expect(removed).toEqual([[uploaded[0]]]);
-  });
+  // The two tests that used to live here ("missing public URL compensating-deletes...",
+  // "thrown public URL construction compensating-deletes...") exercised getPublicUrl()
+  // failing after a successful upload. Now that the stored reference is derived locally
+  // (toSecureRef(storagePath)) instead of asking Storage to construct an address, that
+  // failure mode no longer exists — there's nothing left to compensate for.
 
   test("late upload success after deadline is removed before the error returns", async () => {
     let settleUpload!: (result: { error: unknown | null }) => void;
@@ -158,9 +103,6 @@ test.describe("Change-order signature object ownership", () => {
     const bucket: SignatureStorageBucket = {
       upload() {
         return new Promise((resolve) => { settleUpload = resolve; });
-      },
-      getPublicUrl() {
-        throw new Error("must not construct a URL for a timed-out upload");
       },
       async remove(paths) {
         removed.push([...paths]);

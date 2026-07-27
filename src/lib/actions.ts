@@ -26,6 +26,7 @@ import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { uploadSecureDoc, removeSecureDoc, downloadDocBytes, isSecureRef, resolveDocUrl, toSecureRef } from "./secure-storage";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
 import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
@@ -685,19 +686,10 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
             throw new Error("Certificate must be a PDF or image");
         }
 
-        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-        const supabase = getSupabase();
-        if (!supabase) throw new Error("Storage not configured");
-
         const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
         const storagePath = `tax-certs/${clientId}/${Date.now()}_${safeName}`;
         const buffer = Buffer.from(await file.arrayBuffer());
-        const { error: uploadError } = await supabase.storage
-            .from(STORAGE_BUCKET)
-            .upload(storagePath, buffer, { contentType: file.type || "application/octet-stream", upsert: false });
-        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
-        const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-        certUrl = urlData?.publicUrl || storagePath;
+        certUrl = await uploadSecureDoc(storagePath, buffer, file.type || "application/octet-stream");
     }
     if (!certUrl) throw new Error("Attach a certificate file");
 
@@ -725,7 +717,12 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
     });
 
     await revalidateClientCertSurfaces(clientId);
-    return JSON.parse(JSON.stringify(updated));
+    // The caller pushes this straight into local component state, which the subsequent
+    // router.refresh() won't replace, so hand back a loadable URL rather than a `secure:` ref.
+    return JSON.parse(JSON.stringify({
+        ...updated,
+        taxExemptCertUrl: await resolveDocUrl(updated.taxExemptCertUrl),
+    }));
 }
 
 export async function removeClientTaxExemptCert(clientId: string) {
@@ -743,13 +740,17 @@ export async function removeClientTaxExemptCert(clientId: string) {
         data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
     });
 
-    // Best-effort: explicit "Remove" should not leave the file publicly reachable.
+    // Best-effort: explicit "Remove" should not leave the file reachable.
     if (count === 1) {
         try {
-            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-            const supabase = getSupabase();
-            const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
-            if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+            if (isSecureRef(client.taxExemptCertUrl)) {
+                await removeSecureDoc(client.taxExemptCertUrl!);
+            } else {
+                const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+                const supabase = getSupabase();
+                const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+                if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+            }
         } catch (e) {
             console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
         }
@@ -2415,14 +2416,11 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
-        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
-            const res = await fetch(capturedPdfUrl);
-            if (res.ok) {
-                const ab = await res.arrayBuffer();
-                pdfBuffer = Buffer.from(ab);
+        if (capturedPdfUrl) {
+            pdfBuffer = await downloadDocBytes(capturedPdfUrl);
+            if (!pdfBuffer) {
+                console.warn("[approveEstimate] Failed to read capturedPdfUrl:", capturedPdfUrl);
             }
-        } else if (capturedPdfUrl) {
-            console.warn("[approveEstimate] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
         if (!pdfBuffer) {
             const { generateEstimatePdf } = await import("./pdf");
@@ -2497,49 +2495,49 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 
     // ─── 3. File the signed PDF into the project's "Signed Documents" folder ───
     if (pdfBuffer && estimate?.projectId) {
+        let filedSecureRef: string | null = null;
         try {
-            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-            const supabase = getSupabase();
-
-            if (supabase) {
-                // Find or create a "Signed Documents" folder for this project
-                let folder = await prisma.fileFolder.findFirst({
-                    where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+            // Find or create a "Signed Documents" folder for this project
+            let folder = await prisma.fileFolder.findFirst({
+                where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+            });
+            if (!folder) {
+                folder = await prisma.fileFolder.create({
+                    data: { name: "Signed Documents", projectId: estimate.projectId },
                 });
-                if (!folder) {
-                    folder = await prisma.fileFolder.create({
-                        data: { name: "Signed Documents", projectId: estimate.projectId },
-                    });
-                }
+            }
 
-                // Upload to Supabase Storage
-                const storagePath = `projects/${estimate.projectId}/signed/${Date.now()}_${pdfFilename}`;
-                const { error: uploadError } = await supabase.storage
-                    .from(STORAGE_BUCKET)
-                    .upload(storagePath, pdfBuffer, {
-                        contentType: "application/pdf",
-                        upsert: false,
-                    });
+            // Upload to the private secure-docs bucket
+            const storagePath = `projects/${estimate.projectId}/signed/${Date.now()}_${pdfFilename}`;
+            filedSecureRef = await uploadSecureDoc(storagePath, pdfBuffer, "application/pdf");
 
-                if (!uploadError) {
-                    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-                    const publicUrl = urlData?.publicUrl || storagePath;
+            await prisma.projectFile.create({
+                data: {
+                    name: pdfFilename,
+                    url: filedSecureRef,
+                    size: pdfBuffer.length,
+                    mimeType: "application/pdf",
+                    projectId: estimate.projectId,
+                    folderId: folder.id,
+                },
+            });
 
-                    await prisma.projectFile.create({
-                        data: {
-                            name: pdfFilename,
-                            url: publicUrl,
-                            size: pdfBuffer.length,
-                            mimeType: "application/pdf",
-                            projectId: estimate.projectId,
-                            folderId: folder.id,
-                        },
-                    });
-                } else {
-                    console.error("[approveEstimate] Supabase upload failed:", uploadError);
+            // The portal-captured PDF (if any) was only a transient capture used to build
+            // pdfBuffer above — now that a permanent copy is filed, remove the temporary
+            // object so it doesn't linger as an orphan duplicate in the private bucket.
+            if (capturedPdfUrl && isSecureRef(capturedPdfUrl)) {
+                try {
+                    await removeSecureDoc(capturedPdfUrl);
+                } catch (cleanupErr) {
+                    console.error("[approveEstimate] Failed to remove transient captured PDF:", cleanupErr);
                 }
             }
         } catch (fileErr) {
+            // The upload may have succeeded even though the DB write failed — remove the
+            // orphaned storage object so a retry doesn't leave a dangling signed PDF behind.
+            if (filedSecureRef) {
+                try { await removeSecureDoc(filedSecureRef); } catch {}
+            }
             // Non-critical — don't block the approval if filing fails
             console.error("[approveEstimate] Failed to file signed PDF:", fileErr);
         }
@@ -5099,13 +5097,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     let pdfAttached = false;
     try {
         let pdfBuffer: Buffer | undefined;
-        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
-            // Use the pre-captured portal PDF (high-quality, matches what client sees)
-            const res = await fetch(capturedPdfUrl);
-            if (res.ok) {
-                const ab = await res.arrayBuffer();
-                pdfBuffer = Buffer.from(ab);
-            }
+        if (capturedPdfUrl && (isSecureRef(capturedPdfUrl) || isAllowedCapturedPdfUrl(capturedPdfUrl))) {
+            // Use the pre-captured portal PDF (high-quality, matches what client sees).
+            // Read via the service key so this still works now that the capture lands in the
+            // private bucket; the allowlist still gates legacy http(s) values.
+            pdfBuffer = (await downloadDocBytes(capturedPdfUrl)) ?? undefined;
         } else if (capturedPdfUrl) {
             console.warn("[sendEstimateToClient] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
@@ -5687,7 +5683,8 @@ export async function createContractBlank(
 export async function createContractFromPdf(
     context: { type: "project" | "lead"; id: string },
     title: string,
-    originalPdfPath: string
+    originalPdfPath: string,
+    isPrivate: boolean = false
 ) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -5700,7 +5697,11 @@ export async function createContractFromPdf(
         data: {
             title,
             body: "", // Empty HTML body for PDF contracts
-            originalPdfPath,
+            // `originalPdfPath` is a raw storage path. When the upload targeted the private
+            // secure-docs bucket (see /api/files/signed-upload's "contract-original" scope),
+            // wrap it into a secure ref so every downstream reader (downloadDocBytes,
+            // resolveDocUrl) treats it correctly.
+            originalPdfPath: isPrivate ? toSecureRef(originalPdfPath) : originalPdfPath,
             requiresCountersign: coSettings?.requireContractCountersign ?? false,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
             status: "Draft",
@@ -5710,7 +5711,13 @@ export async function createContractFromPdf(
     if (context.type === "project") revalidatePath(`/projects/${context.id}`);
     if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
 
-    return contract;
+    // Resolve a browser-loadable URL server-side (mirrors the contracts page's own
+    // findOriginalPdfUrl) so the client can preview the just-uploaded PDF immediately
+    // without ever calling resolveDocUrl itself — the private bucket has no public URL,
+    // so the caller has no other way to get one.
+    const originalPdfUrl = await resolveDocUrl(contract.originalPdfPath);
+
+    return { ...contract, originalPdfUrl };
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
@@ -6053,9 +6060,8 @@ async function updateExecutedPdfIfFinalized(contractId: string, ip: string | nul
     if (!supabase) return;
 
     // 1. Download original PDF
-    const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
-    if (dlErr || !dl) throw new Error("Could not load original PDF contract");
-    const originalBuffer = Buffer.from(await dl.arrayBuffer());
+    const originalBuffer = await downloadDocBytes(contract.originalPdfPath);
+    if (!originalBuffer) throw new Error("Could not load original PDF contract");
 
     // 2. Generate updated PDF
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -6092,13 +6098,21 @@ async function updateExecutedPdfIfFinalized(contractId: string, ip: string | nul
 
     // 4. Delete the old file from Storage if it exists
     if (existingFile?.url) {
-        const match = existingFile.url.match(/\/project-files\/(.+)$/);
-        if (match) {
-            const oldStoragePath = decodeURIComponent(match[1]);
+        if (isSecureRef(existingFile.url)) {
             try {
-                await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+                await removeSecureDoc(existingFile.url);
             } catch (removeErr) {
                 console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+            }
+        } else {
+            const match = existingFile.url.match(/\/project-files\/(.+)$/);
+            if (match) {
+                const oldStoragePath = decodeURIComponent(match[1]);
+                try {
+                    await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+                } catch (removeErr) {
+                    console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+                }
             }
         }
         // Delete the old DB record
@@ -6327,10 +6341,18 @@ export async function approveContract(contractId: string, signatureName: string,
 }
 
 export async function getContractSigningHistory(contractId: string) {
-    return await prisma.contractSigningRecord.findMany({
+    const records = await prisma.contractSigningRecord.findMany({
         where: { contractId },
         orderBy: { signedAt: "desc" },
     });
+    // Called live from the Signing History modal, so resolve here: the client can't turn a
+    // private-bucket `secure:` ref into a loadable URL itself. Legacy values pass through.
+    return await Promise.all(
+        records.map(async (record) => ({
+            ...record,
+            signatureUrl: await resolveDocUrl(record.signatureUrl),
+        })),
+    );
 }
 
 /**
@@ -6439,9 +6461,12 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         const supabase = getSupabase();
         if (!supabase) throw new Error("Storage not configured.");
 
-        const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(after.signedPdfPath);
-        if (dlErr || !dl) throw new Error("Could not load the signed contract PDF.");
-        const clientPdf = Buffer.from(await dl.arrayBuffer());
+        // signedPdfPath is polymorphic: a secure ref for a freshly-uploaded intermediate
+        // (countersign-required, non-PDF contracts), or a legacy bare path when it was set
+        // to the pre-existing originalPdfPath (PDF-contract countersign branch). downloadDocBytes
+        // handles both.
+        const clientPdf = await downloadDocBytes(after.signedPdfPath);
+        if (!clientPdf) throw new Error("Could not load the signed contract PDF.");
 
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         executedBuffer = await appendContractCountersignaturePage(clientPdf, {
@@ -6464,8 +6489,20 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         executedRecord = archived.record;
         archivedMeta = { publicUrl: archived.publicUrl, fileName: archived.fileName };
 
-        // Drop the now-superseded private intermediate (best-effort).
-        try { await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]); } catch {}
+        // Drop the now-superseded private intermediate (best-effort). For a PDF-contract
+        // countersign, signedPdfPath was set to the SAME value as originalPdfPath (see
+        // finalize/route.ts) — there is no distinct intermediate to remove in that case, and
+        // deleting it would delete the contract's original PDF. Only remove when signedPdfPath
+        // names a genuinely distinct, contract-owned object.
+        try {
+            if (after.signedPdfPath !== after.originalPdfPath) {
+                if (isSecureRef(after.signedPdfPath)) {
+                    await removeSecureDoc(after.signedPdfPath);
+                } else {
+                    await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]);
+                }
+            }
+        } catch {}
     } catch (e: any) {
         // Roll back the finalize claim so the admin can retry. companySignedAt stays set (the
         // company DID sign); the retry re-claims and re-archives.

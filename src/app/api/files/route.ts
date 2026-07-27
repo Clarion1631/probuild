@@ -6,6 +6,7 @@ import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { hasPermission } from "@/lib/permissions";
 import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
 import { ALLOWED_FILE_EXTENSIONS } from "@/lib/project-files";
+import { resolveDocUrl, isSecureRef, removeSecureDoc } from "@/lib/secure-storage";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -85,10 +86,11 @@ export async function GET(req: NextRequest) {
             return true;
         });
 
-        const filesWithEffective = filtered.map((f: FileWithFolder) => ({
+        const filesWithEffective = await Promise.all(filtered.map(async (f: FileWithFolder) => ({
             ...f,
+            url: await resolveDocUrl(f.url),
             effectiveVisibility: effectiveVisibility(f),
-        }));
+        })));
 
         return NextResponse.json({ folders, files: filesWithEffective });
     } catch (err: any) {
@@ -318,14 +320,22 @@ export async function DELETE(req: NextRequest) {
                 return NextResponse.json({ error: "No permission to delete financial files" }, { status: 403 });
             }
 
-            const supabase = getSupabase();
-            if (supabase) {
-                const url = file.url;
-                const bucketPrefix = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
-                const pathIdx = url.indexOf(bucketPrefix);
-                if (pathIdx >= 0) {
-                    const storagePath = url.substring(pathIdx + bucketPrefix.length);
-                    await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]);
+            if (isSecureRef(file.url)) {
+                try {
+                    await removeSecureDoc(file.url);
+                } catch (removeErr) {
+                    console.error("DELETE /api/files: failed to remove secure object:", removeErr);
+                }
+            } else {
+                const supabase = getSupabase();
+                if (supabase) {
+                    const url = file.url;
+                    const bucketPrefix = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
+                    const pathIdx = url.indexOf(bucketPrefix);
+                    if (pathIdx >= 0) {
+                        const storagePath = url.substring(pathIdx + bucketPrefix.length);
+                        await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]);
+                    }
                 }
             }
             await prisma.projectFile.delete({ where: { id: fileId } });
