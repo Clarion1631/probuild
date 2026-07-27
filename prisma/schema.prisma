@@ -372,6 +372,10 @@ model Estimate {
   taxExempt           Boolean   @default(false)
   taxRateName         String?
   taxRatePercent      Decimal?
+  // Progress billing core: legacy estimates carry tax-inclusive milestone
+  // amounts (the historical behavior); new estimates set this false once the
+  // UI switches to tax-exclusive milestone entry. Read by progress-billing.ts.
+  taxInclusiveMilestones Boolean @default(true)
 
   // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
   targetMarginPercent Float     @default(25)
@@ -541,6 +545,7 @@ model Invoice {
   createdAt   DateTime  @default(now())
 
   payments PaymentSchedule[]
+  progressBillings ProgressBilling[]
 
   @@index([projectId])
   @@index([createdAt])
@@ -588,6 +593,53 @@ model PaymentSchedule {
   @@index([qbInvoiceId])
   @@index([sourceScheduleId])
   @@index([scheduleTaskId])
+}
+
+// Progress billing: the billable artifact the user builds by picking
+// milestones and/or approved change orders and/or a custom amount, writing
+// one client-facing description, and staging exactly ONE QuickBooks invoice.
+// Milestones (PaymentSchedule) remain the record of what has been satisfied —
+// see src/lib/progress-billing.ts for the auto-split mechanic that keeps every
+// ProgressBillingLine mapped 1:1 to a whole milestone.
+model ProgressBilling {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  code        String   // "INV-00171-P1" — sequential per invoice
+  description String   // client-facing: what this payment covers
+  status      String   @default("Draft") // Draft | Staged | Sent | Paid | Void
+  subtotal    Decimal  @default(0)  // pre-tax
+  taxExempt   Boolean  @default(false)
+  taxRate     Decimal  @default(0)  // percent snapshot at build time
+  taxAmount   Decimal  @default(0)
+  total       Decimal  @default(0)  // subtotal + taxAmount
+  qbInvoiceId     String?
+  qbInvoiceLink   String?
+  qbInvoiceSentAt DateTime?
+  qbPaymentId     String?
+  qbSyncedAt      DateTime?
+  qbSyncError     String?
+  sentAt      DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime @default(now())
+  lines       ProgressBillingLine[]
+
+  @@index([invoiceId])
+  @@index([status])
+}
+
+model ProgressBillingLine {
+  id            String @id @default(cuid())
+  billingId     String
+  billing       ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
+  scheduleId    String?  // PaymentSchedule this line bills (null = custom line)
+  changeOrderId String?  // or an approved ChangeOrder
+  description   String
+  amount        Decimal  // pre-tax
+  order         Int      @default(0)
+
+  @@index([billingId])
+  @@index([scheduleId])
 }
 
 model Budget {
