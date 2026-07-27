@@ -12,6 +12,7 @@ import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
+import { parseProductUrl } from "./product-parse";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
@@ -9420,6 +9421,401 @@ export async function getSelectionBoardsForPortal(projectId: string) {
     });
 }
 
+// =============================================
+// Product Library, Clipper, Client Selection Proposals
+// (docs/specs/product-library-portal-selections.md)
+// =============================================
+
+/**
+ * Ownership assertion for the portal-facing product-library actions below.
+ * Mirrors the staff-bypass + resolveSessionClientId + project-ownership check
+ * used inline by /api/portal/files and the portal selections/files pages —
+ * pulled into one helper since several new portal actions need it.
+ */
+async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
+    const session = await getSessionOrDev();
+    const role = (session?.user as { role?: string } | undefined)?.role;
+    const isStaff = role === "ADMIN" || role === "MANAGER";
+    if (isStaff) return { isStaff: true, clientId: null };
+
+    const clientId = await resolveSessionClientId();
+    if (!clientId) throw new Error("Unauthorized");
+    const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
+    if (!project) throw new Error("Unauthorized");
+    return { isStaff: false, clientId };
+}
+
+// ── Product Library CRUD (team) ─────────────────────────────────────────────
+
+export async function createProductLibraryItem(data: {
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendor?: string;
+    vendorUrl?: string;
+    category?: string;
+    source?: "clip" | "manual";
+}) {
+    const user = await assertActiveStaff();
+    const name = data.name?.trim();
+    if (!name) throw new Error("Name is required");
+
+    const item = await prisma.productLibraryItem.create({
+        data: {
+            name,
+            description: data.description?.trim() || null,
+            imageUrl: data.imageUrl || null,
+            price: data.price ?? null,
+            vendor: data.vendor?.trim() || null,
+            vendorUrl: data.vendorUrl || null,
+            category: data.category?.trim() || null,
+            source: data.source || "manual",
+            clippedById: user.id,
+        },
+    });
+    revalidatePath("/company/product-library");
+    return item;
+}
+
+export async function updateProductLibraryItem(id: string, data: {
+    name?: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendor?: string;
+    vendorUrl?: string;
+    category?: string;
+}) {
+    await assertActiveStaff();
+    const item = await prisma.productLibraryItem.update({
+        where: { id },
+        data: {
+            ...(data.name !== undefined && { name: data.name.trim() }),
+            ...(data.description !== undefined && { description: data.description?.trim() || null }),
+            ...(data.imageUrl !== undefined && { imageUrl: data.imageUrl || null }),
+            ...(data.price !== undefined && { price: data.price }),
+            ...(data.vendor !== undefined && { vendor: data.vendor?.trim() || null }),
+            ...(data.vendorUrl !== undefined && { vendorUrl: data.vendorUrl || null }),
+            ...(data.category !== undefined && { category: data.category?.trim() || null }),
+        },
+    });
+    revalidatePath("/company/product-library");
+    return item;
+}
+
+export async function deleteProductLibraryItem(id: string) {
+    await assertActiveStaff();
+    await prisma.productLibraryItem.delete({ where: { id } });
+    revalidatePath("/company/product-library");
+    return { success: true };
+}
+
+export async function getProductLibrary(filter?: { search?: string; category?: string }) {
+    await assertActiveStaff();
+    const where: any = {};
+    if (filter?.category) where.category = filter.category;
+    if (filter?.search?.trim()) {
+        const q = filter.search.trim();
+        where.OR = [
+            { name: { contains: q, mode: "insensitive" } },
+            { vendor: { contains: q, mode: "insensitive" } },
+            { category: { contains: q, mode: "insensitive" } },
+        ];
+    }
+    return prisma.productLibraryItem.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+// ── Project Favorites (team + portal read) ──────────────────────────────────
+
+export async function addProjectFavorite(projectId: string, productId: string, note?: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    const favorite = await prisma.projectProductFavorite.upsert({
+        where: { projectId_productId: { projectId, productId } },
+        update: { note: note?.trim() || null },
+        create: { projectId, productId, note: note?.trim() || null, addedById: user.id, addedByClient: false },
+    });
+    revalidatePath(`/projects/${projectId}/selections`);
+    return favorite;
+}
+
+export async function removeProjectFavorite(projectId: string, productId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    await prisma.projectProductFavorite.deleteMany({ where: { projectId, productId } });
+    revalidatePath(`/projects/${projectId}/selections`);
+    return { success: true };
+}
+
+export async function getProjectFavorites(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.projectProductFavorite.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { product: true },
+    });
+}
+
+export async function getProjectFavoritesForPortal(projectId: string) {
+    await assertPortalProjectOwnership(projectId);
+    return prisma.projectProductFavorite.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { product: true },
+    });
+}
+
+// ── Client Selection Proposals ("Client suggestions") ───────────────────────
+
+export async function submitSelectionProposal(projectId: string, data: {
+    url?: string;
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    clientNote?: string;
+}) {
+    await assertPortalProjectOwnership(projectId);
+
+    const manualName = data.name?.trim();
+    const url = data.url?.trim();
+    if (!manualName && !url) throw new Error("A name or a product link is required");
+
+    // Parse server-side so price is captured even though it's never returned
+    // to the client here. Never throws — degrades to {vendorUrl, name: null}.
+    let parsed: Awaited<ReturnType<typeof parseProductUrl>> | null = null;
+    if (url) {
+        parsed = await parseProductUrl(url);
+    }
+
+    const name = (manualName || parsed?.name || "Suggested item").slice(0, 200);
+
+    const proposal = await prisma.selectionProposal.create({
+        data: {
+            projectId,
+            name,
+            description: data.description?.trim() || parsed?.description || null,
+            imageUrl: data.imageUrl || parsed?.imageUrl || null,
+            price: parsed?.price ?? null,
+            vendorUrl: url || parsed?.vendorUrl || null,
+            clientNote: data.clientNote?.trim() || null,
+            status: "Pending",
+        },
+    });
+
+    const project = await prisma.project.findUnique({ where: { id: projectId }, include: { client: true } });
+
+    // Notify the team — same recipient/pattern as submitClientSelections.
+    const settings = await getCachedCompanySettings();
+    if (settings.notificationEmail && project) {
+        await sendNotification(
+            settings.notificationEmail,
+            `💡 New Client Suggestion — ${project.name}`,
+            `<div style="font-family: sans-serif; color: #333;">
+                <h3>New Selection Suggestion</h3>
+                <p><strong>${project.client?.name || "Client"}</strong> suggested an item for project <strong>${project.name}</strong>:</p>
+                <ul>
+                    <li><strong>${name}</strong></li>
+                    ${proposal.vendorUrl ? `<li><a href="${proposal.vendorUrl}">${proposal.vendorUrl}</a></li>` : ""}
+                    ${proposal.clientNote ? `<li>Note: ${proposal.clientNote}</li>` : ""}
+                </ul>
+                <p>Review it on the project's Selections tab.</p>
+            </div>`
+        );
+    }
+
+    await logActivity({
+        projectId,
+        actorType: "CLIENT",
+        actorName: project?.client?.name || "Client",
+        action: "suggested_selection_item",
+        entityType: "SelectionProposal",
+        entityId: proposal.id,
+        entityName: name,
+    });
+
+    revalidatePath(`/portal/projects/${projectId}/selections`);
+    revalidatePath(`/projects/${projectId}/selections`);
+
+    // Price is PM-side info until approval — never return it to the client.
+    const { price, ...proposalWithoutPrice } = proposal;
+    return proposalWithoutPrice;
+}
+
+export async function getSelectionProposalsForPortal(projectId: string) {
+    await assertPortalProjectOwnership(projectId);
+    const proposals = await prisma.selectionProposal.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
+    // Price stays hidden until a proposal is Approved.
+    return proposals.map((p) => (p.status === "Approved" ? p : { ...p, price: null }));
+}
+
+export async function getSelectionProposals(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.selectionProposal.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { decidedBy: { select: { id: true, name: true, email: true } } },
+    });
+}
+
+export async function decideSelectionProposal(proposalId: string, input: {
+    action: "approve" | "decline";
+    pmNote?: string;
+    price?: number;
+    boardId?: string;
+    categoryId?: string;
+    addToFavorites?: boolean;
+}) {
+    const user = await assertActiveStaff();
+    if (input.action !== "approve" && input.action !== "decline") throw new Error("Invalid action");
+
+    const proposal = await prisma.selectionProposal.findUnique({
+        where: { id: proposalId },
+        include: { project: { include: { client: true } } },
+    });
+    if (!proposal) throw new Error("Proposal not found");
+    if (!canAccessProject(user, proposal.projectId)) throw new Error("Forbidden");
+
+    const newStatus = input.action === "approve" ? "Approved" : "Declined";
+    const decidedAt = new Date();
+    const pmNote = input.pmNote?.trim() || null;
+
+    // Status CAS: only a Pending proposal transitions. A duplicate decide call
+    // (double-click, retried request) matches zero rows and no-ops instead of
+    // re-deciding or minting a second ProductLibraryItem/favorite/option.
+    const claim = await prisma.selectionProposal.updateMany({
+        where: { id: proposalId, status: "Pending" },
+        data: {
+            status: newStatus,
+            pmNote,
+            decidedById: user.id,
+            decidedAt,
+            ...(input.action === "approve" ? {
+                price: input.price ?? proposal.price ?? null,
+                boardId: input.boardId || null,
+                categoryId: input.categoryId || null,
+            } : {}),
+        },
+    });
+    if (claim.count === 0) {
+        return { success: false, alreadyDecided: true };
+    }
+
+    let productId: string | null = null;
+    let favoriteCreated = false;
+    let optionCreated = false;
+
+    if (input.action === "approve") {
+        const product = await prisma.productLibraryItem.create({
+            data: {
+                name: proposal.name,
+                description: proposal.description,
+                imageUrl: proposal.imageUrl,
+                price: input.price ?? proposal.price ?? null,
+                vendorUrl: proposal.vendorUrl,
+                source: "client_proposal",
+                clippedById: user.id,
+            },
+        });
+        productId = product.id;
+
+        await prisma.selectionProposal.update({
+            where: { id: proposalId },
+            data: { productId: product.id },
+        });
+
+        // Default true per spec — approving a suggestion pins it to the
+        // project's client-visible Favorites list unless explicitly opted out.
+        if (input.addToFavorites !== false) {
+            await prisma.projectProductFavorite.upsert({
+                where: { projectId_productId: { projectId: proposal.projectId, productId: product.id } },
+                update: {},
+                create: {
+                    projectId: proposal.projectId,
+                    productId: product.id,
+                    addedById: null,
+                    addedByClient: true,
+                },
+            });
+            favoriteCreated = true;
+        }
+
+        // Optional: also drop it into a board category as a pickable option.
+        // Never touches SelectionBoard.status — approving a suggestion must not
+        // silently flip a board back to an earlier lifecycle state.
+        if (input.boardId && input.categoryId) {
+            const category = await prisma.selectionCategory.findFirst({
+                where: { id: input.categoryId, boardId: input.boardId },
+            });
+            if (category) {
+                const maxOrder = await prisma.selectionOption.aggregate({
+                    where: { categoryId: input.categoryId },
+                    _max: { order: true },
+                });
+                await prisma.selectionOption.create({
+                    data: {
+                        categoryId: input.categoryId,
+                        name: proposal.name,
+                        description: proposal.description,
+                        imageUrl: proposal.imageUrl,
+                        price: input.price ?? proposal.price ?? null,
+                        vendorUrl: proposal.vendorUrl,
+                        order: (maxOrder._max.order ?? -1) + 1,
+                    },
+                });
+                optionCreated = true;
+            }
+        }
+    }
+
+    // Notify the client of the decision — same portal-link email pattern as
+    // sendSelectionBoardToClient.
+    const clientEmail = proposal.project.client?.email;
+    if (clientEmail) {
+        const settings = await getCachedCompanySettings();
+        const { buildClientPortalUrl } = await import("./client-portal-auth");
+        const portalUrl = await buildClientPortalUrl(proposal.project.clientId, clientEmail, `/portal/projects/${proposal.projectId}/selections`);
+        const cc = buildCc(clientEmail, (proposal.project.client as any)?.additionalEmail);
+        const isApproved = input.action === "approve";
+        await sendNotification(
+            clientEmail,
+            isApproved ? `✅ Your suggestion was approved — ${proposal.project.name}` : `Update on your suggestion — ${proposal.project.name}`,
+            `<div style="font-family: sans-serif; color: #333;">
+                <h2>${isApproved ? "Your Suggestion Was Approved" : "Update on Your Suggestion"}</h2>
+                <p>Hi ${proposal.project.client?.name || "there"},</p>
+                <p>Your suggested item "<strong>${proposal.name}</strong>" for <strong>${proposal.project.name}</strong> ${isApproved ? "has been approved and added to your project." : "was not approved this time."}</p>
+                ${pmNote ? `<p style="color:#555;">Note from your project manager: "${pmNote}"</p>` : ""}
+                <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
+                <p style="color:#666;font-size:13px;">— ${settings.companyName || "Your Project Team"}</p>
+            </div>`,
+            undefined,
+            { cc, copyToInternal: true }
+        );
+    }
+
+    await logActivity({
+        projectId: proposal.projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: input.action === "approve" ? "approved_selection_suggestion" : "declined_selection_suggestion",
+        entityType: "SelectionProposal",
+        entityId: proposal.id,
+        entityName: proposal.name,
+    });
+
+    revalidatePath(`/projects/${proposal.projectId}/selections`);
+    revalidatePath(`/portal/projects/${proposal.projectId}/selections`);
+
+    return { success: true, status: newStatus, productId, favoriteCreated, optionCreated };
+}
 
 // =============================================
 // Daily Logs CRUD
