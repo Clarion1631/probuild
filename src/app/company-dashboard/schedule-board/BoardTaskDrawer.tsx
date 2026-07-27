@@ -1,9 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
-import { motion } from "framer-motion";
 import { toast } from "sonner";
 import {
     addTaskComment,
@@ -28,7 +26,7 @@ import {
 } from "@/lib/actions";
 import TaskDetailPanel from "@/app/projects/[id]/schedule/TaskDetailPanel";
 import type { Comment, EstimateItemSummary, PunchItem, Subcontractor, Task, TeamMember } from "@/app/projects/[id]/schedule/schedule-types";
-import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
+import { BoardDrawerShell } from "./BoardDrawerShell";
 
 type BoardTaskDrawerProps = {
     taskId: string | null;
@@ -46,7 +44,6 @@ function messageFromError(error: unknown, fallback: string) {
 
 export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, onClose, onSelectTask, onDeleted }: BoardTaskDrawerProps) {
     const router = useRouter();
-    const drawerRef = useRef<HTMLElement | null>(null);
     const requestRef = useRef(0);
     const [task, setTask] = useState<Task | null>(null);
     const [allTasks, setAllTasks] = useState<Task[]>([]);
@@ -99,43 +96,6 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
         return () => { requestRef.current += 1; };
     }, [taskId, refreshDetail]);
 
-    useEffect(() => {
-        if (!taskId) return;
-        const close = () => onClose();
-        activateExclusiveMenu(close);
-        return () => deactivateExclusiveMenu(close);
-    }, [taskId, onClose]);
-
-    useEffect(() => {
-        if (!taskId) return;
-        function onKeyDown(event: KeyboardEvent) {
-            if (event.key === "Escape") {
-                event.preventDefault();
-                onClose();
-            }
-        }
-        function onPointerDown(event: PointerEvent) {
-            // Let right-click reach TaskBlockSegment's context-menu path; its
-            // exclusive-menu registration closes this drawer in the same turn.
-            if (event.button !== 0) return;
-            const target = event.target;
-            if (!(target instanceof Node) || drawerRef.current?.contains(target)) return;
-            const activeElement = document.activeElement;
-            if (activeElement instanceof HTMLElement && drawerRef.current?.contains(activeElement)) {
-                activeElement.blur();
-            }
-            event.preventDefault();
-            event.stopPropagation();
-            window.setTimeout(onClose, 0);
-        }
-        document.addEventListener("keydown", onKeyDown);
-        document.addEventListener("pointerdown", onPointerDown, true);
-        return () => {
-            document.removeEventListener("keydown", onKeyDown);
-            document.removeEventListener("pointerdown", onPointerDown, true);
-        };
-    }, [taskId, onClose]);
-
     async function mutate(operation: () => Promise<unknown>, fallback: string, success?: string) {
         try {
             await operation();
@@ -148,27 +108,11 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
         }
     }
 
-    if (!taskId || typeof document === "undefined") return null;
+    if (!taskId) return null;
 
-    const content = (
-        <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.16 }}
-            className="pointer-events-none fixed inset-0 z-[180] bg-slate-950/15"
-            aria-hidden={false}
-        >
-            <motion.aside
-                ref={drawerRef}
-                initial={{ x: 20, opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                transition={{ duration: 0.18, ease: "easeOut" }}
-                role="dialog"
-                aria-modal="false"
-                aria-label="Task details"
-                className="pointer-events-auto fixed inset-y-0 right-0 w-[min(420px,calc(100vw-1rem))] bg-white shadow-[-18px_0_45px_rgba(15,23,42,0.22)]"
-            >
-                {task && task.id === taskId ? (
+    return (
+        <BoardDrawerShell open ariaLabel="Task details" onClose={onClose}>
+            {task && task.id === taskId ? (
                     <TaskDetailPanel
                         task={task}
                         onClose={onClose}
@@ -241,10 +185,7 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
                             {isLoading || (!loadError && task?.id !== taskId) ? <div><div className="mx-auto h-7 w-7 animate-spin rounded-full border-2 border-indigo-200 border-t-indigo-600" /><p className="mt-3 text-xs text-hui-textMuted">Loading task…</p></div> : <div><p className="text-sm font-semibold text-hui-textMain">Could not open this task</p><p className="mt-1 text-xs text-hui-textMuted">{loadError}</p><button type="button" onClick={() => void refreshDetail()} className="hui-btn hui-btn-secondary mt-4 text-xs">Try again</button></div>}
                         </div>
                     </div>
-                )}
-            </motion.aside>
-        </motion.div>
+            )}
+        </BoardDrawerShell>
     );
-
-    return createPortal(content, document.body);
 }

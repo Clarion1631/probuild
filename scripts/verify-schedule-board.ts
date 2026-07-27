@@ -768,9 +768,11 @@ async function main() {
         const monthSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/MonthBarsView.tsx", import.meta.url), "utf8");
         const timelineSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TimelineView.tsx", import.meta.url), "utf8");
         const projectBarSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/ProjectBar.tsx", import.meta.url), "utf8");
+        const projectDrawerSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/BoardProjectDrawer.tsx", import.meta.url), "utf8");
+        const drawerShellSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/BoardDrawerShell.tsx", import.meta.url), "utf8");
         const taskBlockSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TaskBlockSegment.tsx", import.meta.url), "utf8");
         const availabilityPanelSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/AvailabilityPanel.tsx", import.meta.url), "utf8");
-        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, taskBlockSource, availabilityPanelSource];
+        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, projectDrawerSource, drawerShellSource, taskBlockSource, availabilityPanelSource];
         check("source forwards canEdit through both views to ProjectBar", monthSource.includes("canEdit={data.canEdit}")
             && timelineSource.includes("canEdit={data.canEdit}"));
         check("source forwards canEdit from ProjectBar to TaskBlockSegment", projectBarSource.includes("<TaskBlockSegment")
@@ -792,8 +794,12 @@ async function main() {
             && availabilityPanelSource.indexOf("Planned $/day") > availabilityPanelSource.indexOf("{canSeeFinancials && ("));
         check("availability panel derives from the DashboardProjectRow/DashboardTaskRow shape already on data (no direct prisma access)",
             !/\bprisma\b/.test(availabilityPanelSource));
-        check("ProjectBar popover surfaces the shop distance line", projectBarSource.includes("project.distanceMilesFromShop != null")
-            && projectBarSource.includes("mi from shop"));
+        check("project drawer replaces the ProjectBar popover and surfaces the shop distance line",
+            !projectBarSource.includes("FloatingPopover")
+            && projectDrawerSource.includes("project.distanceMilesFromShop != null")
+            && projectDrawerSource.includes("mi from shop")
+            && projectDrawerSource.includes("layout=\"list\"")
+            && drawerShellSource.includes("w-[min(420px,calc(100vw-1rem))]"));
     } finally {
         let cleanupPassed = false;
         try {

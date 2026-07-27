@@ -26,6 +26,7 @@ import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
 import { BoardTaskDrawer } from "./BoardTaskDrawer";
+import { BoardProjectDrawer } from "./BoardProjectDrawer";
 import TaskCreationDialog from "@/components/TaskCreationDialog";
 import {
     computeProjectEndResizeCandidate,
@@ -291,6 +292,7 @@ export function ScheduleBoard({
     const [showHours, setShowHours] = useState(false);
     const [boardView, setBoardView] = useState<BoardView>("month");
     const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+    const [openProjectId, setOpenProjectId] = useState<string | null>(null);
     const [taskCreationOpen, setTaskCreationOpen] = useState(false);
     const [taskCreationDefaults, setTaskCreationDefaults] = useState<Partial<DispatchTaskCreationDefaults>>({});
     // Lifted from TimelineView (see CREW_MODE_STORAGE_KEY) so the
@@ -530,6 +532,14 @@ export function ScheduleBoard({
         },
         overlays: data.overlays ? previewOverlays : null,
     };
+    const openProject = openProjectId
+        ? [
+            ...boardData.pipeline.waitingToStart,
+            ...boardData.pipeline.scheduled,
+            ...boardData.pipeline.inProgress,
+            ...boardData.pipeline.substantialCompletion,
+        ].find(project => project.id === openProjectId) ?? null
+        : null;
 
     function setTaskKeyboardState(next: TaskKeyboardEditState | null) {
         taskKeyboardEditRef.current = next;
@@ -762,10 +772,19 @@ export function ScheduleBoard({
     }, []);
 
     const handleBlockActivate = useCallback((taskId: string) => {
+        setOpenProjectId(null);
         setOpenTaskId(taskId);
     }, []);
     const closeTaskDrawer = useCallback(() => setOpenTaskId(null), []);
-    const selectDrawerTask = useCallback((taskId: string) => setOpenTaskId(taskId), []);
+    const handleProjectActivate = useCallback((projectId: string) => {
+        setOpenTaskId(null);
+        setOpenProjectId(projectId);
+    }, []);
+    const closeProjectDrawer = useCallback(() => setOpenProjectId(null), []);
+    const selectDrawerTask = useCallback((taskId: string) => {
+        setOpenProjectId(null);
+        setOpenTaskId(taskId);
+    }, []);
     const handleDrawerTaskDeleted = useCallback((taskId: string) => {
         if (activeTaskPointerRef.current?.taskId === taskId) activeTaskPointerRef.current.cleanup();
         if (taskKeyboardEditRef.current?.taskId === taskId) {
@@ -2408,6 +2427,7 @@ export function ScheduleBoard({
                     teamMembers={data.teamMembers ?? []}
                     isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
+                    onProjectActivate={handleProjectActivate}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
                     onProjectKeyboardAdjust={handleProjectKeyboardAdjust}
@@ -2446,6 +2466,7 @@ export function ScheduleBoard({
                     teamMembers={data.teamMembers ?? []}
                     isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
+                    onProjectActivate={handleProjectActivate}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
                     onProjectKeyboardAdjust={handleProjectKeyboardAdjust}
@@ -2488,6 +2509,13 @@ export function ScheduleBoard({
                 onClose={closeTaskDrawer}
                 onSelectTask={selectDrawerTask}
                 onDeleted={handleDrawerTaskDeleted}
+            />
+            <BoardProjectDrawer
+                project={openProject}
+                teamMembers={data.teamMembers ?? []}
+                isPending={Boolean(openProject && (isSaving || combinedPendingProjectIds.has(openProject.id)))}
+                onMoveCommit={handleProjectMoveCommit}
+                onClose={closeProjectDrawer}
             />
             <TaskCreationDialog
                 open={taskCreationOpen}
