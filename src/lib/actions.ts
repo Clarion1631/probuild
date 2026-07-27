@@ -9752,9 +9752,18 @@ export async function decideSelectionProposal(proposalId: string, input: {
         // Never touches SelectionBoard.status — approving a suggestion must not
         // silently flip a board back to an earlier lifecycle state.
         if (input.boardId && input.categoryId) {
-            const category = await prisma.selectionCategory.findFirst({
-                where: { id: input.categoryId, boardId: input.boardId },
+            // Verify the board itself belongs to this proposal's project — without
+            // this, a staff user scoped to project A could pass a boardId from
+            // project B and write a SelectionOption into another project's board.
+            const board = await prisma.selectionBoard.findFirst({
+                where: { id: input.boardId, projectId: proposal.projectId },
+                select: { id: true },
             });
+            const category = board
+                ? await prisma.selectionCategory.findFirst({
+                    where: { id: input.categoryId, boardId: input.boardId },
+                })
+                : null;
             if (category) {
                 const maxOrder = await prisma.selectionOption.aggregate({
                     where: { categoryId: input.categoryId },

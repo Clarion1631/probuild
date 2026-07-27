@@ -91,44 +91,76 @@ function isPrivateOrReservedIp(ip: string): boolean {
     return true;
 }
 
+// Redirect hops to follow before giving up. Each hop is re-validated against
+// isSafeExternalUrl — see the SSRF note on guardedFetchText below.
+const MAX_REDIRECTS = 5;
+
 /**
- * Fetch a URL with a hard timeout and response-size cap. Caller must have
- * already validated the URL via isSafeExternalUrl(). Returns null on any
- * failure (timeout, non-2xx, oversized body, network error) — never throws.
+ * Fetch a URL with a hard timeout and response-size cap, following redirects
+ * MANUALLY (never `redirect: "follow"`). A vendor site could otherwise 302 to
+ * an internal target (169.254.169.254, localhost, an RFC1918 address) and a
+ * plain fetch would follow it unvalidated — that's a real SSRF even though
+ * the original URL passed isSafeExternalUrl(). Every hop's URL — the initial
+ * one and every Location target — is re-validated before it's fetched, which
+ * also narrows (though doesn't eliminate) the DNS-rebinding window between
+ * the check and the connect for each individual hop.
+ *
+ * Returns null on any failure (timeout, unsafe redirect target, too many
+ * redirects, non-2xx, oversized body, network error) — never throws.
  */
 async function guardedFetchText(url: string): Promise<string | null> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-        const res = await fetch(url, {
-            signal: controller.signal,
-            redirect: "follow",
-            headers: {
-                "User-Agent": BROWSER_USER_AGENT,
-                Accept: "text/html,application/xhtml+xml",
-            },
-        });
-        if (!res.ok || !res.body) return null;
-
-        const contentLengthHeader = res.headers.get("content-length");
-        if (contentLengthHeader && Number(contentLengthHeader) > MAX_RESPONSE_BYTES) return null;
-
-        const reader = res.body.getReader();
-        const chunks: Uint8Array[] = [];
+        let currentUrl = url;
         let total = 0;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-                total += value.byteLength;
-                if (total > MAX_RESPONSE_BYTES) {
-                    await reader.cancel().catch(() => {});
+        const chunks: Uint8Array[] = [];
+
+        for (let redirects = 0; ; redirects++) {
+            // Re-validate right before connecting on every hop, not just the
+            // caller-supplied starting URL.
+            if (!(await isSafeExternalUrl(currentUrl))) return null;
+
+            const res = await fetch(currentUrl, {
+                signal: controller.signal,
+                redirect: "manual",
+                headers: {
+                    "User-Agent": BROWSER_USER_AGENT,
+                    Accept: "text/html,application/xhtml+xml",
+                },
+            });
+
+            const location = res.headers.get("location");
+            if (res.status >= 300 && res.status < 400 && location) {
+                if (redirects >= MAX_REDIRECTS) return null;
+                try {
+                    currentUrl = new URL(location, currentUrl).toString();
+                } catch {
                     return null;
                 }
-                chunks.push(value);
+                continue; // loop re-validates currentUrl before following it
             }
+
+            if (!res.ok || !res.body) return null;
+
+            const contentLengthHeader = res.headers.get("content-length");
+            if (contentLengthHeader && total + Number(contentLengthHeader) > MAX_RESPONSE_BYTES) return null;
+
+            const reader = res.body.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value) {
+                    total += value.byteLength;
+                    if (total > MAX_RESPONSE_BYTES) {
+                        await reader.cancel().catch(() => {});
+                        return null;
+                    }
+                    chunks.push(value);
+                }
+            }
+            return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
         }
-        return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
     } catch {
         return null;
     } finally {
