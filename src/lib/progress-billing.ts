@@ -49,19 +49,16 @@ export type ProgressBillingWithLines = ProgressBilling & { lines: ProgressBillin
 /**
  * Build one progress billing.
  *
- * KNOWN DESIGN NOTE (targetTotal mode — see PROGRESS_BILLING_REPORT.md for the
- * full writeup): the over-billing check and the AUTO-SPLIT below both use the
- * RAW per-line amount the caller supplies (what the user typed against that
- * milestone) — that is the amount carved out of the milestone. The amount that
- * actually lands on the persisted ProgressBillingLine (and therefore on the
- * QuickBooks invoice) is the tax-mode-adjusted amount computed afterward. In
- * "preTax" mode these are always identical (no adjustment happens). In
- * "targetTotal" mode the persisted line amount is the raw amount rescaled so
- * the whole billing's subtotal lands exactly on the client's target total
- * after tax — it can differ from the raw amount used for the split by the
- * rescale factor. Flagged as a risk, not fixed here: no test in this pass
- * exercises split+targetTotal together, and reconciling the two would require
- * a product decision this pass isn't scoped to make.
+ * TWO AMOUNTS, DELIBERATELY DIFFERENT. Every line carries:
+ *   • the PERSISTED amount (ProgressBillingLine.amount) — always PRE-TAX, since
+ *     it feeds the QuickBooks invoice's taxable line; and
+ *   • the SPLIT amount — what gets carved out of the milestone, expressed in
+ *     that milestone's own units (see the "Split units" block below).
+ * On a legacy tax-inclusive job these differ by exactly the tax and that is
+ * correct: a $25,000 check against a $39,998.25 tax-inclusive milestone leaves
+ * $14,998.25 behind while the QuickBooks line reads $22,977.94 + $2,022.06 tax.
+ * On a pre-tax job they are identical. In "preTax" mode they are always
+ * identical regardless of vintage.
  */
 export async function createProgressBillingCore(
     invoiceId: string,
@@ -134,9 +131,8 @@ export async function createProgressBillingCore(
                 if (schedule.stripeSessionId || schedule.stripePaymentIntentId) {
                     throw new Error(`A payment is in progress on "${schedule.name}" — wait for it to finish or void it before billing.`);
                 }
-                if (rawAmount > toNum(schedule.amount) + 0.005) {
-                    throw new Error(`"${schedule.name}": billed amount $${rawAmount.toFixed(2)} exceeds the milestone's amount $${toNum(schedule.amount).toFixed(2)}`);
-                }
+                // Over-billing is checked AFTER the tax math, against the amount
+                // expressed in the milestone's own units (see splitAmounts below).
                 scheduleCache.set(line.scheduleId, schedule);
             } else if (line.changeOrderId) {
                 const co = await tx.changeOrder.findUnique({ where: { id: line.changeOrderId } });
@@ -185,27 +181,59 @@ export async function createProgressBillingCore(
             throw new Error("Internal error: line amounts do not sum to the subtotal");
         }
 
+        // ── Split units ─────────────────────────────────────────────────────
+        // A milestone must be carved up in ITS OWN units, which differ by vintage:
+        //   • legacy estimates (taxInclusiveMilestones = true, every job priced
+        //     before progressive billing): milestone amounts INCLUDE tax, so the
+        //     gross amount the client is paying is what comes out of the milestone
+        //     — a $25,000 check against Mesplay's $39,998.25 leaves $14,998.25.
+        //   • new estimates (false): milestone amounts are PRE-TAX, so the pre-tax
+        //     line amount is what comes out; the tax rides on top of the billing.
+        // In "preTax" mode finalAmounts === rawAmounts, so both branches agree and
+        // this reduces to a no-op. Getting this wrong silently mis-splits live
+        // milestones by exactly the tax, which is why over-billing is validated
+        // here against the same units rather than against the caller's raw input.
+        const estimateForUnits = invLink?.estimateId
+            ? await tx.estimate.findUnique({ where: { id: invLink.estimateId }, select: { taxInclusiveMilestones: true } })
+            : null;
+        // No estimate (ad-hoc invoice) → treat as legacy tax-inclusive, matching
+        // how every existing invoice in the system was priced.
+        const milestonesAreTaxInclusive = estimateForUnits?.taxInclusiveMilestones ?? true;
+        const splitAmounts = milestonesAreTaxInclusive ? rawAmounts : finalAmounts;
+
+        for (let i = 0; i < input.lines.length; i++) {
+            const scheduleId = input.lines[i].scheduleId;
+            if (!scheduleId) continue;
+            const schedule = scheduleCache.get(scheduleId)!;
+            if (splitAmounts[i] > toNum(schedule.amount) + 0.005) {
+                throw new Error(
+                    `"${schedule.name}": billed amount $${splitAmounts[i].toFixed(2)} exceeds the milestone's amount $${toNum(schedule.amount).toFixed(2)}`
+                );
+            }
+        }
+
         // ── AUTO-SPLIT ──────────────────────────────────────────────────────
-        // Uses the RAW per-line amount (see the KNOWN DESIGN NOTE on this
-        // function) — the amount actually carved out of the milestone. Never
-        // deletes a PaymentSchedule/EstimatePaymentSchedule row: the original
-        // is reduced in place and a NEW row absorbs the remainder.
+        // Carves the billed portion out of the milestone using splitAmounts (the
+        // milestone's own units — see above). Never deletes a PaymentSchedule /
+        // EstimatePaymentSchedule row: the original is reduced in place and a NEW
+        // row absorbs the remainder, so the two always sum to what was there
+        // before and the invoice's totalAmount/balanceDue are untouched.
         const resolvedScheduleIds = new Map<number, string>(); // line index -> PaymentSchedule.id billed (whole, post-split)
         for (let i = 0; i < input.lines.length; i++) {
             const line = input.lines[i];
             if (!line.scheduleId) continue;
             const schedule = scheduleCache.get(line.scheduleId)!;
-            const rawAmount = rawAmounts[i];
+            const splitAmount = splitAmounts[i];
             const scheduleAmount = toNum(schedule.amount);
             resolvedScheduleIds.set(i, schedule.id);
 
-            if (rawAmount >= scheduleAmount - 0.005) continue; // full bill — no split needed
+            if (splitAmount >= scheduleAmount - 0.005) continue; // full bill — no split needed
 
-            const remainder = r2(scheduleAmount - rawAmount);
+            const remainder = r2(scheduleAmount - splitAmount);
 
             await tx.paymentSchedule.update({
                 where: { id: schedule.id },
-                data: { amount: rawAmount },
+                data: { amount: splitAmount },
             });
 
             let newSourceScheduleId: string | null = null;
@@ -214,7 +242,7 @@ export async function createProgressBillingCore(
                 if (originalEst) {
                     await tx.estimatePaymentSchedule.update({
                         where: { id: originalEst.id },
-                        data: { amount: rawAmount },
+                        data: { amount: splitAmount },
                     });
                     const newEst = await tx.estimatePaymentSchedule.create({
                         data: {

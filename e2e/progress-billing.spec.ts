@@ -210,6 +210,105 @@ test.describe.serial("createProgressBillingCore", () => {
         expect(num(billing.subtotal) + num(billing.taxAmount)).toBe(num(billing.total));
     });
 
+    test("targetTotal + partial split on a LEGACY tax-inclusive job splits by the gross amount", async () => {
+        // The live Mesplay case: a $25,000 check against a $39,998.25 milestone
+        // whose amount already includes 8.8% tax. The milestone must be carved at
+        // the GROSS $25,000 (leaving $14,998.25), while the billing line records
+        // the PRE-TAX $22,977.94 for QuickBooks. Splitting by the pre-tax figure
+        // instead would silently leave the client short by the tax.
+        await ensureClientAndProject();
+        const suffix = "legacy-split";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const epsId = `${PFX}-eps-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "PB Legacy", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 39998.25, balanceDue: 39998.25, taxInclusiveMilestones: true },
+        });
+        await prisma.estimatePaymentSchedule.create({
+            data: { id: epsId, estimateId, name: "Mechanical Trades", amount: 39998.25, status: "Pending", order: 1 },
+        });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 39998.25, balanceDue: 39998.25, taxRate: 8.8 },
+        });
+        await prisma.paymentSchedule.create({
+            data: { id: psId, invoiceId, name: "Mechanical Trades", amount: 39998.25, status: "Pending", sourceScheduleId: epsId },
+        });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Progress payment (check 1585)",
+            lines: [{ scheduleId: psId, description: "Mechanical Trades", amount: 25000 }],
+            amountMode: "targetTotal",
+            targetTotal: 25000,
+        });
+
+        // Client pays exactly the check amount; tax is stated inside it.
+        expect(num(billing.total)).toBe(25000);
+        expect(num(billing.subtotal)).toBe(22977.94);
+        expect(num(billing.taxAmount)).toBe(2022.06);
+        expect(num(billing.lines[0].amount)).toBe(22977.94); // pre-tax, feeds QuickBooks
+
+        // Milestone carved at the GROSS amount, remainder preserved, nothing lost.
+        const billed = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(billed!.amount)).toBe(25000);
+        const remainder = await prisma.paymentSchedule.findFirst({
+            where: { invoiceId, name: { contains: "(remaining)" } },
+        });
+        expect(num(remainder!.amount)).toBe(14998.25);
+        expect(num(billed!.amount) + num(remainder!.amount)).toBe(39998.25);
+
+        // Estimate mirror split the same way, and the invoice totals never moved.
+        const estOriginal = await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsId } });
+        expect(num(estOriginal!.amount)).toBe(25000);
+        const estRemainder = await prisma.estimatePaymentSchedule.findFirst({
+            where: { estimateId, name: { contains: "(remaining)" } },
+        });
+        expect(num(estRemainder!.amount)).toBe(14998.25);
+        expect(remainder!.sourceScheduleId).toBe(estRemainder!.id);
+
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(39998.25);
+        expect(num(invoice!.balanceDue)).toBe(39998.25);
+    });
+
+    test("targetTotal + partial split on a PRE-TAX job splits by the pre-tax amount", async () => {
+        // Same shape, new-vintage estimate: milestone amounts exclude tax, so the
+        // pre-tax line amount is what comes out of the milestone and tax rides on top.
+        await ensureClientAndProject();
+        const suffix = "pretax-split";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "PB PreTax", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 40000, balanceDue: 40000, taxInclusiveMilestones: false },
+        });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 40000, balanceDue: 40000, taxRate: 8.8 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Mechanical", amount: 40000, status: "Pending" } });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Progress payment",
+            lines: [{ scheduleId: psId, description: "Mechanical", amount: 25000 }],
+            amountMode: "targetTotal",
+            targetTotal: 25000,
+        });
+
+        expect(num(billing.total)).toBe(25000);
+        expect(num(billing.subtotal)).toBe(22977.94);
+
+        // Carved at the PRE-TAX amount this time.
+        const billed = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(billed!.amount)).toBe(22977.94);
+        const remainder = await prisma.paymentSchedule.findFirst({
+            where: { invoiceId, name: { contains: "(remaining)" } },
+        });
+        expect(num(remainder!.amount)).toBe(17022.06);
+        expect(num(billed!.amount) + num(remainder!.amount)).toBe(40000);
+    });
+
     test('amountMode "targetTotal" with 33000 @ 8.8%: total is exactly 33000, subtotal+tax=total, lines sum to subtotal', async () => {
         await ensureClientAndProject();
         const suffix = "target";
