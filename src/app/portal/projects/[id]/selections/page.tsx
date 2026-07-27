@@ -2,9 +2,16 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
-import { getSelectionBoardsForPortal, getPortalVisibility } from "@/lib/actions";
+import {
+    getSelectionBoardsForPortal,
+    getPortalVisibility,
+    getSelectionProposalsForPortal,
+    getProjectFavoritesForPortal,
+} from "@/lib/actions";
 import Link from "next/link";
 import PortalSelectionsClient from "./PortalSelectionsClient";
+import PortalProjectFavorites from "./PortalProjectFavorites";
+import PortalSuggestionsSection from "./PortalSuggestionsSection";
 
 export default async function PortalSelectionsPage(props: { params: Promise<{ id: string }> }) {
     const { id } = await props.params;
@@ -31,7 +38,18 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
         );
     }
 
-    const boards = await getSelectionBoardsForPortal(id);
+    const [boards, proposals, favorites] = await Promise.all([
+        getSelectionBoardsForPortal(id),
+        getSelectionProposalsForPortal(id),
+        getProjectFavoritesForPortal(id),
+    ]);
+
+    // Only show the read-only Favorites section when there's something to look
+    // at, or when the tab already has other content (boards/proposals) so an
+    // empty Favorites card isn't the only thing on an otherwise-empty page —
+    // the "Your suggestions" section below always renders and covers that case
+    // with its own invite-to-suggest empty state.
+    const showFavorites = favorites.length > 0 || boards.length > 0 || proposals.length > 0;
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-4">
@@ -62,6 +80,16 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
             ) : (
                 <PortalSelectionsClient boards={JSON.parse(JSON.stringify(boards))} />
             )}
+
+            <div className="mt-12 space-y-12">
+                {showFavorites && (
+                    <PortalProjectFavorites favorites={JSON.parse(JSON.stringify(favorites))} />
+                )}
+                <PortalSuggestionsSection
+                    projectId={id}
+                    initialProposals={JSON.parse(JSON.stringify(proposals))}
+                />
+            </div>
         </div>
     );
 }
