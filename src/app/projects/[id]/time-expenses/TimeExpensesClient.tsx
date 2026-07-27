@@ -15,6 +15,7 @@ interface Props {
         costTypes: { id: string; name: string }[];
         teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any }[];
         estimates: { id: string; title: string; items: { id: string; name: string }[] }[];
+        changeOrders: { id: string; code: string; title: string; status: string }[];
     };
     currentUser: { id: string; role: string; name: string };
 }
@@ -77,6 +78,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     entries={data.timeEntries}
                     onAddNew={() => setShowTimeModal(true)}
                     currentUser={currentUser}
+                    changeOrders={data.changeOrders}
                 />
             ) : (
                 <ExpensesTab
@@ -84,6 +86,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     expenses={data.expenses}
                     onAddNew={() => setShowExpenseModal(true)}
                     currentUser={currentUser}
+                    changeOrders={data.changeOrders}
                 />
             )}
 
@@ -94,6 +97,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     teamMembers={data.teamMembers}
                     costCodes={data.costCodes}
                     currentUserId={currentUser.id}
+                    changeOrders={data.changeOrders}
                     onClose={() => setShowTimeModal(false)}
                 />
             )}
@@ -103,6 +107,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     estimates={data.estimates}
                     costCodes={data.costCodes}
                     costTypes={data.costTypes}
+                    changeOrders={data.changeOrders}
                     onClose={() => setShowExpenseModal(false)}
                 />
             )}

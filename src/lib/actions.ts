@@ -2627,7 +2627,7 @@ export async function getInvoiceForPortal(id: string) {
                 include: {
                     project: { include: { client: true } },
                     client: true,
-                    payments: { orderBy: { createdAt: "asc" } },
+                    payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: { createdAt: "asc" } },
                 },
             });
             if (!invoice) return null;
@@ -2649,7 +2649,7 @@ export async function getInvoiceForPortal(id: string) {
             include: {
                 project: { include: { client: true } },
                 client: true,
-                payments: { orderBy: { createdAt: "asc" } },
+                payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: { createdAt: "asc" } },
             },
         });
         if (!invoice) return null;
@@ -6960,7 +6960,7 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    let items: string[] = JSON.parse(rawText);
+    const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
     const maxOrder = await prisma.taskPunchItem.aggregate({
@@ -7591,7 +7591,8 @@ export async function createSuggestedChangeOrder(
 }
 
 export async function getChangeOrders(projectId: string) {
-    await assertChangeOrderPermission();
+    const user = await assertChangeOrderPermission();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     return await prisma.changeOrder.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -7600,14 +7601,19 @@ export async function getChangeOrders(projectId: string) {
 }
 
 export async function getChangeOrder(id: string) {
-    await assertChangeOrderPermission();
+    const user = await assertChangeOrderPermission();
+    const target = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target || !canAccessProject(user, target.projectId)) return null;
     return await prisma.changeOrder.findUnique({
         where: { id },
         include: {
             project: { include: { client: true } },
             estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
-            paymentSchedules: { orderBy: { order: "asc" } }
+            paymentSchedules: { orderBy: { order: "asc" } },
+            timeEntries: { include: { user: { select: { name: true, email: true } } }, orderBy: { startTime: "desc" } },
+            expenses: { orderBy: { createdAt: "desc" } },
+            billings: { include: { paymentSchedule: { select: { id: true, name: true, amount: true, status: true } } }, orderBy: { createdAt: "desc" } },
         }
     });
 }
@@ -7662,6 +7668,39 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     return co;
+}
+
+export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
+    const user = await assertChangeOrderPermission();
+    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!target || !canAccessProject(user, target.projectId)) throw new Error("Forbidden");
+    const { previewCostPlusChangeOrderCore } = await import("./billing-core");
+    return previewCostPlusChangeOrderCore(changeOrderId, { throughDate });
+}
+
+export async function billCostPlusChangeOrder(
+    changeOrderId: string,
+    throughDate: string,
+    expectedFingerprint: string,
+    expectedInvoiceId?: string,
+    expectedMarkupPercent?: number,
+    expectedTaxRate?: number,
+) {
+    const user = await assertChangeOrderPermission();
+    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!target || !canAccessProject(user, target.projectId)) throw new Error("Forbidden");
+    const { billCostPlusChangeOrderCore } = await import("./billing-core");
+    const result = await billCostPlusChangeOrderCore(changeOrderId, {
+        throughDate,
+        expectedFingerprint,
+        expectedInvoiceId,
+        expectedMarkupPercent,
+        expectedTaxRate,
+        actor: user.name || user.email,
+    });
+    revalidatePath(`/projects/${target.projectId}/change-orders/${changeOrderId}`);
+    revalidatePath(`/projects/${target.projectId}/invoices/${result.invoiceId}`);
+    return result;
 }
 
 export async function deleteChangeOrder(id: string) {

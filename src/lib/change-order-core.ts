@@ -13,13 +13,65 @@ type ChangeOrderItemInput = {
     costTypeId?: string | null;
 };
 
+type ChangeOrderScheduleInput = {
+    id?: string;
+    name?: string;
+    amount?: string | number;
+    dueDate?: string | Date | null;
+    order?: number;
+};
+
 export type ChangeOrderUpdateInput = {
     title?: string;
     description?: string | null;
+    pricingType?: "FIXED" | "COST_PLUS";
+    markupPercent?: string | number | null;
+    paymentSchedules?: ChangeOrderScheduleInput[] | unknown;
     status?: unknown;
     items?: ChangeOrderItemInput[] | unknown;
     [key: string]: unknown;
 };
+
+function normalizedPricingType(value: unknown, fallback: string): "FIXED" | "COST_PLUS" {
+    const pricingType = value ?? fallback;
+    if (pricingType !== "FIXED" && pricingType !== "COST_PLUS") {
+        throw new Error("Pricing type must be FIXED or COST_PLUS.");
+    }
+    return pricingType;
+}
+
+function normalizedMarkup(value: unknown, fallback: number | null): number | null {
+    if (value === undefined) return fallback;
+    if (value === null || value === "") return null;
+    const markup = Number(value);
+    if (!Number.isFinite(markup) || markup < 0 || markup > 1_000) {
+        throw new Error("Markup percent must be between 0 and 1000.");
+    }
+    return markup;
+}
+
+function normalizeSchedules(
+    schedules: ChangeOrderScheduleInput[],
+    subtotalCents: number,
+): Array<{ id?: string; name: string; amount: number; dueDate: Date | null; order: number }> {
+    if (schedules.length === 0) return [];
+    if (schedules.length < 2) throw new Error("A fixed-price payment schedule requires at least two payments.");
+
+    let priorCents = 0;
+    return schedules.map((schedule, index) => {
+        const isLast = index === schedules.length - 1;
+        const requestedCents = Math.round(Number(schedule.amount ?? 0) * 100);
+        const amountCents = isLast ? subtotalCents - priorCents : requestedCents;
+        if (!Number.isSafeInteger(requestedCents) || requestedCents <= 0 || amountCents <= 0) {
+            throw new Error("Every scheduled payment must be positive and earlier payments must total less than the subtotal.");
+        }
+        priorCents += amountCents;
+        const name = schedule.name?.trim() || `Payment ${index + 1}`;
+        const dueDate = schedule.dueDate ? new Date(schedule.dueDate) : null;
+        if (dueDate && Number.isNaN(dueDate.getTime())) throw new Error(`Invalid due date for ${name}.`);
+        return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: schedule.order ?? index };
+    });
+}
 
 function itemSubtotalCents(items: Array<{ quantity: number; unitCost: unknown }>): number {
     return items.reduce((sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)), 0);
@@ -33,6 +85,7 @@ function itemSubtotalCents(items: Array<{ quantity: number; unitCost: unknown }>
  */
 export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateInput) {
     const items = Array.isArray(data.items) ? data.items as ChangeOrderItemInput[] : undefined;
+    const schedules = Array.isArray(data.paymentSchedules) ? data.paymentSchedules as ChangeOrderScheduleInput[] : undefined;
 
     return prisma.$transaction(async (tx) => {
         // Serialize editors with send, approval, billing, and co-audit repair.
@@ -41,6 +94,8 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             title: string;
             description: string | null;
             totalAmount: unknown;
+            pricingType: string;
+            markupPercent: number | null;
             approvedBy: string | null;
             approvedAt: Date | null;
             clientSignatureUrl: string | null;
@@ -48,7 +103,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
         }>>`
-            SELECT "status", "title", "description", "totalAmount",
+            SELECT "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
                    "companySignedBy", "companySignedAt", "companySignatureUrl"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
@@ -66,7 +121,8 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
         // An Approved CO is the scope and amount the customer signed and billing
         // consumed. Lock all signed scope fields, not only line items, so the
         // portal/PDF cannot drift from the approval audit trail afterward.
-        const hasScopeWrite = ["title", "description", "items"].some((field) => Object.prototype.hasOwnProperty.call(data, field));
+        const hasScopeWrite = ["title", "description", "items", "pricingType", "markupPercent", "paymentSchedules"]
+            .some((field) => Object.prototype.hasOwnProperty.call(data, field));
         const hasSignatureAudit = Boolean(
             current.approvedBy
             || current.approvedAt
@@ -89,6 +145,17 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             const nextDescription = data.description === "" ? null : data.description;
             scalarData.description = nextDescription;
             scopeChanged = scopeChanged || nextDescription !== current.description;
+        }
+
+        const nextPricingType = normalizedPricingType(data.pricingType, current.pricingType);
+        const nextMarkupPercent = normalizedMarkup(data.markupPercent, current.markupPercent);
+        if (data.pricingType !== undefined) {
+            scalarData.pricingType = nextPricingType;
+            scopeChanged = scopeChanged || nextPricingType !== current.pricingType;
+        }
+        if (data.markupPercent !== undefined) {
+            scalarData.markupPercent = nextMarkupPercent;
+            scopeChanged = scopeChanged || nextMarkupPercent !== current.markupPercent;
         }
 
         if (items) {
@@ -178,6 +245,66 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             scalarData.balanceDue = totalCents / 100;
         }
 
+
+        const subtotalCents = scalarData.totalAmount === undefined
+            ? Math.round(Number(current.totalAmount) * 100)
+            : Math.round(Number(scalarData.totalAmount) * 100);
+        const existingSchedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: id },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { id: true, name: true, amount: true, dueDate: true, order: true },
+        });
+        const requestedSchedules = schedules ?? existingSchedules.map((row) => ({
+            id: row.id,
+            name: row.name,
+            amount: Number(row.amount),
+            dueDate: row.dueDate,
+            order: row.order,
+        }));
+
+        if (nextPricingType === "COST_PLUS" && requestedSchedules.length > 0) {
+            throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        }
+        const normalizedSchedules = nextPricingType === "FIXED"
+            ? normalizeSchedules(requestedSchedules, subtotalCents)
+            : [];
+
+        if (schedules !== undefined) {
+            const requestedIds = schedules.map((row) => row.id).filter((value): value is string => Boolean(value));
+            if (new Set(requestedIds).size !== requestedIds.length) throw new Error("Duplicate payment schedule ID.");
+            const existingById = new Map(existingSchedules.map((row) => [row.id, row]));
+            const incomingIds = new Set(normalizedSchedules.map((row) => row.id).filter((value): value is string => Boolean(value)));
+            const deleteIds = existingSchedules.filter((row) => !incomingIds.has(row.id)).map((row) => row.id);
+            if (deleteIds.length) await tx.changeOrderPaymentSchedule.deleteMany({ where: { changeOrderId: id, id: { in: deleteIds } } });
+            for (const row of normalizedSchedules) {
+                const { id: scheduleId, ...scheduleData } = row;
+                if (scheduleId && existingById.has(scheduleId)) {
+                    await tx.changeOrderPaymentSchedule.update({ where: { id: scheduleId }, data: scheduleData });
+                } else {
+                    await tx.changeOrderPaymentSchedule.create({ data: { ...scheduleData, changeOrderId: id } });
+                }
+            }
+            const schedulesChanged = normalizedSchedules.length !== existingSchedules.length
+                || normalizedSchedules.some((row) => {
+                    const prior = row.id ? existingById.get(row.id) : undefined;
+                    return !prior
+                        || prior.name !== row.name
+                        || Math.round(Number(prior.amount) * 100) !== Math.round(row.amount * 100)
+                        || prior.dueDate?.getTime() !== row.dueDate?.getTime()
+                        || prior.order !== row.order;
+                });
+            scopeChanged = scopeChanged || schedulesChanged;
+        } else if (nextPricingType === "FIXED" && existingSchedules.length > 0) {
+            // An item edit can change the subtotal. Keep the signed schedule contract
+            // cent-exact by absorbing the difference into the final row.
+            const final = normalizedSchedules.at(-1)!;
+            const priorFinal = existingSchedules.at(-1)!;
+            if (Math.round(Number(priorFinal.amount) * 100) !== Math.round(final.amount * 100)) {
+                await tx.changeOrderPaymentSchedule.update({ where: { id: priorFinal.id }, data: { amount: final.amount } });
+                scopeChanged = true;
+            }
+        }
+
         // A client may already have the Sent document open. An actual scope
         // change invalidates that render, so atomically return the CO to Draft
         // and force a fresh guarded send before approval can succeed. No-op saves
@@ -201,8 +328,8 @@ export async function approveChangeOrderCore(
         // co-audit repair. Status, item existence, subtotal validation, and the
         // approval write therefore observe one serialized state and commit as a
         // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; totalAmount: unknown }>>`
-            SELECT "id", "code", "status", "totalAmount"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -215,20 +342,25 @@ export async function approveChangeOrderCore(
             throw new Error("A client name and persisted signature is required to approve a change order.");
         }
 
+        if (current.pricingType === "COST_PLUS") {
+            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
+            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        }
+
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId: id },
             select: { quantity: true, unitCost: true },
         });
-        if (items.length === 0) {
+        if (current.pricingType !== "COST_PLUS" && items.length === 0) {
             throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
         }
 
         const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
         const renderedSubtotalCents = itemSubtotalCents(items);
-        if (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0) {
+        if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
             throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
         }
-        if (storedSubtotalCents !== renderedSubtotalCents) {
+        if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
 

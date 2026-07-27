@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -15,6 +15,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [status, setStatus] = useState(initialData.status);
     const [items, setItems] = useState<any[]>(initialData.items || []);
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialData.paymentSchedules || []);
+    const [pricingType, setPricingType] = useState<"FIXED" | "COST_PLUS">(initialData.pricingType === "COST_PLUS" ? "COST_PLUS" : "FIXED");
+    const [markupPercent, setMarkupPercent] = useState(String(initialData.markupPercent ?? 10));
     const [isSaving, setIsSaving] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
     const [activeTab, setActiveTab] = useState("builder"); // builder | details
@@ -22,6 +24,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [signName, setSignName] = useState("");
     const [isSigning, setIsSigning] = useState(false);
     const [isSending, setIsSending] = useState(false);
+    const [isBilling, setIsBilling] = useState(false);
+    const [billingPreview, setBillingPreview] = useState<any | null>(null);
 
     // A signed CO is a contract: title, description, and items are the approved
     // scope and remain immutable after approval. The server enforces the same
@@ -46,6 +50,13 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(initialData.estimate);
+    const unbilledTime = (initialData.timeEntries || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
+    const unbilledExpenses = (initialData.expenses || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
+    const actualHours = unbilledTime.reduce((sum: number, row: any) => sum + Number(row.durationHours || 0), 0);
+    const actualLabor = unbilledTime.reduce((sum: number, row: any) => sum + Number(row.laborCost || 0) + Number(row.burdenCost || 0), 0);
+    const actualExpenses = unbilledExpenses.reduce((sum: number, row: any) => sum + Number(row.amount || 0), 0);
+    const scheduledPriorCents = paymentSchedules.slice(0, -1).reduce((sum: number, row: any) => sum + Math.round(Number(row.amount || 0) * 100), 0);
+    const finalScheduleCents = Math.round(subtotal * 100) - scheduledPriorCents;
 
     async function handleSign() {
         if (!signName.trim()) { toast.error("Please enter a name to sign"); return; }
@@ -95,6 +106,15 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 title,
                 description,
                 items: mappedItems,
+                pricingType,
+                markupPercent: pricingType === "COST_PLUS" ? Number(markupPercent || 10) : null,
+                paymentSchedules: pricingType === "COST_PLUS" ? [] : paymentSchedules.map((row, index) => ({
+                    id: row.id,
+                    name: row.name,
+                    amount: index === paymentSchedules.length - 1 ? finalScheduleCents / 100 : Number(row.amount || 0),
+                    dueDate: row.dueDate || null,
+                    order: index,
+                })),
             });
             setStatus(updated.status);
             toast.success("Change Order saved");
@@ -147,6 +167,49 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         const newItems = [...items];
         newItems[index][field] = value;
         setItems(newItems);
+    }
+
+    function addSchedule() {
+        setPaymentSchedules((rows) => [...rows, { id: generateId(), name: `Payment ${rows.length + 1}`, amount: 0, dueDate: "", order: rows.length }]);
+    }
+
+    function updateSchedule(index: number, field: string, value: any) {
+        setPaymentSchedules((rows) => rows.map((row, rowIndex) => rowIndex === index ? { ...row, [field]: value } : row));
+    }
+
+    async function previewActuals() {
+        const throughDate = new Date().toLocaleDateString("en-CA");
+        setIsBilling(true);
+        try {
+            const preview = await previewCostPlusChangeOrder(initialData.id, throughDate);
+            setBillingPreview(preview);
+        } catch (error: any) {
+            toast.error(error?.message || "Could not preview billable actuals");
+        } finally {
+            setIsBilling(false);
+        }
+    }
+
+    async function confirmBillActuals() {
+        if (!billingPreview) return;
+        setIsBilling(true);
+        try {
+            await billCostPlusChangeOrder(
+                initialData.id,
+                billingPreview.throughDate,
+                billingPreview.fingerprint,
+                billingPreview.invoiceId,
+                billingPreview.markupPercent,
+                billingPreview.taxRate,
+            );
+            toast.success("Actuals billed to the project invoice");
+            setBillingPreview(null);
+            router.refresh();
+        } catch (error: any) {
+            toast.error(error?.message || "Billing failed; refresh the preview and try again");
+        } finally {
+            setIsBilling(false);
+        }
     }
 
     return (
@@ -283,9 +346,38 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 </div>
                             </div>
 
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-5 px-10 py-6 border-b border-slate-100 bg-amber-50/30">
+                                <div>
+                                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Pricing type</label>
+                                    <select
+                                        value={pricingType}
+                                        disabled={isScopeLocked}
+                                        onChange={e => {
+                                            const value = e.target.value as "FIXED" | "COST_PLUS";
+                                            setPricingType(value);
+                                            if (value === "COST_PLUS") setPaymentSchedules([]);
+                                        }}
+                                        className="hui-input w-full"
+                                    >
+                                        <option value="FIXED">Fixed price</option>
+                                        <option value="COST_PLUS">Cost plus</option>
+                                    </select>
+                                </div>
+                                {pricingType === "COST_PLUS" && (
+                                    <div>
+                                        <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Markup percent</label>
+                                        <div className="relative">
+                                            <input type="number" min="0" max="1000" step="0.1" value={markupPercent} disabled={isScopeLocked} onChange={e => setMarkupPercent(e.target.value)} className="hui-input w-full pr-10" />
+                                            <span className="absolute right-3 top-2.5 text-slate-400">%</span>
+                                        </div>
+                                        <p className="text-xs text-slate-500 mt-2">Billed from actual time & materials at cost + {markupPercent || 0}% + tax.</p>
+                                    </div>
+                                )}
+                            </div>
+
                             <div className="bg-white">
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-slate-50/80 border-b border-slate-100 px-8 py-4 uppercase tracking-wider">
-                                    <div className="flex-1">Item Description</div>
+                                    <div className="flex-1">{pricingType === "COST_PLUS" ? "Scope estimate (not a fixed price)" : "Item Description"}</div>
                                     <div className="w-24 text-right">Qty</div>
                                     <div className="w-32 text-right">Unit Cost</div>
                                     <div className="w-32 text-right">Total</div>
@@ -355,8 +447,39 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 )}
                             </div>
 
+                            {pricingType === "FIXED" && (
+                                <div className="border-t border-slate-200 px-8 py-7 bg-white">
+                                    <div className="flex items-center justify-between mb-4">
+                                        <div>
+                                            <h3 className="font-bold text-slate-800">Payment schedule</h3>
+                                            <p className="text-xs text-slate-500 mt-1">Optional. Use at least two positive payments; the final payment absorbs the cent-exact remainder.</p>
+                                        </div>
+                                        {!isScopeLocked && <button type="button" onClick={addSchedule} className="hui-btn hui-btn-secondary text-sm">Add payment</button>}
+                                    </div>
+                                    <div className="space-y-3">
+                                        {paymentSchedules.map((row, index) => {
+                                            const isLast = index === paymentSchedules.length - 1;
+                                            return (
+                                                <div key={row.id || index} className="grid grid-cols-[1fr_150px_160px_40px] gap-3 items-center">
+                                                    <input value={row.name || ""} disabled={isScopeLocked} onChange={e => updateSchedule(index, "name", e.target.value)} className="hui-input" placeholder={`Payment ${index + 1}`} />
+                                                    <input type="number" min="0.01" step="0.01" value={isLast ? Math.max(0, finalScheduleCents) / 100 : row.amount || ""} disabled={isScopeLocked || isLast} onChange={e => updateSchedule(index, "amount", e.target.value)} className="hui-input text-right" aria-label={`Payment ${index + 1} amount`} />
+                                                    <input type="date" value={row.dueDate ? String(row.dueDate).slice(0, 10) : ""} disabled={isScopeLocked} onChange={e => updateSchedule(index, "dueDate", e.target.value)} className="hui-input" />
+                                                    {!isScopeLocked && <button type="button" onClick={() => setPaymentSchedules(rows => rows.filter((_, rowIndex) => rowIndex !== index))} className="text-slate-400 hover:text-red-600">×</button>}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                    {paymentSchedules.length > 0 && (
+                                        <p className={`text-xs mt-3 ${paymentSchedules.length < 2 || finalScheduleCents <= 0 ? "text-red-600" : "text-emerald-700"}`}>
+                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the subtotal." : `Final payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Schedule sums to ${formatCurrency(subtotal)}.`}
+                                        </p>
+                                    )}
+                                </div>
+                            )}
+
                             <div className="bg-slate-50 p-10 flex justify-end border-t border-slate-200">
                                 <div className="w-80 space-y-4 text-sm">
+                                    {pricingType === "FIXED" ? <>
                                     <div className="flex justify-between text-slate-500 font-medium">
                                         <span>Change Order Subtotal</span>
                                         <span className="text-slate-800">{formatCurrency(subtotal)}</span>
@@ -370,9 +493,84 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                         <span>Revised Amount</span>
                                         <span className="text-amber-600">{formatCurrency(total)}</span>
                                     </div>
+                                    </> : <div className="rounded-lg border border-amber-200 bg-amber-50 p-5">
+                                        <p className="text-xs font-semibold uppercase tracking-wider text-amber-700">Approved terms</p>
+                                        <p className="text-xl font-extrabold text-slate-900 mt-2">Cost + {markupPercent || 0}% + tax</p>
+                                        <p className="text-xs text-slate-600 mt-2">No fixed revised amount. Scope values are estimates only.</p>
+                                    </div>}
                                 </div>
                             </div>
                         </div>
+
+                        {pricingType === "COST_PLUS" && (
+                            <div className="hui-card mt-6 p-6">
+                                <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                        <h2 className="text-lg font-bold text-slate-900">Actuals</h2>
+                                        <p className="text-sm text-slate-500 mt-1">Tagged billable time and expenses. Billed rows remain visible in the frozen history.</p>
+                                    </div>
+                                    <button onClick={previewActuals} disabled={status !== "Approved" || isBilling || (unbilledTime.length === 0 && unbilledExpenses.length === 0)} className="hui-btn hui-btn-primary disabled:opacity-50">
+                                        {isBilling ? "Preparing…" : "Bill actuals…"}
+                                    </button>
+                                </div>
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5">
+                                    <div className="rounded-lg bg-slate-50 p-4"><p className="text-xs text-slate-500">Unbilled hours</p><p className="font-bold mt-1">{actualHours.toFixed(2)}h</p></div>
+                                    <div className="rounded-lg bg-slate-50 p-4"><p className="text-xs text-slate-500">Labor + burden</p><p className="font-bold mt-1">{formatCurrency(actualLabor)}</p></div>
+                                    <div className="rounded-lg bg-slate-50 p-4"><p className="text-xs text-slate-500">Expenses</p><p className="font-bold mt-1">{formatCurrency(actualExpenses)}</p></div>
+                                    <div className="rounded-lg bg-slate-50 p-4"><p className="text-xs text-slate-500">Billing runs</p><p className="font-bold mt-1">{initialData.billings?.length || 0}</p></div>
+                                </div>
+                                <div className="mt-6 grid gap-5 xl:grid-cols-2">
+                                    <div className="overflow-hidden rounded-lg border border-slate-200">
+                                        <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800">Tagged time</div>
+                                        {(initialData.timeEntries?.length || 0) === 0 ? (
+                                            <p className="p-4 text-sm text-slate-500">No time entries tagged yet.</p>
+                                        ) : (
+                                            <div className="divide-y divide-slate-100">
+                                                {initialData.timeEntries.map((row: any) => {
+                                                    const billed = Boolean(row.invoiceId || row.invoicedAt);
+                                                    return <div key={row.id} className="flex items-center justify-between gap-4 p-4 text-sm">
+                                                        <div className="min-w-0">
+                                                            <p className="truncate font-medium text-slate-800">{row.user?.name || row.user?.email || "Crew member"}</p>
+                                                            <p className="text-xs text-slate-500">{new Date(row.startTime).toLocaleDateString()} · {Number(row.durationHours || 0).toFixed(2)}h</p>
+                                                        </div>
+                                                        <div className="shrink-0 text-right">
+                                                            <p className="font-semibold">{formatCurrency(Number(row.laborCost || 0) + Number(row.burdenCost || 0))}</p>
+                                                            <span className={`text-xs font-semibold ${billed ? "text-slate-500" : "text-emerald-700"}`}>{billed ? "Billed" : "Unbilled"}</span>
+                                                        </div>
+                                                    </div>;
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="overflow-hidden rounded-lg border border-slate-200">
+                                        <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-800">Tagged expenses</div>
+                                        {(initialData.expenses?.length || 0) === 0 ? (
+                                            <p className="p-4 text-sm text-slate-500">No expenses tagged yet.</p>
+                                        ) : (
+                                            <div className="divide-y divide-slate-100">
+                                                {initialData.expenses.map((row: any) => {
+                                                    const billed = Boolean(row.invoiceId || row.invoicedAt);
+                                                    return <div key={row.id} className="flex items-center justify-between gap-4 p-4 text-sm">
+                                                        <div className="min-w-0">
+                                                            <p className="truncate font-medium text-slate-800">{row.vendor || row.description || "Expense"}</p>
+                                                            <p className="text-xs text-slate-500">{new Date(row.date || row.createdAt).toLocaleDateString()}</p>
+                                                        </div>
+                                                        <div className="shrink-0 text-right">
+                                                            <p className="font-semibold">{formatCurrency(Number(row.amount || 0))}</p>
+                                                            <span className={`text-xs font-semibold ${billed ? "text-slate-500" : "text-emerald-700"}`}>{billed ? "Billed" : "Unbilled"}</span>
+                                                        </div>
+                                                    </div>;
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                                {(initialData.billings?.length || 0) > 0 && <div className="mt-6 border-t border-slate-200 pt-4 space-y-2">
+                                    <h3 className="text-sm font-semibold text-slate-800">Billing history</h3>
+                                    {initialData.billings.map((billing: any) => <div key={billing.id} className="flex items-center justify-between text-sm"><span>{billing.label} · {new Date(billing.createdAt).toLocaleDateString()}</span><span className="font-semibold">{formatCurrency(Number(billing.totalCents) / 100)}</span></div>)}
+                                </div>}
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -428,7 +626,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                             <svg className="w-8 h-8 mx-auto mb-2 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
                                             <p className="text-sm">Awaiting client signature</p>
                                             {status === "Sent" && (
-                                                <p className="text-xs mt-1 text-slate-400">We've asked the client to sign this.</p>
+                                                <p className="text-xs mt-1 text-slate-400">We&apos;ve asked the client to sign this.</p>
                                             )}
                                         </div>
                                     )}
@@ -476,6 +674,28 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 )}
             </div>
         </div>
+
+        {billingPreview && (
+            <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-xl max-w-lg w-full border border-hui-border overflow-hidden">
+                    <div className="px-6 py-4 border-b border-hui-border">
+                        <h2 className="text-lg font-bold text-hui-textMain">Review billable actuals</h2>
+                        <p className="text-sm text-slate-500 mt-1">T&M through {billingPreview.throughDate} · {billingPreview.timeZone}</p>
+                    </div>
+                    <div className="p-6 space-y-3 text-sm">
+                        <div className="flex justify-between"><span>Labor + burden ({billingPreview.timeEntries.length} entries)</span><strong>{formatCurrency(billingPreview.laborCents / 100)}</strong></div>
+                        <div className="flex justify-between"><span>Expenses ({billingPreview.expenses.length})</span><strong>{formatCurrency(billingPreview.expenseCents / 100)}</strong></div>
+                        <div className="flex justify-between"><span>Markup ({billingPreview.markupPercent}%)</span><strong>{formatCurrency(billingPreview.markupCents / 100)}</strong></div>
+                        <div className="flex justify-between"><span>{billingPreview.taxLabel}</span><strong>{formatCurrency(billingPreview.taxCents / 100)}</strong></div>
+                        <div className="flex justify-between border-t border-slate-200 pt-3 text-base"><strong>Total milestone</strong><strong>{formatCurrency(billingPreview.totalCents / 100)}</strong></div>
+                    </div>
+                    <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3">
+                        <button className="hui-btn hui-btn-secondary" onClick={() => setBillingPreview(null)}>Cancel</button>
+                        <button className="hui-btn hui-btn-primary disabled:opacity-50" disabled={isBilling} onClick={confirmBillActuals}>{isBilling ? "Billing…" : "Confirm & bill"}</button>
+                    </div>
+                </div>
+            </div>
+        )}
 
         {showSignModal && (
             <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4">

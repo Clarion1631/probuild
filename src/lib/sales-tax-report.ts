@@ -123,6 +123,7 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
                     include: {
                         client: { select: { id: true, name: true } },
                         project: { select: { id: true, name: true } },
+                        payments: { select: { amount: true, pretaxAmount: true, taxAmount: true } },
                     },
                 },
             },
@@ -154,24 +155,36 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
                 return at - bt;
             });
             const inv = group[0].invoice;
-            const invoiceTotal = toNum(inv.totalAmount);
             const invoiceTax = toNum(inv.taxAmount);
             const invoiceRate = toNum(inv.taxRate);
-            const isExempt = invoiceTax <= 0;
-
-            const rawTaxes = group.map(p => {
+            const storedInvoiceTax = inv.payments
+                .filter((row) => row.pretaxAmount != null && row.taxAmount != null)
+                .reduce((sum, row) => sum + toNum(row.taxAmount), 0);
+            const residualInvoiceTax = Math.max(0, Math.round((invoiceTax - storedInvoiceTax) * 100) / 100);
+            const legacyInvoiceGross = inv.payments
+                .filter((row) => row.pretaxAmount == null || row.taxAmount == null)
+                .reduce((sum, row) => sum + toNum(row.amount), 0);
+            const legacyRows = group.filter((row) => row.pretaxAmount == null || row.taxAmount == null);
+            const rawTaxes = legacyRows.map((p) => {
                 const gross = toNum(p.amount);
-                return invoiceTotal > 0 ? invoiceTax * (gross / invoiceTotal) : 0;
+                return legacyInvoiceGross > 0 ? residualInvoiceTax * (gross / legacyInvoiceGross) : 0;
             });
-            const targetTotalCents = Math.round(rawTaxes.reduce((s, t) => s + t, 0) * 100);
-            const roundedCents = rawTaxes.map(t => Math.round(t * 100));
+            const targetTotalCents = Math.round(rawTaxes.reduce((sum, tax) => sum + tax, 0) * 100);
+            const roundedCents = rawTaxes.map((tax) => Math.round(tax * 100));
             const driftCents = targetTotalCents - roundedCents.reduce((s, c) => s + c, 0);
             if (roundedCents.length > 0) roundedCents[roundedCents.length - 1] += driftCents;
+            const legacyTaxById = new Map(legacyRows.map((row, index) => [row.id, roundedCents[index] / 100]));
 
-            group.forEach((p, i) => {
+            group.forEach((p) => {
                 const gross = toNum(p.amount);
-                const tax = roundedCents[i] / 100;
-                const taxableSubtotal = Math.round((gross - tax) * 100) / 100;
+                const hasStoredSplit = p.pretaxAmount != null && p.taxAmount != null;
+                const tax = hasStoredSplit ? toNum(p.taxAmount) : (legacyTaxById.get(p.id) ?? 0);
+                const taxableSubtotal = hasStoredSplit
+                    ? toNum(p.pretaxAmount)
+                    : Math.round((gross - tax) * 100) / 100;
+                const rowTaxRate = hasStoredSplit
+                    ? (taxableSubtotal > 0 ? tax / taxableSubtotal * 100 : 0)
+                    : invoiceRate;
                 rows.push({
                     id: `inv-${p.id}`,
                     source: "invoice-payment",
@@ -187,8 +200,8 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
                     gross,
                     taxableSubtotal,
                     tax,
-                    taxRate: invoiceRate,
-                    isExempt,
+                    taxRate: rowTaxRate,
+                    isExempt: tax === 0,
                     href: `/projects/${inv.project?.id}/invoices/${inv.id}`,
                 });
             });

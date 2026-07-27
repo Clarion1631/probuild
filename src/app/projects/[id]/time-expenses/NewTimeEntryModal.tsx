@@ -10,19 +10,21 @@ interface Props {
     teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any }[];
     costCodes: { id: string; name: string; code: string }[];
     currentUserId: string;
+    changeOrders: { id: string; code: string; title: string }[];
     onClose: () => void;
 }
 
-export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, currentUserId, onClose }: Props) {
+export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, currentUserId, changeOrders, onClose }: Props) {
     const [saving, setSaving] = useState(false);
     const [userId, setUserId] = useState(currentUserId);
     const [costCodeId, setCostCodeId] = useState("");
     const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
     const [hours, setHours] = useState("");
     const [rate, setRate] = useState("");
-    const [isBillable, setIsBillable] = useState(true);
+    const [isBillable, setIsBillable] = useState(false);
     const [isTaxable, setIsTaxable] = useState(false);
     const [notes, setNotes] = useState("");
+    const [changeOrderId, setChangeOrderId] = useState("");
 
     const selectedMember = teamMembers.find(m => m.id === userId);
     const autoRate = selectedMember?.hourlyRate ? Number(selectedMember.hourlyRate) : 0;
@@ -47,6 +49,7 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                 isBillable,
                 isTaxable,
                 notes,
+                changeOrderId: changeOrderId || null,
             });
             toast.success("Time entry added");
             onClose();
@@ -99,6 +102,14 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                             {costCodes.map(cc => (
                                 <option key={cc.id} value={cc.id}>{cc.code} — {cc.name}</option>
                             ))}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+                        <select value={changeOrderId} onChange={e => setChangeOrderId(e.target.value)} className="hui-input w-full text-sm">
+                            <option value="">Project time (no change order)</option>
+                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
                         </select>
                     </div>
 

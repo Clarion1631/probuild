@@ -439,6 +439,32 @@ export async function setQBInvoicePaymentOptions(
     return res.ok;
 }
 
+/** Add customer-facing text before QBO sends its invoice email. */
+export async function appendQBInvoiceCustomerMemo(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    line: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+    const read = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+    if (!read.ok) return { ok: false, error: `Could not read QuickBooks invoice (${read.status})` };
+    const invoice = (await read.json().catch(() => null))?.Invoice;
+    if (!invoice?.SyncToken) return { ok: false, error: "QuickBooks invoice response was incomplete" };
+
+    const current = String(invoice.CustomerMemo?.value ?? "").trim();
+    if (current.includes(line)) return { ok: true };
+    const update = await qbFetch("/invoice", tokens, {
+        method: "POST",
+        body: JSON.stringify({
+            Id: qbInvoiceId,
+            SyncToken: String(invoice.SyncToken),
+            sparse: true,
+            CustomerMemo: { value: [current, line].filter(Boolean).join("\n\n").slice(0, 1000) },
+        }),
+    });
+    if (!update.ok) return { ok: false, error: `Could not add the backup link to the QuickBooks invoice (${update.status})` };
+    return { ok: true };
+}
+
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
 export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];

@@ -9,10 +9,11 @@ interface Props {
     estimates: { id: string; title: string; items: { id: string; name: string }[] }[];
     costCodes: { id: string; name: string; code: string }[];
     costTypes: { id: string; name: string }[];
+    changeOrders: { id: string; code: string; title: string }[];
     onClose: () => void;
 }
 
-export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, onClose }: Props) {
+export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, changeOrders, onClose }: Props) {
     const [saving, setSaving] = useState(false);
     const [estimateId, setEstimateId] = useState(estimates[0]?.id || "");
     const [itemId, setItemId] = useState("");
@@ -22,7 +23,10 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
     const [vendor, setVendor] = useState("");
     const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
     const [description, setDescription] = useState("");
+    const [changeOrderId, setChangeOrderId] = useState("");
+    const [isBillable, setIsBillable] = useState(true);
     const [receiptFile, setReceiptFile] = useState<File | null>(null);
+    const [receiptFileId, setReceiptFileId] = useState<string | null>(null);
     const [ocrLoading, setOcrLoading] = useState(false);
 
     const selectedEstimate = estimates.find(e => e.id === estimateId);
@@ -36,15 +40,48 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
             formData.append("file", file);
             formData.append("projectId", projectId);
 
-            const res = await fetch("/api/ai/receipt-ocr", { method: "POST", body: formData });
+            const res = await fetch("/api/receipts/parse", { method: "POST", body: formData });
             if (res.ok) {
                 const result = await res.json();
                 if (result.vendor) setVendor(result.vendor);
-                if (result.amount) setAmount(String(result.amount));
+                if (result.total) setAmount(String(result.total));
                 if (result.date) setDate(result.date);
-                if (result.description) setDescription(result.description);
+                if (result.items?.length) setDescription(result.items.map((item: any) => item.description).filter(Boolean).join(", "));
                 toast.success("Receipt scanned successfully");
             }
+            const signRes = await fetch("/api/files/signed-upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    projectId,
+                    visibility: "financial",
+                    files: [{ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream" }],
+                }),
+            });
+            const signData = await signRes.json();
+            if (!signRes.ok || !signData.uploads?.[0]) throw new Error(signData.error || "Receipt upload could not be prepared");
+            const upload = signData.uploads[0];
+            const uploadRes = await fetch(upload.signedUrl, {
+                method: "PUT",
+                headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
+                body: file,
+            });
+            if (!uploadRes.ok) throw new Error("Receipt storage upload failed");
+            const registerRes = await fetch("/api/files/register", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ files: [{
+                    name: upload.name,
+                    url: upload.publicUrl,
+                    size: upload.size,
+                    mimeType: upload.mimeType,
+                    projectId: upload.projectId,
+                    visibility: upload.visibility,
+                }] }),
+            });
+            const registered = await registerRes.json();
+            if (!registerRes.ok || !registered.files?.[0]?.id) throw new Error(registered.error || "Receipt record could not be saved");
+            setReceiptFileId(registered.files[0].id);
         } catch {
             // OCR is optional — user can fill manually
         } finally {
@@ -54,7 +91,7 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
 
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
-        if (!estimateId) {
+        if (!estimateId && !changeOrderId) {
             toast.error("Select an estimate");
             return;
         }
@@ -74,6 +111,9 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
                 date: date || undefined,
                 description: description || undefined,
                 projectId,
+                changeOrderId: changeOrderId || null,
+                isBillable,
+                receiptFileId: receiptFileId || undefined,
             });
             toast.success("Expense added");
             onClose();
@@ -125,6 +165,13 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
                 </div>
 
                 <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+                        <select value={changeOrderId} onChange={e => setChangeOrderId(e.target.value)} className="hui-input w-full text-sm">
+                            <option value="">Project expense (no change order)</option>
+                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
+                        </select>
+                    </div>
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Estimate</label>
@@ -187,6 +234,11 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
                         <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Description</label>
                         <textarea value={description} onChange={e => setDescription(e.target.value)} className="hui-input w-full text-sm" rows={2} placeholder="What was purchased..." />
                     </div>
+
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={isBillable} onChange={e => setIsBillable(e.target.checked)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                        <span className="text-sm text-slate-700">Billable</span>
+                    </label>
 
                     <div className="flex justify-end gap-2 pt-2">
                         <button type="button" onClick={onClose} className="hui-btn hui-btn-secondary text-sm px-4 py-2">Cancel</button>

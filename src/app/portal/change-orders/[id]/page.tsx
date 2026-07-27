@@ -30,5 +30,5 @@ export default async function PortalChangeOrderPage({ params }: { params: Promis
         }
     }
 
-    return <PortalChangeOrderClient initialData={changeOrder} companySettings={settings} />;
+    return <PortalChangeOrderClient initialData={JSON.parse(JSON.stringify(changeOrder))} companySettings={settings} />;
 }
