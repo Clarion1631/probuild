@@ -6,20 +6,34 @@ import {
     deleteProgressBillingCore,
     stageProgressBillingToQuickBooksCore,
 } from "../src/lib/progress-billing";
+import { settleProgressBillingPaidCore } from "../src/lib/quickbooks-payments";
 
 /**
  * Progress billing core regression net.
  *
- * Covers the session-free cores in src/lib/progress-billing.ts directly
- * against the throwaway CI Postgres (same established pattern as
- * e2e/milestone-rebalance.spec.ts — actions.ts wrappers need a real Next.js
- * request scope and come in the UI pass).
+ * Covers the session-free cores in src/lib/progress-billing.ts (+ the settle
+ * helper in src/lib/quickbooks-payments.ts) directly against the throwaway CI
+ * Postgres (same established pattern as e2e/milestone-rebalance.spec.ts —
+ * actions.ts wrappers need a real Next.js request scope and come in the UI
+ * pass).
  *
  * No live QuickBooks connection exists in this test DB (no Integration row),
  * so stageProgressBillingToQuickBooksCore's getFreshQBTokens() call always
  * throws QBNotConnectedError before any QBO network call or DB write — the
- * QBO tests below assert exactly that (rejection + DB unchanged), never a
- * live QBO call.
+ * QBO staging test below asserts exactly that (rejection + DB unchanged),
+ * never a live QBO call. settleProgressBillingPaidCore is exercised directly
+ * (bypassing the QBO probe entirely) by simulating an already-Staged billing,
+ * same pattern the "draft-only guard" test below uses.
+ *
+ * CONTRACT NOTE: `createProgressBillingCore` no longer takes `amountMode` /
+ * `targetTotal` — every test below uses the current contract (`lines[].amount`
+ * in the milestone's own units + optional `grossTotal`). Because the old
+ * fields no longer exist, every test in this file already fails to even
+ * *compile* against the pre-fix signature — on top of that, the tests in the
+ * "consumption guard", "billing codes", and "rescale to zero" describe blocks
+ * below exercise bugs that are independent of the contract change (the guard
+ * simply didn't exist; the numbering was count-based) and would behave
+ * incorrectly even if hand-adapted to the old contract.
  */
 
 const prisma = new PrismaClient();
@@ -30,8 +44,10 @@ async function afterAllCleanup() {
     try {
         await prisma.progressBillingLine.deleteMany({ where: { billing: { invoiceId: { startsWith: PFX } } } });
         await prisma.progressBilling.deleteMany({ where: { invoiceId: { startsWith: PFX } } });
+        await prisma.paymentSchedule.deleteMany({ where: { invoiceId: { startsWith: PFX } } });
         await prisma.paymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.invoice.deleteMany({ where: { id: { startsWith: PFX } } });
+        await prisma.changeOrder.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.estimatePaymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.estimate.deleteMany({ where: { id: { startsWith: PFX } } });
         await prisma.project.deleteMany({ where: { id: { startsWith: PFX } } });
@@ -54,7 +70,7 @@ async function ensureClientAndProject() {
     });
 }
 
-test.describe.serial("createProgressBillingCore", () => {
+test.describe.serial("createProgressBillingCore — core cases", () => {
     test.afterAll(afterAllCleanup);
 
     test("rejects over-billing a milestone; DB unchanged", async () => {
@@ -72,9 +88,8 @@ test.describe.serial("createProgressBillingCore", () => {
             createProgressBillingCore(invoiceId, {
                 description: "Overbill attempt",
                 lines: [{ scheduleId: psId, description: "Deposit", amount: 600 }],
-                amountMode: "preTax",
             }),
-        ).rejects.toThrow(/exceeds the milestone/i);
+        ).rejects.toThrow(/exceeds/i);
 
         const ps = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
         expect(num(ps!.amount)).toBe(500); // unchanged
@@ -96,7 +111,6 @@ test.describe.serial("createProgressBillingCore", () => {
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Full deposit billing",
             lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
-            amountMode: "preTax",
         });
 
         expect(billing.lines.length).toBe(1);
@@ -140,7 +154,6 @@ test.describe.serial("createProgressBillingCore", () => {
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Partial progress billing",
             lines: [{ scheduleId: psId, description: "Progress 1 (partial)", amount: 400 }],
-            amountMode: "preTax",
         });
 
         expect(billing.lines.length).toBe(1);
@@ -187,21 +200,24 @@ test.describe.serial("createProgressBillingCore", () => {
         expect(num(invoice!.balanceDue)).toBe(1000);
     });
 
-    test('amountMode "preTax" math: subtotal + tax(8.8%) = total', async () => {
+    test("NEW-VINTAGE (pre-tax) job: subtotal + tax(8.8%) = total, from a pre-tax raw line amount", async () => {
         await ensureClientAndProject();
-        const suffix = "pretax";
+        const suffix = "pretax-taxmath";
+        const estimateId = `${PFX}-est-${suffix}`;
         const invoiceId = `${PFX}-inv-${suffix}`;
         const psId = `${PFX}-ps-${suffix}`;
 
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "PB PreTax", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 1088, balanceDue: 1088, taxInclusiveMilestones: false },
+        });
         await prisma.invoice.create({
-            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 1000, balanceDue: 1000, taxRate: 8.8 },
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1088, balanceDue: 1088, taxRate: 8.8 },
         });
         await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Progress", amount: 1000, status: "Pending" } });
 
         const billing = await createProgressBillingCore(invoiceId, {
             description: "PreTax billing",
-            lines: [{ scheduleId: psId, description: "Progress", amount: 1000 }],
-            amountMode: "preTax",
+            lines: [{ scheduleId: psId, description: "Progress", amount: 1000 }], // pre-tax: new-vintage units
         });
 
         expect(num(billing.subtotal)).toBe(1000);
@@ -210,14 +226,18 @@ test.describe.serial("createProgressBillingCore", () => {
         expect(num(billing.subtotal) + num(billing.taxAmount)).toBe(num(billing.total));
     });
 
-    test("targetTotal + partial split on a LEGACY tax-inclusive job splits by the gross amount", async () => {
+    test('LEGACY vintage, no grossTotal: split is GROSS and the remainder is correct (the $108/$100 case)', async () => {
         // The live Mesplay case: a $25,000 check against a $39,998.25 milestone
-        // whose amount already includes 8.8% tax. The milestone must be carved at
-        // the GROSS $25,000 (leaving $14,998.25), while the billing line records
-        // the PRE-TAX $22,977.94 for QuickBooks. Splitting by the pre-tax figure
-        // instead would silently leave the client short by the tax.
+        // whose amount already includes 8.8% tax. Under the new contract the
+        // line amount for a legacy milestone IS the gross amount the client is
+        // paying — no amountMode/targetTotal needed. The milestone must be
+        // carved at the GROSS $25,000 (leaving $14,998.25), while the billing
+        // line records the PRE-TAX $22,977.94 for QuickBooks. Splitting by the
+        // pre-tax figure instead (the pre-round-2 "$108 milestone billed '$100
+        // preTax' actually charged $108 but left $8 owed" bug) would silently
+        // leave the client short by the tax.
         await ensureClientAndProject();
-        const suffix = "legacy-split";
+        const suffix = "legacy-gross-mirror";
         const estimateId = `${PFX}-est-${suffix}`;
         const invoiceId = `${PFX}-inv-${suffix}`;
         const epsId = `${PFX}-eps-${suffix}`;
@@ -238,9 +258,7 @@ test.describe.serial("createProgressBillingCore", () => {
 
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Progress payment (check 1585)",
-            lines: [{ scheduleId: psId, description: "Mechanical Trades", amount: 25000 }],
-            amountMode: "targetTotal",
-            targetTotal: 25000,
+            lines: [{ scheduleId: psId, description: "Mechanical Trades", amount: 25000 }], // gross: legacy units, no grossTotal supplied
         });
 
         // Client pays exactly the check amount; tax is stated inside it.
@@ -272,46 +290,85 @@ test.describe.serial("createProgressBillingCore", () => {
         expect(num(invoice!.balanceDue)).toBe(39998.25);
     });
 
-    test("targetTotal + partial split on a PRE-TAX job splits by the pre-tax amount", async () => {
-        // Same shape, new-vintage estimate: milestone amounts exclude tax, so the
-        // pre-tax line amount is what comes out of the milestone and tax rides on top.
+    test("NEW vintage split creates a real estimate-side mirror (sourceScheduleId + split remainder)", async () => {
+        // Same shape, new-vintage estimate: milestone amounts exclude tax, so
+        // the pre-tax line amount is what comes out of the milestone and tax
+        // rides on top. Unlike a stale pre-round-2 test, this one wires up a
+        // real EstimatePaymentSchedule + sourceScheduleId so the mirror split
+        // is actually asserted, not just the invoice-side numbers.
         await ensureClientAndProject();
-        const suffix = "pretax-split";
+        const suffix = "pretax-mirror";
         const estimateId = `${PFX}-est-${suffix}`;
         const invoiceId = `${PFX}-inv-${suffix}`;
+        const epsId = `${PFX}-eps-${suffix}`;
         const psId = `${PFX}-ps-${suffix}`;
 
         await prisma.estimate.create({
-            data: { id: estimateId, title: "PB PreTax", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 40000, balanceDue: 40000, taxInclusiveMilestones: false },
+            data: { id: estimateId, title: "PB PreTax Mirror", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 40000, balanceDue: 40000, taxInclusiveMilestones: false },
+        });
+        await prisma.estimatePaymentSchedule.create({
+            data: { id: epsId, estimateId, name: "Mechanical", amount: 40000, status: "Pending", order: 1 },
         });
         await prisma.invoice.create({
             data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 40000, balanceDue: 40000, taxRate: 8.8 },
         });
-        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Mechanical", amount: 40000, status: "Pending" } });
+        await prisma.paymentSchedule.create({
+            data: { id: psId, invoiceId, name: "Mechanical", amount: 40000, status: "Pending", sourceScheduleId: epsId },
+        });
 
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Progress payment",
-            lines: [{ scheduleId: psId, description: "Mechanical", amount: 25000 }],
-            amountMode: "targetTotal",
-            targetTotal: 25000,
+            lines: [{ scheduleId: psId, description: "Mechanical", amount: 25000 }], // pre-tax: new-vintage units
         });
 
-        expect(num(billing.total)).toBe(25000);
-        expect(num(billing.subtotal)).toBe(22977.94);
+        expect(num(billing.total)).toBe(27200); // round(25000 * 1.088)
+        expect(num(billing.subtotal)).toBe(25000);
+        expect(num(billing.taxAmount)).toBe(2200);
 
         // Carved at the PRE-TAX amount this time.
         const billed = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
-        expect(num(billed!.amount)).toBe(22977.94);
+        expect(num(billed!.amount)).toBe(25000);
         const remainder = await prisma.paymentSchedule.findFirst({
             where: { invoiceId, name: { contains: "(remaining)" } },
         });
-        expect(num(remainder!.amount)).toBe(17022.06);
+        expect(num(remainder!.amount)).toBe(15000);
         expect(num(billed!.amount) + num(remainder!.amount)).toBe(40000);
+
+        // The estimate-side mirror: original reduced, remainder created, linked.
+        const estOriginal = await prisma.estimatePaymentSchedule.findUnique({ where: { id: epsId } });
+        expect(num(estOriginal!.amount)).toBe(25000);
+        const estRemainder = await prisma.estimatePaymentSchedule.findFirst({
+            where: { estimateId, name: { contains: "(remaining)" } },
+        });
+        expect(estRemainder).not.toBeNull();
+        expect(num(estRemainder!.amount)).toBe(15000);
+        expect(remainder!.sourceScheduleId).toBe(estRemainder!.id);
     });
 
-    test('amountMode "targetTotal" with 33000 @ 8.8%: total is exactly 33000, subtotal+tax=total, lines sum to subtotal', async () => {
+    test('unit-mismatch rejected: lines summing to $100 with grossTotal: 50 throws', async () => {
         await ensureClientAndProject();
-        const suffix = "target";
+        const suffix = "unit-mismatch";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 0 },
+        });
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Mismatched units",
+                lines: [{ description: "Custom line", amount: 100 }],
+                grossTotal: 50,
+            }),
+        ).rejects.toThrow(/they must match/i);
+
+        const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
+        expect(billings.length).toBe(0);
+    });
+
+    test('explicit grossTotal matching the lines: 33000 @ 8.8%, total is exactly 33000, subtotal+tax=total, lines sum to subtotal', async () => {
+        await ensureClientAndProject();
+        const suffix = "grosstotal-match";
         const invoiceId = `${PFX}-inv-${suffix}`;
         const psAId = `${PFX}-ps-a-${suffix}`;
         const psBId = `${PFX}-ps-b-${suffix}`;
@@ -320,8 +377,8 @@ test.describe.serial("createProgressBillingCore", () => {
             data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 33000, balanceDue: 33000, taxRate: 8.8 },
         });
         // Both lines bill the milestone in FULL (raw amount === milestone amount)
-        // so no split occurs — this test isolates the targetTotal tax/rescale
-        // math from the auto-split mechanic (covered separately above).
+        // so no split occurs — this test isolates the grossTotal/tax math from
+        // the auto-split mechanic (covered separately above).
         await prisma.paymentSchedule.create({ data: { id: psAId, invoiceId, name: "Progress A", amount: 20000, status: "Pending" } });
         await prisma.paymentSchedule.create({ data: { id: psBId, invoiceId, name: "Progress B", amount: 13000, status: "Pending" } });
 
@@ -331,8 +388,7 @@ test.describe.serial("createProgressBillingCore", () => {
                 { scheduleId: psAId, description: "Progress A", amount: 20000 },
                 { scheduleId: psBId, description: "Progress B", amount: 13000 },
             ],
-            amountMode: "targetTotal",
-            targetTotal: 33000,
+            grossTotal: 33000,
         });
 
         expect(num(billing.total)).toBe(33000);
@@ -366,12 +422,13 @@ test.describe.serial("createProgressBillingCore", () => {
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Exempt billing",
             lines: [{ scheduleId: psId, description: "Progress", amount: 750 }],
-            amountMode: "preTax",
             taxExempt: true,
         });
 
         expect(billing.taxExempt).toBe(true);
-        expect(num(billing.taxRate)).toBe(0);
+        // billing.taxRate always holds the invoice's REAL rate (item F.2) —
+        // taxExempt only zeroes the tax/total computation, not the stored rate.
+        expect(num(billing.taxRate)).toBe(8.8);
         expect(num(billing.taxAmount)).toBe(0);
         expect(num(billing.total)).toBe(num(billing.subtotal));
         expect(num(billing.subtotal)).toBe(750);
@@ -394,7 +451,6 @@ test.describe.serial("createProgressBillingCore", () => {
             createProgressBillingCore(invoiceId, {
                 description: "Should be rejected",
                 lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
-                amountMode: "preTax",
             }),
         ).rejects.toThrow(/break the quickbooks link/i);
 
@@ -402,6 +458,216 @@ test.describe.serial("createProgressBillingCore", () => {
         expect(ps!.qbInvoiceId).toBe("fake-qbo-legacy"); // untouched
         const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
         expect(billings.length).toBe(0);
+    });
+
+    test("a rescaled line that would round to $0.00 is rejected", async () => {
+        // Two custom lines, weights [0.01, 99.99]. A synthetic, unrealistically
+        // high tax rate (999%) shrinks the pre-tax subtotal far enough below
+        // the raw total that the tiny line's proportional share of the
+        // subtotal rounds to $0.00 — exactly the case the "every persisted
+        // line amount must be > 0" guard exists for.
+        await ensureClientAndProject();
+        const suffix = "rescale-zero";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 999 },
+        });
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Rounds to zero",
+                lines: [
+                    { description: "Tiny", amount: 0.01 },
+                    { description: "Big", amount: 99.99 },
+                ],
+            }),
+        ).rejects.toThrow(/\$0\.00 or less/i);
+
+        const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
+        expect(billings.length).toBe(0);
+    });
+});
+
+test.describe.serial("createProgressBillingCore — consumption guard", () => {
+    test.afterAll(afterAllCleanup);
+
+    test("double-billing rejected: bill a milestone in FULL, then a second billing referencing the same milestone throws", async () => {
+        // A full bill never triggers AUTO-SPLIT, so the milestone's `amount`
+        // stays unchanged after billing #1 — without the consumption guard, a
+        // second billing referencing the same still-Pending row would be
+        // allowed to bill it again for up to that same (unchanged) amount.
+        await ensureClientAndProject();
+        const suffix = "double-full";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 500, balanceDue: 500, taxRate: 0 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Deposit", amount: 500, status: "Pending" } });
+
+        await createProgressBillingCore(invoiceId, {
+            description: "First billing",
+            lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
+        });
+
+        // The milestone is still "Pending" with amount unchanged (no split
+        // occurred) — a second reference must be rejected as already-committed.
+        const afterFirst = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(afterFirst!.status).toBe("Pending");
+        expect(num(afterFirst!.amount)).toBe(500);
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Second billing (double bill)",
+                lines: [{ scheduleId: psId, description: "Deposit again", amount: 500 }],
+            }),
+        ).rejects.toThrow(/already billed/i);
+
+        const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
+        expect(billings.length).toBe(1); // only the first one exists
+    });
+
+    test("rejects re-billing a milestone's already-consumed original row after a partial split", async () => {
+        // Bill $400 of a $1,000 milestone (partial split: original reduced to
+        // 400, a new $600 remainder row created — see the PARTIAL-bill test
+        // above). A second billing referencing the SAME (now-$400) original
+        // row for $300 would pass the plain "does this exceed the row's
+        // current amount" check (300 <= 400) — that's the residual double-dip
+        // bug the consumption guard closes: the original row's whole current
+        // amount was already committed by the first billing, so nothing is
+        // left to bill against it (available = 400 - 400 = 0).
+        //
+        // (The task's own illustrative "$700 against the same milestone"
+        // number is NOT used here: $700 already exceeds the reduced row's
+        // amount (400) under the OLD plain over-bill check too, so it would
+        // throw for an unrelated reason and wouldn't demonstrate this guard.)
+        await ensureClientAndProject();
+        const suffix = "double-partial";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 1000, balanceDue: 1000, taxRate: 0 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Progress 1", amount: 1000, status: "Pending" } });
+
+        await createProgressBillingCore(invoiceId, {
+            description: "Partial billing",
+            lines: [{ scheduleId: psId, description: "Progress 1 (partial)", amount: 400 }],
+        });
+
+        const afterSplit = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(afterSplit!.amount)).toBe(400); // reduced to the billed portion
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Re-bill the already-consumed original row",
+                lines: [{ scheduleId: psId, description: "Progress 1 (again)", amount: 300 }],
+            }),
+        ).rejects.toThrow(/already billed/i);
+
+        const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
+        expect(billings.length).toBe(1); // only the first one exists
+
+        // The legitimate remainder ($600) is untouched and still billable —
+        // proves the guard is scoped to the specific committed row, not the
+        // whole milestone family.
+        const remainder = await prisma.paymentSchedule.findFirst({ where: { invoiceId, name: { contains: "(remaining)" } } });
+        expect(num(remainder!.amount)).toBe(600);
+    });
+
+    test("a changeOrderId line is rejected — change orders bill through approval, not progress billing", async () => {
+        // billChangeOrderCore (src/lib/billing-core.ts) already bills an
+        // approved change order by adding a normal PaymentSchedule milestone
+        // to the invoice (handleChangeOrderApproved calls it on approval).
+        // Letting a progress-billing line ALSO reference a changeOrderId would
+        // be a second rail for the same money, so it's rejected outright.
+        await ensureClientAndProject();
+        const suffix = "co-rejected";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 0 },
+        });
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "CO line attempt",
+                // `changeOrderId` is no longer part of the typed contract — cast
+                // to simulate a caller (e.g. stale UI code) still sending one.
+                lines: [{ description: "Extra tile work", amount: 500, changeOrderId: `${PFX}-co-fake` } as never],
+            }),
+        ).rejects.toThrow(/billed by approving them/i);
+
+        const billings = await prisma.progressBilling.findMany({ where: { invoiceId } });
+        expect(billings.length).toBe(0);
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(0); // no phantom growth from the rejected line
+    });
+});
+
+test.describe.serial("createProgressBillingCore — custom lines", () => {
+    test.afterAll(afterAllCleanup);
+
+    test("a custom line materializes a Pending milestone and raises the invoice total", async () => {
+        await ensureClientAndProject();
+        const suffix = "materialize";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 0 },
+        });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Extras billing",
+            lines: [{ description: "Extra demo work", amount: 250 }], // custom — no scheduleId
+        });
+
+        expect(billing.lines.length).toBe(1);
+        const customLine = billing.lines[0];
+        expect(customLine.scheduleId).not.toBeNull();
+
+        const customSchedule = await prisma.paymentSchedule.findUnique({ where: { id: customLine.scheduleId! } });
+        expect(customSchedule!.name).toBe("Extra demo work");
+        expect(num(customSchedule!.amount)).toBe(250);
+        expect(customSchedule!.status).toBe("Pending");
+        expect(customSchedule!.sourceScheduleId).toBeNull();
+
+        // Milestone-referencing lines never move invoice totals — but this is
+        // a custom line, so the invoice grows by exactly what was added.
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.totalAmount)).toBe(250);
+        expect(num(invoice!.balanceDue)).toBe(250);
+    });
+});
+
+test.describe.serial("createProgressBillingCore — billing codes", () => {
+    test.afterAll(afterAllCleanup);
+
+    test("billing codes do not repeat after deleting a middle draft", async () => {
+        await ensureClientAndProject();
+        const suffix = "codes-reuse";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 0 },
+        });
+
+        const b1 = await createProgressBillingCore(invoiceId, { description: "First", lines: [{ description: "Line A", amount: 100 }] });
+        const b2 = await createProgressBillingCore(invoiceId, { description: "Second", lines: [{ description: "Line B", amount: 100 }] });
+        expect(b1.code).toBe(`INV-PB-${suffix}-P1`);
+        expect(b2.code).toBe(`INV-PB-${suffix}-P2`);
+
+        await deleteProgressBillingCore(b1.id); // delete the middle/first draft, leaving only b2
+
+        const b3 = await createProgressBillingCore(invoiceId, { description: "Third", lines: [{ description: "Line C", amount: 100 }] });
+
+        // Count-based numbering (pre-fix) would see 1 remaining billing and
+        // generate "-P2" again, colliding with b2's existing code.
+        expect(b3.code).toBe(`INV-PB-${suffix}-P3`);
+        expect(b3.code).not.toBe(b2.code);
     });
 });
 
@@ -418,7 +684,6 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Original description",
             lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
-            amountMode: "preTax",
         });
         return { invoiceId, psId, billing };
     }
@@ -454,16 +719,24 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
 
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Original description",
-            lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
-            amountMode: "preTax",
+            lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }], // gross (legacy, no estimate)
         });
-        expect(num(billing.taxAmount)).toBe(44); // round(500 * 8.8 / 100)
+        expect(num(billing.subtotal)).toBe(459.56); // round(500 / 1.088)
+        expect(num(billing.taxAmount)).toBe(40.44); // round(500 - 459.56)
+        expect(num(billing.taxRate)).toBe(8.8); // real rate stored even though not exempt
 
         const updated = await updateProgressBillingCore(billing.id, { description: "Revised description", taxExempt: true });
         expect(updated.description).toBe("Revised description");
         expect(updated.taxExempt).toBe(true);
         expect(num(updated.taxAmount)).toBe(0);
         expect(num(updated.total)).toBe(num(updated.subtotal));
+
+        // Un-exempting recomputes tax at the STORED real rate (item F.2) —
+        // never stuck at 0 from having been saved exempt once.
+        const reverted = await updateProgressBillingCore(billing.id, { taxExempt: false });
+        expect(num(reverted.taxRate)).toBe(8.8);
+        expect(num(reverted.taxAmount)).toBe(40.44);
+        expect(num(reverted.total)).toBe(500);
     });
 
     test("delete leaves an already-applied split intact", async () => {
@@ -480,7 +753,6 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Partial to be deleted",
             lines: [{ scheduleId: psId, description: "Progress 1 (partial)", amount: 350 }],
-            amountMode: "preTax",
         });
 
         const beforeDelete = await prisma.paymentSchedule.findMany({ where: { invoiceId } });
@@ -521,7 +793,6 @@ test.describe.serial("stageProgressBillingToQuickBooksCore (no live QuickBooks i
         const billing = await createProgressBillingCore(invoiceId, {
             description: "Stage attempt",
             lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
-            amountMode: "preTax",
         });
 
         // No Integration row exists in this test DB → getFreshQBTokens() throws
@@ -531,5 +802,71 @@ test.describe.serial("stageProgressBillingToQuickBooksCore (no live QuickBooks i
         const stillDraft = await prisma.progressBilling.findUnique({ where: { id: billing.id } });
         expect(stillDraft!.status).toBe("Draft");
         expect(stillDraft!.qbInvoiceId).toBeNull();
+    });
+});
+
+test.describe.serial("settleProgressBillingPaidCore", () => {
+    test.afterAll(afterAllCleanup);
+
+    test("settling a custom-only billing reduces invoice.balanceDue and marks its materialized milestone Paid", async () => {
+        // Drives the settle helper directly against a simulated Staged billing
+        // (no live QuickBooks connection in this test DB — same pattern as the
+        // "draft-only guard" test above). Proves that a custom line's
+        // materialized PaymentSchedule (see the "materialize" describe block)
+        // settles through the exact same rail as any other milestone, with no
+        // special case.
+        await ensureClientAndProject();
+        const suffix = "settle";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 0, balanceDue: 0, taxRate: 0 },
+        });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Custom-only billing",
+            lines: [{ description: "Deposit (custom)", amount: 500 }],
+        });
+
+        const afterCreate = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(afterCreate!.totalAmount)).toBe(500);
+        expect(num(afterCreate!.balanceDue)).toBe(500);
+
+        const scheduleId = billing.lines[0].scheduleId!;
+        expect(scheduleId).toBeTruthy();
+
+        // Simulate staging (no live QuickBooks in this test DB).
+        await prisma.progressBilling.update({
+            where: { id: billing.id },
+            data: { status: "Staged", qbInvoiceId: "fake-qbo-settle" },
+        });
+
+        const settled = await settleProgressBillingPaidCore(billing.id, {
+            paidAt: new Date("2026-07-27"),
+            referenceNumber: "REF-1",
+            qbPaymentId: "fake-payment-1",
+        });
+        expect(settled).toBe(true);
+
+        const billingAfter = await prisma.progressBilling.findUnique({ where: { id: billing.id } });
+        expect(billingAfter!.status).toBe("Paid");
+        expect(billingAfter!.qbPaymentId).toBe("fake-payment-1");
+
+        const schedule = await prisma.paymentSchedule.findUnique({ where: { id: scheduleId } });
+        expect(schedule!.status).toBe("Paid");
+        expect(schedule!.paymentMethod).toBe("quickbooks");
+        expect(schedule!.referenceNumber).toBe("REF-1");
+
+        const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+        expect(num(invoice!.balanceDue)).toBe(0);
+        expect(invoice!.status).toBe("Paid");
+
+        // Idempotent: settling again (e.g. a re-run poller) is a no-op.
+        const settledAgain = await settleProgressBillingPaidCore(billing.id, {
+            paidAt: new Date(),
+            referenceNumber: "REF-2",
+            qbPaymentId: "fake-payment-2",
+        });
+        expect(settledAgain).toBe(false);
     });
 });
