@@ -113,3 +113,100 @@ Modeled on `e2e/milestone-rebalance.spec.ts` (`PFX = "pb-e2e"`, serial describes
 - `src/lib/progress-billing.ts` — new
 - `src/lib/quickbooks-payments.ts` — extended (export + refactor + new settle loop, see §3)
 - `e2e/progress-billing.spec.ts` — new
+
+---
+
+# Round 2 — Codex review fixes (PR #252, branch `feat/progress-billing-core`)
+
+Codex BLOCKED PR #252 on round 1's implementation above. This section covers the fixes to items A–G of the round-2 brief, plus a mid-task course change from the orchestrator that removed change-order lines from progress billing entirely (see §2.5).
+
+## 1. A — replaced the amount-mode contract
+
+Deleted `amountMode` / `targetTotal` from `CreateProgressBillingInput`. New contract:
+
+- `lines[].amount` is always in the milestone's OWN units: **GROSS** for legacy vintage (`Estimate.taxInclusiveMilestones === true`, or no estimate at all), **PRE-TAX** for new vintage.
+- Optional `grossTotal?: number` — when supplied, the client pays exactly this; rejected if it differs from what the lines say they add up to (`expectedGross`) by more than 2 cents ("they must match").
+- `total = grossTotal ?? expectedGross`; `subtotal`/`taxAmount` are always derived by reversing tax out of `total` (never by adding tax on top of a "pre-tax" input), which is what fixes the round-1 bug: a $108 legacy (tax-inclusive) milestone billed as "$100 preTax" used to carve only $100 of gross value out of a $108 milestone while the client was actually charged $108 — leaving a phantom $8 "still owed" on a milestone that was, in reality, fully paid. Under the new contract the caller enters the milestone's own gross amount directly, so the carve and the charge always agree.
+- `ProgressBillingLine.amount` (persisted) is always pre-tax: each line's proportional share of `subtotal`, remainder on the last line, **every** line checked for `<= 0` (not just the last) — throws `"...rescaled amount is $0.00 or less..."`.
+- Split amount (what's carved from the milestone) is a *separate* proportional allocation: of `total` for legacy, identical to the persisted amount for new-vintage. `sum(splitAmounts)` is asserted to equal `total` (legacy) / `subtotal` (new vintage) to the cent before commit.
+
+## 2. B — consumption guard (double-billing / CO cap)
+
+Before splitting, every `scheduleId` line now computes `committed` = sum of `ProgressBillingLine.amount` from every OTHER non-Void `ProgressBilling` that references the same `scheduleId`, converted into the milestone's own units (grossed up per **that line's own billing's** `taxRate`/`taxExempt`, not the current billing's), and rejects when `splitAmount > milestone.amount - committed + 0.005`, naming the amount already billed and the billing code(s) it's on.
+
+This closes two real holes:
+- **A milestone billed in FULL never triggers AUTO-SPLIT** (its `PaymentSchedule.amount` never changes), so a second billing referencing the same still-Pending row used to be allowed to bill it again for up to that same (unchanged) amount. Now `committed` equals the full amount and `available` is 0.
+- **A milestone's post-split ORIGINAL row keeps exactly what was billed into it** as its new `amount` — so a second billing re-referencing that same (reduced) row for anything up to that reduced amount used to pass the old "does this exceed the row's current amount" check. `committed` closes this too.
+
+`§4` documents why I deliberately did **not** use the task brief's literal "$700 against the same milestone" example for the partial-split test — it already throws under the pre-fix code for an unrelated reason (plain over-bill against the row's reduced amount), so it wouldn't demonstrate this guard.
+
+The change-order half of item B (cap against `ChangeOrder.totalAmount`) was built in an earlier pass of this task and then **removed** per the orchestrator's course change — see §2.5.
+
+## 3. C — materialize custom lines as milestones
+
+Every line without a `scheduleId` (a "custom" line — change-order lines are rejected outright, §2.5) now gets a brand-new Pending `PaymentSchedule` at creation: `name` = the line's description, `amount` = the line's split amount (milestone units), no qb/stripe ids, `sourceScheduleId: null`. The invoice's `totalAmount`/`balanceDue` are incremented by the sum of all such materialized amounts in one update, mirroring `addInvoiceMilestone`'s status ladder (`Paid` → `Partially Paid`, else unchanged) exactly. Milestone-referencing lines are untouched — a split conserves the invoice total, it never grows it.
+
+Result: `settleProgressBillingPaidCore` (see §3 QB settle path in round 1, extracted further below) needs no special case for a custom line — every `ProgressBillingLine` ends up with a `scheduleId`, so every line settles through the same milestone rail.
+
+## 4. D — conditional claim on the split (closes the stale-read race)
+
+Both the invoice-side `PaymentSchedule.update` and the estimate-side `EstimatePaymentSchedule.update` inside AUTO-SPLIT are now `updateMany` calls whose `WHERE` pins `{ id, status: "Pending", stripeSessionId: null, stripePaymentIntentId: null, amount: <exact amount read at the top of the transaction> }` (the invoice-side claim also pins `qbInvoiceId: null`). A miss (`count !== 1`) throws `"...changed while this billing was being built — refresh and try again."` instead of silently overwriting a concurrent write (e.g. the legacy `pushMilestoneToQuickBooks` linking a QBO invoice, or a settle, between validation and this write).
+
+## 5. E — compensate an orphaned QBO invoice on staging failure
+
+In `stageProgressBillingToQuickBooksCore`, everything after `createQBMilestoneInvoice` (the pay-link fetch, the conditional link claim, and the claim's own thrown error) is now inside one `try`. Any failure in that block attempts `deleteQBInvoice`; if the delete also fails, the re-thrown error names the doc number + QBO id so it can be removed by hand. Previously only the "claim missed" branch compensated — a failure in the pay-link fetch itself (a real network call) used to leave the just-created QBO invoice orphaned with no error mentioning it at all.
+
+## 6. F — smaller fixes
+
+1. **Billing code reuse.** Numbering switched from `count()` to parsing every existing code's `-P<n>` suffix and taking `max + 1`. A count-based scheme reused a code after a non-last Draft was deleted, colliding with an existing billing's QuickBooks `DocNumber`. Covered by the "billing codes do not repeat after deleting a middle draft" test.
+2. **`taxExempt` no longer loses the rate.** `ProgressBilling.taxRate` is now *always* `toNum(invoice.taxRate)` at creation, regardless of `taxExempt` — `taxExempt` only zeroes the tax/total *computation*, never the stored rate. `updateProgressBillingCore` recomputes `taxAmount`/`total` off that stored rate whenever `taxExempt` flips, so un-exempting a billing that was saved exempt now correctly recomputes tax instead of staying stuck at 0. Covered by an added assertion in the existing update test (round-trip exempt → un-exempt).
+3. **Cent-safe rounding.** `r2` is now `Math.round((x + Number.EPSILON) * 100) / 100` everywhere in this file (was a bare `Math.round(x*100)/100`, which under-rounds values like `1.005` due to float representation).
+4. **Unlinked legacy schedules documented.** Added an `else if (invLink?.estimateId)` branch in AUTO-SPLIT (previously silent) with a comment explaining why a `PaymentSchedule` with no `sourceScheduleId` on an invoice that DOES have an estimate is deliberately not mirrored (nothing on the estimate side to split against) rather than a bug.
+
+## 7. G — tests (all rewritten/added in `e2e/progress-billing.spec.ts`)
+
+Every pre-existing test in the file was rewritten for the new contract (no `amountMode`/`targetTotal` anywhere — the pre-fix function signature doesn't even accept these calls, so every test in the file fails to compile/run against the pre-fix code on that basis alone). On top of the contract-shape change, these specifically exercise runtime bugs that are independent of the contract and would misbehave even against a hypothetically-adapted old implementation:
+
+- `createProgressBillingCore — core cases`: full/partial/legacy-gross/new-vintage-mirror/taxExempt/qb-linked-rejected tests (rewritten), plus new: **unit-mismatch rejected** (`grossTotal: 50` vs lines summing to `$100`), **rescale-to-$0 rejected** (two custom lines + a synthetic 999% tax rate to force one line's proportional share of subtotal to round to `$0.00`).
+- `createProgressBillingCore — consumption guard`: **double-billing rejected** (bill a milestone in FULL, bill it again), and **rejects re-billing a milestone's already-consumed original row after a partial split** — deliberately using `$300` against the reduced `$400` row rather than the brief's illustrative `$700`, because `$700` already exceeds the reduced row's `amount` under the *pre-fix* plain over-bill check too and wouldn't prove the new guard did anything (documented inline in the test).
+- `createProgressBillingCore — consumption guard` also carries the new **change-order rejection test** required by the course change (§2.5) in place of the CO over-cap/duplicate-CO tests it replaced.
+- `createProgressBillingCore — custom lines`: materializes a Pending milestone and raises `invoice.totalAmount`/`balanceDue`.
+- `createProgressBillingCore — billing codes`: create P1/P2, delete P1, create again → must be P3, not a P2 collision (fails under the pre-fix count-based numbering).
+- `updateProgressBillingCore / deleteProgressBillingCore`: rewritten for the new contract; the update test now also asserts a full exempt → un-exempt round-trip recomputes tax at the stored real rate (F.2).
+- `settleProgressBillingPaidCore` (new, exported from `quickbooks-payments.ts` specifically so this could be tested without a live QuickBooks connection — see §2.6): settles a custom-only billing, asserts `invoice.balanceDue` drops to 0, the materialized `PaymentSchedule` goes `Paid`, and a second settle call is a no-op (idempotency).
+
+**What I did NOT build**: a "pre-tax vintage split test [with] a real estimate-side schedule + sourceScheduleId" mirror test was added as required (`NEW vintage split creates a real estimate-side mirror`), replacing the old test that asserted nothing about mirroring.
+
+### 2.5 — Course change: change orders removed from progress billing
+
+Mid-implementation, the orchestrator flagged that `billChangeOrderCore` (`src/lib/billing-core.ts`) already bills an approved change order by adding it to the invoice as a normal `PaymentSchedule` milestone (`handleChangeOrderApproved` calls it on approval, with its own row lock and duplicate-idempotency outcome). A `changeOrderId` field on a progress-billing line would therefore be a **second rail for the same money** — a genuine double-billing hole — and would also collide with a separate session working on change orders concurrently.
+
+Per that redirect, I:
+
+1. Removed `changeOrderId` from `ProgressBillingLineInput` and from every code path in `createProgressBillingCore` (validation loop, resolution/caching loop, consumption guard, AUTO-SPLIT comments, materialization). A line that supplies one (checked via a runtime duck-type check, since the field no longer exists on the type — guards against a stale caller) is rejected with: *"Change orders are billed by approving them, which adds a milestone to the invoice — bill that milestone here."*
+2. Dropped `changeOrderId` from the `ProgressBillingLine` Prisma model and from `scripts/apply-progress-billing-schema.mjs`'s `CREATE TABLE` statement. This column has never existed in any database (the table itself was never applied to prod), so this is a same-migration edit, not a drop-migration — nothing to backfill or roll back. Regenerated the Prisma client via PowerShell (`node_modules\.bin\prisma generate`) after the schema edit.
+3. Kept custom-line materialization (item C) exactly as specified — unaffected by this change.
+4. Deleted the CO-over-cap and duplicate-CO tests from `e2e/progress-billing.spec.ts` and replaced them with one test asserting a `changeOrderId` line is rejected with the message above (`createProgressBillingCore — consumption guard` describe block).
+5. This report section documents the redirect and rationale, per the coordinator's instruction.
+
+Everything else in the brief (A units, B milestone-only consumption guard, D conditional claim, E orphan compensation, F code numbering / taxExempt rate / cent-safe r2, remaining G tests) is unchanged by this course change.
+
+### 2.6 — `settleProgressBillingPaidCore` extraction (`src/lib/quickbooks-payments.ts`)
+
+The progress-billing settle transaction that used to be inlined in `syncQuickBooksPayments`'s second loop is now an exported standalone function, `settleProgressBillingPaidCore(billingId, payment)`, used both by `syncQuickBooksPayments` (unchanged behavior — same claim, same per-line settle via `settleMilestonePaidInTx`) and directly by the new e2e settle test, which simulates a Staged billing (no live QuickBooks in the test DB, same pattern the pre-existing "draft-only guard" test already used) rather than trying to fake a QBO probe response.
+
+## 8. What I ran, and what I could not
+
+- **`npm run build`** (PowerShell, `tsc --noEmit && next build`) — **passed, 0 errors**, run twice: once right after the A–F implementation, once again after the §2.5 course-change edits (schema + code + Prisma regen). Tail of the second run confirmed the full static/dynamic route listing completed with no `error TS`/`Failed to compile`/`Type error` lines (grepped explicitly, zero matches).
+- **`node_modules\.bin\prisma generate`** (PowerShell, per this repo's rule — never Git Bash) — succeeded after the `changeOrderId` column removal from `schema.prisma`.
+- **`npx playwright test --list e2e/progress-billing.spec.ts`** — succeeded, discovered and listed all 23 tests across 3 files (the 2 shared fixtures + 21 in this spec), confirming imports resolve and the file is syntactically well-formed. This does **not** type-check the file — `e2e/` is excluded from `tsconfig.json`'s `include`, so `npm run build`'s `tsc` pass never touches it, and Playwright's own loader (esbuild-based) strips types without checking them. I do not have independent type-level verification of the spec file beyond careful manual review.
+- **`npx playwright test` (actual execution against a throwaway Postgres) — did NOT run.** Docker CLI is present but the daemon was not running. I started Docker Desktop and polled `docker info` across three separate waits (roughly 2 min, 4.5 min, and a background poll up to ~6.5 min) — the daemon never came up in this environment within that combined ~13 minutes. **I could not execute any test in this file, round 1's tests, `e2e/money-pipeline.spec.ts`, or `e2e/milestone-rebalance.spec.ts`.** Per the task's own instruction ("If Docker/Postgres is unavailable, say so explicitly... CI runs them on the PR"), this is disclosed rather than papered over. All money-math assertions in the new/changed tests were hand-computed against the implementation's formulas (shown inline as comments in the test file, e.g. `108/1.088 = 100.0`, `25000 * 1.088 = 27200`) but are **not machine-verified**. This is the single biggest residual risk in this deliverable — CI will run the real suite on the PR and must be checked before merge.
+- Did not touch prod/Supabase at any point, per the hard constraint.
+
+## 9. Remaining risks
+
+- **Unexecuted test suite** (see §8) — the highest-priority thing to check once CI runs.
+- **`updateProgressBillingCore`'s narrow scope** (round-1 deviation, still true): line composition still isn't editable after creation; unchanged by this round.
+- **Committed-amount conversion for the consumption guard uses each historical line's OWN billing's `taxRate`/`taxExempt`** to gross it back up to milestone units (for legacy vintage) rather than the current billing's rate. This is correct as long as `taxRate`/`taxExempt` are immutable per billing after creation (they are, except `taxExempt` can flip via `updateProgressBillingCore`, which does NOT touch the stored `taxRate` — see F.2 — so the conversion stays correct even after an update). Flagging the reasoning here in case a future change to `updateProgressBillingCore` ever lets `taxRate` itself change.
+- **RLS on `ProgressBilling`/`ProgressBillingLine`** — unchanged from round 1 (off, matching the Invoice/PaymentSchedule precedent).
+- Change-order billing itself (via `billChangeOrderCore`/`handleChangeOrderApproved`) was not touched by this task and is owned by the concurrent session referenced in §2.5.
