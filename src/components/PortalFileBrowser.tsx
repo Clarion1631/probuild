@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { toast } from "sonner";
 
 type FileRecord = {
     id: string;
@@ -9,6 +10,7 @@ type FileRecord = {
     size: number;
     mimeType: string;
     createdAt: string;
+    uploadedByClient: boolean;
 };
 
 type FolderRecord = {
@@ -46,6 +48,9 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
     const [viewMode, setViewMode] = useState<"grid" | "list">("list");
     const [previewFile, setPreviewFile] = useState<FileRecord | null>(null);
     const [loaded, setLoaded] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const [dragOver, setDragOver] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const fetchFiles = useCallback(async (folderId: string | null = currentFolder) => {
         const params = new URLSearchParams({ projectId });
@@ -77,6 +82,39 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
         fetchFiles(folderId);
     }
 
+    async function uploadFiles(fileList: FileList | File[]) {
+        const toUpload = Array.from(fileList);
+        if (toUpload.length === 0) return;
+        setUploading(true);
+        let successCount = 0;
+        for (const file of toUpload) {
+            const formData = new FormData();
+            formData.append("projectId", projectId);
+            if (currentFolder) formData.append("folderId", currentFolder);
+            formData.append("file", file);
+            try {
+                const res = await fetch("/api/portal/files", { method: "POST", body: formData });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || "Upload failed");
+                successCount++;
+            } catch (e: any) {
+                toast.error(`${file.name}: ${e.message || "Upload failed"}`);
+            }
+        }
+        setUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        if (successCount > 0) {
+            toast.success(successCount === 1 ? "File uploaded" : `${successCount} files uploaded`);
+            fetchFiles(currentFolder);
+        }
+    }
+
+    function handleDrop(e: React.DragEvent) {
+        e.preventDefault();
+        setDragOver(false);
+        if (e.dataTransfer.files?.length) uploadFiles(e.dataTransfer.files);
+    }
+
     const isEmpty = folders.length === 0 && files.length === 0;
 
     return (
@@ -92,13 +130,29 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                         <p className="text-sm text-hui-textMuted">{files.length} file{files.length !== 1 ? "s" : ""}</p>
                     </div>
                 </div>
-                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                    <button onClick={() => setViewMode("grid")} aria-label="Grid view" title="Grid view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                        <button onClick={() => setViewMode("grid")} aria-label="Grid view" title="Grid view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "grid" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                        </button>
+                        <button onClick={() => setViewMode("list")} aria-label="List view" title="List view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+                        </button>
+                    </div>
+                    <button
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={uploading}
+                        className="hui-btn hui-btn-green disabled:opacity-50"
+                    >
+                        {uploading ? "Uploading…" : "Upload a file"}
                     </button>
-                    <button onClick={() => setViewMode("list")} aria-label="List view" title="List view" className={`p-1.5 rounded-md transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${viewMode === "list" ? "bg-white shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
-                    </button>
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => { if (e.target.files?.length) uploadFiles(e.target.files); }}
+                    />
                 </div>
             </div>
 
@@ -116,6 +170,29 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                         </button>
                     </div>
                 ))}
+            </div>
+
+            {/* Upload dropzone */}
+            <div
+                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={handleDrop}
+                className={`mb-6 rounded-xl border-2 border-dashed px-4 py-5 text-center transition ${dragOver ? "border-blue-400 bg-blue-50/50" : "border-slate-200 bg-slate-50/50"}`}
+            >
+                <p className="text-sm font-medium text-hui-textMain">
+                    Drag files here, or{" "}
+                    <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={uploading}
+                        className="text-blue-600 hover:text-blue-800 font-semibold underline underline-offset-2 disabled:opacity-50"
+                    >
+                        browse
+                    </button>
+                </p>
+                <p className="text-xs text-hui-textMuted mt-1">
+                    Drawings, PDFs, and photos from your designer land in the shared Design Files folder.
+                </p>
             </div>
 
             {/* Empty State */}
@@ -171,7 +248,12 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                                         )}
                                     </div>
                                     <div className="p-3">
-                                        <a href={file.url} target="_blank" rel="noreferrer" className="text-xs font-semibold text-hui-textMain hover:text-blue-600 truncate block transition">{file.name}</a>
+                                        <div className="flex items-center gap-1.5">
+                                            <a href={file.url} target="_blank" rel="noreferrer" className="text-xs font-semibold text-hui-textMain hover:text-blue-600 truncate block transition">{file.name}</a>
+                                            {file.uploadedByClient && (
+                                                <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-full">From you</span>
+                                            )}
+                                        </div>
                                         <div className="flex items-center justify-between mt-1">
                                             <span className="text-[10px] text-slate-400">{formatBytes(file.size)}</span>
                                             <span className="text-[10px] text-slate-400">{new Date(file.createdAt).toLocaleDateString()}</span>
@@ -192,7 +274,12 @@ export default function PortalFileBrowser({ projectId }: { projectId: string }) 
                                         )}
                                     </div>
                                     <div className="flex-1 min-w-0">
-                                        <a href={file.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-hui-textMain hover:text-blue-600 truncate block transition">{file.name}</a>
+                                        <div className="flex items-center gap-1.5">
+                                            <a href={file.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-hui-textMain hover:text-blue-600 truncate block transition">{file.name}</a>
+                                            {file.uploadedByClient && (
+                                                <span className="shrink-0 text-[9px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-full">From you</span>
+                                            )}
+                                        </div>
                                         <p className="text-[10px] text-slate-400">{formatBytes(file.size)}</p>
                                     </div>
                                     <span className="text-[10px] text-slate-400 shrink-0">{new Date(file.createdAt).toLocaleDateString()}</span>
