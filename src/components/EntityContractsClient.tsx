@@ -246,6 +246,9 @@ export default function EntityContractsClient({
                     leadId: entity.type === "lead" ? entity.id : undefined,
                     visibility: "shared",
                     files: [{ name: file.name, size: file.size, mimeType: "application/pdf" }],
+                    // Contract originals carry legal/PII weight — route this upload to the
+                    // private secure-docs bucket instead of the public one.
+                    scope: "contract-original",
                 }),
             });
             const data = await res.json();
@@ -269,17 +272,14 @@ export default function EntityContractsClient({
                 throw new Error(msg);
             }
 
-            // Create the contract in DB referencing the storagePath (upload.storagePath)
+            // Create the contract in DB referencing the storagePath (upload.storagePath).
+            // Uploaded into the private bucket above, so store it as a secure ref — the
+            // server resolves a preview URL for us (the private bucket has no public one).
             const titleWithoutExt = file.name.replace(/\.[^/.]+$/, "");
-            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath);
-            
-            const mappedContract = {
-                ...newContract,
-                originalPdfUrl: upload.publicUrl
-            };
+            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath, true);
 
             toast.success("PDF contract imported successfully!", { id: uploadToast });
-            openEditor(mappedContract);
+            openEditor(newContract);
             router.refresh();
         } catch (err: any) {
             console.error("PDF upload error:", err);

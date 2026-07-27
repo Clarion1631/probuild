@@ -2,6 +2,7 @@ import { getLead } from "@/lib/actions";
 import ClientMessaging from "@/components/ClientMessaging";
 import LeadMessagingHeader from "./LeadMessagingHeader";
 import LeadDetailsSidebar from "./LeadDetailsSidebar";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -57,7 +58,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
                 clientCity={(lead.client as any)?.city || null}
                 clientState={(lead.client as any)?.state || null}
                 clientZip={(lead.client as any)?.zipCode || null}
-                clientTaxExemptCertUrl={(lead.client as any)?.taxExemptCertUrl || null}
+                clientTaxExemptCertUrl={await resolveDocUrl((lead.client as any)?.taxExemptCertUrl)}
                 clientTaxExemptCertExpiresAt={(lead.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null}
                 clientTaxExemptCertNote={(lead.client as any)?.taxExemptCertNote || null}
                 initialMessage={initialMessage}

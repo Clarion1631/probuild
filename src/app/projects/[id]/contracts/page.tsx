@@ -2,7 +2,7 @@ import { getProject, getDocumentTemplates } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import EntityContractsClient from "@/components/EntityContractsClient";
-import { getSupabase } from "@/lib/supabase";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -29,7 +29,8 @@ export default async function ProjectContractsPage({ params }: { params: Promise
     });
 
     // Executed-PDF lookup: widen to cover files saved under either the project or the lead.
-    const executedFiles = await prisma.projectFile.findMany({
+    // ProjectFile.url may hold either a legacy public URL or a secure ref — resolve per row.
+    const executedFilesRaw = await prisma.projectFile.findMany({
         where: {
             OR: [
                 { projectId: project.id },
@@ -41,13 +42,11 @@ export default async function ProjectContractsPage({ params }: { params: Promise
         orderBy: { createdAt: "desc" },
         select: { name: true, url: true },
     });
+    const executedFiles = await Promise.all(
+        executedFilesRaw.map(async (f) => ({ name: f.name, url: await resolveDocUrl(f.url) }))
+    );
 
-    const supabase = getSupabase();
-    const findOriginalPdfUrl = (originalPdfPath: string | null) => {
-        if (!originalPdfPath || !supabase) return null;
-        const { data } = supabase.storage.from("project-files").getPublicUrl(originalPdfPath);
-        return data?.publicUrl || null;
-    };
+    const findOriginalPdfUrl = (originalPdfPath: string | null) => resolveDocUrl(originalPdfPath);
 
     const findExecutedPdfUrl = (contractId: string, title: string) => {
         const exactName = `Executed_Contract_${contractId}.pdf`;
@@ -57,13 +56,16 @@ export default async function ProjectContractsPage({ params }: { params: Promise
         return executedFiles.find(f => f.name.startsWith(safeName))?.url || null;
     };
 
-    const serialized = JSON.parse(JSON.stringify(
-        contracts.map(c => ({
-            ...c,
-            executedPdfUrl: findExecutedPdfUrl(c.id, c.title),
-            originalPdfUrl: findOriginalPdfUrl(c.originalPdfPath)
-        }))
-    ));
+    const resolvedContracts = await Promise.all(contracts.map(async (c) => ({
+        ...c,
+        signatureUrl: await resolveDocUrl(c.signatureUrl),
+        contractorSignatureUrl: await resolveDocUrl(c.contractorSignatureUrl),
+        companySignatureUrl: await resolveDocUrl(c.companySignatureUrl),
+        executedPdfUrl: findExecutedPdfUrl(c.id, c.title),
+        originalPdfUrl: await findOriginalPdfUrl(c.originalPdfPath),
+    })));
+
+    const serialized = JSON.parse(JSON.stringify(resolvedContracts));
 
     const linkedEntity = linkedLeadId
         ? { type: "lead" as const, id: linkedLeadId, name: (project as any).lead?.name ?? "" }

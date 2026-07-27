@@ -1,6 +1,7 @@
 import { getChangeOrder, getProject } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import ChangeOrderEditor from "./ChangeOrderEditor";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -14,9 +15,15 @@ export default async function ChangeOrderPage({
     const co = await getChangeOrder(resolvedParams.coId);
 
     if (!project) return <div>Project not found</div>;
-    if (!co) { 
+    if (!co) {
         notFound();
     }
+
+    const initialData = {
+        ...co,
+        clientSignatureUrl: await resolveDocUrl((co as any).clientSignatureUrl),
+        companySignatureUrl: await resolveDocUrl((co as any).companySignatureUrl),
+    };
 
     return (
         <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
@@ -29,7 +36,7 @@ export default async function ChangeOrderPage({
                         clientEmail: project.client.email || undefined,
                         location: project.location || undefined
                     }}
-                    initialData={co}
+                    initialData={initialData}
                 />
             </div>
         </div>

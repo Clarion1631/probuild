@@ -5,6 +5,7 @@ import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { getPortalVisibility } from "@/lib/actions";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 // GET: list shared files for a portal client (read-only)
 export async function GET(req: NextRequest) {
@@ -88,7 +89,7 @@ export async function GET(req: NextRequest) {
                 ? { OR: [{ visibility: "shared" }, { visibility: null }] }
                 : { visibility: "shared" }),
         };
-        const files = await prisma.projectFile.findMany({
+        const filesRaw = await prisma.projectFile.findMany({
             where: fileWhere,
             orderBy: { createdAt: "desc" },
             select: {
@@ -100,6 +101,9 @@ export async function GET(req: NextRequest) {
                 createdAt: true,
             },
         });
+        const files = await Promise.all(
+            filesRaw.map(async (f) => ({ ...f, url: await resolveDocUrl(f.url) }))
+        );
 
         return NextResponse.json({ folders, files });
     } catch (err: any) {
