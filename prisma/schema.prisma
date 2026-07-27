@@ -38,6 +38,9 @@ model User {
   dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
   createdTaskMaterials TaskMaterial[] @relation("TaskMaterialCreator")
   taskMaterialStatusChanges TaskMaterial[] @relation("TaskMaterialStatusChanger")
+  clippedProducts    ProductLibraryItem[]
+  addedFavorites     ProjectProductFavorite[]
+  decidedProposals   SelectionProposal[]
 }
 
 model Client {
@@ -260,6 +263,8 @@ model Project {
   bidPackages         BidPackage[]
   teamMessages        TeamMessage[]
   activityLogs        ActivityLog[]
+  productFavorites    ProjectProductFavorite[]
+  selectionProposals  SelectionProposal[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -1071,6 +1076,7 @@ model ProjectFile {
   folder       FileFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
   uploadedById String?
   uploadedBy   User?       @relation(fields: [uploadedById], references: [id])
+  uploadedByClient Boolean @default(false)
   createdAt    DateTime    @default(now())
 
   @@index([projectId])
@@ -1532,6 +1538,75 @@ model SelectionOption {
   selected    Boolean           @default(false)
   order       Int               @default(0)
   createdAt   DateTime          @default(now())
+}
+
+
+// Company-wide reusable product catalog, populated via the team "clipper" (paste a
+// vendor URL, parsed server-side) or manual entry. Approved client SelectionProposals
+// also mint a row here (source: "client_proposal"). See docs/specs/product-library-portal-selections.md.
+model ProductLibraryItem {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  price       Decimal? @db.Decimal(12, 2) // list price captured at clip time
+  vendor      String?
+  vendorUrl   String?  // source/product URL
+  category    String?  // free text v1 (e.g. "Plumbing Fixtures")
+  source      String   @default("clip") // "clip" | "manual" | "client_proposal"
+  clippedById String?
+  clippedBy   User?    @relation(fields: [clippedById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  favorites   ProjectProductFavorite[]
+
+  @@index([category])
+  @@index([createdAt])
+}
+
+// A ProductLibraryItem pinned to one project — the client-visible "Project Favorites"
+// list. Rows created by an approved client SelectionProposal carry addedByClient: true
+// and a null addedById (no team member picked it).
+model ProjectProductFavorite {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  productId     String
+  product       ProductLibraryItem @relation(fields: [productId], references: [id], onDelete: Cascade)
+  addedById     String?  // team member User, null when added via approved client proposal
+  addedBy       User?    @relation(fields: [addedById], references: [id])
+  addedByClient Boolean  @default(false)
+  note          String?
+  createdAt     DateTime @default(now())
+
+  @@unique([projectId, productId])
+  @@index([projectId])
+}
+
+// A client-suggested selection item, submitted from the portal. Pending until a PM
+// approves (mints a ProductLibraryItem + optional favorite/board option) or declines.
+// Price is never shown to the client until the proposal is Approved.
+model SelectionProposal {
+  id           String   @id @default(cuid())
+  projectId    String
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  imageUrl     String?
+  price        Decimal? @db.Decimal(12, 2) // parsed list price; NOT shown to client until approved
+  vendorUrl    String?
+  clientNote   String?
+  status       String   @default("Pending") // "Pending" | "Approved" | "Declined"
+  pmNote       String?  // decline reason / approval comment, client-visible
+  productId    String?  // ProductLibraryItem created on approval
+  boardId      String?  // optional: SelectionBoard the PM approved it into
+  categoryId   String?  // optional: SelectionCategory it became an option in
+  decidedById  String?
+  decidedBy    User?    @relation(fields: [decidedById], references: [id])
+  decidedAt    DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([projectId, status])
 }
 
 model MoodBoard {
