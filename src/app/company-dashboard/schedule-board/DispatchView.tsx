@@ -456,6 +456,7 @@ export function DispatchView({
                                     key={project.id}
                                     project={project}
                                     tasks={activeTodayByProject.get(project.id) ?? []}
+                                    dayKey={todayKey}
                                     highlighted={highlightedProjectId === project.id}
                                     canCreate={data.canEdit}
                                     crewDrafts={crewDrafts}

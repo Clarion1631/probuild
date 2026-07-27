@@ -7425,12 +7425,24 @@ export async function addTaskPunchItem(taskId: string, name: string) {
 }
 
 export async function togglePunchItem(id: string) {
-    const item = await prisma.taskPunchItem.findUnique({ where: { id } });
-    if (!item) return null;
-    return prisma.taskPunchItem.update({
-        where: { id },
-        data: { completed: !item.completed },
+    const current = await prisma.taskPunchItem.findUnique({ where: { id } });
+    if (!current) return null;
+    // Completing a punch item is now DIRECT field evidence on the schedule
+    // board, so this needs the same access gate as every other task mutation.
+    await assertScheduleTaskAccess(current.taskId);
+    const nextCompleted = !current.completed;
+    const nextCompletedAt = nextCompleted ? new Date() : null;
+    // Guarded flip: the WHERE clause pins the expected `completed` value, so two concurrent
+    // taps can't both read false and both write true. The loser's updateMany matches 0 rows
+    // and falls back to reading the winner's result instead of double-flipping.
+    const result = await prisma.taskPunchItem.updateMany({
+        where: { id, completed: current.completed },
+        data: { completed: nextCompleted, completedAt: nextCompletedAt },
     });
+    if (result.count === 0) {
+        return prisma.taskPunchItem.findUnique({ where: { id } });
+    }
+    return { ...current, completed: nextCompleted, completedAt: nextCompletedAt };
 }
 
 export async function deletePunchItem(id: string) {

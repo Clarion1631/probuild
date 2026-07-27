@@ -1042,15 +1042,16 @@ model TaskCommentPhoto {
 }
 
 model TaskPunchItem {
-  id        String       @id @default(cuid())
-  taskId    String
-  task      ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  name      String
-  completed Boolean      @default(false)
-  assignee  String?
-  photoUrl  String?
-  order     Int          @default(0)
-  createdAt DateTime     @default(now())
+  id          String       @id @default(cuid())
+  taskId      String
+  task        ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  name        String
+  completed   Boolean      @default(false)
+  completedAt DateTime?
+  assignee    String?
+  photoUrl    String?
+  order       Int          @default(0)
+  createdAt   DateTime     @default(now())
 }
 
 model TaskAssignment {

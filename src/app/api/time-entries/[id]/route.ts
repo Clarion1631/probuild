@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -153,6 +155,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (isPrivileged && !isOwner) {
         data.editedByManagerId = user.id;
         data.editedAt = new Date();
+    }
+
+    // Re-resolve the schedule-task binding only when the edit moves the punch to a
+    // different local day — the board may have changed mid-shift, so we must not
+    // repick the day on every edit. Binding follows the entry's OWNER, not the
+    // editing manager (costs already follow the owner).
+    if (toCompanyDayKey(newStart) !== toCompanyDayKey(existing.startTime)) {
+        data.scheduleTaskId = await resolveScheduleTaskIdForPunch({
+            userId: existing.userId,
+            projectId: existing.projectId,
+            dayKey: toCompanyDayKey(newStart),
+            estimateItemId: existing.estimateItemId,
+        });
     }
 
     const updated = await prisma.timeEntry.update({ where: { id }, data });
