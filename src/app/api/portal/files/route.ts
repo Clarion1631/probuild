@@ -108,6 +108,7 @@ export async function GET(req: NextRequest) {
                 size: true,
                 mimeType: true,
                 createdAt: true,
+                uploadedByClient: true,
             },
         });
 
