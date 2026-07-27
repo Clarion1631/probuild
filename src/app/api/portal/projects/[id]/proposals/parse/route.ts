@@ -4,6 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { parseProductUrl } from "@/lib/product-parse";
+import { getPortalVisibility } from "@/lib/actions";
 
 export const maxDuration = 30;
 
@@ -14,6 +15,15 @@ export const maxDuration = 30;
 export async function POST(req: NextRequest, props: { params: Promise<{ id: string }> }) {
     try {
         const { id: projectId } = await props.params;
+
+        // Same order as the portal selections page and /api/portal/files:
+        // visibility gate first, applied uniformly (no staff bypass) — this
+        // route only exists to prefill the "suggest an item" form, which is
+        // itself gated on showSelections.
+        const visibility = await getPortalVisibility(projectId);
+        if (!visibility.isPortalEnabled || !visibility.showSelections) {
+            return NextResponse.json({ error: "Not found" }, { status: 404 });
+        }
 
         const staffSession = await getServerSession(authOptions);
         const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);

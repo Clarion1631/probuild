@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { parseProductUrl } from "@/lib/product-parse";
+import { ROLES } from "@/lib/permissions";
 
 export const maxDuration = 30;
 
@@ -15,7 +16,10 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
         const user = await prisma.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
-        if (!user || user.status === "DISABLED") {
+        // Gate on a real staff role, not just "a User row exists" — mirrors
+        // /api/users' role-allowlist pattern. ROLES is the canonical
+        // ADMIN/MANAGER/FIELD_CREW/FINANCE list from src/lib/permissions.ts.
+        if (!user || user.status === "DISABLED" || !ROLES.includes(user.role)) {
             return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
         }
 
