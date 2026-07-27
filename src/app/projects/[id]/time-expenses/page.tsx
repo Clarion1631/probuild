@@ -3,6 +3,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { getTimeExpenseData } from "@/lib/time-expense-actions";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import TimeExpensesClient from "./TimeExpensesClient";
 
 export default async function TimeExpensesPage({
@@ -37,7 +38,7 @@ export default async function TimeExpensesPage({
 
     if (!project) redirect("/projects");
 
-    const data = await getTimeExpenseData(projectId);
+    const [data, companyTimeZone] = await Promise.all([getTimeExpenseData(projectId), resolveCompanyTimeZone()]);
 
     return (
         <div className="flex h-full bg-hui-background">
@@ -47,6 +48,7 @@ export default async function TimeExpensesPage({
                         project={project}
                         data={JSON.parse(JSON.stringify(data))}
                         currentUser={{ id: user.id, role: user.role, name: user.name || user.email }}
+                        companyTimeZone={companyTimeZone}
                     />
                 </div>
             </div>

@@ -18,7 +18,7 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
-import { endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
+import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -1348,9 +1348,10 @@ export async function billChangeOrderCore(
             ? schedules.map((row, index) => ({
                 sourceCoScheduleId: row.id as string | null,
                 name: `${co.code} — ${row.name}`.slice(0, 300),
+                dueDate: row.dueDate,
                 pretaxCents: index === schedules.length - 1 ? subtotalCents - priorCents : Math.round(Number(row.amount) * 100),
             }))
-            : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), pretaxCents: subtotalCents }];
+            : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), dueDate: null as Date | null, pretaxCents: subtotalCents }];
         if (pretaxPlans.some((plan) => plan.pretaxCents <= 0)) {
             return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
         }
@@ -1409,6 +1410,7 @@ export async function billChangeOrderCore(
                     taxAmount: plan.taxCents / 100,
                     sourceChangeOrderId: co.id,
                     sourceCoScheduleId: plan.sourceCoScheduleId,
+                    dueDate: plan.dueDate,
                     status: "Pending",
                 },
             });
@@ -1828,6 +1830,7 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
     const totalAmount = totalCents / 100;
 
     const requestedSchedules = input.paymentSchedules ?? [];
+    const scheduleTimeZone = await resolveCompanyTimeZone();
     if (pricingType === "COST_PLUS" && requestedSchedules.length > 0) {
         return { ok: false as const, error: "Cost-plus change orders cannot have a fixed payment schedule." };
     }
@@ -1845,8 +1848,7 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
                 throw new Error("Every scheduled payment must be positive and earlier payments must total less than the subtotal.");
             }
             scheduledCents += amountCents;
-            const dueDate = schedule.dueDate ? new Date(schedule.dueDate) : null;
-            if (dueDate && Number.isNaN(dueDate.getTime())) throw new Error(`Invalid due date for ${schedule.name || `Payment ${index + 1}`}.`);
+            const dueDate = dateInputInTimeZone(schedule.dueDate, scheduleTimeZone, `Due date for ${schedule.name || `Payment ${index + 1}`}`);
             return {
                 name: schedule.name?.trim() || `Payment ${index + 1}`,
                 amount: amountCents / 100,

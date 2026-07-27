@@ -1,5 +1,7 @@
 "use server";
 
+import type { Prisma } from "@prisma/client";
+
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
@@ -2553,26 +2555,51 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     return { success: true };
 }
 
+async function assertInvoiceHasNoChangeOrderBilling(
+    tx: Prisma.TransactionClient,
+    invoiceId: string,
+    operation: "delete" | "re-split",
+) {
+    const schedule = await tx.paymentSchedule.findFirst({
+        where: {
+            invoiceId,
+            OR: [
+                { sourceChangeOrderId: { not: null } },
+                { sourceCoScheduleId: { not: null } },
+                { coBilling: { isNot: null } },
+            ],
+        },
+        select: { id: true },
+    });
+    if (schedule) {
+        throw new Error("Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.");
+    }
+}
 export async function deleteInvoice(invoiceId: string) {
     await assertInvoicePermission();
-    const invoice = await prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        include: { payments: true },
-    });
-    if (!invoice) throw new Error("Invoice not found");
 
-    const hasPaidPayments = invoice.payments.some(p => p.status === "Paid");
-    if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
-    if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
-        throw new Error("Cannot delete a paid or partially paid invoice");
-    }
+    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId });
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            include: { payments: true },
+        });
+        if (!invoice) throw new Error("Invoice not found");
 
-    await prisma.invoice.delete({ where: { id: invoiceId } });
-    revalidatePath(`/projects/${invoice.projectId}/invoices`);
-    revalidatePath(`/invoices`);
-    return { success: true, projectId: invoice.projectId };
+        const hasPaidPayments = invoice.payments.some((p) => p.status === "Paid");
+        if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
+        if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
+            throw new Error("Cannot delete a paid or partially paid invoice");
+        }
+        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
+
+        await tx.invoice.delete({ where: { id: invoiceId } });
+        return invoice.projectId;
+    }));
+    revalidatePath("/projects/" + projectId + "/invoices");
+    revalidatePath("/invoices");
+    return { success: true, projectId };
 }
-
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {
     await assertInvoicePermission();
     const invoice = await prisma.invoice.update({
@@ -3258,66 +3285,77 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
     await assertInvoicePermission();
     if (!timeEntryIds.length) throw new Error("No time entries selected");
 
-    const project = await prisma.project.findUnique({ where: { id: projectId } });
-    if (!project) throw new Error("Project not found");
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        const project = await tx.project.findUnique({ where: { id: projectId }, select: { id: true, clientId: true } });
+        if (!project) throw new Error("Project not found");
 
-    const entries = await prisma.timeEntry.findMany({
-        where: { id: { in: timeEntryIds } },
-        include: { user: true, costCode: true },
-    });
+        const uniqueIds = [...new Set(timeEntryIds)];
+        const entries = await tx.timeEntry.findMany({
+            where: {
+                id: { in: uniqueIds },
+                projectId,
+                changeOrderId: null,
+                invoiceId: null,
+                invoicedAt: null,
+            },
+            include: { user: true, costCode: true },
+            orderBy: { id: "asc" },
+        });
+        if (!entries.length) throw new Error("No eligible untagged and unbilled time entries were selected");
+        if (entries.length !== uniqueIds.length) {
+            throw new Error("Only untagged, unbilled time entries from this project can be invoiced; refresh and try again.");
+        }
 
-    if (!entries.length) throw new Error("No matching time entries found");
-
-    const totalAmount = entries.reduce((sum, e) => sum + (Number(e.laborCost) || 0), 0);
-    const rate = await getDefaultSalesTaxRate();
-    const tax = deriveInvoiceTaxFields(totalAmount, rate, false);
-
-    const invoice = await prisma.invoice.create({
-        data: {
-            code: "INV-TEMP",
-            projectId,
-            clientId: project.clientId,
-            status: "Draft",
-            totalAmount,
-            balanceDue: totalAmount,
-            subtotal: tax.subtotal,
-            taxRate: tax.taxRate,
-            taxAmount: tax.taxAmount,
-        },
-    });
-
-    const invoiceCode2 = `INV-${String(invoice.number).padStart(5, "0")}`;
-    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode2 } });
-
-    // Create one payment schedule entry per time entry as line items
-    for (const entry of entries) {
-        const label = [
-            entry.user?.name || "Labor",
-            entry.costCode ? `(${entry.costCode.code})` : "",
-            `— ${Number(entry.durationHours || 0).toFixed(1)}h`,
-            `on ${new Date(entry.startTime).toLocaleDateString()}`,
-        ].filter(Boolean).join(" ");
-
-        await prisma.paymentSchedule.create({
+        const laborCents = entries.reduce((sum, entry) => sum + Math.round((Number(entry.laborCost) || 0) * 100), 0);
+        const totalAmount = laborCents / 100;
+        const rate = await getDefaultSalesTaxRate();
+        const tax = deriveInvoiceTaxFields(totalAmount, rate, false);
+        const invoice = await tx.invoice.create({
             data: {
-                invoiceId: invoice.id,
-                name: label,
-                amount: Number(entry.laborCost) || 0,
-                status: "Pending",
+                code: "INV-TEMP",
+                projectId: project.id,
+                clientId: project.clientId,
+                status: "Draft",
+                totalAmount,
+                balanceDue: totalAmount,
+                subtotal: tax.subtotal,
+                taxRate: tax.taxRate,
+                taxAmount: tax.taxAmount,
             },
         });
-    }
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: { code: "INV-" + String(invoice.number).padStart(5, "0") },
+        });
 
-    await prisma.timeEntry.updateMany({
-        where: { id: { in: timeEntryIds } },
-        data: { invoicedAt: new Date() },
-    });
+        await tx.paymentSchedule.createMany({
+            data: entries.map((entry) => ({
+                invoiceId: invoice.id,
+                name: [
+                    entry.user?.name || "Labor",
+                    entry.costCode ? "(" + entry.costCode.code + ")" : "",
+                    "- " + Number(entry.durationHours || 0).toFixed(1) + "h",
+                    "on " + new Date(entry.startTime).toLocaleDateString(),
+                ].filter(Boolean).join(" "),
+                amount: Math.round((Number(entry.laborCost) || 0) * 100) / 100,
+                status: "Pending",
+            })),
+        });
 
-    revalidatePath(`/projects/${projectId}/invoices`);
-    revalidatePath(`/projects/${projectId}/time-expenses`);
-    return { id: invoice.id, projectId };
+        const claimed = await tx.timeEntry.updateMany({
+            where: { id: { in: uniqueIds }, projectId, changeOrderId: null, invoiceId: null, invoicedAt: null },
+            data: { invoiceId: invoice.id, invoicedAt: new Date() },
+        });
+        if (claimed.count !== uniqueIds.length) {
+            throw new Error("A selected time entry was billed or tagged concurrently; no invoice was created. Refresh and try again.");
+        }
+        return { id: invoice.id, projectId };
+    }));
+
+    revalidatePath("/projects/" + projectId + "/invoices");
+    revalidatePath("/projects/" + projectId + "/time-expenses");
+    return result;
 }
-
 export async function getInvoice(id: string) {
     await assertInvoicePermission();
     const invoice = await prisma.invoice.findUnique({
@@ -4163,6 +4201,8 @@ export async function splitInvoiceMilestones(
             );
         }
 
+        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "re-split");
+
         // Recalculate balanceDue: paid amount stays the same, only pending changes
         const paidAmount = Math.round(
             (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
@@ -4491,7 +4531,7 @@ export async function saveCompanySettings(data: any) {
             website: data.website,
             logoUrl: data.logoUrl,
             licenseNumber: typeof data.licenseNumber === "string"
-                ? data.licenseNumber.replace(/[\r\n\t]/g, "").trim().slice(0, 50)
+                ? data.licenseNumber.replace(/[\n\t]/g, "").trim().slice(0, 50)
                 : undefined,
             notificationEmail: data.notificationEmail,
             stripeEnabled: data.stripeEnabled,

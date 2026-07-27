@@ -1,19 +1,29 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { createExpense } from "@/lib/time-expense-actions";
-
+function todayInTimeZone(timeZone: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+}
 interface Props {
     projectId: string;
     estimates: { id: string; title: string; items: { id: string; name: string }[] }[];
     costCodes: { id: string; name: string; code: string }[];
     costTypes: { id: string; name: string }[];
-    changeOrders: { id: string; code: string; title: string }[];
+    companyTimeZone: string;
+    changeOrders: { id: string; code: string; title: string; estimateId: string }[];
     onClose: () => void;
 }
 
-export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, changeOrders, onClose }: Props) {
+export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, companyTimeZone, changeOrders, onClose }: Props) {
     const [saving, setSaving] = useState(false);
     const [estimateId, setEstimateId] = useState(estimates[0]?.id || "");
     const [itemId, setItemId] = useState("");
@@ -21,74 +31,111 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
     const [costTypeId, setCostTypeId] = useState("");
     const [amount, setAmount] = useState("");
     const [vendor, setVendor] = useState("");
-    const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+    const [date, setDate] = useState(() => todayInTimeZone(companyTimeZone));
     const [description, setDescription] = useState("");
     const [changeOrderId, setChangeOrderId] = useState("");
     const [isBillable, setIsBillable] = useState(true);
     const [receiptFile, setReceiptFile] = useState<File | null>(null);
     const [receiptFileId, setReceiptFileId] = useState<string | null>(null);
     const [ocrLoading, setOcrLoading] = useState(false);
+    const [receiptUploadError, setReceiptUploadError] = useState<string | null>(null);
+    const receiptRequestGeneration = useRef(0);
 
     const selectedEstimate = estimates.find(e => e.id === estimateId);
     const lineItems = selectedEstimate?.items || [];
 
-    async function handleReceiptOCR(file: File) {
-        setReceiptFile(file);
-        setOcrLoading(true);
-        try {
-            const formData = new FormData();
-            formData.append("file", file);
-            formData.append("projectId", projectId);
-
-            const res = await fetch("/api/receipts/parse", { method: "POST", body: formData });
-            if (res.ok) {
-                const result = await res.json();
-                if (result.vendor) setVendor(result.vendor);
-                if (result.total) setAmount(String(result.total));
-                if (result.date) setDate(result.date);
-                if (result.items?.length) setDescription(result.items.map((item: any) => item.description).filter(Boolean).join(", "));
-                toast.success("Receipt scanned successfully");
-            }
-            const signRes = await fetch("/api/files/signed-upload", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    projectId,
-                    visibility: "financial",
-                    files: [{ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream" }],
-                }),
-            });
-            const signData = await signRes.json();
-            if (!signRes.ok || !signData.uploads?.[0]) throw new Error(signData.error || "Receipt upload could not be prepared");
-            const upload = signData.uploads[0];
-            const uploadRes = await fetch(upload.signedUrl, {
-                method: "PUT",
-                headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
-                body: file,
-            });
-            if (!uploadRes.ok) throw new Error("Receipt storage upload failed");
-            const registerRes = await fetch("/api/files/register", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ files: [{
-                    name: upload.name,
-                    url: upload.publicUrl,
-                    size: upload.size,
-                    mimeType: upload.mimeType,
-                    projectId: upload.projectId,
-                    visibility: upload.visibility,
-                }] }),
-            });
-            const registered = await registerRes.json();
-            if (!registerRes.ok || !registered.files?.[0]?.id) throw new Error(registered.error || "Receipt record could not be saved");
-            setReceiptFileId(registered.files[0].id);
-        } catch {
-            // OCR is optional — user can fill manually
-        } finally {
-            setOcrLoading(false);
-        }
+    function clearReceipt() {
+        receiptRequestGeneration.current += 1;
+        setReceiptFile(null);
+        setReceiptFileId(null);
+        setReceiptUploadError(null);
+        setOcrLoading(false);
+        const input = document.getElementById("receipt-upload") as HTMLInputElement | null;
+        if (input) input.value = "";
     }
 
+    async function handleReceiptOCR(file: File) {
+        const requestToken = ++receiptRequestGeneration.current;
+        const isCurrentRequest = () => receiptRequestGeneration.current === requestToken;
+        setReceiptFile(file);
+        setReceiptFileId(null);
+        setReceiptUploadError(null);
+        setOcrLoading(true);
+        try {
+            try {
+                const formData = new FormData();
+                formData.append("file", file);
+                formData.append("projectId", projectId);
+                const res = await fetch("/api/receipts/parse", { method: "POST", body: formData });
+                if (!isCurrentRequest()) return;
+                if (res.ok) {
+                    const result = await res.json();
+                    if (!isCurrentRequest()) return;
+                    if (result.vendor) setVendor(result.vendor);
+                    if (result.total) setAmount(String(result.total));
+                    if (result.date) setDate(result.date);
+                    if (result.items?.length) setDescription(result.items.map((item: any) => item.description).filter(Boolean).join(", "));
+                    toast.success("Receipt scanned successfully");
+                } else {
+                    toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+                }
+            } catch {
+                if (!isCurrentRequest()) return;
+                toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+            }
+
+            if (!isCurrentRequest()) return;
+            try {
+                const signRes = await fetch("/api/files/signed-upload", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        projectId,
+                        visibility: "financial",
+                        files: [{ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream" }],
+                    }),
+                });
+                if (!isCurrentRequest()) return;
+                const signData = await signRes.json();
+                if (!isCurrentRequest()) return;
+                if (!signRes.ok || !signData.uploads?.[0]) throw new Error(signData.error || "Receipt upload could not be prepared");
+                const upload = signData.uploads[0];
+                const uploadRes = await fetch(upload.signedUrl, {
+                    method: "PUT",
+                    headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
+                    body: file,
+                });
+                if (!isCurrentRequest()) return;
+                if (!uploadRes.ok) throw new Error("Receipt storage upload failed");
+                const registerRes = await fetch("/api/files/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ files: [{
+                        name: upload.name,
+                        url: upload.publicUrl,
+                        size: upload.size,
+                        mimeType: upload.mimeType,
+                        projectId: upload.projectId,
+                        visibility: upload.visibility,
+                    }] }),
+                });
+                if (!isCurrentRequest()) return;
+                const registered = await registerRes.json();
+                if (!isCurrentRequest()) return;
+                if (!registerRes.ok || !registered.files?.[0]?.id) throw new Error(registered.error || "Receipt record could not be saved");
+                setReceiptFileId(registered.files[0].id);
+                setReceiptUploadError(null);
+            } catch (err) {
+                if (!isCurrentRequest()) return;
+                const message = err instanceof Error ? err.message : "Receipt attachment failed";
+                setReceiptFileId(null);
+                setReceiptUploadError(message);
+                toast.error("Receipt attachment failed: " + message);
+            }
+        } finally {
+            if (isCurrentRequest()) setOcrLoading(false);
+        }
+    }
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
         if (!estimateId && !changeOrderId) {
@@ -97,6 +144,10 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
         }
         if (!amount || parseFloat(amount) <= 0) {
             toast.error("Enter a valid amount");
+            return;
+        }
+        if (ocrLoading || receiptUploadError) {
+            toast.error("Resolve the receipt attachment error or clear the receipt before saving");
             return;
         }
         setSaving(true);
@@ -134,16 +185,17 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
 
                 {/* Receipt OCR Upload */}
                 <div className="mb-5 border-2 border-dashed border-slate-300 rounded-lg p-4 text-center hover:border-hui-primary transition cursor-pointer"
-                    onClick={() => document.getElementById("receipt-upload")?.click()}
+                    onClick={() => { if (!ocrLoading) document.getElementById("receipt-upload")?.click(); }}
                 >
                     <input
                         id="receipt-upload"
                         type="file"
                         accept="image/*,application/pdf"
+                        disabled={ocrLoading}
                         className="hidden"
                         onChange={e => {
                             const f = e.target.files?.[0];
-                            if (f) handleReceiptOCR(f);
+                            if (f) void handleReceiptOCR(f);
                         }}
                     />
                     {ocrLoading ? (
@@ -163,11 +215,17 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
                         </>
                     )}
                 </div>
+                {receiptUploadError && (
+                    <div role="alert" className="mb-5 flex items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                        <span>Receipt attachment failed: {receiptUploadError}</span>
+                        <button type="button" onClick={clearReceipt} className="font-semibold underline">Clear receipt</button>
+                    </div>
+                )}
 
                 <form onSubmit={handleSubmit} className="space-y-4">
                     <div>
                         <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
-                        <select value={changeOrderId} onChange={e => setChangeOrderId(e.target.value)} className="hui-input w-full text-sm">
+                        <select value={changeOrderId} onChange={e => { const value = e.target.value; setChangeOrderId(value); setItemId(""); const changeOrder = changeOrders.find(co => co.id === value); if (changeOrder?.estimateId) setEstimateId(changeOrder.estimateId); }} className="hui-input w-full text-sm">
                             <option value="">Project expense (no change order)</option>
                             {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
                         </select>
@@ -242,7 +300,7 @@ export default function NewExpenseEntryModal({ projectId, estimates, costCodes, 
 
                     <div className="flex justify-end gap-2 pt-2">
                         <button type="button" onClick={onClose} className="hui-btn hui-btn-secondary text-sm px-4 py-2">Cancel</button>
-                        <button type="submit" disabled={saving} className="hui-btn hui-btn-green text-sm px-4 py-2">
+                        <button type="submit" disabled={saving || ocrLoading || Boolean(receiptUploadError)} className="hui-btn hui-btn-green text-sm px-4 py-2">
                             {saving ? "Saving..." : "Add Expense"}
                         </button>
                     </div>

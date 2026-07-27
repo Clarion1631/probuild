@@ -1,4 +1,5 @@
 import { prisma } from "./prisma";
+import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { coLineCents } from "./co-tax";
 
 type ChangeOrderItemInput = {
@@ -53,6 +54,7 @@ function normalizedMarkup(value: unknown, fallback: number | null): number | nul
 function normalizeSchedules(
     schedules: ChangeOrderScheduleInput[],
     subtotalCents: number,
+    timeZone: string,
 ): Array<{ id?: string; name: string; amount: number; dueDate: Date | null; order: number }> {
     if (schedules.length === 0) return [];
     if (schedules.length < 2) throw new Error("A fixed-price payment schedule requires at least two payments.");
@@ -67,8 +69,7 @@ function normalizeSchedules(
         }
         priorCents += amountCents;
         const name = schedule.name?.trim() || `Payment ${index + 1}`;
-        const dueDate = schedule.dueDate ? new Date(schedule.dueDate) : null;
-        if (dueDate && Number.isNaN(dueDate.getTime())) throw new Error(`Invalid due date for ${name}.`);
+        const dueDate = dateInputInTimeZone(schedule.dueDate, timeZone, `Due date for ${name}`);
         return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: schedule.order ?? index };
     });
 }
@@ -86,6 +87,7 @@ function itemSubtotalCents(items: Array<{ quantity: number; unitCost: unknown }>
 export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateInput) {
     const items = Array.isArray(data.items) ? data.items as ChangeOrderItemInput[] : undefined;
     const schedules = Array.isArray(data.paymentSchedules) ? data.paymentSchedules as ChangeOrderScheduleInput[] : undefined;
+    const timeZone = await resolveCompanyTimeZone();
 
     return prisma.$transaction(async (tx) => {
         // Serialize editors with send, approval, billing, and co-audit repair.
@@ -266,7 +268,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
         }
         const normalizedSchedules = nextPricingType === "FIXED"
-            ? normalizeSchedules(requestedSchedules, subtotalCents)
+            ? normalizeSchedules(requestedSchedules, subtotalCents, timeZone)
             : [];
 
         if (schedules !== undefined) {

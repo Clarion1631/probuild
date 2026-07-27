@@ -7,7 +7,7 @@ import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import {
     createExpenseCore,
-    createTimeEntryCore,
+    createTimeEntryFromStoredRatesCore,
     tagExpensesToChangeOrderCore,
     tagTimeEntriesToChangeOrderCore,
 } from "@/lib/time-expense-core";
@@ -28,8 +28,6 @@ export async function createTimeEntry(data: {
     costCodeId: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
-    burdenCost?: number;
     changeOrderId?: string | null;
     isBillable?: boolean;
     isTaxable?: boolean;
@@ -38,7 +36,7 @@ export async function createTimeEntry(data: {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
     await assertTimeExpenseProjectAccess(data.projectId);
-    await createTimeEntryCore(data, session.user.email);
+    await createTimeEntryFromStoredRatesCore(data, session.user.email);
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
@@ -252,7 +250,7 @@ export async function getTimeEntries(projectId: string) {
     return prisma.timeEntry.findMany({
         where: { projectId },
         include: {
-            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
             costType: { select: { id: true, name: true } },
@@ -283,7 +281,7 @@ export async function getTimeExpenseData(projectId: string) {
     const timeEntries = await prisma.timeEntry.findMany({
         where: { projectId },
         include: {
-            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },
             changeOrder: { select: { id: true, code: true, title: true } },
         },
@@ -312,7 +310,7 @@ export async function getTimeExpenseData(projectId: string) {
 
     const teamMembers = await prisma.user.findMany({
         where: { status: { not: "DISABLED" } },
-        select: { id: true, name: true, email: true, hourlyRate: true },
+        select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true },
         orderBy: { name: "asc" },
     });
 
@@ -327,7 +325,7 @@ export async function getTimeExpenseData(projectId: string) {
 
     const changeOrders = await prisma.changeOrder.findMany({
         where: { projectId, pricingType: "COST_PLUS", status: { in: ["Sent", "Approved"] } },
-        select: { id: true, code: true, title: true, status: true },
+        select: { id: true, code: true, title: true, status: true, estimateId: true },
         orderBy: { createdAt: "desc" },
     });
 

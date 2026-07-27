@@ -1,4 +1,5 @@
 import { prisma } from "./prisma";
+import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -64,7 +65,9 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     if (data.burdenCost != null && (!Number.isFinite(data.burdenCost) || data.burdenCost < 0)) {
         throw new Error("Burden cost cannot be negative");
     }
-    const startTime = new Date(data.date);
+    const startTime = /^\d{4}-\d{2}-\d{2}$/.test(data.date)
+        ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
+        : new Date(data.date);
     if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
 
     const changeOrder = data.changeOrderId ? await resolveChangeOrder(data.changeOrderId, data.projectId) : null;
@@ -91,6 +94,18 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
             notes: data.notes?.trim() || null,
         },
     });
+}
+
+export type CreateTimeEntryFromStoredRatesInput = Omit<CreateTimeEntryCoreInput, "laborCost" | "burdenCost">;
+
+export async function createTimeEntryFromStoredRatesCore(data: CreateTimeEntryFromStoredRatesInput, actor: string) {
+    const member = await prisma.user.findUnique({
+        where: { id: data.userId },
+        select: { id: true, hourlyRate: true, burdenRate: true },
+    });
+    if (!member) throw new Error("Crew member not found");
+    const costs = calculateCrewTimeCosts(data.durationHours, Number(member.hourlyRate), Number(member.burdenRate));
+    return createTimeEntryCore({ ...data, ...costs }, actor);
 }
 
 export type CreateExpenseCoreInput = {
@@ -123,6 +138,16 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
     if (data.projectId && estimate.projectId !== data.projectId) throw new Error("Estimate does not belong to this project");
     if (changeOrder && estimate.projectId !== changeOrder.projectId) throw new Error("Change order and estimate project do not match");
 
+    if (data.itemId) {
+        const item = await prisma.estimateItem.findUnique({
+            where: { id: data.itemId },
+            select: { estimateId: true },
+        });
+        if (!item || item.estimateId !== estimateId) {
+            throw new Error("Line item must belong to the resolved estimate");
+        }
+    }
+
     let receiptUrl = data.receiptUrl?.trim() || null;
     if (data.receiptFileId) {
         const receipt = await prisma.projectFile.findUnique({
@@ -134,7 +159,11 @@ export async function createExpenseCore(data: CreateExpenseCoreInput, actor: str
         }
         receiptUrl = receipt.url;
     }
-    const expenseDate = data.date ? new Date(data.date) : null;
+    const expenseDate = data.date
+        ? /^\d{4}-\d{2}-\d{2}$/.test(data.date)
+            ? dateOnlyInTimeZone(data.date, await resolveCompanyTimeZone())
+            : new Date(data.date)
+        : null;
     if (expenseDate && Number.isNaN(expenseDate.getTime())) throw new Error("A valid expense date is required");
 
     return prisma.expense.create({

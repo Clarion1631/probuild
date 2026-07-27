@@ -9,12 +9,13 @@ import {
   previewCostPlusChangeOrderCore,
   sendChangeOrderToClientCore,
 } from "../src/lib/billing-core";
-import { approveChangeOrderCore } from "../src/lib/change-order-core";
+import { approveChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { approveChangeOrderWithSignature } from "../src/lib/change-order-approval";
 import {
   calculateCrewTimeCosts,
   createExpenseCore,
   createTimeEntryCore,
+  createTimeEntryFromStoredRatesCore,
   findCrewMatches,
   tagExpensesToChangeOrderCore,
   tagTimeEntriesToChangeOrderCore,
@@ -22,7 +23,7 @@ import {
 import { reconcileMilestoneToQbo } from "../src/lib/quickbooks-payments";
 import { querySalesTaxData } from "../src/lib/sales-tax-report";
 import { signClientPortalToken } from "../src/lib/client-portal-auth";
-import { endOfDateInTimeZone, resolveCompanyTimeZone } from "../src/lib/company-timezone";
+import { dateOnlyInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "../src/lib/company-timezone";
 
 const prisma = new PrismaClient();
 const run = `cpco-${process.pid}-${Date.now()}`;
@@ -41,12 +42,16 @@ const IDS = {
   invoiceTax: `${run}-invoice-tax`,
   invoiceReconcile: `${run}-invoice-reconcile`,
   invoiceB: `${run}-invoice-b`,
+  invoiceGuard: `${run}-invoice-guard`,
   receipt: `${run}-receipt`,
   costPlusZero: `${run}-co-zero`,
   dstCo: `${run}-co-dst`,
+  dateOnlyCo: `${run}-co-date-only`,
   splitCo: `${run}-co-split`,
   lumpCo: `${run}-co-lump`,
   deniedCo: `${run}-co-denied`,
+  itemA: `${run}-item-a`,
+  itemB: `${run}-item-b`,
 } as const;
 
 let costPlusId = "";
@@ -203,6 +208,24 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
           totalAmount: 0,
           balanceDue: 0,
         },
+        {
+          id: IDS.invoiceGuard,
+          code: `${run}-INV-GUARD`,
+          projectId: IDS.projectA,
+          clientId: IDS.clientA,
+          status: "Draft",
+          subtotal: 100,
+          taxRate: 0,
+          taxAmount: 0,
+          totalAmount: 100,
+          balanceDue: 100,
+        },
+      ],
+    });
+    await prisma.estimateItem.createMany({
+      data: [
+        { id: IDS.itemA, estimateId: IDS.estimateA, name: "Estimate A item", quantity: 1, unitCost: 10, total: 10 },
+        { id: IDS.itemB, estimateId: IDS.estimateB, name: "Estimate B item", quantity: 1, unitCost: 20, total: 20 },
       ],
     });
     await prisma.projectFile.create({
@@ -224,12 +247,13 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         where: { changeOrder: { projectId: { in: [IDS.projectA, IDS.projectB] } } },
       });
       await prisma.paymentSchedule.deleteMany({
-        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB] } },
+        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } },
       });
       await prisma.timeEntry.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
       await prisma.expense.deleteMany({ where: { estimateId: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
       await prisma.changeOrder.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
-      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB] } } });
+      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } } });
+      await prisma.estimateItem.deleteMany({ where: { id: { in: [IDS.itemA, IDS.itemB] } } });
       await prisma.projectFile.deleteMany({ where: { id: IDS.receipt } });
       await prisma.estimate.deleteMany({ where: { id: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
       await prisma.project.deleteMany({ where: { id: { in: [IDS.projectA, IDS.projectB] } } });
@@ -435,6 +459,98 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     expect(dollars(invoice.balanceDue)).toBe(211.75);
   });
 
+  test("CPCO-F1: CO-backed invoices refuse deletion and re-splitting", async ({ page }) => {
+    await prisma.paymentSchedule.create({
+      data: {
+        invoiceId: IDS.invoiceGuard,
+        name: "Frozen change-order billing",
+        amount: 100,
+        status: "Pending",
+        sourceChangeOrderId: costPlusId,
+      },
+    });
+    await page.goto("/projects/" + IDS.projectA + "/invoices/" + IDS.invoiceGuard, { waitUntil: "networkidle" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(page.locator("[data-sonner-toast][data-type=\"error\"]").last()).toContainText(/void\/rebill/i);
+    expect(await prisma.invoice.findUnique({ where: { id: IDS.invoiceGuard }, select: { id: true } })).not.toBeNull();
+    await page.getByRole("button", { name: "Split payments", exact: true }).click();
+    await page.getByPlaceholder("e.g. Deposit, Final Payment").fill("Replacement milestone");
+    await page.getByPlaceholder("0.00").fill("100");
+    await page.getByRole("button", { name: "Apply schedule", exact: true }).click();
+    await expect(page.locator("[data-sonner-toast][data-type=\"error\"]").last()).toContainText(/void\/rebill/i);
+    expect(await prisma.paymentSchedule.count({ where: { invoiceId: IDS.invoiceGuard, sourceChangeOrderId: costPlusId } })).toBe(1);
+  });
+
+  test("CPCO-F2: tagged or billed time rows are excluded from Create Invoice selection", async ({ page }) => {
+    const eligible = await prisma.timeEntry.create({ data: { projectId: IDS.projectA, userId: IDS.user, startTime: new Date("2026-07-18T12:00:00.000Z"), durationHours: 1, laborCost: 100, burdenCost: 25 } });
+    const tagged = await prisma.timeEntry.create({ data: { projectId: IDS.projectA, userId: IDS.user, changeOrderId: costPlusId, isBillable: true, startTime: new Date("2026-07-18T13:00:00.000Z"), durationHours: 1, laborCost: 100, burdenCost: 25 } });
+    const billed = await prisma.timeEntry.create({ data: { projectId: IDS.projectA, userId: IDS.user, startTime: new Date("2026-07-18T14:00:00.000Z"), durationHours: 1, laborCost: 100, burdenCost: 25, invoiceId: IDS.invoiceA, invoicedAt: new Date("2026-07-18T15:00:00.000Z") } });
+    await page.goto("/projects/" + IDS.projectA + "/time-expenses", { waitUntil: "networkidle" });
+    await expect(page.getByTestId("time-entry-select-" + eligible.id)).toBeEnabled();
+    await expect(page.getByTestId("time-entry-select-" + tagged.id)).toBeDisabled();
+    await expect(page.getByTestId("time-entry-select-" + billed.id)).toBeDisabled();
+    await expect(page.getByTestId("time-entry-select-" + tagged.id)).toHaveAttribute("title", /change-order/i);
+    await expect(page.getByTestId("time-entry-select-" + billed.id)).toHaveAttribute("title", /billed/i);
+  });
+
+  test("CPCO-F3: date-only actuals use the company-local calendar boundary", async () => {
+    await prisma.changeOrder.create({ data: { id: IDS.dateOnlyCo, code: run + "-CO-DATE-ONLY", title: "Date-only boundary", projectId: IDS.projectA, estimateId: IDS.estimateA, status: "Approved", pricingType: "COST_PLUS", markupPercent: 0, totalAmount: 0, balanceDue: 0 } });
+    const sameDayTime = await createTimeEntryCore({ projectId: IDS.projectA, userId: IDS.user, costCodeId: null, date: "2026-03-08", durationHours: 1, laborCost: 10, burdenCost: 0, changeOrderId: IDS.dateOnlyCo, isBillable: true }, "Playwright date-only");
+    const nextDayTime = await createTimeEntryCore({ projectId: IDS.projectA, userId: IDS.user, costCodeId: null, date: "2026-03-09", durationHours: 1, laborCost: 20, burdenCost: 0, changeOrderId: IDS.dateOnlyCo, isBillable: true }, "Playwright date-only");
+    const sameDayExpense = await createExpenseCore({ projectId: IDS.projectA, estimateId: IDS.estimateA, amount: 30, date: "2026-03-08", changeOrderId: IDS.dateOnlyCo, isBillable: true }, "Playwright date-only");
+    const nextDayExpense = await createExpenseCore({ projectId: IDS.projectA, estimateId: IDS.estimateA, amount: 40, date: "2026-03-09", changeOrderId: IDS.dateOnlyCo, isBillable: true }, "Playwright date-only");
+    const billed = await billCostPlusChangeOrderCore(IDS.dateOnlyCo, { throughDate: "2026-03-08", actor: "Playwright date-only" });
+    expect(billed.laborCents).toBe(1_000);
+    expect(billed.expenseCents).toBe(3_000);
+    expect((await prisma.timeEntry.findUniqueOrThrow({ where: { id: sameDayTime.id } })).invoiceId).toBe(IDS.invoiceA);
+    expect((await prisma.timeEntry.findUniqueOrThrow({ where: { id: nextDayTime.id } })).invoiceId).toBeNull();
+    expect((await prisma.expense.findUniqueOrThrow({ where: { id: sameDayExpense.id } })).invoiceId).toBe(IDS.invoiceA);
+    expect((await prisma.expense.findUniqueOrThrow({ where: { id: nextDayExpense.id } })).invoiceId).toBeNull();
+  });
+
+  test("CPCO-F4: manual time creation derives labor and burden from stored crew rates", async () => {
+    const entry = await createTimeEntryFromStoredRatesCore({ projectId: IDS.projectA, userId: IDS.user, costCodeId: null, date: "2026-07-19T12:00:00.000Z", durationHours: 2, changeOrderId: costPlusId, isBillable: true }, "Playwright stored rates");
+    expect(dollars(entry.laborCost)).toBe(200);
+    expect(dollars(entry.burdenCost)).toBe(50);
+  });
+
+  test("CPCO-F5: a CO expense rejects a line item from another estimate", async () => {
+    const message = await rejectionMessage(createExpenseCore({ projectId: IDS.projectA, estimateId: IDS.estimateB, itemId: IDS.itemB, amount: 1, changeOrderId: costPlusId, isBillable: true }, "Playwright item ownership"));
+    expect(message.toLowerCase()).toContain("line item");
+  });
+
+  test("CPCO-F6: receipt upload failures cannot leave a stale attachment on the expense form", () => {
+    const source = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx"), "utf8");
+    expect(source).toContain("setReceiptFileId(null)");
+    expect(source).toContain("receiptUploadError");
+    expect(source).toContain("toast.error");
+    expect(source).toMatch(/disabled=\{saving \|\| ocrLoading \|\| Boolean\(receiptUploadError\)\}/);
+  });
+
+  test("CPCO-G2: receipt uploads lock the picker and ignore stale completions", () => {
+    const source = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx"), "utf8");
+    expect(source).toContain("useRef");
+    expect(source).toContain("receiptRequestGeneration");
+    expect(source).toContain("requestToken");
+    expect(source).toContain("isCurrentRequest");
+    expect(source).toMatch(/id=\"receipt-upload\"[\s\S]*disabled=\{ocrLoading\}/);
+  });
+
+  test("CPCO-G3: time and expense forms default dates from the server-provided company timezone", () => {
+    const page = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/page.tsx"), "utf8");
+    const client = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/TimeExpensesClient.tsx"), "utf8");
+    const timeModal = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx"), "utf8");
+    const expenseModal = readFileSync(join(process.cwd(), "src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx"), "utf8");
+    expect(page).toContain("resolveCompanyTimeZone");
+    expect(client).toContain("companyTimeZone");
+    for (const source of [timeModal, expenseModal]) {
+      expect(source).toContain("companyTimeZone");
+      expect(source).toContain("Intl.DateTimeFormat");
+      expect(source).toMatch(/timeZone[,}]/);
+      expect(source).not.toContain("new Date().toISOString().split(\"T\")[0]");
+    }
+  });
   test("CPCO3: a second cost-plus billing run reports nothing to bill", async () => {
     const message = await rejectionMessage(billCostPlusChangeOrderCore(costPlusId, {
       throughDate: "2026-07-15",
@@ -532,19 +648,20 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         title: "Two milestone fixed CO",
         projectId: IDS.projectA,
         estimateId: IDS.estimateSplit,
-        status: "Approved",
+        status: "Draft",
         pricingType: "FIXED",
         totalAmount: 100.01,
         balanceDue: 100.01,
         items: { create: { name: "Fixed work", quantity: 1, unitCost: 100.01, total: 100.01 } },
-        paymentSchedules: {
-          create: [
-            { name: "Start", amount: 50, order: 0 },
-            { name: "Finish", amount: 50.01, order: 1 },
-          ],
-        },
       },
     });
+    await updateChangeOrderCore(IDS.splitCo, {
+      paymentSchedules: [
+        { name: "Start", amount: 50, dueDate: "2026-07-20", order: 0 },
+        { name: "Finish", amount: 50.01, dueDate: "2026-08-05", order: 1 },
+      ],
+    });
+    await prisma.changeOrder.update({ where: { id: IDS.splitCo }, data: { status: "Approved" } });
 
     const result = await billChangeOrderCore(IDS.splitCo, billingTestDependencies);
     expect(result.ok).toBe(true);
@@ -559,6 +676,9 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map((row) => row.sourceCoScheduleId)).size).toBe(2);
     expect(rows.every((row) => !!row.sourceCoScheduleId)).toBe(true);
+    const timeZone = await resolveCompanyTimeZone();
+    expect(rows.find((row) => row.name.includes("Start"))?.dueDate?.getTime()).toBe(dateOnlyInTimeZone("2026-07-20", timeZone).getTime());
+    expect(rows.find((row) => row.name.includes("Finish"))?.dueDate?.getTime()).toBe(dateOnlyInTimeZone("2026-08-05", timeZone).getTime());
     expect(Math.round(rows.reduce((sum, row) => sum + Number(row.pretaxAmount), 0) * 100)).toBe(10_001);
     expect(Math.round(rows.reduce((sum, row) => sum + Number(row.taxAmount), 0) * 100)).toBe(880);
     expect(Math.round(rows.reduce((sum, row) => sum + Number(row.amount), 0) * 100)).toBe(10_881);

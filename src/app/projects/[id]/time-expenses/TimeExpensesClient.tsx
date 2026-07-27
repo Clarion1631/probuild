@@ -13,16 +13,17 @@ interface Props {
         expenses: any[];
         costCodes: { id: string; name: string; code: string }[];
         costTypes: { id: string; name: string }[];
-        teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any }[];
+        teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any; burdenRate?: any }[];
         estimates: { id: string; title: string; items: { id: string; name: string }[] }[];
-        changeOrders: { id: string; code: string; title: string; status: string }[];
+        changeOrders: { id: string; code: string; title: string; status: string; estimateId: string }[];
     };
     currentUser: { id: string; role: string; name: string };
+    companyTimeZone: string;
 }
 
 type Tab = "time" | "expenses";
 
-export default function TimeExpensesClient({ project, data, currentUser }: Props) {
+export default function TimeExpensesClient({ project, data, currentUser, companyTimeZone }: Props) {
     const [activeTab, setActiveTab] = useState<Tab>("time");
     const [showTimeModal, setShowTimeModal] = useState(false);
     const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -97,6 +98,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     teamMembers={data.teamMembers}
                     costCodes={data.costCodes}
                     currentUserId={currentUser.id}
+                    companyTimeZone={companyTimeZone}
                     changeOrders={data.changeOrders}
                     onClose={() => setShowTimeModal(false)}
                 />
@@ -107,6 +109,7 @@ export default function TimeExpensesClient({ project, data, currentUser }: Props
                     estimates={data.estimates}
                     costCodes={data.costCodes}
                     costTypes={data.costTypes}
+                    companyTimeZone={companyTimeZone}
                     changeOrders={data.changeOrders}
                     onClose={() => setShowExpenseModal(false)}
                 />

@@ -1,0 +1,1185 @@
+warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.
+Reading additional input from stdin...
+2026-07-27T21:40:11.279311Z ERROR codex_models_manager::cache: failed to load models cache: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:40:16.566157Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer resource_metadata=\"https://mcp.slack.com/.well-known/oauth-protected-resource\"" })
+2026-07-27T21:40:17.923605Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Auth(AuthorizationRequired)
+2026-07-27T21:40:18.773704Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer error=\"invalid_request\", error_description=\"No access token was provided in this request\", resource_metadata=\"https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/\"" })
+2026-07-27T21:40:28.643237Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+Get-Content : Cannot find path 
+'C:\Users\jat00\.codex\skills\.system\superpowers\6.2.0\skills\using-superpowers\SKILL.md' because it does not exist.
+At line:2 char:1
++ Get-Content -Raw 'C:\Users\jat00\.codex\skills\.system\superpowers\6. ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\Users\jat00\...powers\SKILL.md:String) [Get-Content], ItemNotFoundEx 
+   ception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+
+2026-07-27T21:40:57.036015Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+--- tracked files ---
+seed-vendor-tags.mjs
+README.md
+WORKFLOW_AUDIT.md
+VISION.md
+vercel.json
+ts_errors.txt
+tsconfig.json
+tmp-test-setup.js
+tmp-fix.js
+test-ai.mjs
+test-ai.js
+temp_portal.txt
+tailwind.config.js
+STRIPE_ESTIMATE_PAYMENT.md
+seed-templates.mjs
+seed-tags.js
+seed-lien.mjs
+QA_REPORT_2026-04-07.md
+QA_AGENT_PROMPT.md
+prisma\seed.ts
+prisma\schema.prisma.tmp
+prisma\schema.prisma
+src\proxy.ts
+scripts\verify-template-roundtrip.ts
+scripts\verify-gpt-estimate.ts
+scripts\verify-estimate-edit.ts
+scripts\verify-billing-tools.ts
+eslint.config.mjs
+src\lib\email.ts
+COGNEE_INGEST_DECISION.md
+scripts\create-indexes.ts
+scripts\vendor\README.md
+scripts\backfill-signature-storage.mjs
+scripts\fix-template-formatting.mjs
+scripts\estimate-template-seeds.ts
+scripts\download-hdri.ts
+scripts\download-assets.ts
+scripts\import-houzz.mjs
+scripts\houzz-audit.js
+scripts\time-travel-cron.mjs
+scripts\import-log-2026-04-21.json
+scripts\migrate-takeoffs.mjs
+scripts\test-field-comments-e2e.mjs
+scripts\seed-test-contract.mjs
+scripts\seed-residential-templates.mjs
+FIX_PORTALPAYBUTTON_TOTAL.md
+scripts\seed-estimate-templates.ts
+scripts\reset-signatures.mjs
+scripts\probe-deploy-columns.mjs
+CONTRACT_EDITOR_REDESIGN.md
+components.json
+compare.py
+DESIGN_SYSTEM.md
+scripts\patch-menu.js
+scripts\backfill-phone-e164.ts
+scripts\apply-pdf-contracts-schema.mjs
+scripts\apply-field-comments-schema.mjs
+scripts\apply-countersign-schema.mjs
+scripts\apply-co-countersign-schema.mjs
+scripts\add-admin.js
+scraper.py
+requirements.txt
+package.json
+package-lock.json
+OPTIMIZATIONS.md
+playwright.config.ts
+playwright.config.prod.ts
+postcss.config.js
+src\lib\budget-actions.ts
+src\lib\billing-core.ts
+src\lib\auto-grant-project-access.ts
+src\lib\auth.ts
+src\lib\anthropic.ts
+src\lib\ai-json.ts
+src\lib\ai-estimate-transform.ts
+src\lib\actions.ts
+src\lib\crypto.ts
+qa-report\trace\xtermModule.DYP7pi_n.css
+qa-report\trace\uiMode.Vipi55dB.js
+qa-report\trace\uiMode.html
+src\lib\contract-styles.ts
+qa-report\trace\uiMode.Btcz36p_.css
+src\lib\contract-finalize.ts
+qa-report\trace\sw.bundle.js
+src\lib\company-timezone.ts
+qa-report\trace\snapshot.html
+src\lib\co-tax.ts
+qa-report\trace\playwright-logo.svg
+src\lib\client-portal-auth.ts
+src\lib\client-actions.ts
+qa-report\trace\manifest.webmanifest
+src\lib\change-order-core.ts
+src\lib\change-order-approval.ts
+src\lib\build-pdf.ts
+src\lib\budget-math.ts
+src\lib\payments-report.ts
+src\lib\payment-reminders.ts
+src\lib\payment-outbox.ts
+src\lib\payment-notifications.ts
+src\lib\open-invoices-report.ts
+src\lib\office-task-utils.ts
+src\lib\mobile-auth.ts
+src\lib\merge-fields.ts
+src\lib\letterhead.ts
+src\lib\lead-note-actions.ts
+src\lib\lead-drive.ts
+src\lib\lead-access.ts
+src\lib\integration-store.ts
+cloner.py
+CLAUDE.md
+check-settings.mjs
+bun.lock
+AGENT_CONTEXT.md
+qa-report\trace\index.html
+qa-report\trace\index.CzXZzn5A.css
+qa-report\trace\index.C5466mMT.js
+qa-report\trace\defaultSettingsView.B4dS75f0.css
+qa-report\trace\codicon.DCmgc-ay.ttf
+qa-report\trace\codeMirrorModule.DYBRYzYX.css
+next.config.ts
+prisma\migrations\sprint5_baseline\migration.sql
+src\lib\gmail-client.ts
+src\lib\global-tracker-report.ts
+src\lib\geocode.ts
+src\lib\file-auth.ts
+src\lib\wa-tax.ts
+src\lib\google-drive.ts
+src\lib\gmail-sync.ts
+src\lib\utils.ts
+src\lib\gpt-estimate.ts
+src\lib\tx-retry.ts
+src\lib\transactions-report.ts
+src\lib\time-expense-core.ts
+src\lib\time-expense-actions.ts
+src\lib\time-billing-report.ts
+src\lib\tax-cert.ts
+src\lib\supabase.ts
+src\lib\subcontractor-actions.ts
+src\lib\sub-portal-auth.ts
+src\lib\sales-tax-report.ts
+src\lib\report-utils.ts
+src\lib\quickbooks.ts
+src\lib\quickbooks-payments.ts
+src\lib\project-status.ts
+src\lib\project-match.ts
+src\lib\project-files.ts
+src\lib\prisma.ts
+src\lib\prisma-helpers.ts
+src\lib\portal-auth.ts
+src\lib\phone.ts
+src\lib\permissions.ts
+src\lib\pdf.ts
+src\lib\pdf-richtext.ts
+src\lib\payouts-report.ts
+src\lib\staff-status.ts
+src\lib\sms.ts
+src\lib\signature-storage.ts
+src\lib\stripe-estimate-settlement.ts
+src\lib\stripe.ts
+skills-lock.json
+docs\TESTING.md
+src\lib\help-chat\github.ts
+qa-report\results.json
+qa-report\trace\assets\defaultSettingsView-GTWI-W_B.js
+qa-report\index.html
+qa-report\trace\assets\codeMirrorModule-DS0FLvoc.js
+extension\README.md
+extension\manifest.json
+extension\background.js
+HANDOFF.md
+public\window.svg
+public\vercel.svg
+public\next.svg
+public\logo.png
+public\login-bg.png
+public\globe.svg
+public\file.svg
+PROJECT_GUIDE.md
+ProbuildTodo.md
+src\lib\studio\materials.ts
+src\lib\studio\library.ts
+src\lib\studio\geometry.ts
+src\lib\studio\doc.ts
+src\lib\studio\catalog.ts
+src\lib\studio\share-token.ts
+src\lib\studio\scan-import.ts
+src\lib\studio\render-prompt.ts
+src\lib\studio\stacking.ts
+src\lib\studio\share-url.ts
+src\lib\studio\templates.ts
+src\lib\studio\units.ts
+agent-prompts\00-README-WORKFLOW-GROUPS.md
+migrations\add_conversation_id_to_help_request.sql
+migrations\004_cost_plus_change_orders.sql
+migrations\apply_schema_b.sql
+migrations\apply_schema_help.ps1
+agent-prompts\G2-05-client-messaging.txt
+agent-prompts\G2-04-portal-visibility.txt
+agent-prompts\G2-14-clients-management.txt
+agent-prompts\G2-21-mood-boards.txt
+src\lib\studio\usdz-generator.ts
+migrations\phase2b_client_message_read_at.sql
+migrations\phase1_dedup_leads.sql
+migrations\payment_reminders.sql
+migrations\apply_schema_help.sql
+migrations\session10_float_to_decimal.sql
+migrations\phase2_unified_messaging.sql
+migrations\session10_friendly_ids_and_integration.sql
+agent-prompts\G3-06-subcontractor-portal.txt
+src\app\globals.css
+src\app\favicon.ico
+agent-prompts\G3-07-sub-messaging.txt
+e2e\stripe-estimate-mirror.spec.ts
+e2e\reconcile-to-qbo.spec.ts
+e2e\quality-gate.spec.ts
+e2e\qa-timeclock-expenses.spec.ts
+e2e\qa-settings-company.spec.ts
+e2e\qa-schedule-tasks.spec.ts
+e2e\qa-navigation-audit.spec.ts
+e2e\qa-lead-messaging.spec.ts
+e2e\qa-lead-estimate-invoice.spec.ts
+e2e\qa-help-chat.spec.ts
+e2e\qa-client-portal.spec.ts
+e2e\prod-auth.setup.ts
+e2e\portal-schedule-calendar.spec.ts
+e2e\money-pipeline.spec.ts
+lib\db\types.ts
+lib\db\schema.ts
+src\app\icon.png
+agent-prompts\G3-08-certificate-vault.txt
+agent-prompts\G4-10-change-orders.txt
+docs\screenshots\timeline.png
+docs\screenshots\leads.png
+docs\screenshots\estimateform.png
+docs\screenshots\dashboard.png
+docs\leads-snapshot.txt
+docs\houzz-audit.md
+docs\houzz-api-calls.md
+docs\dashboard-snapshot.txt
+docs\dashboard-final.txt
+docs\CONTRACTS.md
+e2e\data.setup.ts
+e2e\coverage-expansion.spec.ts
+e2e\cost-plus-change-order.spec.ts
+e2e\auth.setup.ts
+e2e\auth-status.spec.ts
+e2e\estimate-editor.spec.ts
+e2e\deck-stacking.spec.ts
+e2e\financial-action-auth.spec.ts
+e2e\full-workflow.spec.ts
+
+2026-07-27T21:41:28.276552Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.6 seconds
+Output:
+--- expense ---
+Get-Content : An object at the specified path src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx does not 
+exist, or has been filtered by the -Include or -Exclude parameter.
+At line:2 char:8
++ $lines=Get-Content 'src/app/projects/[id]/time-expenses/NewTimeEntryM ...
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (System.String[]:String[]) [Get-Content], Exception
+    + FullyQualifiedErrorId : ItemNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+Cannot index into a null array.
+At line:2 char:81
++ ... cts/[id]/time-expenses/NewTimeEntryModal.tsx'; $lines[0..180]; Write- ...
++                                                    ~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : NullArray
+ 
+Get-Content : An object at the specified path src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx does not 
+exist, or has been filtered by the -Include or -Exclude parameter.
+At line:2 char:136
++ ... --'; $lines=Get-Content 'src/app/projects/[id]/time-expenses/NewExpen ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (System.String[]:String[]) [Get-Content], Exception
+    + FullyQualifiedErrorId : ItemNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+Cannot index into a null array.
+At line:2 char:212
++ ... projects/[id]/time-expenses/NewExpenseEntryModal.tsx'; $lines[0..330]
++                                                            ~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : NullArray
+ 
+
+2026-07-27T21:42:22.642862Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:42:59.681323Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:43:03.555120Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:43:08.282598Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:43:26.591433Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.1 seconds
+Output:
+Failed to write file C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\docs\superpowers\plans\2026-07-27-pb-pipeline-004-round2-fix.md
+
+2026-07-27T21:43:44.558353Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.1 seconds
+Output:
+Failed to write file C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\docs\superpowers\plans\2026-07-27-pb-pipeline-004-round2-fix.md
+
+2026-07-27T21:43:56.649650Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to read file to update C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\e2e\cost-plus-change-order.spec.ts: failed to prepare fs sandbox: failed to prepare windows sandbox wrapper: windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed
+2026-07-27T21:45:23.486082Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:45:31.962635Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 1.4 seconds
+Output:
+
+failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.
+
+2026-07-27T21:45:32.086515Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:45:36.765453Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:45:50.331563Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+RED G3: time modal is not timezone-aware
+At line:2 char:247
++ ... meFormat') { throw 'RED G3: time modal is not timezone-aware' }; if ( ...
++                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (RED G3: time modal is not timezone-aware:String) [], RuntimeException
+    + FullyQualifiedErrorId : RED G3: time modal is not timezone-aware
+ 
+
+2026-07-27T21:45:50.331654Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+RED G2: receipt request-generation guard is missing
+At line:2 char:155
++ ... eration') { throw 'RED G2: receipt request-generation guard is missin ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (RED G2: receipt...uard is missing:String) [], RuntimeException
+    + FullyQualifiedErrorId : RED G2: receipt request-generation guard is missing
+ 
+
+2026-07-27T21:45:50.458077Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:45:56.134845Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+RED G2: receipt request-generation guard is missing
+At line:2 char:155
++ ... eration') { throw 'RED G2: receipt request-generation guard is missin ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (RED G2: receipt...uard is missing:String) [], RuntimeException
+    + FullyQualifiedErrorId : RED G2: receipt request-generation guard is missing
+ 
+
+2026-07-27T21:45:56.273402Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:46:01.396646Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+RED G3: time modal is not timezone-aware
+At line:2 char:247
++ ... meFormat') { throw 'RED G3: time modal is not timezone-aware' }; if ( ...
++                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (RED G3: time modal is not timezone-aware:String) [], RuntimeException
+    + FullyQualifiedErrorId : RED G3: time modal is not timezone-aware
+ 
+
+2026-07-27T21:46:01.520351Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:46:04.488623Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+RED G1: split milestone does not carry dueDate
+At line:2 char:105
++ ... .dueDate') { throw 'RED G1: split milestone does not carry dueDate' }
++                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (RED G1: split m...t carry dueDate:String) [], RuntimeException
+    + FullyQualifiedErrorId : RED G1: split milestone does not carry dueDate
+ 
+
+2026-07-27T21:46:04.621661Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:47:37.365732Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.5 seconds
+Output:
+At line:37 char:70
++ $raw = [System.IO.File]::ReadAllText((Join-Path (Get-Location) $path)
++                                                                      ~
+Missing ')' in method call.
+At line:38 char:1
++ $eol = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
++ ~~~~
+Unexpected token '$eol' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : MissingEndParenthesisInMethodCall
+ 
+
+2026-07-27T21:48:26.108890Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.6 seconds
+Output:
+Expected text not found in src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx
+At line:10 char:38
++ ...  $text.Contains($oldLf)) { throw "Expected text not found in $Path" }
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (Expected text n...eEntryModal.tsx:String) [], RuntimeException
+    + FullyQualifiedErrorId : Expected text not found in src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx
+ 
+
+2026-07-27T21:48:26.146161Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:48:30.307545Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:48:47.607669Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.5 seconds
+Output:
+At line:10 char:72
++ ... .Contains($oldLf)) { throw "Expected text not found in $Path: [$Old]" ...
++                                                            ~~~~~~
+Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to 
+delimit the name.
+At line:31 char:48
++ $oldImport = "import { formatCurrency } from \"@/lib/utils\";`n`ninte ...
++                                                ~
+Unrecognized token in source text.
+At line:31 char:48
++ $oldImport = "import { formatCurrency } from \"@/lib/utils\";`n`ninte ...
++                                                ~
+Unexpected token '@' in expression or statement.
+At line:32 char:48
++ $newImport = "import { formatCurrency } from \"@/lib/utils\";`n`n$tod ...
++                                                ~
+Unrecognized token in source text.
+At line:32 char:48
++ $newImport = "import { formatCurrency } from \"@/lib/utils\";`n`n$tod ...
++                                                ~
+Unexpected token '@' in expression or statement.
+At line:34 char:47
++ $oldImport = "import { createExpense } from \"@/lib/time-expense-acti ...
++                                               ~
+Unrecognized token in source text.
+At line:34 char:47
++ $oldImport = "import { createExpense } from \"@/lib/time-expense-acti ...
++                                               ~
+Unexpected token '@' in expression or statement.
+At line:35 char:47
++ $newImport = "import { createExpense } from \"@/lib/time-expense-acti ...
++                                               ~
+Unrecognized token in source text.
+At line:35 char:47
++ $newImport = "import { createExpense } from \"@/lib/time-expense-acti ...
++                                               ~
+Unexpected token '@' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidVariableReferenceWithDrive
+ 
+
+2026-07-27T21:48:47.750475Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:49:04.959675Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.6 seconds
+Output:
+Expected text not found in src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx: [    currentUserId: string;\n    
+changeOrders:]
+At line:10 char:38
++ ... tains($oldLf)) { throw "Expected text not found in ${Path}: [$Old]" }
++                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (Expected text n... changeOrders:]:String) [], RuntimeException
+    + FullyQualifiedErrorId : Expected text not found in src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx: [  
+      currentUserId: string;\n    changeOrders:]
+ 
+
+2026-07-27T21:49:04.989365Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:49:09.517961Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:49:47.975046Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.5 seconds
+Output:
+At line:9 char:77
++ ... place('from "@/lib/time-expense-actions";\nimport', "from \"@/lib/tim ...
++                                                                 ~
+Unrecognized token in source text.
+At line:9 char:77
++ ... eplace('from "@/lib/time-expense-actions";\nimport', "from \"@/lib/ti ...
++                                                                  ~
+Missing ')' in method call.
+At line:9 char:77
++ ... place('from "@/lib/time-expense-actions";\nimport', "from \"@/lib/tim ...
++                                                                 ~
+Unexpected token '@' in expression or statement.
+At line:9 char:115
++ ... e-actions";\nimport', "from \"@/lib/time-expense-actions\";`nimport")
++                                                                         ~
+Unexpected token ')' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : UnrecognizedToken
+ 
+
+2026-07-27T21:50:07.607944Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.2 seconds
+Output:
+
+2026-07-27T21:51:13.488710Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 2.4 seconds
+Output:
+Linting 12 changed files
+e2e/cost-plus-change-order.spec.ts
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx
+src/app/projects/[id]/time-expenses/TimeExpensesClient.tsx
+src/app/projects/[id]/time-expenses/TimeTab.tsx
+src/app/projects/[id]/time-expenses/page.tsx
+src/lib/actions.ts
+src/lib/billing-core.ts
+src/lib/change-order-core.ts
+src/lib/company-timezone.ts
+src/lib/time-expense-actions.ts
+src/lib/time-expense-core.ts
+warning: in the working copy of 'e2e/cost-plus-change-order.spec.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/company-timezone.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/time-expense-core.ts', LF will be replaced by CRLF the next time Git touches it
+
+Oops! Something went wrong! :(
+
+ESLint: 9.39.4
+
+No files matching the pattern "e2e/cost-plus-change-order.spec.ts src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx src/app/projects/[id]/time-expenses/TimeExpensesClient.tsx src/app/projects/[id]/time-expenses/TimeTab.tsx src/app/projects/[id]/time-expenses/page.tsx src/lib/actions.ts src/lib/billing-core.ts src/lib/change-order-core.ts src/lib/company-timezone.ts src/lib/time-expense-actions.ts src/lib/time-expense-core.ts" were found.
+Please check for typing mistakes in the pattern.
+
+
+2026-07-27T21:51:19.538477Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 2.2 seconds
+Output:
+warning: in the working copy of 'e2e/cost-plus-change-order.spec.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/company-timezone.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/time-expense-core.ts', LF will be replaced by CRLF the next time Git touches it
+
+Oops! Something went wrong! :(
+
+ESLint: 9.39.4
+
+No files matching the pattern "e2e/cost-plus-change-order.spec.ts src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx src/app/projects/[id]/time-expenses/TimeExpensesClient.tsx src/app/projects/[id]/time-expenses/TimeTab.tsx src/app/projects/[id]/time-expenses/page.tsx src/lib/actions.ts src/lib/billing-core.ts src/lib/change-order-core.ts src/lib/company-timezone.ts src/lib/time-expense-actions.ts src/lib/time-expense-core.ts" were found.
+Please check for typing mistakes in the pattern.
+
+
+2026-07-27T21:51:32.406034Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:51:43.544165Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 4.2 seconds
+Output:
+
+Running 52 tests using 1 worker
+
+node:internal/child_process:421
+    throw new ErrnoException(err, 'spawn');
+          ^
+
+Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:421:11)
+    at spawn (node:child_process:796:9)
+    at Object.fork (node:child_process:174:10)
+    at WorkerHost.startRunner (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\node_modules\playwright\lib\runner\processHost.js:54:49)
+    at WorkerHost.start (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\node_modules\playwright\lib\runner\workerHost.js:66:23)
+    at Dispatcher._runJobInWorker (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\node_modules\playwright\lib\runner\dispatcher.js:101:20) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawn'
+}
+
+Node.js v24.12.0
+
+2026-07-27T21:51:43.672428Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:52:02.325631Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:53:12.377035Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Total output lines: 805
+Output:
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:3: trailing whitespace.
++import { useRef, useState } from "react";
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:6: trailing whitespace.
++function todayInTimeZone(timeZone: string): string {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:7: trailing whitespace.
++    const parts = new Intl.DateTimeFormat("en-US", {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:8: trailing whitespace.
++        timeZone,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:9: trailing whitespace.
++        year: "numeric",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:10: trailing whitespace.
++        month: "2-digit",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:11: trailing whitespace.
++        day: "2-digit",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:12: trailing whitespace.
++    }).formatToParts(new Date());
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:13: trailing whitespace.
++    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:14: trailing whitespace.
++    return `${values.year}-${values.month}-${values.day}`;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:15: trailing whitespace.
++}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:20: trailing whitespace.
++    costTypes: { id: string; name: string }[];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:21: trailing whitespace.
++    companyTimeZone: string;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:22: trailing whitespace.
++    changeOrders: { id: string; code: string; title: string; estimateId: string }[];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:26: trailing whitespace.
++export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, companyTimeZone, changeOrders, onClose }: Props) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:34: trailing whitespace.
++    const [date, setDate] = useState(() => todayInTimeZone(companyTimeZone));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:35: trailing whitespace.
++    const [description, setDescription] = useState("");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:36: trailing whitespace.
++    const [changeOrderId, setChangeOrderId] = useState("");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:37: trailing whitespace.
++    const [isBillable, setIsBillable] = useState(true);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:38: trailing whitespace.
++    const [receiptFile, setReceiptFile] = useState<File | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:39: trailing whitespace.
++    const [receiptFileId, setReceiptFileId] = useState<string | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:41: trailing whitespace.
++    const [receiptUploadError, setReceiptUploadError] = useState<string | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:42: trailing whitespace.
++    const receiptRequestGeneration = useRef(0);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:47: trailing whitespace.
++    function clearReceipt() {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:48: trailing whitespace.
++        receiptRequestGeneration.current += 1;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:49: trailing whitespace.
++        setReceiptFile(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:50: trailing whitespace.
++        setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:51: trailing whitespace.
++        setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:52: trailing whitespace.
++        setOcrLoading(false);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:53: trailing whitespace.
++        const input = document.getElementById("receipt-upload") as HTMLInputElement | null;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:54: trailing whitespace.
++        if (input) input.value = "";
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:55: trailing whitespace.
++    }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:56: trailing whitespace.
++
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:58: trailing whitespace.
++        const requestToken = ++receiptRequestGeneration.current;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:59: trailing whitespace.
++        const isCurrentRequest = () => receiptRequestGeneration.current === requestToken;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:61: trailing whitespace.
++        setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:62: trailing whitespace.
++        setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:65: trailing whitespace.
++            try {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:66: trailing whitespace.
++                const formData = new FormData();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:67: trailing whitespace.
++                formData.append("file", file);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:68: trailing whitespace.
++                formData.append("projectId", projectId);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:69: trailing whitespace.
++                const res = await fetch("/api/receipts/parse", { method: "POST", body: formData });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:70: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:71: trailing whitespace.
++                if (res.ok) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:72: trailing whitespace.
++                    const result = await res.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:73: trailing whitespace.
++                    if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:74: trailing whitespace.
++                    if (result.vendor) setVendor(result.vendor);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:75: trailing whitespace.
++                    if (result.total) setAmount(String(result.total));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:76: trailing whitespace.
++                    if (result.date) setDate(result.date);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:77: trailing whitespace.
++                    if (result.items?.length) setDescription(result.items.map((item: any) => item.description).filter(Boolean).join(", "));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:78: trailing whitespace.
++                    toast.success("Receipt scanned successfully");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:79: trailing whitespace.
++                } else {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:80: trailing whitespace.
++                    toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:81: trailing whitespace.
++                }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:82: trailing whitespace.
++            } catch {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:83: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:84: trailing whitespace.
++                toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:85: trailing whitespace.
++            }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:87: trailing whitespace.
++            if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:88: trailing whitespace.
++            try {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:89: trailing whitespace.
++                const signRes = await fetch("/api/files/signed-upload", {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:90: trailing whitespace.
++                    method: "POST",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:91: trailing whitespace.
++                    headers: { "Content-Type": "application/json" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:92: trailing whitespace.
++                    body: JSON.stringify({
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:93: trailing whitespace.
++                        projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:94: trailing whitespace.
++                        visibility: "financial",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:95: trailing whitespace.
++                        files: [{ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream" }],
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:96: trailing whitespace.
++                    }),
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:97: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:98: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:99: trailing whitespace.
++                const signData = await signRes.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:100: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:101: trailing whitespace.
++                if (!signRes.ok || !signData.uploads?.[0]) throw new Error(signData.error || "Receipt upload could not be prepared");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:102: trailing whitespace.
++                const upload = signData.uploads[0];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:103: trailing whitespace.
++                const uploadRes = await fetch(upload.signedUrl, {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:104: trailing whitespace.
++                    method: "PUT",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:105: trailing whitespace.
++                    headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:106: trailing whitespace.
++                    body: file,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:107: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:108: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:109: trailing whitespace.
++                if (!uploadRes.ok) throw new Error("Receipt storage upload failed");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:110: trailing whitespace.
++                const registerRes = await fetch("/api/files/register", {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:111: trailing whitespace.
++                    method: "POST",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:112: trailing whitespace.
++                    headers: { "Content-Type": "application/json" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:113: trailing whitespace.
++                    body: JSON.stringify({ files: [{
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:114: trailing whitespace.
++                        name: upload.name,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:115: trailing whitespace.
++                        url: upload.publicUrl,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:116: trailing whitespace.
++                        size: upload.size,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:117: trailing whitespace.
++                        mimeType: upload.mimeType,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:118: trailing whitespace.
++                        projectId: upload.projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:119: trailing whitespace.
++                        visibility: upload.visibility,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:120: trailing whitespace.
++                    }] }),
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:121: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:122: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:123: trailing whitespace.
++                const registered = await registerRes.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:124: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:125: trailing whitespace.
++                if (!registerRes.ok || !registered.files?.[0]?.id) throw new Error(registered.error || "Receipt record could not be saved");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:126: trailing whitespace.
++                setReceiptFileId(registered.files[0].id);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:127: trailing whitespace.
++                setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:128: trailing whitespace.
++            } catch (err) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:129: trailing whitespace.
++                if (!isCurrentRequest()) return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:130: trailing whitespace.
++                const message = err instanceof Error ? err.message : "Receipt attachment failed";
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:131: trailing whitespace.
++                setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:132: trailing whitespace.
++                setReceiptUploadError(message);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:133: trailing whitespace.
++                toast.error("Receipt attachment failed: " + message);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:134: trailing whitespace.
++            }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:136: trailing whitespace.
++            if (isCurrentRequest()) setOcrLoading(false);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:141: trailing whitespace.
++        if (!estimateId && !changeOrderId) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:149: trailing whitespace.
++        if (ocrLoading || receiptUploadError) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:150: trailing whitespace.
++            toast.error("Resolve the receipt attachment error or clear the receipt before saving");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:151: trailing whitespace.
++            return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:152: trailing whitespace.
++        }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:164: trailing whitespace.
++                projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:165: trailing whitespace.
++                changeOrderId: changeOrderId || null,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:166: trailing whitespace.
++                isBillable,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:167: trailing whitespace.
++                receiptFileId: receiptFileId || undefined,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:188: trailing whitespace.
++                    onClick={() => { if (!ocrLoading) document.getElementById("receipt-upload")?.click(); }}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:194: trailing whitespace.
++                        disabled={ocrLoading}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:198: trailing whitespace.
++                            if (f) void handleReceiptOCR(f);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:218: trailing whitespace.
++                {receiptUploadError && (
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:219: trailing whitespace.
++                    <div role="alert" className="mb-5 flex items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:220: trailing whitespace.
++                        <span>Receipt attachment failed: {receiptUploadError}</span>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:221: trailing whitespace.
++                        <button type="button" onClick={clearReceipt} className="font-semibold underline">Clear receipt</button>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:222: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:223: trailing whitespace.
++                )}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:225: trailing whitespace.
++                <form onSubmit={handleSubmit} className="space-y-4">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:226: trailing whitespace.
++                    <div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:227: trailing whitespace.
++                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:228: trailing whitespace.
++                        <select value={changeOrderId} onChange={e => { const value = e.target.value; setChangeOrderId(value); setItemId(""); const changeOrder = changeOrders.find(co => co.id === value); if (changeOrder?.estimateId) setEstimateId(changeOrder.estimateId); }} className="hui-input w-full text-sm">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:229: trailing whitespace.
++                            <option value="">Project expense (no change order)</option>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:230: trailing whitespace.
++                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:231: trailing whitespace.
++                        </select>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:232: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:291: trailing whitespace.
++                    <div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:292: trailing whitespace.
++                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Description</label>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:294: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:295: trailing whitespace.
++
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:296: trailing whitespace.
++                    <label className="flex item…3965 tokens truncated…pe="checkbox" data-testid={"time-entry-select-" + entry.id} checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} disabled={Boolean(entry.changeOrder || entry.invoiceId || entry.invoicedAt)} title={entry.changeOrder ? "Change-order time must be billed through cost-plus billing" : entry.invoiceId || entry.invoicedAt ? "This time entry is already billed" : undefined} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" />
+src/app/projects/[id]/time-expenses/TimeTab.tsx:280: trailing whitespace.
++                                        <td className="px-4 py-3 text-slate-600">{entry.costCode ? `${entry.costCode.code} — ${entry.costCode.name}` : "—"}</td>
+src/app/projects/[id]/time-expenses/TimeTab.tsx:281: trailing whitespace.
++                                        <td className="px-4 py-3 text-slate-600">{entry.changeOrder ? <span>{entry.changeOrder.code} · {entry.invoiceId || entry.invoicedAt ? "Billed" : entry.isBillable ? "Billable" : "Not billable"}</span> : "—"}</td>
+src/app/projects/[id]/time-expenses/page.tsx:6: trailing whitespace.
++import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+src/app/projects/[id]/time-expenses/page.tsx:41: trailing whitespace.
++    const [data, companyTimeZone] = await Promise.all([getTimeExpenseData(projectId), resolveCompanyTimeZone()]);
+src/app/projects/[id]/time-expenses/page.tsx:51: trailing whitespace.
++                        companyTimeZone={companyTimeZone}
+src/lib/time-expense-actions.ts:6: trailing whitespace.
++import { revalidatePath } from "next/cache";
+src/lib/time-expense-actions.ts:7: trailing whitespace.
++import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+src/lib/time-expense-actions.ts:8: trailing whitespace.
++import {
+src/lib/time-expense-actions.ts:9: trailing whitespace.
++    createExpenseCore,
+src/lib/time-expense-actions.ts:10: trailing whitespace.
++    createTimeEntryFromStoredRatesCore,
+src/lib/time-expense-actions.ts:11: trailing whitespace.
++    tagExpensesToChangeOrderCore,
+src/lib/time-expense-actions.ts:12: trailing whitespace.
++    tagTimeEntriesToChangeOrderCore,
+src/lib/time-expense-actions.ts:13: trailing whitespace.
++} from "@/lib/time-expense-core";
+src/lib/time-expense-actions.ts:14: trailing whitespace.
++
+src/lib/time-expense-actions.ts:15: trailing whitespace.
++async function assertTimeExpenseProjectAccess(projectId: string) {
+src/lib/time-expense-actions.ts:16: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:17: trailing whitespace.
++    if (!user && await canUseDevAuthFallback()) return;
+src/lib/time-expense-actions.ts:18: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:19: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:20: trailing whitespace.
++    if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:21: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:30: trailing whitespace.
++    durationHours: number;
+src/lib/time-expense-actions.ts:31: trailing whitespace.
++    changeOrderId?: string | null;
+src/lib/time-expense-actions.ts:32: trailing whitespace.
++    isBillable?: boolean;
+src/lib/time-expense-actions.ts:36: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:37: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:38: trailing whitespace.
++    await assertTimeExpenseProjectAccess(data.projectId);
+src/lib/time-expense-actions.ts:39: trailing whitespace.
++    await createTimeEntryFromStoredRatesCore(data, session.user.email);
+src/lib/time-expense-actions.ts:45: trailing whitespace.
++export async function updateTimeEntry(
+src/lib/time-expense-actions.ts:55: trailing whitespace.
++) {
+src/lib/time-expense-actions.ts:56: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:57: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:58: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:59: trailing whitespace.
++    if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
+src/lib/time-expense-actions.ts:60: trailing whitespace.
++    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
+src/lib/time-expense-actions.ts:61: trailing whitespace.
++    const startTime = new Date(data.date);
+src/lib/time-expense-actions.ts:62: trailing whitespace.
++    if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
+src/lib/time-expense-actions.ts:63: trailing whitespace.
++    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true } });
+src/lib/time-expense-actions.ts:64: trailing whitespace.
++    if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:65: trailing whitespace.
++    if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+src/lib/time-expense-actions.ts:66: trailing whitespace.
++
+src/lib/time-expense-actions.ts:67: trailing whitespace.
++    const updated = await prisma.timeEntry.updateMany({
+src/lib/time-expense-actions.ts:68: trailing whitespace.
++        where: { id, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:75: trailing whitespace.
++        },
+src/lib/time-expense-actions.ts:76: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:77: trailing whitespace.
++    if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
+src/lib/time-expense-actions.ts:83: trailing whitespace.
++export async function deleteTimeEntry(id: string) {
+src/lib/time-expense-actions.ts:84: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:85: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:86: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:87: trailing whitespace.
++    const entry = await prisma.timeEntry.findUnique({ where: { id } });
+src/lib/time-expense-actions.ts:88: trailing whitespace.
++    if (!entry) throw new Error("Not found");
+src/lib/time-expense-actions.ts:89: trailing whitespace.
++    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:90: trailing whitespace.
++    if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
+src/lib/time-expense-actions.ts:91: trailing whitespace.
++
+src/lib/time-expense-actions.ts:92: trailing whitespace.
++    const deleted = await prisma.timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+src/lib/time-expense-actions.ts:93: trailing whitespace.
++    if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
+src/lib/time-expense-actions.ts:109: trailing whitespace.
++        select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
+src/lib/time-expense-actions.ts:113: trailing whitespace.
++        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
+src/lib/time-expense-actions.ts:121: trailing whitespace.
++        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:141: trailing whitespace.
++    description?: string;
+src/lib/time-expense-actions.ts:142: trailing whitespace.
++    receiptFileId?: string;
+src/lib/time-expense-actions.ts:143: trailing whitespace.
++    changeOrderId?: string | null;
+src/lib/time-expense-actions.ts:144: trailing whitespace.
++    isBillable?: boolean;
+src/lib/time-expense-actions.ts:145: trailing whitespace.
++    projectId: string;
+src/lib/time-expense-actions.ts:146: trailing whitespace.
++}) {
+src/lib/time-expense-actions.ts:147: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:148: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:149: trailing whitespace.
++    await assertTimeExpenseProjectAccess(data.projectId);
+src/lib/time-expense-actions.ts:150: trailing whitespace.
++    await createExpenseCore({
+src/lib/time-expense-actions.ts:151: trailing whitespace.
++        projectId: data.projectId,
+src/lib/time-expense-actions.ts:152: trailing whitespace.
++        estimateId: data.estimateId,
+src/lib/time-expense-actions.ts:153: trailing whitespace.
++        itemId: data.itemId,
+src/lib/time-expense-actions.ts:154: trailing whitespace.
++        costCodeId: data.costCodeId,
+src/lib/time-expense-actions.ts:155: trailing whitespace.
++        costTypeId: data.costTypeId,
+src/lib/time-expense-actions.ts:156: trailing whitespace.
++        amount: data.amount,
+src/lib/time-expense-actions.ts:157: trailing whitespace.
++        vendor: data.vendor,
+src/lib/time-expense-actions.ts:158: trailing whitespace.
++        date: data.date,
+src/lib/time-expense-actions.ts:159: trailing whitespace.
++        description: data.description,
+src/lib/time-expense-actions.ts:160: trailing whitespace.
++        receiptFileId: data.receiptFileId,
+src/lib/time-expense-actions.ts:161: trailing whitespace.
++        changeOrderId: data.changeOrderId,
+src/lib/time-expense-actions.ts:162: trailing whitespace.
++        isBillable: data.isBillable,
+src/lib/time-expense-actions.ts:163: trailing whitespace.
++    }, session.user.email);
+src/lib/time-expense-actions.ts:169: trailing whitespace.
++export async function deleteExpense(id: string, projectId: string) {
+src/lib/time-expense-actions.ts:170: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:171: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:172: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:173: trailing whitespace.
++    const expense = await prisma.expense.findUnique({
+src/lib/time-expense-actions.ts:174: trailing whitespace.
++        where: { id },
+src/lib/time-expense-actions.ts:175: trailing whitespace.
++        select: { invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+src/lib/time-expense-actions.ts:176: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:177: trailing whitespace.
++    if (!expense || expense.estimate.projectId !== projectId || !canAccessProject(user, expense.estimate.projectId)) {
+src/lib/time-expense-actions.ts:178: trailing whitespace.
++        throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:179: trailing whitespace.
++    }
+src/lib/time-expense-actions.ts:180: trailing whitespace.
++    if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
+src/lib/time-expense-actions.ts:181: trailing whitespace.
++
+src/lib/time-expense-actions.ts:182: trailing whitespace.
++    const deleted = await prisma.expense.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+src/lib/time-expense-actions.ts:183: trailing whitespace.
++    if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
+src/lib/time-expense-actions.ts:189: trailing whitespace.
++export async function deleteExpenses(
+src/lib/time-expense-actions.ts:197: trailing whitespace.
++    const expenses = await prisma.expense.findMany({
+src/lib/time-expense-actions.ts:198: trailing whitespace.
++        where: { id: { in: ids } },
+src/lib/time-expense-actions.ts:199: trailing whitespace.
++        select: { id: true, invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+src/lib/time-expense-actions.ts:200: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:201: trailing whitespace.
++
+src/lib/time-expense-actions.ts:202: trailing whitespace.
++    const allowed = expenses.filter(
+src/lib/time-expense-actions.ts:203: trailing whitespace.
++        e => !e.invoiceId && !e.invoicedAt && e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
+src/lib/time-expense-actions.ts:212: trailing whitespace.
++    const result = await prisma.expense.deleteMany({
+src/lib/time-expense-actions.ts:213: trailing whitespace.
++        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:221: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:222: trailing whitespace.
++
+src/lib/time-expense-actions.ts:223: trailing whitespace.
++export async function tagTimeEntriesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+src/lib/time-expense-actions.ts:224: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:225: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:226: trailing whitespace.
++    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+src/lib/time-expense-actions.ts:227: trailing whitespace.
++    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+src/lib/time-expense-actions.ts:228: trailing whitespace.
++    await assertTimeExpenseProjectAccess(target.projectId);
+src/lib/time-expense-actions.ts:229: trailing whitespace.
++    const result = await tagTimeEntriesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+src/lib/time-expense-actions.ts:230: trailing whitespace.
++    revalidatePath(`/projects/${projectId}/time-expenses`);
+src/lib/time-expense-actions.ts:231: trailing whitespace.
++    return result;
+src/lib/time-expense-actions.ts:232: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:233: trailing whitespace.
++
+src/lib/time-expense-actions.ts:234: trailing whitespace.
++export async function tagExpensesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+src/lib/time-expense-actions.ts:235: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:236: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:237: trailing whitespace.
++    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+src/lib/time-expense-actions.ts:238: trailing whitespace.
++    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+src/lib/time-expense-actions.ts:239: trailing whitespace.
++    await assertTimeExpenseProjectAccess(target.projectId);
+src/lib/time-expense-actions.ts:240: trailing whitespace.
++    const result = await tagExpensesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+src/lib/time-expense-actions.ts:241: trailing whitespace.
++    revalidatePath(`/projects/${projectId}/time-expenses`);
+src/lib/time-expense-actions.ts:242: trailing whitespace.
++    return result;
+src/lib/time-expense-actions.ts:243: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:247: trailing whitespace.
++export async function getTimeEntries(projectId: string) {
+src/lib/time-expense-actions.ts:248: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:252: trailing whitespace.
++        include: {
+src/lib/time-expense-actions.ts:253: trailing whitespace.
++            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
+src/lib/time-expense-actions.ts:254: trailing whitespace.
++            costCode: { select: { id: true, name: true, code: true } },
+src/lib/time-expense-actions.ts:255: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:262: trailing whitespace.
++export async function getExpenses(projectId: string) {
+src/lib/time-expense-actions.ts:263: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:267: trailing whitespace.
++        include: {
+src/lib/time-expense-actions.ts:270: trailing whitespace.
++            item: { select: { id: true, name: true } },
+src/lib/time-expense-actions.ts:271: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:279: trailing whitespace.
++export async function getTimeExpenseData(projectId: string) {
+src/lib/time-expense-actions.ts:280: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:281: trailing whitespace.
++    const timeEntries = await prisma.timeEntry.findMany({
+src/lib/time-expense-actions.ts:284: trailing whitespace.
++            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
+src/lib/time-expense-actions.ts:285: trailing whitespace.
++            costCode: { select: { id: true, name: true, code: true } },
+src/lib/time-expense-actions.ts:286: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:296: trailing whitespace.
++            item: { select: { id: true, name: true } },
+src/lib/time-expense-actions.ts:297: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:313: trailing whitespace.
++        select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true },
+src/lib/time-expense-actions.ts:317: trailing whitespace.
++    const estimates = await prisma.estimate.findMany({
+src/lib/time-expense-actions.ts:324: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:325: trailing whitespace.
++
+src/lib/time-expense-actions.ts:326: trailing whitespace.
++    const changeOrders = await prisma.changeOrder.findMany({
+src/lib/time-expense-actions.ts:327: trailing whitespace.
++        where: { projectId, pricingType: "COST_PLUS", status: { in: ["Sent", "Approved"] } },
+src/lib/time-expense-actions.ts:328: trailing whitespace.
++        select: { id: true, code: true, title: true, status: true, estimateId: true },
+src/lib/time-expense-actions.ts:329: trailing whitespace.
++        orderBy: { createdAt: "desc" },
+src/lib/time-expense-actions.ts:330: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:331: trailing whitespace.
++
+src/lib/time-expense-actions.ts:332: trailing whitespace.
++    return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates, changeOrders };
+src/lib/time-expense-actions.ts:333: trailing whitespace.
++}
+warning: in the working copy of 'e2e/cost-plus-change-order.spec.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/company-timezone.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/time-expense-core.ts', LF will be replaced by CRLF the next time Git touches it
+

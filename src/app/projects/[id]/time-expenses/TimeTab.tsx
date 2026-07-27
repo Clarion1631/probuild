@@ -85,9 +85,14 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
         });
     }
 
+    const selectableFiltered = useMemo(
+        () => filtered.filter((entry) => !entry.changeOrder && !entry.invoiceId && !entry.invoicedAt),
+        [filtered],
+    );
+
     function toggleAll() {
-        if (selectedIds.size === filtered.length) setSelectedIds(new Set());
-        else setSelectedIds(new Set(filtered.map(e => e.id)));
+        if (selectedIds.size === selectableFiltered.length) setSelectedIds(new Set());
+        else setSelectedIds(new Set(selectableFiltered.map((entry) => entry.id)));
     }
 
     async function handleDelete(id: string) {
@@ -253,7 +258,7 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
                                     <th className="px-4 py-3 text-left w-10">
-                                        <input type="checkbox" checked={selectedIds.size === filtered.length && filtered.length > 0} onChange={toggleAll} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                        <input type="checkbox" checked={selectedIds.size === selectableFiltered.length && selectableFiltered.length > 0} onChange={toggleAll} disabled={selectableFiltered.length === 0} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" title={selectableFiltered.length === 0 ? "No untagged, unbilled time entries can be invoiced" : "Select all eligible time entries"} />
                                     </th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Date</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Team Member</th>
@@ -266,9 +271,9 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {filtered.map(entry => (
-                                    <tr key={entry.id} className="hover:bg-slate-50 transition">
+                                    <tr key={entry.id} data-testid={"time-entry-row-" + entry.id} className="hover:bg-slate-50 transition">
                                         <td className="px-4 py-3">
-                                            <input type="checkbox" checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                            <input type="checkbox" data-testid={"time-entry-select-" + entry.id} checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} disabled={Boolean(entry.changeOrder || entry.invoiceId || entry.invoicedAt)} title={entry.changeOrder ? "Change-order time must be billed through cost-plus billing" : entry.invoiceId || entry.invoicedAt ? "This time entry is already billed" : undefined} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" />
                                         </td>
                                         <td className="px-4 py-3 text-slate-600 tabular-nums">{new Date(entry.startTime).toLocaleDateString()}</td>
                                         <td className="px-4 py-3 font-medium text-hui-textMain">{entry.user.name || entry.user.email}</td>
