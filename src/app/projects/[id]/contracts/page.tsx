@@ -24,7 +24,10 @@ export default async function ProjectContractsPage({ params }: { params: Promise
                 ...(linkedLeadId ? [{ leadId: linkedLeadId }] : []),
             ],
         },
-        include: { signingRecords: true },
+        // Only the record COUNT is rendered here; the Signing History modal loads full
+        // records (with resolved signature URLs) on demand. Selecting just the id keeps raw
+        // `secure:` signature paths out of the serialized page payload.
+        include: { signingRecords: { select: { id: true } } },
         orderBy: { createdAt: "desc" },
     });
 

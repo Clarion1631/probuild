@@ -28,9 +28,13 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     const status = isDevMock ? 'authenticated' : sessionStatus;
     const role = (session?.user as any)?.role;
 
+    // /clip is the bookmarklet capture popup — team-authed but rendered bare
+    // (no sidebar/header) since it opens in a 480x720 window.push chrome-less
+    // popup. Auth itself is still enforced by the page's own server-side
+    // getSessionOrDev() + redirect("/login"), same as every other team page.
     useEffect(() => {
         if (status === 'authenticated') {
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
 
             // If an authenticated user suddenly has no role, they were likely deleted.
             // Force sign out to clear the stale session so they can try again.
@@ -44,14 +48,14 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
             }
         }
         if (status === 'unauthenticated' && process.env.NODE_ENV !== 'development') { // Bypass only if NOT in development
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
+            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
             if (!isPublicRoute) {
                 router.replace('/login');
             }
         }
     }, [status, role, pathname, router, session]);
 
-    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login';
+    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
 
     if (status === 'authenticated' && !role && !isPublicRoute) {
         return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Signing out...</div>;

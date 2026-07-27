@@ -10,6 +10,15 @@ export const ALLOWED_FILE_EXTENSIONS = new Set([
     ".txt", ".rtf", ".dwg", ".dxf",
 ]);
 
+// Client-portal file uploads (two-way Design Files exchange). Narrower purpose
+// than the team allowlist above — images, PDFs, CAD, common office docs, and
+// zip archives (designers often send a zipped folder of files) — but adds
+// .zip, which the team allowlist doesn't need.
+export const PORTAL_UPLOAD_EXTENSIONS = new Set([
+    ...ALLOWED_FILE_EXTENSIONS,
+    ".zip",
+]);
+
 const MIME_BY_EXTENSION: Record<string, string> = {
     ".pdf": "application/pdf",
     ".doc": "application/msword",

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Users, Building, FileText, Anchor, Shield } from "lucide-react";
+import { Users, Building, FileText, Anchor, Shield, ShoppingBag } from "lucide-react";
 import ErrorBoundary from "@/components/ErrorBoundary";
 
 export default function CompanyLayout({ children }: { children: React.ReactNode }) {
@@ -26,6 +26,7 @@ export default function CompanyLayout({ children }: { children: React.ReactNode 
                 { name: "Cost Codes & Phases", href: "/company/cost-codes", icon: FileText },
                 { name: "My Items", href: "/company/my-items", icon: FileText },
                 { name: "Catalogs", href: "/company/catalogs", icon: FileText },
+                { name: "Product Library", href: "/company/product-library", icon: ShoppingBag },
             ]
         }
     ];
