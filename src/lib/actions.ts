@@ -9714,40 +9714,27 @@ export async function decideSelectionProposal(proposalId: string, input: {
     const safeImageUrl = safeUrlOrNull(proposal.imageUrl);
     const safeVendorUrl = safeUrlOrNull(proposal.vendorUrl);
 
-    // Validate board/category ownership BEFORE the transaction (not inside it —
-    // no point opening a transaction just to discover the board doesn't belong
-    // to this project). A staff user scoped to project A could otherwise pass a
-    // boardId from project B and write a SelectionOption into another
-    // project's board.
-    let validCategoryId: string | null = null;
-    if (input.action === "approve" && input.boardId && input.categoryId) {
-        const board = await prisma.selectionBoard.findFirst({
-            where: { id: input.boardId, projectId: proposal.projectId },
-            select: { id: true },
-        });
-        if (board) {
-            const category = await prisma.selectionCategory.findFirst({
-                where: { id: input.categoryId, boardId: input.boardId },
-                select: { id: true },
-            });
-            if (category) validCategoryId = category.id;
-        }
-    }
-
     let productId: string | null = null;
     let favoriteCreated = false;
     let optionCreated = false;
     let alreadyDecided = false;
 
-    // CAS claim + every dependent write (ProductLibraryItem, favorite,
-    // SelectionOption, the proposal's own productId backfill) run inside one
-    // transaction so a mid-sequence failure can't leave a half-approved
-    // proposal (e.g. status flipped to Approved but no ProductLibraryItem).
+    // CAS claim + board/category validation + every dependent write
+    // (ProductLibraryItem, favorite, SelectionOption, the proposal's own
+    // productId/boardId/categoryId backfill) run inside one transaction, so:
+    //   - a mid-sequence failure can't leave a half-approved proposal (e.g.
+    //     status flipped to Approved but no ProductLibraryItem), and
+    //   - the board/category ownership check reads the SAME transactional
+    //     snapshot the writes commit against — validating outside the
+    //     transaction would leave a TOCTOU window where the board/category
+    //     could be deleted or reassigned between the check and the write.
     await prisma.$transaction(async (tx) => {
         // Status CAS: only a Pending proposal transitions. A duplicate decide
         // call (double-click, retried request) matches zero rows and no-ops
         // instead of re-deciding or minting a second ProductLibraryItem/
-        // favorite/option.
+        // favorite/option. boardId/categoryId are intentionally NOT set here —
+        // they're only known-valid once the check below runs, inside this same
+        // transaction, and are written in the follow-up update further down.
         const claim = await tx.selectionProposal.updateMany({
             where: { id: proposalId, status: "Pending" },
             data: {
@@ -9757,8 +9744,6 @@ export async function decideSelectionProposal(proposalId: string, input: {
                 decidedAt,
                 ...(input.action === "approve" ? {
                     price: input.price ?? proposal.price ?? null,
-                    boardId: input.boardId || null,
-                    categoryId: validCategoryId,
                 } : {}),
             },
         });
@@ -9768,6 +9753,37 @@ export async function decideSelectionProposal(proposalId: string, input: {
         }
 
         if (input.action !== "approve") return;
+
+        // Validate board/category ownership INSIDE the transaction (after the
+        // claim, same isolated snapshot the writes below use). A staff user
+        // scoped to project A could otherwise pass a boardId from project B
+        // and write a SelectionOption into another project's board. Only ever
+        // persist boardId/categoryId on the proposal when BOTH were supplied
+        // AND validated — never the raw, unvalidated input.boardId. If the
+        // caller explicitly asked to link a board+category and that link
+        // doesn't check out, abort the whole decision (throwing here rolls
+        // back the CAS claim above too, so the proposal stays Pending) rather
+        // than silently approving without the link.
+        let validBoardId: string | null = null;
+        let validCategoryId: string | null = null;
+        if (input.boardId && input.categoryId) {
+            const board = await tx.selectionBoard.findFirst({
+                where: { id: input.boardId, projectId: proposal.projectId },
+                select: { id: true },
+            });
+            if (!board) {
+                throw new Error("That board doesn't belong to this project — refresh and try again.");
+            }
+            const category = await tx.selectionCategory.findFirst({
+                where: { id: input.categoryId, boardId: input.boardId },
+                select: { id: true },
+            });
+            if (!category) {
+                throw new Error("That category doesn't belong to the selected board — refresh and try again.");
+            }
+            validBoardId = board.id;
+            validCategoryId = category.id;
+        }
 
         const product = await tx.productLibraryItem.create({
             data: {
@@ -9784,7 +9800,7 @@ export async function decideSelectionProposal(proposalId: string, input: {
 
         await tx.selectionProposal.update({
             where: { id: proposalId },
-            data: { productId: product.id },
+            data: { productId: product.id, boardId: validBoardId, categoryId: validCategoryId },
         });
 
         // Default true per spec — approving a suggestion pins it to the

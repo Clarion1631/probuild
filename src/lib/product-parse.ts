@@ -24,6 +24,9 @@ const FETCH_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024; // ~2MB cap, cumulative across the whole redirect chain
 const MAX_REDIRECTS = 5;
 const ALLOWED_PORTS = new Set([80, 443]);
+// Any URL we'd fetch, follow, or hand back to a caller (vendorUrl, imageUrl) —
+// an absurdly long string is never a legitimate product/image link.
+const MAX_URL_LEN = 2000;
 const BROWSER_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -168,13 +171,20 @@ const IPV6_BLOCKED_RANGES: Array<[string, number]> = [
 ];
 
 function isBlockedIPv6(ip: string): boolean {
+    // Fail closed: ANY IPv6 string that doesn't parse to a definite 128-bit
+    // value is treated as blocked, never as "allowed" — this function has no
+    // implicit-allow fallthrough for an unrecognized/unparseable form.
     const big = ipv6ToBigInt(ip);
-    if (big === null) return true; // fail closed
+    if (big === null) return true;
     if (big === BigInt(0)) return true; // ::
     if (big === BigInt(1)) return true; // ::1
-    if (ipv6InCidr(big, "::ffff:0:0", 96) || ipv6InCidr(big, "64:ff9b::", 96)) {
-        // IPv4-mapped (::ffff:a.b.c.d) or NAT64 (64:ff9b::a.b.c.d) — the real
-        // target is the embedded IPv4 address, so validate that instead.
+    if (
+        ipv6InCidr(big, "::ffff:0:0", 96) ||   // IPv4-mapped: ::ffff:a.b.c.d
+        ipv6InCidr(big, "64:ff9b::", 96) ||    // NAT64: 64:ff9b::a.b.c.d
+        ipv6InCidr(big, "::", 96)              // IPv4-compatible (deprecated): ::a.b.c.d
+    ) {
+        // The real target is the embedded IPv4 address in all three forms —
+        // decode it and validate that instead of the IPv6 wrapper.
         return isBlockedIPv4Int(Number(big & BigInt(0xFFFFFFFF)));
     }
     return IPV6_BLOCKED_RANGES.some(([base, len]) => ipv6InCidr(big, base, len));
@@ -194,6 +204,13 @@ function isBlockedIp(ip: string): boolean {
  * resolved here; that happens once, at actual connect time, in fetchOneHop().
  */
 export function isSafeExternalUrl(url: string): boolean {
+    // Length gate first — this is what keeps an absurdly long vendorUrl out of
+    // the returned ParsedProduct too: every caller (parseProductUrl's initial
+    // check, and guardedFetchText's per-hop re-check) already treats a false
+    // result here as "unsafe", so vendorUrl never ends up backed by a URL
+    // longer than this without ever reaching a fetch attempt.
+    if (url.length > MAX_URL_LEN) return false;
+
     let parsed: URL;
     try {
         parsed = new URL(url);
@@ -215,22 +232,59 @@ export function isSafeExternalUrl(url: string): boolean {
 // Transport: node:http/https with a validating `lookup`, manual redirects
 // =============================================================================
 
-type NodeLookupCallback = (err: NodeJS.ErrnoException | null, address: string, family: number) => void;
+/**
+ * dns.lookup-compatible function that rejects any resolved address in the
+ * blocked ranges, and otherwise hands Node the exact address(es) it
+ * validated — that's what Node actually connects to, so there's no window
+ * between "validated" and "connected to" for a rebinding DNS server to
+ * exploit.
+ *
+ * Node's `lookup` option has TWO callback shapes depending on the caller's
+ * `options.all`:
+ *   - options.all is NOT true (the historical default): callback(err, address, family) — one address.
+ *   - options.all === true: callback(err, addresses) — an array of {address, family}.
+ * Node 20+ / Next 16 enable Happy Eyeballs (`autoSelectFamily`, on by
+ * default) for http(s).request, which calls `lookup` with `{ all: true }` to
+ * get every address so it can race them per RFC 8305. An earlier version of
+ * this function always replied with the single-address shape, which broke
+ * that contract silently. This version inspects `options.all` and replies in
+ * the shape the caller asked for, in both the success and error paths.
+ * `autoSelectFamily: false` is also set on the request below as a second,
+ * independent layer — but this function is correct either way.
+ */
+function validatingLookup(
+    hostname: string,
+    optionsOrCallback: dns.LookupAllOptions | dns.LookupOneOptions | ((...args: any[]) => void),
+    maybeCallback?: (...args: any[]) => void,
+): void {
+    const hasExplicitOptions = typeof optionsOrCallback !== "function";
+    const options = hasExplicitOptions ? (optionsOrCallback as dns.LookupAllOptions | dns.LookupOneOptions) : undefined;
+    const callback = (hasExplicitOptions ? maybeCallback : optionsOrCallback) as (...args: any[]) => void;
+    const wantsAll = !!(options && (options as dns.LookupAllOptions).all === true);
 
-/** dns.lookup-compatible function that rejects any resolved address in the
- * blocked ranges, and otherwise hands Node the exact address it validated —
- * that address is what Node actually connects to, so there's no window
- * between "validated" and "connected to" for a rebinding DNS server to exploit. */
-function validatingLookup(hostname: string, options: unknown, callback: NodeLookupCallback): void {
-    const cb: NodeLookupCallback = typeof options === "function" ? (options as NodeLookupCallback) : callback;
     dns.lookup(hostname, { all: true, verbatim: true }, (err, addresses) => {
-        if (err) { cb(err, "", 4); return; }
+        if (err) {
+            wantsAll ? callback(err, []) : callback(err, "", 4);
+            return;
+        }
         const list = addresses as dns.LookupAddress[];
-        if (!list.length) { cb(new Error("DNS lookup returned no addresses"), "", 4); return; }
+        if (!list.length) {
+            const noAddrErr = new Error("DNS lookup returned no addresses");
+            wantsAll ? callback(noAddrErr, []) : callback(noAddrErr, "", 4);
+            return;
+        }
         const blocked = list.find((a) => isBlockedIp(a.address));
-        if (blocked) { cb(new Error(`Resolved address ${blocked.address} is not allowed`), "", 4); return; }
-        const chosen = list[0];
-        cb(null, chosen.address, chosen.family);
+        if (blocked) {
+            const blockedErr = new Error(`Resolved address ${blocked.address} is not allowed`);
+            wantsAll ? callback(blockedErr, []) : callback(blockedErr, "", 4);
+            return;
+        }
+        if (wantsAll) {
+            callback(null, list);
+        } else {
+            const chosen = list[0];
+            callback(null, chosen.address, chosen.family);
+        }
     });
 }
 
@@ -239,7 +293,7 @@ type HopResult =
     | { kind: "body"; text: string }
     | { kind: "fail" };
 
-function fetchOneHop(url: string, deadline: number): Promise<HopResult> {
+function fetchOneHop(url: string, deadline: number, hardDeadlineSignal: AbortSignal): Promise<HopResult> {
     return new Promise((resolve) => {
         let parsed: URL;
         try {
@@ -250,7 +304,7 @@ function fetchOneHop(url: string, deadline: number): Promise<HopResult> {
         }
 
         const timeLeft = deadline - Date.now();
-        if (timeLeft <= 0) { resolve({ kind: "fail" }); return; }
+        if (timeLeft <= 0 || hardDeadlineSignal.aborted) { resolve({ kind: "fail" }); return; }
 
         const transport = parsed.protocol === "https:" ? https : http;
         const port = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
@@ -262,20 +316,34 @@ function fetchOneHop(url: string, deadline: number): Promise<HopResult> {
             resolve(result);
         };
 
-        const req = transport.request(
-            {
-                hostname: parsed.hostname,
-                port,
-                path: `${parsed.pathname}${parsed.search}`,
-                method: "GET",
-                // Validated at actual connect time — see validatingLookup() above.
-                lookup: validatingLookup as unknown as typeof dns.lookup,
-                headers: {
-                    "User-Agent": BROWSER_USER_AGENT,
-                    Accept: "text/html,application/xhtml+xml",
-                },
-                timeout: timeLeft,
+        // `autoSelectFamily` (Happy Eyeballs opt-out) and `signal` (hard
+        // wall-clock abort — see guardedFetchText) are both valid Node
+        // http(s).request options at runtime, but the @types/node version
+        // pinned in this repo predates them, hence the `as any`.
+        const requestOptions: any = {
+            hostname: parsed.hostname,
+            port,
+            path: `${parsed.pathname}${parsed.search}`,
+            method: "GET",
+            // Validated at actual connect time — see validatingLookup() above.
+            lookup: validatingLookup as unknown as typeof dns.lookup,
+            // Defense-in-depth alongside validatingLookup()'s {all:true}
+            // support: disabling Happy Eyeballs means Node won't call
+            // `lookup` with {all:true} in the first place on this request.
+            autoSelectFamily: false,
+            headers: {
+                "User-Agent": BROWSER_USER_AGENT,
+                Accept: "text/html,application/xhtml+xml",
             },
+            // Inactivity timeout — resets on every byte received, so alone it
+            // can't stop a trickling server. The hard wall-clock cap is
+            // `signal` below (shared across every hop by the caller).
+            timeout: timeLeft,
+            signal: hardDeadlineSignal,
+        };
+
+        const req = transport.request(
+            requestOptions,
             (res) => {
                 const status = res.statusCode || 0;
                 const location = res.headers.location;
@@ -332,29 +400,48 @@ function fetchOneHop(url: string, deadline: number): Promise<HopResult> {
  * validatingLookup() above (see the SSRF guard section for why both layers
  * exist). Capped at MAX_REDIRECTS hops.
  *
+ * The deadline is enforced TWO ways: fetchOneHop's per-request `timeout` is
+ * an INACTIVITY timeout (Node resets it on every byte received, so alone it
+ * can't stop a trickling server that dribbles one byte just often enough to
+ * never go quiet). The `hardDeadline` AbortController below is the real
+ * wall-clock cap — one timer, started once here, shared across every hop via
+ * the same AbortSignal, that destroys whatever request/response is currently
+ * in-flight the moment FETCH_TIMEOUT_MS elapses, no matter how much activity
+ * it's seeing.
+ *
  * Returns null on any failure (timeout, unsafe target, too many redirects,
  * non-2xx, oversized body, network error) — never throws.
  */
 async function guardedFetchText(url: string): Promise<string | null> {
     const deadline = Date.now() + FETCH_TIMEOUT_MS;
-    let currentUrl = url;
+    const hardDeadline = new AbortController();
+    const hardDeadlineTimer = setTimeout(
+        () => hardDeadline.abort(new Error("guardedFetchText hard deadline exceeded")),
+        FETCH_TIMEOUT_MS,
+    );
 
-    for (let redirects = 0; ; redirects++) {
-        if (!isSafeExternalUrl(currentUrl)) return null;
-        if (Date.now() >= deadline) return null;
+    try {
+        let currentUrl = url;
 
-        const result = await fetchOneHop(currentUrl, deadline);
-        if (result.kind === "fail") return null;
-        if (result.kind === "redirect") {
-            if (redirects >= MAX_REDIRECTS) return null;
-            try {
-                currentUrl = new URL(result.location, currentUrl).toString();
-            } catch {
-                return null;
+        for (let redirects = 0; ; redirects++) {
+            if (!isSafeExternalUrl(currentUrl)) return null;
+            if (Date.now() >= deadline || hardDeadline.signal.aborted) return null;
+
+            const result = await fetchOneHop(currentUrl, deadline, hardDeadline.signal);
+            if (result.kind === "fail") return null;
+            if (result.kind === "redirect") {
+                if (redirects >= MAX_REDIRECTS) return null;
+                try {
+                    currentUrl = new URL(result.location, currentUrl).toString();
+                } catch {
+                    return null;
+                }
+                continue;
             }
-            continue;
+            return result.text;
         }
-        return result.text;
+    } finally {
+        clearTimeout(hardDeadlineTimer);
     }
 }
 
@@ -409,11 +496,11 @@ const MAX_PRICE = 9_999_999.99;
 /**
  * Single normalization point for every extraction path (JSON-LD, OpenGraph,
  * Gemini). Clamps string lengths, rejects a non-finite/out-of-range price,
- * drops an imageUrl that isn't a plain http(s) URL (never persist/return a
- * javascript:/data: URL pulled from a scraped page), and — if the page quoted
- * a non-USD price — nulls the price and folds the original amount/currency
- * into the description instead (no schema change for a currency field).
- * Returns null if there's no usable name.
+ * drops an imageUrl that isn't a plain http(s) URL OR is over MAX_URL_LEN
+ * (never persist/return a javascript:/data:/absurdly-long URL pulled from a
+ * scraped page), and — if the page quoted a non-USD price — nulls the price
+ * and folds the original amount/currency into the description instead (no
+ * schema change for a currency field). Returns null if there's no usable name.
  */
 function normalizeParsedProduct(raw: RawExtract): Omit<ParsedProduct, "vendorUrl"> | null {
     const name = raw.name?.trim().slice(0, MAX_NAME_LEN);
@@ -421,7 +508,8 @@ function normalizeParsedProduct(raw: RawExtract): Omit<ParsedProduct, "vendorUrl
 
     let description = raw.description?.trim().slice(0, MAX_DESCRIPTION_LEN) || undefined;
     const vendor = raw.vendor?.trim().slice(0, MAX_VENDOR_LEN) || undefined;
-    const imageUrl = raw.imageUrl && isHttpUrl(raw.imageUrl) ? raw.imageUrl : undefined;
+    const imageUrl =
+        raw.imageUrl && raw.imageUrl.length <= MAX_URL_LEN && isHttpUrl(raw.imageUrl) ? raw.imageUrl : undefined;
 
     const rawPrice =
         typeof raw.price === "number" && Number.isFinite(raw.price) && raw.price > 0 && raw.price <= MAX_PRICE
@@ -598,7 +686,14 @@ Rules:
  * {vendorUrl, name: null} so the caller can fall back to manual entry.
  */
 export async function parseProductUrl(url: string): Promise<ParsedProduct> {
-    const fallback: ParsedProduct = { vendorUrl: url, name: null };
+    // vendorUrl is a required field on ParsedProduct (not optional — every
+    // caller expects it echoed back even on total failure, e.g. to show the
+    // link the user pasted), so an over-length url can't be "nulled" the way
+    // imageUrl is above. Instead it's capped to an empty string, which every
+    // render site and persist-layer check (isHttpUrl) already treats as "no
+    // link" — an over-length URL never survives into vendorUrl either way.
+    const safeVendorUrl = url.length <= MAX_URL_LEN ? url : "";
+    const fallback: ParsedProduct = { vendorUrl: safeVendorUrl, name: null };
 
     if (!isSafeExternalUrl(url)) return fallback;
 
@@ -606,13 +701,13 @@ export async function parseProductUrl(url: string): Promise<ParsedProduct> {
     if (!html) return fallback;
 
     const jsonLd = normalizeParsedProduct(parseJsonLdProduct(html) || {});
-    if (jsonLd) return { vendorUrl: url, ...jsonLd };
+    if (jsonLd) return { vendorUrl: safeVendorUrl, ...jsonLd };
 
     const og = normalizeParsedProduct(parseOpenGraph(html) || {});
-    if (og) return { vendorUrl: url, ...og };
+    if (og) return { vendorUrl: safeVendorUrl, ...og };
 
     const gemini = normalizeParsedProduct((await parseWithGemini(html, url)) || {});
-    if (gemini) return { vendorUrl: url, ...gemini };
+    if (gemini) return { vendorUrl: safeVendorUrl, ...gemini };
 
     return fallback;
 }
