@@ -8,8 +8,16 @@ import ClipClient from "./ClipClient";
 // /clip as a public route so it skips the sidebar/header), but auth is still
 // enforced right here exactly like every other team page: no session -> normal
 // login redirect, CLIENT role -> portal.
-export default async function ClipPage(props: { searchParams: Promise<{ url?: string }> }) {
-    const { url } = await props.searchParams;
+//
+// name/price/currency/image/vendor come from the bookmarklet's in-page DOM
+// extraction (see buildBookmarkletHref in ProductLibraryClient.tsx) — when
+// present, ClipClient prefills directly from them and skips the auto
+// server-side parse call entirely, since the bookmarklet already read the
+// live page (bypassing bot walls a server fetch can't get past).
+export default async function ClipPage(props: {
+    searchParams: Promise<{ url?: string; name?: string; price?: string; currency?: string; image?: string; vendor?: string }>;
+}) {
+    const { url, name, price, currency, image, vendor } = await props.searchParams;
 
     const session = await getSessionOrDev();
     if (!session?.user) redirect("/login");
@@ -24,5 +32,15 @@ export default async function ClipPage(props: { searchParams: Promise<{ url?: st
             .map((p: any) => ({ id: p.id, name: p.name }));
     } catch {}
 
-    return <ClipClient initialUrl={url || ""} allProjects={allProjects} />;
+    return (
+        <ClipClient
+            initialUrl={url || ""}
+            initialName={name || ""}
+            initialPrice={price || ""}
+            initialCurrency={currency || ""}
+            initialImage={image || ""}
+            initialVendor={vendor || ""}
+            allProjects={allProjects}
+        />
+    );
 }

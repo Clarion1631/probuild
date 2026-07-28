@@ -680,6 +680,131 @@ Rules:
     }
 }
 
+// =============================================================================
+// Last-resort fallback: Gemini's url_context tool
+// =============================================================================
+//
+// Big retail sites (Lowe's, Home Depot, ...) sit behind Akamai/bot-wall
+// products that return a 403/challenge page to ANY non-browser fetch — ours
+// included, no matter how browser-like the User-Agent. guardedFetchText()
+// above just sees the block page (or nothing at all). Gemini's `url_context`
+// tool fetches the URL through Google's own infrastructure, which routinely
+// gets a real response where ours gets blocked. It's the true last resort:
+// slower and less precise than reading the page's own JSON-LD/OpenGraph
+// tags, so it only runs after every direct-fetch-based path has failed.
+
+const GEMINI_URL_CONTEXT_TIMEOUT_MS = 20_000;
+
+function buildUrlContextPrompt(url: string, strongParaphrase: boolean): string {
+    if (strongParaphrase) {
+        return `You have access to the url_context tool. Fetch this product page. Do NOT quote or copy any text from the page verbatim — describe everything you find entirely in your own words, as if summarizing it for a colleague who cannot see the page.
+
+URL: ${url}
+
+Return ONLY a strict JSON object with this exact shape, no other text, no markdown code fences:
+{"name": string|null, "price": number|null, "currency": string|null, "vendor": string|null, "imageUrl": string|null, "description": string|null}
+
+Rules:
+- Paraphrase everything — do not copy exact phrases from the source page.
+- "price" is the numeric list price with no currency symbol. Use null if not found.
+- "currency" is the ISO 4217 currency code (e.g. "USD"), or null if you can't tell.
+- "imageUrl" is the product's main image URL if you can identify one, otherwise null.
+- "vendor" is the store/brand name, otherwise null.`;
+    }
+    return `You have access to the url_context tool. Fetch this product page and, in your own words (do not copy sentences directly from the page), extract the product facts you find.
+
+URL: ${url}
+
+Return ONLY a strict JSON object with this exact shape, no other text, no markdown code fences:
+{"name": string|null, "price": number|null, "currency": string|null, "vendor": string|null, "imageUrl": string|null, "description": string|null}
+
+Rules:
+- "name" is the product's title/name, paraphrased in your own words if needed.
+- "price" is the numeric list price with no currency symbol (e.g. 199.00). Use null if not found.
+- "currency" is the ISO 4217 currency code (e.g. "USD"). Assume "USD" for a bare $ sign. Use null if you can't tell.
+- "vendor" is the store/brand name.
+- "imageUrl" is the product's main image URL if you can identify one, otherwise null.
+- "description" is a brief, ORIGINAL one-sentence summary of the product in your own words — not a sentence copied from the page.`;
+}
+
+type UrlContextAttempt = { text: string | null; retrievalOk: boolean; finishReason: string | null };
+
+async function callGeminiUrlContext(url: string, apiKey: string, strongParaphrase: boolean): Promise<UrlContextAttempt> {
+    const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: buildUrlContextPrompt(url, strongParaphrase) }] }],
+                tools: [{ url_context: {} }],
+                generationConfig: { temperature: 0.3 },
+            }),
+            signal: AbortSignal.timeout(GEMINI_URL_CONTEXT_TIMEOUT_MS),
+        },
+    );
+    if (!res.ok) return { text: null, retrievalOk: false, finishReason: null };
+
+    const data = await res.json();
+    const candidate = data?.candidates?.[0];
+    const finishReason: string | null = candidate?.finishReason ?? null;
+    const urlStatus = candidate?.urlContextMetadata?.urlMetadata?.[0]?.urlRetrievalStatus;
+    const retrievalOk = urlStatus === "URL_RETRIEVAL_STATUS_SUCCESS";
+    const text: string | null = candidate?.content?.parts?.[0]?.text ?? null;
+    return { text, retrievalOk, finishReason };
+}
+
+/** Gemini sometimes wraps its JSON in a ```json ... ``` (or bare ```) fence
+ * despite being asked not to — strip it before parsing, tolerantly. */
+function extractJsonFromGeminiText(text: string): any | null {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = (fenced ? fenced[1] : text).trim();
+    try {
+        return JSON.parse(candidate);
+    } catch {
+        return null;
+    }
+}
+
+async function parseWithGeminiUrlContext(url: string): Promise<RawExtract | null> {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+
+    try {
+        let attempt = await callGeminiUrlContext(url, apiKey, false);
+        // A strict "extract the facts" prompt can get the response blocked
+        // with finishReason RECITATION (Gemini refusing to emit what looks
+        // like a verbatim copy of the source page) — retry once with a
+        // prompt that leans harder into paraphrasing, then give up gracefully.
+        if (attempt.finishReason === "RECITATION" || !attempt.text) {
+            attempt = await callGeminiUrlContext(url, apiKey, true);
+        }
+        if (!attempt.retrievalOk || !attempt.text) return null;
+
+        const parsed = extractJsonFromGeminiText(attempt.text);
+        if (!parsed || typeof parsed !== "object") return null;
+
+        const name = typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : null;
+        if (!name) return null;
+
+        let imageUrl = typeof parsed.imageUrl === "string" ? parsed.imageUrl : undefined;
+        // Observed in testing: Gemini sometimes echoes the source page URL
+        // back as "the image" when it can't identify a real product photo.
+        if (imageUrl && imageUrl === url) imageUrl = undefined;
+
+        return {
+            name,
+            description: typeof parsed.description === "string" ? parsed.description : undefined,
+            imageUrl,
+            price: toNumberOrUndefined(parsed.price),
+            priceCurrency: typeof parsed.currency === "string" ? parsed.currency : undefined,
+            vendor: typeof parsed.vendor === "string" ? parsed.vendor : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Parse a pasted product URL into structured data for the clipper / client
  * suggestion flows. Never throws — any failure at any stage degrades to
@@ -698,16 +823,28 @@ export async function parseProductUrl(url: string): Promise<ParsedProduct> {
     if (!isSafeExternalUrl(url)) return fallback;
 
     const html = await guardedFetchText(url);
-    if (!html) return fallback;
 
-    const jsonLd = normalizeParsedProduct(parseJsonLdProduct(html) || {});
-    if (jsonLd) return { vendorUrl: safeVendorUrl, ...jsonLd };
+    if (html) {
+        const jsonLd = normalizeParsedProduct(parseJsonLdProduct(html) || {});
+        if (jsonLd) return { vendorUrl: safeVendorUrl, ...jsonLd };
 
-    const og = normalizeParsedProduct(parseOpenGraph(html) || {});
-    if (og) return { vendorUrl: safeVendorUrl, ...og };
+        const og = normalizeParsedProduct(parseOpenGraph(html) || {});
+        if (og) return { vendorUrl: safeVendorUrl, ...og };
 
-    const gemini = normalizeParsedProduct((await parseWithGemini(html, url)) || {});
-    if (gemini) return { vendorUrl: safeVendorUrl, ...gemini };
+        const gemini = normalizeParsedProduct((await parseWithGemini(html, url)) || {});
+        if (gemini) return { vendorUrl: safeVendorUrl, ...gemini };
+    }
+
+    // Every direct-fetch-based path failed — either guardedFetchText()
+    // itself came back empty (bot wall / 403 / challenge page / timeout), or
+    // it fetched something but none of the in-page extraction paths above
+    // found a usable name. Try Google's fetcher as the true last resort (see
+    // the section comment above parseWithGeminiUrlContext). This still runs
+    // on Google's own infrastructure — not ours — so it isn't a new SSRF
+    // surface, but it's still gated behind the isSafeExternalUrl() check
+    // that already ran at the top of this function, same as every other path.
+    const urlContext = normalizeParsedProduct((await parseWithGeminiUrlContext(url)) || {});
+    if (urlContext) return { vendorUrl: safeVendorUrl, ...urlContext };
 
     return fallback;
 }

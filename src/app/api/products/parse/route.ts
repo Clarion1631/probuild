@@ -5,7 +5,10 @@ import { prisma } from "@/lib/prisma";
 import { parseProductUrl } from "@/lib/product-parse";
 import { ROLES } from "@/lib/permissions";
 
-export const maxDuration = 30;
+// parseProductUrl's worst case now chains guardedFetchText (~10s) + the
+// text-based Gemini fallback (~10s) + the url_context fallback (up to two
+// ~20s attempts) — comfortably over the old 30s cap.
+export const maxDuration = 60;
 
 // POST: team-only product URL parse for the clipper / product library. Full
 // ParsedProduct (including price) — team members are allowed to see list price.
