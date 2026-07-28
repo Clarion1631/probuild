@@ -6028,6 +6028,53 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
     return { toEmail: client?.email || null, autoCc };
 }
 
+/**
+ * Compensating delete for an uploaded signature after an AMBIGUOUS database outcome.
+ * A Prisma rejection does not prove the write rolled back — on the PgBouncer pooler a
+ * connection can drop after COMMIT — so probe for a surviving reference to this exact
+ * object first. Unknown outcome => KEEP the object: an orphan is sweepable
+ * (scripts/sweep-orphaned-public-signatures.mjs), a deleted e-signature is not.
+ */
+async function discardSignatureUnlessReferenced(
+    url: string | null,
+    discard: () => Promise<void>,
+    isReferenced: () => Promise<boolean>,
+    context: string,
+): Promise<void> {
+    if (!url) return;
+
+    let referenced: boolean;
+    try {
+        referenced = await isReferenced();
+    } catch (error) {
+        try {
+            console.error(`[${context}] signature reference probe failed — keeping the upload (unknown outcome, refuse to delete)`, error);
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+        return;
+    }
+
+    if (referenced) {
+        try {
+            console.warn(`[${context}] signature survived a rejected write — keeping the upload`, { url });
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+        return;
+    }
+
+    try {
+        await discard();
+    } catch (error) {
+        try {
+            console.error(`[${context}] signature cleanup failed`, error);
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+    }
+}
+
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string, expectedTitle: string, expectedBody: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -6054,7 +6101,11 @@ export async function signContractAsContractor(contractId: string, signerName: s
         try {
             await ownedContractorSignature.discard();
         } catch (error) {
-            console.error("[signContractAsContractor] signature cleanup failed", error);
+            try {
+                console.error("[signContractAsContractor] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
         }
     };
     const ip = await getRequestIp();
@@ -6094,7 +6145,20 @@ export async function signContractAsContractor(contractId: string, signerName: s
             });
         });
     } catch (error) {
-        await discardContractorSignature();
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
+            contractorSignatureUrl,
+            discardContractorSignature,
+            async () => {
+                const [contractHit, recordHit] = await Promise.all([
+                    prisma.contract.findFirst({ where: { id: contractId, contractorSignatureUrl }, select: { id: true } }),
+                    prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl: contractorSignatureUrl }, select: { id: true } }),
+                ]);
+                return !!contractHit || !!recordHit;
+            },
+            "signContractAsContractor",
+        );
         throw error;
     }
 
@@ -6281,7 +6345,11 @@ export async function approveContract(contractId: string, signatureName: string,
         try {
             await ownedClientSignature.discard();
         } catch (error) {
-            console.error("[approveContract] signature cleanup failed", error);
+            try {
+                console.error("[approveContract] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
         }
     };
     const ip = await getRequestIp();
@@ -6379,10 +6447,25 @@ export async function approveContract(contractId: string, signatureName: string,
         });
     });
     } catch (error) {
-        await discardClientSignature();
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
+            signatureUrl,
+            discardClientSignature,
+            async () => {
+                const [contractHit, recordHit] = await Promise.all([
+                    prisma.contract.findFirst({ where: { id: contractId, signatureUrl }, select: { id: true } }),
+                    prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl }, select: { id: true } }),
+                ]);
+                return !!contractHit || !!recordHit;
+            },
+            "approveContract",
+        );
         throw error;
     }
     if (signatureDidNotLand) {
+        // Deterministic: the transaction committed and told us this upload was never
+        // written anywhere (idempotent retry against an already-Signed row).
         await discardClientSignature();
     }
 
@@ -6508,7 +6591,11 @@ export async function countersignContractAsCompany(contractId: string, signerNam
             try {
                 await ownedCompanySignature.discard();
             } catch (error) {
-                console.error("[countersignContractAsCompany] signature cleanup failed", error);
+                try {
+                    console.error("[countersignContractAsCompany] signature cleanup failed", error);
+                } catch {
+                    // Logging must never replace the caller's primary error.
+                }
             }
         };
         let companySignatureLanded = false;
@@ -6530,12 +6617,25 @@ export async function countersignContractAsCompany(contractId: string, signerNam
                 }
             });
         } catch (error) {
-            await discardCompanySignature();
+            // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+            // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+            await discardSignatureUnlessReferenced(
+                companySignatureUrl,
+                discardCompanySignature,
+                async () => {
+                    const [contractHit, recordHit] = await Promise.all([
+                        prisma.contract.findFirst({ where: { id: contractId, companySignatureUrl }, select: { id: true } }),
+                        prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl: companySignatureUrl }, select: { id: true } }),
+                    ]);
+                    return !!contractHit || !!recordHit;
+                },
+                "countersignContractAsCompany",
+            );
             throw error;
         }
         if (!companySignatureLanded) {
-            // Lost the race — another request already recorded the company signature between
-            // our load and the guarded update, so this upload never got written anywhere.
+            // Deterministic: the transaction committed and told us via guard.count this
+            // upload lost the race and was never written anywhere.
             await discardCompanySignature();
         }
     }
@@ -8638,7 +8738,11 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         try {
             await ownedCompanySignature.discard();
         } catch (error) {
-            console.error("[countersignChangeOrderAsCompany] signature cleanup failed", error);
+            try {
+                console.error("[countersignChangeOrderAsCompany] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
         }
     };
 
@@ -8655,10 +8759,22 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
             },
         });
     } catch (error) {
-        await discardCompanySignature();
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
+            companySignatureUrl,
+            discardCompanySignature,
+            async () => {
+                const hit = await prisma.changeOrder.findFirst({ where: { id, companySignatureUrl }, select: { id: true } });
+                return !!hit;
+            },
+            "countersignChangeOrderAsCompany",
+        );
         throw error;
     }
     if (result.count === 0) {
+        // Deterministic: the updateMany itself reported zero rows matched — this upload
+        // never landed anywhere.
         await discardCompanySignature();
         throw new Error("Change order already countersigned by company");
     }
