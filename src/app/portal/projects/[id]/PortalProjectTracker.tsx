@@ -108,7 +108,7 @@ export default function PortalProjectTracker({
                         </div>
 
                         <div
-                            className="relative flex h-16 w-16 shrink-0 rotate-2 flex-col items-center justify-center rounded-2xl border-2 bg-white/85 shadow-sm backdrop-blur sm:h-[4.5rem] sm:w-[4.5rem]"
+                            className="relative flex h-16 w-16 shrink-0 flex-col items-center justify-center rounded-2xl border-2 bg-white/85 shadow-sm backdrop-blur sm:h-[4.5rem] sm:w-[4.5rem]"
                             style={{ borderColor: "var(--project-accent)" }}
                             aria-label={`${data.overallPct}% complete`}
                         >
