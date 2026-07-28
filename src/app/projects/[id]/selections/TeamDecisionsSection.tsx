@@ -18,6 +18,7 @@ import {
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import AddCandidateModal from "./AddCandidateModal";
+import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import {
     ImageOff,
     ExternalLink,
@@ -56,6 +57,14 @@ interface DecisionData {
     sortOrder: number;
     pmNote: string | null;
     candidates: Candidate[];
+}
+
+interface DeletedDecision {
+    id: string;
+    name: string;
+    area: string | null;
+    deletedAt: string;
+    candidates: { id: string }[];
 }
 
 const ARCHIVED = "Archived";
@@ -454,9 +463,11 @@ function AddDecisionModal({ projectId, open, onClose, onCreated }: { projectId: 
 export default function TeamDecisionsSection({
     projectId,
     initialDecisions,
+    initialRecentlyDeleted,
 }: {
     projectId: string;
     initialDecisions: DecisionData[];
+    initialRecentlyDeleted: DeletedDecision[];
 }) {
     const router = useRouter();
     const [decisions, setDecisions] = useState<DecisionData[]>(initialDecisions);
@@ -555,6 +566,8 @@ export default function TeamDecisionsSection({
                     ))}
                 </div>
             )}
+
+            <RecentlyDeletedDecisions projectId={projectId} initialDeleted={initialRecentlyDeleted} />
 
             <AddDecisionModal projectId={projectId} open={addDecisionOpen} onClose={() => setAddDecisionOpen(false)} onCreated={refresh} />
         </div>
