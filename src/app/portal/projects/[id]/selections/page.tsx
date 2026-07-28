@@ -3,16 +3,11 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
 import {
-    getSelectionBoardsForPortal,
     getPortalVisibility,
-    getProjectFavoritesForPortal,
     getProjectDecisionsForPortal,
 } from "@/lib/actions";
 import { PortalAuthError } from "@/lib/permissions";
 import Link from "next/link";
-import PortalSelectionsClient from "./PortalSelectionsClient";
-import PortalProjectFavorites from "./PortalProjectFavorites";
-import PortalSuggestionsSection from "./PortalSuggestionsSection";
 import PortalDecisionsSection from "./PortalDecisionsSection";
 
 export default async function PortalSelectionsPage(props: { params: Promise<{ id: string }> }) {
@@ -40,13 +35,9 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
         );
     }
 
-    let boards: Awaited<ReturnType<typeof getSelectionBoardsForPortal>>;
-    let favorites: Awaited<ReturnType<typeof getProjectFavoritesForPortal>>;
     let decisionsData: Awaited<ReturnType<typeof getProjectDecisionsForPortal>>;
     try {
-        [boards, favorites, decisionsData] = await Promise.all([
-            getSelectionBoardsForPortal(id),
-            getProjectFavoritesForPortal(id),
+        [decisionsData] = await Promise.all([
             getProjectDecisionsForPortal(id),
         ]);
     } catch (e) {
@@ -54,12 +45,6 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
         throw e;
     }
 
-    // Only show the read-only Favorites section when there's something to look
-    // at, or when the tab already has other content so an empty Favorites card
-    // isn't the only thing on an otherwise-empty page — the Decisions
-    // playground below always renders and covers that case with its own
-    // invite-to-start empty state.
-    const showFavorites = favorites.length > 0 || boards.length > 0 || decisionsData.decisions.length > 0 || decisionsData.unsorted.length > 0;
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
     return (
@@ -83,28 +68,12 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
                 </p>
             </div>
 
-            <div className="space-y-6 mb-12">
-                <PortalSuggestionsSection projectId={id} appUrl={appUrl} />
-                <PortalDecisionsSection
-                    projectId={id}
-                    initialDecisions={JSON.parse(JSON.stringify(decisionsData.decisions))}
-                    initialUnsorted={JSON.parse(JSON.stringify(decisionsData.unsorted))}
-                />
-            </div>
-
-            {boards.length > 0 && (
-                <div className="mb-12">
-                    <div className="mb-4">
-                        <h2 className="text-xl font-bold text-hui-textMain">Selection Boards</h2>
-                        <p className="text-sm text-hui-textMuted">Options your project team has put together for you to pick from.</p>
-                    </div>
-                    <PortalSelectionsClient boards={JSON.parse(JSON.stringify(boards))} />
-                </div>
-            )}
-
-            {showFavorites && (
-                <PortalProjectFavorites favorites={JSON.parse(JSON.stringify(favorites))} />
-            )}
+            <PortalDecisionsSection
+                projectId={id}
+                appUrl={appUrl}
+                initialDecisions={JSON.parse(JSON.stringify(decisionsData.decisions))}
+                initialUnsorted={JSON.parse(JSON.stringify(decisionsData.unsorted))}
+            />
         </div>
     );
 }
