@@ -43,8 +43,8 @@ export async function GET(request: Request) {
 // POST /api/messages — send a message
 export async function POST(request: Request) {
     const body = await request.json();
-    let { projectId, body: messageBody, senderType, senderName, senderEmail, subcontractorId } = body;
-    subcontractorId = subcontractorId || null;
+    const { projectId, body: messageBody, senderType, senderName, senderEmail } = body;
+    const subcontractorId = body.subcontractorId || null;
 
     if (!projectId || !messageBody || !senderType) {
         return NextResponse.json({ error: "projectId, body, and senderType required" }, { status: 400 });

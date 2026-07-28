@@ -1,150 +1,22 @@
 "use client";
 
 import { Fragment } from "react";
-import type { CompanyDashboardData, CrewConflict, DashboardProjectRow } from "@/lib/schedule-core";
-import { addDays, formatCurrency, formatDate, getFallbackProjectColor, isSameUTCDay, isWeekend, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
-import { getEffectiveProjectRange } from "./useBarLayout";
+import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
+import { addDays, formatCurrency, formatDate, isSameUTCDay, isWeekend, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import {
+    buildAvailabilityRows,
+    isConflictedDay,
+    type AvailabilityChip,
+    type AvailabilityMember,
+} from "./availability";
 
-// Planning panel for Richard (ops manager): "a small dashboard of
-// availability for each day so he can plan them out." Derives entirely from
-// already-serialized board data (project.tasks[].assignments + project.crew
-// + project/task windows) — no new queries, no money-fetch imports. Rendered
-// by ScheduleBoard below the Month/Timeline view, canEdit roles only.
-
+// Planning panel for Richard (ops manager). Pure booked-vs-soft and conflict
+// derivation lives in availability.ts so Dispatch can consume the same rules.
 const AVAILABILITY_DAYS = 14;
 const FAR_JOB_MILES_THRESHOLD = 25;
 const PAID_HOURS_PER_DAY = 8;
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const CAR_GLYPH = "\u{1F697}"; // far-job indicator — plan for a longer day
-
-interface AvailabilityMember {
-    id: string;
-    name: string;
-    role: string;
-    burdenedHourlyRate?: number;
-}
-
-interface AvailabilityChip {
-    kind: "booked" | "soft";
-    projectId: string;
-    projectName: string;
-    projectColor: string;
-    taskName: string | null;
-    startDate: string;
-    endDate: string;
-    distanceMilesFromShop: number | null;
-}
-
-interface AvailabilityRow {
-    userId: string;
-    name: string;
-    burdenedHourlyRate?: number;
-    chipsByDay: Map<string, AvailabilityChip[]>;
-}
-
-/**
- * Per-member, per-day chips for the next AVAILABILITY_DAYS UTC days. Booked =
- * a TaskAssignment whose (end-exclusive) window covers the day. Soft = no
- * task THAT DAY, but the member is on project.crew of a project whose
- * effective window covers the day (reuses getEffectiveProjectRange, same
- * source TimelineView's By-crew coverage blocks use). At most one booked and
- * one soft chip per project per day — a project with two same-day tasks for
- * one member collapses to a single booked chip.
- */
-function buildAvailabilityRows(members: AvailabilityMember[], projects: DashboardProjectRow[], days: Date[]): AvailabilityRow[] {
-    const dayKeys = days.map(formatDate);
-    const memberById = new Map(members.map(m => [m.id, m]));
-    const rowsByUser = new Map<string, AvailabilityRow>();
-    const rowFor = (member: AvailabilityMember): AvailabilityRow => {
-        let row = rowsByUser.get(member.id);
-        if (!row) {
-            row = { userId: member.id, name: member.name, burdenedHourlyRate: member.burdenedHourlyRate, chipsByDay: new Map() };
-            rowsByUser.set(member.id, row);
-        }
-        return row;
-    };
-
-    for (const project of projects) {
-        const projectColor = project.color || getFallbackProjectColor(project.id);
-        const bookedDaysByUser = new Map<string, Set<string>>();
-
-        for (const task of project.tasks) {
-            const start = parseUTCDate(task.startDate.slice(0, 10));
-            const end = task.type === "milestone" ? addDays(start, 1) : parseUTCDate(task.endDate.slice(0, 10));
-            if (end <= start) continue;
-            for (const assignment of task.assignments) {
-                if (assignment.status !== "ACTIVATED") continue;
-                const member = memberById.get(assignment.userId);
-                if (!member) continue;
-                for (const dayKey of dayKeys) {
-                    const day = parseUTCDate(dayKey);
-                    if (day < start || day >= end) continue;
-                    const row = rowFor(member);
-                    const chips = row.chipsByDay.get(dayKey) ?? [];
-                    if (chips.some(chip => chip.kind === "booked" && chip.projectId === project.id)) continue;
-                    chips.push({
-                        kind: "booked",
-                        projectId: project.id,
-                        projectName: project.name,
-                        projectColor,
-                        taskName: task.name,
-                        startDate: task.startDate.slice(0, 10),
-                        endDate: task.endDate.slice(0, 10),
-                        distanceMilesFromShop: project.distanceMilesFromShop,
-                    });
-                    row.chipsByDay.set(dayKey, chips);
-                    const booked = bookedDaysByUser.get(member.id) ?? new Set<string>();
-                    booked.add(dayKey);
-                    bookedDaysByUser.set(member.id, booked);
-                }
-            }
-        }
-
-        const range = getEffectiveProjectRange(project);
-        if (!range) continue;
-        for (const crewMember of project.crew) {
-            if (crewMember.status !== "ACTIVATED") continue;
-            const member = memberById.get(crewMember.id);
-            if (!member) continue;
-            for (const dayKey of dayKeys) {
-                const day = parseUTCDate(dayKey);
-                if (day < range.start || day >= range.end) continue;
-                if (bookedDaysByUser.get(member.id)?.has(dayKey)) continue;
-                const row = rowFor(member);
-                const chips = row.chipsByDay.get(dayKey) ?? [];
-                chips.push({
-                    kind: "soft",
-                    projectId: project.id,
-                    projectName: project.name,
-                    projectColor,
-                    taskName: null,
-                    startDate: formatDate(range.start),
-                    endDate: formatDate(range.end),
-                    distanceMilesFromShop: project.distanceMilesFromShop,
-                });
-                row.chipsByDay.set(dayKey, chips);
-            }
-        }
-    }
-
-    return members
-        .map(member => rowsByUser.get(member.id) ?? { userId: member.id, name: member.name, burdenedHourlyRate: member.burdenedHourlyRate, chipsByDay: new Map<string, AvailabilityChip[]>() })
-        .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// Double-booked ring: reuses the already-serialized crewConflicts overlap
-// windows (task-based or project-window fallback) — no new computation.
-function isConflictedDay(conflicts: CrewConflict[] | null, userId: string, dayKey: string): boolean {
-    if (!conflicts) return false;
-    const entry = conflicts.find(c => c.userId === userId);
-    if (!entry) return false;
-    const day = parseUTCDate(dayKey);
-    return entry.pairs.some(pair => {
-        const start = parseUTCDate(pair.overlapStart.slice(0, 10));
-        const end = parseUTCDate(pair.overlapEnd.slice(0, 10));
-        return day >= start && day < end;
-    });
-}
+const CAR_GLYPH = "\u{1F697}";
 
 function chipTooltip(chip: AvailabilityChip): string {
     const far = (chip.distanceMilesFromShop ?? 0) > FAR_JOB_MILES_THRESHOLD;
@@ -153,7 +25,6 @@ function chipTooltip(chip: AvailabilityChip): string {
         : `${chip.projectName} — on the crew, no task assignment that day`;
     return far ? `${base} — ${CAR_GLYPH} ~${chip.distanceMilesFromShop}mi — plan extended day` : base;
 }
-
 interface AvailabilityPanelProps {
     data: CompanyDashboardData;
     onDrillDown: () => void;
@@ -169,10 +40,10 @@ export function AvailabilityPanel({ data, onDrillDown }: AvailabilityPanelProps)
     ];
     // Rows = FIELD_CREW, plus any ADMIN who actually does field work (shows
     // up on a project crew) — Richard, not Marge/Justin.
-    const crewMemberIds = new Set(projects.flatMap(project => project.crew.map(member => member.id)));
-    const members: AvailabilityMember[] = (teamMembers ?? []).filter(member => (
-        member.role === "FIELD_CREW" || (member.role === "ADMIN" && crewMemberIds.has(member.id))
-    ));
+    // Owner call 2026-07-23: only members DESIGNATED as crew are planned here
+    // — no admins/office on the availability grid (teamMembers is already
+    // FIELD_CREW-only at serialization; this filter just states the rule).
+    const members: AvailabilityMember[] = (teamMembers ?? []).filter(member => member.role === "FIELD_CREW");
 
     const today = todayUTC();
     const days = Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(today, i));

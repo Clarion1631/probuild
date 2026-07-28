@@ -672,7 +672,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                                                 <div className="bg-white border border-slate-200 rounded-md p-3">
                                                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                                                        <strong className="text-slate-700">ESIGN Act Disclosure:</strong> By signing above and clicking "Sign & Approve," I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA, (2) I have reviewed and agree to the estimate{initialEstimate.termsAndConditions ? " and Terms & Conditions" : ""}, and (3) I authorize the described work.
+                                                        <strong className="text-slate-700">ESIGN Act Disclosure:</strong> By signing above and clicking &quot;Sign & Approve,&quot; I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA, (2) I have reviewed and agree to the estimate{initialEstimate.termsAndConditions ? " and Terms & Conditions" : ""}, and (3) I authorize the described work.
                                                     </p>
                                                 </div>
 

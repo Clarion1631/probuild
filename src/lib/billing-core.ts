@@ -1,5 +1,6 @@
 import { revalidatePath as nextRevalidatePath } from "next/cache";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import type { Prisma } from "@prisma/client";
 
 // Cache revalidation is best-effort: it throws outside a Next request context
 // (e.g. verification scripts), and a stale cache page is never worth failing a
@@ -17,6 +18,7 @@ import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
+import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -1036,18 +1038,336 @@ export async function sendMilestoneInvoicesCore(
 // rail can take it from there. Never bills the same CO twice.
 // ─────────────────────────────────────────────────────────────────────────────
 
-type BillChangeOrderOutcome =
+type CoInvoiceTarget = { id: string; code: string; status: string };
+
+async function findChangeOrderInvoice(
+    tx: Prisma.TransactionClient,
+    co: { estimateId: string; projectId: string },
+): Promise<CoInvoiceTarget | null> {
+    return (await tx.invoice.findFirst({
+        where: { estimateId: co.estimateId },
+        orderBy: { createdAt: "desc" },
+        select: { id: true, code: true, status: true },
+    })) ?? (await tx.invoice.findFirst({
+        where: { projectId: co.projectId },
+        orderBy: { createdAt: "desc" },
+        select: { id: true, code: true, status: true },
+    }));
+}
+
+type CostPlusActuals = {
+    laborCents: number;
+    expenseCents: number;
+    markupCents: number;
+    taxCents: number;
+    pretaxCents: number;
+    totalCents: number;
+    fingerprint: string;
+    timeEntries: Array<{
+        id: string;
+        name: string;
+        date: string;
+        hours: number;
+        notes: string | null;
+        laborCents: number;
+        burdenCents: number;
+        totalCents: number;
+    }>;
+    expenses: Array<{
+        id: string;
+        date: string;
+        vendor: string | null;
+        description: string | null;
+        receiptUrl: string | null;
+        amountCents: number;
+    }>;
+};
+
+async function loadCostPlusActuals(
+    tx: Prisma.TransactionClient,
+    changeOrderId: string,
+    endAt: Date,
+    markupPercent: number,
+    taxRate: number,
+    lockRows = false,
+): Promise<CostPlusActuals> {
+    let lockedTimeIds: string[] | null = null;
+    let lockedExpenseIds: string[] | null = null;
+    if (lockRows) {
+        // Stable child order after canonical parent locks: TimeEntry → Expense,
+        // each ordered by id. This freezes amounts/tags/dates through snapshot + stamp.
+        const timeLocks = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "TimeEntry"
+            WHERE "changeOrderId" = ${changeOrderId}
+              AND "isBillable" = true
+              AND "invoiceId" IS NULL
+              AND "invoicedAt" IS NULL
+              AND "startTime" <= ${endAt}
+            ORDER BY "id" FOR UPDATE`;
+        const expenseLocks = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "Expense"
+            WHERE "changeOrderId" = ${changeOrderId}
+              AND "isBillable" = true
+              AND "invoiceId" IS NULL
+              AND "invoicedAt" IS NULL
+              AND COALESCE("date", "createdAt") <= ${endAt}
+            ORDER BY "id" FOR UPDATE`;
+        lockedTimeIds = timeLocks.map((row) => row.id);
+        lockedExpenseIds = expenseLocks.map((row) => row.id);
+    }
+    const [timeRows, expenseRows] = await Promise.all([
+        tx.timeEntry.findMany({
+            where: lockRows
+                ? { id: { in: lockedTimeIds ?? [] }, invoiceId: null, invoicedAt: null }
+                : { changeOrderId, isBillable: true, invoiceId: null, invoicedAt: null, startTime: { lte: endAt } },
+            select: {
+                id: true,
+                startTime: true,
+                durationHours: true,
+                laborCost: true,
+                burdenCost: true,
+                notes: true,
+                user: { select: { name: true, email: true } },
+            },
+            orderBy: { id: "asc" },
+        }),
+        tx.expense.findMany({
+            where: lockRows
+                ? { id: { in: lockedExpenseIds ?? [] }, invoiceId: null, invoicedAt: null }
+                : {
+                    changeOrderId,
+                    isBillable: true,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    OR: [{ date: { lte: endAt } }, { date: null, createdAt: { lte: endAt } }],
+                },
+            select: { id: true, date: true, createdAt: true, amount: true, vendor: true, description: true, receiptUrl: true },
+            orderBy: { id: "asc" },
+        }),
+    ]);
+
+    const timeEntries = timeRows.map((row) => {
+        const laborCents = Math.round(toNum(row.laborCost) * 100);
+        const burdenCents = Math.round(toNum(row.burdenCost) * 100);
+        return {
+            id: row.id,
+            name: row.user.name || row.user.email,
+            date: row.startTime.toISOString(),
+            hours: row.durationHours ?? 0,
+            notes: row.notes,
+            laborCents,
+            burdenCents,
+            totalCents: laborCents + burdenCents,
+        };
+    });
+    const expenses = expenseRows.map((row) => ({
+        id: row.id,
+        date: (row.date ?? row.createdAt).toISOString(),
+        vendor: row.vendor,
+        description: row.description,
+        receiptUrl: row.receiptUrl,
+        amountCents: Math.round(toNum(row.amount) * 100),
+    }));
+    const laborCents = timeEntries.reduce((sum, row) => sum + row.totalCents, 0);
+    const expenseCents = expenses.reduce((sum, row) => sum + row.amountCents, 0);
+    const markupCents = Math.round((laborCents + expenseCents) * markupPercent / 100);
+    const pretaxCents = laborCents + expenseCents + markupCents;
+    const taxCents = Math.round(pretaxCents * taxRate);
+    const fingerprintRows = [
+        ...timeEntries.map((row) => `time:${row.id}:${row.totalCents}`),
+        ...expenses.map((row) => `expense:${row.id}:${row.amountCents}`),
+    ].sort();
+    return {
+        laborCents,
+        expenseCents,
+        markupCents,
+        taxCents,
+        pretaxCents,
+        totalCents: pretaxCents + taxCents,
+        fingerprint: createHash("sha256").update(fingerprintRows.join("|")).digest("hex"),
+        timeEntries,
+        expenses,
+    };
+}
+
+export async function previewCostPlusChangeOrderCore(
+    changeOrderId: string,
+    input: { throughDate: string },
+) {
+    const timeZone = await resolveCompanyTimeZone();
+    const endAt = endOfDateInTimeZone(input.throughDate, timeZone);
+    const co = await prisma.changeOrder.findUnique({
+        where: { id: changeOrderId },
+        select: {
+            id: true, code: true, title: true, status: true, pricingType: true, markupPercent: true,
+            projectId: true, estimateId: true,
+            estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
+        },
+    });
+    if (!co) throw new Error("Change order not found");
+    if (co.pricingType !== "COST_PLUS") throw new Error(`${co.code} is not a cost-plus change order`);
+    if (co.status !== "Approved") throw new Error(`${co.code} must be Approved before actuals can be billed`);
+    const invoice = await prisma.$transaction((tx) => findChangeOrderInvoice(tx, co));
+    if (!invoice) throw new Error("This project has no invoice yet — create the invoice first, then bill actuals.");
+    const markupPercent = co.markupPercent ?? 10;
+    const taxRate = coTaxRate(co.estimate);
+    const actuals = await prisma.$transaction((tx) => loadCostPlusActuals(tx, co.id, endAt, markupPercent, taxRate));
+    return {
+        ...actuals,
+        changeOrderId: co.id,
+        code: co.code,
+        title: co.title,
+        throughDate: input.throughDate,
+        throughDateEnd: endAt,
+        timeZone,
+        invoiceId: invoice.id,
+        invoiceCode: invoice.code,
+        markupPercent,
+        taxRate,
+        taxLabel: coTaxLabel(co.estimate),
+    };
+}
+
+export async function billCostPlusChangeOrderCore(
+    changeOrderId: string,
+    input: {
+        throughDate: string;
+        actor: string;
+        expectedFingerprint?: string;
+        expectedInvoiceId?: string;
+        expectedMarkupPercent?: number;
+        expectedTaxRate?: number;
+    },
+) {
+    const timeZone = await resolveCompanyTimeZone();
+    const endAt = endOfDateInTimeZone(input.throughDate, timeZone);
+    return withTxRetry(() => prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; pricingType: string;
+            markupPercent: number | null; projectId: string; estimateId: string;
+        }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "projectId", "estimateId"
+            FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+        const co = locked[0];
+        if (!co) throw new Error("Change order not found");
+        if (co.pricingType !== "COST_PLUS") throw new Error(`${co.code} is fixed price — use bill_change_order`);
+        if (co.status !== "Approved") throw new Error(`${co.code} must be Approved before actuals can be billed`);
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: co.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+        const invoice = await findChangeOrderInvoice(tx, co);
+        if (!invoice) throw new Error("This project has no invoice yet — create the invoice first, then bill actuals.");
+        await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
+        const markupPercent = co.markupPercent ?? 10;
+        const taxRate = coTaxRate(estimateTax);
+        if ((input.expectedInvoiceId && input.expectedInvoiceId !== invoice.id)
+            || (input.expectedMarkupPercent != null && input.expectedMarkupPercent !== markupPercent)
+            || (input.expectedTaxRate != null && Math.abs(input.expectedTaxRate - taxRate) > 0.0000001)) {
+            throw new Error("Billing terms changed since the preview — review the refreshed invoice, markup, and tax before confirming.");
+        }
+        const actuals = await loadCostPlusActuals(tx, co.id, endAt, markupPercent, taxRate, true);
+        if (input.expectedFingerprint && input.expectedFingerprint !== actuals.fingerprint) {
+            throw new Error("Billable time or expenses changed since the preview — review the refreshed totals before confirming.");
+        }
+        if (actuals.timeEntries.length === 0 && actuals.expenses.length === 0) {
+            throw new Error(`Nothing to bill through ${input.throughDate}`);
+        }
+        if (actuals.pretaxCents <= 0 || actuals.totalCents <= 0) {
+            throw new Error("Billable actuals must produce a positive invoice total");
+        }
+
+        const milestoneName = `${co.code} — ${co.title} (T&M through ${input.throughDate})`.slice(0, 300);
+        const milestone = await tx.paymentSchedule.create({
+            data: {
+                invoiceId: invoice.id,
+                name: milestoneName,
+                amount: actuals.totalCents / 100,
+                pretaxAmount: actuals.pretaxCents / 100,
+                taxAmount: actuals.taxCents / 100,
+                sourceChangeOrderId: co.id,
+                status: "Pending",
+            },
+        });
+        const billing = await tx.changeOrderBilling.create({
+            data: {
+                changeOrderId: co.id,
+                paymentScheduleId: milestone.id,
+                label: `T&M through ${input.throughDate}`,
+                laborCents: actuals.laborCents,
+                expenseCents: actuals.expenseCents,
+                markupCents: actuals.markupCents,
+                taxCents: actuals.taxCents,
+                totalCents: actuals.totalCents,
+                snapshot: { timeEntries: actuals.timeEntries, expenses: actuals.expenses },
+                createdBy: input.actor,
+            },
+        });
+        const billedAt = new Date();
+        if (actuals.timeEntries.length) {
+            const stamped = await tx.timeEntry.updateMany({
+                where: {
+                    id: { in: actuals.timeEntries.map((row) => row.id) },
+                    changeOrderId: co.id,
+                    isBillable: true,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    startTime: { lte: endAt },
+                },
+                data: { invoiceId: invoice.id, invoicedAt: billedAt },
+            });
+            if (stamped.count !== actuals.timeEntries.length) throw new Error("Time entries changed while billing; retry from a fresh preview");
+        }
+        if (actuals.expenses.length) {
+            const stamped = await tx.expense.updateMany({
+                where: {
+                    id: { in: actuals.expenses.map((row) => row.id) },
+                    changeOrderId: co.id,
+                    isBillable: true,
+                    invoiceId: null,
+                    invoicedAt: null,
+                    OR: [{ date: { lte: endAt } }, { date: null, createdAt: { lte: endAt } }],
+                },
+                data: { invoiceId: invoice.id, invoicedAt: billedAt },
+            });
+            if (stamped.count !== actuals.expenses.length) throw new Error("Expenses changed while billing; retry from a fresh preview");
+        }
+        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+                subtotal: { increment: actuals.pretaxCents / 100 },
+                taxAmount: { increment: actuals.taxCents / 100 },
+                totalAmount: { increment: actuals.totalCents / 100 },
+                balanceDue: { increment: actuals.totalCents / 100 },
+                ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
+            },
+        });
+        return {
+            ...actuals,
+            billingId: billing.id,
+            milestoneId: milestone.id,
+            milestoneName,
+            invoiceId: invoice.id,
+            invoiceCode: invoice.code,
+            throughDate: input.throughDate,
+            timeZone,
+        };
+    }, { timeout: 15_000 }));
+}
+
+type LegacyBillChangeOrderOutcome =
     | { kind: "error"; error: string }
     | { kind: "duplicate"; dup: { id: string; name: string; amount: number; status: string; invoiceId: string; invoiceCode: string } }
     | { kind: "created"; milestoneId: string; milestoneName: string; amount: number; subtotal: number; taxAmount: number; taxLabel: string; invoiceId: string; invoiceCode: string; projectId: string; coCode: string };
 
-export async function billChangeOrderCore(changeOrderId: string) {
+async function billChangeOrderCoreLegacy(changeOrderId: string) {
     // Everything — status check, idempotency check, invoice pick, create,
     // totals bump — runs inside ONE transaction that takes a row lock on the
     // CO (SELECT ... FOR UPDATE): concurrent bill calls serialize on the row,
     // and concurrent status writers (approve/decline use plain updates) block
     // until this transaction commits, so a just-declined CO can't be billed.
-    const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<BillChangeOrderOutcome> => {
+    const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<LegacyBillChangeOrderOutcome> => {
         const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
             SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
@@ -1188,11 +1508,198 @@ export async function billChangeOrderCore(changeOrderId: string) {
 // a silent stall. Never throws: the customer's approval must stand regardless.
 // ─────────────────────────────────────────────────────────────────────────────
 
+export async function billChangeOrderCore(
+    changeOrderId: string,
+    dependencies: { logActivity?: typeof logActivityLazy; revalidatePath?: typeof revalidatePath } = {},
+) {
+    const outcome = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; pricingType: string;
+            totalAmount: unknown; projectId: string; estimateId: string;
+        }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId"
+            FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+        const co = locked[0];
+        if (!co) return { ok: false as const, error: "Change order not found" };
+        if (co.status !== "Approved") {
+            return { ok: false as const, error: `Change order ${co.code} must be Approved before it can be billed.` };
+        }
+        if (co.pricingType === "COST_PLUS") {
+            return { ok: false as const, error: `${co.code} is cost plus — use bill_cost_plus_change_order with a through date.` };
+        }
+        const subtotalCents = Math.round(Number(co.totalAmount) * 100);
+        if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: co.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+        const rate = coTaxRate(estimateTax);
+        const totalTaxCents = Math.round(subtotalCents * rate);
+        const invoice = await findChangeOrderInvoice(tx, co);
+        if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
+        await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
+        const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+
+        const schedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId },
+            orderBy: [{ order: "asc" }, { createdAt: "asc" }],
+        });
+        if (schedules.length === 1) return { ok: false as const, error: "Fixed change-order splits require at least two schedule rows" };
+        if (schedules.some((row) => Math.round(Number(row.amount) * 100) <= 0)) {
+            return { ok: false as const, error: "Every fixed change-order schedule amount must be greater than zero" };
+        }
+        const priorCents = schedules.slice(0, -1).reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
+        const pretaxPlans = schedules.length
+            ? schedules.map((row, index) => ({
+                sourceCoScheduleId: row.id as string | null,
+                name: `${co.code} — ${row.name}`.slice(0, 300),
+                dueDate: row.dueDate,
+                pretaxCents: index === schedules.length - 1 ? subtotalCents - priorCents : Math.round(Number(row.amount) * 100),
+            }))
+            : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), dueDate: null as Date | null, pretaxCents: subtotalCents }];
+        if (pretaxPlans.some((plan) => plan.pretaxCents <= 0)) {
+            return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
+        }
+        if (schedules.length) {
+            const storedCents = schedules.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
+            if (storedCents !== subtotalCents) return { ok: false as const, error: "Change-order schedule amounts are out of sync with the signed subtotal" };
+        }
+
+        let allocatedTaxCents = 0;
+        const plans = pretaxPlans.map((plan, index) => {
+            const taxCents = index === pretaxPlans.length - 1
+                ? totalTaxCents - allocatedTaxCents
+                : Math.round(plan.pretaxCents * rate);
+            allocatedTaxCents += taxCents;
+            return { ...plan, taxCents, totalCents: plan.pretaxCents + taxCents };
+        });
+        const existing = await tx.paymentSchedule.findMany({
+            where: {
+                invoice: { projectId: co.projectId },
+                status: { not: "Canceled" },
+                OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
+            },
+        });
+        const milestones: Array<{
+            id: string; name: string; amount: number; pretaxAmount: number; taxAmount: number;
+            status: string; created: boolean;
+        }> = [];
+        let newPretaxCents = 0;
+        let newTaxCents = 0;
+        let newTotalCents = 0;
+        for (const plan of plans) {
+            const prior = plan.sourceCoScheduleId
+                ? existing.find((row) => row.sourceCoScheduleId === plan.sourceCoScheduleId || row.name === plan.name)
+                : existing.find((row) => !row.sourceCoScheduleId);
+            if (prior) {
+                if (Math.round(Number(prior.amount) * 100) !== plan.totalCents) {
+                    return { ok: false as const, error: `Existing milestone "${prior.name}" does not match the signed change-order amount` };
+                }
+                milestones.push({
+                    id: prior.id,
+                    name: prior.name,
+                    amount: Number(prior.amount),
+                    pretaxAmount: Number(prior.pretaxAmount ?? plan.pretaxCents / 100),
+                    taxAmount: Number(prior.taxAmount ?? plan.taxCents / 100),
+                    status: prior.status,
+                    created: false,
+                });
+                continue;
+            }
+            const created = await tx.paymentSchedule.create({
+                data: {
+                    invoiceId: invoice.id,
+                    name: plan.name,
+                    amount: plan.totalCents / 100,
+                    pretaxAmount: plan.pretaxCents / 100,
+                    taxAmount: plan.taxCents / 100,
+                    sourceChangeOrderId: co.id,
+                    sourceCoScheduleId: plan.sourceCoScheduleId,
+                    dueDate: plan.dueDate,
+                    status: "Pending",
+                },
+            });
+            newPretaxCents += plan.pretaxCents;
+            newTaxCents += plan.taxCents;
+            newTotalCents += plan.totalCents;
+            milestones.push({
+                id: created.id,
+                name: created.name,
+                amount: plan.totalCents / 100,
+                pretaxAmount: plan.pretaxCents / 100,
+                taxAmount: plan.taxCents / 100,
+                status: created.status,
+                created: true,
+            });
+        }
+        if (newTotalCents > 0) {
+            await tx.invoice.update({
+                where: { id: invoice.id },
+                data: {
+                    subtotal: { increment: newPretaxCents / 100 },
+                    taxAmount: { increment: newTaxCents / 100 },
+                    totalAmount: { increment: newTotalCents / 100 },
+                    balanceDue: { increment: newTotalCents / 100 },
+                    ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
+                },
+            });
+        }
+        return {
+            ok: true as const,
+            alreadyBilled: milestones.every((row) => !row.created),
+            milestones,
+            subtotal: subtotalCents / 100,
+            taxAmount: totalTaxCents / 100,
+            amount: (subtotalCents + totalTaxCents) / 100,
+            taxLabel: coTaxLabel(estimateTax),
+            invoiceId: invoice.id,
+            invoiceCode: invoice.code,
+            projectId: co.projectId,
+            coCode: co.code,
+        };
+    }, { timeout: 15_000 }));
+
+    if (!outcome.ok) return outcome;
+    try {
+        await (dependencies.logActivity ?? logActivityLazy)({
+            projectId: outcome.projectId,
+            actorType: "TEAM",
+            actorName: "ChatGPT connector",
+            action: "billed_change_order",
+            entityType: "invoice",
+            entityId: outcome.invoiceId,
+            entityName: `Invoice ${outcome.invoiceCode}`,
+            metadata: { changeOrder: outcome.coCode, milestones: outcome.milestones.map((row) => row.name), amount: outcome.amount },
+        });
+    } catch { /* activity feed only */ }
+    (dependencies.revalidatePath ?? revalidatePath)(`/projects/${outcome.projectId}/invoices`);
+    (dependencies.revalidatePath ?? revalidatePath)(`/projects/${outcome.projectId}/invoices/${outcome.invoiceId}`);
+    (dependencies.revalidatePath ?? revalidatePath)("/invoices");
+    const first = outcome.milestones[0];
+    return {
+        ok: true as const,
+        alreadyBilled: outcome.alreadyBilled,
+        invoiceId: outcome.invoiceId,
+        invoiceCode: outcome.invoiceCode,
+        milestoneId: first.id,
+        milestoneName: first.name,
+        milestones: outcome.milestones,
+        amount: outcome.amount,
+        subtotal: outcome.subtotal,
+        taxAmount: outcome.taxAmount,
+        taxLabel: outcome.taxLabel,
+        milestoneStatus: first.status,
+        note: outcome.alreadyBilled
+            ? "This change order is already on the invoice — use send_milestone_invoice if it still needs to go out."
+            : `Added ${outcome.milestones.length} milestone${outcome.milestones.length === 1 ? "" : "s"} for ${formatCurrency(outcome.amount)}.`,
+    };
+}
+
 export async function handleChangeOrderApproved(
     changeOrderId: string,
     opts?: { notify?: boolean; freshlyApproved?: boolean },
-): Promise<{ billed: boolean; sent: boolean; issues: string[] }> {
-    const summary = { billed: false, sent: false, issues: [] as string[] };
+): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean }> {
+    const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean } = { billed: false, sent: false, issues: [] };
     let coLabel = changeOrderId;
     let amountLabel = "";
     let projectName = "";
@@ -1201,7 +1708,7 @@ export async function handleChangeOrderApproved(
     try {
         const co = await prisma.changeOrder.findUnique({
             where: { id: changeOrderId },
-            select: { code: true, title: true, totalAmount: true, approvedBy: true, project: { select: { name: true } } },
+            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, project: { select: { name: true } } },
         });
         if (co) {
             coLabel = `${co.code} — ${co.title}`;
@@ -1209,29 +1716,35 @@ export async function handleChangeOrderApproved(
             projectName = co.project?.name ?? "";
         }
 
-        const bill = await billChangeOrderCore(changeOrderId);
-        if (bill.ok) {
+        if (co?.pricingType === "COST_PLUS") {
+            summary.awaitingActuals = true;
+            amountLabel = `cost + ${co.markupPercent ?? 10}% + tax`;
+        } else {
+            const bill = await billChangeOrderCore(changeOrderId);
+            if (bill.ok) {
             // Show the customer's true charge (subtotal + tax) in the team alert.
             amountLabel = "alreadyBilled" in bill && !bill.alreadyBilled && "subtotal" in bill
                 ? `${formatCurrency(bill.amount)} = ${formatCurrency(bill.subtotal)} + ${formatCurrency(bill.taxAmount)} tax`
                 : formatCurrency(bill.amount);
-        }
-        if (!bill.ok) {
-            summary.issues.push(bill.error);
-        } else if (bill.alreadyBilled) {
+            }
+            if (!bill.ok) {
+                summary.issues.push(bill.error);
+            } else if (bill.alreadyBilled) {
             // Only the call that FRESHLY billed the CO may auto-send — this makes a
             // concurrent/replayed approval a no-op instead of a duplicate payment
             // email (billChangeOrderCore's row lock guarantees exactly one fresh bill).
-            summary.billed = true;
-            summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
-        } else {
-            summary.billed = true;
-            const send = await sendMilestoneInvoicesCore(bill.invoiceId, [bill.milestoneId], undefined, undefined, "Auto (change-order approval)");
-            const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
-            summary.sent = send.results.some(r => !!r.sentTo);
-            if (resultIssues.length) summary.issues.push(...resultIssues);
-            if (!summary.sent && !resultIssues.length) summary.issues.push(send.error || "QuickBooks send failed");
-            sentTo = send.results.find(r => r.sentTo)?.sentTo ?? "";
+                summary.billed = true;
+                summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
+            } else {
+                summary.billed = true;
+                const freshIds = bill.milestones.filter((row) => row.created).map((row) => row.id);
+                const send = await sendMilestoneInvoicesCore(bill.invoiceId, freshIds, undefined, undefined, "Auto (change-order approval)");
+                const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
+                summary.sent = send.results.some(r => !!r.sentTo);
+                if (resultIssues.length) summary.issues.push(...resultIssues);
+                if (!summary.sent && !resultIssues.length) summary.issues.push(send.error || "QuickBooks send failed");
+                sentTo = send.results.find(r => r.sentTo)?.sentTo ?? "";
+            }
         }
     } catch (err: any) {
         summary.issues.push(err?.message || "Unexpected error during auto-billing");
@@ -1265,12 +1778,16 @@ export async function handleChangeOrderApproved(
         const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
         if (to) {
             const ok = summary.sent;
-            const subject = ok
-                ? `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`
-                : `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`;
-            const detail = ok
-                ? `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`
-                : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
+            const subject = summary.awaitingActuals
+                ? `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`
+                : ok
+                    ? `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`
+                    : `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`;
+            const detail = summary.awaitingActuals
+                ? `<p>The customer approved the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`
+                : ok
+                    ? `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`
+                    : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
             await sendNotification(
                 to,
                 subject,
@@ -1293,7 +1810,14 @@ export async function handleChangeOrderApproved(
 // sendChangeOrderToClient; emails the customer a portal link to review & sign.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendChangeOrderToClientCore(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendChangeOrderToClientCore(
+    changeOrderId: string,
+    dependencies: {
+        sendNotification?: typeof sendNotification;
+        logActivity?: typeof logActivityLazy;
+        revalidatePath?: typeof revalidatePath;
+    } = {},
+): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     // Read, amount math, and the Draft/Sent -> Sent flip run inside ONE
     // transaction holding a row lock on the CO (SELECT ... FOR UPDATE, same
     // pattern as billChangeOrderCore): a concurrent writer (editor save,
@@ -1307,10 +1831,12 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
             code: string; title: string; projectId: string; projectName: string;
             clientId: string; clientName: string; clientEmail: string; additionalEmail: string | null;
             coSubtotal: number; coTaxAmount: number; coRevisedAmount: number; taxLabel: string;
+            pricingType: string; markupPercent: number; updatedAt: Date;
+            schedules: Array<{ name: string; amount: number; dueDate: Date | null }>;
         };
     const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
-            SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; pricingType: string; markupPercent: number | null; totalAmount: unknown; projectId: string; estimateId: string; updatedAt: Date }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "totalAmount", "projectId", "estimateId", "updatedAt"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
@@ -1332,10 +1858,10 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
             (sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)),
             0,
         );
-        if (items.length === 0 || storedSubtotalCents <= 0 || renderedSubtotalCents <= 0) {
+        if (co.pricingType !== "COST_PLUS" && (items.length === 0 || storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
             return { kind: "error", error: `Change order ${co.code} has no priced items yet — add pricing before sending it to the client.` };
         }
-        if (storedSubtotalCents !== renderedSubtotalCents) {
+        if (co.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             return { kind: "error", error: `Change order ${co.code} pricing is out of sync with its items — save it before sending.` };
         }
 
@@ -1356,10 +1882,19 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         const coSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
         const coTaxAmount = Math.round(coSubtotal * coTaxRate(estimateTax) * 100) / 100;
         const coRevisedAmount = Math.round((coSubtotal + coTaxAmount) * 100) / 100;
+        const schedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { name: true, amount: true, dueDate: true },
+        });
+        if (co.pricingType === "COST_PLUS" && schedules.length > 0) {
+            return { kind: "error", error: "Cost-plus change orders cannot have a fixed payment schedule." };
+        }
 
-        await tx.changeOrder.update({
+        const sentCo = await tx.changeOrder.update({
             where: { id: changeOrderId },
             data: { status: "Sent", sentAt: new Date() },
+            select: { updatedAt: true },
         });
 
         return {
@@ -1367,11 +1902,15 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
             code: co.code, title: co.title, projectId: co.projectId, projectName: project?.name ?? "",
             clientId: client.id, clientName: client.name, clientEmail: client.email, additionalEmail: client.additionalEmail,
             coSubtotal, coTaxAmount, coRevisedAmount, taxLabel: coTaxLabel(estimateTax),
+            pricingType: co.pricingType,
+            markupPercent: co.markupPercent ?? 10,
+            updatedAt: sentCo.updatedAt,
+            schedules: schedules.map((row) => ({ ...row, amount: Number(row.amount) })),
         };
     }, { timeout: 15_000 });
 
     if (outcome.kind === "error") return { success: false, error: outcome.error };
-    const { code, title, projectId, projectName, coSubtotal, coTaxAmount, coRevisedAmount, taxLabel } = outcome;
+    const { code, title, projectId, projectName, coSubtotal, coTaxAmount, coRevisedAmount, taxLabel, pricingType, markupPercent, schedules } = outcome;
     const client = { id: outcome.clientId, name: outcome.clientName, email: outcome.clientEmail, additionalEmail: outcome.additionalEmail };
 
     const { buildClientPortalUrl } = await import("./client-portal-auth");
@@ -1386,15 +1925,16 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
     // number that no longer matches the portal. FOR UPDATE (not findUnique):
     // the recheck must WAIT for any in-flight writer to commit before reading,
     // or it would read the pre-update row and pass while stale.
-    const recheckRows = await prisma.$queryRaw<Array<{ status: string; totalAmount: unknown }>>`
-        SELECT "status", "totalAmount" FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+    const recheckRows = await prisma.$queryRaw<Array<{ status: string; totalAmount: unknown; updatedAt: Date }>>`
+        SELECT "status", "totalAmount", "updatedAt" FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
     const recheck = recheckRows[0];
-    if (!recheck || recheck.status !== "Sent" || Math.abs(Math.round(Number(recheck.totalAmount) * 100) / 100 - coSubtotal) > 0.005) {
+    if (!recheck || recheck.status !== "Sent" || recheck.updatedAt.getTime() !== outcome.updatedAt.getTime()
+        || Math.abs(Math.round(Number(recheck.totalAmount) * 100) / 100 - coSubtotal) > 0.005) {
         return { success: false, error: `Change order ${code} was modified while the email was being prepared — review it and send again.` };
     }
 
     const changeOrderCc = buildCc(client.email, client.additionalEmail);
-    await sendNotification(
+    await (dependencies.sendNotification ?? sendNotification)(
         client.email,
         `${companyName} sent you a change order to review`,
         `<!DOCTYPE html>
@@ -1408,9 +1948,10 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
                     Please review the scope changes and approve or decline.
                 </p>
                 <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center; margin: 24px 0;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>
-                    ${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${escapeHtml(taxLabel)}</div>` : ""}
+                    ${pricingType === "COST_PLUS"
+                        ? `<div style="font-size: 18px; font-weight: 700; color: #111;">Cost + ${markupPercent}% + tax</div><div style="color:#666;font-size:13px;margin-top:6px;">Billed from actual time and materials. Scope-line amounts are non-binding estimates.</div>`
+                        : `<div style="color: #666; font-size: 13px; margin-bottom: 4px;">Change Order Amount</div><div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(coRevisedAmount)}</div>${coTaxAmount > 0 ? `<div style="color: #999; font-size: 12px; margin-top: 4px;">${formatCurrency(coSubtotal)} + ${formatCurrency(coTaxAmount)} ${escapeHtml(taxLabel)}</div>` : ""}`}
+                    ${schedules.length ? `<div style="margin-top:16px;text-align:left;"><strong>Payment schedule</strong>${schedules.map((row) => `<div style="display:flex;justify-content:space-between;margin-top:6px;"><span>${escapeHtml(row.name)}${row.dueDate ? ` (${row.dueDate.toLocaleDateString("en-US")})` : ""}</span><span>${formatCurrency(row.amount)}</span></div>`).join("")}</div>` : ""}
                 </div>
                 <div style="text-align: center; margin: 32px 0;">
                     <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
@@ -1431,7 +1972,7 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
     );
 
     // Log activity
-    await logActivityLazy({
+    await (dependencies.logActivity ?? logActivityLazy)({
         projectId,
         actorType: "TEAM",
         actorName: companyName,
@@ -1441,8 +1982,8 @@ export async function sendChangeOrderToClientCore(changeOrderId: string): Promis
         entityName: `Change Order ${code || title}`,
     });
 
-    revalidatePath(`/projects/${projectId}/change-orders/${changeOrderId}`);
-    revalidatePath(`/projects/${projectId}/change-orders`);
+    (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders/${changeOrderId}`);
+    (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders`);
     return { success: true, sentTo: client.email };
 }
 
@@ -1455,13 +1996,24 @@ export type ChangeOrderDraftInput = {
     estimateId: string;
     title: string;
     description?: string;
-    items: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[];
+    pricingType?: "FIXED" | "COST_PLUS";
+    markupPercent?: number | null;
+    items?: { name: string; description?: string; costCode?: string; costType?: string; quantity: number; unitCost: number }[];
+    paymentSchedules?: { name: string; amount: number; dueDate?: string | Date | null; order?: number }[];
 };
 
 export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
-    const { projectId, estimateId, title, description, items } = input;
+    const { projectId, estimateId, title, description } = input;
+    const items = input.items ?? [];
+    const pricingType = input.pricingType ?? "FIXED";
+    const markupPercent = input.markupPercent ?? (pricingType === "COST_PLUS" ? 10 : null);
     if (!title?.trim()) return { ok: false as const, error: "title is required" };
-    if (!Array.isArray(items) || items.length === 0) return { ok: false as const, error: "items must be a non-empty array" };
+    if (pricingType !== "FIXED" && pricingType !== "COST_PLUS") return { ok: false as const, error: "pricingType must be FIXED or COST_PLUS" };
+    if (markupPercent !== null && (!Number.isFinite(markupPercent) || Number(markupPercent) < 0 || Number(markupPercent) > 1_000)) {
+        return { ok: false as const, error: "markupPercent must be between 0 and 1000" };
+    }
+    if (!Array.isArray(items)) return { ok: false as const, error: "items must be an array" };
+    if (pricingType === "FIXED" && items.length === 0) return { ok: false as const, error: "items must be a non-empty array for a fixed-price change order" };
 
     const estimate = await prisma.estimate.findFirst({
         where: { id: estimateId, projectId },
@@ -1505,6 +2057,37 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
     });
     const totalAmount = totalCents / 100;
 
+    const requestedSchedules = input.paymentSchedules ?? [];
+    const scheduleTimeZone = await resolveCompanyTimeZone();
+    if (pricingType === "COST_PLUS" && requestedSchedules.length > 0) {
+        return { ok: false as const, error: "Cost-plus change orders cannot have a fixed payment schedule." };
+    }
+    if (pricingType === "FIXED" && requestedSchedules.length === 1) {
+        return { ok: false as const, error: "A fixed-price payment schedule requires at least two payments." };
+    }
+    let scheduledCents = 0;
+    let scheduleRows: Array<{ name: string; amount: number; dueDate: Date | null; order: number }>;
+    try {
+        scheduleRows = requestedSchedules.map((schedule, index) => {
+            const requestedCents = Math.round(Number(schedule.amount) * 100);
+            const isLast = index === requestedSchedules.length - 1;
+            const amountCents = isLast ? totalCents - scheduledCents : requestedCents;
+            if (!Number.isSafeInteger(requestedCents) || requestedCents <= 0 || amountCents <= 0) {
+                throw new Error("Every scheduled payment must be positive and earlier payments must total less than the subtotal.");
+            }
+            scheduledCents += amountCents;
+            const dueDate = dateInputInTimeZone(schedule.dueDate, scheduleTimeZone, `Due date for ${schedule.name || `Payment ${index + 1}`}`);
+            return {
+                name: schedule.name?.trim() || `Payment ${index + 1}`,
+                amount: amountCents / 100,
+                dueDate,
+                order: schedule.order ?? index,
+            };
+        });
+    } catch (error: any) {
+        return { ok: false as const, error: error?.message || "Invalid payment schedule" };
+    }
+
     const changeOrder = await prisma.$transaction(async tx => {
         const created = await tx.changeOrder.create({
             data: {
@@ -1514,9 +2097,12 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
                 title: title.trim(),
                 description: description?.trim() || null,
                 status: "Draft",
+                pricingType,
+                markupPercent,
                 totalAmount,
                 balanceDue: totalAmount,
                 items: { create: rows },
+                ...(scheduleRows.length ? { paymentSchedules: { create: scheduleRows } } : {}),
             },
         });
         return tx.changeOrder.update({
@@ -1534,6 +2120,9 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
         title: changeOrder.title,
         totalAmount,
         itemCount: rows.length,
+        pricingType,
+        markupPercent,
+        paymentSchedules: scheduleRows,
         status: "Draft",
         url: `https://probuild.goldentouchremodeling.com/projects/${projectId}/change-orders`,
         warnings,
@@ -1862,6 +2451,29 @@ export async function deleteInvoiceMilestoneCore(
  * are unlinked extras. `updatePendingMilestoneAmountsCore` (re-price in place)
  * is the correct tool when the mirror link must survive.
  */
+// Frozen CO billing (ChangeOrderBilling / sourceChangeOrderId / sourceCoScheduleId links)
+// must never be orphaned by invoice-level destructive operations. Callers hold the invoice lock.
+export async function assertInvoiceHasNoChangeOrderBilling(
+    tx: Prisma.TransactionClient,
+    invoiceId: string,
+    operation: "delete" | "re-split",
+) {
+    const schedule = await tx.paymentSchedule.findFirst({
+        where: {
+            invoiceId,
+            OR: [
+                { sourceChangeOrderId: { not: null } },
+                { sourceCoScheduleId: { not: null } },
+                { coBilling: { isNot: null } },
+            ],
+        },
+        select: { id: true },
+    });
+    if (schedule) {
+        throw new Error("Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.");
+    }
+}
+
 export async function splitInvoiceMilestonesCore(
     invoiceId: string,
     milestones: { name: string; amount: number; dueDate?: string | null }[],
@@ -1909,6 +2521,8 @@ export async function splitInvoiceMilestonesCore(
                 `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
             );
         }
+
+        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "re-split");
 
         // Recalculate: the paid portion survives untouched, and only the pending
         // portion is replaced. totalAmount must keep counting the surviving paid

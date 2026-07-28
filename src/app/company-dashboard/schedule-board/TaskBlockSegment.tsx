@@ -5,11 +5,12 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import type { DashboardTaskRow } from "@/lib/schedule-core";
 import { addTaskComment, deleteScheduleTask } from "@/lib/actions";
-import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatDate, getDaysBetween, getDefaultColorForTaskName, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { clipRange, type DateRange, type TaskDateOverride, type TaskEditMode } from "./useBarLayout";
 import { FloatingPopover } from "./FloatingPopover";
 import { TaskCrewPicker } from "./CrewPickers";
 import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
+import { DRAG_VISUAL_ACTIVE_EVENT, isDragVisualLayerActive } from "./dragVisualLayer";
 
 export interface TaskPointerEditStart {
     pointerId: number;
@@ -28,6 +29,7 @@ export interface ActiveTaskKeyboardEdit {
 }
 
 export interface TaskEditCallbacks {
+    onActivate: (taskId: string) => void;
     onTaskPointerEditStart: (_task: DashboardTaskRow, _mode: TaskEditMode, _start: TaskPointerEditStart) => void;
     onTaskKeyboardStart: (_task: DashboardTaskRow, _mode: TaskEditMode, _sourceElement: HTMLElement) => void;
     onTaskKeyboardAdjust: (_task: DashboardTaskRow, _mode: TaskEditMode, _deltaDays: number) => void;
@@ -79,20 +81,6 @@ function initials(name: string): string {
 
 // Hover-card notes (owner-feedback round, item 3).
 const HOVER_CARD_OPEN_DELAY_MS = 300;
-const NOTE_TRUNCATE_LENGTH = 140;
-
-function relativeDayLabel(iso: string): string {
-    const createdDay = parseUTCDate(iso.slice(0, 10));
-    const diffDays = getDaysBetween(createdDay, todayUTC());
-    if (diffDays <= 0) return "Today";
-    if (diffDays === 1) return "Yesterday";
-    if (diffDays < 7) return `${diffDays} days ago`;
-    return formatDate(createdDay);
-}
-
-function truncateNote(text: string): string {
-    return text.length > NOTE_TRUNCATE_LENGTH ? `${text.slice(0, NOTE_TRUNCATE_LENGTH)}…` : text;
-}
 
 // Readability pass (2026-07-22): a task chip only shows its text label once
 // it's wide enough for roughly 3 characters at the bumped 11px label font —
@@ -128,13 +116,13 @@ export function TaskBlockSegment({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: TaskBlockSegmentProps) {
     const router = useRouter();
     const observerRef = useRef<ResizeObserver | null>(null);
     const rootRef = useRef<HTMLDivElement | null>(null);
     const fragmentId = useId().replace(/:/g, "");
     const [allocatedWidth, setAllocatedWidth] = useState(0);
-    const actionTriggerRef = useRef<HTMLButtonElement>(null);
     const [menuOpen, setMenuOpen] = useState(false);
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
     const [menuView, setMenuView] = useState<TaskMenuView>("main");
@@ -185,7 +173,7 @@ export function TaskBlockSegment({
         if (!menuOpen) setNoteDraft("");
     }, [menuOpen]);
     // Only one schedule-board menu open at a time (item 1) — including across
-    // a right-click/context menu vs the click-triggered "⋯" menu.
+    // right-click/context-menu and block-activation paths.
     useEffect(() => {
         if (!menuOpen) {
             setMenuView("main");
@@ -207,12 +195,28 @@ export function TaskBlockSegment({
         }
         setHoverCardOpen(false);
     }, [isAnyDragActive, menuOpen]);
+    // Pointer drags no longer update ScheduleBoard state at threshold time.
+    // Listen below the board root so an already-open card still closes while
+    // the root render counter remains unchanged for the full active drag.
+    useEffect(() => {
+        const closeForPointerDrag = () => {
+            if (!isDragVisualLayerActive()) return;
+            if (hoverOpenTimeoutRef.current != null) {
+                window.clearTimeout(hoverOpenTimeoutRef.current);
+                hoverOpenTimeoutRef.current = null;
+            }
+            setHoverCardOpen(false);
+        };
+        window.addEventListener(DRAG_VISUAL_ACTIVE_EVENT, closeForPointerDrag);
+        return () => window.removeEventListener(DRAG_VISUAL_ACTIVE_EVENT, closeForPointerDrag);
+    }, []);
     useEffect(() => () => {
         if (hoverOpenTimeoutRef.current != null) window.clearTimeout(hoverOpenTimeoutRef.current);
     }, []);
 
     function handleHoverCardMouseEnter() {
         if (isAnyDragActive || menuOpen || hoverOpenTimeoutRef.current != null) return;
+        if (isDragVisualLayerActive()) return;
         hoverOpenTimeoutRef.current = window.setTimeout(() => {
             hoverOpenTimeoutRef.current = null;
             setHoverCardOpen(true);
@@ -220,6 +224,7 @@ export function TaskBlockSegment({
     }
     function handleHoverCardFocus() {
         if (isAnyDragActive || menuOpen) return;
+        if (isDragVisualLayerActive()) return;
         if (hoverOpenTimeoutRef.current != null) {
             window.clearTimeout(hoverOpenTimeoutRef.current);
             hoverOpenTimeoutRef.current = null;
@@ -255,7 +260,7 @@ export function TaskBlockSegment({
             pointerType: event.pointerType,
             clientX: event.clientX,
             clientY: event.clientY,
-            sourceElement: event.currentTarget,
+            sourceElement: rootRef.current ?? event.currentTarget,
             timelineDayWidth,
             timelineLeftInset,
             timelineScrollContainerRef,
@@ -268,6 +273,18 @@ export function TaskBlockSegment({
         setMenuOpen(true);
     }
 
+    // Plain activation opens the one board-level drawer. The quick menu remains
+    // an explicit right-click / keyboard-context-menu surface.
+    function handleBlockActivate(event: ReactMouseEvent<HTMLDivElement> | KeyboardEvent<HTMLElement>) {
+        if (!canEdit || isPending) return;
+        if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
+        // A block sits inside its project bar, whose own click opens the
+        // PROJECT drawer — without this, the bar activation instantly replaces
+        // the task menu via the exclusive-surface coordinator.
+        event.stopPropagation();
+        onActivate(task.id);
+    }
+
     function handleKeyboard(event: KeyboardEvent<HTMLElement>, mode: TaskEditMode) {
         if (event.target !== event.currentTarget) return;
         if (!canEdit || isPending) return;
@@ -278,6 +295,12 @@ export function TaskBlockSegment({
             event.preventDefault();
             event.stopPropagation();
             openMenu(null);
+            return;
+        }
+        if (mode === "move" && activeMode === null && (event.key === " " || event.key === "Enter")) {
+            event.preventDefault();
+            event.stopPropagation();
+            handleBlockActivate(event);
             return;
         }
         if (!editing && (event.key === " " || event.key === "Enter")) {
@@ -382,13 +405,16 @@ export function TaskBlockSegment({
             title={title}
             role="group"
             tabIndex={0}
-            aria-label={`${title}. ${canEdit ? "Press Space or Enter to move with the keyboard." : "Read only."}${isDraft ? " Unsaved change." : ""}`}
+            aria-label={`${title}. ${canEdit ? "Press Enter or Space to open task actions." : "Read only."}${isDraft ? " Unsaved change." : ""}`}
             aria-disabled={!canEdit || isPending}
             aria-busy={isPending}
             data-task-edit-block="true"
+            data-drag-visual-kind="task"
+            data-drag-task-id={task.id}
             data-project-start={formatDate(projectRange.start)}
             data-can-edit={canEdit ? "true" : "false"}
             onPointerDown={event => beginPointerEdit(event, "move")}
+            onClick={handleBlockActivate}
             onKeyDown={event => handleKeyboard(event, "move")}
             onContextMenu={handleContextMenu}
             onMouseEnter={handleHoverCardMouseEnter}
@@ -432,19 +458,7 @@ export function TaskBlockSegment({
             )}
 
             {!mutationDisabled && (
-            <>
-                <button
-                    ref={actionTriggerRef}
-                    type="button"
-                    onClick={event => { event.stopPropagation(); if (menuOpen) setMenuOpen(false); else openMenu(null); }}
-                    onPointerDown={event => event.stopPropagation()}
-                    aria-expanded={menuOpen}
-                    className="absolute right-0 top-0 z-30 cursor-pointer rounded bg-white/85 px-1 text-[8px] font-bold text-slate-800 opacity-0 shadow transition group-hover/task:opacity-100 group-focus-within/task:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-                    aria-label={`Task actions for ${task.name}`}
-                >
-                    ⋯
-                </button>
-                <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
+                <FloatingPopover open={menuOpen} anchorRef={rootRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
                     {menuView === "main" && (
                         <div className="space-y-1" onPointerDown={event => event.stopPropagation()}>
                             <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
@@ -534,25 +548,12 @@ export function TaskBlockSegment({
                         </div>
                     )}
                 </FloatingPopover>
-            </>
             )}
             <FloatingPopover open={hoverCardOpen} anchorRef={rootRef} onClose={closeHoverCard} width={220} pointerEventsNone>
                 <div className="space-y-1">
                     <p className="text-xs font-semibold text-hui-textMain">{isMilestone ? `◆ ${task.name}` : task.name}</p>
-                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)}</p>
+                    <p className="text-[10px] text-hui-textMuted">UTC {formatDate(taskStart)} → {formatDate(isMilestone ? taskStart : taskEnd)} · {task.status} · {progress}%</p>
                     <p className="text-[10px] text-hui-textMuted">Crew: {crew}</p>
-                    {task.latestComments.length > 0 && (
-                        <div className="space-y-1 border-t border-hui-border pt-1">
-                            {task.latestComments.map((comment, index) => (
-                                <p key={index} className="text-[10px] text-hui-textMain">
-                                    <span className="font-semibold">{comment.authorName}</span>{" "}
-                                    <span className="text-hui-textMuted">{relativeDayLabel(comment.createdAt)}</span>
-                                    {" — "}
-                                    {truncateNote(comment.text)}
-                                </p>
-                            ))}
-                        </div>
-                    )}
                 </div>
             </FloatingPopover>
         </div>

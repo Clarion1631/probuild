@@ -1,6 +1,7 @@
 import { getEstimate, getLead, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import EstimateEditor from "@/app/projects/[id]/estimates/[estimateId]/EstimateEditor";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -18,6 +19,12 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
     }
 
     const serializedEstimate = JSON.parse(JSON.stringify(estimate));
+    serializedEstimate.signatureUrl = await resolveDocUrl((estimate as any).signatureUrl);
+    if (Array.isArray(serializedEstimate.files)) {
+        serializedEstimate.files = await Promise.all(
+            serializedEstimate.files.map(async (f: any) => ({ ...f, url: await resolveDocUrl(f.url) }))
+        );
+    }
 
     let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
     try {

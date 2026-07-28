@@ -4,10 +4,23 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded } from "@/lib/billing-core";
-import { applyChangeOrderToSchedule, getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, setProjectStartDate, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, getCrewConflicts } from "@/lib/schedule-core";
+import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
+import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
+import {
+    applyChangeOrderToScheduleWithConfirmation,
+    assignProjectCrewWithConfirmation,
+    assignTaskCrew,
+    generateProjectScheduleWithConfirmation,
+    getProjectSchedule,
+    listCrewAvailability,
+    planSchedule,
+    setProjectStartDateWithConfirmation,
+    setTaskStatus,
+    updateTaskDates,
+} from "@/lib/mcp-schedule-tools";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -439,20 +452,29 @@ const handler = createMcpHandler(
                 annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
                 description:
                     "Captures a field change order as a DRAFT on a project (attached to one of its estimates — find the estimateId via list_project_billing). " +
-                    "Line items follow the same costCode/costType rules as estimates. It is NOT sent to the customer — review and send happen in ProBuild.",
+                    "Say 'cost plus 10' with pricingType COST_PLUS and markupPercent 10. Say 'two payments, half up front' with two paymentSchedules. " +
+                    "Line items follow the same costCode/costType rules as estimates. Cost-plus scope items are optional. It is NOT sent to the customer — review and send happen in ProBuild.",
                 inputSchema: {
                     projectId: z.string().max(50),
                     estimateId: z.string().max(50).describe("Estimate on the project this change order amends (from list_project_billing)"),
                     title: z.string().min(1).max(300).describe("e.g. 'Add recessed lighting in kitchen'"),
                     description: z.string().max(2000).optional(),
+                    pricingType: z.enum(["FIXED", "COST_PLUS"]).default("FIXED"),
+                    markupPercent: z.number().min(0).max(1000).nullable().optional(),
                     items: z.array(z.object({
                         name: z.string().min(1).max(300),
                         description: z.string().max(2000).optional(),
                         costCode: z.string().max(50).optional(),
                         costType: z.string().max(50).optional(),
-                        quantity: z.number().positive().max(1_000_000),
+                        quantity: z.number().min(0).max(1_000_000),
                         unitCost: z.number().min(0).max(10_000_000),
-                    })).min(1).max(100),
+                    })).max(100).optional(),
+                    paymentSchedules: z.array(z.object({
+                        name: z.string().min(1).max(300),
+                        amount: z.number().positive().max(10_000_000),
+                        dueDate: z.string().optional(),
+                        order: z.number().int().min(0).optional(),
+                    })).max(20).optional(),
                 },
             },
             async args => {
@@ -479,7 +501,8 @@ const handler = createMcpHandler(
                 const co = await prisma.changeOrder.findUnique({
                     where: { id: changeOrderId },
                     select: {
-                        code: true, title: true, status: true, totalAmount: true, updatedAt: true,
+                        code: true, title: true, status: true, pricingType: true, markupPercent: true, totalAmount: true, updatedAt: true,
+                        paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true, order: true } },
                         estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
                         project: { select: { name: true, client: { select: { name: true, email: true } } } },
                     },
@@ -495,7 +518,7 @@ const handler = createMcpHandler(
 
                 // updatedAt in the payload means any edit to the CO between preview
                 // and confirm (title, items, totals) invalidates the token.
-                const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, total: Number(co.totalAmount), status: co.status, updatedAt: co.updatedAt.toISOString() });
+                const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, pricingType: co.pricingType, markupPercent: co.markupPercent, total: Number(co.totalAmount), schedules: co.paymentSchedules.map(row => [row.id, row.name, Number(row.amount), row.dueDate?.toISOString(), row.order]), status: co.status, updatedAt: co.updatedAt.toISOString() });
                 if (!verifyPreviewToken(confirmToken, payload)) {
                     const subtotal = Number(co.totalAmount);
                     const taxAmount = Math.round(subtotal * coTaxRate(co.estimate) * 100) / 100;
@@ -503,10 +526,12 @@ const handler = createMcpHandler(
                         preview: true,
                         changeOrder: {
                             code: co.code, title: co.title, status: co.status,
-                            subtotal,
-                            tax: taxAmount,
-                            taxTreatment: coTaxLabel(co.estimate),
-                            revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100,
+                            pricingType: co.pricingType,
+                            markupPercent: co.markupPercent,
+                            paymentSchedules: co.paymentSchedules.map(row => ({ ...row, amount: Number(row.amount) })),
+                            ...(co.pricingType === "COST_PLUS"
+                                ? { terms: `cost + ${co.markupPercent ?? 10}% + tax, billed from actuals` }
+                                : { subtotal, tax: taxAmount, taxTreatment: coTaxLabel(co.estimate), revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100 }),
                         },
                         project: co.project?.name,
                         recipient,
@@ -712,19 +737,164 @@ const handler = createMcpHandler(
         );
 
         server.registerTool(
+            "list_change_orders",
+            {
+                title: "List project change orders and actuals",
+                annotations: { readOnlyHint: true },
+                description: "Lists change orders with pricing type, signature state, unbilled billable actuals, hours, and billed-to-date. Use this before logging or billing cost-plus work.",
+                inputSchema: { projectId: z.string().max(50) },
+            },
+            async ({ projectId }) => {
+                const orders = await prisma.changeOrder.findMany({
+                    where: { projectId },
+                    orderBy: { createdAt: "desc" },
+                    include: {
+                        timeEntries: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { durationHours: true, laborCost: true, burdenCost: true } },
+                        expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
+                        billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
+                        paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true } },
+                    },
+                });
+                return textResult(orders.map((co) => ({
+                    id: co.id,
+                    code: co.code,
+                    title: co.title,
+                    status: co.status,
+                    pricingType: co.pricingType,
+                    markupPercent: co.markupPercent,
+                    subtotal: Number(co.totalAmount),
+                    signature: { approvedBy: co.approvedBy, approvedAt: co.approvedAt, signed: Boolean(co.approvedAt && co.clientSignatureUrl) },
+                    paymentSchedules: co.paymentSchedules.map((row) => ({ ...row, amount: Number(row.amount) })),
+                    actualsToDate: {
+                        hours: co.timeEntries.reduce((sum, row) => sum + (row.durationHours ?? 0), 0),
+                        laborAndBurden: co.timeEntries.reduce((sum, row) => sum + Number(row.laborCost) + Number(row.burdenCost ?? 0), 0),
+                        expenses: co.expenses.reduce((sum, row) => sum + Number(row.amount), 0),
+                    },
+                    billedToDate: co.billings.reduce((sum, row) => sum + row.totalCents, 0) / 100,
+                })));
+            },
+        );
+
+        server.registerTool(
+            "log_time",
+            {
+                title: "Log crew time to a project or cost-plus change order",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description: "Logs time for an explicitly named crew member. Provide projectId or changeOrderId. A cost-plus tag is billable automatically; ambiguous crew names return the project crew list.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional(),
+                    changeOrderId: z.string().max(50).optional(),
+                    crewMember: z.string().trim().min(1).max(200),
+                    date: z.string().min(10).max(40),
+                    hours: z.number().positive().max(24),
+                    note: z.string().max(2000).optional(),
+                    burdenCost: z.number().min(0).max(1_000_000).optional().describe("Optional total burden cost for this entry"),
+                },
+            },
+            async ({ projectId, changeOrderId, crewMember, date, hours, note, burdenCost }) => {
+                if ((projectId ? 1 : 0) + (changeOrderId ? 1 : 0) !== 1) {
+                    return { ...textResult({ error: "Provide exactly one of projectId or changeOrderId." }), isError: true };
+                }
+                const co = changeOrderId ? await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } }) : null;
+                const resolvedProjectId = projectId ?? co?.projectId;
+                if (!resolvedProjectId) return { ...textResult({ error: "Change order not found" }), isError: true };
+                const project = await prisma.project.findUnique({
+                    where: { id: resolvedProjectId },
+                    select: { name: true, crew: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } } },
+                });
+                if (!project) return { ...textResult({ error: "Project not found" }), isError: true };
+                const matches = findCrewMatches(project.crew, crewMember);
+                if (matches.length !== 1) {
+                    return { ...textResult({ error: matches.length ? `Crew name "${crewMember}" is ambiguous.` : `Crew member "${crewMember}" was not found.`, crew: project.crew.map(row => ({ name: row.name, email: row.email })) }), isError: true };
+                }
+                const member = matches[0];
+                const costs = calculateCrewTimeCosts(hours, Number(member.hourlyRate ?? 0), Number(member.burdenRate ?? 0), burdenCost);
+                const entry = await createTimeEntryCore({
+                    projectId: resolvedProjectId,
+                    changeOrderId: changeOrderId ?? null,
+                    userId: member.id,
+                    date,
+                    durationHours: hours,
+                    laborCost: costs.laborCost,
+                    burdenCost: costs.burdenCost,
+                    notes: note,
+                    isBillable: Boolean(changeOrderId),
+                }, "ChatGPT connector");
+                return textResult({ id: entry.id, projectId: resolvedProjectId, changeOrderId: entry.changeOrderId, crewMember: member.name || member.email, hours, laborCost: Number(entry.laborCost), burdenCost: Number(entry.burdenCost ?? 0), url: `https://probuild.goldentouchremodeling.com/projects/${resolvedProjectId}/time-expenses` });
+            },
+        );
+
+        server.registerTool(
+            "log_expense",
+            {
+                title: "Log an expense to a project estimate or cost-plus change order",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description: "Logs an expense. Use changeOrderId for cost-plus actuals, or estimateId for an ordinary project expense. receiptFileId accepts the id returned by upload_file.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).optional(),
+                    estimateId: z.string().max(50).optional(),
+                    amount: z.number().positive().max(10_000_000),
+                    vendor: z.string().max(300).optional(),
+                    date: z.string().max(40).optional(),
+                    description: z.string().max(2000).optional(),
+                    receiptFileId: z.string().max(80).optional(),
+                },
+            },
+            async ({ changeOrderId, estimateId, amount, vendor, date, description, receiptFileId }) => {
+                if ((changeOrderId ? 1 : 0) + (estimateId ? 1 : 0) !== 1) {
+                    return { ...textResult({ error: "Provide exactly one of changeOrderId or estimateId." }), isError: true };
+                }
+                try {
+                    const expense = await createExpenseCore({ changeOrderId, estimateId, amount, vendor, date, description, receiptFileId, isBillable: Boolean(changeOrderId) }, "ChatGPT connector");
+                    const estimate = await prisma.estimate.findUnique({ where: { id: expense.estimateId }, select: { projectId: true } });
+                    return textResult({ id: expense.id, changeOrderId: expense.changeOrderId, amount: Number(expense.amount), receiptUrl: expense.receiptUrl, url: estimate?.projectId ? `https://probuild.goldentouchremodeling.com/projects/${estimate.projectId}/time-expenses` : null });
+                } catch (err: any) {
+                    return { ...textResult({ error: err?.message || "Expense could not be logged" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
             "bill_change_order",
             {
                 title: "Bill an approved change order",
                 annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description:
-                    "Adds an APPROVED change order to the project's invoice as a new payment milestone (idempotent — a CO can only be billed once). " +
+                    "Bills an APPROVED change order. Fixed-price orders bill immediately. COST_PLUS uses a bound TWO-STEP preview: call with throughDate, show the itemized totals, then echo confirmToken. " +
                     "Nothing is emailed by this tool; it returns the milestone id so you can then run send_milestone_invoice (preview → user approval → confirm) " +
                     "to email the customer the QuickBooks payment link. Find change order ids and statuses via list_project_billing.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Change order id from list_project_billing (status must be Approved)"),
+                    throughDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Required for cost-plus: local company date through which actuals are included"),
+                    confirmToken: z.string().max(40).optional(),
                 },
             },
-            async ({ changeOrderId }) => {
+            async ({ changeOrderId, throughDate, confirmToken }) => {
+                const co = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { pricingType: true } });
+                if (!co) return { ...textResult({ error: "Change order not found" }), isError: true };
+                if (co.pricingType === "COST_PLUS") {
+                    if (!throughDate) return { ...textResult({ error: "throughDate is required for a cost-plus billing run" }), isError: true };
+                    try {
+                        const preview = await previewCostPlusChangeOrderCore(changeOrderId, { throughDate });
+                        const payload = JSON.stringify({ changeOrderId, throughDate: preview.throughDate, invoiceId: preview.invoiceId, markupPercent: preview.markupPercent, taxRate: preview.taxRate, fingerprint: preview.fingerprint });
+                        if (!verifyPreviewToken(confirmToken, payload)) {
+                            return textResult({ preview: true, ...preview, confirmToken: mintPreviewToken(payload), instruction: "Show labor (including burden), expenses, markup, tax, total, and the through date. Call again with this token only after explicit approval." });
+                        }
+                        const result = await billCostPlusChangeOrderCore(changeOrderId, {
+                            throughDate,
+                            actor: "ChatGPT connector",
+                            expectedFingerprint: preview.fingerprint,
+                            expectedInvoiceId: preview.invoiceId,
+                            expectedMarkupPercent: preview.markupPercent,
+                            expectedTaxRate: preview.taxRate,
+                        });
+                        return textResult({ ...result, backupUrlNote: "The itemized backup link appears on the invoice portal and is emailed when this milestone is sent." });
+                    } catch (err: any) {
+                        let freshPreview: unknown = null;
+                        try { freshPreview = await previewCostPlusChangeOrderCore(changeOrderId, { throughDate }); } catch {}
+                        return { ...textResult({ error: err?.message || "Cost-plus billing failed", freshPreview }), isError: true };
+                    }
+                }
                 const result = await billChangeOrderCore(changeOrderId);
                 if (!result.ok) return { ...textResult({ error: result.error }), isError: true };
                 return textResult(result);
@@ -1215,6 +1385,152 @@ const handler = createMcpHandler(
         );
 
         server.registerTool(
+            "get_project_schedule",
+            {
+                title: "Get one project's detailed schedule",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns every task for exactly one project, including YYYY-MM-DD dates, status, progress, crew names and lead, task/appointment fields, completion criteria, and material counts. " +
+                    "Pass exactly one of projectId or the project's exact jobName. This read-only tool never returns rates or financial data.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional().describe("Exact project id from list_projects, find_job, or get_company_schedule"),
+                    jobName: z.string().trim().min(1).max(300).optional().describe("Exact project name, case-insensitive; use projectId if names are duplicated"),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await getProjectSchedule(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to get project schedule" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "plan_schedule",
+            {
+                title: "Plan and bulk-create project schedule tasks",
+                description:
+                    "Creates 1–50 tasks atomically on a project. Dates must be real YYYY-MM-DD values; scheduledTime is 24-hour HH:MM and appointment-only. " +
+                    "crewNames and leadName match ACTIVATED users by exact full name or first name; ambiguous names return candidates, and leadName must also appear in crewNames. " +
+                    "TWO-STEP, SINGLE-USE: first call without confirmToken, show the complete task/date/crew preview, then call again with the returned 64-character confirmation token only after explicit user approval. Any invalid task rolls back the whole plan.",
+                inputSchema: {
+                    projectId: z.string().max(50).describe("Target project id"),
+                    tasks: z.array(z.object({
+                        name: z.string().trim().min(1).max(300),
+                        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                        type: z.enum(["task", "milestone", "appointment"]).optional(),
+                        crewNames: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
+                        leadName: z.string().trim().min(1).max(200).optional(),
+                        doneWhen: z.string().max(2000).optional(),
+                        scheduledTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Use 24-hour HH:MM").optional(),
+                        estimatedHours: z.number().min(0).max(100_000).optional(),
+                    })).min(1).max(50),
+                    confirmToken: z.string().length(64).optional().describe("Single-use token from this exact plan_schedule preview"),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await planSchedule(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to plan schedule" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "update_task_dates",
+            {
+                title: "Update a schedule task's dates",
+                description:
+                    "Moves one task's startDate and/or endDate. Dates must use YYYY-MM-DD; normal tasks require endDate after startDate and milestones stay on one day. " +
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for the exact before/after preview, obtain user approval, then repeat the same arguments with that token.",
+                inputSchema: {
+                    taskId: z.string().max(50),
+                    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
+                    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await updateTaskDates(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to update task dates" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "set_task_status",
+            {
+                title: "Set a schedule task's status",
+                description:
+                    "Sets status to Not Started, In Progress, Complete, or Blocked. Blocked requires a non-empty blockedReason; moving away from Blocked clears it. " +
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for a preview, show it to the user, then repeat the exact arguments with the returned token after approval.",
+                inputSchema: {
+                    taskId: z.string().max(50),
+                    status: z.enum(["Not Started", "In Progress", "Complete", "Blocked"]),
+                    blockedReason: z.string().trim().max(2000).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await setTaskStatus(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to set task status" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "assign_task_crew",
+            {
+                title: "Replace a task's crew and lead",
+                description:
+                    "Replaces one task's complete crew list using ACTIVATED first-name or exact full-name matches; ambiguous names return candidates. leadName is optional but must also appear in crewNames. " +
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for the replacement preview, show it to the user, then repeat the exact arguments with the token after approval.",
+                inputSchema: {
+                    taskId: z.string().max(50),
+                    crewNames: z.array(z.string().trim().min(1).max(200)).max(50),
+                    leadName: z.string().trim().min(1).max(200).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await assignTaskCrew(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to assign task crew" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "list_crew_availability",
+            {
+                title: "List field-crew availability",
+                annotations: { readOnlyHint: true },
+                description:
+                    "For each ACTIVATED FIELD_CREW member and each requested day, returns booked task names or free. startDate must be YYYY-MM-DD and days must be 1–14. " +
+                    "This read-only output deliberately excludes emails, rates, costs, budgets, and every other financial field.",
+                inputSchema: {
+                    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                    days: z.number().int().min(1).max(14),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await listCrewAvailability(args));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to list crew availability" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
             "set_project_start_date",
             {
                 title: "Move (or clear) a project's company start date",
@@ -1224,22 +1540,17 @@ const handler = createMcpHandler(
                     "milestones shift on both mirrors (estimate + invoice side) — EXCEPT any milestone group already pushed to QuickBooks, " +
                     "which is skipped entirely and reported in skippedQbMilestones for manual/QB-side fixing. In-progress projects only move " +
                     "the marker (tasks never shift). Closed projects are refused. Pass startDate null to clear the marker (tasks untouched). " +
-                    "Internal and reversible — no customer email, no preview token needed.",
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for the effect preview, show it to the user, then repeat the exact arguments with that token after approval.",
                 inputSchema: {
                     projectId: z.string().max(50).describe("Project id from get_company_schedule or list_projects"),
                     startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD (no time component)").nullable().describe("New start date as YYYY-MM-DD; null clears the start marker"),
                     shiftJobTasks: z.boolean().optional().describe("Shift the job's tasks and linked milestones by the same delta (default true)"),
+                    confirmToken: z.string().length(64).optional().describe("Single-use token from this exact preview"),
                 },
             },
-            async ({ projectId, startDate, shiftJobTasks }) => {
+            async args => {
                 try {
-                    const result = await setProjectStartDate({
-                        projectId,
-                        startDate: startDate === null ? null : parseStartDateInput(startDate),
-                        shiftJobTasks: shiftJobTasks ?? true,
-                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
-                    });
-                    return textResult(result);
+                    return textResult(await setProjectStartDateWithConfirmation(args));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to set project start date" }), isError: true };
                 }
@@ -1256,20 +1567,16 @@ const handler = createMcpHandler(
                     "payment milestones to them. Preconditions: the estimate must be Approved, Invoiced, Partially Paid, or Paid, " +
                     "owned by a PROJECT (not a lead), and the project must have a start date first (set_project_start_date). " +
                     "mode 'merge' (default) skips items already task-linked; 'regenerate' deletes untouched generated tasks and rebuilds. " +
-                    "Idempotent — safe to re-run.",
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for a preview, then repeat the exact arguments with that token only after explicit approval.",
                 inputSchema: {
                     estimateId: z.string().max(50).describe("Estimate id (from find_job or list_project_billing) — must be Approved+ and on a project with a start date"),
                     mode: z.enum(["merge", "regenerate"]).optional().describe("'merge' (default) fills gaps; 'regenerate' rebuilds untouched generated tasks"),
+                    confirmToken: z.string().length(64).optional(),
                 },
             },
-            async ({ estimateId, mode }) => {
+            async args => {
                 try {
-                    const result = await generateScheduleFromEstimate({
-                        estimateId,
-                        mode: mode ?? "merge",
-                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
-                    });
-                    return textResult(result);
+                    return textResult(await generateProjectScheduleWithConfirmation(args));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to generate schedule" }), isError: true };
                 }
@@ -1283,20 +1590,16 @@ const handler = createMcpHandler(
                 description:
                     "Replaces the project's crew with exactly the given user ids (connect/disconnect diff — re-running with the " +
                     "same list is a no-op). Every id must be an ACTIVATED team member. Crew drives the company-calendar chips and " +
-                    "the crewConflicts block in get_company_schedule (double-bookings across overlapping project windows).",
+                    "the crewConflicts block in get_company_schedule. TWO-STEP, SINGLE-USE: preview first, then repeat the exact arguments with confirmToken after approval.",
                 inputSchema: {
                     projectId: z.string().max(50).describe("Project id from get_company_schedule or list_projects"),
                     userIds: z.array(z.string().max(50)).max(50).describe("ACTIVATED user ids to assign — the FULL crew (not a delta); empty array clears the crew"),
+                    confirmToken: z.string().length(64).optional(),
                 },
             },
-            async ({ projectId, userIds }) => {
+            async args => {
                 try {
-                    const result = await setProjectCrew({
-                        projectId,
-                        userIds,
-                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
-                    });
-                    return textResult(result);
+                    return textResult(await assignProjectCrewWithConfirmation(args));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to assign crew" }), isError: true };
                 }
@@ -1310,20 +1613,17 @@ const handler = createMcpHandler(
                 description:
                     "Adds an Approved change order's positive-scope tasks and payment milestones to its project's schedule. " +
                     "Deductions are reported for manual trimming and never remove existing tasks automatically. " +
-                    "Default merge mode is idempotent; regenerate rebuilds only untouched CO-generated task subtrees.",
+                    "Default merge mode is idempotent; regenerate rebuilds only untouched CO-generated task subtrees. " +
+                    "TWO-STEP, SINGLE-USE: preview first, then repeat the exact arguments with confirmToken after approval.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Approved change-order id"),
                     mode: z.enum(["merge", "regenerate"]).optional().describe("'merge' (default) applies once; 'regenerate' rebuilds only untouched generated work"),
+                    confirmToken: z.string().length(64).optional(),
                 },
             },
-            async ({ changeOrderId, mode }) => {
+            async args => {
                 try {
-                    const result = await applyChangeOrderToSchedule({
-                        changeOrderId,
-                        mode: mode ?? "merge",
-                        actor: { type: "SYSTEM", name: "ChatGPT connector" },
-                    });
-                    return textResult(result);
+                    return textResult(await applyChangeOrderToScheduleWithConfirmation(args));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to apply change order to schedule" }), isError: true };
                 }
@@ -1331,7 +1631,7 @@ const handler = createMcpHandler(
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.10.0" },
+        serverInfo: { name: "probuild", version: "1.12.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -1349,12 +1649,15 @@ const handler = createMcpHandler(
             + "To locate a job or estimate you only know by name/number (and don't know if it's still a lead or already a project), use find_job — it searches leads AND projects including closed/won ones, plus estimates by code. " +
             "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice, resend_invoice and send_estimate EMAIL THE CUSTOMER — " +
             "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
-            "Change-order lifecycle: create_change_order (draft) → send_change_order (preview + user approval; customer signs via portal) → " +
-            "once Approved, bill_change_order puts it on the invoice → send_milestone_invoice emails the payment link. " +
+            "Change-order lifecycle: create_change_order (draft, including cost-plus and fixed milestone schedules) → send_change_order (preview + user approval; customer signs via portal) → " +
+            "once Approved, log_time/log_expense record cost-plus actuals and bill_change_order previews then bills them; fixed orders bill directly → send_milestone_invoice emails the payment link and T&M backup. " +
             "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
             "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +
             "for the next N days, with each project's crew and a crewConflicts block (double-bookings across overlapping project windows). " +
+            "get_project_schedule returns one job's task-level plan; list_crew_availability returns only field-crew bookings/free days and never rates or financials. " +
+            "plan_schedule bulk-creates up to 50 tasks; update_task_dates, set_task_status, and assign_task_crew refine individual tasks. " +
+            "Every schedule-writing tool uses a single-use TWO-STEP confirmation: call without confirmToken, show the returned preview, and only repeat the exact arguments with that token after explicit user approval. Never self-confirm. " +
             "set_project_start_date moves a project's company start date — for a project still Waiting to Start it also shifts " +
             "the job's tasks and linked milestones by the same delta (pass shiftJobTasks false to move only the marker); milestone groups already pushed " +
             "to QuickBooks are never shifted and come back in skippedQbMilestones for manual fixing. " +

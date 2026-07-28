@@ -1,6 +1,7 @@
 "use client";
 
 import * as Dialog from "@radix-ui/react-dialog";
+import { motion } from "framer-motion";
 import type { ProjectDropIntent } from "./useBarLayout";
 
 export type ProjectMoveChoice = "marker-only" | "not-started-tasks";
@@ -19,8 +20,17 @@ export function ShiftConfirmDialog({ intent, isPending, onChoice, onCancel }: Sh
     return (
         <Dialog.Root open={Boolean(intent)} onOpenChange={open => { if (!open && !isPending) onCancel(); }}>
             <Dialog.Portal>
-                <Dialog.Overlay className="fixed inset-0 z-[70] bg-black/45" />
-                <Dialog.Content className="fixed left-1/2 top-1/2 z-[71] w-[min(92vw,32rem)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-hui-border bg-white p-5 shadow-2xl focus:outline-none">
+                <Dialog.Overlay asChild>
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.16 }} className="fixed inset-0 z-[70] bg-black/45" />
+                </Dialog.Overlay>
+                <Dialog.Content asChild>
+                <motion.div
+                    data-motion-scope="dialog-enter"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ duration: 0.18 }}
+                    className="fixed left-1/2 top-1/2 z-[71] w-[min(92vw,32rem)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-hui-border bg-white p-5 shadow-2xl focus:outline-none"
+                >
                     <Dialog.Title className="text-base font-semibold text-hui-textMain">Move In Progress project</Dialog.Title>
                     <Dialog.Description className="mt-2 text-sm text-hui-textMuted">
                         {intent ? `${intent.project.name} is previewed ${magnitude} day${magnitude === 1 ? "" : "s"} ${direction}. Choose one edit; these actions are intentionally not combined.` : "Choose how to move this project."}
@@ -50,6 +60,7 @@ export function ShiftConfirmDialog({ intent, isPending, onChoice, onCancel }: Sh
                             </button>
                         </Dialog.Close>
                     </div>
+                </motion.div>
                 </Dialog.Content>
             </Dialog.Portal>
         </Dialog.Root>

@@ -88,7 +88,9 @@ export async function claimQBInvoiceUnlink(
     return cleared.count === 1;
 }
 
-async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
+// Exported for stageProgressBillingToQuickBooksCore (src/lib/progress-billing.ts),
+// which needs the same customer/item resolution pushMilestoneToQuickBooks uses.
+export async function resolveCustomerAndItem(tokens: QBTokens, clientId: string): Promise<{ customerId: string; itemId: string }> {
     const client = await prisma.client.findUnique({
         where: { id: clientId },
         select: { id: true, name: true, email: true, qbCustomerId: true },
@@ -135,6 +137,22 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     if (!schedule) throw new Error("Payment milestone not found");
     if (schedule.status === "Paid") throw new Error("Milestone is already paid");
 
+    // A milestone already claimed by a progress billing must never get its own
+    // legacy QBO invoice: the billing stages one covering it, so a second one here
+    // would leave TWO collectible invoices for the same money. Checked (and
+    // re-checked below, immediately before the link write) because a full-milestone
+    // billing leaves the row Pending and unlinked — exactly the state this function
+    // otherwise accepts.
+    const claimedBy = await prisma.progressBillingLine.findFirst({
+        where: { scheduleId: paymentScheduleId, billing: { status: { not: "Void" } } },
+        select: { billing: { select: { code: true, status: true } } },
+    });
+    if (claimedBy) {
+        throw new Error(
+            `This milestone is already covered by progress invoice ${claimedBy.billing.code} (${claimedBy.billing.status}) — stage that instead of creating a separate QuickBooks invoice here.`
+        );
+    }
+
     const tokens = passedTokens ?? await getFreshQBTokens();
 
     if (schedule.qbInvoiceId) {
@@ -160,7 +178,8 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
-    const docNumber = `${invoice.code}-${position}`;
+    const suffix = `-${position}`;
+    const docNumber = `${invoice.code.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
 
     const projectName = invoice.project?.name || "Project";
     const amount = toNum(schedule.amount);
@@ -168,12 +187,17 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // Carry the sales tax explicitly so Vanessa's QBO sales-tax reporting sees
     // the liability. The milestone amount is tax-inclusive; split it using the
     // invoice's rate (each milestone carries its proportional share of tax).
-    const taxRate = toNum(invoice.taxRate);
     let tax: { preTaxAmount: number; taxAmount: number } | null = null;
-    if (taxRate > 0) {
+    if (schedule.pretaxAmount != null && schedule.taxAmount != null) {
+        tax = {
+            preTaxAmount: toNum(schedule.pretaxAmount),
+            taxAmount: toNum(schedule.taxAmount),
+        };
+    } else {
+        const taxRate = toNum(invoice.taxRate);
         const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
         const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
-        if (taxAmount > 0) tax = { preTaxAmount, taxAmount };
+        if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
     const { qbId, total } = await createQBMilestoneInvoice(tokens, {
@@ -208,19 +232,34 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // silently out of sync. If the claim misses, the just-created QBO invoice is
     // deleted (compensation) instead of being attached to a row it no longer
     // describes.
-    const linked = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            status: "Pending",
-            qbPaymentId: null,
-            qbInvoiceId: null,
-            amount: schedule.amount,
-            name: schedule.name,
-            dueDate: schedule.dueDate,
-        },
-        // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-        data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
-    });
+    // Taken under the invoice lock and paired with a progress-billing re-check:
+    // createProgressBillingCore locks the same invoice row, so the two paths
+    // serialize instead of interleaving. Without this a progress billing could
+    // claim this milestone in the window between the guard at the top of this
+    // function and the write below (a full-milestone billing leaves the row
+    // Pending and unlinked, so every pinned column here would still match) and
+    // the client would end up with two collectible QuickBooks invoices.
+    const linked = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { id: true },
+        });
+        if (claimedNow) return { count: 0 };
+        return tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                status: "Pending",
+                qbPaymentId: null,
+                qbInvoiceId: null,
+                amount: schedule.amount,
+                name: schedule.name,
+                dueDate: schedule.dueDate,
+            },
+            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
+            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
+        });
+    }));
     if (linked.count !== 1) {
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
         if (!compensated) {
@@ -231,6 +270,161 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     }
 
     return { qbInvoiceId: qbId, payLink, qbTotal: total };
+}
+
+/**
+ * Shared bookkeeping for settling ONE milestone from a QuickBooks payment:
+ * claim it Paid, recompute the parent invoice's balance/status from every
+ * milestone, and mirror the settle onto the linked estimate-side copy.
+ *
+ * Caller-locked: the caller must already hold the canonical Estimate→Invoice
+ * locks (via `lockMoneyParents`) for this milestone's invoice BEFORE calling
+ * this — it does no locking of its own so it can be called more than once
+ * inside one transaction (progressBillingSettleLoop below settles every
+ * milestone line of a multi-line progress billing under ONE lock+transaction).
+ *
+ * Deliberately does NOT enqueue a paid notification — that is the caller's
+ * job, so a caller that must not notify (progress billing settle, this pass)
+ * can skip it without a second/duplicate writer for the same lifecycle event.
+ */
+async function settleMilestonePaidInTx(
+    t: Prisma.TransactionClient,
+    paymentScheduleId: string,
+    invoiceId: string,
+    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }
+): Promise<boolean> {
+    // INVARIANT: do NOT pin qbInvoiceId in this claim. A real QBO settlement must
+    // win over a concurrent breakQBInvoiceLink (which nulls qbInvoiceId): pinning it
+    // would drop a genuinely-received payment (the row would be excluded from the next
+    // sync's `pending` query forever → client could be double-billed). The settle
+    // wins; qbPaymentId below preserves the QBO audit link even if the id was cleared.
+    const claim = await t.paymentSchedule.updateMany({
+        where: { id: paymentScheduleId, status: { not: "Paid" } },
+        data: {
+            status: "Paid",
+            paymentMethod: "quickbooks",
+            paidAt: payment.paidAt,
+            paymentDate: payment.paidAt,
+            referenceNumber: payment.referenceNumber,
+            qbPaymentId: payment.qbPaymentId,
+            qbSyncedAt: new Date(),
+        },
+    });
+    if (claim.count === 0) return false;
+
+    const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
+    if (!invoice) return false;
+    const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
+    const totalPaid = allSchedules
+        .filter(s => s.status === "Paid")
+        .reduce((sum, s) => sum + toNum(s.amount), 0);
+    const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
+    await t.invoice.update({
+        where: { id: invoiceId },
+        data: {
+            balanceDue: newBalance,
+            status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
+        },
+    });
+
+    // Mirror the settle onto the estimate-side milestone copy so the
+    // estimate editor/balance track the QuickBooks rail too (link-first,
+    // name+amount fallback for pre-link rows; claimed update).
+    if (invoice.estimateId) {
+        const settled = allSchedules.find(s => s.id === paymentScheduleId);
+        let estCopy: { id: string } | null = null;
+        if (settled?.sourceScheduleId) {
+            estCopy = await t.estimatePaymentSchedule.findFirst({
+                where: { id: settled.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
+            });
+        } else if (settled) {
+            // Fallback for pre-link rows: only safe when exactly one candidate matches.
+            const candidates = await t.estimatePaymentSchedule.findMany({
+                where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: settled.name },
+                take: 2,
+            });
+            const matching = candidates.filter(c => toNum(c.amount) === toNum(settled.amount));
+            estCopy = matching.length === 1 ? matching[0] : null;
+        }
+        if (estCopy && settled) {
+            const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
+                where: { id: estCopy.id, status: { not: "Paid" } },
+                data: {
+                    status: "Paid",
+                    paymentMethod: "quickbooks",
+                    paidAt: payment.paidAt,
+                    paymentDate: payment.paidAt,
+                    referenceNumber: payment.referenceNumber,
+                },
+            });
+            if (mirrorClaim.count > 0) {
+                const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
+                if (estimate) {
+                    const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
+                    const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
+                    const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
+                    const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
+                    await t.estimate.update({
+                        where: { id: invoice.estimateId },
+                        data: {
+                            balanceDue: estBalance,
+                            status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
+                            ...(estFirstPayment && { statusBeforePayment: estimate.status }),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Settle ONE progress billing (src/lib/progress-billing.ts) from a QuickBooks
+ * payment: claim the billing Paid, then settle every milestone line it
+ * carries (custom/CO lines are materialized into a real PaymentSchedule at
+ * billing-creation time — see createProgressBillingCore — so every line has a
+ * scheduleId here; there is no special case). Exported (not just inlined in
+ * syncQuickBooksPayments below) so it can be driven directly — by a caller
+ * that already has a settlement to record, or by a test with no live
+ * QuickBooks connection.
+ */
+export async function settleProgressBillingPaidCore(
+    billingId: string,
+    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null },
+): Promise<boolean> {
+    const billing = await prisma.progressBilling.findUnique({
+        where: { id: billingId },
+        select: {
+            id: true,
+            invoiceId: true,
+            lines: { select: { scheduleId: true } },
+            invoice: { select: { estimateId: true } },
+        },
+    });
+    if (!billing) return false;
+
+    return withTxRetry(() => prisma.$transaction(async (t) => {
+        // Canonical lock order: Estimate → Invoice → schedules. Every line of
+        // this billing shares the same invoiceId, so one lock covers them all.
+        await lockMoneyParents(t, { estimateId: billing.invoice.estimateId, invoiceId: billing.invoiceId });
+
+        const claim = await t.progressBilling.updateMany({
+            where: { id: billing.id, status: { in: ["Staged", "Sent"] }, qbPaymentId: null },
+            data: { status: "Paid", paidAt: payment.paidAt, qbPaymentId: payment.qbPaymentId, qbSyncedAt: new Date() },
+        });
+        if (claim.count === 0) return false;
+
+        for (const line of billing.lines) {
+            if (!line.scheduleId) continue; // defensive — every line should have one by creation time
+            await settleMilestonePaidInTx(t, line.scheduleId, billing.invoiceId, payment);
+        }
+        // TODO(progress-billing): route paid-billing notifications through
+        // notifyMilestonePaid in the UI pass — deliberately not enqueued here
+        // (this pass ships no customer notifications, per the owner's hard
+        // constraint; see PROGRESS_BILLING_REPORT.md).
+        return true;
+    }));
 }
 
 /**
@@ -249,89 +443,9 @@ async function markMilestonePaidFromQB(
         const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
         await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
 
-        // INVARIANT: do NOT pin qbInvoiceId in this claim. A real QBO settlement must
-        // win over a concurrent breakQBInvoiceLink (which nulls qbInvoiceId): pinning it
-        // would drop a genuinely-received payment (the row would be excluded from the next
-        // sync's `pending` query forever → client could be double-billed). The settle
-        // wins; qbPaymentId below preserves the QBO audit link even if the id was cleared.
-        const claim = await t.paymentSchedule.updateMany({
-            where: { id: paymentScheduleId, status: { not: "Paid" } },
-            data: {
-                status: "Paid",
-                paymentMethod: "quickbooks",
-                paidAt: payment.paidAt,
-                paymentDate: payment.paidAt,
-                referenceNumber: payment.referenceNumber,
-                qbPaymentId: payment.qbPaymentId,
-                qbSyncedAt: new Date(),
-            },
-        });
-        if (claim.count === 0) return false;
+        const claimed = await settleMilestonePaidInTx(t, paymentScheduleId, invoiceId, payment);
+        if (!claimed) return false;
 
-        const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
-        if (!invoice) return false;
-        const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
-        const totalPaid = allSchedules
-            .filter(s => s.status === "Paid")
-            .reduce((sum, s) => sum + toNum(s.amount), 0);
-        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-        await t.invoice.update({
-            where: { id: invoiceId },
-            data: {
-                balanceDue: newBalance,
-                status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
-            },
-        });
-
-        // Mirror the settle onto the estimate-side milestone copy so the
-        // estimate editor/balance track the QuickBooks rail too (link-first,
-        // name+amount fallback for pre-link rows; claimed update).
-        if (invoice.estimateId) {
-            const settled = allSchedules.find(s => s.id === paymentScheduleId);
-            let estCopy: { id: string } | null = null;
-            if (settled?.sourceScheduleId) {
-                estCopy = await t.estimatePaymentSchedule.findFirst({
-                    where: { id: settled.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
-                });
-            } else if (settled) {
-                // Fallback for pre-link rows: only safe when exactly one candidate matches.
-                const candidates = await t.estimatePaymentSchedule.findMany({
-                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: settled.name },
-                    take: 2,
-                });
-                const matching = candidates.filter(c => toNum(c.amount) === toNum(settled.amount));
-                estCopy = matching.length === 1 ? matching[0] : null;
-            }
-            if (estCopy && settled) {
-                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
-                    where: { id: estCopy.id, status: { not: "Paid" } },
-                    data: {
-                        status: "Paid",
-                        paymentMethod: "quickbooks",
-                        paidAt: payment.paidAt,
-                        paymentDate: payment.paidAt,
-                        referenceNumber: payment.referenceNumber,
-                    },
-                });
-                if (mirrorClaim.count > 0) {
-                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
-                    if (estimate) {
-                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
-                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
-                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
-                        await t.estimate.update({
-                            where: { id: invoice.estimateId },
-                            data: {
-                                balanceDue: estBalance,
-                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
-                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
-                            },
-                        });
-                    }
-                }
-            }
-        }
         // Durable notification, enqueued in-tx (delivered by the drainer after commit).
         await enqueueMilestonePaid(t, { scheduleId: paymentScheduleId, scheduleType: "invoice" });
         return true;
@@ -386,6 +500,12 @@ export async function reconcileMilestoneToQbo(
         if (schedule.status === "Paid" || schedule.status === "Canceled") {
             return { ok: false, error: "Cannot reconcile a paid or canceled milestone" };
         }
+        if (schedule.pretaxAmount != null || schedule.taxAmount != null) {
+            return {
+                ok: false,
+                error: "This milestone has a frozen ProBuild tax split and cannot be reconciled to a changed QuickBooks total. Void the QuickBooks invoice and rebill it in ProBuild.",
+            };
+        }
 
         const oldAmount = toNum(schedule.amount);
         // Idempotent: a re-submit with the same QBO total is a no-op.
@@ -412,14 +532,19 @@ export async function reconcileMilestoneToQbo(
         const newTotal = r2(allSchedules.reduce((sum, s) => sum + toNum(s.amount), 0));
         const totalPaid = r2(allSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0));
         const newBalance = Math.max(0, r2(newTotal - totalPaid));
+        const splitSchedules = allSchedules.filter((row) => row.pretaxAmount != null && row.taxAmount != null);
+        const legacySchedules = allSchedules.filter((row) => row.pretaxAmount == null || row.taxAmount == null);
+        const storedPretax = r2(splitSchedules.reduce((sum, row) => sum + toNum(row.pretaxAmount), 0));
+        const storedTax = r2(splitSchedules.reduce((sum, row) => sum + toNum(row.taxAmount), 0));
+        const residualTotal = r2(legacySchedules.reduce((sum, row) => sum + toNum(row.amount), 0));
         const invoiceRate = toNum(invoice.taxRate);
-        const tax = deriveInvoiceTaxFields(newTotal, invoiceRate, invoiceRate <= 0);
+        const residualTax = deriveInvoiceTaxFields(residualTotal, invoiceRate, invoiceRate <= 0);
         await t.invoice.update({
             where: { id: invoice.id },
             data: {
                 totalAmount: newTotal,
-                subtotal: tax.subtotal,
-                taxAmount: tax.taxAmount,
+                subtotal: r2(storedPretax + residualTax.subtotal),
+                taxAmount: r2(storedTax + residualTax.taxAmount),
                 balanceDue: newBalance,
                 status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
             },
@@ -479,6 +604,10 @@ export interface QBPaymentSyncResult {
     settled: number;
     partiallyPaid: number;
     errors: string[];
+    // Progress billings (src/lib/progress-billing.ts) settled this run — a
+    // separate counter from `settled` (which counts individual milestones)
+    // since one progress billing can carry several milestone lines.
+    progressBillingsSettled: number;
 }
 
 /**
@@ -486,7 +615,7 @@ export interface QBPaymentSyncResult {
  * Safe to run repeatedly (cron + on-view). Never throws on a single bad row.
  */
 export async function syncQuickBooksPayments(scope?: { invoiceId?: string; projectId?: string }): Promise<QBPaymentSyncResult> {
-    const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [] };
+    const result: QBPaymentSyncResult = { checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0 };
 
     const pending = await prisma.paymentSchedule.findMany({
         where: {
@@ -501,7 +630,28 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
         },
         take: 100,
     });
-    if (pending.length === 0) return result;
+
+    // Progress billings (src/lib/progress-billing.ts) staged/sent to QuickBooks
+    // — a second, independent pass over the same QBO connection. Milestones
+    // billed through a ProgressBilling are NOT in `pending` above (billing
+    // them there doesn't touch PaymentSchedule.qbInvoiceId), so this pass is
+    // the only place they get settled from a QuickBooks payment.
+    const pendingBillings = await prisma.progressBilling.findMany({
+        where: {
+            qbInvoiceId: { not: null },
+            status: { in: ["Staged", "Sent"] },
+            ...(scope?.invoiceId ? { invoiceId: scope.invoiceId } : {}),
+            ...(scope?.projectId ? { invoice: { projectId: scope.projectId } } : {}),
+        },
+        select: {
+            id: true, invoiceId: true, qbInvoiceId: true, code: true,
+            lines: { select: { scheduleId: true } },
+            invoice: { select: { code: true, estimateId: true } },
+        },
+        take: 100,
+    });
+
+    if (pending.length === 0 && pendingBillings.length === 0) return result;
 
     let tokens: QBTokens;
     try {
@@ -583,6 +733,41 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
             }
         } catch (e) {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
+        }
+    }
+
+    // ── Progress billings ───────────────────────────────────────────────────
+    // Same probe → settle shape as the milestone loop above, but claims ONE
+    // ProgressBilling row and settles it via settleProgressBillingPaidCore,
+    // which walks every line the billing carries under a single lock+transaction
+    // (custom/change-order lines were materialized into a real PaymentSchedule
+    // at billing-creation time — see createProgressBillingCore — so every line
+    // has a scheduleId and settles like any other milestone; no special case).
+    for (const billing of pendingBillings) {
+        try {
+            const probe = await probeQBInvoice(tokens, billing.qbInvoiceId!);
+            if (probe.state === "error") continue; // transient — retry next run
+            if (probe.state === "voided" || probe.state === "notFound") {
+                result.errors.push(`${billing.invoice.code}/${billing.code}: QBO invoice ${probe.state}`);
+                continue;
+            }
+            // probe.state === "ok"
+            if (probe.total > 0 && probe.balance <= 0) {
+                const paymentId = probe.paymentTxnIds[0] || null;
+                let paidAt = new Date();
+                let referenceNumber: string | null = null;
+                if (paymentId) {
+                    const p = await getQBPayment(tokens, paymentId);
+                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
+                    referenceNumber = p?.referenceNumber || null;
+                }
+                const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });
+                if (settled) result.progressBillingsSettled++;
+            } else if (probe.balance < probe.total) {
+                result.partiallyPaid++;
+            }
+        } catch (e) {
+            result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
         }
     }
 

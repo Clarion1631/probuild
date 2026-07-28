@@ -53,7 +53,7 @@ export async function syncPurchaseOrderEmails(purchaseOrderCode: string, purchas
 
             // Extract body (simplified)
             let body = '';
-            let attachmentUrl = null;
+            const attachmentUrl = null;
             let isAttachment = false;
 
             if (payload.parts) {

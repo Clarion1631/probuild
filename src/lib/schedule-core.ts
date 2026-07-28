@@ -23,7 +23,66 @@ import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTask
 // for schedule generation (same selection rule, PB-pipeline-002 R1 fix 6).
 export const CONTRACT_ESTIMATE_STATUSES = ["Approved", "Invoiced", "Partially Paid", "Paid"];
 
+export function canonicalContractEstimateQuery(projectId: string) {
+    return {
+        where: {
+            projectId,
+            status: { in: CONTRACT_ESTIMATE_STATUSES },
+        },
+        orderBy: { createdAt: "desc" as const },
+    };
+}
+
 export type ScheduleActor = { type: "TEAM" | "SYSTEM"; name: string };
+
+export interface LockedTaskAssignmentParent {
+    id: string;
+    projectId: string;
+    name: string;
+}
+
+/**
+ * Canonical lock order for every TaskAssignment writer: parent Project first,
+ * then the ScheduleTask row. The final read verifies the task did not move
+ * between the caller's access check and lock acquisition.
+ */
+export async function lockTaskAssignmentParent(
+    tx: Prisma.TransactionClient,
+    taskId: string,
+    expectedProjectId?: string,
+): Promise<LockedTaskAssignmentParent> {
+    const reference = expectedProjectId
+        ? { projectId: expectedProjectId }
+        : await tx.scheduleTask.findUnique({
+            where: { id: taskId },
+            select: { projectId: true },
+        });
+    if (!reference?.projectId) throw new Error("Task is not attached to a project");
+    await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${reference.projectId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+    const locked = await tx.scheduleTask.findUnique({
+        where: { id: taskId },
+        select: { id: true, projectId: true, name: true },
+    });
+    if (!locked || locked.projectId !== reference.projectId) {
+        throw new Error("Task moved to another project; refresh and retry");
+    }
+    return {
+        id: locked.id,
+        projectId: locked.projectId,
+        name: locked.name,
+    };
+}
+
+export async function touchTaskAssignmentRevision(
+    tx: Prisma.TransactionClient,
+    taskId: string,
+): Promise<void> {
+    await tx.scheduleTask.update({
+        where: { id: taskId },
+        data: { updatedAt: new Date() },
+    });
+}
 
 // The company shop — 5305 NE 121st Ave, Vancouver WA — anchor point for the
 // crew-availability panel's "how far is this job" distance (not money; safe
@@ -72,7 +131,9 @@ export interface PipelineCrewMember {
 export interface PipelineProject {
     id: string;
     name: string;
+    updatedAt: string;
     client: string | null;
+    location: string | null;
     status: string;
     startDate: string | null;
     // Target end date (PB-schedule-002 item 3). Feeds getEffectiveProjectRange
@@ -135,7 +196,8 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true, endDate: true, color: true,
+                id: true, name: true, status: true, startDate: true, endDate: true, updatedAt: true, color: true,
+                location: true,
                 locationLat: true, locationLng: true,
                 client: { select: { name: true } },
                 crew: { select: { id: true, name: true, email: true, status: true, role: true } },
@@ -152,7 +214,9 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
     const bucket = (p: (typeof projects)[number]): PipelineProject => ({
         id: p.id,
         name: p.name,
+        updatedAt: p.updatedAt.toISOString(),
         client: p.client?.name ?? null,
+        location: p.location,
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
         endDate: p.endDate ? p.endDate.toISOString() : null,
@@ -342,18 +406,28 @@ export interface SetProjectStartDateResult {
  *
  * Every call writes an ActivityLog row (actorType TEAM for UI, SYSTEM for MCP).
  */
-export async function setProjectStartDate(input: {
+export interface SetProjectStartDateInput {
     projectId: string;
     startDate: Date | null;
     shiftJobTasks?: boolean;
     actor: ScheduleActor;
-}): Promise<SetProjectStartDateResult> {
+}
+
+interface InternalSetProjectStartDateInput extends SetProjectStartDateInput {
+    transaction?: Prisma.TransactionClient;
+    writeActivityLog?: boolean;
+    skipAutoGenerate?: boolean;
+}
+
+async function runSetProjectStartDate(
+    input: InternalSetProjectStartDateInput,
+): Promise<SetProjectStartDateResult> {
     const { projectId, startDate, actor } = input;
     const shiftJobTasks = input.shiftJobTasks !== false; // default true
 
     // Retry wrapper per the repo's money-path convention (see tx-retry.ts): a
     // rolled-back write-conflict on the shared pooler re-runs against fresh state.
-    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Serialize concurrent start-date moves: lock the project row BEFORE
         // reading the current marker, so two moves can never compute their
         // deltas from the same stale startDate (lost-update / double-shift race).
@@ -576,25 +650,27 @@ export async function setProjectStartDate(input: {
             }
         }
 
-        await tx.activityLog.create({
-            data: {
-                projectId,
-                actorType: actor.type,
-                actorName: actor.name,
-                action: "moved_project_start",
-                entityType: "project",
-                entityId: projectId,
-                entityName: project.name,
-                metadata: JSON.stringify({
-                    previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
-                    startDate: startDate ? startDate.toISOString() : null,
-                    shiftedTasks,
-                    shiftedMilestones,
-                    skippedQbMilestones: skippedQbMilestones.length,
-                    notes,
-                }),
-            },
-        });
+        if (input.writeActivityLog !== false) {
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: actor.type,
+                    actorName: actor.name,
+                    action: "moved_project_start",
+                    entityType: "project",
+                    entityId: projectId,
+                    entityName: project.name,
+                    metadata: JSON.stringify({
+                        previousStartDate: previousStartDate ? previousStartDate.toISOString() : null,
+                        startDate: startDate ? startDate.toISOString() : null,
+                        shiftedTasks,
+                        shiftedMilestones,
+                        skippedQbMilestones: skippedQbMilestones.length,
+                        notes,
+                    }),
+                },
+            });
+        }
 
         return {
             projectId,
@@ -606,19 +682,21 @@ export async function setProjectStartDate(input: {
             skippedQbMilestones,
             notes,
         };
-    }));
+    };
+    const result = input.transaction
+        ? await execute(input.transaction)
+        : await withTxRetry(() => prisma.$transaction(execute));
 
     // Post-commit best-effort generation hook (PB-pipeline-003): sign first,
     // date later ⇒ the schedule appears by itself. Fires when the project ends
     // up dated with zero tasks and a qualifying estimate; failures are caught
     // and surface in notes[], never fail the date move.
-    if (startDate !== null) {
+    if (!input.skipAutoGenerate && startDate !== null) {
         try {
             const [taskCount, qualifying] = await Promise.all([
                 prisma.scheduleTask.count({ where: { projectId } }),
                 prisma.estimate.findFirst({
-                    where: { projectId, status: { in: CONTRACT_ESTIMATE_STATUSES } },
-                    orderBy: { createdAt: "desc" },
+                    ...canonicalContractEstimateQuery(projectId),
                     select: { id: true, code: true },
                 }),
             ]);
@@ -637,6 +715,24 @@ export async function setProjectStartDate(input: {
     }
 
     return result;
+}
+
+export async function setProjectStartDate(
+    input: SetProjectStartDateInput,
+): Promise<SetProjectStartDateResult> {
+    return runSetProjectStartDate(input);
+}
+
+export async function setProjectStartDateInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetProjectStartDateInput & { writeActivityLog?: boolean },
+): Promise<SetProjectStartDateResult> {
+    return runSetProjectStartDate({
+        ...input,
+        transaction: tx,
+        writeActivityLog: input.writeActivityLog,
+        skipAutoGenerate: true,
+    });
 }
 
 export interface ShiftNotStartedTasksInput {
@@ -659,8 +755,13 @@ export interface ShiftNotStartedTasksResult {
  * Pending payment milestones stay fixed and are returned as operator notes;
  * this path never changes the project marker or any payment/money row.
  */
-export async function shiftNotStartedTasks(
-    input: ShiftNotStartedTasksInput,
+interface InternalShiftNotStartedTasksInput extends ShiftNotStartedTasksInput {
+    transaction?: Prisma.TransactionClient;
+    writeActivityLog?: boolean;
+}
+
+async function runShiftNotStartedTasks(
+    input: InternalShiftNotStartedTasksInput,
 ): Promise<ShiftNotStartedTasksResult> {
     const { projectId, deltaDays, actor } = input;
     if (!Number.isSafeInteger(deltaDays) || deltaDays === 0) {
@@ -673,7 +774,7 @@ export async function shiftNotStartedTasks(
         throw new Error("deltaDays cannot exceed 365 days in a single shift");
     }
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Keep this lock first: all schedule moves serialize on Project before
         // selecting child tasks, matching setProjectStartDate's lock family.
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
@@ -755,23 +856,25 @@ export async function shiftNotStartedTasks(
             }
         }
 
-        await tx.activityLog.create({
-            data: {
-                projectId,
-                actorType: actor.type,
-                actorName: actor.name,
-                action: "shift_not_started_tasks",
-                entityType: "project",
-                entityId: projectId,
-                entityName: project.name,
-                metadata: JSON.stringify({
-                    deltaDays,
-                    shiftedTasks: shiftedTaskIds.length,
-                    shiftedTaskIds,
-                    explicitDueDateMilestones: notes.length,
-                }),
-            },
-        });
+        if (input.writeActivityLog !== false) {
+            await tx.activityLog.create({
+                data: {
+                    projectId,
+                    actorType: actor.type,
+                    actorName: actor.name,
+                    action: "shift_not_started_tasks",
+                    entityType: "project",
+                    entityId: projectId,
+                    entityName: project.name,
+                    metadata: JSON.stringify({
+                        deltaDays,
+                        shiftedTasks: shiftedTaskIds.length,
+                        shiftedTaskIds,
+                        explicitDueDateMilestones: notes.length,
+                    }),
+                },
+            });
+        }
 
         return {
             projectId,
@@ -781,7 +884,27 @@ export async function shiftNotStartedTasks(
             shiftedTasks: shiftedTaskIds.length,
             notes,
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function shiftNotStartedTasks(
+    input: ShiftNotStartedTasksInput,
+): Promise<ShiftNotStartedTasksResult> {
+    return runShiftNotStartedTasks(input);
+}
+
+export async function shiftNotStartedTasksInTransaction(
+    tx: Prisma.TransactionClient,
+    input: ShiftNotStartedTasksInput & { writeActivityLog?: boolean },
+): Promise<ShiftNotStartedTasksResult> {
+    return runShiftNotStartedTasks({
+        ...input,
+        transaction: tx,
+        writeActivityLog: input.writeActivityLog,
+    });
 }
 
 export interface CashflowBucket {
@@ -865,6 +988,15 @@ function isHourLikeBudgetUnit(budgetUnit: string | null): boolean {
     return !!budgetUnit && HOUR_LIKE_BUDGET_UNITS.has(budgetUnit.toLowerCase());
 }
 
+export function deriveEstimateItemHours(item: {
+    quantity: number;
+    budgetUnit: string | null;
+    childCount?: number;
+}): number | null {
+    if ((item.childCount ?? 0) > 0) return null;
+    return isHourLikeBudgetUnit(item.budgetUnit) ? item.quantity : null;
+}
+
 interface EstimateLine {
     id: string;
     name: string;
@@ -932,16 +1064,24 @@ export interface GenerateScheduleResult {
  * SUBTREE — a protected descendant keeps the whole subtree (never a cascade
  * through protected work).
  */
-export async function generateScheduleFromEstimate(input: {
+export interface GenerateScheduleInput {
     estimateId: string;
     mode?: "merge" | "regenerate";
     requireEmptyProject?: boolean;
     actor: ScheduleActor;
-}): Promise<GenerateScheduleResult> {
+}
+
+interface InternalGenerateScheduleInput extends GenerateScheduleInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runGenerateScheduleFromEstimate(
+    input: InternalGenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
     const mode = input.mode ?? "merge";
     if (mode !== "merge" && mode !== "regenerate") throw new Error(`Unknown generation mode "${mode}"`);
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Lock-then-read, mirroring setProjectStartDate exactly: resolve the
         // project id with a minimal read, take the Project row lock, and ONLY
         // THEN re-read the full estimate (items, paymentSchedules — clones are
@@ -1204,7 +1344,7 @@ export async function generateScheduleFromEstimate(input: {
                     color: colorFor(line),
                     order: nextOrder++,
                     type: "task",
-                    estimatedHours: isHourLikeBudgetUnit(line.budgetUnit) ? line.quantity : null,
+                    estimatedHours: deriveEstimateItemHours(line),
                     estimateItemId: line.id,
                     parentId: parentTaskId,
                 });
@@ -1378,7 +1518,23 @@ export async function generateScheduleFromEstimate(input: {
         });
 
         return { estimateCode: estimate.code, created: createdRows, skipped, milestonesLinked, notes };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function generateScheduleFromEstimate(
+    input: GenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
+    return runGenerateScheduleFromEstimate(input);
+}
+
+export async function generateScheduleFromEstimateInTransaction(
+    tx: Prisma.TransactionClient,
+    input: GenerateScheduleInput,
+): Promise<GenerateScheduleResult> {
+    return runGenerateScheduleFromEstimate({ ...input, transaction: tx });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1396,12 +1552,20 @@ export interface ProjectCrewMember {
  * Every id must be an ACTIVATED user. Idempotent; writes a "set_project_crew"
  * ActivityLog row.
  */
-export async function setProjectCrew(input: {
+export interface SetProjectCrewInput {
     projectId: string;
     userIds: string[];
     actor: ScheduleActor;
-}): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+}
+
+interface InternalSetProjectCrewInput extends SetProjectCrewInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runSetProjectCrew(
+    input: InternalSetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    const execute = async (tx: Prisma.TransactionClient) => {
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${input.projectId} FOR UPDATE`;
         const project = await tx.project.findUnique({
             where: { id: input.projectId },
@@ -1458,7 +1622,23 @@ export async function setProjectCrew(input: {
             projectId: input.projectId,
             crew: wanted.map(id => ({ id, name: byId.get(id)!.name || byId.get(id)!.email })),
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function setProjectCrew(
+    input: SetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    return runSetProjectCrew(input);
+}
+
+export async function setProjectCrewInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetProjectCrewInput,
+): Promise<{ projectId: string; crew: ProjectCrewMember[] }> {
+    return runSetProjectCrew({ ...input, transaction: tx });
 }
 
 export interface CrewConflictPair {
@@ -1886,7 +2066,8 @@ export interface DashboardTaskAssignment {
     userId: string;
     name: string;
     status: string;
-    role: string;
+    userRole: string;
+    assignmentRole: string;
 }
 
 export interface DashboardTaskComment {
@@ -1898,6 +2079,7 @@ export interface DashboardTaskComment {
 export interface DashboardTaskRow {
     id: string;
     name: string;
+    updatedAt: string;
     startDate: string;
     endDate: string;
     color: string | null;
@@ -1905,6 +2087,13 @@ export interface DashboardTaskRow {
     progress: number;
     status: string;
     type: string;
+    doneWhen: string | null;
+    blockedReason: string | null;
+    scheduledTime: string | null;
+    confirmationStatus: string | null;
+    pendingMaterials: number;
+    stagedMaterials: number;
+    missingMaterials: number;
     assignments: DashboardTaskAssignment[];
     // Hover-card notes (owner-feedback round, item 3): most recent 2 task
     // comments, newest first — same TaskComment source the project schedule
@@ -2164,15 +2353,16 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject] = await Promise.all([
+    const [taskRows, qualifying, unappliedByProject, materialCounts] = await Promise.all([
         prisma.scheduleTask.findMany({
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
-                id: true, projectId: true, name: true, startDate: true, endDate: true, color: true, parentId: true, progress: true, status: true, type: true,
+                id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
+                doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, user: { select: { name: true, email: true, status: true, role: true } } },
+                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true } } },
                 },
                 // Hover-card notes (item 3): capped at 2, newest first — same
                 // audience as the project schedule page's own comment thread
@@ -2186,14 +2376,32 @@ export async function getCompanyDashboardData(
         }),
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
         getUnappliedChangeOrders(rowIds),
+        prisma.taskMaterial.groupBy({
+            by: ["taskId", "status"],
+            where: {
+                task: { projectId: { in: rowIds } },
+                status: { in: ["pending", "staged", "missing"] },
+            },
+            _count: { id: true },
+        }),
     ]);
+    const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
+    for (const count of materialCounts) {
+        const current = materialCountsByTask.get(count.taskId) ?? { pending: 0, staged: 0, missing: 0 };
+        if (count.status === "pending" || count.status === "staged" || count.status === "missing") {
+            current[count.status] = count._count.id;
+        }
+        materialCountsByTask.set(count.taskId, current);
+    }
     const tasksByProject = new Map<string, DashboardTaskRow[]>();
     for (const task of taskRows) {
         if (!task.projectId) continue;
         const rows = tasksByProject.get(task.projectId) ?? [];
+        const taskMaterialCounts = materialCountsByTask.get(task.id) ?? { pending: 0, staged: 0, missing: 0 };
         rows.push({
             id: task.id,
             name: task.name,
+            updatedAt: task.updatedAt.toISOString(),
             startDate: task.startDate.toISOString(),
             endDate: task.endDate.toISOString(),
             color: task.color,
@@ -2201,12 +2409,20 @@ export async function getCompanyDashboardData(
             progress: task.progress,
             status: task.status,
             type: task.type,
+            doneWhen: task.doneWhen,
+            blockedReason: task.blockedReason,
+            scheduledTime: task.scheduledTime,
+            confirmationStatus: task.confirmationStatus,
+            pendingMaterials: taskMaterialCounts.pending,
+            stagedMaterials: taskMaterialCounts.staged,
+            missingMaterials: taskMaterialCounts.missing,
             assignments: task.assignments.map(a => ({
                 id: a.id,
                 userId: a.userId,
                 name: a.user.name || a.user.email,
                 status: a.user.status,
-                role: a.user.role,
+                userRole: a.user.role,
+                assignmentRole: a.role,
             })),
             latestComments: task.comments.map(c => ({
                 text: c.text,
@@ -2232,7 +2448,10 @@ export async function getCompanyDashboardData(
     // appended so the picker stays unambiguous.
     const teamMembersRaw = canEdit
         ? await prisma.user.findMany({
-            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
+            // Owner call 2026-07-23: only people DESIGNATED as crew are
+            // schedulable — no admins/office in the pickers or availability.
+            // Already-assigned non-crew still render as removable entries.
+            where: { status: "ACTIVATED", role: "FIELD_CREW" },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true, role: true, hourlyRate: true, burdenRate: true },
         })
@@ -2249,9 +2468,12 @@ export async function getCompanyDashboardData(
                 // ignores the extra field).
                 ...(canSeeFinancials ? { burdenedHourlyRate: round2(Number(u.hourlyRate) + Number(u.burdenRate)) } : {}),
             }));
-            const nameCounts = new Map<string, number>();
-            for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
-            return rows.map(r => (nameCounts.get(r.name)! > 1 ? { ...r, name: `${r.name} (${r.email})` } : r));
+            // Names stay bare — no email disambiguation (owner call 2026-07-23:
+            // full addresses wrapped across six lines in the crew checklist and
+            // a 9-person crew knows who's who; duplicate-name accounts simply
+            // render twice, and the email remains in the serialized field for
+            // any UI that ever needs a tooltip).
+            return rows;
         })()
         : null;
 
@@ -2400,15 +2622,23 @@ export interface ApplyChangeOrderResult {
  * tasks exist (linking still converges); "regenerate" rebuilds only
  * provenance-tagged subtrees passing the P2 full eligibility predicate.
  */
-export async function applyChangeOrderToSchedule(input: {
+export interface ApplyChangeOrderScheduleInput {
     changeOrderId: string;
     mode?: "merge" | "regenerate";
     actor: ScheduleActor;
-}): Promise<ApplyChangeOrderResult> {
+}
+
+interface InternalApplyChangeOrderScheduleInput extends ApplyChangeOrderScheduleInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runApplyChangeOrderToSchedule(
+    input: InternalApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
     const mode = input.mode ?? "merge";
     if (mode !== "merge" && mode !== "regenerate") throw new Error(`Unknown mode "${mode}"`);
 
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
+    const execute = async (tx: Prisma.TransactionClient) => {
         // Lock-then-read (same discipline as generation and start-date moves).
         const coRef = await tx.changeOrder.findUnique({
             where: { id: input.changeOrderId },
@@ -2822,7 +3052,23 @@ export async function applyChangeOrderToSchedule(input: {
         });
 
         return { changeOrderCode: co.code, projectId, created: createdRows, skipped, milestonesLinked, notes };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function applyChangeOrderToSchedule(
+    input: ApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
+    return runApplyChangeOrderToSchedule(input);
+}
+
+export async function applyChangeOrderToScheduleInTransaction(
+    tx: Prisma.TransactionClient,
+    input: ApplyChangeOrderScheduleInput,
+): Promise<ApplyChangeOrderResult> {
+    return runApplyChangeOrderToSchedule({ ...input, transaction: tx });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2834,20 +3080,27 @@ export async function applyChangeOrderToSchedule(input: {
  * id must be an ACTIVATED user (same validation as setProjectCrew); role stays
  * "assigned". Idempotent; writes a "set_task_crew" ActivityLog row.
  */
-export async function setTaskCrew(input: {
+export interface SetTaskCrewInput {
     taskId: string;
     userIds: string[];
     actor: ScheduleActor;
-}): Promise<{ taskId: string; projectId: string; assignments: { id: string; userId: string; name: string }[] }> {
-    return withTxRetry(() => prisma.$transaction(async (tx) => {
-        const taskRef = await tx.scheduleTask.findUnique({
-            where: { id: input.taskId },
-            select: { projectId: true },
-        });
-        if (!taskRef) throw new Error("Task not found");
-        if (!taskRef.projectId) throw new Error("Task is not attached to a project");
-        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${taskRef.projectId} FOR UPDATE`;
-        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${input.taskId} FOR UPDATE`;
+}
+
+export interface SetTaskCrewResult {
+    taskId: string;
+    projectId: string;
+    assignments: { id: string; userId: string; name: string; role: string }[];
+}
+
+interface InternalSetTaskCrewInput extends SetTaskCrewInput {
+    transaction?: Prisma.TransactionClient;
+}
+
+async function runSetTaskCrew(
+    input: InternalSetTaskCrewInput,
+): Promise<SetTaskCrewResult> {
+    const execute = async (tx: Prisma.TransactionClient) => {
+        const lockedParent = await lockTaskAssignmentParent(tx, input.taskId);
         const task = await tx.scheduleTask.findUnique({
             where: { id: input.taskId },
             select: {
@@ -2858,7 +3111,7 @@ export async function setTaskCrew(input: {
         });
         if (!task) throw new Error("Task not found");
         if (!task.projectId) throw new Error("Task is not attached to a project");
-        if (task.projectId !== taskRef.projectId) throw new Error("Task moved to another project; refresh and retry");
+        if (task.projectId !== lockedParent.projectId) throw new Error("Task moved to another project; refresh and retry");
 
         const wanted = [...new Set(input.userIds)];
         const users = wanted.length
@@ -2883,7 +3136,11 @@ export async function setTaskCrew(input: {
             await tx.taskAssignment.deleteMany({ where: { taskId: input.taskId, userId: { in: toRemove } } });
         }
         for (const userId of toAdd) {
+            // Lead assignment is intentionally not settable here yet; task crew changes remain assigned until the later lead-management PR.
             await tx.taskAssignment.create({ data: { taskId: input.taskId, userId, role: "assigned" } });
+        }
+        if (toAdd.length > 0 || toRemove.length > 0) {
+            await touchTaskAssignmentRevision(tx, input.taskId);
         }
 
         await tx.activityLog.create({
@@ -2901,12 +3158,31 @@ export async function setTaskCrew(input: {
 
         const final = await tx.taskAssignment.findMany({
             where: { taskId: input.taskId },
-            select: { id: true, userId: true, user: { select: { name: true, email: true } } },
+            select: { id: true, userId: true, role: true, user: { select: { name: true, email: true } } },
         });
         return {
             taskId: input.taskId,
             projectId: task.projectId,
-            assignments: final.map(a => ({ id: a.id, userId: a.userId, name: a.user.name || a.user.email })),
+            assignments: final.map(a => ({
+                id: a.id,
+                userId: a.userId,
+                name: a.user.name || a.user.email,
+                role: a.role,
+            })),
         };
-    }));
+    };
+    return input.transaction
+        ? execute(input.transaction)
+        : withTxRetry(() => prisma.$transaction(execute));
+}
+
+export async function setTaskCrew(input: SetTaskCrewInput): Promise<SetTaskCrewResult> {
+    return runSetTaskCrew(input);
+}
+
+export async function setTaskCrewInTransaction(
+    tx: Prisma.TransactionClient,
+    input: SetTaskCrewInput,
+): Promise<SetTaskCrewResult> {
+    return runSetTaskCrew({ ...input, transaction: tx });
 }

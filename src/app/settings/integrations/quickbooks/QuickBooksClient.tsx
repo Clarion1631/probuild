@@ -179,15 +179,15 @@ export default function QuickBooksClient({
                 <ul className="space-y-2 text-sm text-hui-textMuted">
                     <li className="flex gap-2">
                         <span className="text-hui-primary mt-0.5">→</span>
-                        <span><strong>Estimates:</strong> Push approved estimates from ProBuild to QB as Estimates. Open the estimate and click "Sync to QuickBooks".</span>
+                        <span><strong>Estimates:</strong> Push approved estimates from ProBuild to QB as Estimates. Open the estimate and click &quot;Sync to QuickBooks&quot;.</span>
                     </li>
                     <li className="flex gap-2">
                         <span className="text-hui-primary mt-0.5">→</span>
-                        <span><strong>Invoices:</strong> Push issued invoices to QB as Invoices. Open an invoice and click "Sync to QuickBooks".</span>
+                        <span><strong>Invoices:</strong> Push issued invoices to QB as Invoices. Open an invoice and click &quot;Sync to QuickBooks&quot;.</span>
                     </li>
                     <li className="flex gap-2">
                         <span className="text-hui-primary mt-0.5">→</span>
-                        <span><strong>GL codes:</strong> Each line item syncs to the GL account you mapped above. Unmapped items go to "Other Income".</span>
+                        <span><strong>GL codes:</strong> Each line item syncs to the GL account you mapped above. Unmapped items go to &quot;Other Income&quot;.</span>
                     </li>
                 </ul>
             </div>

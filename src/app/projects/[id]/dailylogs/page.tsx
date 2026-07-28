@@ -17,7 +17,10 @@ export default async function DailyLogsPage({ params }: { params: Promise<{ id: 
 
     const session = await getServerSession(authOptions);
     const user = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true } })
+        ? await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { id: true, name: true, role: true },
+        })
         : null;
 
     const logs = await getDailyLogs(id);
@@ -29,6 +32,7 @@ export default async function DailyLogsPage({ params }: { params: Promise<{ id: 
             logs={JSON.parse(JSON.stringify(logs))}
             currentUserId={user?.id || ""}
             currentUserName={user?.name || "Unknown"}
+            canManagePortalShare={["ADMIN", "MANAGER"].includes(user?.role || "")}
         />
     );
 }

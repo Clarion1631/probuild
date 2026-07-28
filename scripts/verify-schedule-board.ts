@@ -1,3 +1,4 @@
+// Usage: set ALLOW_PROD_VERIFY=1 when DATABASE_URL targets Supabase; this verifier creates and deletes fixtures.
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
@@ -36,6 +37,16 @@ function withoutTaskDates(value: Record<string, unknown>): string {
 }
 
 async function main() {
+    const databaseUrl = process.env.DATABASE_URL ?? "";
+    if (databaseUrl.includes("supabase.c") && process.env.ALLOW_PROD_VERIFY !== "1") {
+        console.error(
+            "[verify-schedule-board] REFUSING TO RUN: DATABASE_URL points at Supabase.\n" +
+            "This script creates and deletes verification fixtures in the target database.\n" +
+            "Set ALLOW_PROD_VERIFY=1 to opt in."
+        );
+        process.exit(1);
+    }
+
     const checks: Check[] = [];
     const check = (label: string, passed: boolean) => checks.push([label, passed]);
     const tag = randomUUID();
@@ -483,7 +494,11 @@ async function main() {
         check("withTxRetry retries one P2034 conflict and succeeds on attempt two", retryProbe === "retried" && retryAttempts === 2);
 
         const scheduleCoreSource = readFileSync(new URL("../src/lib/schedule-core.ts", import.meta.url), "utf8");
-        const shiftStart = scheduleCoreSource.indexOf("export async function shiftNotStartedTasks");
+        // B1 moved the shift core into the private runShiftNotStartedTasks
+        // (the export is now a thin delegator so Publish can run it inside
+        // its own transaction) — the invariant lives in the runner's body.
+        const shiftRunnerStart = scheduleCoreSource.indexOf("async function runShiftNotStartedTasks");
+        const shiftStart = shiftRunnerStart >= 0 ? shiftRunnerStart : scheduleCoreSource.indexOf("export async function shiftNotStartedTasks");
         const shiftEnd = scheduleCoreSource.indexOf("export interface CashflowBucket", shiftStart);
         const shiftBody = scheduleCoreSource.slice(shiftStart, shiftEnd);
         const projectLockIndex = shiftBody.indexOf('SELECT id FROM "Project"');
@@ -503,6 +518,7 @@ async function main() {
             && /UPDATE "ScheduleTask"[\s\S]*?RETURNING "id", "startDate", "endDate"/.test(scheduleCoreSource));
 
         const actionsSource = readFileSync(new URL("../src/lib/actions.ts", import.meta.url), "utf8");
+        const scheduleTaskCoreSource = readFileSync(new URL("../src/lib/schedule-task-core.ts", import.meta.url), "utf8");
         const actionStart = actionsSource.indexOf("export async function shiftNotStartedTasksAction");
         const actionEnd = actionsSource.indexOf("export async function generateProjectScheduleAction", actionStart);
         const actionBody = actionsSource.slice(actionStart, actionEnd);
@@ -518,11 +534,11 @@ async function main() {
         check("canonical task action preserves schedule permission and project access for date mutations", canonicalTaskActionStart >= 0
             && canonicalTaskActionBody.includes("await assertScheduleTaskAccess(taskId)")
             && !canonicalTaskActionBody.includes('["ADMIN", "MANAGER"].includes(user.role)')
-            && canonicalTaskActionBody.includes("parseStartDateInput")
-            && canonicalTaskActionBody.includes('SELECT id FROM "Project"')
-            && canonicalTaskActionBody.includes('SELECT id FROM "ScheduleTask"')
-            && canonicalTaskActionBody.includes("persistedTask.type === \"milestone\"")
-            && canonicalTaskActionBody.includes('revalidatePath("/company-dashboard")'));
+            && canonicalTaskActionBody.includes("updateScheduleTaskInTransaction(")
+            && canonicalTaskActionBody.includes('revalidatePath("/company-dashboard")')
+            && scheduleTaskCoreSource.includes("parseStartDateInput")
+            && scheduleTaskCoreSource.includes("lockTaskAssignmentParent(tx, taskId")
+            && scheduleTaskCoreSource.includes('persisted.type === "milestone"'));
         const companyTaskAdapterStart = actionsSource.indexOf("export async function updateCompanyScheduleTaskDatesAction");
         const companyTaskAdapterEnd = actionsSource.indexOf("export async function updateProjectStatus", companyTaskAdapterStart);
         const companyTaskAdapterBody = actionsSource.slice(companyTaskAdapterStart, companyTaskAdapterEnd);
@@ -695,24 +711,27 @@ async function main() {
         check("assigned DISABLED user still appears as a removable crew entry", !!inactiveCrewEntry && inactiveCrewEntry.status !== "ACTIVATED");
 
         const dupeEntries = (dashboardForCrew.teamMembers ?? []).filter(u => u.id === dupeUserA.id || u.id === dupeUserB.id);
-        check("teamMembers disambiguates identical display names with the email",
-            dupeEntries.length === 2 && dupeEntries.every(u => u.name.includes(u.email)) && dupeEntries[0].name !== dupeEntries[1].name);
+        // Owner call 2026-07-23: NO email decoration in picker names ever —
+        // full addresses wrapped across six lines in the crew checklist.
+        // Duplicate display names render as-is (email stays in its own field).
+        check("teamMembers never decorates names with emails, even for duplicates",
+            dupeEntries.length === 2 && dupeEntries.every(u => !u.name.includes("@")) && dupeEntries[0].name === dupeEntries[1].name);
         const soloNamedEntry = (dashboardForCrew.teamMembers ?? []).find(u => u.id === activeUser.id);
         check("teamMembers leaves unique display names unmodified",
             soloNamedEntry?.name === (activeUser.name ?? activeUser.email) && !soloNamedEntry.name.includes("@"));
         check("teamMembers.burdenedHourlyRate is exactly hourlyRate + burdenRate, rounded to 2dp",
             soloNamedEntry?.role === "FIELD_CREW" && soloNamedEntry?.burdenedHourlyRate === 30.85);
 
-        const scheduleCoreCrewStart = scheduleCoreSource.indexOf("export async function setProjectCrew");
+        const scheduleCoreCrewStart = scheduleCoreSource.indexOf("async function runSetProjectCrew");
         const scheduleCoreCrewEnd = scheduleCoreSource.indexOf("export interface CrewConflictPair", scheduleCoreCrewStart);
         const scheduleCoreCrewBody = scheduleCoreSource.slice(scheduleCoreCrewStart, scheduleCoreCrewEnd);
         check("source validates ACTIVATED only for users being added to project crew",
             scheduleCoreCrewBody.includes("toConnect.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
-        const scheduleCoreTaskCrewStart = scheduleCoreSource.indexOf("export async function setTaskCrew");
+        const scheduleCoreTaskCrewStart = scheduleCoreSource.indexOf("async function runSetTaskCrew");
         const scheduleCoreTaskCrewBody = scheduleCoreSource.slice(scheduleCoreTaskCrewStart);
         check("source validates ACTIVATED only for users being added to task crew",
             scheduleCoreTaskCrewBody.includes("toAdd.map(id => byId.get(id)!).filter(u => u.status !== \"ACTIVATED\")"));
-        check("teamMembers query excludes FINANCE role", scheduleCoreSource.includes('role: { not: "FINANCE" }'));
+        check("teamMembers query is FIELD_CREW-only (no admins/office/finance schedulable)", scheduleCoreSource.includes('where: { status: "ACTIVATED", role: "FIELD_CREW" }'));
 
         // Batch task-date save (fix 2) — ADMIN/MANAGER gated, loops the ONE
         // canonical updateScheduleTask (not a second mutation core), isolates
@@ -749,9 +768,11 @@ async function main() {
         const monthSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/MonthBarsView.tsx", import.meta.url), "utf8");
         const timelineSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TimelineView.tsx", import.meta.url), "utf8");
         const projectBarSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/ProjectBar.tsx", import.meta.url), "utf8");
+        const projectDrawerSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/BoardProjectDrawer.tsx", import.meta.url), "utf8");
+        const drawerShellSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/BoardDrawerShell.tsx", import.meta.url), "utf8");
         const taskBlockSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/TaskBlockSegment.tsx", import.meta.url), "utf8");
         const availabilityPanelSource = readFileSync(new URL("../src/app/company-dashboard/schedule-board/AvailabilityPanel.tsx", import.meta.url), "utf8");
-        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, taskBlockSource, availabilityPanelSource];
+        const scheduleBoardSources = [boardSource, monthSource, timelineSource, projectBarSource, projectDrawerSource, drawerShellSource, taskBlockSource, availabilityPanelSource];
         check("source forwards canEdit through both views to ProjectBar", monthSource.includes("canEdit={data.canEdit}")
             && timelineSource.includes("canEdit={data.canEdit}"));
         check("source forwards canEdit from ProjectBar to TaskBlockSegment", projectBarSource.includes("<TaskBlockSegment")
@@ -773,8 +794,12 @@ async function main() {
             && availabilityPanelSource.indexOf("Planned $/day") > availabilityPanelSource.indexOf("{canSeeFinancials && ("));
         check("availability panel derives from the DashboardProjectRow/DashboardTaskRow shape already on data (no direct prisma access)",
             !/\bprisma\b/.test(availabilityPanelSource));
-        check("ProjectBar popover surfaces the shop distance line", projectBarSource.includes("project.distanceMilesFromShop != null")
-            && projectBarSource.includes("mi from shop"));
+        check("project drawer replaces the ProjectBar popover and surfaces the shop distance line",
+            !projectBarSource.includes("FloatingPopover")
+            && projectDrawerSource.includes("project.distanceMilesFromShop != null")
+            && projectDrawerSource.includes("mi from shop")
+            && projectDrawerSource.includes("layout=\"list\"")
+            && drawerShellSource.includes("w-[min(420px,calc(100vw-1rem))]"));
     } finally {
         let cleanupPassed = false;
         try {

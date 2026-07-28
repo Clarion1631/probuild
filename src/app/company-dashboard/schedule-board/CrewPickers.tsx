@@ -1,19 +1,14 @@
 "use client";
 
 // Extracted out of CompanyDashboardClient.tsx (item 1) so ProjectBar.tsx and
-// TaskBlockSegment.tsx can reuse the SAME crew pickers inside the new
-// context-menu "Project crew…" / "Task crew…" items, without a circular
+// TaskBlockSegment.tsx and BoardProjectDrawer.tsx can reuse the SAME crew
+// pickers without a circular
 // import (CompanyDashboardClient -> ScheduleBoard -> …View -> ProjectBar
 // would import back into CompanyDashboardClient otherwise). Behavior is
 // byte-identical to the original inline components.
 //
-// Rebuild (owner-feedback round, item 5): the picker used to bring its own
-// fixed-width, fixed-height, self-scrolling inner panel, nested inside the
-// schedule board's ALREADY-scrollable FloatingPopover menus (ProjectBar/
-// TaskBlockSegment's "crew" view) — a double scrollbar + horizontal overflow.
-// CrewChecklist is now a plain two-column grid with NO scroll/width of its
-// own — FloatingPopover is the one and only scroll owner everywhere a picker
-// renders.
+// The compact picker owns no scrolling; its surrounding popover does. The
+// project drawer opts into the single-column list layout and owns the scroll.
 
 import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
@@ -27,16 +22,16 @@ function initials(name: string): string {
     return parts.map(p => p[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
-interface CrewOption {
+export interface CrewOption {
     id: string;
     label: string;
+    tag?: string;
 }
 
 // Shared checklist presentation — used both `variant="inline"` (rendered
-// directly inside an ALREADY-open schedule-board FloatingPopover, no nested
-// popover of its own) and `variant="popover"` (the Schedule & crew table's
-// own trigger + FloatingPopover). No selected-initials chip here — the
-// table/bar trigger button keeps summarizing initials on its own.
+// directly in an existing surface) and `variant="popover"` (the Schedule &
+// crew table's own trigger + FloatingPopover). No selected-initials chip here
+// — the table/bar trigger button keeps summarizing initials on its own.
 // Serializes full-list crew writes: instant optimistic UI, but requests go
 // out strictly in order (a later toggle's list can never be overtaken by an
 // earlier one racing through the locked server transaction). While one write
@@ -70,16 +65,22 @@ function useSerializedCrewSubmit(send: (ids: string[]) => Promise<void>, onError
     return { submit, isPending };
 }
 
-function CrewChecklist({
+export function CrewChecklist({
     legend,
     options,
     selected,
     onToggle,
+    leadUserId,
+    onLeadChange,
+    layout = "compact",
 }: {
     legend: string;
     options: CrewOption[];
     selected: string[];
     onToggle: (userId: string) => void;
+    leadUserId?: string | null;
+    onLeadChange?: (userId: string | null) => void;
+    layout?: "compact" | "list";
 }) {
     return (
         <fieldset className="m-0 min-w-0 border-0 p-0">
@@ -87,18 +88,43 @@ function CrewChecklist({
             {options.length === 0 ? (
                 <p className="px-2 py-1 text-xs text-hui-textMuted">No active team members.</p>
             ) : (
-                <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
-                    {options.map(option => (
-                        <label key={option.id} className="flex min-h-11 min-w-0 items-center gap-2 rounded-md px-2 py-2 hover:bg-slate-50 focus-within:ring-2 focus-within:ring-hui-primary">
-                            <input
-                                type="checkbox"
-                                checked={selected.includes(option.id)}
-                                onChange={() => onToggle(option.id)}
-                                className="h-4 w-4 shrink-0 accent-hui-primary"
-                            />
-                            <span className="min-w-0 break-words text-sm text-hui-textMain">{option.label}</span>
-                        </label>
-                    ))}
+                <div className={layout === "list" ? "grid grid-cols-1 gap-1" : "grid grid-cols-1 gap-1 sm:grid-cols-2"}>
+                    {options.map(option => {
+                        const isSelected = selected.includes(option.id);
+                        const isLead = leadUserId === option.id;
+                        return (
+                            <div key={option.id} className={`flex min-w-0 items-center rounded-md px-2 hover:bg-slate-50 focus-within:ring-2 focus-within:ring-hui-primary ${layout === "list" ? "min-h-12 py-2" : "min-h-11 py-1"}`}>
+                                <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1">
+                                    <input
+                                        type="checkbox"
+                                        checked={isSelected}
+                                        onChange={() => onToggle(option.id)}
+                                        className="h-4 w-4 shrink-0 accent-hui-primary"
+                                    />
+                                    <span className="min-w-0 break-words text-sm text-hui-textMain">
+                                        {option.label}{layout !== "list" && option.tag ? ` (${option.tag})` : ""}
+                                    </span>
+                                    {layout === "list" && option.tag && (
+                                        <span className="ml-auto shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                                            {option.tag}
+                                        </span>
+                                    )}
+                                </label>
+                                {isSelected && onLeadChange && (
+                                    <button
+                                        type="button"
+                                        onClick={() => onLeadChange(isLead ? null : option.id)}
+                                        aria-label={isLead ? `Remove ${option.label} as lead` : `Set ${option.label} as lead`}
+                                        aria-pressed={isLead}
+                                        title={isLead ? "Task lead" : "Make task lead"}
+                                        className={`ml-1 shrink-0 rounded p-1 transition ${isLead ? "bg-amber-50 text-amber-500" : "text-slate-300 hover:bg-amber-50 hover:text-amber-500"}`}
+                                    >
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill={isLead ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8"><path d="m12 2.75 2.84 5.75 6.35.92-4.6 4.48 1.09 6.32L12 17.24l-5.68 2.98 1.09-6.32-4.6-4.48 6.35-.92L12 2.75Z" /></svg>
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })}
                 </div>
             )}
         </fieldset>
@@ -112,14 +138,15 @@ export function CrewPicker({
     crew,
     teamMembers,
     variant = "popover",
+    layout = "compact",
 }: {
     projectId: string;
     crew: PipelineCrewMember[];
     teamMembers: { id: string; name: string; email: string }[];
-    // "inline" (ProjectBar's "Project crew…" menu view — already inside a
-    // FloatingPopover) vs "popover" (Schedule & crew table — owns its own
-    // trigger + FloatingPopover).
+    // "inline" renders directly in an existing surface; "popover" owns its
+    // trigger and FloatingPopover.
     variant?: "inline" | "popover";
+    layout?: "compact" | "list";
 }) {
     const router = useRouter();
     const [open, setOpen] = useState(false);
@@ -157,12 +184,16 @@ export function CrewPicker({
     const unlistedAssigned = crew.filter(c => !teamMembers.some(m => m.id === c.id));
     const options = [
         ...teamMembers.map(m => ({ id: m.id, label: m.name || m.email })),
-        ...unlistedAssigned.map(c => ({ id: c.id, label: `${c.name} (${c.role === "FINANCE" ? "finance" : "inactive"})` })),
+        ...unlistedAssigned.map(c => ({
+            id: c.id,
+            label: c.name,
+            tag: c.status !== "ACTIVATED" ? "inactive" : c.role.toLowerCase().replace("_", " "),
+        })),
     ];
     const legend = `Project crew — ${selected.length} assigned`;
 
     if (variant === "inline") {
-        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} />;
+        return <CrewChecklist legend={legend} options={options} selected={selected} onToggle={toggle} layout={layout} />;
     }
 
     const selectedNames = options.filter(o => selected.includes(o.id));
@@ -205,7 +236,11 @@ export function TaskCrewPicker({
     const unlisted = task.assignments.filter(a => !teamMembers.some(m => m.id === a.userId));
     const options = [
         ...teamMembers.map(member => ({ id: member.id, label: member.name || member.email })),
-        ...unlisted.map(a => ({ id: a.userId, label: `${a.name} (${a.role === "FINANCE" ? "finance" : "inactive"})` })),
+        ...unlisted.map(a => ({
+            id: a.userId,
+            label: a.name,
+            tag: a.status !== "ACTIVATED" ? "inactive" : a.userRole.toLowerCase().replace("_", " "),
+        })),
     ];
     const legend = `Task crew — ${selected.length} assigned`;
 

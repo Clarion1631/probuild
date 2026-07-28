@@ -3,15 +3,31 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { toast } from "sonner";
+import { publishDispatchAction } from "@/lib/actions";
 import { saveCompanyScheduleTaskDatesAction, shiftNotStartedTasksAction, updateProjectEndDateAction, updateProjectStartDateAction } from "@/lib/actions";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow, OverlayIncomeItem } from "@/lib/schedule-core";
+import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
+import type {
+    DispatchAssignment,
+    DispatchIntent,
+    PersistedDispatchProjectState,
+    PersistedDispatchTaskState,
+} from "@/lib/dispatch-intent";
+import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
+import { DispatchView } from "./DispatchView";
+import type { DispatchTaskCreationDefaults } from "./DispatchView";
+import { DispatchReviewDialog } from "./DispatchReviewDialog";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
 import { UnscheduledTray } from "./UnscheduledTray";
+import { BoardTaskDrawer } from "./BoardTaskDrawer";
+import { BoardProjectDrawer } from "./BoardProjectDrawer";
+import TaskCreationDialog from "@/components/TaskCreationDialog";
 import {
     computeProjectEndResizeCandidate,
     createProjectDropIntent,
@@ -33,10 +49,17 @@ import {
 } from "./useBarLayout";
 import type { TaskPointerEditStart } from "./TaskBlockSegment";
 import type { ProjectEndResizePointerStart, ProjectPointerEditStart } from "./ProjectBar";
+import {
+    createDragVisualLayer,
+    projectDragSourceSelector,
+    projectMarkerDragSourceSelector,
+    taskDragSourceSelector,
+    type DragVisualLayer,
+} from "./dragVisualLayer";
 
 export type { ProjectMoveChoice } from "./ShiftConfirmDialog";
 export type { ProjectDropIntent } from "./useBarLayout";
-export type BoardView = "month" | "timeline";
+export type BoardView = "month" | "timeline" | "dispatch";
 
 const MONTH_LABELS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const BOARD_VIEW_STORAGE_KEY = "gtr-company-schedule-board-view";
@@ -48,8 +71,17 @@ const EDGE_AUTOSCROLL_THRESHOLD_PX = 48;
 const MAX_AUTOSCROLL_PX_PER_FRAME = 16;
 const EMPTY_PROJECT_IDS: ReadonlySet<string> = new Set();
 
+let scheduleBoardRenderCount = 0;
+
+declare global {
+    interface Window {
+        __boardRenderCount?: number;
+    }
+}
+
 interface ScheduleBoardProps {
     data: CompanyDashboardData;
+    weather: VancouverForecastDay[];
     externallyPendingProjectIds: ReadonlySet<string>;
     isProjectExternallyPending: (projectId: string) => boolean;
     onEffectivePendingProjectIdsChange: (projectIds: ReadonlySet<string>) => void;
@@ -79,9 +111,11 @@ interface ActiveTaskPointerEdit {
     latestClientX: number;
     latestClientY: number;
     grabDate: string | null;
+    monthDayWidth: number | null;
     mode: TaskEditMode;
     active: boolean;
     currentCandidate: TaskDateOverride | null;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -106,6 +140,7 @@ interface ActiveProjectPointerEdit {
     grabDate: string;
     originalStart: string;
     active: boolean;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -114,10 +149,9 @@ interface ActiveProjectPointerEdit {
 }
 
 // Right-edge resize drag (item 2) — a SEPARATE pointer-drag from
-// ActiveProjectPointerEdit above: it previews via the SAME projectPreviewOverrides
-// slot (only one project edit can be active at a time — see cancelActiveProjectEdit)
-// but commits immediately (updateProjectEndDateAction), never joining the
-// draft/Save system.
+// ActiveProjectPointerEdit above. Its active preview lives in the detached
+// visual layer, but its final valid candidate still commits immediately through
+// updateProjectEndDateAction and never joins the draft/Save system.
 interface ActiveProjectEndResizeEdit {
     projectId: string;
     project: DashboardProjectRow;
@@ -136,6 +170,7 @@ interface ActiveProjectEndResizeEdit {
     monthDayWidth: number | null;
     active: boolean;
     currentCandidate: string | null;
+    visualLayer: DragVisualLayer | null;
     animationFrameId: number | null;
     sourceElement: HTMLElement;
     previousTouchAction: string;
@@ -148,6 +183,26 @@ interface ProjectDraftMove {
     originalStart: string;
     targetStart: string;
     deltaDays: number;
+}
+
+interface CrewDraft {
+    addUserIds: string[];
+    removeUserIds: string[];
+    expectedAssignments: DispatchAssignment[];
+}
+
+interface DispatchReconciliationExpectation {
+    publicationId: string;
+    projects: Record<string, PersistedDispatchProjectState>;
+    tasks: Record<string, PersistedDispatchTaskState>;
+    assignments: Record<string, DispatchAssignment[]>;
+}
+
+interface DispatchReviewState {
+    clientRequestId: string;
+    intents: DispatchIntent[];
+    preview: PublishDispatchSuccess;
+    published: boolean;
 }
 
 function hitTestScheduleDate(clientX: number, clientY: number): string | null {
@@ -196,13 +251,39 @@ function shiftMonth(month: string, delta: number): string {
     return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+function dashboardTaskAssignments(task: DashboardTaskRow): DispatchAssignment[] {
+    return task.assignments
+        .map(assignment => ({
+            userId: assignment.userId,
+            role: assignment.assignmentRole === "lead" ? "lead" as const : "assigned" as const,
+        }))
+        .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role));
+}
+
+function dashboardAssignmentsMatch(
+    task: DashboardTaskRow,
+    expected: DispatchAssignment[],
+): boolean {
+    const actual = dashboardTaskAssignments(task);
+    return actual.length === expected.length
+        && actual.every((assignment, index) =>
+            assignment.userId === expected[index]?.userId
+            && assignment.role === expected[index]?.role,
+        );
+}
+
 export function ScheduleBoard({
     data,
+    weather,
     externallyPendingProjectIds,
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
     externalShiftEvents,
 }: ScheduleBoardProps) {
+    if (process.env.NODE_ENV !== "production") {
+        scheduleBoardRenderCount += 1;
+        if (typeof window !== "undefined") window.__boardRenderCount = scheduleBoardRenderCount;
+    }
     const router = useRouter();
     const { month, isAdmin, overlays } = data;
     const [showIncome, setShowIncome] = useState(true);
@@ -210,6 +291,10 @@ export function ScheduleBoard({
     const [showExpenses, setShowExpenses] = useState(false);
     const [showHours, setShowHours] = useState(false);
     const [boardView, setBoardView] = useState<BoardView>("month");
+    const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+    const [openProjectId, setOpenProjectId] = useState<string | null>(null);
+    const [taskCreationOpen, setTaskCreationOpen] = useState(false);
+    const [taskCreationDefaults, setTaskCreationDefaults] = useState<Partial<DispatchTaskCreationDefaults>>({});
     // Lifted from TimelineView (see CREW_MODE_STORAGE_KEY) so the
     // availability panel's drill-down can force crew mode on even when
     // Timeline is already mounted — writing localStorage alone wouldn't
@@ -219,10 +304,16 @@ export function ScheduleBoard({
     const [projectPreviewOverrides, setProjectPreviewOverrides] = useState<Record<string, DashboardProjectRow>>({});
     const [projectIncomeOverrides, setProjectIncomeOverrides] = useState<Record<string, OverlayIncomeItem[]>>({});
     const [projectRefreshExpectations, setProjectRefreshExpectations] = useState<Record<string, ProjectRefreshExpectation>>({});
+    const [dispatchReconciliationExpectation, setDispatchReconciliationExpectation] = useState<DispatchReconciliationExpectation | null>(null);
+    const [dispatchReview, setDispatchReview] = useState<DispatchReviewState | null>(null);
+    const [dispatchConflictTargetIds, setDispatchConflictTargetIds] = useState<Set<string>>(() => new Set());
+    const [isDispatchReviewing, setIsDispatchReviewing] = useState(false);
+    const [isDispatchPublishing, setIsDispatchPublishing] = useState(false);
     // Drafts accumulate here — the SAME map drives the live visual preview AND
     // the pending-to-save payload; nothing writes to the server until Save.
     const [taskDateOverrides, setTaskDateOverrides] = useState<Record<string, TaskDateOverride>>({});
     const [projectDrafts, setProjectDrafts] = useState<Record<string, ProjectDraftMove>>({});
+    const [crewDrafts, setCrewDrafts] = useState<Record<string, CrewDraft>>({});
     // Read at reconciliation-timeout FIRE time (an effect-render snapshot can
     // miss a just-added draft or resurrect a just-discarded one).
     const projectDraftsRef = useRef(projectDrafts);
@@ -248,11 +339,6 @@ export function ScheduleBoard({
     // it participates in the SAME isPending gating as every other lock).
     const activeProjectEndResizeRef = useRef<ActiveProjectEndResizeEdit | null>(null);
     const [endResizeSavingProjectIds, setEndResizeSavingProjectIds] = useState<ReadonlySet<string>>(EMPTY_PROJECT_IDS);
-    // True for the duration of ANY pointer drag whose threshold has been
-    // crossed (project move, project end-resize, task move/resize) —
-    // combined with the keyboard-edit states below to gate task hover cards
-    // off while an edit is in progress (item 3).
-    const [pointerDragActive, setPointerDragActive] = useState(false);
     const previousExternallyPendingProjectIdsRef = useRef<ReadonlySet<string>>(new Set(externallyPendingProjectIds));
     const [confirmIntent, setConfirmIntent] = useState<ProjectDropIntent | null>(null);
     // Bumped on every "Today" click so TimelineView re-scrolls to today even
@@ -265,7 +351,7 @@ export function ScheduleBoard({
     useEffect(() => {
         try {
             const stored = localStorage.getItem(BOARD_VIEW_STORAGE_KEY);
-            if (stored === "month" || stored === "timeline") setBoardView(stored);
+            if (stored === "month" || stored === "timeline" || stored === "dispatch") setBoardView(stored);
         } catch {
             // Storage can be unavailable in privacy-restricted browser contexts.
         }
@@ -306,28 +392,60 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
+    const dispatchTaskNamesById = useMemo(
+        () => new Map(canonicalProjects.flatMap(project => project.tasks.map(task => [task.id, task.name] as const))),
+        [canonicalProjects],
+    );
+    const dispatchMemberNamesById = useMemo(() => new Map([
+        ...(data.teamMembers ?? []).map(member => [member.id, member.name || member.email] as const),
+        ...canonicalProjects.flatMap(project => project.tasks.flatMap(task =>
+            task.assignments.map(assignment => [assignment.userId, assignment.name] as const),
+        )),
+    ]), [canonicalProjects, data.teamMembers]);
+    const activeProjectOptions = useMemo(() => canonicalProjects.map(project => ({
+        id: project.id,
+        name: project.name,
+        color: project.color || "#4c9a2a",
+    })), [canonicalProjects]);
+    const teamMemberById = useMemo(
+        () => new Map((data.teamMembers ?? []).map(member => [member.id, member])),
+        [data.teamMembers],
+    );
     // A saved-but-not-yet-refreshed task keeps its override (pinned to the
     // persisted dates) purely for rendering/reconciliation — it is NOT an
     // unsaved draft and must not count toward or re-enter a Save.
-    const draftTaskIds = useMemo(
-        () => new Set(Object.keys(taskDateOverrides).filter(taskId => !awaitingTaskRefreshIds.has(taskId))),
-        [taskDateOverrides, awaitingTaskRefreshIds],
+    const dispatchAwaitingTaskIds = useMemo(
+        () => new Set(Object.keys(dispatchReconciliationExpectation?.tasks ?? {})),
+        [dispatchReconciliationExpectation],
     );
+    const draftTaskIds = useMemo(
+        () => new Set(Object.keys(taskDateOverrides).filter(taskId =>
+            !awaitingTaskRefreshIds.has(taskId) && !dispatchAwaitingTaskIds.has(taskId),
+        )),
+        [taskDateOverrides, awaitingTaskRefreshIds, dispatchAwaitingTaskIds],
+    );
+    const crewDraftTaskIds = useMemo(() => new Set(Object.keys(crewDrafts)), [crewDrafts]);
     const draftProjectIds = useMemo(() => new Set(Object.keys(projectDrafts)), [projectDrafts]);
-    const draftCount = draftTaskIds.size + draftProjectIds.size;
+    const draftCount = draftTaskIds.size + draftProjectIds.size + crewDraftTaskIds.size;
+    const openTaskProjectId = openTaskId ? canonicalTaskProjectById.get(openTaskId) : null;
+    const openTaskHasDraft = Boolean(openTaskId && (
+        draftTaskIds.has(openTaskId)
+        || (openTaskProjectId && draftProjectIds.has(openTaskProjectId))
+    ));
+    const openTaskHasCrewDraft = Boolean(openTaskId && crewDrafts[openTaskId]);
 
     // Locking during draft mode: a drafted item stays fully interactive.
     // Only an in-flight Save (global — the whole board pauses while
     // committing) or an externally-locked project (the legacy StartDateRow
     // mutating that same project directly) ever blocks an edit.
     const isProjectLocked = useCallback((projectId: string) => (
-        isSaving || isProjectExternallyPending(projectId)
-    ), [isSaving, isProjectExternallyPending]);
+        (isSaving || isProjectExternallyPending(projectId)) || isDispatchReviewing || isDispatchPublishing
+    ), [isDispatchPublishing, isDispatchReviewing, isSaving, isProjectExternallyPending]);
     const isTaskLocked = useCallback((taskId: string) => {
-        if (isSaving) return true;
+        if (isSaving || isDispatchReviewing || isDispatchPublishing) return true;
         const projectId = canonicalTaskProjectById.get(taskId);
         return Boolean(projectId && isProjectExternallyPending(projectId));
-    }, [isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
+    }, [isDispatchPublishing, isDispatchReviewing, isSaving, isProjectExternallyPending, canonicalTaskProjectById]);
 
     // End-resize saves are a SECOND source of "externally" pending, alongside
     // the legacy StartDateRow (item 2) — merged so both views' isPending gate
@@ -336,18 +454,30 @@ export function ScheduleBoard({
         () => mergeProjectPendingIds(externallyPendingProjectIds, endResizeSavingProjectIds),
         [externallyPendingProjectIds, endResizeSavingProjectIds],
     );
-    // Hover cards go quiet the moment ANY drag — pointer or keyboard, project
-    // or task — is in progress (item 3).
-    const isAnyDragActive = pointerDragActive || projectKeyboardEdit !== null || taskKeyboardEdit !== null;
+    // Keyboard edits still gate hover cards through React. Active pointer edits
+    // publish below this root from dragVisualLayer, avoiding a board render.
+    const isAnyDragActive = projectKeyboardEdit !== null || taskKeyboardEdit !== null;
 
     useEffect(() => () => onEffectivePendingProjectIdsChange(EMPTY_PROJECT_IDS), [onEffectivePendingProjectIdsChange]);
     // ONE derived publisher for the page-wide lock: the live union of the
-    // running batch save's locked projects and every in-flight end-resize
-    // save. Snapshot-based inline publications left windows where a resize
+    // running batch save's locked projects, every in-flight end-resize
+    // save, and — while a dispatch review/publish is in flight — every
+    // draft-affected project (the publish transaction will touch exactly
+    // those rows; sibling writers like StartDateRow must see them pending).
+    // Snapshot-based inline publications left windows where a resize
     // starting mid-batch went unpublished.
     useEffect(() => {
-        onEffectivePendingProjectIdsChange(mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds));
-    }, [saveLockedProjectIds, endResizeSavingProjectIds, onEffectivePendingProjectIdsChange]);
+        let pending = mergeProjectPendingIds(saveLockedProjectIds, endResizeSavingProjectIds);
+        if (isDispatchReviewing || isDispatchPublishing) {
+            const dispatchAffected = new Set(draftProjectIds);
+            for (const taskId of [...draftTaskIds, ...crewDraftTaskIds]) {
+                const projectId = canonicalTaskProjectById.get(taskId);
+                if (projectId) dispatchAffected.add(projectId);
+            }
+            pending = mergeProjectPendingIds(pending, dispatchAffected);
+        }
+        onEffectivePendingProjectIdsChange(pending);
+    }, [saveLockedProjectIds, endResizeSavingProjectIds, isDispatchReviewing, isDispatchPublishing, draftProjectIds, draftTaskIds, crewDraftTaskIds, canonicalTaskProjectById, onEffectivePendingProjectIdsChange]);
 
     const applyPreview = (project: DashboardProjectRow) => {
         const projectPreview = projectPreviewOverrides[project.id] ?? project;
@@ -355,7 +485,29 @@ export function ScheduleBoard({
             ...projectPreview,
             tasks: projectPreview.tasks.map(task => {
                 const dates = taskDateOverrides[task.id];
-                return dates ? { ...task, ...dates } : task;
+                const draft = crewDrafts[task.id];
+                const reconciledAssignments = dispatchReconciliationExpectation?.assignments[task.id];
+                const expectedAssignments = draft
+                    ? draft.expectedAssignments
+                        .filter(assignment => !draft.removeUserIds.includes(assignment.userId))
+                        .concat(draft.addUserIds.map(userId => ({ userId, role: "assigned" as const })))
+                        .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role))
+                    : reconciledAssignments;
+                const assignments = expectedAssignments
+                    ? expectedAssignments.map(assignment => {
+                        const existing = task.assignments.find(row => row.userId === assignment.userId);
+                        const member = teamMemberById.get(assignment.userId);
+                        return {
+                            id: existing?.id ?? `crew-draft:${task.id}:${assignment.userId}`,
+                            userId: assignment.userId,
+                            name: existing?.name ?? member?.name ?? member?.email ?? "Crew member",
+                            status: existing?.status ?? "ACTIVATED",
+                            userRole: existing?.userRole ?? member?.role ?? "FIELD_CREW",
+                            assignmentRole: assignment.role,
+                        };
+                    })
+                    : task.assignments;
+                return { ...task, ...(dates ?? {}), assignments };
             }),
         };
     };
@@ -380,6 +532,14 @@ export function ScheduleBoard({
         },
         overlays: data.overlays ? previewOverlays : null,
     };
+    const openProject = openProjectId
+        ? [
+            ...boardData.pipeline.waitingToStart,
+            ...boardData.pipeline.scheduled,
+            ...boardData.pipeline.inProgress,
+            ...boardData.pipeline.substantialCompletion,
+        ].find(project => project.id === openProjectId) ?? null
+        : null;
 
     function setTaskKeyboardState(next: TaskKeyboardEditState | null) {
         taskKeyboardEditRef.current = next;
@@ -388,6 +548,36 @@ export function ScheduleBoard({
 
     function setTaskPreview(taskId: string, dates: TaskDateOverride) {
         setTaskDateOverrides(current => ({ ...current, [taskId]: dates }));
+    }
+
+    function detachDispatchExpectationTargets(input: {
+        projectIds?: ReadonlySet<string>;
+        taskIds?: ReadonlySet<string>;
+    }) {
+        setDispatchConflictTargetIds(current => {
+            const next = new Set([...current].filter(targetId =>
+                !input.projectIds?.has(targetId) && !input.taskIds?.has(targetId),
+            ));
+            return next.size === current.size ? current : next;
+        });
+        setDispatchReconciliationExpectation(current => {
+            if (!current) return current;
+            const projects = Object.fromEntries(Object.entries(current.projects).filter(([projectId]) =>
+                !input.projectIds?.has(projectId),
+            ));
+            const tasks = Object.fromEntries(Object.entries(current.tasks).filter(([taskId]) =>
+                !input.taskIds?.has(taskId),
+            ));
+            const assignments = Object.fromEntries(Object.entries(current.assignments).filter(([taskId]) =>
+                !input.taskIds?.has(taskId),
+            ));
+            if (Object.keys(projects).length === 0
+                && Object.keys(tasks).length === 0
+                && Object.keys(assignments).length === 0) {
+                return null;
+            }
+            return { ...current, projects, tasks, assignments };
+        });
     }
 
     // Shared by the board's own save loop AND external (legacy StartDateRow)
@@ -426,6 +616,7 @@ export function ScheduleBoard({
         // refresh — cancelling a speculative edit must restore it, never
         // delete it (deleting strands the awaiting id and the refresh poll).
         if (awaitingTaskRefreshIds.has(taskId)) return;
+        if (dispatchAwaitingTaskIds.has(taskId)) return;
         setTaskDateOverrides(current => {
             if (!(taskId in current)) return current;
             const next = { ...current };
@@ -502,10 +693,59 @@ export function ScheduleBoard({
     }, [canonicalProjectById, projectRefreshExpectations]);
 
     useEffect(() => {
-        if (Object.keys(projectRefreshExpectations).length === 0 && awaitingTaskRefreshIds.size === 0) return;
+        const expectation = dispatchReconciliationExpectation;
+        if (!expectation) return;
+        const projectsMatch = Object.entries(expectation.projects).every(([projectId, expected]) => {
+            const canonical = canonicalProjectById.get(projectId);
+            return Boolean(
+                canonical
+                && (canonical.startDate ? canonical.startDate.slice(0, 10) : null) === expected.startDate
+                && (canonical.endDate ? canonical.endDate.slice(0, 10) : null) === expected.endDate,
+            );
+        });
+        const tasksMatch = Object.entries(expectation.tasks).every(([taskId, expected]) => {
+            const canonical = canonicalTaskById.get(taskId);
+            return Boolean(
+                canonical
+                && canonical.startDate.slice(0, 10) === expected.startDate
+                && canonical.endDate.slice(0, 10) === expected.endDate,
+            );
+        });
+        const assignmentsMatch = Object.entries(expectation.assignments).every(([taskId, expected]) => {
+            const canonical = canonicalTaskById.get(taskId);
+            return Boolean(canonical && dashboardAssignmentsMatch(canonical, expected));
+        });
+        if (!projectsMatch || !tasksMatch || !assignmentsMatch) return;
+
+        const projectIds = new Set(Object.keys(expectation.projects));
+        const taskIds = new Set([
+            ...Object.keys(expectation.tasks),
+            ...Object.keys(expectation.assignments),
+        ]);
+        const timeoutId = window.setTimeout(() => {
+            setProjectPreviewOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !projectIds.has(projectId)),
+            ));
+            setProjectIncomeOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !projectIds.has(projectId)),
+            ));
+            setTaskDateOverrides(current => Object.fromEntries(
+                Object.entries(current).filter(([taskId]) => !taskIds.has(taskId)),
+            ));
+            setDispatchReconciliationExpectation(current =>
+                current?.publicationId === expectation.publicationId ? null : current,
+            );
+        }, 0);
+        return () => window.clearTimeout(timeoutId);
+    }, [canonicalProjectById, canonicalTaskById, dispatchReconciliationExpectation]);
+
+    useEffect(() => {
+        if (Object.keys(projectRefreshExpectations).length === 0
+            && awaitingTaskRefreshIds.size === 0
+            && !dispatchReconciliationExpectation) return;
         const intervalId = window.setInterval(() => router.refresh(), 2_000);
         return () => window.clearInterval(intervalId);
-    }, [awaitingTaskRefreshIds.size, projectRefreshExpectations, router]);
+    }, [awaitingTaskRefreshIds.size, dispatchReconciliationExpectation, projectRefreshExpectations, router]);
 
     useEffect(() => () => {
         activeProjectPointerRef.current?.cleanup();
@@ -525,6 +765,52 @@ export function ScheduleBoard({
             // The selected view still applies for this session when persistence fails.
         }
     }
+
+    const openTaskCreation = useCallback((defaults: Partial<DispatchTaskCreationDefaults> = {}) => {
+        setTaskCreationDefaults(defaults);
+        setTaskCreationOpen(true);
+    }, []);
+
+    const handleBlockActivate = useCallback((taskId: string) => {
+        setOpenProjectId(null);
+        setOpenTaskId(taskId);
+    }, []);
+    const closeTaskDrawer = useCallback(() => setOpenTaskId(null), []);
+    const handleProjectActivate = useCallback((projectId: string) => {
+        setOpenTaskId(null);
+        setOpenProjectId(projectId);
+    }, []);
+    const closeProjectDrawer = useCallback(() => setOpenProjectId(null), []);
+    const selectDrawerTask = useCallback((taskId: string) => {
+        setOpenProjectId(null);
+        setOpenTaskId(taskId);
+    }, []);
+    const handleDrawerTaskDeleted = useCallback((taskId: string) => {
+        if (activeTaskPointerRef.current?.taskId === taskId) activeTaskPointerRef.current.cleanup();
+        if (taskKeyboardEditRef.current?.taskId === taskId) {
+            taskKeyboardCleanupRef.current?.();
+            setTaskKeyboardState(null);
+        }
+        setTaskDateOverrides(current => {
+            if (!(taskId in current)) return current;
+            const next = { ...current };
+            delete next[taskId];
+            return next;
+        });
+        setAwaitingTaskRefreshIds(current => {
+            if (!current.has(taskId)) return current;
+            const next = new Set(current);
+            next.delete(taskId);
+            return next;
+        });
+        setCrewDrafts(current => {
+            if (!(taskId in current)) return current;
+            const next = { ...current };
+            delete next[taskId];
+            return next;
+        });
+        setOpenTaskId(null);
+    }, []);
 
     function setProjectPreview(project: DashboardProjectRow, targetStart: string) {
         const preview = previewProjectMove(project, targetStart);
@@ -566,6 +852,76 @@ export function ScheduleBoard({
 
     // ── Draft-mode writers: accumulate locally, never touch the server. ──
 
+    function queueCrewAddition(taskId: string, userId: string): boolean {
+        const task = canonicalTaskById.get(taskId);
+        if (!data.canEdit || isTaskLocked(taskId) || !task) return false;
+        const existingDraft = crewDrafts[taskId];
+        const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
+        const addUserIds = new Set(existingDraft?.addUserIds ?? []);
+        const removeUserIds = new Set(existingDraft?.removeUserIds ?? []);
+        const isExpected = expectedAssignments.some(assignment => assignment.userId === userId);
+        const isEffectivelyAssigned = (isExpected && !removeUserIds.has(userId)) || addUserIds.has(userId);
+        if (isEffectivelyAssigned) {
+            toast.info(`${teamMemberById.get(userId)?.name ?? "Crew member"} is already on ${task.name}.`);
+            return false;
+        }
+
+        if (isExpected) removeUserIds.delete(userId);
+        else addUserIds.add(userId);
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
+        if (addUserIds.size === 0 && removeUserIds.size === 0) {
+            setCrewDrafts(current => {
+                if (!(taskId in current)) return current;
+                const next = { ...current };
+                delete next[taskId];
+                return next;
+            });
+            return true;
+        }
+        setCrewDrafts(current => ({
+            ...current,
+            [taskId]: {
+                expectedAssignments,
+                addUserIds: [...addUserIds].sort(),
+                removeUserIds: [...removeUserIds].sort(),
+            },
+        }));
+        return true;
+    }
+
+    function queueCrewRemoval(taskId: string, userId: string) {
+        const task = canonicalTaskById.get(taskId);
+        if (!data.canEdit || isTaskLocked(taskId) || !task) return;
+        const existingDraft = crewDrafts[taskId];
+        const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
+        const addUserIds = new Set(existingDraft?.addUserIds ?? []);
+        const removeUserIds = new Set(existingDraft?.removeUserIds ?? []);
+        const isExpected = expectedAssignments.some(assignment => assignment.userId === userId);
+        const isEffectivelyAssigned = (isExpected && !removeUserIds.has(userId)) || addUserIds.has(userId);
+        if (!isEffectivelyAssigned) return;
+
+        if (addUserIds.has(userId)) addUserIds.delete(userId);
+        else if (isExpected) removeUserIds.add(userId);
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
+        if (addUserIds.size === 0 && removeUserIds.size === 0) {
+            setCrewDrafts(current => {
+                if (!(taskId in current)) return current;
+                const next = { ...current };
+                delete next[taskId];
+                return next;
+            });
+            return;
+        }
+        setCrewDrafts(current => ({
+            ...current,
+            [taskId]: {
+                expectedAssignments,
+                addUserIds: [...addUserIds].sort(),
+                removeUserIds: [...removeUserIds].sort(),
+            },
+        }));
+    }
+
     function draftTaskChange(taskId: string, dates: TaskDateOverride) {
         const canonicalTask = canonicalTaskById.get(taskId);
         if (!data.canEdit || isTaskLocked(taskId) || !canonicalTask) {
@@ -594,7 +950,8 @@ export function ScheduleBoard({
         // would delete the pinned override and strand the awaiting id.
         if (!awaitingTaskRefreshIds.has(taskId)
             && normalizedDates.startDate === originalDates.startDate
-            && normalizedDates.endDate === originalDates.endDate) {
+            && normalizedDates.endDate === originalDates.endDate
+            && !dispatchAwaitingTaskIds.has(taskId)) {
             clearTaskPreview(taskId);
             return;
         }
@@ -603,6 +960,7 @@ export function ScheduleBoard({
             if (!current.has(taskId)) return current;
             return new Set([...current].filter(id => id !== taskId));
         });
+        detachDispatchExpectationTargets({ taskIds: new Set([taskId]) });
         setTaskPreview(taskId, normalizedDates);
     }
 
@@ -632,6 +990,10 @@ export function ScheduleBoard({
             clearProjectDraft(project.id);
             return;
         }
+        detachDispatchExpectationTargets({
+            projectIds: new Set([project.id]),
+            taskIds: new Set(canonicalProject.tasks.map(task => task.id)),
+        });
         setProjectPreview(canonicalProject, intent.targetStart);
         // Rebase this project's existing task drafts by the CHANGE in project
         // delta (full-shift projects only — the preview shifts their tasks, so
@@ -665,12 +1027,15 @@ export function ScheduleBoard({
         cancelActiveProjectEdit();
         for (const projectId of Object.keys(projectDrafts)) clearProjectPreview(projectId);
         setProjectDrafts({});
+        setCrewDrafts({});
         // Discard clears UNSAVED drafts only. Saved-awaiting overrides are
         // committed state pending refresh — removing them here would strand
         // their awaiting ids and the refresh poll forever.
-        setTaskDateOverrides(current => Object.fromEntries(
-            Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId)),
-        ));
+        setTaskDateOverrides(current => {
+            const savedAwaitingEntries = Object.entries(current).filter(([taskId]) => awaitingTaskRefreshIds.has(taskId));
+            const dispatchAwaitingEntries = Object.entries(current).filter(([taskId]) => dispatchAwaitingTaskIds.has(taskId));
+            return Object.fromEntries([...savedAwaitingEntries, ...dispatchAwaitingEntries]);
+        });
     }
 
     function waitForConfirmChoice(): Promise<ProjectMoveChoice | "cancel"> {
@@ -687,6 +1052,160 @@ export function ScheduleBoard({
     function cancelConfirmedMove() {
         confirmResolverRef.current?.("cancel");
         confirmResolverRef.current = null;
+    }
+
+    function handleDispatchFailure(result: Exclude<Awaited<ReturnType<typeof publishDispatchAction>>, { ok: true }>) {
+        if (result.code === "STALE_DISPATCH") {
+            setDispatchConflictTargetIds(new Set(result.conflicts.map(conflict => conflict.targetId)));
+            setDispatchReview(null);
+            toast.error("Dispatch changed while you were reviewing. Nothing was queued. Your drafts are still here.");
+            router.refresh();
+            return;
+        }
+        if (result.code === "NO_CHANGES") {
+            toast.info(result.message);
+            return;
+        }
+        toast.error(result.message);
+    }
+
+    async function collectDispatchIntents(): Promise<DispatchIntent[] | null> {
+        const projectEntries = Object.entries(projectDrafts);
+        const taskEntries = [...draftTaskIds].map(taskId => [taskId, taskDateOverrides[taskId]!] as const);
+        const crewEntries = Object.entries(crewDrafts);
+        if (projectEntries.length === 0 && taskEntries.length === 0 && crewEntries.length === 0) return [];
+
+        const affectedProjectIds = new Set([
+            ...projectEntries.map(([projectId]) => projectId),
+            ...taskEntries
+                .map(([taskId]) => canonicalTaskProjectById.get(taskId))
+                .filter((projectId): projectId is string => Boolean(projectId)),
+            ...crewEntries
+                .map(([taskId]) => canonicalTaskProjectById.get(taskId))
+                .filter((projectId): projectId is string => Boolean(projectId)),
+        ]);
+        const lockedNames = [...affectedProjectIds]
+            .filter(projectId => combinedPendingProjectIds.has(projectId))
+            .map(projectId => canonicalProjectById.get(projectId)?.name ?? projectId);
+        if (lockedNames.length > 0) {
+            toast.info(`Review will be available after another edit finishes: ${lockedNames.join(", ")}`);
+            return null;
+        }
+
+        const inProgressChoices = new Map<string, ProjectMoveChoice>();
+        for (const [projectId, draft] of projectEntries) {
+            const project = canonicalProjectById.get(projectId);
+            if (!project) {
+                toast.error(`Project ${projectId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            if (project.status !== "In Progress") continue;
+            const refreshedIntent = createProjectDropIntent(project, draft.targetStart);
+            if (!refreshedIntent) {
+                toast.error(`${project.name} no longer has a movable schedule range. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            setConfirmIntent(refreshedIntent);
+            const choice = await waitForConfirmChoice();
+            setConfirmIntent(null);
+            if (choice === "cancel") return null;
+            inProgressChoices.set(projectId, choice);
+        }
+
+        const intents: DispatchIntent[] = [];
+        for (const [projectId, draft] of projectEntries) {
+            const project = canonicalProjectById.get(projectId);
+            if (!project) return null;
+            intents.push({
+                kind: "PROJECT_START",
+                projectId,
+                expectedUpdatedAt: project.updatedAt,
+                expectedTasks: project.tasks.map(task => ({
+                    taskId: task.id,
+                    expectedUpdatedAt: task.updatedAt,
+                    expectedAssignments: dashboardTaskAssignments(task),
+                })),
+                startDate: draft.targetStart,
+                shiftMode: project.status === "In Progress"
+                    ? inProgressChoices.get(projectId) === "marker-only"
+                        ? "MARKER_ONLY"
+                        : "NOT_STARTED_TASKS"
+                    : "ALL_TASKS",
+            });
+        }
+        for (const [taskId, dates] of taskEntries) {
+            const task = canonicalTaskById.get(taskId);
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!task || !projectId) {
+                toast.error(`Task ${taskId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            intents.push({
+                kind: "TASK_DATES",
+                projectId,
+                taskId,
+                expectedUpdatedAt: task.updatedAt,
+                expectedAssignments: dashboardTaskAssignments(task),
+                startDate: dates.startDate,
+                endDate: dates.endDate,
+            });
+        }
+        for (const [taskId, draft] of crewEntries) {
+            const task = canonicalTaskById.get(taskId);
+            const projectId = canonicalTaskProjectById.get(taskId);
+            if (!task || !projectId) {
+                toast.error(`Task ${taskId} is no longer on this schedule. Refresh before reviewing.`);
+                router.refresh();
+                return null;
+            }
+            const removeIds = new Set(draft.removeUserIds);
+            const assignments = draft.expectedAssignments
+                .filter(assignment => !removeIds.has(assignment.userId))
+                .concat(draft.addUserIds.map(userId => ({ userId, role: "assigned" as const })))
+                .sort((left, right) => left.userId.localeCompare(right.userId) || left.role.localeCompare(right.role));
+            intents.push({
+                kind: "TASK_CREW",
+                projectId,
+                taskId,
+                expectedUpdatedAt: task.updatedAt,
+                expectedAssignments: draft.expectedAssignments,
+                assignments,
+            });
+        }
+        return intents;
+    }
+
+    async function reviewDispatchDrafts() {
+        if (isDispatchReviewing || isDispatchPublishing || isSaving || draftCount === 0) return;
+        cancelActiveTaskEdit();
+        cancelActiveProjectEdit();
+        setIsDispatchReviewing(true);
+        try {
+            const intents = await collectDispatchIntents();
+            if (!intents || intents.length === 0) return;
+            const clientRequestId = crypto.randomUUID();
+            const result = await publishDispatchAction({
+                clientRequestId,
+                intents,
+                dryRun: true,
+            });
+            if (!result.ok) {
+                handleDispatchFailure(result);
+                return;
+            }
+            setDispatchReview({
+                clientRequestId,
+                intents,
+                preview: result,
+                published: false,
+            });
+        } finally {
+            setConfirmIntent(null);
+            setIsDispatchReviewing(false);
+        }
     }
 
     // Commits every drafted change in one Save gesture: project-start moves
@@ -874,6 +1393,81 @@ export function ScheduleBoard({
         }
     }
 
+    async function publishDispatchDrafts() {
+        if (!dispatchReview || dispatchReview.published || isDispatchPublishing) return;
+        setIsDispatchPublishing(true);
+        try {
+            const result = await publishDispatchAction({
+                clientRequestId: dispatchReview.clientRequestId,
+                intents: dispatchReview.intents,
+                dryRun: false,
+            });
+            if (!result.ok) {
+                handleDispatchFailure(result);
+                return;
+            }
+            if (!result.publicationId) {
+                toast.error("Dispatch committed without a publication ID. Refresh before trying again.");
+                return;
+            }
+
+            const publishedProjectIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "PROJECT_START")
+                .map(intent => intent.projectId));
+            const explicitlyDraftedTaskIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "TASK_DATES")
+                .map(intent => intent.taskId));
+            const publishedCrewTaskIds = new Set(dispatchReview.intents
+                .filter(intent => intent.kind === "TASK_CREW")
+                .map(intent => intent.taskId));
+
+            setProjectDrafts(current => Object.fromEntries(
+                Object.entries(current).filter(([projectId]) => !publishedProjectIds.has(projectId)),
+            ));
+            setProjectPreviewOverrides(current => {
+                const next = { ...current };
+                for (const [projectId, expected] of Object.entries(result.reconciliation.projects)) {
+                    const row = next[projectId] ?? canonicalProjectById.get(projectId);
+                    if (!row) continue;
+                    next[projectId] = {
+                        ...row,
+                        startDate: expected.startDate ? `${expected.startDate}T00:00:00.000Z` : null,
+                        endDate: expected.endDate ? `${expected.endDate}T00:00:00.000Z` : null,
+                    };
+                }
+                return next;
+            });
+            setTaskDateOverrides(current => {
+                const next = Object.fromEntries(
+                    Object.entries(current).filter(([taskId]) => !explicitlyDraftedTaskIds.has(taskId)),
+                );
+                for (const [taskId, dates] of Object.entries(result.reconciliation.tasks)) {
+                    next[taskId] = dates;
+                }
+                return next;
+            });
+            setCrewDrafts(current => Object.fromEntries(
+                Object.entries(current).filter(([taskId]) => !publishedCrewTaskIds.has(taskId)),
+            ));
+            setDispatchReconciliationExpectation({
+                publicationId: result.publicationId,
+                projects: result.reconciliation.projects,
+                tasks: result.reconciliation.tasks,
+                assignments: result.reconciliation.assignments,
+            });
+            setDispatchConflictTargetIds(new Set());
+            setDispatchReview({
+                ...dispatchReview,
+                preview: result,
+                published: true,
+            });
+            toast.success("Dispatch recorded — delivery pending");
+            router.refresh();
+        } finally {
+            setIsDispatchPublishing(false);
+        }
+    }
+
     function cancelProjectEditsForProjects(projectIds: ReadonlySet<string>) {
         const pointerEdit = activeProjectPointerRef.current;
         if (pointerEdit && projectIds.has(pointerEdit.projectId)) {
@@ -936,6 +1530,7 @@ export function ScheduleBoard({
             grabDate: hitTestScheduleDate(start.clientX, start.clientY) ?? start.fallbackGrabDate,
             originalStart: start.originalStart,
             active: false,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -982,8 +1577,15 @@ export function ScheduleBoard({
                 drag.originX -= container.scrollLeft - before;
             }
             const candidate = calculateProjectPointerCandidate();
-            if (candidate) setProjectPreview(drag.project, candidate);
-            else clearProjectPreview(drag.projectId);
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    label: candidate ? `UTC start ${candidate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
+            }
             if (getProjectAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runProjectPointerFrame);
             }
@@ -1000,7 +1602,16 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: drag.project.status === "In Progress"
+                        ? projectMarkerDragSourceSelector(project.id)
+                        : projectDragSourceSelector(project.id),
+                    kind: drag.project.status === "In Progress" ? "project-marker-move" : "project-move",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                    cloneSelector: drag.project.status === "In Progress" ? '[data-drag-project-title="true"]' : undefined,
+                });
             }
             event.preventDefault();
             requestProjectPointerFrame();
@@ -1028,20 +1639,27 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
         drag.cleanup = () => {
             if (activeProjectPointerRef.current === drag) activeProjectPointerRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // The optimistic preview may re-key the originating segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeProjectPointerRef.current = drag;
@@ -1054,6 +1672,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     // Immediate server write for a released end-resize drag (item 2) — NOT
@@ -1115,6 +1734,7 @@ export function ScheduleBoard({
             monthDayWidth: start.timelineDayWidth ? null : measureMonthDayWidth(start.clientX, start.clientY),
             active: false,
             currentCandidate: null,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -1155,17 +1775,24 @@ export function ScheduleBoard({
                 maxStep: MAX_AUTOSCROLL_PX_PER_FRAME,
             });
         };
-        const applyEndResizeCandidate = () => {
+        const updateEndResizeVisual = () => {
             const candidate = calculateEndResizeCandidate();
             drag.currentCandidate = candidate;
-            if (!candidate || candidate === drag.originalEnd) {
-                clearProjectPreview(drag.projectId);
-                return;
+            const dayWidth = drag.start.timelineDayWidth ?? drag.monthDayWidth;
+            const deltaX = candidate && dayWidth
+                ? getDaysBetween(parseUTCDate(drag.originalEnd), parseUTCDate(candidate)) * dayWidth
+                : undefined;
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    deltaX,
+                    sourceOffsetX: drag.originX - drag.startX,
+                    label: candidate ? `UTC end ${candidate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
             }
-            setProjectPreviewOverrides(current => ({
-                ...current,
-                [drag.projectId]: { ...drag.project, endDate: `${candidate}T00:00:00.000Z` },
-            }));
         };
         const runEndResizeFrame = () => {
             drag.animationFrameId = null;
@@ -1177,7 +1804,7 @@ export function ScheduleBoard({
                 container.scrollLeft += scrollDelta;
                 drag.originX -= container.scrollLeft - before;
             }
-            applyEndResizeCandidate();
+            updateEndResizeVisual();
             if (getEndResizeAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
             }
@@ -1191,7 +1818,13 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: projectDragSourceSelector(project.id),
+                    kind: "project-end-resize",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                });
             }
             event.preventDefault();
             if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runEndResizeFrame);
@@ -1209,6 +1842,10 @@ export function ScheduleBoard({
                 clearProjectPreview(drag.projectId);
                 return;
             }
+            setProjectPreviewOverrides(current => ({
+                ...current,
+                [drag.projectId]: { ...drag.project, endDate: `${candidate}T00:00:00.000Z` },
+            }));
             commitProjectEndResize(drag.project, candidate);
         };
         const onPointerUp = (event: PointerEvent) => {
@@ -1218,20 +1855,27 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
         drag.cleanup = () => {
             if (activeProjectEndResizeRef.current === drag) activeProjectEndResizeRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // The optimistic preview may re-key the originating segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeProjectEndResizeRef.current = drag;
@@ -1244,6 +1888,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     function handleProjectKeyboardStart(project: DashboardProjectRow, sourceElement: HTMLElement) {
@@ -1339,9 +1984,11 @@ export function ScheduleBoard({
             latestClientX: start.clientX,
             latestClientY: start.clientY,
             grabDate: hitTestScheduleDate(start.clientX, start.clientY),
+            monthDayWidth: start.timelineDayWidth ? null : measureMonthDayWidth(start.clientX, start.clientY),
             mode,
             active: false,
             currentCandidate: originalDates,
+            visualLayer: null,
             animationFrameId: null,
             sourceElement: start.sourceElement,
             previousTouchAction: start.sourceElement.style.touchAction,
@@ -1362,18 +2009,27 @@ export function ScheduleBoard({
             }
             return previewTaskPointerCandidate(canonicalTask, mode, deltaDays);
         };
-        const applyPointerCandidate = (): TaskDateOverride | null => {
+        const updateTaskVisual = (): TaskDateOverride | null => {
             const candidate = calculatePointerCandidate();
-            const previousCandidate = drag.currentCandidate;
             drag.currentCandidate = candidate;
-            if (!candidate) {
-                drag.currentCandidate = null;
-                clearTaskPreview(task.id);
-                return null;
+            let deltaX: number | undefined;
+            const dayWidth = start.timelineDayWidth ?? drag.monthDayWidth;
+            if (candidate && dayWidth && mode !== "move") {
+                const originalBoundary = mode === "resize-left" ? originalDates.startDate : originalDates.endDate;
+                const candidateBoundary = mode === "resize-left" ? candidate.startDate : candidate.endDate;
+                deltaX = getDaysBetween(parseUTCDate(originalBoundary), parseUTCDate(candidateBoundary)) * dayWidth;
             }
-            if (previousCandidate?.startDate === candidate.startDate && previousCandidate.endDate === candidate.endDate) return candidate;
-            if (candidate.startDate === originalDates.startDate && candidate.endDate === originalDates.endDate) clearTaskPreview(task.id);
-            else setTaskPreview(task.id, candidate);
+            const visualLayer = drag.visualLayer;
+            if (visualLayer) {
+                visualLayer.update({
+                    clientX: drag.latestClientX,
+                    clientY: drag.latestClientY,
+                    deltaX,
+                    sourceOffsetX: drag.originX - drag.startX,
+                    label: candidate ? `UTC ${candidate.startDate} to ${candidate.endDate}` : null,
+                    targetDate: candidate ? hitTestScheduleDate(drag.latestClientX, drag.latestClientY) : null,
+                });
+            }
             return candidate;
         };
         const getTaskAutoscrollStep = () => {
@@ -1402,7 +2058,7 @@ export function ScheduleBoard({
                 container.scrollLeft += scrollDelta;
                 drag.originX -= container.scrollLeft - before;
             }
-            applyPointerCandidate();
+            updateTaskVisual();
             if (getTaskAutoscrollStep() !== 0 && drag.animationFrameId == null) {
                 drag.animationFrameId = requestAnimationFrame(runTaskPointerFrame);
             }
@@ -1416,7 +2072,13 @@ export function ScheduleBoard({
                 if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < threshold) return;
                 drag.active = true;
                 drag.sourceElement.style.touchAction = "none";
-                setPointerDragActive(true);
+                drag.visualLayer = createDragVisualLayer({
+                    sourceElement: drag.sourceElement,
+                    sourceSelector: taskDragSourceSelector(task.id),
+                    kind: mode === "move" ? "task-move" : mode === "resize-left" ? "task-resize-left" : "task-resize-right",
+                    startClientX: drag.startX,
+                    startClientY: drag.startY,
+                });
             }
             event.preventDefault();
             if (drag.animationFrameId == null) drag.animationFrameId = requestAnimationFrame(runTaskPointerFrame);
@@ -1446,21 +2108,28 @@ export function ScheduleBoard({
             if (event.pointerId === drag.pointerId) finish(true);
         };
         const onWindowBlur = () => finish(true);
+        const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+            if (event.key !== "Escape" || !drag.active) return;
+            event.preventDefault();
+            finish(true);
+        };
 
         drag.cleanup = () => {
             if (activeTaskPointerRef.current === drag) activeTaskPointerRef.current = null;
-            setPointerDragActive(false);
             window.removeEventListener("pointermove", onPointerMove);
             window.removeEventListener("pointerup", onPointerUp);
             window.removeEventListener("pointercancel", onPointerCancel);
             window.removeEventListener("blur", onWindowBlur);
+            window.removeEventListener("keydown", onWindowKeyDown);
             if (drag.animationFrameId != null) cancelAnimationFrame(drag.animationFrameId);
             drag.animationFrameId = null;
+            drag.visualLayer?.cleanup();
+            drag.visualLayer = null;
             drag.sourceElement.style.touchAction = drag.previousTouchAction;
             try {
                 if (drag.sourceElement.hasPointerCapture(drag.pointerId)) drag.sourceElement.releasePointerCapture(drag.pointerId);
             } catch {
-                // A task preview can unmount its original weekly segment.
+                // A refresh may replace the originating weekly segment.
             }
         };
         activeTaskPointerRef.current = drag;
@@ -1473,6 +2142,7 @@ export function ScheduleBoard({
         window.addEventListener("pointerup", onPointerUp);
         window.addEventListener("pointercancel", onPointerCancel);
         window.addEventListener("blur", onWindowBlur);
+        window.addEventListener("keydown", onWindowKeyDown);
     }
 
     function handleTaskKeyboardStart(task: DashboardTaskRow, mode: TaskEditMode, sourceElement: HTMLElement) {
@@ -1612,9 +2282,11 @@ export function ScheduleBoard({
     const pendingRefreshKinds = [
         Object.keys(projectRefreshExpectations).length > 0 ? "project" : null,
         awaitingTaskRefreshIds.size > 0 ? "task" : null,
+        dispatchReconciliationExpectation ? "dispatch" : null,
     ].filter((kind): kind is string => Boolean(kind));
 
     return (
+        <MotionConfig reducedMotion="user">
         <div ref={boardContainerRef} className="hui-card mb-6 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-hui-border">
                 <div className="flex items-baseline gap-3">
@@ -1641,7 +2313,20 @@ export function ScheduleBoard({
                         >
                             Timeline
                         </button>
+                        <button
+                            type="button"
+                            onClick={() => selectBoardView("dispatch")}
+                            aria-pressed={boardView === "dispatch"}
+                            className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "dispatch" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                        >
+                            Dispatch
+                        </button>
                     </div>
+                    {data.canEdit && (
+                        <button type="button" onClick={() => openTaskCreation()} className="hui-btn hui-btn-primary text-sm">
+                            + Task
+                        </button>
+                    )}
                     {isAdmin && overlays && (
                         <div className="flex flex-wrap items-center gap-1 mr-1">
                             <button type="button" onClick={() => setShowIncome(value => !value)} className={`text-xs font-semibold px-2 py-1 rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${showIncome ? "bg-green-100 text-green-700 border-green-300" : "bg-white text-hui-textMuted border-hui-border"}`}>Income</button>
@@ -1655,40 +2340,78 @@ export function ScheduleBoard({
                     <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
                 </div>
             </div>
+            <AnimatePresence initial={false}>
             {draftCount > 0 && (
-                <div role="status" className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
+                <motion.div
+                    key="draft-status"
+                    data-motion-scope="status-change"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.16 }}
+                    role="status"
+                    className="sticky top-0 z-40 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900"
+                >
                     <span>{draftCount} unsaved change{draftCount === 1 ? "" : "s"}</span>
                     <div className="flex items-center gap-2">
-                        <button type="button" onClick={discardAllDrafts} disabled={isSaving} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
+                        <button type="button" onClick={discardAllDrafts} disabled={isSaving || isDispatchReviewing || isDispatchPublishing} className="hui-btn hui-btn-secondary text-xs disabled:cursor-wait disabled:opacity-60">
                             Discard
                         </button>
-                        <button type="button" onClick={() => void saveAllDrafts()} disabled={isSaving} className="hui-btn hui-btn-green text-xs disabled:cursor-wait disabled:opacity-60">
-                            {isSaving ? "Saving..." : "Save"}
-                        </button>
+                        {boardView !== "dispatch" && (
+                            <button type="button" onClick={() => void saveAllDrafts()} disabled={isSaving} className="hui-btn hui-btn-green text-xs disabled:cursor-wait disabled:opacity-60">
+                                {isSaving ? "Saving..." : "Save"}
+                            </button>
+                        )}
                     </div>
-                </div>
+                </motion.div>
             )}
+            </AnimatePresence>
             <UnscheduledTray
                 projects={data.pipeline.waitingToStart}
                 canEdit={data.canEdit}
                 pendingProjectIds={externallyPendingProjectIds}
                 onMoveProject={scheduleUnscheduledProject}
             />
-            {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0) && (
-                <div className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">
+            <AnimatePresence initial={false}>
+            {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0 || dispatchReconciliationExpectation) && (
+                <motion.div
+                    key="refresh-status"
+                    data-motion-scope="status-change"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.16 }}
+                    className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+                    role="status"
+                >
                     <span>Refreshing saved {pendingRefreshKinds.join(" and ")} schedule changes...</span>
                     <button type="button" className="font-semibold underline" onClick={() => router.refresh()}>Retry now</button>
-                </div>
+                </motion.div>
             )}
+            </AnimatePresence>
             <span ref={projectKeyboardSentinelRef} tabIndex={-1} className="sr-only" aria-live="polite" data-project-keyboard-sentinel="true">
                 {projectKeyboardEdit ? `Moving project to ${projectKeyboardEdit.targetStart}. Use arrow keys, Enter to save, or Escape to cancel.` : ""}
             </span>
             <span ref={taskKeyboardSentinelRef} tabIndex={-1} className="sr-only" aria-live="polite" data-task-keyboard-sentinel="true">
                 {taskKeyboardEdit ? `Keyboard editing ${taskKeyboardEdit.mode}` : ""}
             </span>
-            {boardView === "month" ? (
+            {boardView === "dispatch" ? (
+                <DispatchView
+                    data={boardData}
+                    weather={weather}
+                    onActivate={handleBlockActivate}
+                    onCreateTask={openTaskCreation}
+                    onReviewDispatch={() => void reviewDispatchDrafts()}
+                    draftCount={draftCount}
+                    isReviewingDispatch={isDispatchReviewing || isDispatchPublishing}
+                    crewDrafts={crewDrafts}
+                    onDraftCrewAdd={queueCrewAddition}
+                    onDraftCrewRemove={queueCrewRemoval}
+                />
+            ) : boardView === "month" ? (
                 <MonthBarsView
                     data={boardData}
+                    weather={weather}
                     showIncome={showIncome}
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
@@ -1700,9 +2423,11 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    onCreateTask={openTaskCreation}
                     teamMembers={data.teamMembers ?? []}
                     isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
+                    onProjectActivate={handleProjectActivate}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
                     onProjectKeyboardAdjust={handleProjectKeyboardAdjust}
@@ -1717,10 +2442,12 @@ export function ScheduleBoard({
                     onTaskKeyboardCancel={handleTaskKeyboardCancel}
                     onTaskDatesCommit={handleTaskDatesCommit}
                     onTaskMoveBy={handleTaskMoveBy}
+                    onActivate={handleBlockActivate}
                 />
             ) : (
                 <TimelineView
                     data={boardData}
+                    weather={weather}
                     showIncome={showIncome}
                     showProjectedCo={showProjectedCo}
                     showExpenses={showExpenses}
@@ -1732,12 +2459,14 @@ export function ScheduleBoard({
                     isSaving={isSaving}
                     activeTaskKeyboardEdit={taskKeyboardEdit}
                     onTrayProjectDrop={scheduleUnscheduledProject}
+                    onCreateTask={openTaskCreation}
                     groupByCrew={groupByCrew}
                     onToggleGroupByCrew={() => setGroupByCrewMode(!groupByCrew)}
                     scrollToTodayNonce={scrollToTodayNonce}
                     teamMembers={data.teamMembers ?? []}
                     isAnyDragActive={isAnyDragActive}
                     activeProjectKeyboardId={projectKeyboardEdit?.projectId ?? null}
+                    onProjectActivate={handleProjectActivate}
                     onProjectPointerEditStart={handleProjectPointerEditStart}
                     onProjectKeyboardStart={handleProjectKeyboardStart}
                     onProjectKeyboardAdjust={handleProjectKeyboardAdjust}
@@ -1752,6 +2481,7 @@ export function ScheduleBoard({
                     onTaskKeyboardCancel={handleTaskKeyboardCancel}
                     onTaskDatesCommit={handleTaskDatesCommit}
                     onTaskMoveBy={handleTaskMoveBy}
+                    onActivate={handleBlockActivate}
                 />
             )}
             {data.canEdit && <AvailabilityPanel data={data} onDrillDown={drillDownToCrewTimeline} />}
@@ -1761,6 +2491,45 @@ export function ScheduleBoard({
                 onChoice={handleMoveChoice}
                 onCancel={cancelConfirmedMove}
             />
+            <DispatchReviewDialog
+                result={dispatchReview?.preview ?? null}
+                published={dispatchReview?.published ?? false}
+                isPending={isDispatchPublishing}
+                conflictTargetIds={dispatchConflictTargetIds}
+                taskNamesById={dispatchTaskNamesById}
+                memberNamesById={dispatchMemberNamesById}
+                onConfirm={() => void publishDispatchDrafts()}
+                onClose={() => setDispatchReview(null)}
+            />
+            <BoardTaskDrawer
+                taskId={openTaskId}
+                hasDraft={openTaskHasDraft}
+                hasCrewDraft={openTaskHasCrewDraft}
+                teamMembers={data.teamMembers ?? []}
+                onClose={closeTaskDrawer}
+                onSelectTask={selectDrawerTask}
+                onDeleted={handleDrawerTaskDeleted}
+            />
+            <BoardProjectDrawer
+                project={openProject}
+                teamMembers={data.teamMembers ?? []}
+                isPending={Boolean(openProject && (isSaving || combinedPendingProjectIds.has(openProject.id)))}
+                onMoveCommit={handleProjectMoveCommit}
+                onClose={closeProjectDrawer}
+            />
+            <TaskCreationDialog
+                open={taskCreationOpen}
+                onClose={() => setTaskCreationOpen(false)}
+                defaultProjectId={taskCreationDefaults.defaultProjectId}
+                lockProject={taskCreationDefaults.lockProject}
+                defaultStartDate={taskCreationDefaults.defaultStartDate}
+                defaultCrewIds={taskCreationDefaults.defaultCrewIds}
+                defaultName={taskCreationDefaults.defaultName}
+                defaultEstimatedHours={taskCreationDefaults.defaultEstimatedHours}
+                estimateItemId={taskCreationDefaults.estimateItemId}
+                projects={activeProjectOptions}
+            />
         </div>
+        </MotionConfig>
     );
 }

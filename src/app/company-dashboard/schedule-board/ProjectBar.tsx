@@ -1,22 +1,16 @@
 "use client";
 
-import { createContext, useContext, useEffect, useRef, useState, useTransition, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
-import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { toast } from "sonner";
+import { createContext, useContext, useRef, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import type {
     DashboardProjectRow,
     OverlayChangeOrderItem,
     OverlayIncomeItem,
 } from "@/lib/schedule-core";
-import { updateProjectColor, updateProjectEndDateAction, updateProjectStartDateAction } from "@/lib/actions";
-import { addDays, formatDate, parseUTCDate, PRESET_COLORS } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatDate, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { assignTaskLanes, getEffectiveProjectRange, type WeekSegment } from "./useBarLayout";
 import { MilestoneMarker } from "./MilestoneMarker";
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
-import { FloatingPopover } from "./FloatingPopover";
-import { CrewPicker } from "./CrewPickers";
-import { activateExclusiveMenu, deactivateExclusiveMenu } from "./menuCoordinator";
+import { ProjectTaskOverflow } from "./ProjectTaskOverflow";
 
 // Mini-lane sizing for overlapping tasks inside one project bar (item 5, and
 // the 2026-07-22 readability pass — 9px task labels were unreadable):
@@ -44,6 +38,7 @@ export function computeTaskLaneLayout(tasks: { id: string; startDate: string; en
 
 export interface ProjectEditCallbacks {
     activeProjectKeyboardId: string | null;
+    onProjectActivate: (_projectId: string) => void;
     onProjectPointerEditStart: (_project: DashboardProjectRow, _start: ProjectPointerEditStart) => void;
     onProjectKeyboardStart: (_project: DashboardProjectRow, _sourceElement: HTMLElement) => void;
     onProjectKeyboardAdjust: (_project: DashboardProjectRow, _deltaDays: number) => void;
@@ -75,19 +70,18 @@ export interface ProjectBarProps extends TaskEditCallbacks {
     timelineDayWidth?: number;
     timelineLeftInset?: number;
     timelineScrollContainerRef?: RefObject<HTMLDivElement | null>;
-    // Context-menu "Project crew…" / TaskBlockSegment's "Task crew…" (item 1)
-    // reuse the exact CrewPicker/TaskCrewPicker the Schedule & crew table uses.
+    // Threaded to TaskBlockSegment's retained task-crew quick menu.
     teamMembers: { id: string; name: string; email: string }[];
     // Suppresses every task's hover card while ANY schedule-board drag is
     // active (item 3) — threaded through to this bar's own task renders.
     isAnyDragActive: boolean;
     activeProjectKeyboardId: ProjectEditCallbacks["activeProjectKeyboardId"];
+    onProjectActivate: ProjectEditCallbacks["onProjectActivate"];
     onProjectPointerEditStart: ProjectEditCallbacks["onProjectPointerEditStart"];
     onProjectKeyboardStart: ProjectEditCallbacks["onProjectKeyboardStart"];
     onProjectKeyboardAdjust: ProjectEditCallbacks["onProjectKeyboardAdjust"];
     onProjectKeyboardCommit: ProjectEditCallbacks["onProjectKeyboardCommit"];
     onProjectKeyboardCancel: ProjectEditCallbacks["onProjectKeyboardCancel"];
-    onMoveCommit: ProjectEditCallbacks["onProjectMoveCommit"];
     onProjectEndResizeStart: ProjectEditCallbacks["onProjectEndResizeStart"];
 }
 
@@ -126,12 +120,6 @@ function initials(name: string): string {
     return name.trim().split(/\s+/).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
-// The bar's Actions/context menu is a single FloatingPopover instance whose
-// CONTENT switches between a top-level list and each item's own sub-view
-// (item 1) — simpler and more robust than nesting flyout panels, and keeps
-// every item reachable by keyboard from the same panel.
-type BarMenuView = "main" | "dates" | "crew" | "color";
-
 export function ProjectBar({
     project,
     segment,
@@ -152,12 +140,12 @@ export function ProjectBar({
     teamMembers,
     isAnyDragActive,
     activeProjectKeyboardId,
+    onProjectActivate,
     onProjectPointerEditStart,
     onProjectKeyboardStart,
     onProjectKeyboardAdjust,
     onProjectKeyboardCommit,
     onProjectKeyboardCancel,
-    onMoveCommit,
     onProjectEndResizeStart,
     onTaskPointerEditStart,
     onTaskKeyboardStart,
@@ -166,55 +154,11 @@ export function ProjectBar({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: ProjectBarProps) {
-    const router = useRouter();
     const gridStart = useContext(ProjectBarGridStartContext);
     const projectRange = getEffectiveProjectRange(project);
-    const projectStart = projectRange ? formatDate(projectRange.start) : "";
-    const actionTriggerRef = useRef<HTMLButtonElement>(null);
-    const [menuOpen, setMenuOpen] = useState(false);
-    const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number } | null>(null);
-    const [menuView, setMenuView] = useState<BarMenuView>("main");
-    const overflowTriggerRef = useRef<HTMLButtonElement>(null);
-    const [overflowOpen, setOverflowOpen] = useState(false);
-    const actionResetKey = `${isPending ? "pending" : "ready"}:${projectStart}`;
-    const [targetStartDraft, setTargetStartDraft] = useState(() => ({ resetKey: actionResetKey, value: projectStart }));
-    const targetStart = targetStartDraft.resetKey === actionResetKey ? targetStartDraft.value : projectStart;
-    if (targetStartDraft.resetKey !== actionResetKey) {
-        setTargetStartDraft({ resetKey: actionResetKey, value: projectStart });
-    }
-    const projectEndDate = project.endDate ? project.endDate.slice(0, 10) : "";
-    const [endDateDraft, setEndDateDraft] = useState(() => ({ resetKey: actionResetKey, value: projectEndDate }));
-    const endDateValue = endDateDraft.resetKey === actionResetKey ? endDateDraft.value : projectEndDate;
-    if (endDateDraft.resetKey !== actionResetKey) {
-        setEndDateDraft({ resetKey: actionResetKey, value: projectEndDate });
-    }
-    const [isColorPending, startColorTransition] = useTransition();
-    const [isEndDatePending, startEndDateTransition] = useTransition();
-    const [isRemovePending, startRemoveTransition] = useTransition();
-    useEffect(() => {
-        setMenuOpen(false);
-    }, [actionResetKey]);
-    // Only one schedule-board menu open at a time (item 1) — including across
-    // a right-click/context menu vs the click-triggered Actions menu.
-    useEffect(() => {
-        if (!menuOpen) {
-            setMenuView("main");
-            setMenuAnchorPoint(null);
-            return;
-        }
-        const close = () => setMenuOpen(false);
-        activateExclusiveMenu(close);
-        return () => deactivateExclusiveMenu(close);
-    }, [menuOpen]);
-    // The "+N" overflow popover is a menu too — register it so opening any
-    // other menu (mouse OR keyboard) closes it, preserving one-menu-at-a-time.
-    useEffect(() => {
-        if (!overflowOpen) return;
-        const close = () => setOverflowOpen(false);
-        activateExclusiveMenu(close);
-        return () => deactivateExclusiveMenu(close);
-    }, [overflowOpen]);
+    const rootRef = useRef<HTMLDivElement>(null);
     if (!gridStart || !projectRange) return null;
 
     const visibleStart = addDays(gridStart, segment.weekIndex * 7 + segment.startColumn);
@@ -265,7 +209,7 @@ export function ProjectBar({
     // Right-edge grab handle (item 2): a SEPARATE pointer-drag from the
     // whole-bar move above — stopPropagation so it wins over handlePointerDown
     // within its own hit area instead of also starting a move-drag. Available
-    // whenever the bar's Actions menu is (canEdit), independent of
+    // whenever the bar is editable, independent of
     // canMoveProject — a Substantial Completion project can't have its START
     // dragged, but its finish date is still editable, same as "Edit dates…".
     function handleEndResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
@@ -276,7 +220,7 @@ export function ProjectBar({
             pointerType: event.pointerType,
             clientX: event.clientX,
             clientY: event.clientY,
-            sourceElement: event.currentTarget,
+            sourceElement: rootRef.current ?? event.currentTarget,
             originalStart: formatDate(projectRange!.start),
             originalEnd: formatDate(projectRange!.end),
             timelineDayWidth,
@@ -285,29 +229,26 @@ export function ProjectBar({
         });
     }
 
-    function openMenu(anchorPoint: { x: number; y: number } | null) {
-        setMenuAnchorPoint(anchorPoint);
-        setMenuView("main");
-        setMenuOpen(true);
-    }
-
     function handleKeyboard(event: KeyboardEvent<HTMLDivElement>) {
         if (event.target !== event.currentTarget || isPending) return;
         const editing = activeProjectKeyboardId === project.id;
-        // ContextMenu key / Shift+F10: the keyboard equivalent of a right-click
-        // (item 1) — opens the same menu the Actions button opens, ref-anchored
-        // since there is no cursor position to anchor to.
+        // ContextMenu key / Shift+F10: the keyboard equivalent of a right-click.
         if (!editing && canEdit && (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey))) {
             event.preventDefault();
-            openMenu(null);
+            onProjectActivate(project.id);
             return;
         }
-        if (!canMoveProject) return;
-        if (!editing && (event.key === " " || event.key === "Enter")) {
+        if (!editing && canMoveProject && event.altKey && (event.key === " " || event.key === "Enter")) {
             event.preventDefault();
             onProjectKeyboardStart(project, event.currentTarget);
             return;
         }
+        if (!editing && (event.key === " " || event.key === "Enter")) {
+            event.preventDefault();
+            onProjectActivate(project.id);
+            return;
+        }
+        if (!canMoveProject) return;
         if (!editing) return;
         const step = event.shiftKey ? 7 : 1;
         if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
@@ -331,93 +272,25 @@ export function ProjectBar({
         if (!canEdit || isPending) return;
         if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
         event.preventDefault();
-        openMenu({ x: event.clientX, y: event.clientY });
+        onProjectActivate(project.id);
     }
 
-    // Merged "Edit dates…" submit (item 1): a Start change and an End change
-    // are TWO INDEPENDENT writers fired from the same form. Start joins the
-    // existing draft system (onMoveCommit -> draftProjectMove — unsaved until
-    // Save); End calls updateProjectEndDateAction immediately and ONLY when
-    // it actually changed (the Clear button below fires the same action
-    // directly, unconditionally).
-    function handleDateSubmit(event: FormEvent<HTMLFormElement>) {
-        event.preventDefault();
-        if (canMoveProject && targetStart && !isPending) {
-            onMoveCommit(project, targetStart);
-        }
-        if (endDateValue !== projectEndDate) {
-            submitEndDate(endDateValue || null);
-        }
-        setMenuOpen(false);
-    }
-
-    function submitColor(color: string) {
-        startColorTransition(async () => {
-            try {
-                await updateProjectColor(project.id, color);
-                router.refresh();
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update color");
-            }
-        });
-        setMenuOpen(false);
-    }
-
-    // Immediate action (item 3) — NOT part of the board's draft-mode system;
-    // takes effect right away, unlike task/project START dates which route
-    // through Save.
-    function submitEndDate(value: string | null) {
-        startEndDateTransition(async () => {
-            try {
-                await updateProjectEndDateAction(project.id, value);
-                router.refresh();
-                toast.success(value ? "End date set" : "End date cleared");
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to update end date");
-            }
-        });
-        setMenuOpen(false);
-    }
-
-    // Waiting-to-Start projects only (item 1) — immediate action through the
-    // EXISTING updateProjectStartDateAction(projectId, null, false) path,
-    // never offered for In Progress or any other status.
-    function handleRemoveFromSchedule() {
-        if (!window.confirm(`Remove "${project.name}" from the schedule? This clears its start date — the project moves back to Unscheduled.`)) return;
-        startRemoveTransition(async () => {
-            try {
-                await updateProjectStartDateAction(project.id, null, false);
-                router.refresh();
-                toast.success("Removed from schedule");
-            } catch (err: any) {
-                toast.error(err?.message || "Failed to remove from schedule");
-            }
-        });
-        setMenuOpen(false);
-    }
-
-    // A bare click on the bar (not a drag, and not on an interactive
-    // descendant like the name link or the Actions menu itself) toggles the
-    // Actions dropdown instead of doing nothing — the bar itself never
-    // navigates. An active drag calls preventDefault on pointermove once the
-    // threshold is crossed, which suppresses the browser's synthetic click,
-    // so this only fires for genuine clicks.
+    // A bare click opens the project drawer. An active drag calls preventDefault
+    // on pointermove once its threshold is crossed, suppressing the synthetic
+    // click so this only fires for genuine clicks.
     function handleBarClick(event: ReactMouseEvent<HTMLDivElement>) {
         if (!canEdit || isPending) return;
         if ((event.target as HTMLElement).closest("a,button,input,summary,form,details")) return;
-        if (menuOpen) {
-            setMenuOpen(false);
-        } else {
-            openMenu(null);
-        }
+        onProjectActivate(project.id);
     }
-
-    const menuBusy = isColorPending || isEndDatePending || isRemovePending;
 
     return (
         <div
+            ref={rootRef}
             className={`group/project relative touch-pan-y select-none overflow-visible rounded-md border text-white shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 ${canMoveProject && !isPending ? "cursor-move" : ""} ${isDraft ? "border-dashed border-2 border-white/90 saturate-[.55] brightness-95" : "border-black/10"}`}
             style={{ backgroundColor: projectColor, height: barHeight }}
+            data-drag-visual-kind="project"
+            data-drag-project-id={project.id}
             data-can-edit={canEdit ? "true" : "false"}
             role="group"
             aria-label={`${project.name} project bar${isDraft ? " (unsaved change)" : ""}`}
@@ -429,11 +302,11 @@ export function ProjectBar({
             onContextMenu={handleContextMenu}
             onKeyDown={handleKeyboard}
         >
-            <div className="absolute inset-x-0 top-0 z-10 flex h-[18px] min-w-0 items-center gap-1 px-1 text-[10px] leading-none">
+            <div data-drag-project-title="true" className="absolute inset-x-0 top-0 z-10 flex h-[18px] min-w-0 items-center gap-1 px-1 text-[10px] leading-none">
                 {segment.continuesBefore && <span aria-hidden="true">‹</span>}
-                <Link href={`/projects/${project.id}`} title={projectTitle} className="min-w-0 flex-1 truncate font-semibold text-white outline-none hover:underline focus-visible:ring-2 focus-visible:ring-white">
+                <span title={projectTitle} className="min-w-0 flex-1 truncate font-semibold text-white">
                     {project.name}
-                </Link>
+                </span>
                 {project.crew.length > 0 && (
                     <span className="shrink-0 text-[9px] font-medium text-white/90" title={`Crew: ${crewLabel}`}>
                         {project.crew.slice(0, 3).map(member => initials(member.name)).join(" ")}{project.crew.length > 3 ? ` +${project.crew.length - 3}` : ""}
@@ -443,121 +316,6 @@ export function ProjectBar({
                     <span className="inline-flex min-w-4 shrink-0 items-center justify-center rounded-full bg-red-600 px-1 py-0.5 text-[9px] font-bold text-white" title={`Crew conflicts: ${conflictNames.join(", ")}`} aria-label={`${conflictNames.length} crew conflict${conflictNames.length === 1 ? "" : "s"}`}>
                         !{conflictNames.length}
                     </span>
-                )}
-                {canEdit && (
-                    <>
-                        <button
-                            ref={actionTriggerRef}
-                            type="button"
-                            onClick={event => { event.stopPropagation(); if (menuOpen) setMenuOpen(false); else openMenu(null); }}
-                            aria-expanded={menuOpen}
-                            className="shrink-0 cursor-pointer rounded bg-white/20 px-1 py-0.5 text-[9px] font-bold text-white opacity-0 transition hover:bg-white/30 group-hover/project:opacity-100 group-focus-within/project:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                            aria-label={`Project actions for ${project.name}`}
-                        >
-                            Actions
-                        </button>
-                        <FloatingPopover open={menuOpen} anchorRef={actionTriggerRef} anchorPoint={menuAnchorPoint} onClose={() => setMenuOpen(false)} width={240}>
-                            {menuView === "main" && (
-                                <div className="space-y-1">
-                                    <Link
-                                        href={`/projects/${project.id}`}
-                                        className="block w-full rounded px-2 py-1.5 text-xs font-semibold text-hui-primary hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
-                                    >
-                                        Open project
-                                    </Link>
-                                    {project.distanceMilesFromShop != null && (
-                                        <p className="px-2 text-[10px] text-hui-textMuted">≈{project.distanceMilesFromShop} mi from shop</p>
-                                    )}
-                                    <button type="button" onClick={() => setMenuView("dates")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
-                                        Edit dates…
-                                    </button>
-                                    <button type="button" onClick={() => setMenuView("crew")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
-                                        Project crew…
-                                    </button>
-                                    <button type="button" onClick={() => setMenuView("color")} className="block w-full rounded px-2 py-1.5 text-left text-xs text-hui-textMain hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary">
-                                        Color…
-                                    </button>
-                                    {project.status === "Waiting to Start" && (
-                                        <button
-                                            type="button"
-                                            disabled={menuBusy}
-                                            onClick={handleRemoveFromSchedule}
-                                            className="block w-full rounded px-2 py-1.5 text-left text-xs text-red-600 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-60"
-                                        >
-                                            Remove from schedule
-                                        </button>
-                                    )}
-                                </div>
-                            )}
-                            {menuView === "dates" && (
-                                <form onSubmit={handleDateSubmit} className="space-y-2">
-                                    <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
-                                    {canMoveProject && (
-                                        <div>
-                                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-date-${project.id}-${segment.weekIndex}`}>Start date</label>
-                                            <input
-                                                id={`bar-project-date-${project.id}-${segment.weekIndex}`}
-                                                type="date"
-                                                value={targetStart}
-                                                onChange={event => setTargetStartDraft({ resetKey: actionResetKey, value: event.target.value })}
-                                                disabled={isPending}
-                                                className="hui-input w-full px-2 py-1 text-xs"
-                                            />
-                                            <p className="mt-0.5 text-[9px] text-hui-textMuted">Joins unsaved changes — Save to commit.</p>
-                                        </div>
-                                    )}
-                                    <div>
-                                        <label className="block text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted" htmlFor={`bar-project-enddate-${project.id}`}>End date</label>
-                                        <input
-                                            id={`bar-project-enddate-${project.id}`}
-                                            type="date"
-                                            value={endDateValue}
-                                            onChange={event => setEndDateDraft({ resetKey: actionResetKey, value: event.target.value })}
-                                            disabled={isEndDatePending}
-                                            className="hui-input w-full px-2 py-1 text-xs"
-                                        />
-                                        <p className="mt-0.5 text-[9px] text-hui-textMuted">Saves immediately.</p>
-                                    </div>
-                                    <button type="button" disabled={isEndDatePending || !project.endDate} onClick={() => submitEndDate(null)} className="hui-btn hui-btn-secondary w-full text-[10px] disabled:opacity-60">
-                                        Clear end date
-                                    </button>
-                                    <button type="submit" disabled={isEndDatePending || (canMoveProject && (isPending || !targetStart))} className="hui-btn hui-btn-primary w-full text-xs disabled:cursor-wait disabled:opacity-60">
-                                        {isEndDatePending ? "Saving..." : "Save"}
-                                    </button>
-                                </form>
-                            )}
-                            {menuView === "crew" && (
-                                <div className="space-y-2">
-                                    <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
-                                    <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Project crew</p>
-                                    <CrewPicker projectId={project.id} crew={project.crew} teamMembers={teamMembers} variant="inline" />
-                                </div>
-                            )}
-                            {menuView === "color" && (
-                                <div className="space-y-2">
-                                    <button type="button" onClick={() => setMenuView("main")} className="text-[10px] font-semibold text-hui-textMuted hover:text-hui-primary">← Back</button>
-                                    <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Color</p>
-                                    <div className="grid grid-cols-8 gap-1.5">
-                                        {PRESET_COLORS.map(swatch => {
-                                            const isSelected = !!project.color && project.color.toLowerCase() === swatch.toLowerCase();
-                                            return (
-                                                <button
-                                                    key={swatch}
-                                                    type="button"
-                                                    disabled={isColorPending}
-                                                    onClick={() => submitColor(swatch)}
-                                                    className={`h-5 w-5 rounded-full transition hover:scale-110 disabled:opacity-60 ${isSelected ? "ring-2 ring-offset-1 ring-slate-700" : `ring-1 ${swatch.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`}`}
-                                                    style={{ backgroundColor: swatch }}
-                                                    title={swatch}
-                                                    aria-label={`Set project color to ${swatch}`}
-                                                />
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            )}
-                        </FloatingPopover>
-                    </>
                 )}
                 {segment.continuesAfter && <span aria-hidden="true">›</span>}
             </div>
@@ -583,28 +341,7 @@ export function ProjectBar({
                     <span className="absolute inset-y-1 left-[9px] w-px bg-white/90" />
                 </div>
             )}
-            {hiddenTasks.length > 0 && (
-                <>
-                    <button
-                        ref={overflowTriggerRef}
-                        type="button"
-                        onClick={event => { event.stopPropagation(); setOverflowOpen(value => !value); }}
-                        aria-expanded={overflowOpen}
-                        className="absolute bottom-0 right-0 z-20 rounded-tl bg-black/40 px-1 text-[8px] font-bold text-white hover:bg-black/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        aria-label={`${hiddenTasks.length} more overlapping task${hiddenTasks.length === 1 ? "" : "s"} on ${project.name}`}
-                    >
-                        +{hiddenTasks.length}
-                    </button>
-                    <FloatingPopover open={overflowOpen} anchorRef={overflowTriggerRef} onClose={() => setOverflowOpen(false)} width={200}>
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-hui-textMuted">Also running</p>
-                        <ul className="space-y-1">
-                            {hiddenTasks.map(task => (
-                                <li key={task.id} className="truncate text-xs text-hui-textMain" title={task.name}>{task.name}</li>
-                            ))}
-                        </ul>
-                    </FloatingPopover>
-                </>
-            )}
+            <ProjectTaskOverflow projectName={project.name} tasks={hiddenTasks} />
             <div className="absolute inset-x-0 bottom-0 overflow-visible rounded-b-md" style={{ height: taskStripHeight }}>
                 {project.tasks.filter(task => laneByTaskId.has(task.id)).map(task => (
                     <TaskBlockSegment
@@ -631,6 +368,7 @@ export function ProjectBar({
                         onTaskKeyboardCancel={onTaskKeyboardCancel}
                         onTaskDatesCommit={onTaskDatesCommit}
                         onTaskMoveBy={onTaskMoveBy}
+                        onActivate={onActivate}
                     />
                 ))}
             </div>

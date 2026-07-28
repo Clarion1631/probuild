@@ -10,7 +10,7 @@ export default async function CompanySettingsPage() {
             <div className="max-w-[600px] py-8 px-6">
                 <div className="mb-8">
                     <h1 className="text-2xl font-bold text-hui-textMain">Company Settings</h1>
-                    <p className="text-sm text-hui-textMuted mt-1">Manage your company's profile information. This data will be used on estimates, invoices, and the customer portal.</p>
+                    <p className="text-sm text-hui-textMuted mt-1">Manage your company&apos;s profile information. This data will be used on estimates, invoices, and the customer portal.</p>
                 </div>
 
                 <CompanySettingsClient initialData={initialSettings} />

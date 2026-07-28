@@ -246,6 +246,9 @@ export default function EntityContractsClient({
                     leadId: entity.type === "lead" ? entity.id : undefined,
                     visibility: "shared",
                     files: [{ name: file.name, size: file.size, mimeType: "application/pdf" }],
+                    // Contract originals carry legal/PII weight — route this upload to the
+                    // private secure-docs bucket instead of the public one.
+                    scope: "contract-original",
                 }),
             });
             const data = await res.json();
@@ -269,17 +272,14 @@ export default function EntityContractsClient({
                 throw new Error(msg);
             }
 
-            // Create the contract in DB referencing the storagePath (upload.storagePath)
+            // Create the contract in DB referencing the storagePath (upload.storagePath).
+            // Uploaded into the private bucket above, so store it as a secure ref — the
+            // server resolves a preview URL for us (the private bucket has no public one).
             const titleWithoutExt = file.name.replace(/\.[^/.]+$/, "");
-            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath);
-            
-            const mappedContract = {
-                ...newContract,
-                originalPdfUrl: upload.publicUrl
-            };
+            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath, true);
 
             toast.success("PDF contract imported successfully!", { id: uploadToast });
-            openEditor(mappedContract);
+            openEditor(newContract);
             router.refresh();
         } catch (err: any) {
             console.error("PDF upload error:", err);
@@ -509,7 +509,7 @@ export default function EntityContractsClient({
                                         placeholder="spouse@example.com, manager@company.com"
                                         className="hui-input w-full"
                                     />
-                                    <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client's additional email and the assigned manager. Edit as needed.</p>
+                                    <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client&apos;s additional email and the assigned manager. Edit as needed.</p>
                                 </div>
                             </div>
                             <div className="flex gap-3 justify-end mt-6">

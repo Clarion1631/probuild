@@ -131,7 +131,7 @@ export default function RichTextEditor({
         if (next !== normalizedCurrent && next !== current) {
             editor.commands.setContent(next, { emitUpdate: false });
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+         
     }, [value, editor]);
 
     if (!editor) {

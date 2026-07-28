@@ -152,7 +152,7 @@ test.describe("Workflow 9: Navigation Audit", () => {
       `/projects/${PROJECT_ID}/client-portal`,
     ];
 
-    let failures: string[] = [];
+    const failures: string[] = [];
 
     for (const route of projectSubPages) {
       try {

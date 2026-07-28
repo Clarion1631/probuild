@@ -270,6 +270,16 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                         <span className="ml-2">• Paid {new Date(payment.paymentDate).toLocaleDateString()}</span>
                                                     )}
                                                 </p>
+                                                {payment.coBilling && (
+                                                    <a
+                                                        href={`/api/pdf/change-orders/${payment.coBilling.changeOrderId}/billing/${payment.coBilling.id}?inline=true`}
+                                                        target="_blank"
+                                                        rel="noreferrer"
+                                                        className="inline-flex mt-2 text-xs font-semibold text-emerald-700 hover:text-emerald-800 underline underline-offset-2"
+                                                    >
+                                                        View itemized backup
+                                                    </a>
+                                                )}
                                             </div>
                                             <div className="flex items-center gap-4">
                                                 <span className="font-semibold text-slate-800 text-lg">

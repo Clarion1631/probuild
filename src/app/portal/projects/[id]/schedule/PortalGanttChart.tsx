@@ -4,8 +4,8 @@ import { useState, useRef, type Dispatch, type SetStateAction } from "react";
 import { addTaskCommentAsSub, updateTaskStatusAsSub } from "@/lib/actions";
 
 type Dependency = { id: string; predecessorId: string; dependentId: string };
-type TeamMember = { id: string; name: string | null; email: string };
-type Assignment = { id: string; userId: string; user: TeamMember };
+type Assignment = { id: string; userId: string; firstName: string };
+type SubAssignment = { id: string; companyName: string };
 type Comment = { id: string; text: string; createdAt: string; authorName: string };
 
 type Task = {
@@ -20,6 +20,7 @@ type Task = {
     order: number;
     dependencies: Dependency[];
     assignments?: Assignment[];
+    subAssignments?: SubAssignment[];
     comments?: Comment[];
 };
 
@@ -278,10 +279,13 @@ export default function PortalGanttChart({
                                 )}
                                 <div className="flex-1 min-w-0 pr-2">
                                     <div className="text-xs font-medium text-slate-800 truncate" title={task.name}>{task.name}</div>
-                                    {(task.assignments || []).length > 0 && (
+                                    {((task.assignments || []).length > 0 || (task.subAssignments || []).length > 0) && (
                                         <div className="flex items-center gap-1 mt-0.5">
-                                            {(task.assignments || []).slice(0, 2).map(a => (
-                                                <span key={a.userId} className="text-[9px] text-slate-500 truncate">{a.user.name || a.user.email}</span>
+                                            {[
+                                                ...(task.assignments || []).map(a => ({ id: `crew-${a.id}`, label: a.firstName })),
+                                                ...(task.subAssignments || []).map(a => ({ id: `sub-${a.id}`, label: a.companyName })),
+                                            ].slice(0, 2).map(assignee => (
+                                                <span key={assignee.id} className="text-[9px] text-slate-500 truncate">{assignee.label}</span>
                                             ))}
                                         </div>
                                     )}

@@ -54,7 +54,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                 {/* Basic Info */}
                 <div>
                     <h2 className="text-lg font-bold text-hui-textMain mb-6 border-b border-hui-border pb-2">Company Name & Contact</h2>
-                    <p className="text-sm text-hui-textMuted mb-6">Manage your company's profile information. This data will be used on estimates, invoices, and the customer portal.</p>
+                    <p className="text-sm text-hui-textMuted mb-6">Manage your company&apos;s profile information. This data will be used on estimates, invoices, and the customer portal.</p>
                     <div className="space-y-6">
                         <div className="relative">
                             <input
@@ -331,7 +331,7 @@ export default function CompanySettingsClient({ initialData }: { initialData: an
                                     />
                                     <div className="flex-1">
                                         <span className="block text-sm font-semibold text-hui-textMain">Client pays the processing fee (Recommended)</span>
-                                        <span className="block text-xs text-hui-textMuted mt-1">A separate "Processing Fee" line item is added when the client chooses to pay by Credit Card. (Bank transfers remain free).</span>
+                                        <span className="block text-xs text-hui-textMuted mt-1">A separate &quot;Processing Fee&quot; line item is added when the client chooses to pay by Credit Card. (Bank transfers remain free).</span>
                                         
                                         {formData.passProcessingFee && (
                                             <div className="mt-4 pt-4 border-t border-blue-100 flex items-center gap-4">

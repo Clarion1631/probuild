@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
-import { deleteExpense, deleteExpenses, getExpenses } from "@/lib/time-expense-actions";
+import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
 
 interface Expense {
     id: string;
@@ -15,6 +15,10 @@ interface Expense {
     costCode: { id: string; name: string; code: string } | null;
     costType: { id: string; name: string } | null;
     item: { id: string; name: string } | null;
+    changeOrder: { id: string; code: string; title: string } | null;
+    invoiceId?: string | null;
+    invoicedAt?: string | Date | null;
+    isBillable?: boolean;
 }
 
 interface Props {
@@ -22,6 +26,7 @@ interface Props {
     expenses: Expense[];
     onAddNew: () => void;
     currentUser: { id: string; role: string; name: string };
+    changeOrders: { id: string; code: string; title: string }[];
 }
 
 function num(v: unknown): number {
@@ -36,11 +41,12 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser }: Props) {
+export default function ExpensesTab({ projectId, expenses: initialExpenses, onAddNew, currentUser, changeOrders }: Props) {
     const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
     const [filter, setFilter] = useState("");
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [bulkChangeOrderId, setBulkChangeOrderId] = useState("");
 
     const refreshExpenses = useCallback(async () => {
         try {
@@ -185,6 +191,19 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         <option value="Reviewed">Reviewed</option>
                     </select>
                     {selectedIds.size > 0 && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
+                        <>
+                        <select value={bulkChangeOrderId} onChange={e => setBulkChangeOrderId(e.target.value)} className="hui-input text-sm py-1.5 px-3">
+                            <option value="">Tag to change order…</option>
+                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
+                        </select>
+                        <button disabled={!bulkChangeOrderId} onClick={async () => {
+                            try {
+                                await tagExpensesToChangeOrder(projectId, Array.from(selectedIds), bulkChangeOrderId);
+                                toast.success("Expenses tagged to change order");
+                                setSelectedIds(new Set());
+                                await refreshExpenses();
+                            } catch (err: any) { toast.error(err.message || "Failed to tag expenses"); }
+                        }} className="hui-btn hui-btn-secondary text-sm px-3 py-1.5 disabled:opacity-50">Tag selected</button>
                         <button
                             onClick={handleBulkDelete}
                             className="hui-btn bg-white border border-red-300 text-red-600 hover:bg-red-50 text-sm px-3 py-1.5 flex items-center gap-1.5"
@@ -194,6 +213,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                             </svg>
                             Delete ({selectedIds.size})
                         </button>
+                        </>
                     )}
                 </div>
                 <div className="flex items-center gap-2">
@@ -216,7 +236,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z" />
                     </svg>
                     <h3 className="text-lg font-semibold text-slate-600 mb-1">No expenses yet</h3>
-                    <p className="text-sm text-slate-400">Click "New Expense" to log a project expense.</p>
+                    <p className="text-sm text-slate-400">Click &quot;New Expense&quot; to log a project expense.</p>
                 </div>
             ) : (
                 <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -232,6 +252,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Description</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Cost Code</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Line Item</th>
+                                    <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Change order</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Amount</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">Status</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">QB</th>
@@ -249,6 +270,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                         <td className="px-4 py-3 text-slate-600 max-w-[200px] truncate">{expense.description || "—"}</td>
                                         <td className="px-4 py-3 text-slate-600">{expense.costCode ? `${expense.costCode.code}` : "—"}</td>
                                         <td className="px-4 py-3 text-slate-600">{expense.item?.name || "—"}</td>
+                                        <td className="px-4 py-3 text-slate-600">{expense.changeOrder ? <span>{expense.changeOrder.code} · {expense.invoiceId || expense.invoicedAt ? "Billed" : expense.isBillable ? "Billable" : "Not billable"}</span> : "—"}</td>
                                         <td className="px-4 py-3 text-right tabular-nums font-medium text-hui-textMain">{fmtMoney(num(expense.amount))}</td>
                                         <td className="px-4 py-3 text-center">
                                             <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${

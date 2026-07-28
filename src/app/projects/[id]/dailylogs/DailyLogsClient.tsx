@@ -2,7 +2,13 @@
 
 import { useState, useTransition, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { createDailyLog, deleteDailyLog, deleteDailyLogPhoto, createSuggestedChangeOrder } from "@/lib/actions";
+import {
+    createDailyLog,
+    deleteDailyLog,
+    deleteDailyLogPhoto,
+    createSuggestedChangeOrder,
+    setDailyLogPortalShare,
+} from "@/lib/actions";
 import { toast } from "sonner";
 
 // Weather icons mapping
@@ -48,6 +54,7 @@ type DailyLogPhoto = {
     url: string;
     caption: string | null;
     createdAt: string;
+    sharedToPortal: boolean;
 };
 
 type DailyLog = {
@@ -62,6 +69,10 @@ type DailyLog = {
     createdBy: { id: string; name: string | null; email: string };
     createdAt: string;
     updatedAt: string;
+    sharedToPortal: boolean;
+    sharedContentHash: string | null;
+    sharedPhotoIds: string[];
+    portalShareValid: boolean;
 };
 
 type CoSuggestion = {
@@ -85,14 +96,23 @@ interface Props {
     logs: DailyLog[];
     currentUserId: string;
     currentUserName: string;
+    canManagePortalShare: boolean;
 }
 
-export default function DailyLogsClient({ projectId, projectName, logs, currentUserId, currentUserName }: Props) {
+export default function DailyLogsClient({
+    projectId,
+    projectName,
+    logs,
+    currentUserId,
+    currentUserName,
+    canManagePortalShare,
+}: Props) {
     const router = useRouter();
     const [showForm, setShowForm] = useState(false);
     const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
     const [isPending, startTransition] = useTransition();
     const [deletingId, setDeletingId] = useState<string | null>(null);
+    const [sharingLogId, setSharingLogId] = useState<string | null>(null);
     const [photoLightbox, setPhotoLightbox] = useState<{ url: string; caption: string | null } | null>(null);
     const [exporting, setExporting] = useState(false);
     const [isGeneratingAI, setIsGeneratingAI] = useState(false);
@@ -245,7 +265,6 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                         workPerformed: formWork,
                         materialsDelivered: formMaterials || undefined,
                         issues: formIssues || undefined,
-                        createdById: currentUserId,
                         photoUrls: photoUrls.length > 0 ? photoUrls : undefined,
                     });
                     toast.success("Daily log created!");
@@ -275,6 +294,30 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
         } finally {
             setDeletingId(null);
         }
+    };
+
+    const handlePortalShare = async (
+        log: DailyLog,
+        shared: boolean,
+        photoIds = log.sharedPhotoIds,
+    ) => {
+        setSharingLogId(log.id);
+        try {
+            await setDailyLogPortalShare(log.id, { shared, photoIds });
+            toast.success(shared ? "Daily log shared to portal" : "Daily log removed from portal");
+            router.refresh();
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Failed to update portal sharing");
+        } finally {
+            setSharingLogId(null);
+        }
+    };
+
+    const handlePortalPhotoToggle = async (log: DailyLog, photoId: string) => {
+        const nextPhotoIds = log.sharedPhotoIds.includes(photoId)
+            ? log.sharedPhotoIds.filter(id => id !== photoId)
+            : [...log.sharedPhotoIds, photoId];
+        await handlePortalShare(log, true, nextPhotoIds);
     };
 
     const handleExportPdf = async () => {
@@ -698,6 +741,35 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                                                                             alt={photo.caption || "Daily log photo"}
                                                                                             className="w-full h-full object-cover"
                                                                                         />
+                                                                                        {canManagePortalShare && log.portalShareValid && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={(event) => {
+                                                                                                    event.stopPropagation();
+                                                                                                    void handlePortalPhotoToggle(log, photo.id);
+                                                                                                }}
+                                                                                                disabled={sharingLogId === log.id}
+                                                                                                className={`absolute right-1.5 top-1.5 flex h-11 w-11 items-center justify-center rounded-full border-2 shadow-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 ${
+                                                                                                    log.sharedPhotoIds.includes(photo.id)
+                                                                                                        ? "border-white bg-emerald-600 text-white"
+                                                                                                        : "border-white bg-slate-950/65 text-white"
+                                                                                                } disabled:cursor-wait disabled:opacity-60`}
+                                                                                                aria-label={
+                                                                                                    log.sharedPhotoIds.includes(photo.id)
+                                                                                                        ? "Remove photo from portal update"
+                                                                                                        : "Share photo in portal update"
+                                                                                                }
+                                                                                                aria-pressed={log.sharedPhotoIds.includes(photo.id)}
+                                                                                            >
+                                                                                                {log.sharedPhotoIds.includes(photo.id) ? (
+                                                                                                    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                                                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="m5 12 4 4L19 6" />
+                                                                                                    </svg>
+                                                                                                ) : (
+                                                                                                    <span className="h-4 w-4 rounded-full border-2 border-current" aria-hidden="true" />
+                                                                                                )}
+                                                                                            </button>
+                                                                                        )}
                                                                                         {photo.caption && (
                                                                                             <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-2">
                                                                                                 <p className="text-[10px] text-white truncate">{photo.caption}</p>
@@ -710,11 +782,50 @@ export default function DailyLogsClient({ projectId, projectName, logs, currentU
                                                                     )}
 
                                                                     {/* Actions */}
-                                                                    <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                                                                    <div className="flex flex-col gap-3 border-t border-slate-100 pt-3 sm:flex-row sm:items-center sm:justify-between">
+                                                                        {canManagePortalShare && (
+                                                                            <div className="flex min-w-0 items-center gap-3">
+                                                                                <button
+                                                                                    type="button"
+                                                                                    role="switch"
+                                                                                    aria-checked={log.portalShareValid}
+                                                                                    aria-label="Share to portal"
+                                                                                    disabled={sharingLogId === log.id}
+                                                                                    onClick={(event) => {
+                                                                                        event.stopPropagation();
+                                                                                        void handlePortalShare(log, !log.portalShareValid);
+                                                                                    }}
+                                                                                    className={`relative h-7 w-12 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary focus-visible:ring-offset-2 ${
+                                                                                        log.portalShareValid ? "bg-emerald-600" : "bg-slate-300"
+                                                                                    } disabled:cursor-wait disabled:opacity-60`}
+                                                                                >
+                                                                                    <span
+                                                                                        className={`absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                                                                                            log.portalShareValid ? "translate-x-6" : "translate-x-1"
+                                                                                        }`}
+                                                                                        aria-hidden="true"
+                                                                                    />
+                                                                                </button>
+                                                                                <div className="min-w-0">
+                                                                                    <p className="text-xs font-semibold text-hui-textMain">
+                                                                                        Share to portal
+                                                                                    </p>
+                                                                                    <p className="text-[0.68rem] leading-4 text-hui-textMuted">
+                                                                                        {sharingLogId === log.id
+                                                                                            ? "Updating client view…"
+                                                                                            : log.portalShareValid
+                                                                                                ? `${log.sharedPhotoIds.length} selected photo${log.sharedPhotoIds.length === 1 ? "" : "s"}`
+                                                                                                : log.sharedToPortal
+                                                                                                    ? "Needs re-approval after edits"
+                                                                                                    : "Text only until you select photos"}
+                                                                                    </p>
+                                                                                </div>
+                                                                            </div>
+                                                                        )}
                                                                         <button
                                                                             onClick={(e) => { e.stopPropagation(); handleDelete(log.id); }}
                                                                             disabled={deletingId === log.id}
-                                                                            className="text-xs text-red-500 hover:text-red-700 hover:bg-red-50 px-3 py-1.5 rounded transition"
+                                                                            className="min-h-11 self-end rounded px-3 py-1.5 text-xs text-red-500 transition hover:bg-red-50 hover:text-red-700 disabled:opacity-60 sm:self-auto"
                                                                         >
                                                                             {deletingId === log.id ? "Deleting..." : "Delete Log"}
                                                                         </button>

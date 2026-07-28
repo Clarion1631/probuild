@@ -61,7 +61,7 @@ export default function SubcontractorInviteForm({
                 </div>
 
                 <div className="p-6 overflow-y-auto flex-1">
-                    <p className="text-sm text-muted-foreground mb-6">Enter Subcontractor's contact information here:</p>
+                    <p className="text-sm text-muted-foreground mb-6">Enter Subcontractor&apos;s contact information here:</p>
 
                     <form id="invite-sub-form" onSubmit={handleSubmit} className="space-y-8">
                         

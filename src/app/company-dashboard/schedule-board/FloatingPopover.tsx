@@ -163,13 +163,23 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
                 overscrollBehaviorY: "contain",
                 visibility: position ? "visible" : "hidden",
             }}
-            className={`z-[200] space-y-2 rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
+            className={`relative z-[200] rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
             onPointerDown={pointerEventsNone ? undefined : event => event.stopPropagation()}
         >
+            {!pointerEventsNone && (
+                <button
+                    type="button"
+                    aria-label="Close"
+                    onClick={onClose}
+                    className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded text-base leading-none text-slate-400 transition hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                >
+                    ×
+                </button>
+            )}
             {/* Content wrapper: observed for size changes — the panel box
                 itself stops growing once maxHeight caps it, so observing the
                 panel alone misses menu→taller-view switches. */}
-            <div ref={contentRef}>{children}</div>
+            <div ref={contentRef} className={pointerEventsNone ? undefined : "pr-6"}>{children}</div>
         </div>,
         document.body,
     );

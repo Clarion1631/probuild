@@ -4,30 +4,43 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { createTimeEntry } from "@/lib/time-expense-actions";
 import { formatCurrency } from "@/lib/utils";
-
+function todayInTimeZone(timeZone: string): string {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+}
 interface Props {
     projectId: string;
-    teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any }[];
+    teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any; burdenRate?: any }[];
     costCodes: { id: string; name: string; code: string }[];
     currentUserId: string;
+    companyTimeZone: string;
+    changeOrders: { id: string; code: string; title: string }[];
     onClose: () => void;
 }
 
-export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, currentUserId, onClose }: Props) {
+export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, currentUserId, companyTimeZone, changeOrders, onClose }: Props) {
     const [saving, setSaving] = useState(false);
     const [userId, setUserId] = useState(currentUserId);
     const [costCodeId, setCostCodeId] = useState("");
-    const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+    const [date, setDate] = useState(() => todayInTimeZone(companyTimeZone));
     const [hours, setHours] = useState("");
-    const [rate, setRate] = useState("");
-    const [isBillable, setIsBillable] = useState(true);
+    const [isBillable, setIsBillable] = useState(false);
     const [isTaxable, setIsTaxable] = useState(false);
     const [notes, setNotes] = useState("");
+    const [changeOrderId, setChangeOrderId] = useState("");
 
     const selectedMember = teamMembers.find(m => m.id === userId);
-    const autoRate = selectedMember?.hourlyRate ? Number(selectedMember.hourlyRate) : 0;
-    const effectiveRate = rate ? parseFloat(rate) : autoRate;
-    const totalCost = (parseFloat(hours) || 0) * effectiveRate;
+    const storedRate = selectedMember?.hourlyRate ? Number(selectedMember.hourlyRate) : 0;
+    const storedBurdenRate = selectedMember?.burdenRate ? Number(selectedMember.burdenRate) : 0;
+    const hoursValue = parseFloat(hours) || 0;
+    const laborPreview = hoursValue * storedRate;
+    const burdenPreview = hoursValue * storedBurdenRate;
 
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
@@ -43,10 +56,10 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                 costCodeId: costCodeId || null,
                 date,
                 durationHours: parseFloat(hours),
-                laborCost: totalCost,
                 isBillable,
                 isTaxable,
                 notes,
+                changeOrderId: changeOrderId || null,
             });
             toast.success("Time entry added");
             onClose();
@@ -87,8 +100,8 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                             <input type="number" step="0.25" min="0" value={hours} onChange={e => setHours(e.target.value)} className="hui-input w-full text-sm" placeholder="0.00" />
                         </div>
                         <div>
-                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Rate ($/hr)</label>
-                            <input type="number" step="0.01" min="0" value={rate} onChange={e => setRate(e.target.value)} className="hui-input w-full text-sm" placeholder={autoRate > 0 ? `Auto: $${autoRate}` : "0.00"} />
+                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Stored rate ($/hr)</label>
+                            <input type="text" value={formatCurrency(storedRate)} readOnly className="hui-input w-full text-sm bg-slate-50" />
                         </div>
                     </div>
 
@@ -99,6 +112,14 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                             {costCodes.map(cc => (
                                 <option key={cc.id} value={cc.id}>{cc.code} — {cc.name}</option>
                             ))}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+                        <select value={changeOrderId} onChange={e => setChangeOrderId(e.target.value)} className="hui-input w-full text-sm">
+                            <option value="">Project time (no change order)</option>
+                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
                         </select>
                     </div>
 
@@ -118,9 +139,9 @@ export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, c
                         </label>
                     </div>
 
-                    {(parseFloat(hours) || 0) > 0 && (
+                    {hoursValue > 0 && (
                         <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
-                            <span className="font-medium">{hours}h</span> x <span className="font-medium">{formatCurrency(effectiveRate)}/hr</span> = <span className="font-bold text-hui-textMain">{formatCurrency(totalCost)}</span>
+                            <span className="font-medium">{hours}h</span> = labor <span className="font-medium">{formatCurrency(laborPreview)}</span> + burden <span className="font-medium">{formatCurrency(burdenPreview)}</span>
                         </div>
                     )}
 

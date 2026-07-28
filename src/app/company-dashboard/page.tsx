@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { getSessionOrDev } from "@/lib/auth";
 import { getUserWithPermissionsByEmail, hasPermission } from "@/lib/permissions";
 import { getCompanyDashboardData } from "@/lib/schedule-core";
+import { getVancouverWeather } from "@/lib/weather";
 import CompanyDashboardClient from "./CompanyDashboardClient";
 
 // Company-wide pipeline dashboard (PB-pipeline-001 + PB-pipeline-002):
@@ -38,9 +39,12 @@ export default async function CompanyDashboardPage({
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(rawMonth) ? rawMonth : currentMonth;
 
-    const data = await getCompanyDashboardData(
-        { role: effectiveUser.role, canSeeFinancials: hasPermission(effectiveUser, "financialReports") },
-        month,
-    );
-    return <CompanyDashboardClient data={data} />;
+    const [data, weather] = await Promise.all([
+        getCompanyDashboardData(
+            { role: effectiveUser.role, canSeeFinancials: hasPermission(effectiveUser, "financialReports") },
+            month,
+        ),
+        getVancouverWeather(),
+    ]);
+    return <CompanyDashboardClient data={data} weather={weather ?? []} />;
 }

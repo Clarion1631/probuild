@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
 import Link from "next/link";
 import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
+import type { VancouverForecastDay } from "@/lib/weather";
 import {
     addDays,
     formatCurrency,
@@ -22,6 +23,9 @@ import { ProjectBar, ProjectBarGridStartContext, computeTaskLaneLayout, type Pro
 import { TaskBlockSegment, type ActiveTaskKeyboardEdit, type TaskEditCallbacks } from "./TaskBlockSegment";
 import { PROJECT_DRAG_MIME } from "./UnscheduledTray";
 import { assignTaskLanes, clipRange, getEffectiveProjectRange, toTimelineRect, type WeekSegment } from "./useBarLayout";
+import type { DispatchTaskCreationDefaults } from "./DispatchView";
+import { clearScheduleTargetHighlight, highlightScheduleTarget, isDragVisualLayerActive } from "./dragVisualLayer";
+import { isPrimaryUnmodifiedClick, isScheduleCellBackgroundTarget } from "./emptyCellCreation";
 
 // Item 4 (2026-07-22 owner addendum): the canvas spans 28 days BEFORE the
 // anchor month's own grid start through 112 days after it — ~20 weeks total,
@@ -50,6 +54,7 @@ export const CREW_MODE_STORAGE_KEY = "gtr-company-schedule-board-crew-mode";
 
 interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     data: CompanyDashboardData;
+    weather: VancouverForecastDay[];
     showIncome: boolean;
     showProjectedCo: boolean;
     showExpenses: boolean;
@@ -61,6 +66,7 @@ interface TimelineViewProps extends TaskEditCallbacks, ProjectEditCallbacks {
     isSaving: boolean;
     activeTaskKeyboardEdit: ActiveTaskKeyboardEdit | null;
     onTrayProjectDrop: (_project: DashboardProjectRow, _targetStart: string) => void;
+    onCreateTask: (_defaults: DispatchTaskCreationDefaults) => void;
     // Lifted to ScheduleBoard (see CREW_MODE_STORAGE_KEY) so the availability
     // panel's drill-down can force crew mode on even when this view is
     // already mounted.
@@ -102,6 +108,11 @@ interface CrewTimelineRow {
     name: string;
     taskBlocks: CrewTaskBlock[];
     coverageBlocks: CrewCoverageBlock[];
+}
+
+interface TimelineCellFocus {
+    rowKey: string;
+    dayKey: string;
 }
 
 /**
@@ -160,6 +171,7 @@ function buildCrewTimelineRows(projects: DashboardProjectRow[], colorFor: (proje
 
 export function TimelineView({
     data,
+    weather,
     showIncome,
     showProjectedCo,
     showExpenses,
@@ -171,13 +183,14 @@ export function TimelineView({
     isSaving,
     activeTaskKeyboardEdit,
     onTrayProjectDrop,
+    onCreateTask,
     groupByCrew,
     onToggleGroupByCrew,
     scrollToTodayNonce,
     teamMembers,
     isAnyDragActive,
-    onProjectMoveCommit,
     activeProjectKeyboardId,
+    onProjectActivate,
     onProjectPointerEditStart,
     onProjectKeyboardStart,
     onProjectKeyboardAdjust,
@@ -191,9 +204,11 @@ export function TimelineView({
     onTaskKeyboardCancel,
     onTaskDatesCommit,
     onTaskMoveBy,
+    onActivate,
 }: TimelineViewProps) {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
-    const [dragOverDate, setDragOverDate] = useState<string | null>(null);
+    const timelineCellRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+    const [focusedCell, setFocusedCell] = useState<TimelineCellFocus | null>(null);
     // Empty-day-cell "Schedule here…" context menu (item 1) — one instance
     // for the whole view (only one day's menu can be open at a time), point-
     // anchored to the right-click location.
@@ -242,6 +257,7 @@ export function TimelineView({
     const days = Array.from({ length: TIMELINE_DAYS_TOTAL }, (_, index) => addDays(gridStart, index));
     const visibleRange = { start: gridStart, end: gridEnd };
     const today = todayUTC();
+    const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
 
     // On mount and whenever the anchor month changes (Prev/Next/Today), bring
     // the anchor month's first day to the canvas's left edge. Re-anchors on
@@ -251,7 +267,7 @@ export function TimelineView({
         const container = scrollContainerRef.current;
         if (!container) return;
         container.scrollLeft = TIMELINE_DAYS_BEFORE_ANCHOR * dayWidth;
-        // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the anchor month + zoom only
+         
     }, [data.month, dayWidth]);
 
     // "Today" button (ScheduleBoard header): scroll today into view even when
@@ -275,6 +291,13 @@ export function TimelineView({
     ];
     const colorForProject = (project: DashboardProjectRow) => project.color || getFallbackProjectColor(project.id);
     const crewRows = groupByCrew ? buildCrewTimelineRows(projects, colorForProject) : [];
+    const timelineRowKeys = groupByCrew
+        ? crewRows.map(row => `crew:${row.userId}`)
+        : projects.map(project => `project:${project.id}`);
+    const timelineDayKeys = days.map(formatDate);
+    const focusedCellIsVisible = focusedCell != null
+        && timelineRowKeys.includes(focusedCell.rowKey)
+        && timelineDayKeys.includes(focusedCell.dayKey);
     const adminOverlays = data.isAdmin ? data.overlays : null;
     const visibleIncomeMilestones = adminOverlays && showIncome ? adminOverlays.income : [];
     const visibleChangeOrderMilestones = adminOverlays && showProjectedCo ? adminOverlays.changeOrders : [];
@@ -309,16 +332,75 @@ export function TimelineView({
         if (!data.canEdit || !hasProjectDragPayload(event)) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
-        setDragOverDate(dayKey);
+        highlightScheduleTarget({ clientX: event.clientX, clientY: event.clientY, targetDate: dayKey });
     }
 
     function handleDayDrop(dayKey: string, event: DragEvent<HTMLDivElement>) {
         if (!data.canEdit || !hasProjectDragPayload(event)) return;
         event.preventDefault();
-        setDragOverDate(null);
+        clearScheduleTargetHighlight();
         const projectId = event.dataTransfer.getData(PROJECT_DRAG_MIME);
         const project = data.pipeline.waitingToStart.find(candidate => candidate.id === projectId);
         if (project) onTrayProjectDrop(project, dayKey);
+    }
+
+    function handleDayDragLeave(event: DragEvent<HTMLDivElement>) {
+        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+        clearScheduleTargetHighlight();
+    }
+
+    function handleEmptyCellClick(defaults: DispatchTaskCreationDefaults, event: ReactMouseEvent<HTMLDivElement>) {
+        if (!data.canEdit || isAnyDragActive || isDragVisualLayerActive()) return;
+        if (!isPrimaryUnmodifiedClick(event) || !isScheduleCellBackgroundTarget(event.target, event.currentTarget)) return;
+        onCreateTask(defaults);
+    }
+
+    function timelineCellKey(rowKey: string, dayKey: string): string {
+        return `${rowKey}|${dayKey}`;
+    }
+
+    function setTimelineCellRef(rowKey: string, dayKey: string, element: HTMLDivElement | null) {
+        const key = timelineCellKey(rowKey, dayKey);
+        if (element) timelineCellRefs.current.set(key, element);
+        else timelineCellRefs.current.delete(key);
+    }
+
+    function isTimelineCellTabbable(rowKey: string, dayKey: string): boolean {
+        const tabStop = focusedCellIsVisible
+            ? focusedCell
+            : timelineRowKeys.length > 0 && timelineDayKeys.length > 0
+                ? { rowKey: timelineRowKeys[0], dayKey: timelineDayKeys[0] }
+                : null;
+        return tabStop?.rowKey === rowKey && tabStop.dayKey === dayKey;
+    }
+
+    function handleEmptyCellKeyDown(
+        defaults: DispatchTaskCreationDefaults,
+        event: KeyboardEvent<HTMLDivElement>,
+        rowKey: string,
+        dayKey: string,
+    ) {
+        if (!data.canEdit || isAnyDragActive || isDragVisualLayerActive() || event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onCreateTask(defaults);
+            return;
+        }
+
+        const dayDelta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+        const rowDelta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+        if (dayDelta === 0 && rowDelta === 0) return;
+
+        event.preventDefault();
+        const rowIndex = timelineRowKeys.indexOf(rowKey);
+        const dayIndex = timelineDayKeys.indexOf(dayKey);
+        if (rowIndex < 0 || dayIndex < 0) return;
+        const nextRowKey = timelineRowKeys[Math.max(0, Math.min(timelineRowKeys.length - 1, rowIndex + rowDelta))];
+        const nextDayKey = timelineDayKeys[Math.max(0, Math.min(timelineDayKeys.length - 1, dayIndex + dayDelta))];
+        setFocusedCell({ rowKey: nextRowKey, dayKey: nextDayKey });
+        window.requestAnimationFrame(() => {
+            timelineCellRefs.current.get(timelineCellKey(nextRowKey, nextDayKey))?.focus();
+        });
     }
 
     return (
@@ -377,6 +459,27 @@ export function TimelineView({
                         </div>
                     </div>
 
+                    {weather.length > 0 && (
+                        <div className="flex border-b border-hui-border bg-sky-50/40" aria-label="Vancouver 10-day forecast">
+                            <div data-timeline-sticky-label="true" className="sticky left-0 z-40 shrink-0 border-r border-hui-border bg-sky-50 px-3 py-1.5 text-[10px] font-semibold text-slate-500" style={{ width: LABEL_WIDTH }}>Vancouver</div>
+                            <div className="grid h-7 shrink-0" style={{ width: CANVAS_WIDTH, gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }}>
+                                {days.map(day => {
+                                    const dayKey = formatDate(day);
+                                    const forecast = weatherByDate.get(dayKey);
+                                    return (
+                                        <div
+                                            key={`weather-${dayKey}`}
+                                            className="min-w-0 overflow-hidden border-r border-hui-border text-center text-[9px] leading-7"
+                                            title={forecast ? `Vancouver ${forecast.low}\u00B0\u2013${forecast.high}\u00B0, ${forecast.precipitationProbability}% rain` : undefined}
+                                        >
+                                            {forecast?.glyph ?? ""}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
                     {adminOverlays && (showIncome || showProjectedCo || showExpenses || showHours) && (
                         <div className="flex border-b border-hui-border bg-slate-50/70" aria-label="Visible overlay totals by day">
                             <div data-timeline-sticky-label="true" className="sticky left-0 z-40 shrink-0 border-r border-hui-border bg-slate-50 px-3 py-2 text-[10px] font-semibold text-slate-500" style={{ width: LABEL_WIDTH }}>
@@ -417,6 +520,7 @@ export function TimelineView({
                         crewRows.length === 0 ? (
                             <div className="px-4 py-8 text-center text-sm text-hui-textMuted">No active crew coverage in this window.</div>
                         ) : crewRows.map(row => {
+                            const rowKey = `crew:${row.userId}`;
                             const { laneByTaskId, laneCount: rawLaneCount } = assignTaskLanes(row.taskBlocks.map(block => ({ id: block.taskId, start: block.start, end: block.end })));
                             const laneCount = Math.max(1, rawLaneCount);
                             const TASK_LANE_TOP = 20;
@@ -436,8 +540,19 @@ export function TimelineView({
                                                 return (
                                                     <div
                                                         key={dayKey}
+                                                        ref={element => setTimelineCellRef(rowKey, dayKey, element)}
+                                                        data-schedule-date={dayKey}
+                                                        onDragOver={event => handleDayDragOver(dayKey, event)}
+                                                        onDragLeave={handleDayDragLeave}
+                                                        onDrop={event => handleDayDrop(dayKey, event)}
+                                                        onClick={event => handleEmptyCellClick({ defaultStartDate: dayKey, defaultCrewIds: [row.userId] }, event)}
+                                                        onKeyDown={event => handleEmptyCellKeyDown({ defaultStartDate: dayKey, defaultCrewIds: [row.userId] }, event, rowKey, dayKey)}
+                                                        onFocus={() => setFocusedCell({ rowKey, dayKey })}
                                                         onContextMenu={event => handleDayContextMenu(dayKey, event)}
-                                                        className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`}
+                                                        role={data.canEdit ? "button" : undefined}
+                                                        tabIndex={data.canEdit ? (isTimelineCellTabbable(rowKey, dayKey) ? 0 : -1) : undefined}
+                                                        aria-label={data.canEdit ? `Create task for ${row.name} on ${dayKey}` : undefined}
+                                                        className={`border-r border-hui-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`}
                                                     />
                                                 );
                                             })}
@@ -482,6 +597,7 @@ export function TimelineView({
                         })
                     ) : (<>
                     {projects.map((project, projectIndex) => {
+                        const rowKey = `project:${project.id}`;
                         const range = getEffectiveProjectRange(project);
                         const clipped = range ? clipRange(range, visibleRange) : null;
                         const rect = clipped ? toTimelineRect(clipped, gridStart, dayWidth) : null;
@@ -560,18 +676,33 @@ export function TimelineView({
                                     )}
                                 </div>
                                 <div data-timeline-schedule-grid="true" className="relative shrink-0" style={{ width: CANVAS_WIDTH, height: rowHeight }}>
-                                    <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }} aria-hidden="true">
+                                    <div className="absolute inset-0 grid" style={{ gridTemplateColumns: `repeat(${TIMELINE_DAYS_TOTAL}, ${dayWidth}px)` }}>
                                         {days.map(day => {
                                             const dayKey = formatDate(day);
                                             return (
                                                 <div
                                                     key={dayKey}
+                                                    ref={element => setTimelineCellRef(rowKey, dayKey, element)}
                                                     data-schedule-date={dayKey}
                                                     onDragOver={event => handleDayDragOver(dayKey, event)}
-                                                    onDragLeave={() => setDragOverDate(current => current === dayKey ? null : current)}
+                                                    onDragLeave={handleDayDragLeave}
                                                     onDrop={event => handleDayDrop(dayKey, event)}
+                                                    onClick={event => handleEmptyCellClick({
+                                                        defaultProjectId: project.id,
+                                                        lockProject: true,
+                                                        defaultStartDate: dayKey,
+                                                    }, event)}
+                                                    onKeyDown={event => handleEmptyCellKeyDown({
+                                                        defaultProjectId: project.id,
+                                                        lockProject: true,
+                                                        defaultStartDate: dayKey,
+                                                    }, event, rowKey, dayKey)}
+                                                    onFocus={() => setFocusedCell({ rowKey, dayKey })}
                                                     onContextMenu={event => handleDayContextMenu(dayKey, event)}
-                                                    className={`border-r border-hui-border ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"} ${dragOverDate === dayKey ? "bg-indigo-100 ring-1 ring-inset ring-indigo-500" : ""}`}
+                                                    role={data.canEdit ? "button" : undefined}
+                                                    tabIndex={data.canEdit ? (isTimelineCellTabbable(rowKey, dayKey) ? 0 : -1) : undefined}
+                                                    aria-label={data.canEdit ? `Create task for ${project.name} on ${dayKey}` : undefined}
+                                                    className={`border-r border-hui-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 ${isWeekend(day) ? "bg-slate-100/70" : "bg-white"}`}
                                                 />
                                             );
                                         })}
@@ -596,6 +727,7 @@ export function TimelineView({
                                                 draftTaskIds={draftTaskIds}
                                                 activeTaskKeyboardEdit={activeTaskKeyboardEdit}
                                                 activeProjectKeyboardId={activeProjectKeyboardId}
+                                                onProjectActivate={onProjectActivate}
                                                 timelineDayWidth={dayWidth}
                                                 timelineLeftInset={LABEL_WIDTH}
                                                 timelineScrollContainerRef={scrollContainerRef}
@@ -606,7 +738,6 @@ export function TimelineView({
                                                 onProjectKeyboardAdjust={onProjectKeyboardAdjust}
                                                 onProjectKeyboardCommit={onProjectKeyboardCommit}
                                                 onProjectKeyboardCancel={onProjectKeyboardCancel}
-                                                onMoveCommit={onProjectMoveCommit}
                                                 onProjectEndResizeStart={onProjectEndResizeStart}
                                                 onTaskPointerEditStart={onTaskPointerEditStart}
                                                 onTaskKeyboardStart={onTaskKeyboardStart}
@@ -615,6 +746,7 @@ export function TimelineView({
                                                 onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                 onTaskDatesCommit={onTaskDatesCommit}
                                                 onTaskMoveBy={onTaskMoveBy}
+                                                onActivate={onActivate}
                                             />
                                         </div>
                                     )}
@@ -644,6 +776,7 @@ export function TimelineView({
                                                     onTaskKeyboardCancel={onTaskKeyboardCancel}
                                                     onTaskDatesCommit={onTaskDatesCommit}
                                                     onTaskMoveBy={onTaskMoveBy}
+                                                    onActivate={onActivate}
                                                 />
                                             </div>
                                         );
