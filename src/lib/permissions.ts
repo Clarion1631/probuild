@@ -16,6 +16,20 @@ export type PermissionKey =
 
 const ADMIN_ROLES = ["ADMIN", "MANAGER"];
 
+/** Typed marker for the "Unauthorized" errors thrown by the portal access
+ * assertions in actions.ts, so callers can detect an auth failure with
+ * `instanceof` instead of the fragile `e.message === "Unauthorized"` string
+ * match. Message stays exactly "Unauthorized" so any pre-existing string
+ * matcher still works — this is additive, not a replacement. Lives here
+ * (rather than actions.ts) because actions.ts is a "use server" file and may
+ * only export async functions. */
+export class PortalAuthError extends Error {
+    constructor() {
+        super("Unauthorized");
+        this.name = "PortalAuthError";
+    }
+}
+
 // Server-side: get current user with permissions
 export async function getCurrentUserWithPermissions() {
     const session = await getServerSession(authOptions);

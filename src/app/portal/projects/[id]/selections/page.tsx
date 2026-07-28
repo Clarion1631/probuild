@@ -8,6 +8,7 @@ import {
     getSelectionProposalsForPortal,
     getProjectFavoritesForPortal,
 } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import Link from "next/link";
 import PortalSelectionsClient from "./PortalSelectionsClient";
 import PortalProjectFavorites from "./PortalProjectFavorites";
@@ -38,11 +39,19 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
         );
     }
 
-    const [boards, proposals, favorites] = await Promise.all([
-        getSelectionBoardsForPortal(id),
-        getSelectionProposalsForPortal(id),
-        getProjectFavoritesForPortal(id),
-    ]);
+    let boards: Awaited<ReturnType<typeof getSelectionBoardsForPortal>>;
+    let proposals: Awaited<ReturnType<typeof getSelectionProposalsForPortal>>;
+    let favorites: Awaited<ReturnType<typeof getProjectFavoritesForPortal>>;
+    try {
+        [boards, proposals, favorites] = await Promise.all([
+            getSelectionBoardsForPortal(id),
+            getSelectionProposalsForPortal(id),
+            getProjectFavoritesForPortal(id),
+        ]);
+    } catch (e) {
+        if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
+        throw e;
+    }
 
     // Only show the read-only Favorites section when there's something to look
     // at, or when the tab already has other content (boards/proposals) so an
