@@ -13,7 +13,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
-import { persistSignature } from "./signature-storage";
+import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
@@ -6047,8 +6047,16 @@ export async function signContractAsContractor(contractId: string, signerName: s
 
     // Move the signature image out of the DB column into Supabase Storage (avoids the
     // PgBouncer pooler message-size error on large high-DPI data-URLs). Falls back to the
-    // raw data-URL when Storage isn't configured. See persistSignature().
-    const contractorSignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    // raw data-URL when Storage isn't configured. See persistOwnedSignature().
+    const ownedContractorSignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    const contractorSignatureUrl = ownedContractorSignature.url;
+    const discardContractorSignature = async () => {
+        try {
+            await ownedContractorSignature.discard();
+        } catch (error) {
+            console.error("[signContractAsContractor] signature cleanup failed", error);
+        }
+    };
     const ip = await getRequestIp();
     const signedAt = new Date();
 
@@ -6060,30 +6068,35 @@ export async function signContractAsContractor(contractId: string, signerName: s
     // triggers in updateContract), so a signature can never commit over a document that was
     // edited after the signer last saw it (Codex blockers: a sign request based on an old
     // document must not reintroduce a live signature on changed text OR a changed title).
-    await prisma.$transaction(async (tx) => {
-        const guard = await tx.contract.updateMany({
-            where: {
-                id: contractId,
-                contractorSignedAt: null,
-                title: expectedTitle,
-                body: expectedBody,
-            },
-            data: {
-                contractorSignedBy: signerName,
-                contractorSignedAt: signedAt,
-                contractorSignatureUrl,
-            },
+    try {
+        await prisma.$transaction(async (tx) => {
+            const guard = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    contractorSignedAt: null,
+                    title: expectedTitle,
+                    body: expectedBody,
+                },
+                data: {
+                    contractorSignedBy: signerName,
+                    contractorSignedAt: signedAt,
+                    contractorSignatureUrl,
+                },
+            });
+            if (guard.count === 0) {
+                const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+                if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
+                throw new Error("The contract text changed after you opened it — review the current text and sign again.");
+            }
+            // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+            await tx.contractSigningRecord.create({
+                data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+            });
         });
-        if (guard.count === 0) {
-            const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
-            if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
-            throw new Error("The contract text changed after you opened it — review the current text and sign again.");
-        }
-        // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
-        await tx.contractSigningRecord.create({
-            data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
-        });
-    });
+    } catch (error) {
+        await discardContractorSignature();
+        throw error;
+    }
 
     try {
         await updateExecutedPdfIfFinalized(contractId, ip);
@@ -6262,9 +6275,23 @@ export async function approveContract(contractId: string, signatureName: string,
     // Persist the signature image to Storage BEFORE the transaction so the network upload
     // stays out of the DB tx. The same URL is written to both the Contract and the
     // ContractSigningRecord audit row. Falls back to the data-URL when Storage is absent.
-    const signatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const ownedClientSignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const signatureUrl = ownedClientSignature.url;
+    const discardClientSignature = async () => {
+        try {
+            await ownedClientSignature.discard();
+        } catch (error) {
+            console.error("[approveContract] signature cleanup failed", error);
+        }
+    };
     const ip = await getRequestIp();
 
+    // Set inside the transaction when the CAS guard loses to a prior "already Signed" retry
+    // (the no-op early-return below) — the uploaded signature never gets written to the row
+    // in that case, so it must be discarded after the transaction settles.
+    let signatureDidNotLand = false;
+
+    try {
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
             // CAS-bind the body we validated (and, when it carries a contractor block, that
@@ -6291,7 +6318,12 @@ export async function approveContract(contractId: string, signatureName: string,
             if (transition.count === 0) {
                 // Already signed — allow finalize retry without overwriting audit data.
                 const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
-                if (current?.status === "Signed") return;
+                if (current?.status === "Signed") {
+                    // Idempotent retry — the row already carries a prior signature; this
+                    // upload never gets written, so it must be cleaned up after the tx commits.
+                    signatureDidNotLand = true;
+                    return;
+                }
                 if (current && ["Draft", "Sent", "Viewed"].includes(current.status)) {
                     // Still signable ⇒ the CAS missed: text was edited (or the contractor
                     // signature was cleared) between validation and commit.
@@ -6342,6 +6374,13 @@ export async function approveContract(contractId: string, signatureName: string,
             }
         });
     });
+    } catch (error) {
+        await discardClientSignature();
+        throw error;
+    }
+    if (signatureDidNotLand) {
+        await discardClientSignature();
+    }
 
     const settings = await getCachedCompanySettings();
     if (settings.notificationEmail && isNotificationEnabled(settings, "contractSigned")) {
@@ -6459,18 +6498,38 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     // record share a transaction so a failed audit insert rolls the signature back too — a retry
     // then redoes BOTH (never leaves companySignedAt set with no audit row).
     if (!contract.companySignedAt) {
-        const companySignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/company`);
-        await prisma.$transaction(async (tx) => {
-            const guard = await tx.contract.updateMany({
-                where: { id: contractId, status: "Signed", companySignedAt: null },
-                data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
-            });
-            if (guard.count > 0) {
-                await tx.contractSigningRecord.create({
-                    data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
-                });
+        const ownedCompanySignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/company`);
+        const companySignatureUrl = ownedCompanySignature.url;
+        const discardCompanySignature = async () => {
+            try {
+                await ownedCompanySignature.discard();
+            } catch (error) {
+                console.error("[countersignContractAsCompany] signature cleanup failed", error);
             }
-        });
+        };
+        let companySignatureLanded = false;
+        try {
+            await prisma.$transaction(async (tx) => {
+                const guard = await tx.contract.updateMany({
+                    where: { id: contractId, status: "Signed", companySignedAt: null },
+                    data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
+                });
+                if (guard.count > 0) {
+                    companySignatureLanded = true;
+                    await tx.contractSigningRecord.create({
+                        data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
+                    });
+                }
+            });
+        } catch (error) {
+            await discardCompanySignature();
+            throw error;
+        }
+        if (!companySignatureLanded) {
+            // Lost the race — another request already recorded the company signature between
+            // our load and the guarded update, so this upload never got written anywhere.
+            await discardCompanySignature();
+        }
     }
 
     // Canonical state (covers a retry that recorded the signature but failed before finalizing).
@@ -8565,19 +8624,36 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 
     // Move the signature image into Storage (avoids the PgBouncer pooler message-size
     // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
-    const companySignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/company`);
+    const ownedCompanySignature = await persistOwnedSignature(signatureDataUrl, `change-orders/${id}/company`);
+    const companySignatureUrl = ownedCompanySignature.url;
+    const discardCompanySignature = async () => {
+        try {
+            await ownedCompanySignature.discard();
+        } catch (error) {
+            console.error("[countersignChangeOrderAsCompany] signature cleanup failed", error);
+        }
+    };
 
     // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
     // so two concurrent requests can't both succeed (eliminates TOCTOU race).
-    const result = await prisma.changeOrder.updateMany({
-        where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
-        data: {
-            companySignedBy: signerName.trim(),
-            companySignedAt: new Date(),
-            companySignatureUrl,
-        },
-    });
-    if (result.count === 0) throw new Error("Change order already countersigned by company");
+    let result;
+    try {
+        result = await prisma.changeOrder.updateMany({
+            where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
+            data: {
+                companySignedBy: signerName.trim(),
+                companySignedAt: new Date(),
+                companySignatureUrl,
+            },
+        });
+    } catch (error) {
+        await discardCompanySignature();
+        throw error;
+    }
+    if (result.count === 0) {
+        await discardCompanySignature();
+        throw new Error("Change order already countersigned by company");
+    }
 
     revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${existing.projectId}/change-orders`);
