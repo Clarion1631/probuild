@@ -161,7 +161,32 @@ function runPureCases(): void {
     assert.equal(mapped.stages.find(stage => stage.label === "Rough-ins")?.state, "current");
     assert.equal(mapped.stages.find(stage => stage.label === "Rough-ins")?.pct, 50);
     assert.equal(mapped.stages.find(stage => stage.label === "Finishes")?.state, "upcoming");
-    assert.equal(mapped.overallPct, 38);
+    assert.equal(
+        mapped.overallPct,
+        Math.round(mapped.stages.reduce((sum, stage) => sum + stage.pct, 0) / mapped.stages.length),
+        "overall must be the mean of the per-stage percentages",
+    );
+    assert.equal(mapped.overallPct, 44);
+
+    assert.equal(buildProjectTracker([]).overallPct, 0, "a project with no tasks stays at 0%");
+
+    const emptyLeadingStages = buildProjectTracker([
+        trackerTask({
+            id: "shop-frame",
+            name: "Frame partition walls",
+            status: "Not Started",
+            progress: 0,
+            startDate: date(0),
+        }),
+    ]);
+    assert.equal(emptyLeadingStages.stages[0].state, "complete");
+    assert.equal(emptyLeadingStages.stages[1].state, "complete");
+    assert.equal(emptyLeadingStages.stages[2].state, "current");
+    assert.equal(
+        emptyLeadingStages.overallPct,
+        25,
+        "empty-but-passed stages must count toward the overall roundel",
+    );
 
     const nearestFallback = buildProjectTracker([
         trackerTask({

@@ -254,10 +254,6 @@ export function buildProjectTracker(tasks: readonly PortalTrackerTask[]): Projec
         tasks.filter(task => assigned.get(task.id) === stageIndex),
     );
 
-    const totalTaskProgress = tasks.reduce((sum, task) => sum + normalizedProgress(task), 0);
-    const overallPct = tasks.length === 0
-        ? 0
-        : Math.round(totalTaskProgress / tasks.length);
     const allProjectTasksComplete = tasks.length > 0 && tasks.every(isComplete);
 
     let currentIndex = tasksByStage.findIndex(stageTasks =>
@@ -289,6 +285,12 @@ export function buildProjectTracker(tasks: readonly PortalTrackerTask[]): Projec
             pct,
         };
     });
+
+    // Overall = mean of the per-stage percentages so the roundel can never
+    // contradict the stage rail (empty-but-passed stages count as done).
+    const overallPct = tasks.length === 0
+        ? 0
+        : Math.round(stages.reduce((sum, stage) => sum + stage.pct, 0) / stages.length);
 
     return { stages, overallPct };
 }
