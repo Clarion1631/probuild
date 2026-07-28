@@ -5,14 +5,15 @@ import { notFound } from "next/navigation";
 import {
     getSelectionBoardsForPortal,
     getPortalVisibility,
-    getSelectionProposalsForPortal,
     getProjectFavoritesForPortal,
+    getProjectDecisionsForPortal,
 } from "@/lib/actions";
 import { PortalAuthError } from "@/lib/permissions";
 import Link from "next/link";
 import PortalSelectionsClient from "./PortalSelectionsClient";
 import PortalProjectFavorites from "./PortalProjectFavorites";
 import PortalSuggestionsSection from "./PortalSuggestionsSection";
+import PortalDecisionsSection from "./PortalDecisionsSection";
 
 export default async function PortalSelectionsPage(props: { params: Promise<{ id: string }> }) {
     const { id } = await props.params;
@@ -40,13 +41,13 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
     }
 
     let boards: Awaited<ReturnType<typeof getSelectionBoardsForPortal>>;
-    let proposals: Awaited<ReturnType<typeof getSelectionProposalsForPortal>>;
     let favorites: Awaited<ReturnType<typeof getProjectFavoritesForPortal>>;
+    let decisionsData: Awaited<ReturnType<typeof getProjectDecisionsForPortal>>;
     try {
-        [boards, proposals, favorites] = await Promise.all([
+        [boards, favorites, decisionsData] = await Promise.all([
             getSelectionBoardsForPortal(id),
-            getSelectionProposalsForPortal(id),
             getProjectFavoritesForPortal(id),
+            getProjectDecisionsForPortal(id),
         ]);
     } catch (e) {
         if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
@@ -54,11 +55,11 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
     }
 
     // Only show the read-only Favorites section when there's something to look
-    // at, or when the tab already has other content (boards/proposals) so an
-    // empty Favorites card isn't the only thing on an otherwise-empty page —
-    // the "Your suggestions" section below always renders and covers that case
-    // with its own invite-to-suggest empty state.
-    const showFavorites = favorites.length > 0 || boards.length > 0 || proposals.length > 0;
+    // at, or when the tab already has other content so an empty Favorites card
+    // isn't the only thing on an otherwise-empty page — the Decisions
+    // playground below always renders and covers that case with its own
+    // invite-to-start empty state.
+    const showFavorites = favorites.length > 0 || boards.length > 0 || decisionsData.decisions.length > 0 || decisionsData.unsorted.length > 0;
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
     return (
@@ -78,29 +79,32 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
             <div className="mb-8">
                 <h1 className="text-3xl font-bold text-hui-textMain mb-2">Selections</h1>
                 <p className="text-sm text-hui-textMuted">
-                    Browse the options below and select your preferred choice for each category.
+                    Explore your options, decide what you love, and your project team takes it from there.
                 </p>
             </div>
 
-            {boards.length === 0 ? (
-                <div className="hui-card p-12 text-center">
-                    <h3 className="text-lg font-semibold text-hui-textMain mb-2">No Selection Boards Available</h3>
-                    <p className="text-sm text-hui-textMuted">Your project manager hasn&apos;t shared any selection boards yet.</p>
-                </div>
-            ) : (
-                <PortalSelectionsClient boards={JSON.parse(JSON.stringify(boards))} />
-            )}
-
-            <div className="mt-12 space-y-12">
-                {showFavorites && (
-                    <PortalProjectFavorites favorites={JSON.parse(JSON.stringify(favorites))} />
-                )}
-                <PortalSuggestionsSection
+            <div className="space-y-6 mb-12">
+                <PortalSuggestionsSection projectId={id} appUrl={appUrl} />
+                <PortalDecisionsSection
                     projectId={id}
-                    initialProposals={JSON.parse(JSON.stringify(proposals))}
-                    appUrl={appUrl}
+                    initialDecisions={JSON.parse(JSON.stringify(decisionsData.decisions))}
+                    initialUnsorted={JSON.parse(JSON.stringify(decisionsData.unsorted))}
                 />
             </div>
+
+            {boards.length > 0 && (
+                <div className="mb-12">
+                    <div className="mb-4">
+                        <h2 className="text-xl font-bold text-hui-textMain">Selection Boards</h2>
+                        <p className="text-sm text-hui-textMuted">Options your project team has put together for you to pick from.</p>
+                    </div>
+                    <PortalSelectionsClient boards={JSON.parse(JSON.stringify(boards))} />
+                </div>
+            )}
+
+            {showFavorites && (
+                <PortalProjectFavorites favorites={JSON.parse(JSON.stringify(favorites))} />
+            )}
         </div>
     );
 }
