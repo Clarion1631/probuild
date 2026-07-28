@@ -19,20 +19,24 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
         return notFound();
     }
 
-    const board = await getMoodBoard(boardId);
-    if (!board || board.projectId !== id) return notFound();
-
     // Ownership check: PortalVisibility only gates whether mood boards are
     // enabled for the project, not whether this session may see THIS
     // project's boards — without this a client authenticated on a different
-    // project could read another project's board by id.
+    // project could read another project's board by id. Runs before
+    // getMoodBoard both to avoid a wasted query for unauthorized visitors and
+    // because getMoodBoard now runs its own ownership check (on the board's
+    // actual project, which may differ from `id` for a bogus boardId) —
+    // sharing this try/catch means that throw is caught too.
     let isStaff: boolean;
+    let board: Awaited<ReturnType<typeof getMoodBoard>>;
     try {
         ({ isStaff } = await getPortalMoodBoardAccess(id));
+        board = await getMoodBoard(boardId);
     } catch (e) {
         if (e instanceof Error && e.message === "Unauthorized") return notFound();
         throw e;
     }
+    if (!board || board.projectId !== id) return notFound();
 
     // Staff add images from their own editor (MoodBoardEditor.tsx) — the
     // portal photo-upload tray posts to /api/portal/files, which always marks

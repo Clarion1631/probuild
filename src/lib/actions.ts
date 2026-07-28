@@ -9594,6 +9594,7 @@ export async function submitClientSelections(boardId: string, selections: Record
 }
 
 export async function getSelectionBoardsForPortal(projectId: string) {
+    await assertProjectReadAccess(projectId);
     return await prisma.selectionBoard.findMany({
         where: {
             projectId,
@@ -9670,6 +9671,25 @@ async function assertPortalMoodBoardAccess(projectId: string): Promise<{ isStaff
 // same as the internal function.
 export async function getPortalMoodBoardAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
     return assertPortalMoodBoardAccess(projectId);
+}
+
+/** Read gate for project-scoped data shared by the staff app and the client
+ * portal: internal staff see everything; a client session must own the
+ * project. Deliberately does NOT read PortalVisibility — those per-feature
+ * flags decide what the CLIENT is shown and are enforced by the portal pages
+ * themselves; applying them here would lock staff out of their own tools
+ * whenever a project's portal is switched off. */
+async function assertProjectReadAccess(projectId: string): Promise<{ isStaff: boolean }> {
+    const session = await getSessionOrDev();
+    const role = (session?.user as { role?: string } | undefined)?.role;
+    const isStaff = role === "ADMIN" || role === "MANAGER" || role === "FIELD_CREW" || role === "FINANCE";
+    if (isStaff) return { isStaff: true };
+
+    const clientId = await resolveSessionClientId();
+    if (!clientId) throw new Error("Unauthorized");
+    const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
+    if (!project) throw new Error("Unauthorized");
+    return { isStaff: false };
 }
 
 /** Persist boundary for any stored vendorUrl/imageUrl: only a plain http(s)
@@ -10369,6 +10389,7 @@ export async function setDailyLogPortalShare(
 // =============================================
 
 export async function getMoodBoards(projectId: string) {
+    await assertProjectReadAccess(projectId);
     return await prisma.moodBoard.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -10377,10 +10398,13 @@ export async function getMoodBoards(projectId: string) {
 }
 
 export async function getMoodBoard(id: string) {
-    return await prisma.moodBoard.findUnique({
+    const board = await prisma.moodBoard.findUnique({
         where: { id },
         include: { items: true, project: { include: { client: true } } },
     });
+    if (!board) return null;
+    await assertProjectReadAccess(board.projectId);
+    return board;
 }
 
 export async function createMoodBoard(projectId: string, title: string) {
