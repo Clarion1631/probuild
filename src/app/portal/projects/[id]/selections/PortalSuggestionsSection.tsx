@@ -6,6 +6,9 @@ import { toast } from "sonner";
 import { submitSelectionProposal } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 
+const COULD_NOT_READ_PAGE_MESSAGE =
+    "We couldn't read that page automatically. Just add the name (and a photo link if you have one) and we'll take it from there.";
+
 interface Proposal {
     id: string;
     name: string;
@@ -71,9 +74,13 @@ function SuggestItemModal({
             if (data.name) setName(data.name);
             if (data.imageUrl) setImageUrl(data.imageUrl);
             if (data.description) setParsedDescription(data.description);
-            toast.success("Filled in what we could find — feel free to edit it.");
+            if (data.name || data.imageUrl) {
+                toast.success("Filled in what we could find — feel free to edit it.");
+            } else {
+                toast.info(COULD_NOT_READ_PAGE_MESSAGE);
+            }
         } catch (e: any) {
-            toast.error(e.message || "Couldn't read that link. You can still fill this in by hand.");
+            toast.error(COULD_NOT_READ_PAGE_MESSAGE);
         } finally {
             setParsing(false);
         }

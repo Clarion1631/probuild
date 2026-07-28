@@ -6,7 +6,10 @@ import { resolveSessionClientId } from "@/lib/portal-auth";
 import { parseProductUrl } from "@/lib/product-parse";
 import { getPortalVisibility } from "@/lib/actions";
 
-export const maxDuration = 30;
+// See the matching comment in /api/products/parse — parseProductUrl's worst
+// case (direct fetch + text-based Gemini + up to two url_context attempts)
+// is comfortably over the old 30s cap.
+export const maxDuration = 60;
 
 // POST: portal-client product URL parse, used to prefill the "suggest an item"
 // form. Price is stripped from the response — it's PM-side info until the
