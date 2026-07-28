@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { getSupabase } from "@/lib/supabase";
 import { sendNotification } from "@/lib/email";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "@/lib/contract-finalize";
+import { uploadSecureDoc, removeSecureDoc, downloadDocBytes } from "@/lib/secure-storage";
 import { PDFDocument } from "pdf-lib";
 import { appendContractCountersignaturePage } from "@/lib/pdf";
 
@@ -122,9 +123,8 @@ export async function POST(
             let committed = false;
             let storagePathUploaded: string | null = null;
             try {
-                const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
-                if (dlErr || !dl) throw new Error("Could not load original PDF contract");
-                const originalBuffer = Buffer.from(await dl.arrayBuffer());
+                const originalBuffer = await downloadDocBytes(contract.originalPdfPath);
+                if (!originalBuffer) throw new Error("Could not load original PDF contract");
 
                 const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
                 const ip = contract.approvalIp || "0.0.0.0";
@@ -146,8 +146,11 @@ export async function POST(
                     clientOnlyPdf
                 );
                 record = archived.record;
-                storagePathUploaded = archived.storagePath;
-                
+                // Track the secure ref the archive step returned (not the raw storage path) —
+                // the executed PDF lives in SECURE_BUCKET, so cleanup must go through
+                // removeSecureDoc rather than a raw STORAGE_BUCKET remove().
+                storagePathUploaded = archived.publicUrl;
+
                 await prisma.contract.update({
                     where: { id: contract.id },
                     data: { status: "Finalized" },
@@ -192,7 +195,7 @@ export async function POST(
                 console.error("Finalize PDF Contract Error:", err);
                 if (!committed && storagePathUploaded) {
                     try {
-                        await supabase.storage.from(STORAGE_BUCKET).remove([storagePathUploaded]);
+                        await removeSecureDoc(storagePathUploaded);
                     } catch {}
                 }
                 return NextResponse.json({ error: err.message || "Failed to finalize PDF contract" }, { status: 500 });
@@ -225,10 +228,10 @@ export async function POST(
 
             const cPrefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
             const intermediatePath = `${cPrefix}/intermediate/${Date.now()}_Signed_Contract_${contract.id}.pdf`;
-            const { error: cUpErr } = await supabase.storage
-                .from(STORAGE_BUCKET)
-                .upload(intermediatePath, cBuffer, { contentType: "application/pdf", upsert: false });
-            if (cUpErr) {
+            let secureRef: string;
+            try {
+                secureRef = await uploadSecureDoc(intermediatePath, cBuffer, "application/pdf");
+            } catch (cUpErr: any) {
                 return NextResponse.json({ error: `Storage upload failed: ${cUpErr.message}` }, { status: 500 });
             }
 
@@ -239,15 +242,15 @@ export async function POST(
             try {
                 claim = await prisma.contract.updateMany({
                     where: { id: contract.id, signedPdfPath: null },
-                    data: { signedPdfPath: intermediatePath },
+                    data: { signedPdfPath: secureRef },
                 });
             } catch (claimErr) {
                 // DB threw between upload and claim — remove the orphaned upload before bubbling up.
-                try { await supabase.storage.from(STORAGE_BUCKET).remove([intermediatePath]); } catch {}
+                try { await removeSecureDoc(secureRef); } catch {}
                 throw claimErr;
             }
             if (claim.count === 0) {
-                try { await supabase.storage.from(STORAGE_BUCKET).remove([intermediatePath]); } catch {}
+                try { await removeSecureDoc(secureRef); } catch {}
                 return NextResponse.json({ success: true, awaitingCountersign: true });
             }
 
@@ -317,7 +320,6 @@ export async function POST(
         let safeName = `Executed_Contract_${contract.id}.pdf`;
         let publicUrl = "";
         let committed = false;
-        let storagePathUploaded: string | null = null;
         try {
             let formData;
             try {
@@ -344,7 +346,6 @@ export async function POST(
             );
             record = archived.record;
             publicUrl = archived.publicUrl;
-            storagePathUploaded = archived.storagePath;
             safeName = archived.fileName;
             committed = true;
         } catch (pipelineErr: any) {
@@ -355,11 +356,12 @@ export async function POST(
                     where: { id, status: "Finalized" },
                     data: { status: "Signed" },
                 });
-                // Best-effort cleanup of any uploaded storage object so a retry
-                // doesn't leave orphans.
-                if (storagePathUploaded) {
+                // Best-effort cleanup of any uploaded storage object so a retry doesn't
+                // leave orphans. `publicUrl` is the secure ref archiveExecutedContractPdf
+                // returned — the executed PDF lives in SECURE_BUCKET, not STORAGE_BUCKET.
+                if (publicUrl) {
                     try {
-                        await supabase.storage.from(STORAGE_BUCKET).remove([storagePathUploaded]);
+                        await removeSecureDoc(publicUrl);
                     } catch {}
                 }
             }

@@ -2,6 +2,7 @@ import { getChangeOrderForPortal, getPublicCompanySettings, getPortalVisibility 
 import { notFound } from "next/navigation";
 import PortalChangeOrderClient from "./PortalChangeOrderClient";
 import Link from "next/link";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export default async function PortalChangeOrderPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
@@ -30,5 +31,13 @@ export default async function PortalChangeOrderPage({ params }: { params: Promis
         }
     }
 
-    return <PortalChangeOrderClient initialData={JSON.parse(JSON.stringify(changeOrder))} companySettings={settings} />;
+    // Serialize Decimal-backed values before the client boundary, then overlay
+    // the resolved (signed) private-storage signature URLs.
+    const initialData = {
+        ...JSON.parse(JSON.stringify(changeOrder)),
+        clientSignatureUrl: await resolveDocUrl((changeOrder as any).clientSignatureUrl),
+        companySignatureUrl: await resolveDocUrl((changeOrder as any).companySignatureUrl),
+    };
+
+    return <PortalChangeOrderClient initialData={initialData} companySettings={settings} />;
 }

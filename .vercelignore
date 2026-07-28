@@ -38,3 +38,6 @@ __pycache__
 .vercel
 *.tsbuildinfo
 coverage
+
+# Local workspace folder (financial exports, not app source)
+gtr-probuild

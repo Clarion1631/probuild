@@ -131,7 +131,7 @@ export default function NewProjectModal({
                         </div>
                         <div>
                             <label className="block text-sm text-hui-textMuted mb-1">Status</label>
-                            <select name="status" defaultValue="In Progress" className="hui-input w-full">
+                            <select name="status" defaultValue="Waiting to Start" className="hui-input w-full">
                                 {statusOptions.map(s => (
                                     <option key={s} value={s}>{s}</option>
                                 ))}

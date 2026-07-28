@@ -118,6 +118,8 @@ export async function POST(req: Request) {
         data: {
             name,
             clientId,
+            // Every project birth lands in the pipeline's pre-work stage.
+            status: "Waiting to Start",
             location: typeof body.location === "string" ? body.location : null,
             locationLat,
             locationLng,

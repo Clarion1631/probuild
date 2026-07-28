@@ -1,9 +1,12 @@
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { getPortalVisibility, getScheduleTasks, getScheduleTasksForSub } from "@/lib/actions";
+import { getPortalScheduleTasks, getPortalVisibility, getScheduleTasksForSub } from "@/lib/actions";
 import PortalScheduleView from "./PortalScheduleView";
 import Link from "next/link";
 import { getSubPortalSession } from "@/lib/sub-portal-auth";
+import { resolveSessionClientId } from "@/lib/portal-auth";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -15,17 +18,31 @@ export default async function PortalSchedulePage(props: { params: Promise<{ id: 
     const subSession = await getSubPortalSession();
     const subcontractorId = subSession?.id ?? null;
 
+    let project;
+    if (subcontractorId) {
+        project = await prisma.project.findUnique({ where: { id } });
+    } else {
+        const staffSession = await getServerSession(authOptions);
+        const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+
+        if (isStaff) {
+            project = await prisma.project.findFirst({ where: { id } });
+        } else {
+            const sessionClientId = await resolveSessionClientId();
+            if (!sessionClientId) return notFound();
+            project = await prisma.project.findFirst({ where: { id, clientId: sessionClientId } });
+        }
+    }
+    if (!project) return notFound();
+
     const visibility = await getPortalVisibility(id);
     if (!subcontractorId && (!visibility.isPortalEnabled || !visibility.showSchedule)) {
         return notFound();
     }
 
-    const project = await prisma.project.findUnique({ where: { id } });
-    if (!project) return notFound();
-
     const rawTasks = subcontractorId
         ? await getScheduleTasksForSub(id, subcontractorId)
-        : await getScheduleTasks(id);
+        : await getPortalScheduleTasks(id);
 
     const tasks = rawTasks.map((t: any) => ({
         id: t.id,
@@ -45,7 +62,11 @@ export default async function PortalSchedulePage(props: { params: Promise<{ id: 
         assignments: (t.assignments || []).map((a: any) => ({
             id: a.id,
             userId: a.userId,
-            user: { name: a.user.name, email: a.user.email }
+            firstName: a.firstName || a.user?.name?.trim().split(/\s+/)[0] || "Crew",
+        })),
+        subAssignments: (t.subAssignments || []).map((a: any) => ({
+            id: a.id,
+            companyName: a.companyName || a.subcontractor?.companyName || "Subcontractor",
         })),
         comments: (t.comments || []).map((c: any) => ({
             id: c.id,

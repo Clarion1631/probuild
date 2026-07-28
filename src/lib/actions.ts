@@ -11,14 +11,18 @@ import { authOptions, getSessionOrDev } from "./auth";
 import { sendNotification } from "./email";
 import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-helpers";
 import { formatCurrency } from "./utils";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
+import { parseProductUrl } from "./product-parse";
+import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
+import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
+import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
@@ -26,11 +30,41 @@ import { normalizeE164 } from "./phone";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { uploadSecureDoc, removeSecureDoc, downloadDocBytes, isSecureRef, resolveDocUrl, toSecureRef } from "./secure-storage";
 import { archiveExecutedContractPdf, sendExecutedContractEmails } from "./contract-finalize";
 import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { publishDispatch } from "./dispatch-publication";
+import type { DispatchIntent } from "./dispatch-intent";
+import type { PublishDispatchResult } from "./dispatch-publication";
+import {
+    addTaskMaterialCore,
+    deleteTaskMaterialCore,
+    getStagingQueueCore,
+    getTaskMaterialsCore,
+    importEstimateMaterialsCore,
+    setTaskMaterialStatusCore,
+    updateTaskMaterialCore,
+    type TaskMaterialActor,
+    type TaskMaterialInput,
+    type TaskMaterialUpdateInput,
+    type TaskMaterialStatus,
+} from "./task-materials-core";
+import { assertPortalProjectAccess } from "./portal-project-access";
+import {
+    computeDailyLogSharedContentHash,
+    getPortalScheduleTasksCore,
+    setDailyLogPortalShareCore,
+} from "./portal-tracker";
+import {
+    createScheduleTaskInTransaction,
+    setTaskLeadInTransaction,
+    updateScheduleTaskInTransaction,
+    type CreateScheduleTaskInput,
+    type UpdateScheduleTaskInput,
+} from "./schedule-task-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -656,19 +690,10 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
             throw new Error("Certificate must be a PDF or image");
         }
 
-        const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-        const supabase = getSupabase();
-        if (!supabase) throw new Error("Storage not configured");
-
         const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
         const storagePath = `tax-certs/${clientId}/${Date.now()}_${safeName}`;
         const buffer = Buffer.from(await file.arrayBuffer());
-        const { error: uploadError } = await supabase.storage
-            .from(STORAGE_BUCKET)
-            .upload(storagePath, buffer, { contentType: file.type || "application/octet-stream", upsert: false });
-        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
-        const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-        certUrl = urlData?.publicUrl || storagePath;
+        certUrl = await uploadSecureDoc(storagePath, buffer, file.type || "application/octet-stream");
     }
     if (!certUrl) throw new Error("Attach a certificate file");
 
@@ -696,7 +721,12 @@ export async function saveClientTaxExemptCert(clientId: string, formData: FormDa
     });
 
     await revalidateClientCertSurfaces(clientId);
-    return JSON.parse(JSON.stringify(updated));
+    // The caller pushes this straight into local component state, which the subsequent
+    // router.refresh() won't replace, so hand back a loadable URL rather than a `secure:` ref.
+    return JSON.parse(JSON.stringify({
+        ...updated,
+        taxExemptCertUrl: await resolveDocUrl(updated.taxExemptCertUrl),
+    }));
 }
 
 export async function removeClientTaxExemptCert(clientId: string) {
@@ -714,13 +744,17 @@ export async function removeClientTaxExemptCert(clientId: string) {
         data: { taxExemptCertUrl: null, taxExemptCertExpiresAt: null, taxExemptCertNote: null },
     });
 
-    // Best-effort: explicit "Remove" should not leave the file publicly reachable.
+    // Best-effort: explicit "Remove" should not leave the file reachable.
     if (count === 1) {
         try {
-            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-            const supabase = getSupabase();
-            const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
-            if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+            if (isSecureRef(client.taxExemptCertUrl)) {
+                await removeSecureDoc(client.taxExemptCertUrl!);
+            } else {
+                const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
+                const supabase = getSupabase();
+                const path = taxCertStoragePathFromUrl(client.taxExemptCertUrl, STORAGE_BUCKET);
+                if (supabase && path) await supabase.storage.from(STORAGE_BUCKET).remove([path]);
+            }
         } catch (e) {
             console.warn("[removeClientTaxExemptCert] storage cleanup failed:", e instanceof Error ? e.message : e);
         }
@@ -1065,7 +1099,8 @@ export async function convertLeadToProject(leadId: string) {
                 clientId: lead.clientId,
                 location: geo?.formattedAddress ?? lead.location,
                 ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "In Progress",
+                status: "Waiting to Start",
+                startDate: lead.expectedStartDate ?? null,
                 type: lead.projectType || "Unknown",
                 managerId: lead.managerId || null,
                 tags: lead.tags || null,
@@ -1191,8 +1226,10 @@ export async function createProject(data: {
 
     const { id: projectId } = await convertLeadToProject(lead.id);
 
-    // Apply project-specific fields the conversion doesn't carry (it defaults status to "In Progress").
-    if (data.status && data.status !== "In Progress") {
+    // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
+    // A provided status always applies — including "In Progress" for callers
+    // that explicitly want the job to skip the waiting stage.
+    if (data.status) {
         await prisma.project.update({ where: { id: projectId }, data: { status: data.status } });
     }
 
@@ -2257,9 +2294,13 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         data: { status: "Invoiced" },
     });
 
-    // 3) Every pending milestone → its own QuickBooks invoice + hosted pay link,
-    //    so the portal can default to QuickBooks for all of them. The first one
-    //    (the deposit) also rides the approval email.
+    // 3) ONLY the deposit gets a QuickBooks invoice + hosted pay link here, so it can
+    //    ride the approval email. The rest of the schedule stays a suggestion until
+    //    someone deliberately bills it ("QuickBooks Link" per milestone today, the
+    //    progress-invoice builder next) — staging the whole schedule up front filled
+    //    QuickBooks with invoices nobody had billed yet and let payments land against
+    //    amounts that had since changed (Mesplay: a $25k check against a staged $40k
+    //    milestone, 2026-07). One approval, one QuickBooks invoice.
     let payLink: string | null = null;
     const pendingMilestones = await prisma.paymentSchedule.findMany({
         where: { invoiceId: invoice.id, status: "Pending" },
@@ -2267,17 +2308,15 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
         select: { id: true, name: true, amount: true },
     });
     const deposit = pendingMilestones[0] || null;
-    if (pendingMilestones.length > 0) {
+    if (deposit) {
         try {
             const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
-            for (const milestone of pendingMilestones) {
-                const pushed = await pushMilestoneToQuickBooks(milestone.id);
-                if (milestone.id === deposit?.id) payLink = pushed.payLink;
-            }
+            const pushed = await pushMilestoneToQuickBooks(deposit.id);
+            payLink = pushed.payLink;
         } catch (e) {
             // QuickBooks not connected or unreachable — Stripe portal payment and
             // manual recording still work; the PM can push links later.
-            console.warn("[approveEstimate] QuickBooks milestone push skipped:", e instanceof Error ? e.message : e);
+            console.warn("[approveEstimate] QuickBooks deposit push skipped:", e instanceof Error ? e.message : e);
         }
     }
 
@@ -2381,14 +2420,11 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
-        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
-            const res = await fetch(capturedPdfUrl);
-            if (res.ok) {
-                const ab = await res.arrayBuffer();
-                pdfBuffer = Buffer.from(ab);
+        if (capturedPdfUrl) {
+            pdfBuffer = await downloadDocBytes(capturedPdfUrl);
+            if (!pdfBuffer) {
+                console.warn("[approveEstimate] Failed to read capturedPdfUrl:", capturedPdfUrl);
             }
-        } else if (capturedPdfUrl) {
-            console.warn("[approveEstimate] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
         if (!pdfBuffer) {
             const { generateEstimatePdf } = await import("./pdf");
@@ -2463,49 +2499,49 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 
     // ─── 3. File the signed PDF into the project's "Signed Documents" folder ───
     if (pdfBuffer && estimate?.projectId) {
+        let filedSecureRef: string | null = null;
         try {
-            const { getSupabase, STORAGE_BUCKET } = await import("./supabase");
-            const supabase = getSupabase();
-
-            if (supabase) {
-                // Find or create a "Signed Documents" folder for this project
-                let folder = await prisma.fileFolder.findFirst({
-                    where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+            // Find or create a "Signed Documents" folder for this project
+            let folder = await prisma.fileFolder.findFirst({
+                where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+            });
+            if (!folder) {
+                folder = await prisma.fileFolder.create({
+                    data: { name: "Signed Documents", projectId: estimate.projectId },
                 });
-                if (!folder) {
-                    folder = await prisma.fileFolder.create({
-                        data: { name: "Signed Documents", projectId: estimate.projectId },
-                    });
-                }
+            }
 
-                // Upload to Supabase Storage
-                const storagePath = `projects/${estimate.projectId}/signed/${Date.now()}_${pdfFilename}`;
-                const { error: uploadError } = await supabase.storage
-                    .from(STORAGE_BUCKET)
-                    .upload(storagePath, pdfBuffer, {
-                        contentType: "application/pdf",
-                        upsert: false,
-                    });
+            // Upload to the private secure-docs bucket
+            const storagePath = `projects/${estimate.projectId}/signed/${Date.now()}_${pdfFilename}`;
+            filedSecureRef = await uploadSecureDoc(storagePath, pdfBuffer, "application/pdf");
 
-                if (!uploadError) {
-                    const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-                    const publicUrl = urlData?.publicUrl || storagePath;
+            await prisma.projectFile.create({
+                data: {
+                    name: pdfFilename,
+                    url: filedSecureRef,
+                    size: pdfBuffer.length,
+                    mimeType: "application/pdf",
+                    projectId: estimate.projectId,
+                    folderId: folder.id,
+                },
+            });
 
-                    await prisma.projectFile.create({
-                        data: {
-                            name: pdfFilename,
-                            url: publicUrl,
-                            size: pdfBuffer.length,
-                            mimeType: "application/pdf",
-                            projectId: estimate.projectId,
-                            folderId: folder.id,
-                        },
-                    });
-                } else {
-                    console.error("[approveEstimate] Supabase upload failed:", uploadError);
+            // The portal-captured PDF (if any) was only a transient capture used to build
+            // pdfBuffer above — now that a permanent copy is filed, remove the temporary
+            // object so it doesn't linger as an orphan duplicate in the private bucket.
+            if (capturedPdfUrl && isSecureRef(capturedPdfUrl)) {
+                try {
+                    await removeSecureDoc(capturedPdfUrl);
+                } catch (cleanupErr) {
+                    console.error("[approveEstimate] Failed to remove transient captured PDF:", cleanupErr);
                 }
             }
         } catch (fileErr) {
+            // The upload may have succeeded even though the DB write failed — remove the
+            // orphaned storage object so a retry doesn't leave a dangling signed PDF behind.
+            if (filedSecureRef) {
+                try { await removeSecureDoc(filedSecureRef); } catch {}
+            }
             // Non-critical — don't block the approval if filing fails
             console.error("[approveEstimate] Failed to file signed PDF:", fileErr);
         }
@@ -2551,30 +2587,17 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         revalidatePath(`/projects/${estimate.projectId}/estimates`);
         revalidatePath(`/projects/${estimate.projectId}/files`);
     }
+    // Post-commit best effort: approval/invoice/budget work above must stand even
+    // if schedule generation is skipped or fails.
+    try {
+        await autoGenerateScheduleForApprovedEstimate(estimateId);
+    } catch (error) {
+        console.error("[approveEstimate] schedule auto-generation failed (approval unaffected):", error);
+    }
     revalidatePath(`/portal/estimates/${estimateId}`);
     return { success: true };
 }
 
-async function assertInvoiceHasNoChangeOrderBilling(
-    tx: Prisma.TransactionClient,
-    invoiceId: string,
-    operation: "delete" | "re-split",
-) {
-    const schedule = await tx.paymentSchedule.findFirst({
-        where: {
-            invoiceId,
-            OR: [
-                { sourceChangeOrderId: { not: null } },
-                { sourceCoScheduleId: { not: null } },
-                { coBilling: { isNot: null } },
-            ],
-        },
-        select: { id: true },
-    });
-    if (schedule) {
-        throw new Error("Cannot " + operation + " an invoice with change-order billing. Void/rebill the change-order billing before trying again.");
-    }
-}
 export async function deleteInvoice(invoiceId: string) {
     await assertInvoicePermission();
 
@@ -2591,6 +2614,7 @@ export async function deleteInvoice(invoiceId: string) {
         if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
             throw new Error("Cannot delete a paid or partially paid invoice");
         }
+        const { assertInvoiceHasNoChangeOrderBilling } = await import("./billing-core");
         await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
 
         await tx.invoice.delete({ where: { id: invoiceId } });
@@ -3639,27 +3663,11 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically: the guard fields go in the WHERE, so if the QB
-    // sync settles this milestone (status→Paid, qbPaymentId set) between the read
-    // above and this write, the claim matches 0 rows and we never strip QB fields
-    // off a now-paid row. `qbInvoiceId` is pinned to the value we read so a
-    // concurrent re-push (new id) can't be clobbered either.
-    const cleared = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            status: { not: "Paid" },
-            qbPaymentId: null,
-            qbInvoiceId: schedule.qbInvoiceId,
-        },
-        data: {
-            qbInvoiceId: null,
-            qbInvoiceLink: null,
-            qbInvoiceSentAt: null,
-            qbSyncedAt: null,
-            qbSyncError: null,
-        },
-    });
-    if (cleared.count !== 1) {
+    // Claim the unlink atomically via the shared helper (also used by
+    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
+    const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
+    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
+    if (!cleared) {
         return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
     }
 
@@ -4041,6 +4049,42 @@ async function assertChangeOrderPermission() {
     return assertStaffPermission("changeOrders");
 }
 
+async function assertScheduleProjectAccess(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+async function assertScheduleTaskAccess(taskId: string) {
+    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId }, select: { projectId: true } });
+    if (!task?.projectId) throw new Error("Task not found");
+    const user = await assertScheduleProjectAccess(task.projectId);
+    return { user, projectId: task.projectId };
+}
+
+async function assertStagingQueueAccess() {
+    const user = await assertActiveStaff();
+    if (!["ADMIN", "MANAGER", "FIELD_CREW"].includes(user.role) || !hasPermission(user, "schedules")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+function taskMaterialActor(user: any): TaskMaterialActor {
+    if (!user?.id) throw new Error("Authenticated staff user is required");
+    return {
+        userId: user.id,
+        role: user.role,
+        name: user.name || user.email,
+    };
+}
+
+function revalidateTaskMaterialPaths(projectId: string) {
+    revalidatePath(`/projects/${projectId}/schedule`);
+    revalidatePath("/company-dashboard");
+    revalidatePath("/company-dashboard/staging");
+}
+
 async function assertFinancialPermission() {
     return assertStaffPermission("financialReports");
 }
@@ -4157,83 +4201,57 @@ export async function splitInvoiceMilestones(
 ) {
     await assertInvoicePermission();
 
-    if (!milestones.length) throw new Error("At least one milestone is required");
-
-    const validated = milestones.map((m, i) => {
-        const name = (m.name || "").trim();
-        const amount = Math.round(Number(m.amount) * 100) / 100;
-        if (!name) throw new Error(`Milestone ${i + 1}: name is required`);
-        if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Milestone ${i + 1}: amount must be greater than zero`);
-        return { name, amount, dueDate: m.dueDate || null };
-    });
-
-    const newTotal = Math.round(validated.reduce((s, m) => s + m.amount, 0) * 100) / 100;
-
-    // Interactive tx, invoice locked FIRST (canonical Estimate → Invoice order; this flow touches
-    // only the invoice). The paid portion is re-read from the LOCKED invoice, so a concurrent
-    // settle on a surviving Paid milestone can't leave paidAmount stale and get its balance
-    // overwritten. Arithmetic is otherwise unchanged from the original array-form transaction.
-    const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        await lockMoneyParents(tx, { invoiceId });
-        const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
-        if (!invoice) throw new Error("Invoice not found");
-
-        // Refuse to re-split while a payment is in flight on a non-Paid milestone. The delete
-        // below drops every non-Paid schedule; if one has an open Stripe checkout or a sent
-        // QuickBooks invoice, a settlement landing afterward would find no row to claim and the
-        // customer would be charged with nothing to reconcile against. Checked under the invoice
-        // lock so a checkout/QB-send starting concurrently can't slip in after this guard.
-        const inFlight = await tx.paymentSchedule.findFirst({
-            where: {
-                invoiceId,
-                status: { not: "Paid" },
-                OR: [
-                    { stripeSessionId: { not: null } },
-                    { stripePaymentIntentId: { not: null } },
-                    { qbInvoiceId: { not: null } },
-                ],
-            },
-            select: { name: true },
-        });
-        if (inFlight) {
-            throw new Error(
-                `A payment is in progress on this invoice (milestone "${inFlight.name}"). Wait for it to finish or void it before re-splitting the milestones.`,
-            );
-        }
-
-        await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "re-split");
-
-        // Recalculate balanceDue: paid amount stays the same, only pending changes
-        const paidAmount = Math.round(
-            (Number(invoice.totalAmount) - Number(invoice.balanceDue)) * 100,
-        ) / 100;
-        const newBalance = Math.max(0, Math.round((newTotal - paidAmount) * 100) / 100);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : invoice.status === "Draft" ? "Draft"
-            : invoice.status === "Overdue" ? "Overdue"
-            : "Issued";
-
-        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
-        await tx.paymentSchedule.createMany({
-            data: validated.map((m) => ({
-                invoiceId,
-                name: m.name,
-                amount: m.amount,
-                status: "Pending",
-                dueDate: m.dueDate ? new Date(m.dueDate) : null,
-            })),
-        });
-        await tx.invoice.update({
-            where: { id: invoiceId },
-            data: { totalAmount: newTotal, balanceDue: newBalance, status: newStatus },
-        });
-        return invoice.projectId;
-    }));
+    const { splitInvoiceMilestonesCore } = await import("./billing-core");
+    const projectId = await splitInvoiceMilestonesCore(invoiceId, milestones);
 
     revalidatePath(`/projects/${projectId}/invoices`);
     revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
+
+    return { success: true };
+}
+
+/**
+ * Re-price the Pending milestones on an invoice without changing the invoice
+ * total ("Edit amounts"). See `updatePendingMilestoneAmountsCore` for the
+ * validation, mirror-sync, and QuickBooks re-stage details.
+ */
+export async function updatePendingMilestoneAmounts(
+    invoiceId: string,
+    rows: { scheduleId: string; name: string; amount: number; dueDate?: string | null }[],
+) {
+    await assertInvoicePermission();
+
+    const { updatePendingMilestoneAmountsCore } = await import("./billing-core");
+    const result = await updatePendingMilestoneAmountsCore(invoiceId, rows);
+
+    // Same paths splitInvoiceMilestones revalidates.
+    const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { projectId: true } });
+    if (invoice) {
+        revalidatePath(`/projects/${invoice.projectId}/invoices`);
+        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
+    }
+    revalidatePath(`/invoices`);
+
+    return result;
+}
+
+/**
+ * Delete a Pending, non-mirrored, non-QB-linked "extra charge" milestone —
+ * the inverse of `addInvoiceMilestone`. QB-linked rows must be unlinked via
+ * Break QB Link first; this action is DB-only.
+ */
+export async function deleteInvoiceMilestone(scheduleId: string) {
+    await assertInvoicePermission();
+
+    const { deleteInvoiceMilestoneCore } = await import("./billing-core");
+    const result = await deleteInvoiceMilestoneCore(scheduleId);
+
+    revalidatePath(`/projects/${result.projectId}/invoices`);
+    revalidatePath(`/projects/${result.projectId}/invoices/${result.invoiceId}`);
+    revalidatePath(`/invoices`);
+    revalidatePath(`/portal`);
+    revalidatePath(`/reports/open-invoices`);
 
     return { success: true };
 }
@@ -5100,13 +5118,11 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
     let pdfAttached = false;
     try {
         let pdfBuffer: Buffer | undefined;
-        if (capturedPdfUrl && isAllowedCapturedPdfUrl(capturedPdfUrl)) {
-            // Use the pre-captured portal PDF (high-quality, matches what client sees)
-            const res = await fetch(capturedPdfUrl);
-            if (res.ok) {
-                const ab = await res.arrayBuffer();
-                pdfBuffer = Buffer.from(ab);
-            }
+        if (capturedPdfUrl && (isSecureRef(capturedPdfUrl) || isAllowedCapturedPdfUrl(capturedPdfUrl))) {
+            // Use the pre-captured portal PDF (high-quality, matches what client sees).
+            // Read via the service key so this still works now that the capture lands in the
+            // private bucket; the allowlist still gates legacy http(s) values.
+            pdfBuffer = (await downloadDocBytes(capturedPdfUrl)) ?? undefined;
         } else if (capturedPdfUrl) {
             console.warn("[sendEstimateToClient] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
@@ -5688,7 +5704,8 @@ export async function createContractBlank(
 export async function createContractFromPdf(
     context: { type: "project" | "lead"; id: string },
     title: string,
-    originalPdfPath: string
+    originalPdfPath: string,
+    isPrivate: boolean = false
 ) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -5701,7 +5718,11 @@ export async function createContractFromPdf(
         data: {
             title,
             body: "", // Empty HTML body for PDF contracts
-            originalPdfPath,
+            // `originalPdfPath` is a raw storage path. When the upload targeted the private
+            // secure-docs bucket (see /api/files/signed-upload's "contract-original" scope),
+            // wrap it into a secure ref so every downstream reader (downloadDocBytes,
+            // resolveDocUrl) treats it correctly.
+            originalPdfPath: isPrivate ? toSecureRef(originalPdfPath) : originalPdfPath,
             requiresCountersign: coSettings?.requireContractCountersign ?? false,
             ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
             status: "Draft",
@@ -5711,22 +5732,82 @@ export async function createContractFromPdf(
     if (context.type === "project") revalidatePath(`/projects/${context.id}`);
     if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
 
-    return contract;
+    // Resolve a browser-loadable URL server-side (mirrors the contracts page's own
+    // findOriginalPdfUrl) so the client can preview the just-uploaded PDF immediately
+    // without ever calling resolveDocUrl itself — the private bucket has no public URL,
+    // so the caller has no other way to get one.
+    const originalPdfUrl = await resolveDocUrl(contract.originalPdfPath);
+
+    return { ...contract, originalPdfUrl };
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
-    const existing = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
-    if (existing && ["Signed", "Finalized"].includes(existing.status)) {
-        if (data.title !== undefined || data.body !== undefined) {
-            throw new Error("Cannot edit a contract that has already been signed or finalized");
-        }
-    }
+    const existing = await prisma.contract.findUnique({
+        where: { id },
+        select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
+    });
+    if (!existing) throw new Error("Contract not found");
 
     // Guard the signing-field handshake: normalize any un-normalized merge-field spans to
     // raw {{KEY}} so the portal (which greps for {{KEY}}) can always find the signing blocks.
     const safeData = { ...data };
     if (typeof safeData.body === "string") safeData.body = normalizeContractBody(safeData.body);
-    const contract = await prisma.contract.update({ where: { id }, data: safeData });
+
+    const editsText = safeData.title !== undefined || safeData.body !== undefined;
+    if (!editsText) {
+        const contract = await prisma.contract.update({ where: { id }, data: safeData });
+        revalidatePath(`/`);
+        return contract;
+    }
+
+    // A contractor pre-signature (signContractAsContractor) covers the document text as it
+    // stood when signed — the send/approve gates only check that contractorSignedAt exists,
+    // so an edit after pre-sign would present altered text over the old signature. Text
+    // edits therefore clear the contractor signature fields (forcing a re-sign of the new
+    // text) in the SAME write, and the write is a full compare-and-swap on the snapshot we
+    // diffed against (title/body/signature state): any concurrent edit or signature landing
+    // between our read and this write makes the CAS miss and the save is rejected, instead
+    // of silently reverting someone else's text under a live signature (Codex round-1
+    // blocker: a stale no-op save must not retain a signature made over newer text).
+    const textChanged =
+        (safeData.title !== undefined && safeData.title !== existing.title) ||
+        (safeData.body !== undefined && safeData.body !== (existing.body ?? ""));
+    const clearingSignature = textChanged && !!existing.contractorSignedAt;
+    await prisma.$transaction(async (tx) => {
+        const res = await tx.contract.updateMany({
+            where: {
+                id,
+                status: { notIn: ["Signed", "Finalized"] },
+                title: existing.title,
+                body: existing.body,
+                contractorSignedAt: existing.contractorSignedAt,
+            },
+            data: {
+                ...safeData,
+                ...(textChanged ? { contractorSignedBy: null, contractorSignedAt: null, contractorSignatureUrl: null } : {}),
+            },
+        });
+        if (res.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id }, select: { status: true } });
+            if (current && ["Signed", "Finalized"].includes(current.status)) {
+                throw new Error("Cannot edit a contract that has already been signed or finalized");
+            }
+            throw new Error("Contract changed while you were editing (someone edited or signed it) — reload and try again.");
+        }
+        // The cleared signature's original audit row stays; append an invalidation marker so
+        // the e-sign trail shows the pre-edit signature no longer covers the current text.
+        if (clearingSignature) {
+            await tx.contractSigningRecord.create({
+                data: {
+                    contractId: id,
+                    signedBy: existing.contractorSignedBy || "Contractor",
+                    notes: "Contractor signature invalidated — contract text was edited after signing; re-sign required",
+                },
+            });
+        }
+    });
+    const contract = await prisma.contract.findUnique({ where: { id } });
+    if (!contract) throw new Error("Contract not found");
     revalidatePath(`/`);
     return contract;
 }
@@ -5738,7 +5819,7 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[]) {
+export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5748,6 +5829,20 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     });
 
     if (!contract) throw new Error("Contract not found");
+
+    // MCP confirm-token guard: the caller previewed a specific document to the user and
+    // binds that snapshot's hash here. If the contract changed between their preview and
+    // this read (a concurrent edit), refuse — never email a legal document whose text
+    // differs from what the user approved. Must hash the SAME fields, the same way, as
+    // the send_contract tool in src/app/api/mcp/[transport]/route.ts.
+    if (expectedFingerprint) {
+        const fresh = createHash("sha256")
+            .update(JSON.stringify({ title: contract.title, body: contract.body, status: contract.status, requiresCountersign: contract.requiresCountersign }))
+            .digest("hex").slice(0, 24);
+        if (fresh !== expectedFingerprint) {
+            throw new Error("The contract changed after the preview — run the send preview again and re-confirm.");
+        }
+    }
     const client = contract.project?.client || contract.lead?.client;
     if (!client?.email) throw new Error("Client has no email address");
 
@@ -5788,16 +5883,32 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     // the email so the client gets their link, but we do NOT clobber status).
     // Recurring contracts that the cron re-arms legitimately re-enter "Sent"
     // from an earlier "Sent"/"Viewed" cycle — the whitelist includes those.
-    await prisma.contract.updateMany({
+    //
+    // The transition also CAS-binds the body we validated above (and, when the text
+    // carries a contractor block, that the contractor signature still exists) — an
+    // edit landing between the gate check and here now clears the pre-signature, so
+    // without this binding we could email a link to altered, unsigned text that the
+    // upfront gate never saw. A CAS miss on a still-unsigned contract aborts the
+    // send; a miss on an already-Signed/Finalized row keeps the old resend-as-no-op
+    // behavior (email the executed contract's link, never clobber status).
+    const sendTransition = await prisma.contract.updateMany({
         where: {
             id: contractId,
             status: { in: ["Draft", "Sent", "Viewed"] },
+            body: contract.body,
+            ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
         },
         data: {
             status: "Sent",
             sentAt: new Date(),
         }
     });
+    if (sendTransition.count === 0) {
+        const current = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+        if (!current || !["Signed", "Finalized"].includes(current.status)) {
+            throw new Error("Contract changed while sending (text edited or signature cleared) — reload and try again.");
+        }
+    }
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
     const portalUrl = `${appUrl}/portal/contracts/${contractId}?token=${accessToken}`;
@@ -5885,7 +5996,7 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
     return { toEmail: client?.email || null, autoCc };
 }
 
-export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string) {
+export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string, expectedTitle: string, expectedBody: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
 
@@ -5913,16 +6024,29 @@ export async function signContractAsContractor(contractId: string, signerName: s
     // the signature write back too — a retry then redoes BOTH (never leaves contractorSignedAt set
     // with no audit row). updateMany only matches rows where contractorSignedAt IS NULL, so two
     // concurrent requests can't both succeed (eliminates TOCTOU race).
+    // The guard also CAS-checks the title and body the signer saw (both are cleared-signature
+    // triggers in updateContract), so a signature can never commit over a document that was
+    // edited after the signer last saw it (Codex blockers: a sign request based on an old
+    // document must not reintroduce a live signature on changed text OR a changed title).
     await prisma.$transaction(async (tx) => {
         const guard = await tx.contract.updateMany({
-            where: { id: contractId, contractorSignedAt: null },
+            where: {
+                id: contractId,
+                contractorSignedAt: null,
+                title: expectedTitle,
+                body: expectedBody,
+            },
             data: {
                 contractorSignedBy: signerName,
                 contractorSignedAt: signedAt,
                 contractorSignatureUrl,
             },
         });
-        if (guard.count === 0) throw new Error("Contract already signed by contractor");
+        if (guard.count === 0) {
+            const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+            if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
+            throw new Error("The contract text changed after you opened it — review the current text and sign again.");
+        }
         // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
         await tx.contractSigningRecord.create({
             data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
@@ -5957,9 +6081,8 @@ async function updateExecutedPdfIfFinalized(contractId: string, ip: string | nul
     if (!supabase) return;
 
     // 1. Download original PDF
-    const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(contract.originalPdfPath);
-    if (dlErr || !dl) throw new Error("Could not load original PDF contract");
-    const originalBuffer = Buffer.from(await dl.arrayBuffer());
+    const originalBuffer = await downloadDocBytes(contract.originalPdfPath);
+    if (!originalBuffer) throw new Error("Could not load original PDF contract");
 
     // 2. Generate updated PDF
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
@@ -5996,13 +6119,21 @@ async function updateExecutedPdfIfFinalized(contractId: string, ip: string | nul
 
     // 4. Delete the old file from Storage if it exists
     if (existingFile?.url) {
-        const match = existingFile.url.match(/\/project-files\/(.+)$/);
-        if (match) {
-            const oldStoragePath = decodeURIComponent(match[1]);
+        if (isSecureRef(existingFile.url)) {
             try {
-                await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+                await removeSecureDoc(existingFile.url);
             } catch (removeErr) {
                 console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+            }
+        } else {
+            const match = existingFile.url.match(/\/project-files\/(.+)$/);
+            if (match) {
+                const oldStoragePath = decodeURIComponent(match[1]);
+                try {
+                    await supabase.storage.from(STORAGE_BUCKET).remove([oldStoragePath]);
+                } catch (removeErr) {
+                    console.warn("[updateExecutedPdfIfFinalized] Could not remove old PDF from storage:", removeErr);
+                }
             }
         }
         // Delete the old DB record
@@ -6104,10 +6235,17 @@ export async function approveContract(contractId: string, signatureName: string,
 
     await prisma.$transaction(async (tx) => {
         if (!isRecurring) {
+            // CAS-bind the body we validated (and, when it carries a contractor block, that
+            // the contractor pre-signature still exists) into the transition — text edits now
+            // clear the pre-signature, so without this a contract could flip to Signed over
+            // text the upfront gate never validated, or without the required contractor
+            // signature at commit time.
             const transition = await tx.contract.updateMany({
                 where: {
                     id: contractId,
                     status: { in: ["Draft", "Sent", "Viewed"] },
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
                 },
                 data: {
                     status: "Signed",
@@ -6120,15 +6258,27 @@ export async function approveContract(contractId: string, signatureName: string,
             });
             if (transition.count === 0) {
                 // Already signed — allow finalize retry without overwriting audit data.
-                // If status is anything other than "Signed", the contract is finalized and immutable.
                 const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
                 if (current?.status === "Signed") return;
+                if (current && ["Draft", "Sent", "Viewed"].includes(current.status)) {
+                    // Still signable ⇒ the CAS missed: text was edited (or the contractor
+                    // signature was cleared) between validation and commit.
+                    throw new Error("The contract changed while you were signing — please reload and review the current text.");
+                }
                 throw new Error("Contract is not in a signable state (already finalized)");
             }
         } else {
             const nextDue = new Date(now.getTime() + contract.recurringDays! * 86400000);
-            await tx.contract.update({
-                where: { id: contractId },
+            // Recurring signs tolerate duplicate same-cycle audit rows, but they get the same
+            // content/signature CAS as the one-time branch: both concurrent signers see the
+            // same body so both still match, while an edit (which clears the contractor
+            // pre-signature) between validation and commit makes the CAS miss and rejects.
+            const recurringTransition = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    body: contract.body,
+                    ...(bodyHasContractorBlock(contract.body || "") ? { contractorSignedAt: { not: null } } : {}),
+                },
                 data: {
                     approvedBy: signatureName,
                     approvedAt: now,
@@ -6140,6 +6290,9 @@ export async function approveContract(contractId: string, signatureName: string,
                     nextDueDate: nextDue,
                 }
             });
+            if (recurringTransition.count === 0) {
+                throw new Error("The contract changed while you were signing — please reload and review the current text.");
+            }
         }
 
         // Audit record — inside the same transaction as the state flip, so
@@ -6209,10 +6362,18 @@ export async function approveContract(contractId: string, signatureName: string,
 }
 
 export async function getContractSigningHistory(contractId: string) {
-    return await prisma.contractSigningRecord.findMany({
+    const records = await prisma.contractSigningRecord.findMany({
         where: { contractId },
         orderBy: { signedAt: "desc" },
     });
+    // Called live from the Signing History modal, so resolve here: the client can't turn a
+    // private-bucket `secure:` ref into a loadable URL itself. Legacy values pass through.
+    return await Promise.all(
+        records.map(async (record) => ({
+            ...record,
+            signatureUrl: await resolveDocUrl(record.signatureUrl),
+        })),
+    );
 }
 
 /**
@@ -6321,9 +6482,12 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         const supabase = getSupabase();
         if (!supabase) throw new Error("Storage not configured.");
 
-        const { data: dl, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(after.signedPdfPath);
-        if (dlErr || !dl) throw new Error("Could not load the signed contract PDF.");
-        const clientPdf = Buffer.from(await dl.arrayBuffer());
+        // signedPdfPath is polymorphic: a secure ref for a freshly-uploaded intermediate
+        // (countersign-required, non-PDF contracts), or a legacy bare path when it was set
+        // to the pre-existing originalPdfPath (PDF-contract countersign branch). downloadDocBytes
+        // handles both.
+        const clientPdf = await downloadDocBytes(after.signedPdfPath);
+        if (!clientPdf) throw new Error("Could not load the signed contract PDF.");
 
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
         executedBuffer = await appendContractCountersignaturePage(clientPdf, {
@@ -6346,8 +6510,20 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         executedRecord = archived.record;
         archivedMeta = { publicUrl: archived.publicUrl, fileName: archived.fileName };
 
-        // Drop the now-superseded private intermediate (best-effort).
-        try { await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]); } catch {}
+        // Drop the now-superseded private intermediate (best-effort). For a PDF-contract
+        // countersign, signedPdfPath was set to the SAME value as originalPdfPath (see
+        // finalize/route.ts) — there is no distinct intermediate to remove in that case, and
+        // deleting it would delete the contract's original PDF. Only remove when signedPdfPath
+        // names a genuinely distinct, contract-owned object.
+        try {
+            if (after.signedPdfPath !== after.originalPdfPath) {
+                if (isSecureRef(after.signedPdfPath)) {
+                    await removeSecureDoc(after.signedPdfPath);
+                } else {
+                    await supabase.storage.from(STORAGE_BUCKET).remove([after.signedPdfPath]);
+                }
+            }
+        } catch {}
     } catch (e: any) {
         // Roll back the finalize claim so the admin can retry. companySignedAt stays set (the
         // company DID sign); the retry re-claims and re-archives.
@@ -6414,6 +6590,9 @@ export async function countersignContractAsCompany(contractId: string, signerNam
 // ────────────────────────────────────────────────
 
 export async function getScheduleTasks(projectId: string) {
+    // Hardened (dispatch-arc foundation): internal schedule details require an authenticated team session.
+    const session = await getSessionOrDev();
+    if (!session?.user) throw new Error("Unauthorized");
     return prisma.scheduleTask.findMany({
         where: { projectId },
         orderBy: { order: "asc" },
@@ -6429,7 +6608,226 @@ export async function getScheduleTasks(projectId: string) {
     });
 }
 
+export interface TaskBankResult {
+    estimate: { id: string; code: string } | null;
+    items: {
+        estimateItemId: string;
+        name: string;
+        estimatedHours: number | null;
+    }[];
+    scheduledCount: number;
+    totalCount: number;
+}
+
+export async function getTaskBank(projectId: string): Promise<TaskBankResult> {
+    const session = await getSessionOrDev();
+    if (!session?.user) throw new Error("Unauthorized");
+
+    const estimate = await prisma.estimate.findFirst({
+        ...canonicalContractEstimateQuery(projectId),
+        select: {
+            id: true,
+            code: true,
+            items: {
+                where: { type: { not: "Section" } },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
+                select: {
+                    id: true,
+                    name: true,
+                    quantity: true,
+                    budgetUnit: true,
+                    _count: { select: { subItems: true } },
+                    scheduleTask: { select: { id: true } },
+                },
+            },
+        },
+    });
+    if (!estimate) {
+        return {
+            estimate: null,
+            items: [],
+            scheduledCount: 0,
+            totalCount: 0,
+        };
+    }
+
+    const scheduledCount = estimate.items.filter(item => Boolean(item.scheduleTask)).length;
+    return {
+        estimate: { id: estimate.id, code: estimate.code },
+        items: estimate.items
+            .filter(item => !item.scheduleTask)
+            .map(item => ({
+                estimateItemId: item.id,
+                name: item.name,
+                estimatedHours: deriveEstimateItemHours({
+                    quantity: item.quantity,
+                    budgetUnit: item.budgetUnit,
+                    childCount: item._count.subItems,
+                }),
+            })),
+        scheduledCount,
+        totalCount: estimate.items.length,
+    };
+}
+
+function serializeScheduleTaskForDetail(task: any) {
+    return {
+        id: task.id,
+        projectId: task.projectId,
+        name: task.name,
+        startDate: task.startDate.toISOString().slice(0, 10),
+        endDate: task.endDate.toISOString().slice(0, 10),
+        color: task.color,
+        progress: task.progress,
+        estimatedHours: task.estimatedHours,
+        assignee: task.assignee,
+        parentId: task.parentId,
+        estimateItemId: task.estimateItemId ?? null,
+        order: task.order,
+        status: task.status,
+        type: task.type,
+        doneWhen: task.doneWhen ?? null,
+        blockedReason: task.blockedReason ?? null,
+        scheduledTime: task.scheduledTime ?? null,
+        confirmationStatus: task.confirmationStatus ?? null,
+        actualHours: task.timeEntries.reduce((sum: number, entry: { durationHours: number }) => sum + entry.durationHours, 0),
+        dependencies: task.dependencies,
+        dependents: task.dependents,
+        timeEntries: task.timeEntries,
+        assignments: task.assignments,
+        subAssignments: task.subAssignments,
+        estimateItem: task.estimateItem ? { ...task.estimateItem, total: Number(task.estimateItem.total) } : null,
+    };
+}
+
+export async function getScheduleTaskDetail(taskId: string) {
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    const tasks = await prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { order: "asc" },
+        include: {
+            dependencies: true,
+            dependents: true,
+            timeEntries: { select: { durationHours: true } },
+            assignments: { include: { user: { select: { id: true, name: true, email: true } } } },
+            subAssignments: { include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } } },
+            estimateItem: { select: { id: true, name: true, type: true, total: true, estimateId: true, quantity: true, budgetUnit: true } },
+        },
+    });
+    const task = tasks.find((candidate: any) => candidate.id === taskId);
+    if (!task) throw new Error("Task not found");
+    return {
+        ...serializeScheduleTaskForDetail(task),
+        allTasks: tasks.map(serializeScheduleTaskForDetail),
+    };
+}
+
+export async function getTaskMaterials(taskId: string) {
+    const { user } = await assertScheduleTaskAccess(taskId);
+    const rows = await getTaskMaterialsCore(taskId);
+    return rows.map(row => ({
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    }));
+}
+
+export async function addTaskMaterial(taskId: string, input: TaskMaterialInput) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const row = await addTaskMaterialCore({
+        taskId,
+        input,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function updateTaskMaterial(materialId: string, input: TaskMaterialUpdateInput) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const row = await updateTaskMaterialCore({
+        materialId,
+        input,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function setTaskMaterialStatus(
+    materialId: string,
+    status: TaskMaterialStatus,
+    resolutionNote?: string | null,
+) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const row = await setTaskMaterialStatusCore({
+        materialId,
+        status,
+        resolutionNote,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return {
+        ...row,
+        canDelete: ["ADMIN", "MANAGER"].includes(user.role) || row.createdById === user.id,
+    };
+}
+
+export async function deleteTaskMaterial(materialId: string) {
+    const material = await prisma.taskMaterial.findUnique({
+        where: { id: materialId },
+        select: { taskId: true },
+    });
+    if (!material) throw new Error("Material not found");
+    const { user, projectId } = await assertScheduleTaskAccess(material.taskId);
+    const result = await deleteTaskMaterialCore({
+        materialId,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return result;
+}
+
+export async function importEstimateMaterials(taskId: string) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const result = await importEstimateMaterialsCore({
+        taskId,
+        actor: taskMaterialActor(user),
+    });
+    revalidateTaskMaterialPaths(projectId);
+    return result;
+}
+
+export async function getStagingQueue(dayISO: string) {
+    await assertStagingQueueAccess();
+    return getStagingQueueCore(dayISO);
+}
+
+export async function getPortalScheduleTasks(projectId: string) {
+    // Client-safe allowlist shared by the simple tracker and the full schedule.
+    await assertPortalProjectAccess(projectId, "showSchedule");
+    return getPortalScheduleTasksCore(projectId);
+}
+
 export async function getDashboardTasks(projectId: string) {
+    // Hardened (dispatch-arc foundation): dashboard task summaries require an authenticated team session.
+    const session = await getSessionOrDev();
+    if (!session?.user) throw new Error("Unauthorized");
     return prisma.scheduleTask.findMany({
         where: { projectId },
         orderBy: { order: "asc" },
@@ -6512,100 +6910,76 @@ export async function updateTaskStatusAsSub(taskId: string, subcontractorId: str
     return task;
 }
 
-export async function createScheduleTask(projectId: string, data: {
-    name: string;
-    startDate: string;
-    endDate: string;
-    color?: string;
-    status?: string;
-    assignee?: string;
-    parentId?: string;
-    type?: string;
-}) {
-    const maxOrder = await prisma.scheduleTask.aggregate({
-        where: { projectId },
-        _max: { order: true },
-    });
-    const isMilestone = data.type === "milestone";
-    const task = await prisma.scheduleTask.create({
-        data: {
+type TaskCommentAuthor = {
+    userId: string | null;
+    fallbackLabel: string;
+};
+
+async function resolveTaskCommentAuthor(): Promise<TaskCommentAuthor> {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    const sessionName = (session?.user?.name as string | null) ?? null;
+    const sessionEmail = (session?.user?.email as string | null) ?? null;
+    let userId: string | null = null;
+    if (sessionUserId) {
+        userId = (await prisma.user.findUnique({ where: { id: sessionUserId }, select: { id: true } }))?.id ?? null;
+    }
+    return { userId, fallbackLabel: sessionName ?? sessionEmail ?? "Unknown" };
+}
+
+function buildTaskCommentCreateData(taskId: string, text: string, author: TaskCommentAuthor, photoUrls?: string[]) {
+    const cleanPhotoUrls = (photoUrls ?? []).filter(url => typeof url === "string" && url.length > 0).slice(0, 10);
+    return {
+        taskId,
+        text,
+        userId: author.userId,
+        subcontractorName: author.userId ? null : author.fallbackLabel,
+        photos: cleanPhotoUrls.length > 0 ? { create: cleanPhotoUrls.map(url => ({ url })) } : undefined,
+    };
+}
+
+export async function createScheduleTask(projectId: string, data: CreateScheduleTaskInput) {
+    const user = await assertScheduleProjectAccess(projectId);
+    const note = data.note?.trim() || null;
+    const commentAuthor = note ? await resolveTaskCommentAuthor() : null;
+    const task = await withTxRetry(() => prisma.$transaction(tx =>
+        createScheduleTaskInTransaction(
+            tx,
             projectId,
-            name: data.name,
-            startDate: new Date(data.startDate),
-            endDate: isMilestone ? new Date(data.startDate) : new Date(data.endDate),
-            color: data.color || getDefaultColorForTaskName(data.name) || "#4c9a2a",
-            status: data.status || "Not Started",
-            assignee: data.assignee || null,
-            parentId: data.parentId || null,
-            order: (maxOrder._max.order ?? -1) + 1,
-            type: data.type || "task",
-        },
-    });
+            data,
+            { type: "TEAM", name: user.name || user.email },
+            commentAuthor,
+        ),
+    ));
+    revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${projectId}/schedule`);
     return task;
 }
 
-export async function updateScheduleTask(taskId: string, data: {
-    name?: string;
-    startDate?: string;
-    endDate?: string;
-    color?: string;
-    progress?: number;
-    status?: string;
-    assignee?: string;
-    order?: number;
-    estimatedHours?: number | null;
-    type?: string;
-    estimateItemId?: string | null;
-}) {
-    const updateData: any = {};
-    if (data.name !== undefined) updateData.name = data.name;
-    if (data.startDate !== undefined) updateData.startDate = new Date(data.startDate);
-    if (data.endDate !== undefined) updateData.endDate = new Date(data.endDate);
-    if (data.color !== undefined) updateData.color = data.color;
-    if (data.progress !== undefined) updateData.progress = data.progress;
-    if (data.status !== undefined) updateData.status = data.status;
-    if (data.assignee !== undefined) updateData.assignee = data.assignee;
-    if (data.order !== undefined) updateData.order = data.order;
-    if (data.estimatedHours !== undefined) updateData.estimatedHours = data.estimatedHours;
-    if (data.type !== undefined) updateData.type = data.type;
-    if (data.estimateItemId !== undefined) {
-        updateData.estimateItemId = data.estimateItemId;
-        if (data.estimateItemId) {
-            const existing = await prisma.scheduleTask.findFirst({
-                where: { estimateItemId: data.estimateItemId, id: { not: taskId } },
-                select: { id: true, name: true },
-            });
-            if (existing) throw new Error(`Already linked to "${existing.name}"`);
-            const item = await prisma.estimateItem.findUnique({
-                where: { id: data.estimateItemId },
-                select: { type: true, quantity: true, budgetUnit: true },
-            });
-            if (item && (item.type === "Labor" || item.budgetUnit === "hours")) {
-                updateData.estimatedHours = item.quantity || null;
-            }
-        }
-    }
-    // Milestones always have same start and end date
-    if (data.type === "milestone" && updateData.startDate) {
-        updateData.endDate = updateData.startDate;
-    }
-
-    const task = await prisma.scheduleTask.update({
-        where: { id: taskId },
-        data: updateData,
-    });
-    revalidatePath(`/projects/${task.projectId}/schedule`);
+export async function updateScheduleTask(taskId: string, data: UpdateScheduleTaskInput) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const task = await withTxRetry(() => prisma.$transaction(tx =>
+        updateScheduleTaskInTransaction(
+            tx,
+            taskId,
+            data,
+            { type: "TEAM", name: user.name || user.email },
+            projectId,
+        ),
+    ));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
     return task;
 }
-
 export async function deleteScheduleTask(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
 }
 
 export async function reorderScheduleTasks(projectId: string, orderedIds: string[]) {
+    await assertScheduleProjectAccess(projectId);
     if (new Set(orderedIds).size !== orderedIds.length) {
         throw new Error("Duplicate task IDs in reorder request");
     }
@@ -6632,6 +7006,11 @@ export async function reorderScheduleTasks(projectId: string, orderedIds: string
 }
 
 export async function linkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     const dep = await prisma.taskDependency.create({
         data: { predecessorId, dependentId },
     });
@@ -6641,6 +7020,11 @@ export async function linkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function unlinkTasks(predecessorId: string, dependentId: string) {
+    const [predecessor, dependent] = await Promise.all([
+        assertScheduleTaskAccess(predecessorId),
+        assertScheduleTaskAccess(dependentId),
+    ]);
+    if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
     await prisma.taskDependency.deleteMany({
         where: { predecessorId, dependentId },
     });
@@ -6650,106 +7034,33 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
     await assertEstimatePermission();
-    const estimate = await prisma.estimate.findUnique({
-        where: { id: estimateId },
-        include: {
-            items: {
-                where: { parentId: null },
-                orderBy: { order: "asc" },
-                include: {
-                    subItems: { orderBy: { order: "asc" } },
-                },
-            },
-        },
+    // Rewired through the schedule-core generator (PB-pipeline-002): one
+    // shared precondition/idempotency path for estimate — schedule.
+    // Merge mode skips already task-linked items. Response shape preserved
+    // for existing callers: the created task rows.
+    const result = await generateScheduleFromEstimate({
+        estimateId,
+        mode: "merge",
+        actor: { type: "TEAM", name: "Team" },
     });
-    if (!estimate || estimate.items.length === 0) return [];
-
-    const maxOrder = await prisma.scheduleTask.aggregate({
-        where: { projectId },
-        _max: { order: true },
-    });
-    let order = (maxOrder._max.order ?? -1) + 1;
-
-    const TYPE_COLORS: Record<string, string> = {
-        Material: "#3b82f6",
-        Labor: "#f59e0b",
-        Subcontractor: "#8b5cf6",
-    };
-
-    const today = new Date();
-    const created = [];
-    let dayOffset = 0;
-
-    for (const item of estimate.items) {
-        // Calculate estimated hours from labor items
-        let estimatedHours: number | null = null;
-        if (item.type === "Labor") {
-            // Top-level is labor — use its quantity as hours
-            estimatedHours = item.quantity || null;
-        } else if (item.subItems && item.subItems.length > 0) {
-            // Parent group — sum labor sub-item quantities as hours
-            const laborHours = item.subItems
-                .filter((si: any) => si.type === "Labor")
-                .reduce((sum: number, si: any) => sum + (si.quantity || 0), 0);
-            if (laborHours > 0) estimatedHours = laborHours;
-        }
-
-        const duration = item.type === "Labor" ? 7 : item.type === "Subcontractor" ? 10 : 5;
-        const startDate = new Date(today.getTime() + dayOffset * 86400000);
-        const endDate = new Date(today.getTime() + (dayOffset + duration) * 86400000);
-        dayOffset += Math.ceil(duration * 0.7);
-
-        const alreadyLinked = await prisma.scheduleTask.findFirst({
-            where: { estimateItemId: item.id }, select: { id: true },
-        });
-        const task = await prisma.scheduleTask.create({
-            data: {
-                projectId,
-                name: item.name,
-                startDate,
-                endDate,
-                color: getDefaultColorForTaskName(item.name) || TYPE_COLORS[item.type] || "#4c9a2a",
-                order: order++,
-                status: "Not Started",
-                estimatedHours,
-                estimateItemId: alreadyLinked ? null : item.id,
-            },
-        });
-        created.push(task);
-    }
-
     revalidatePath(`/projects/${projectId}/schedule`);
-    return created;
+    return result.created;
 }
-
 
 // ========== TASK COMMENTS ==========
 
 export async function addTaskComment(taskId: string, text: string, photoUrls?: string[]) {
+    // Hardened (owner-feedback round, item 3): this action had no auth check
+    // at all — any caller could comment on any task. Same gate every other
+    // per-task schedule mutation in this file uses (schedules permission +
+    // project access), now also the entry point for the schedule board's
+    // hover-card "Add note…".
+    await assertScheduleTaskAccess(taskId);
     // Derive identity from the session — never trust a client-supplied userId.
-    const session = await getSessionOrDev();
-    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
-    const sessionName = (session?.user?.name as string | null) ?? null;
-    const sessionEmail = (session?.user?.email as string | null) ?? null;
-
-    let resolvedUser: { id: string; name: string | null; email: string } | null = null;
-    if (sessionUserId) {
-        resolvedUser = await prisma.user.findUnique({
-            where: { id: sessionUserId },
-            select: { id: true, name: true, email: true },
-        });
-    }
-    const fallbackLabel = sessionName ?? sessionEmail ?? "Unknown";
-    const cleanPhotoUrls = (photoUrls ?? []).filter(u => typeof u === "string" && u.length > 0).slice(0, 10);
+    const author = await resolveTaskCommentAuthor();
 
     const comment = await prisma.taskComment.create({
-        data: {
-            taskId,
-            text,
-            userId: resolvedUser?.id ?? null,
-            subcontractorName: resolvedUser ? null : fallbackLabel,
-            photos: cleanPhotoUrls.length > 0 ? { create: cleanPhotoUrls.map(url => ({ url })) } : undefined,
-        },
+        data: buildTaskCommentCreateData(taskId, text, author, photoUrls),
         include: {
             user: { select: { id: true, name: true, email: true } },
             photos: { orderBy: { createdAt: "asc" } },
@@ -6926,24 +7237,53 @@ export async function getTaskPunchItems(taskId: string) {
 // ========== TASK ASSIGNMENTS ==========
 
 export async function assignUserToTask(taskId: string, userId: string) {
-    const assignment = await prisma.taskAssignment.create({
-        data: { taskId, userId },
-        include: { user: { select: { id: true, name: true, email: true } } },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    const assignment = await withTxRetry(() => prisma.$transaction(async tx => {
+        await lockTaskAssignmentParent(tx, taskId, projectId);
+        const user = await tx.user.findUnique({ where: { id: userId }, select: { status: true } });
+        if (!user || user.status !== "ACTIVATED") throw new Error("Task crew members must be ACTIVATED users");
+        const created = await tx.taskAssignment.create({
+            data: { taskId, userId },
+            include: { user: { select: { id: true, name: true, email: true } } },
+        });
+        await touchTaskAssignmentRevision(tx, taskId);
+        return created;
+    }));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
     return assignment;
 }
 
 export async function unassignUserFromTask(taskId: string, userId: string) {
-    await prisma.taskAssignment.deleteMany({
-        where: { taskId, userId },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: taskId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    await withTxRetry(() => prisma.$transaction(async tx => {
+        await lockTaskAssignmentParent(tx, taskId, projectId);
+        const deleted = await tx.taskAssignment.deleteMany({
+            where: { taskId, userId },
+        });
+        if (deleted.count > 0) await touchTaskAssignmentRevision(tx, taskId);
+    }));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
 }
 
+export async function setTaskLead(taskId: string, userId: string | null) {
+    const { user, projectId } = await assertScheduleTaskAccess(taskId);
+    const assignments = await withTxRetry(() => prisma.$transaction(tx =>
+        setTaskLeadInTransaction(
+            tx,
+            taskId,
+            userId,
+            { type: "TEAM", name: user.name || user.email },
+            projectId,
+        ),
+    ));
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return assignments;
+}
 export async function assignSubToTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     const assignment = await prisma.subTaskAssignment.create({
         data: { taskId, subcontractorId },
         include: { subcontractor: { select: { id: true, companyName: true, email: true, trade: true } } },
@@ -6954,6 +7294,7 @@ export async function assignSubToTask(taskId: string, subcontractorId: string) {
 }
 
 export async function unassignSubFromTask(taskId: string, subcontractorId: string) {
+    await assertScheduleTaskAccess(taskId);
     await prisma.subTaskAssignment.deleteMany({
         where: { taskId, subcontractorId },
     });
@@ -7144,12 +7485,44 @@ export async function getTeamMembers() {
     });
 }
 
+export async function getScheduleCrewMembers() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "schedules")) throw new Error("Forbidden");
+    return prisma.user.findMany({
+        where: { status: "ACTIVATED", role: "FIELD_CREW" },
+        orderBy: { name: "asc" },
+        select: { id: true, name: true, email: true },
+    });
+}
+
 export async function clearAllTasks(projectId: string) {
-    // Delete all related data first (dependencies, comments, punch items, assignments)
-    const taskIds = (await prisma.scheduleTask.findMany({ where: { projectId }, select: { id: true } })).map(t => t.id);
-    if (taskIds.length === 0) return;
-    await prisma.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
-    await prisma.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
+    await assertScheduleProjectAccess(projectId);
+    await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const taskRows = await tx.$queryRaw<{ id: string }[]>`
+            SELECT "id"
+            FROM "ScheduleTask"
+            WHERE "projectId" = ${projectId}
+            ORDER BY "id"
+            FOR UPDATE
+        `;
+        const taskIds = taskRows.map(task => task.id);
+        if (taskIds.length === 0) return;
+        const assignedTaskIds = (await tx.taskAssignment.findMany({
+            where: { taskId: { in: taskIds } },
+            distinct: ["taskId"],
+            select: { taskId: true },
+        })).map(row => row.taskId);
+        await tx.taskAssignment.deleteMany({ where: { taskId: { in: taskIds } } });
+        if (assignedTaskIds.length > 0) {
+            await tx.scheduleTask.updateMany({
+                where: { id: { in: assignedTaskIds } },
+                data: { updatedAt: new Date() },
+            });
+        }
+        await tx.taskComment.deleteMany({ where: { taskId: { in: taskIds } } });
+    }));
+    revalidatePath("/company-dashboard");
     revalidatePath(`/projects/${projectId}/schedule`);
 }
 
@@ -7163,6 +7536,20 @@ export async function getActiveSubcontractors() {
 
 // ========== PROJECT BOARD ACTIONS ==========
 
+// Company-board authorization adapter only. updateScheduleTask remains the
+// single validation, locking, mutation, audit, and revalidation capability.
+export async function updateCompanyScheduleTaskDatesAction(taskId: string, dates: {
+    startDate: string;
+    endDate: string;
+}) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    return updateScheduleTask(taskId, dates);
+}
+
 export async function updateProjectStatus(projectId: string, status: string) {
     await assertActiveStaff();
     await prisma.project.update({
@@ -7174,7 +7561,298 @@ export async function updateProjectStatus(projectId: string, status: string) {
     return { success: true };
 }
 
+// Move a project's company-level start date from the dashboard's waiting-to-start
+// table. Thin wrapper over schedule-core (which owns the shift rules + ActivityLog);
+// ADMIN/MANAGER only, same inline role check as the other project actions.
+export async function updateProjectStartDateAction(projectId: string, startDateISO: string | null, shiftJobTasks: boolean) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectStartDate({
+        projectId,
+        startDate: startDateISO ? parseStartDateInput(startDateISO) : null,
+        shiftJobTasks,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
+}
+
+// Set (or clear) a project's target end date — an IMMEDIATE write, unlike
+// task/project START dates on the company board, which route through the
+// draft-mode system (see ScheduleBoard.tsx). ADMIN/MANAGER only, same gate
+// pattern as updateProjectStartDateAction.
+//
+// Project.endDate feeds getEffectiveProjectRange (bar rendering, see
+// useBarLayout.ts) AND effectiveWorkEnd (schedule-core.ts — CO placement +
+// the project-window conflict rule) via the same raw value — moving it
+// changes where future CO blocks land. That's intentional, not a bug.
+export async function updateProjectEndDateAction(projectId: string, endDateISO: string | null) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+
+    const endDate = endDateISO ? parseStartDateInput(endDateISO) : null;
+    // Same lock family as setProjectStartDate: validate against the LOCKED
+    // startDate so a concurrent start move can't slip past the invariant.
+    const project = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const locked = await tx.project.findUnique({
+            where: { id: projectId },
+            select: { id: true, name: true, startDate: true, endDate: true },
+        });
+        if (!locked) throw new Error("Project not found");
+        if (endDate && locked.startDate && endDate.getTime() <= locked.startDate.getTime()) {
+            throw new Error("End date must be after the project's start date");
+        }
+        await tx.project.update({ where: { id: projectId }, data: { endDate } });
+        return locked;
+    }));
+    await prisma.activityLog.create({
+        data: {
+            projectId,
+            actorType: "TEAM",
+            actorName: caller.name || caller.email,
+            action: "set_project_end_date",
+            entityType: "project",
+            entityId: projectId,
+            entityName: project.name,
+            metadata: JSON.stringify({
+                previousEndDate: project.endDate ? project.endDate.toISOString() : null,
+                endDate: endDate ? endDate.toISOString() : null,
+            }),
+        },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return { projectId, endDate: endDate ? endDate.toISOString() : null };
+}
+
+// Shift unfinished work on an active project without moving its company-level
+// start marker or any payment milestone. ADMIN/MANAGER only.
+export async function shiftNotStartedTasksAction(projectId: string, deltaDays: number): Promise<ShiftNotStartedTasksResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await shiftNotStartedTasks({
+        projectId,
+        deltaDays,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath("/projects");
+    return result;
+}
+
+// Generate a project's schedule from its most recent qualifying estimate
+// (the same deterministic selection contractValue uses). ADMIN/MANAGER only.
+export async function generateProjectScheduleAction(projectId: string) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+
+    const estimate = await prisma.estimate.findFirst({
+        ...canonicalContractEstimateQuery(projectId),
+        select: { id: true },
+    });
+    if (!estimate) throw new Error("No Approved, Invoiced, Partially Paid, or Paid estimate on this project yet — approve an estimate first.");
+
+    const result = await generateScheduleFromEstimate({
+        estimateId: estimate.id,
+        mode: "merge",
+        requireEmptyProject: true,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${projectId}/schedule`);
+    return result;
+}
+
+// Replace a project's crew from the dashboard picker. ADMIN/MANAGER only;
+// the core validates every id is an ACTIVATED user.
+export async function updateProjectCrewAction(projectId: string, userIds: string[]) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setProjectCrew({
+        projectId,
+        userIds,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    return result;
+}
+
+export async function applyChangeOrderToScheduleAction(changeOrderId: string, mode: "merge" | "regenerate" = "merge") {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await applyChangeOrderToSchedule({
+        changeOrderId,
+        mode,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
+    return result;
+}
+
+export async function updateTaskCrewAction(taskId: string, userIds: string[]) {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const result = await setTaskCrew({
+        taskId,
+        userIds,
+        actor: { type: "TEAM", name: caller.name || caller.email },
+    });
+    revalidatePath("/company-dashboard");
+    revalidatePath(`/projects/${result.projectId}/schedule`);
+    return result;
+}
+
+export interface SaveCompanyScheduleTaskDatesInput {
+    taskId: string;
+    startDate: string; // YYYY-MM-DD
+    endDate: string;   // YYYY-MM-DD
+}
+
+export interface PublishDispatchActionInput {
+    clientRequestId: string;
+    intents: DispatchIntent[];
+    dryRun?: boolean;
+}
+
+export async function publishDispatchAction(
+    input: PublishDispatchActionInput,
+): Promise<PublishDispatchResult> {
+    // Same session helper as every other hardened schedule mutation — the
+    // dev fallback only exists under NODE_ENV=development.
+    const session = await getSessionOrDev();
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({
+            where: { email: session.user.email },
+            select: { id: true, role: true, status: true, name: true, email: true },
+        })
+        : null;
+    if (!caller || caller.status !== "ACTIVATED" || !["ADMIN", "MANAGER"].includes(caller.role)) {
+        return {
+            ok: false,
+            code: "FORBIDDEN",
+            message: "You do not have permission to queue a dispatch.",
+            conflicts: [],
+        };
+    }
+
+    return publishDispatch({
+        clientRequestId: input.clientRequestId,
+        intents: input.intents,
+        dryRun: input.dryRun,
+        actor: {
+            userId: caller.id,
+            name: caller.name || caller.email,
+        },
+    }).then(result => {
+        if (result.ok && result.publicationId) {
+            revalidatePath("/company-dashboard");
+        }
+        return result;
+    }).catch(error => {
+        console.error("Dispatch publication failed", error);
+        return {
+            ok: false as const,
+            code: "DISPATCH_FAILED" as const,
+            message: "Nothing was queued. Please try again with the same review.",
+            conflicts: [],
+        };
+    });
+}
+
+export interface SaveCompanyScheduleTaskDateResult {
+    taskId: string;
+    ok: boolean;
+    startDate?: string;
+    endDate?: string;
+    error?: string;
+}
+
+export interface SaveCompanyScheduleTaskDatesResult {
+    results: SaveCompanyScheduleTaskDateResult[];
+    succeeded: number;
+    failed: number;
+}
+
+// Commit the company schedule board's draft-mode edits in one batch. ADMIN/
+// MANAGER only, same gate as the other dashboard batch actions. Loops the
+// canonical updateScheduleTask per task — deliberately NOT a second mutation
+// core — so every existing lock/validation/ActivityLog path applies
+// unchanged. One task's failure never blocks the rest: each change is applied
+// independently and reported in `results`, so the client can clear succeeded
+// drafts and keep failed ones pending for retry.
+export async function saveCompanyScheduleTaskDatesAction(
+    changes: SaveCompanyScheduleTaskDatesInput[],
+): Promise<SaveCompanyScheduleTaskDatesResult> {
+    const session = await getServerSession(authOptions);
+    const caller = session?.user?.email
+        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true, email: true } })
+        : null;
+    if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    if (changes.length > 200) throw new Error("Too many schedule changes in one save (max 200) — save in smaller batches");
+    // Deterministic dedupe: the LAST occurrence of a taskId wins and is applied
+    // exactly once (no duplicate activity records or inflated success counts).
+    const deduped = [...new Map(changes.map(change => [change.taskId, change])).values()];
+
+    const results: SaveCompanyScheduleTaskDateResult[] = [];
+    for (const change of deduped) {
+        try {
+            const task = await updateScheduleTask(change.taskId, {
+                startDate: change.startDate,
+                endDate: change.endDate,
+            });
+            results.push({
+                taskId: change.taskId,
+                ok: true,
+                startDate: task.startDate.toISOString(),
+                endDate: task.endDate.toISOString(),
+            });
+        } catch (err: any) {
+            results.push({ taskId: change.taskId, ok: false, error: err?.message ?? String(err) });
+        }
+    }
+
+    return {
+        results,
+        succeeded: results.filter(r => r.ok).length,
+        failed: results.filter(r => !r.ok).length,
+    };
+}
+
+// PB-schedule-002 item 2: this action previously had NO auth check at all
+// (not even assertActiveStaff) and, as of this change, no UI caller in the
+// repo either — tightened to the same schedule-permission gate as the other
+// per-project schedule mutations (deleteScheduleTask, reorderScheduleTasks,
+// etc.) rather than the weaker assertActiveStaff, since the company
+// schedule board's Color… menu item is schedules-scoped. The board's canEdit
+// is ADMIN/MANAGER-only (schedule-core.ts), and both hasPermission and
+// canAccessProject auto-pass ADMIN/MANAGER, so this is a no-op for that
+// caller.
 export async function updateProjectColor(projectId: string, color: string) {
+    await assertScheduleProjectAccess(projectId);
     await prisma.project.update({
         where: { id: projectId },
         data: { color }
@@ -7296,6 +7974,10 @@ export async function markClientMessagesRead(entityId: string, entityType: "lead
 
 
 export async function toggleSchedulePublished(projectId: string, published: boolean) {
+    // Hardened (dispatch-arc foundation): only ADMIN/MANAGER sessions may change client schedule visibility.
+    const session = await getSessionOrDev();
+    const role = ((session?.user as any)?.role as string | null) ?? null;
+    if (!role || !["ADMIN", "MANAGER"].includes(role)) throw new Error("Forbidden");
     const existing = await prisma.portalVisibility.findUnique({ where: { projectId } });
     if (existing) {
         await prisma.portalVisibility.update({ where: { projectId }, data: { showSchedule: published } });
@@ -7803,7 +8485,7 @@ export async function approveChangeOrder(id: string, signatureName: string, user
         const runAutomation = async () => {
             try {
                 const { handleChangeOrderApproved } = await import("./billing-core");
-                await handleChangeOrderApproved(id);
+                await handleChangeOrderApproved(id, { freshlyApproved: true });
             } catch (err) {
                 console.error("[approveChangeOrder] post-approval automation failed:", err);
             }
@@ -8830,13 +9512,506 @@ export async function getSelectionBoardsForPortal(projectId: string) {
     });
 }
 
+// =============================================
+// Product Library, Clipper, Client Selection Proposals
+// (docs/specs/product-library-portal-selections.md)
+// =============================================
+
+/**
+ * Ownership + visibility assertion for the portal-facing product-library
+ * actions below (all gated on the Selections tab: proposals and favorites).
+ * Mirrors the exact check order the portal selections page.tsx and
+ * /api/portal/files route use — visibility gate first, applied uniformly to
+ * staff AND client (no staff bypass here, matching how this feature area's
+ * own pages/routes read PortalVisibility; that's a different convention from
+ * assertPortalProjectAccessCore's staff-bypass, which is scoped to the
+ * schedule/daily-logs areas) — then staff-bypass + resolveSessionClientId +
+ * project-ownership for the client path.
+ */
+async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
+    const visibility = await getPortalVisibility(projectId);
+    if (!visibility.isPortalEnabled || !visibility.showSelections) throw new Error("Unauthorized");
+
+    const session = await getSessionOrDev();
+    const role = (session?.user as { role?: string } | undefined)?.role;
+    const isStaff = role === "ADMIN" || role === "MANAGER";
+    if (isStaff) return { isStaff: true, clientId: null };
+
+    const clientId = await resolveSessionClientId();
+    if (!clientId) throw new Error("Unauthorized");
+    const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
+    if (!project) throw new Error("Unauthorized");
+    return { isStaff: false, clientId };
+}
+
+/** Persist boundary for any stored vendorUrl/imageUrl: only a plain http(s)
+ * URL is ever written — a scraped page, Gemini's output, or a client-typed
+ * "Photo URL" field could otherwise smuggle a javascript:/data: URL into the
+ * DB, which would execute if a render site ever put it straight into href/img
+ * src. Render sites additionally guard with the same isHttpUrl() check
+ * (belt-and-suspenders — see ClientSuggestions.tsx etc.), but nothing unsafe
+ * should reach the database in the first place. */
+function safeUrlOrNull(url: string | null | undefined): string | null {
+    return isHttpUrl(url) ? url : null;
+}
+
+// ── Product Library CRUD (team) ─────────────────────────────────────────────
+
+export async function createProductLibraryItem(data: {
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendor?: string;
+    vendorUrl?: string;
+    category?: string;
+    source?: "clip" | "manual";
+}) {
+    const user = await assertActiveStaff();
+    const name = data.name?.trim();
+    if (!name) throw new Error("Name is required");
+
+    const item = await prisma.productLibraryItem.create({
+        data: {
+            name,
+            description: data.description?.trim() || null,
+            imageUrl: safeUrlOrNull(data.imageUrl),
+            price: data.price ?? null,
+            vendor: data.vendor?.trim() || null,
+            vendorUrl: safeUrlOrNull(data.vendorUrl),
+            category: data.category?.trim() || null,
+            source: data.source || "manual",
+            clippedById: user.id,
+        },
+    });
+    revalidatePath("/company/product-library");
+    return item;
+}
+
+export async function updateProductLibraryItem(id: string, data: {
+    name?: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendor?: string;
+    vendorUrl?: string;
+    category?: string;
+}) {
+    await assertActiveStaff();
+    const item = await prisma.productLibraryItem.update({
+        where: { id },
+        data: {
+            ...(data.name !== undefined && { name: data.name.trim() }),
+            ...(data.description !== undefined && { description: data.description?.trim() || null }),
+            ...(data.imageUrl !== undefined && { imageUrl: safeUrlOrNull(data.imageUrl) }),
+            ...(data.price !== undefined && { price: data.price }),
+            ...(data.vendor !== undefined && { vendor: data.vendor?.trim() || null }),
+            ...(data.vendorUrl !== undefined && { vendorUrl: safeUrlOrNull(data.vendorUrl) }),
+            ...(data.category !== undefined && { category: data.category?.trim() || null }),
+        },
+    });
+    revalidatePath("/company/product-library");
+    return item;
+}
+
+export async function deleteProductLibraryItem(id: string) {
+    await assertActiveStaff();
+    await prisma.productLibraryItem.delete({ where: { id } });
+    revalidatePath("/company/product-library");
+    return { success: true };
+}
+
+export async function getProductLibrary(filter?: { search?: string; category?: string }) {
+    await assertActiveStaff();
+    const where: any = {};
+    if (filter?.category) where.category = filter.category;
+    if (filter?.search?.trim()) {
+        const q = filter.search.trim();
+        where.OR = [
+            { name: { contains: q, mode: "insensitive" } },
+            { vendor: { contains: q, mode: "insensitive" } },
+            { category: { contains: q, mode: "insensitive" } },
+        ];
+    }
+    return prisma.productLibraryItem.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+// ── Project Favorites (team + portal read) ──────────────────────────────────
+
+export async function addProjectFavorite(projectId: string, productId: string, note?: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    const favorite = await prisma.projectProductFavorite.upsert({
+        where: { projectId_productId: { projectId, productId } },
+        update: { note: note?.trim() || null },
+        create: { projectId, productId, note: note?.trim() || null, addedById: user.id, addedByClient: false },
+    });
+    revalidatePath(`/projects/${projectId}/selections`);
+    return favorite;
+}
+
+export async function removeProjectFavorite(projectId: string, productId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    await prisma.projectProductFavorite.deleteMany({ where: { projectId, productId } });
+    revalidatePath(`/projects/${projectId}/selections`);
+    return { success: true };
+}
+
+export async function getProjectFavorites(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.projectProductFavorite.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { product: true },
+    });
+}
+
+export async function getProjectFavoritesForPortal(projectId: string) {
+    await assertPortalProjectOwnership(projectId);
+    return prisma.projectProductFavorite.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { product: true },
+    });
+}
+
+// ── Client Selection Proposals ("Client suggestions") ───────────────────────
+
+export async function submitSelectionProposal(projectId: string, data: {
+    url?: string;
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    clientNote?: string;
+}) {
+    await assertPortalProjectOwnership(projectId);
+
+    const manualName = data.name?.trim();
+    const url = data.url?.trim();
+    if (!manualName && !url) throw new Error("A name or a product link is required");
+
+    // Parse server-side so price is captured even though it's never returned
+    // to the client here. Never throws — degrades to {vendorUrl, name: null}.
+    let parsed: Awaited<ReturnType<typeof parseProductUrl>> | null = null;
+    if (url) {
+        parsed = await parseProductUrl(url);
+    }
+
+    const name = (manualName || parsed?.name || "Suggested item").slice(0, 200);
+
+    const proposal = await prisma.selectionProposal.create({
+        data: {
+            projectId,
+            name,
+            description: data.description?.trim() || parsed?.description || null,
+            imageUrl: safeUrlOrNull(data.imageUrl) || safeUrlOrNull(parsed?.imageUrl),
+            price: parsed?.price ?? null,
+            vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
+            clientNote: data.clientNote?.trim() || null,
+            status: "Pending",
+        },
+    });
+
+    const project = await prisma.project.findUnique({ where: { id: projectId }, include: { client: true } });
+
+    // Notify the team — same recipient/pattern as submitClientSelections.
+    const settings = await getCachedCompanySettings();
+    if (settings.notificationEmail && project) {
+        await sendNotification(
+            settings.notificationEmail,
+            `💡 New Client Suggestion — ${project.name}`,
+            `<div style="font-family: sans-serif; color: #333;">
+                <h3>New Selection Suggestion</h3>
+                <p><strong>${project.client?.name || "Client"}</strong> suggested an item for project <strong>${project.name}</strong>:</p>
+                <ul>
+                    <li><strong>${name}</strong></li>
+                    ${proposal.vendorUrl ? `<li><a href="${proposal.vendorUrl}">${proposal.vendorUrl}</a></li>` : ""}
+                    ${proposal.clientNote ? `<li>Note: ${proposal.clientNote}</li>` : ""}
+                </ul>
+                <p>Review it on the project's Selections tab.</p>
+            </div>`
+        );
+    }
+
+    await logActivity({
+        projectId,
+        actorType: "CLIENT",
+        actorName: project?.client?.name || "Client",
+        action: "suggested_selection_item",
+        entityType: "SelectionProposal",
+        entityId: proposal.id,
+        entityName: name,
+    });
+
+    revalidatePath(`/portal/projects/${projectId}/selections`);
+    revalidatePath(`/projects/${projectId}/selections`);
+
+    // Price is PM-side info until approval — never return it to the client.
+    const { price, ...proposalWithoutPrice } = proposal;
+    return proposalWithoutPrice;
+}
+
+export async function getSelectionProposalsForPortal(projectId: string) {
+    await assertPortalProjectOwnership(projectId);
+    const proposals = await prisma.selectionProposal.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
+    // Price stays hidden until a proposal is Approved.
+    return proposals.map((p) => (p.status === "Approved" ? p : { ...p, price: null }));
+}
+
+export async function getSelectionProposals(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.selectionProposal.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+        include: { decidedBy: { select: { id: true, name: true, email: true } } },
+    });
+}
+
+export async function decideSelectionProposal(proposalId: string, input: {
+    action: "approve" | "decline";
+    pmNote?: string;
+    price?: number;
+    boardId?: string;
+    categoryId?: string;
+    addToFavorites?: boolean;
+}) {
+    const user = await assertActiveStaff();
+    if (input.action !== "approve" && input.action !== "decline") throw new Error("Invalid action");
+
+    const proposal = await prisma.selectionProposal.findUnique({
+        where: { id: proposalId },
+        include: { project: { include: { client: true } } },
+    });
+    if (!proposal) throw new Error("Proposal not found");
+    if (!canAccessProject(user, proposal.projectId)) throw new Error("Forbidden");
+
+    const newStatus = input.action === "approve" ? "Approved" : "Declined";
+    const decidedAt = new Date();
+    const pmNote = input.pmNote?.trim() || null;
+    // Re-validated at every persist boundary — proposal.imageUrl/vendorUrl were
+    // already sanitized when the proposal was created (submitSelectionProposal),
+    // but this is the second place they get copied into a new row, so it's
+    // checked again rather than trusted.
+    const safeImageUrl = safeUrlOrNull(proposal.imageUrl);
+    const safeVendorUrl = safeUrlOrNull(proposal.vendorUrl);
+
+    let productId: string | null = null;
+    let favoriteCreated = false;
+    let optionCreated = false;
+    let alreadyDecided = false;
+
+    // CAS claim + board/category validation + every dependent write
+    // (ProductLibraryItem, favorite, SelectionOption, the proposal's own
+    // productId/boardId/categoryId backfill) run inside one transaction, so:
+    //   - a mid-sequence failure can't leave a half-approved proposal (e.g.
+    //     status flipped to Approved but no ProductLibraryItem), and
+    //   - the board/category ownership check reads the SAME transactional
+    //     snapshot the writes commit against — validating outside the
+    //     transaction would leave a TOCTOU window where the board/category
+    //     could be deleted or reassigned between the check and the write.
+    await prisma.$transaction(async (tx) => {
+        // Status CAS: only a Pending proposal transitions. A duplicate decide
+        // call (double-click, retried request) matches zero rows and no-ops
+        // instead of re-deciding or minting a second ProductLibraryItem/
+        // favorite/option. boardId/categoryId are intentionally NOT set here —
+        // they're only known-valid once the check below runs, inside this same
+        // transaction, and are written in the follow-up update further down.
+        const claim = await tx.selectionProposal.updateMany({
+            where: { id: proposalId, status: "Pending" },
+            data: {
+                status: newStatus,
+                pmNote,
+                decidedById: user.id,
+                decidedAt,
+                ...(input.action === "approve" ? {
+                    price: input.price ?? proposal.price ?? null,
+                } : {}),
+            },
+        });
+        if (claim.count === 0) {
+            alreadyDecided = true;
+            return;
+        }
+
+        if (input.action !== "approve") return;
+
+        // Validate board/category ownership INSIDE the transaction (after the
+        // claim, same isolated snapshot the writes below use). A staff user
+        // scoped to project A could otherwise pass a boardId from project B
+        // and write a SelectionOption into another project's board. Only ever
+        // persist boardId/categoryId on the proposal when BOTH were supplied
+        // AND validated — never the raw, unvalidated input.boardId. If the
+        // caller explicitly asked to link a board+category and that link
+        // doesn't check out, abort the whole decision (throwing here rolls
+        // back the CAS claim above too, so the proposal stays Pending) rather
+        // than silently approving without the link.
+        let validBoardId: string | null = null;
+        let validCategoryId: string | null = null;
+        if (input.boardId && input.categoryId) {
+            const board = await tx.selectionBoard.findFirst({
+                where: { id: input.boardId, projectId: proposal.projectId },
+                select: { id: true },
+            });
+            if (!board) {
+                throw new Error("That board doesn't belong to this project — refresh and try again.");
+            }
+            const category = await tx.selectionCategory.findFirst({
+                where: { id: input.categoryId, boardId: input.boardId },
+                select: { id: true },
+            });
+            if (!category) {
+                throw new Error("That category doesn't belong to the selected board — refresh and try again.");
+            }
+            validBoardId = board.id;
+            validCategoryId = category.id;
+        }
+
+        const product = await tx.productLibraryItem.create({
+            data: {
+                name: proposal.name,
+                description: proposal.description,
+                imageUrl: safeImageUrl,
+                price: input.price ?? proposal.price ?? null,
+                vendorUrl: safeVendorUrl,
+                source: "client_proposal",
+                clippedById: user.id,
+            },
+        });
+        productId = product.id;
+
+        await tx.selectionProposal.update({
+            where: { id: proposalId },
+            data: { productId: product.id, boardId: validBoardId, categoryId: validCategoryId },
+        });
+
+        // Default true per spec — approving a suggestion pins it to the
+        // project's client-visible Favorites list unless explicitly opted out.
+        if (input.addToFavorites !== false) {
+            await tx.projectProductFavorite.upsert({
+                where: { projectId_productId: { projectId: proposal.projectId, productId: product.id } },
+                update: {},
+                create: {
+                    projectId: proposal.projectId,
+                    productId: product.id,
+                    addedById: null,
+                    addedByClient: true,
+                },
+            });
+            favoriteCreated = true;
+        }
+
+        // Optional: also drop it into a board category as a pickable option
+        // (validCategoryId is only set above once board+category ownership is
+        // confirmed). Never touches SelectionBoard.status — approving a
+        // suggestion must not silently flip a board back to an earlier
+        // lifecycle state.
+        if (validCategoryId) {
+            const maxOrder = await tx.selectionOption.aggregate({
+                where: { categoryId: validCategoryId },
+                _max: { order: true },
+            });
+            await tx.selectionOption.create({
+                data: {
+                    categoryId: validCategoryId,
+                    name: proposal.name,
+                    description: proposal.description,
+                    imageUrl: safeImageUrl,
+                    price: input.price ?? proposal.price ?? null,
+                    vendorUrl: safeVendorUrl,
+                    order: (maxOrder._max.order ?? -1) + 1,
+                },
+            });
+            optionCreated = true;
+        }
+    });
+
+    if (alreadyDecided) {
+        return { success: false, alreadyDecided: true };
+    }
+
+    // Notifications + activity log run AFTER the transaction commits, and a
+    // failure here must not throw the whole action into a failed state — the
+    // decision is already durably recorded. Same pattern submitClientSelections
+    // and the other portal notifiers use (sendNotification never throws on its
+    // own, but building the portal link can, so the whole block is wrapped).
+    try {
+        const clientEmail = proposal.project.client?.email;
+        if (clientEmail) {
+            const settings = await getCachedCompanySettings();
+            const { buildClientPortalUrl } = await import("./client-portal-auth");
+            const portalUrl = await buildClientPortalUrl(proposal.project.clientId, clientEmail, `/portal/projects/${proposal.projectId}/selections`);
+            const cc = buildCc(clientEmail, (proposal.project.client as any)?.additionalEmail);
+            const isApproved = input.action === "approve";
+            await sendNotification(
+                clientEmail,
+                isApproved ? `✅ Your suggestion was approved — ${proposal.project.name}` : `Update on your suggestion — ${proposal.project.name}`,
+                `<div style="font-family: sans-serif; color: #333;">
+                    <h2>${isApproved ? "Your Suggestion Was Approved" : "Update on Your Suggestion"}</h2>
+                    <p>Hi ${proposal.project.client?.name || "there"},</p>
+                    <p>Your suggested item "<strong>${proposal.name}</strong>" for <strong>${proposal.project.name}</strong> ${isApproved ? "has been approved and added to your project." : "was not approved this time."}</p>
+                    ${pmNote ? `<p style="color:#555;">Note from your project manager: "${pmNote}"</p>` : ""}
+                    <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">View Selections</a></p>
+                    <p style="color:#666;font-size:13px;">— ${settings.companyName || "Your Project Team"}</p>
+                </div>`,
+                undefined,
+                { cc, copyToInternal: true }
+            );
+        }
+    } catch (err) {
+        console.error("[decideSelectionProposal] client notification failed:", err);
+    }
+
+    await logActivity({
+        projectId: proposal.projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: input.action === "approve" ? "approved_selection_suggestion" : "declined_selection_suggestion",
+        entityType: "SelectionProposal",
+        entityId: proposal.id,
+        entityName: proposal.name,
+    });
+
+    revalidatePath(`/projects/${proposal.projectId}/selections`);
+    revalidatePath(`/portal/projects/${proposal.projectId}/selections`);
+
+    return { success: true, status: newStatus, productId, favoriteCreated, optionCreated };
+}
 
 // =============================================
 // Daily Logs CRUD
 // =============================================
 
+async function assertDailyLogAccess(projectId: string) {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    if (!sessionUserId) throw new Error("Unauthorized");
+
+    const user = await prisma.user.findUnique({
+        where: { id: sessionUserId },
+        include: {
+            permissions: true,
+            projectAccess: { select: { projectId: true } },
+            assignedProjects: { select: { id: true } },
+        },
+    });
+    if (!user || user.status === "DISABLED") throw new Error("Unauthorized");
+    if (!hasPermission(user, "dailyLogs") || !canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
 export async function getDailyLogs(projectId: string) {
-    return await prisma.dailyLog.findMany({
+    // Hardened (dispatch-arc foundation): require daily-log permission and project access before reading logs.
+    await assertDailyLogAccess(projectId);
+    const logs = await prisma.dailyLog.findMany({
         where: { projectId },
         orderBy: { date: "desc" },
         include: {
@@ -8844,9 +10019,29 @@ export async function getDailyLogs(projectId: string) {
             photos: { orderBy: { createdAt: "asc" } },
         },
     });
+    return logs.map(log => {
+        const sharedPhotoIds = log.photos
+            .filter(photo => photo.sharedToPortal)
+            .map(photo => photo.id);
+        const currentHash = computeDailyLogSharedContentHash(
+            log.workPerformed,
+            sharedPhotoIds,
+        );
+        return {
+            ...log,
+            sharedPhotoIds,
+            portalShareValid: log.sharedToPortal
+                && Boolean(log.sharedContentHash)
+                && log.sharedContentHash === currentHash,
+        };
+    });
 }
 
 export async function getDailyLog(id: string) {
+    // Hardened (dispatch-arc foundation): resolve the log's project before authorizing the read.
+    const target = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target) return null;
+    await assertDailyLogAccess(target.projectId);
     return await prisma.dailyLog.findUnique({
         where: { id },
         include: {
@@ -8864,9 +10059,10 @@ export async function createDailyLog(projectId: string, data: {
     workPerformed: string;
     materialsDelivered?: string;
     issues?: string;
-    createdById: string;
     photoUrls?: { url: string; caption?: string }[];
 }) {
+    // Hardened (dispatch-arc foundation): derive the author from an authorized staff session.
+    const author = await assertDailyLogAccess(projectId);
     const log = await prisma.dailyLog.create({
         data: {
             projectId,
@@ -8876,7 +10072,7 @@ export async function createDailyLog(projectId: string, data: {
             workPerformed: data.workPerformed,
             materialsDelivered: data.materialsDelivered || null,
             issues: data.issues || null,
-            createdById: data.createdById,
+            createdById: author.id,
             photos: data.photoUrls && data.photoUrls.length > 0 ? {
                 create: data.photoUrls.map(p => ({
                     url: p.url,
@@ -8899,11 +10095,20 @@ export async function updateDailyLog(id: string, data: {
     materialsDelivered?: string;
     issues?: string;
 }) {
+    // Hardened (dispatch-arc foundation): authorize against the persisted log project before updating.
+    const target = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target) throw new Error("Daily log not found");
+    await assertDailyLogAccess(target.projectId);
     const updateData: any = {};
     if (data.date !== undefined) updateData.date = new Date(data.date);
     if (data.weather !== undefined) updateData.weather = data.weather || null;
     if (data.crewOnSite !== undefined) updateData.crewOnSite = data.crewOnSite || null;
-    if (data.workPerformed !== undefined) updateData.workPerformed = data.workPerformed;
+    if (data.workPerformed !== undefined) {
+        updateData.workPerformed = data.workPerformed;
+        // Content approval is a snapshot. Any work-text edit requires a
+        // manager to re-share, even if the new string happens to be similar.
+        updateData.sharedContentHash = null;
+    }
     if (data.materialsDelivered !== undefined) updateData.materialsDelivered = data.materialsDelivered || null;
     if (data.issues !== undefined) updateData.issues = data.issues || null;
 
@@ -8917,8 +10122,10 @@ export async function updateDailyLog(id: string, data: {
 }
 
 export async function deleteDailyLog(id: string) {
+    // Hardened (dispatch-arc foundation): authorize against the persisted log project before deleting.
     const log = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
     if (!log) return { success: false };
+    await assertDailyLogAccess(log.projectId);
 
     await prisma.dailyLog.delete({ where: { id } });
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
@@ -8926,8 +10133,10 @@ export async function deleteDailyLog(id: string) {
 }
 
 export async function addDailyLogPhotos(dailyLogId: string, photos: { url: string; caption?: string }[]) {
+    // Hardened (dispatch-arc foundation): authorize against the persisted log project before adding photos.
     const log = await prisma.dailyLog.findUnique({ where: { id: dailyLogId }, select: { projectId: true } });
     if (!log) throw new Error("Daily log not found");
+    await assertDailyLogAccess(log.projectId);
 
     await prisma.dailyLogPhoto.createMany({
         data: photos.map(p => ({
@@ -8942,15 +10151,57 @@ export async function addDailyLogPhotos(dailyLogId: string, photos: { url: strin
 }
 
 export async function deleteDailyLogPhoto(photoId: string) {
+    // Hardened (dispatch-arc foundation): authorize against the photo's persisted log project before deleting.
     const photo = await prisma.dailyLogPhoto.findUnique({
         where: { id: photoId },
-        include: { dailyLog: { select: { projectId: true } } },
+        include: { dailyLog: { select: { id: true, projectId: true } } },
     });
     if (!photo) return { success: false };
+    await assertDailyLogAccess(photo.dailyLog.projectId);
 
-    await prisma.dailyLogPhoto.delete({ where: { id: photoId } });
+    await prisma.$transaction(async tx => {
+        await tx.dailyLogPhoto.delete({ where: { id: photoId } });
+        if (photo.sharedToPortal) {
+            await tx.dailyLog.update({
+                where: { id: photo.dailyLog.id },
+                data: { sharedContentHash: null },
+            });
+        }
+    });
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
     return { success: true };
+}
+
+export async function setDailyLogPortalShare(
+    logId: string,
+    input: { shared: boolean; photoIds: string[] },
+) {
+    const session = await getSessionOrDev();
+    const role = ((session?.user as any)?.role as string | null) ?? null;
+    if (!role || !["ADMIN", "MANAGER"].includes(role)) throw new Error("Forbidden");
+
+    const target = await prisma.dailyLog.findUnique({
+        where: { id: logId },
+        select: { projectId: true },
+    });
+    if (!target) throw new Error("Daily log not found");
+    await assertDailyLogAccess(target.projectId);
+
+    const userId = ((session?.user as any)?.id as string | null) ?? null;
+    const actorName = session?.user?.name || session?.user?.email || "Team member";
+    const result = await setDailyLogPortalShareCore(
+        logId,
+        input,
+        {
+            userId: userId || "session",
+            role,
+            name: actorName,
+        },
+    );
+
+    revalidatePath(`/projects/${target.projectId}/dailylogs`);
+    revalidatePath(`/portal/projects/${target.projectId}`);
+    return result;
 }
 
 // =============================================
@@ -10272,5 +11523,3 @@ export async function restoreOfficeTask(id: string) {
     revalidatePath("/tasks");
     return task;
 }
-
-

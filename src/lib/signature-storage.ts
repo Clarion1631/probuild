@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
+import { SECURE_BUCKET, isSecureRef, toSecureRef } from "./secure-storage";
 
 // Accepts the data-URLs that SignaturePad / DocumentSignModal produce (canvas.toDataURL).
 const SIGNATURE_DATA_URL_RE = /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)$/;
@@ -18,7 +19,6 @@ export type SignatureStorageBucket = {
         body: Buffer,
         options: { contentType: string; upsert: false },
     ): Promise<{ error: unknown | null }>;
-    getPublicUrl(path: string): { data: { publicUrl?: string | null } };
     remove(paths: string[]): Promise<{ error: unknown | null }>;
 };
 
@@ -39,7 +39,7 @@ const noDiscard = async () => {};
 function defaultSignatureBucket(): SignatureStorageBucket | null {
     const supabase = getSupabase();
     return supabase
-        ? supabase.storage.from(STORAGE_BUCKET) as unknown as SignatureStorageBucket
+        ? supabase.storage.from(SECURE_BUCKET) as unknown as SignatureStorageBucket
         : null;
 }
 
@@ -94,6 +94,11 @@ export async function persistOwnedSignature(
     dependencies: Partial<SignaturePersistenceDependencies> = {},
 ): Promise<OwnedSignature> {
     if (!value) return { url: null, discard: noDiscard };
+
+    // Already migrated to the private bucket — pass through unchanged.
+    if (isSecureRef(value)) {
+        return { url: value, discard: noDiscard };
+    }
 
     // Already migrated / remote — only OUR storage URLs may pass through unchanged.
     if (/^https?:\/\//i.test(value)) {
@@ -182,25 +187,9 @@ export async function persistOwnedSignature(
         throw new Error("Couldn't save your signature — please try again.");
     }
 
-    let publicUrl: string | null | undefined;
-    try {
-        publicUrl = bucket.getPublicUrl(storagePath).data?.publicUrl;
-    } catch {
-        publicUrl = null;
-    }
-    if (!publicUrl) {
-        try {
-            await discard();
-        } catch (error) {
-            console.error("[signature-storage] cleanup failed", {
-                operation: "discard-unaddressable-signature",
-                errorType: cleanupErrorType(error),
-            });
-        }
-        throw new Error("Couldn't save your signature — please try again.");
-    }
-
-    return { url: publicUrl, discard };
+    // The address is derived locally from the storage path, so there's no "upload
+    // succeeded but we couldn't construct an address" failure mode to guard against here.
+    return { url: toSecureRef(storagePath), discard };
 }
 
 export async function persistSignature(

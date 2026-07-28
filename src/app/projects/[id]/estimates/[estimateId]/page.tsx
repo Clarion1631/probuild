@@ -1,6 +1,7 @@
 import { getEstimate, getProject, getCompanySettings, getEstimateActivity } from "@/lib/actions";
 import EstimateEditor from "./EstimateEditor";
 import { notFound } from "next/navigation";
+import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +29,14 @@ export default async function EstimatePage({
         salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
     } catch { /* ignore parse errors */ }
 
+    const serializedEstimate = JSON.parse(JSON.stringify(estimate));
+    serializedEstimate.signatureUrl = await resolveDocUrl((estimate as any).signatureUrl);
+    if (Array.isArray(serializedEstimate.files)) {
+        serializedEstimate.files = await Promise.all(
+            serializedEstimate.files.map(async (f: any) => ({ ...f, url: await resolveDocUrl(f.url) }))
+        );
+    }
+
     return (
         <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
             <div className="flex-1 bg-slate-50 overflow-hidden flex flex-col">
@@ -42,7 +51,7 @@ export default async function EstimatePage({
                         clientTaxExemptCertUrl: (project.client as any)?.taxExemptCertUrl || null,
                         clientTaxExemptCertExpiresAt: (project.client as any)?.taxExemptCertExpiresAt?.toISOString?.() || null
                     }}
-                    initialEstimate={JSON.parse(JSON.stringify(estimate))}
+                    initialEstimate={serializedEstimate}
                     salesTaxes={salesTaxes}
                     settings={settings}
                     activityEvents={activityEvents}

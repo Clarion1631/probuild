@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "crypto";
 import { prisma } from "@/lib/prisma";
-import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
+import { getSupabase } from "@/lib/supabase";
+import { uploadSecureDoc } from "@/lib/secure-storage";
 
 export const maxDuration = 60;
 
@@ -84,22 +85,15 @@ export async function POST(
         const safeName = `Estimate_${(estimate.code || id).replace(/[^a-zA-Z0-9._-]/g, "_")}.pdf`;
         const storagePath = `estimate-pdfs/${id}/${Date.now()}_${safeName}`;
 
-        const { error: uploadError } = await supabase.storage
-            .from(STORAGE_BUCKET)
-            .upload(storagePath, buffer, {
-                contentType: "application/pdf",
-                upsert: true,
-            });
-
-        if (uploadError) {
+        let secureRef: string;
+        try {
+            secureRef = await uploadSecureDoc(storagePath, buffer, "application/pdf");
+        } catch (uploadError: any) {
             console.error("Supabase upload error:", uploadError);
             return NextResponse.json({ error: `Storage upload failed: ${uploadError.message}` }, { status: 500 });
         }
 
-        const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-        const url = urlData?.publicUrl || storagePath;
-
-        return NextResponse.json({ success: true, url }, { status: 200 });
+        return NextResponse.json({ success: true, url: secureRef }, { status: 200 });
     } catch (err: any) {
         console.error("PDF upload error:", err);
         return NextResponse.json({ error: err.message || "Upload failed" }, { status: 500 });

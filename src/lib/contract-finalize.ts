@@ -6,8 +6,8 @@
 // "archive the executed PDF" and "email the executed PDF" steps have exactly one
 // implementation each — never a second writer for the same lifecycle event.
 import { prisma } from "./prisma";
-import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { sendNotification } from "./email";
+import { uploadSecureDoc, removeSecureDoc } from "./secure-storage";
 
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -20,28 +20,21 @@ export function executedContractFileName(contractId: string): string {
 type ContractRef = { id: string; title: string; projectId: string | null; leadId: string | null };
 
 /**
- * Upload an executed-contract PDF buffer to Storage and create the shared ProjectFile row.
- * The caller owns the contract status transition + rollback. Throws on failure so the
- * caller can roll back and best-effort remove the returned storagePath.
+ * Upload an executed-contract PDF buffer to the private secure-docs bucket and create the
+ * shared ProjectFile row. The caller owns the contract status transition + rollback. Throws
+ * on failure so the caller can roll back and best-effort remove the returned storagePath.
  */
 export async function archiveExecutedContractPdf(
   contract: ContractRef,
   buffer: Buffer
 ): Promise<{ record: any; publicUrl: string; storagePath: string; fileName: string }> {
-  const supabase = getSupabase();
-  if (!supabase) throw new Error("Storage not configured.");
-
   const fileName = executedContractFileName(contract.id);
   const prefix = contract.projectId ? `projects/${contract.projectId}` : `leads/${contract.leadId}`;
   const storagePath = `${prefix}/${Date.now()}_${fileName}`;
 
-  const { error: uploadError } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .upload(storagePath, buffer, { contentType: "application/pdf", upsert: false });
-  if (uploadError) throw new Error(`Storage upload failed: ${uploadError.message}`);
-
-  const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-  const publicUrl = urlData?.publicUrl || storagePath;
+  // `publicUrl` on the return value now carries a secure ref (secure:<path>), not a
+  // browser-loadable URL — signed URLs must be minted per-read via resolveDocUrl().
+  const publicUrl = await uploadSecureDoc(storagePath, buffer, "application/pdf");
 
   let record;
   try {
@@ -59,7 +52,7 @@ export async function archiveExecutedContractPdf(
   } catch (e) {
     // The upload succeeded but the DB row failed — remove the orphaned storage object so a
     // retry doesn't leave a dangling executed PDF in the bucket.
-    try { await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]); } catch {}
+    try { await removeSecureDoc(publicUrl); } catch {}
     throw e;
   }
   return { record, publicUrl, storagePath, fileName };
@@ -89,7 +82,8 @@ export async function sendExecutedContractEmails(opts: {
     `<h2 style="font-size:18px;margin:0 0 8px;color:#16a34a;">&#10003; Document Executed</h2>`,
     `<p style="color:#666;margin:0 0 16px;">Hi ${esc(opts.clientName || "Client")},</p>`,
     `<p style="color:#666;margin:0 0 16px;line-height:1.5;">Thank you! <strong>${esc(opts.contractTitle)}</strong> has been fully signed and executed. A PDF copy is attached and archived for your records.</p>`,
-    `<div style="text-align:center;margin:0 0 16px;"><a href="${encodeURI(opts.publicUrl)}" target="_blank" style="display:inline-block;background:#222;color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-weight:600;font-size:15px;">Download PDF</a></div>`,
+    // No download link here — publicUrl is now a secure ref, and a signed URL would expire
+    // before the recipient clicks it. The PDF is already attached to this same email.
     '</div></body></html>',
   ].join('');
 

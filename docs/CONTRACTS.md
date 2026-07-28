@@ -7,7 +7,7 @@ _Last updated: 2026-06-23. Snapshot of the whole contract system: what works, wh
 The full contract lifecycle is **live in production** (commit `412a5d4`, deployed 2026-06-23):
 **author → send (magic link) → customer signs in the portal → (optional) company countersigns → executed PDF lands in the customer portal.**
 
-The **same screen serves leads and projects** — both `/leads/[id]/contracts` and `/projects/[id]/contracts` render the shared `src/components/EntityContractsClient.tsx`. (`src/app/leads/[id]/contracts/LeadContractsClient.tsx` is dead code — nothing imports it.)
+The **same screen serves leads and projects** — both `/leads/[id]/contracts` and `/projects/[id]/contracts` render the shared `src/components/EntityContractsClient.tsx`.
 
 > **Money-path note:** contract signing is **money-path-inert** — `approveContract` does NOT auto-convert estimates or touch invoices/payment schedules. The sign→convert→invoice money chain is driven by *estimate* signing, not contracts. Do **not** wire auto-conversion into `approveContract`.
 

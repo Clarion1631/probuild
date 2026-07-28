@@ -30,7 +30,7 @@ interface Template { id: string; name: string; type: string; }
 interface SigningRecord {
     id: string; signedBy: string; signedAt: string | Date;
     periodStart?: string | Date | null; periodEnd?: string | Date | null;
-    signatureUrl?: string | null;
+    signatureUrl?: string | null; notes?: string | null;
 }
 interface Entity { type: "lead" | "project"; id: string; name: string; clientName: string; }
 interface LinkedEntity { type: "lead" | "project"; id: string; name: string; }
@@ -246,6 +246,9 @@ export default function EntityContractsClient({
                     leadId: entity.type === "lead" ? entity.id : undefined,
                     visibility: "shared",
                     files: [{ name: file.name, size: file.size, mimeType: "application/pdf" }],
+                    // Contract originals carry legal/PII weight — route this upload to the
+                    // private secure-docs bucket instead of the public one.
+                    scope: "contract-original",
                 }),
             });
             const data = await res.json();
@@ -269,17 +272,14 @@ export default function EntityContractsClient({
                 throw new Error(msg);
             }
 
-            // Create the contract in DB referencing the storagePath (upload.storagePath)
+            // Create the contract in DB referencing the storagePath (upload.storagePath).
+            // Uploaded into the private bucket above, so store it as a secure ref — the
+            // server resolves a preview URL for us (the private bucket has no public one).
             const titleWithoutExt = file.name.replace(/\.[^/.]+$/, "");
-            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath);
-            
-            const mappedContract = {
-                ...newContract,
-                originalPdfUrl: upload.publicUrl
-            };
+            const newContract = await createContractFromPdf(context, titleWithoutExt, upload.storagePath, true);
 
             toast.success("PDF contract imported successfully!", { id: uploadToast });
-            openEditor(mappedContract);
+            openEditor(newContract);
             router.refresh();
         } catch (err: any) {
             console.error("PDF upload error:", err);
@@ -306,7 +306,11 @@ export default function EntityContractsClient({
                 updatePayload.body = editBody;
             }
             const updated = await updateContract(editingContract.id, updatePayload);
-            toast.success("Contract updated!");
+            if (editingContract.contractorSignedAt && !updated?.contractorSignedAt) {
+                toast.warning("Contractor signature cleared — the text changed, so the contract must be re-signed before sending.");
+            } else {
+                toast.success("Contract updated!");
+            }
             setEditingContract(updated);
             router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to update contract"); }
@@ -456,7 +460,9 @@ export default function EntityContractsClient({
         if (!contractorSignModal) return;
         setSigningAsContractor(true);
         try {
-            await signContractAsContractor(contractorSignModal.id, name, dataUrl);
+            // Pass the title/body this modal was opened with so the server CAS-rejects the
+            // signature if the document was edited after the signer last saw it.
+            await signContractAsContractor(contractorSignModal.id, name, dataUrl, contractorSignModal.title ?? "", contractorSignModal.body ?? "");
             toast.success("Contractor signature saved!");
             setContractorSignModal(null);
             router.refresh();
@@ -527,7 +533,8 @@ export default function EntityContractsClient({
                                 <button
                                     onClick={() => {
                                         setShowContractorSignPrompt(false);
-                                        const contract = initialContracts.find((c: any) => c.id === pendingSendContractId);
+                                        const contract = (editingContract?.id === pendingSendContractId ? editingContract : null)
+                                            ?? initialContracts.find((c: any) => c.id === pendingSendContractId);
                                         setPendingSendContractId(null);
                                         if (contract) setContractorSignModal(contract);
                                     }}
@@ -676,6 +683,12 @@ export default function EntityContractsClient({
                         )}
                     </div>
                 </header>
+                {!isReadOnly && editingContract.contractorSignedAt && (
+                    <div className="shrink-0 flex items-center gap-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-200 px-6 py-2">
+                        <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                        <span>Signed by contractor ({editingContract.contractorSignedBy}). Saving changes to the title or text will clear that signature, and the contract will need to be re-signed before it can be sent.</span>
+                    </div>
+                )}
                 {editingContract.originalPdfPath ? (
                     <div className="flex-1 bg-slate-100 flex items-center justify-center overflow-hidden relative">
                         <iframe
@@ -1014,15 +1027,23 @@ export default function EntityContractsClient({
                                 <div className="text-center py-8 text-slate-500 text-sm">No signing records yet.</div>
                             ) : (
                                 <div className="space-y-3">
-                                    {signingHistory.map((r, idx) => (
-                                        <div key={r.id} className="bg-slate-50 rounded-lg p-4 border border-slate-100">
+                                    {signingHistory.map((r, idx) => {
+                                        // Marker string written by updateContract when a text edit clears
+                                        // the contractor's pre-signature — render as an invalidation event,
+                                        // not another green signing entry.
+                                        const isInvalidation = !!r.notes?.startsWith("Contractor signature invalidated");
+                                        return (
+                                        <div key={r.id} className={`rounded-lg p-4 border ${isInvalidation ? "bg-amber-50 border-amber-200" : "bg-slate-50 border-slate-100"}`}>
                                             <div className="flex items-start justify-between">
                                                 <div>
                                                     <div className="flex items-center gap-2 mb-1">
-                                                        <span className="w-5 h-5 bg-green-100 text-green-700 rounded-full flex items-center justify-center text-[10px] font-bold">{signingHistory.length - idx}</span>
+                                                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${isInvalidation ? "bg-amber-100 text-amber-700" : "bg-green-100 text-green-700"}`}>{isInvalidation ? "!" : signingHistory.length - idx}</span>
                                                         <span className="font-semibold text-sm text-slate-800">{r.signedBy}</span>
                                                     </div>
                                                     <p className="text-xs text-slate-500 pl-7">{new Date(r.signedAt).toLocaleString()}</p>
+                                                    {isInvalidation && (
+                                                        <p className="text-xs text-amber-700 pl-7 mt-0.5">{r.notes}</p>
+                                                    )}
                                                     {r.periodStart && r.periodEnd && (
                                                         <p className="text-xs text-slate-400 pl-7 mt-0.5">Period: {new Date(r.periodStart).toLocaleDateString()} – {new Date(r.periodEnd).toLocaleDateString()}</p>
                                                     )}
@@ -1030,7 +1051,8 @@ export default function EntityContractsClient({
                                                 {r.signatureUrl && <img src={r.signatureUrl} alt="Signature" className="h-8 object-contain opacity-60" />}
                                             </div>
                                         </div>
-                                    ))}
+                                        );
+                                    })}
                                 </div>
                             )}
                         </div>

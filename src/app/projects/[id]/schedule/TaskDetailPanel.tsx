@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 import DependencyPicker from "./DependencyPicker";
 import ColorPicker from "./ColorPicker";
+import { TaskMaterialsSection } from "./TaskMaterialsSection";
 
 const ESTIMATE_LINK_STOPWORDS = new Set(["and", "or", "the", "a", "to", "of", "with", "for", "in", "on", "at", "&"]);
 function tokenizeForMatch(s: string): string[] {
@@ -18,8 +19,9 @@ export type TaskDetailPanelProps = {
     onClose: () => void;
     panelTab: "details" | "punch" | "conversation";
     setPanelTab: (tab: "details" | "punch" | "conversation") => void;
-    onStatusChange: (taskId: string, status: string) => void;
+    onStatusChange: (taskId: string, status: string, blockedReason?: string) => void;
     onNameChange: (taskId: string, name: string) => void;
+    onDoneWhenChange: (taskId: string, doneWhen: string | null) => void;
     onDateChange: (taskId: string, field: "startDate" | "endDate", value: string) => void;
     onEstimatedHoursChange: (taskId: string, hours: number) => void;
     onColorChange: (taskId: string, color: string) => void;
@@ -32,6 +34,7 @@ export type TaskDetailPanelProps = {
     subcontractors: Subcontractor[];
     onAssign: (userId: string) => void;
     onUnassign: (userId: string) => void;
+    onSetLead: (userId: string | null) => void;
     onAssignSub: (subId: string) => void;
     onUnassignSub: (subId: string) => void;
     punchItems: PunchItem[];
@@ -48,17 +51,26 @@ export type TaskDetailPanelProps = {
     onLinkPredecessor: (predecessorId: string) => void;
     onUnlinkPredecessor: (predecessorId: string) => void;
     onSelectTask?: (taskId: string) => void;
+    onAppointmentChange: (taskId: string, data: { scheduledTime?: string | null; confirmationStatus?: "planned" | "requested" | "confirmed" | null }) => void;
+    datesReadOnly?: boolean;
+    dateReadOnlyNote?: string;
+    crewReadOnly?: boolean;
+    crewReadOnlyNote?: string;
+    embedded?: boolean;
 };
 
 export default function TaskDetailPanel({
     task, onClose, panelTab, setPanelTab,
-    onStatusChange, onNameChange, onDateChange, onEstimatedHoursChange, onColorChange, onDelete,
+    onStatusChange, onNameChange, onDoneWhenChange, onDateChange, onEstimatedHoursChange, onColorChange, onDelete,
     estimateItems, onLinkEstimateItem, onUnlinkEstimateItem, onFetchEstimateItems,
-    teamMembers, subcontractors, onAssign, onUnassign, onAssignSub, onUnassignSub,
+    teamMembers, subcontractors, onAssign, onUnassign, onSetLead, onAssignSub, onUnassignSub,
     punchItems, onAddPunch, onTogglePunch, onDeletePunch, onAiPunchlist, isAiPunching,
     comments, onAddComment,
     showCriticalPath, criticalPathIds,
-    allTasks, onLinkPredecessor, onUnlinkPredecessor, onSelectTask,
+    allTasks, onLinkPredecessor, onUnlinkPredecessor, onSelectTask, onAppointmentChange,
+    datesReadOnly = false, dateReadOnlyNote,
+    crewReadOnly = false, crewReadOnlyNote,
+    embedded = false,
 }: TaskDetailPanelProps) {
     const [showAssignMenu, setShowAssignMenu] = useState(false);
     const [showEstimateLinkMenu, setShowEstimateLinkMenu] = useState(false);
@@ -69,6 +81,21 @@ export default function TaskDetailPanel({
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
     const [nameDirty, setNameDirty] = useState(false);
+    const [statusDraft, setStatusDraft] = useState(task.status);
+    const [blockedReasonDraft, setBlockedReasonDraft] = useState(task.blockedReason ?? "");
+    const [blockedReasonError, setBlockedReasonError] = useState(false);
+    const [doneWhenDraft, setDoneWhenDraft] = useState(task.doneWhen ?? "");
+    const [scheduledTimeDraft, setScheduledTimeDraft] = useState(task.scheduledTime ?? "");
+
+    useEffect(() => {
+        setNameDraft(task.name);
+        setNameDirty(false);
+        setStatusDraft(task.status);
+        setBlockedReasonDraft(task.blockedReason ?? "");
+        setBlockedReasonError(false);
+        setDoneWhenDraft(task.doneWhen ?? "");
+        setScheduledTimeDraft(task.scheduledTime ?? "");
+    }, [task.id, task.name, task.status, task.blockedReason, task.doneWhen, task.scheduledTime]);
 
     const taskMap = new Map(allTasks.map(t => [t.id, t] as const));
     const predecessors = task.dependencies
@@ -87,6 +114,37 @@ export default function TaskDetailPanel({
         if (!nameDirty || !next || next === task.name) { setNameDirty(false); setNameDraft(task.name); return; }
         onNameChange(task.id, next);
         setNameDirty(false);
+    }
+
+    function handleDoneWhenSave() {
+        const next = doneWhenDraft.trim() || null;
+        if (next === task.doneWhen) return;
+        onDoneWhenChange(task.id, next);
+    }
+
+    function handleStatusSelect(status: string) {
+        setStatusDraft(status);
+        setBlockedReasonError(false);
+        if (status === "Blocked") return;
+        setBlockedReasonDraft("");
+        onStatusChange(task.id, status);
+    }
+
+    function commitBlockedReason() {
+        const reason = blockedReasonDraft.trim();
+        if (!reason) {
+            setBlockedReasonError(true);
+            return;
+        }
+        if (task.status === "Blocked" && reason === task.blockedReason) return;
+        setBlockedReasonError(false);
+        onStatusChange(task.id, "Blocked", reason);
+    }
+
+    function handleScheduledTimeSave() {
+        const next = scheduledTimeDraft || null;
+        if (next === task.scheduledTime) return;
+        onAppointmentChange(task.id, { scheduledTime: next });
     }
 
     function handleAddPunchLocal() {
@@ -109,7 +167,7 @@ export default function TaskDetailPanel({
     }
 
     return (
-        <div className="w-[480px] shrink-0 bg-white border-l border-hui-border flex flex-col z-10 shadow-lg animate-in slide-in-from-right-5">
+        <div className={`${embedded ? "w-full h-full" : "w-[480px]"} shrink-0 bg-white border-l border-hui-border flex flex-col z-10 shadow-lg animate-in slide-in-from-right-5`}>
             {/* Panel Header */}
             <div className="flex items-center justify-between px-5 py-3.5 border-b border-hui-border bg-slate-50">
                 <div className="flex items-center gap-2.5 flex-1 min-w-0">
@@ -142,7 +200,7 @@ export default function TaskDetailPanel({
                     </div>
                     <h3 className="text-sm font-bold text-hui-textMain truncate">{task.name}</h3>
                 </div>
-                <button onClick={onClose} className="text-slate-400 hover:text-slate-700 p-1.5 rounded-md hover:bg-slate-100 transition">
+                <button onClick={onClose} aria-label="Close task details" className="text-slate-400 hover:text-slate-700 p-1.5 rounded-md hover:bg-slate-100 transition">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                 </button>
             </div>
@@ -179,30 +237,112 @@ export default function TaskDetailPanel({
                                     />
                                 </div>
                                 <div>
+                                    <label className={SECTION_LABEL}>Done when</label>
+                                    <input
+                                        type="text"
+                                        value={doneWhenDraft}
+                                        onChange={e => setDoneWhenDraft(e.target.value)}
+                                        onBlur={handleDoneWhenSave}
+                                        onKeyDown={e => {
+                                            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                                            if (e.key === "Escape") { setDoneWhenDraft(task.doneWhen ?? ""); (e.target as HTMLInputElement).blur(); }
+                                        }}
+                                        className="hui-input text-sm mt-1.5 w-full"
+                                        placeholder="The field result that marks this done"
+                                    />
+                                </div>
+                                <div>
                                     <label className={SECTION_LABEL}>Status</label>
-                                    <select value={task.status} onChange={e => onStatusChange(task.id, e.target.value)} className="hui-input text-sm mt-1.5 w-full">
+                                    <select value={statusDraft} onChange={e => handleStatusSelect(e.target.value)} className="hui-input text-sm mt-1.5 w-full">
                                         {STATUS_OPTIONS.map(s => (<option key={s} value={s}>{s}</option>))}
                                     </select>
+                                    {statusDraft === "Blocked" && (
+                                        <div className="mt-2">
+                                            <label className={SECTION_LABEL}>Blocked reason</label>
+                                            <input
+                                                type="text"
+                                                list={`blocked-reason-categories-${task.id}`}
+                                                value={blockedReasonDraft}
+                                                onChange={e => { setBlockedReasonDraft(e.target.value); setBlockedReasonError(false); }}
+                                                onBlur={commitBlockedReason}
+                                                onKeyDown={e => {
+                                                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                                                    if (e.key === "Escape") { e.preventDefault(); setBlockedReasonDraft(task.blockedReason ?? ""); setStatusDraft(task.status); setBlockedReasonError(false); }
+                                                }}
+                                                className={`hui-input text-sm mt-1.5 w-full ${blockedReasonError ? "border-red-400 focus:border-red-500 focus:ring-red-200" : ""}`}
+                                                placeholder="Choose a category or enter a reason"
+                                                aria-invalid={blockedReasonError}
+                                                autoFocus={task.status !== "Blocked"}
+                                            />
+                                            <datalist id={`blocked-reason-categories-${task.id}`}>
+                                                {[
+                                                    "Materials",
+                                                    "Inspection",
+                                                    "Predecessor",
+                                                    "Client decision",
+                                                    "Site condition",
+                                                    "Subcontractor",
+                                                    "Other",
+                                                ].map(reason => <option key={reason} value={reason} />)}
+                                            </datalist>
+                                            <p className={`mt-1 text-xs ${blockedReasonError ? "text-red-600" : "text-slate-400"}`}>
+                                                {blockedReasonError ? "A reason is required before this task can be blocked." : "Required. You can add free text after a category."}
+                                            </p>
+                                        </div>
+                                    )}
                                 </div>
                                 {task.type === "milestone" ? (
                                     <div>
                                         <label className={SECTION_LABEL}>Date</label>
-                                        <input type="date" value={task.startDate} onChange={e => onDateChange(task.id, "startDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full" />
+                                        <input type="date" value={task.startDate} disabled={datesReadOnly} onChange={e => onDateChange(task.id, "startDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" />
                                     </div>
                                 ) : (
                                     <>
                                         <div className="grid grid-cols-2 gap-3">
-                                            <div><label className={SECTION_LABEL}>Start</label><input type="date" value={task.startDate} onChange={e => onDateChange(task.id, "startDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full" /></div>
-                                            <div><label className={SECTION_LABEL}>End</label><input type="date" value={task.endDate} onChange={e => onDateChange(task.id, "endDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full" /></div>
+                                            <div><label className={SECTION_LABEL}>Start</label><input type="date" value={task.startDate} disabled={datesReadOnly} onChange={e => onDateChange(task.id, "startDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" /></div>
+                                            <div><label className={SECTION_LABEL}>End</label><input type="date" value={task.endDate} disabled={datesReadOnly} onChange={e => onDateChange(task.id, "endDate", e.target.value)} className="hui-input text-sm mt-1.5 w-full disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed" /></div>
                                         </div>
+                                        {task.type === "appointment" && (
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className={SECTION_LABEL}>Time (Los Angeles)</label>
+                                                    <input
+                                                        type="time"
+                                                        value={scheduledTimeDraft}
+                                                        onChange={e => setScheduledTimeDraft(e.target.value)}
+                                                        onBlur={handleScheduledTimeSave}
+                                                        className="hui-input text-sm mt-1.5 w-full"
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className={SECTION_LABEL}>Confirmation</label>
+                                                    <select
+                                                        value={task.confirmationStatus ?? "planned"}
+                                                        onChange={e => onAppointmentChange(task.id, { confirmationStatus: e.target.value as "planned" | "requested" | "confirmed" })}
+                                                        className="hui-input text-sm mt-1.5 w-full capitalize"
+                                                    >
+                                                        <option value="planned">Planned</option>
+                                                        <option value="requested">Requested</option>
+                                                        <option value="confirmed">Confirmed</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        )}
                                         <div>
                                             <label className={SECTION_LABEL}>Estimated Hours</label>
                                             <input type="number" value={task.estimatedHours ?? ""} onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) onEstimatedHoursChange(task.id, v); }} className="hui-input text-sm mt-1.5 w-full" placeholder="e.g. 40" />
                                         </div>
                                     </>
                                 )}
+                                {datesReadOnly && dateReadOnlyNote && (
+                                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">{dateReadOnlyNote}</p>
+                                )}
                             </div>
                         </details>
+
+                        <div className="border-t border-slate-100" />
+
+                        <TaskMaterialsSection taskId={task.id} estimateItemId={task.estimateItemId ?? null} />
 
                         <div className="border-t border-slate-100" />
 
@@ -421,11 +561,16 @@ export default function TaskDetailPanel({
                                 {hasTeam && <span className="text-xs text-slate-400 ml-1">({(task.assignments || []).length + (task.subAssignments || []).length})</span>}
                             </summary>
                             <div className="pb-4 pl-5.5">
+                                {crewReadOnly && crewReadOnlyNote && (
+                                    <p className="mb-3 rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-medium text-indigo-800">
+                                        {crewReadOnlyNote}
+                                    </p>
+                                )}
                                 <div className="flex items-center justify-between mb-2">
                                     <label className={SECTION_LABEL}>Assigned</label>
                                     <div className="relative">
-                                        <button onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
-                                        {showAssignMenu && (
+                                        <button disabled={crewReadOnly} onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition disabled:cursor-not-allowed disabled:text-slate-300">+ Add</button>
+                                        {showAssignMenu && !crewReadOnly && (
                                             <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in max-h-60 overflow-y-auto">
                                                 <div className="px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider bg-slate-50">Team Members</div>
                                                 {teamMembers.filter(m => !(task.assignments || []).some(a => a.userId === m.id)).map(m => (
@@ -451,7 +596,18 @@ export default function TaskDetailPanel({
                                         <div key={a.userId} className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2.5">
                                             <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center shrink-0">{getInitials(a.user.name, a.user.email)}</div>
                                             <span className="text-xs font-medium text-hui-textMain flex-1 truncate">{a.user.name || a.user.email}</span>
-                                            <button onClick={() => onUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0">
+                                            <button
+                                                type="button"
+                                                disabled={crewReadOnly}
+                                                onClick={() => onSetLead(a.role === "lead" ? null : a.userId)}
+                                                aria-label={a.role === "lead" ? `Remove ${a.user.name || a.user.email} as lead` : `Set ${a.user.name || a.user.email} as lead`}
+                                                aria-pressed={a.role === "lead"}
+                                                title={a.role === "lead" ? "Task lead — click to remove" : "Make task lead"}
+                                                className={`shrink-0 rounded p-1 transition disabled:cursor-not-allowed disabled:opacity-40 ${a.role === "lead" ? "text-amber-500 bg-amber-50" : "text-slate-300 hover:text-amber-500 hover:bg-amber-50"}`}
+                                            >
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill={a.role === "lead" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8"><path d="m12 2.75 2.84 5.75 6.35.92-4.6 4.48 1.09 6.32L12 17.24l-5.68 2.98 1.09-6.32-4.6-4.48 6.35-.92L12 2.75Z" /></svg>
+                                            </button>
+                                            <button disabled={crewReadOnly} onClick={() => onUnassign(a.userId)} className="text-slate-300 hover:text-red-500 transition shrink-0 disabled:cursor-not-allowed disabled:opacity-40" aria-label={`Remove ${a.user.name || a.user.email} from task`}>
                                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                             </button>
                                         </div>

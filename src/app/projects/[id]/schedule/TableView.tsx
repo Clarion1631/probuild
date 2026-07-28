@@ -54,7 +54,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     const pathname = usePathname();
     const searchParams = useSearchParams();
     const VALID_SORT_KEYS = useMemo(() => new Set<SortKey>(["manual", "name", "type", "startDate", "endDate", "duration", "status", "progress", "estimatedHours", "actualHours"]), []);
-    const VALID_TYPES = useMemo(() => new Set<FilterState["type"]>(["all", "task", "milestone"]), []);
+    const VALID_TYPES = useMemo(() => new Set<FilterState["type"]>(["all", "task", "milestone", "appointment"]), []);
     const sortKeyRaw = searchParams.get("sort") as SortKey | null;
     const sortKey: SortKey = sortKeyRaw && VALID_SORT_KEYS.has(sortKeyRaw) ? sortKeyRaw : "startDate";
     const sortDirRaw = searchParams.get("dir");
@@ -345,9 +345,9 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                 <div className="mb-4">
                                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Type</label>
                                     <div className="mt-1.5 flex gap-1">
-                                        {(["all", "task", "milestone"] as const).map(opt => (
+                                        {(["all", "task", "milestone", "appointment"] as const).map(opt => (
                                             <button key={opt} onClick={() => updateUrl({ type: opt === "all" ? null : opt })} className={`text-[10px] font-semibold px-2 py-1 rounded-md transition border flex-1 capitalize ${filters.type === opt ? "bg-indigo-50 text-indigo-700 border-indigo-300" : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"}`}>
-                                                {opt === "all" ? "All" : opt === "task" ? "Tasks" : "Milestones"}
+                                                {opt === "all" ? "All" : opt === "task" ? "Tasks" : opt === "milestone" ? "Milestones" : "Appointments"}
                                             </button>
                                         ))}
                                     </div>
@@ -576,8 +576,8 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                                 )}
                                                             </div>
                                                             <div className="px-3 py-2">
-                                                                <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded ${task.type === "milestone" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>
-                                                                    {task.type === "milestone" ? "Mile." : "Task"}
+                                                                <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded ${task.type === "milestone" ? "bg-amber-100 text-amber-700" : task.type === "appointment" ? "bg-indigo-100 text-indigo-700" : "bg-slate-100 text-slate-600"}`}>
+                                                                    {task.type === "milestone" ? "Mile." : task.type === "appointment" ? "Appt." : "Task"}
                                                                 </span>
                                                             </div>
                                                             <div className="px-3 py-2">
@@ -728,6 +728,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                         setPanelTab={actions.setPanelTab}
                         onStatusChange={actions.handleStatusChange}
                         onNameChange={actions.handleNameSave}
+                        onDoneWhenChange={actions.handleDoneWhenChange}
                         onDateChange={actions.handleDateChange}
                         onEstimatedHoursChange={actions.handleEstimatedHoursSave}
                         onColorChange={actions.handleColorChange}
@@ -740,6 +741,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                         subcontractors={subcontractors}
                         onAssign={actions.handleAssign}
                         onUnassign={actions.handleUnassign}
+                        onSetLead={actions.handleSetLead}
                         onAssignSub={actions.handleAssignSub}
                         onUnassignSub={actions.handleUnassignSub}
                         punchItems={actions.punchItems}
@@ -756,6 +758,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                         onLinkPredecessor={actions.handleLinkPredecessor}
                         onUnlinkPredecessor={actions.handleUnlinkPredecessor}
                         onSelectTask={actions.selectTask}
+                        onAppointmentChange={actions.handleAppointmentChange}
                     />
                 )}
             </div>

@@ -92,7 +92,7 @@ export default async function PortalInvoicePage({
     searchParams,
 }: {
     params: Promise<{ id: string }>;
-    searchParams: Promise<{ payment?: string; session_id?: string }>;
+    searchParams: Promise<{ payment?: string; session_id?: string; milestone?: string }>;
 }) {
     const resolvedParams = await params;
     const resolvedSearch = await searchParams;
@@ -105,8 +105,11 @@ export default async function PortalInvoicePage({
             select: { id: true }
         });
         if (inv) {
-            const queryParams = resolvedSearch.session_id ? `?session_id=${resolvedSearch.session_id}` : '';
-            redirect(`/portal/invoices/${inv.id}${queryParams}`);
+            const qp = new URLSearchParams();
+            if (resolvedSearch.session_id) qp.set("session_id", resolvedSearch.session_id);
+            if (resolvedSearch.milestone) qp.set("milestone", resolvedSearch.milestone);
+            const qs = qp.toString();
+            redirect(`/portal/invoices/${inv.id}${qs ? `?${qs}` : ''}`);
         } else {
             return notFound();
         }
@@ -147,6 +150,7 @@ export default async function PortalInvoicePage({
             initialInvoice={invoice}
             companySettings={settings}
             paymentSuccess={resolvedSearch.payment === "success"}
+            focusMilestoneParam={resolvedSearch.milestone || null}
         />
     );
 }
