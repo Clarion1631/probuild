@@ -290,16 +290,23 @@ export default function SelectionsClient({
                                     {/* Board Actions */}
                                     <div className="flex items-center gap-2 px-5 py-3 bg-slate-50 border-b border-hui-border">
                                         {board.status === "Draft" && (
-                                            <button
-                                                onClick={() => handleSendToClient(board.id)}
-                                                className="hui-btn hui-btn-green text-sm flex items-center gap-1.5"
-                                                disabled={board.categories.length === 0}
-                                            >
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                                                </svg>
-                                                Send to Client
-                                            </button>
+                                            <>
+                                                <button
+                                                    onClick={() => handleSendToClient(board.id)}
+                                                    className="hui-btn hui-btn-green text-sm flex items-center gap-1.5"
+                                                    disabled={board.categories.length === 0 || board.categories.some(c => c.options.length === 0)}
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                                                    </svg>
+                                                    Send to Client
+                                                </button>
+                                                {(board.categories.length === 0 || board.categories.some(c => c.options.length === 0)) && (
+                                                    <span className="text-xs text-hui-textMuted">
+                                                        Add at least one option to every category before sending.
+                                                    </span>
+                                                )}
+                                            </>
                                         )}
                                         {board.status !== "Draft" && (
                                             <button

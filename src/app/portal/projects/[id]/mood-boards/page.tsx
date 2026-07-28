@@ -1,9 +1,8 @@
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
-import { getPortalVisibility, getMoodBoards } from "@/lib/actions";
+import { getPortalVisibility, getMoodBoards, getPortalMoodBoardAccess } from "@/lib/actions";
 import Link from "next/link";
+import PortalStartMoodBoardButton from "./PortalStartMoodBoardButton";
 
 export default async function PortalMoodBoardsPage(props: { params: Promise<{ id: string }> }) {
     const { id } = await props.params;
@@ -23,6 +22,18 @@ export default async function PortalMoodBoardsPage(props: { params: Promise<{ id
         );
     }
 
+    // Ownership check: PortalVisibility alone only gates whether mood boards
+    // are enabled for the project, not whether the current session may see
+    // THIS project's boards — a client on a different project could
+    // otherwise browse boards that aren't theirs.
+    let isStaff: boolean;
+    try {
+        ({ isStaff } = await getPortalMoodBoardAccess(id));
+    } catch (e) {
+        if (e instanceof Error && e.message === "Unauthorized") return notFound();
+        throw e;
+    }
+
     const boards = await getMoodBoards(id);
 
     return (
@@ -39,11 +50,14 @@ export default async function PortalMoodBoardsPage(props: { params: Promise<{ id
                 </Link>
             </div>
 
-            <div className="mb-8">
-                <h1 className="text-3xl font-bold text-hui-textMain mb-2">Visual Mood Boards</h1>
-                <p className="text-sm text-hui-textMuted">
-                    Explore design concepts and material presentations.
-                </p>
+            <div className="mb-8 flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                    <h1 className="text-3xl font-bold text-hui-textMain mb-2">Visual Mood Boards</h1>
+                    <p className="text-sm text-hui-textMuted">
+                        Explore design concepts and material presentations — drag, drop, and arrange them together with your project team.
+                    </p>
+                </div>
+                {!isStaff && <PortalStartMoodBoardButton projectId={id} />}
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
