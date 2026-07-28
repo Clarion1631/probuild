@@ -9728,15 +9728,26 @@ export async function submitSelectionProposal(projectId: string, data: {
     const url = data.url?.trim();
     if (!manualName && !url) throw new Error("A name or a product link is required");
 
+    const clampedListPrice = clampListPrice(data.listPrice);
+
     // Parse server-side so price is captured even though it's never returned
     // to the client here. Never throws — degrades to {vendorUrl, name: null}.
+    // Skipped entirely when the caller already supplied a valid listPrice —
+    // the only reason this re-parse exists is to recover the price that the
+    // portal prefill route (/api/portal/projects/[id]/proposals/parse)
+    // strips from its response; the clipper path (submitSelectionProposal's
+    // listPrice caller) already has that price from the bookmarklet's
+    // in-page DOM read, so re-fetching the URL server-side here would just
+    // be a slow (up to the Gemini url_context fallback's ~20s+) no-op for
+    // price, while every other field already prefers the caller-supplied
+    // value over parsed.* below regardless. The manual "Suggest an item"
+    // modal never sends listPrice, so it's unaffected and still gets parsed.
     let parsed: Awaited<ReturnType<typeof parseProductUrl>> | null = null;
-    if (url) {
+    if (url && clampedListPrice === undefined) {
         parsed = await parseProductUrl(url);
     }
 
     const name = (manualName || parsed?.name || "Suggested item").slice(0, 200);
-    const clampedListPrice = clampListPrice(data.listPrice);
 
     const proposal = await prisma.selectionProposal.create({
         data: {
