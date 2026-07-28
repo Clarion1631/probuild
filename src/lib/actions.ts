@@ -270,14 +270,27 @@ export async function updateLeadStage(id: string, stage: string) {
     revalidatePath(`/leads`);
 }
 
+/** Find a client by name, tolerating legacy rows saved with stray whitespace or
+ *  different casing — an exact lookup on a trimmed name would miss e.g. "Dixie Berg "
+ *  and create a duplicate client. */
+async function findClientByName(name: string) {
+    const exact = await prisma.client.findFirst({ where: { name } });
+    if (exact) return exact;
+    const collapse = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+    const candidates = await prisma.client.findMany({
+        where: { name: { contains: name.trim(), mode: "insensitive" } },
+    });
+    return candidates.find((c) => collapse(c.name) === collapse(name)) ?? null;
+}
+
 export async function createLead(data: { name: string; clientName: string; clientEmail?: string; clientPhone?: string; location?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; source?: string; projectType?: string; message?: string }) {
     // Find or create client
-    let client = await prisma.client.findFirst({
-        where: { name: data.clientName },
-    });
+    const clientName = data.clientName.trim();
+    if (!clientName) throw new Error("Client name is required.");
+    let client = await findClientByName(clientName);
 
     if (!client) {
-        const initials = data.clientName
+        const initials = clientName
             .split(" ")
             .map((n) => n[0])
             .join("")
@@ -285,7 +298,7 @@ export async function createLead(data: { name: string; clientName: string; clien
             .slice(0, 2);
         client = await prisma.client.create({
             data: {
-                name: data.clientName,
+                name: clientName,
                 initials,
                 email: data.clientEmail || null,
                 primaryPhone: data.clientPhone || null,
@@ -531,11 +544,13 @@ export async function updateLeadInfo(id: string, data: any) {
     });
 
     // Also update client if passed in
-    if (data.clientName) {
+    const updatedClientName = data.clientName?.trim();
+    if (data.clientName && !updatedClientName) throw new Error("Client name cannot be blank.");
+    if (updatedClientName) {
         await prisma.client.update({
             where: { id: lead.clientId },
             data: {
-                name: data.clientName,
+                name: updatedClientName,
                 // undefined-check: EditLeadModal always sends all address fields (initialized from
                 // DB values), so these guards fire every save. Empty string → null clears the field.
                 // Callers that omit a field entirely (pass undefined) preserve the existing DB value.
@@ -578,7 +593,9 @@ export async function getClient(id: string) {
 
 export async function createClient(data: { name: string; email?: string; companyName?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string; internalNotes?: string }) {
     "use server";
-    const initials = data.name
+    const name = data.name.trim();
+    if (!name) throw new Error("Client name is required.");
+    const initials = name
         .split(" ")
         .map((n) => n[0])
         .join("")
@@ -587,7 +604,7 @@ export async function createClient(data: { name: string; email?: string; company
 
     const client = await prisma.client.create({
         data: {
-            name: data.name,
+            name,
             initials,
             email: data.email || null,
             companyName: data.companyName || null,
@@ -606,10 +623,12 @@ export async function createClient(data: { name: string; email?: string; company
 
 export async function updateClient(clientId: string, data: { name?: string; email?: string; additionalEmail?: string; primaryPhone?: string; addressLine1?: string; city?: string; state?: string; zipCode?: string }) {
     "use server";
+    const name = data.name?.trim();
+    if (data.name !== undefined && !name) throw new Error("Client name is required.");
     const client = await prisma.client.update({
         where: { id: clientId },
         data: {
-            name: data.name,
+            name,
             email: data.email,
             additionalEmail: data.additionalEmail || undefined,
             primaryPhone: data.primaryPhone,
@@ -1190,7 +1209,7 @@ export async function createProject(data: {
     if (!clientId) {
         const clientName = (data.clientName || "").trim();
         if (!clientName) throw new Error("A customer is required to create a project.");
-        let client = await prisma.client.findFirst({ where: { name: clientName } });
+        let client = await findClientByName(clientName);
         if (!client) {
             const initials = clientName.split(" ").map((n) => n[0]).join("").toUpperCase().slice(0, 2);
             client = await prisma.client.create({
