@@ -38,6 +38,7 @@ model User {
   dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
   createdTaskMaterials TaskMaterial[] @relation("TaskMaterialCreator")
   taskMaterialStatusChanges TaskMaterial[] @relation("TaskMaterialStatusChanger")
+  createdPunchItems TaskPunchItem[] @relation("TaskPunchItemCreator")
   clippedProducts    ProductLibraryItem[]
   addedFavorites     ProjectProductFavorite[]
   decidedProposals   SelectionProposal[]
@@ -1051,7 +1052,11 @@ model TaskPunchItem {
   assignee    String?
   photoUrl    String?
   order       Int          @default(0)
+  createdById String?
+  createdBy   User?        @relation("TaskPunchItemCreator", fields: [createdById], references: [id], onDelete: SetNull)
   createdAt   DateTime     @default(now())
+
+  @@index([createdById])
 }
 
 model TaskAssignment {
@@ -1070,6 +1075,7 @@ model McpConfirmation {
   id         String    @id @default(cuid())
   token      String    @unique
   toolName   String
+  actorLabel String    @default("justin-ai")
   argsHash   String
   preview    String
   createdAt  DateTime  @default(now())
