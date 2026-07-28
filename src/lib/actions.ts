@@ -14,7 +14,7 @@ import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
-import { parseProductUrl } from "./product-parse";
+import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -9568,6 +9568,19 @@ function safeUrlOrNull(url: string | null | undefined): string | null {
     return isHttpUrl(url) ? url : null;
 }
 
+/** Clamp a client-supplied list price identically to product-parse.ts's own
+ * normalizeParsedProduct() price rule (finite, >0, <=MAX_PRICE) — used by
+ * submitSelectionProposal's optional listPrice param (the portal clipper's
+ * bookmarklet-extracted price) so it's held to the exact same bound as a
+ * server-parsed price instead of a second, driftable check. Returns
+ * undefined (not persisted) for anything out of range. */
+function clampListPrice(value: number | null | undefined): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > PRODUCT_PARSE_MAX_PRICE) {
+        return undefined;
+    }
+    return value;
+}
+
 // ── Product Library CRUD (team) ─────────────────────────────────────────────
 
 export async function createProductLibraryItem(data: {
@@ -9701,6 +9714,13 @@ export async function submitSelectionProposal(projectId: string, data: {
     description?: string;
     imageUrl?: string;
     clientNote?: string;
+    // Price already known at call time (e.g. the portal clipper bookmarklet
+    // read it straight off the live page DOM, same as the team clipper) — see
+    // clampListPrice() above. Still never returned to the client below; only
+    // ever persisted server-side. Falls back to the server-side parse's price
+    // when not supplied, same as every other field's precedence in this
+    // function (client-supplied value wins, parse fills the gap).
+    listPrice?: number;
 }) {
     await assertPortalProjectOwnership(projectId);
 
@@ -9708,10 +9728,22 @@ export async function submitSelectionProposal(projectId: string, data: {
     const url = data.url?.trim();
     if (!manualName && !url) throw new Error("A name or a product link is required");
 
+    const clampedListPrice = clampListPrice(data.listPrice);
+
     // Parse server-side so price is captured even though it's never returned
     // to the client here. Never throws — degrades to {vendorUrl, name: null}.
+    // Skipped entirely when the caller already supplied a valid listPrice —
+    // the only reason this re-parse exists is to recover the price that the
+    // portal prefill route (/api/portal/projects/[id]/proposals/parse)
+    // strips from its response; the clipper path (submitSelectionProposal's
+    // listPrice caller) already has that price from the bookmarklet's
+    // in-page DOM read, so re-fetching the URL server-side here would just
+    // be a slow (up to the Gemini url_context fallback's ~20s+) no-op for
+    // price, while every other field already prefers the caller-supplied
+    // value over parsed.* below regardless. The manual "Suggest an item"
+    // modal never sends listPrice, so it's unaffected and still gets parsed.
     let parsed: Awaited<ReturnType<typeof parseProductUrl>> | null = null;
-    if (url) {
+    if (url && clampedListPrice === undefined) {
         parsed = await parseProductUrl(url);
     }
 
@@ -9723,7 +9755,7 @@ export async function submitSelectionProposal(projectId: string, data: {
             name,
             description: data.description?.trim() || parsed?.description || null,
             imageUrl: safeUrlOrNull(data.imageUrl) || safeUrlOrNull(parsed?.imageUrl),
-            price: parsed?.price ?? null,
+            price: clampedListPrice ?? parsed?.price ?? null,
             vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
             clientNote: data.clientNote?.trim() || null,
             status: "Pending",
