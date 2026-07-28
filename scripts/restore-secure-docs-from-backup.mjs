@@ -1,6 +1,6 @@
 // EMERGENCY UNDO for the secure-docs migration. Restores documents that
 // migrate-secure-docs.mjs moved into the PRIVATE `secure-docs` bucket (and that
-// purge-migrated-public-docs.mjs / sweep-orphaned-public-signatures.mjs then deleted from the
+// purge-migrated-public-docs.mjs / sweep-orphaned-signature-objects.mjs then deleted from the
 // PUBLIC `project-files` bucket) back into the public bucket, from the on-disk backup that
 // backup-migrated-public-docs.mjs (and the orphan sweep) produced before those deletions.
 //

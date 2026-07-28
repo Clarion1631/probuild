@@ -6033,7 +6033,8 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
  * A Prisma rejection does not prove the write rolled back — on the PgBouncer pooler a
  * connection can drop after COMMIT — so probe for a surviving reference to this exact
  * object first. Unknown outcome => KEEP the object: an orphan is sweepable
- * (scripts/sweep-orphaned-public-signatures.mjs), a deleted e-signature is not.
+ * (scripts/sweep-orphaned-signature-objects.mjs, which covers both the public project-files
+ * bucket and the private secure-docs bucket this upload lands in), a deleted e-signature is not.
  */
 async function discardSignatureUnlessReferenced(
     url: string | null,
@@ -6043,7 +6044,9 @@ async function discardSignatureUnlessReferenced(
 ): Promise<void> {
     if (!url) return;
 
-    let referenced: boolean;
+    // Typed `unknown` on purpose: the delete decision must fail closed even if a future
+    // probe returns something other than a boolean.
+    let referenced: unknown;
     try {
         referenced = await isReferenced();
     } catch (error) {
@@ -6055,9 +6058,16 @@ async function discardSignatureUnlessReferenced(
         return;
     }
 
-    if (referenced) {
+    // Fail closed: ONLY an explicit `false` authorises deletion. `true` means the write
+    // committed despite the rejection; anything else means we don't actually know.
+    if (referenced !== false) {
         try {
-            console.warn(`[${context}] signature survived a rejected write — keeping the upload`, { url });
+            console.warn(
+                referenced === true
+                    ? `[${context}] signature survived a rejected write — keeping the upload`
+                    : `[${context}] signature reference probe gave a non-boolean result — keeping the upload (unknown outcome, refuse to delete)`,
+                { url },
+            );
         } catch {
             // Logging must never replace the caller's primary error.
         }
