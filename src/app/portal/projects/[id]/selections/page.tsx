@@ -50,6 +50,7 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
     // the "Your suggestions" section below always renders and covers that case
     // with its own invite-to-suggest empty state.
     const showFavorites = favorites.length > 0 || boards.length > 0 || proposals.length > 0;
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-4">
@@ -88,6 +89,7 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
                 <PortalSuggestionsSection
                     projectId={id}
                     initialProposals={JSON.parse(JSON.stringify(proposals))}
+                    appUrl={appUrl}
                 />
             </div>
         </div>
