@@ -2601,6 +2601,9 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 export async function deleteInvoice(invoiceId: string) {
     await assertInvoicePermission();
 
+    // Guard failures return { error } instead of throwing: production masks
+    // thrown server-action messages, so the client would never see the reason.
+    try {
     const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
         await lockMoneyParents(tx, { invoiceId });
         const invoice = await tx.invoice.findUnique({
@@ -2622,7 +2625,10 @@ export async function deleteInvoice(invoiceId: string) {
     }));
     revalidatePath("/projects/" + projectId + "/invoices");
     revalidatePath("/invoices");
-    return { success: true, projectId };
+    return { success: true as const, projectId };
+    } catch (e: any) {
+        return { success: false as const, error: e?.message || "Cannot delete this invoice" };
+    }
 }
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {
     await assertInvoicePermission();
@@ -4201,14 +4207,21 @@ export async function splitInvoiceMilestones(
 ) {
     await assertInvoicePermission();
 
-    const { splitInvoiceMilestonesCore } = await import("./billing-core");
-    const projectId = await splitInvoiceMilestonesCore(invoiceId, milestones);
+    // Guard failures return { error } instead of throwing: production masks
+    // thrown server-action messages, so the client would never see the reason.
+    let projectId: string;
+    try {
+        const { splitInvoiceMilestonesCore } = await import("./billing-core");
+        projectId = await splitInvoiceMilestonesCore(invoiceId, milestones);
+    } catch (e: any) {
+        return { success: false as const, error: e?.message || "Failed to update payment schedule" };
+    }
 
     revalidatePath(`/projects/${projectId}/invoices`);
     revalidatePath(`/projects/${projectId}/invoices/${invoiceId}`);
     revalidatePath(`/invoices`);
 
-    return { success: true };
+    return { success: true as const };
 }
 
 /**
