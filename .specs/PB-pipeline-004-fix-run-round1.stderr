@@ -1,0 +1,1506 @@
+warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.
+Reading additional input from stdin...
+2026-07-27T20:50:46.210481Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer error=\"invalid_request\", error_description=\"No access token was provided in this request\", resource_metadata=\"https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/\"" })
+2026-07-27T20:50:47.364815Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Auth(AuthorizationRequired)
+2026-07-27T20:50:48.026170Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer resource_metadata=\"https://mcp.slack.com/.well-known/oauth-protected-resource\"" })
+2026-07-27T20:50:57.803999Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.5 seconds
+Output:
+Get-Content : Cannot find path 'C:/Users/jat00/.codex/skills/.system/superpowers/6.2.0/skills/writing-plans/SKILL.md' 
+because it does not exist.
+At line:2 char:1
++ Get-Content -Raw -LiteralPath 'C:/Users/jat00/.codex/skills/.system/s ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:/Users/jat00/...-plans/SKILL.md:String) [Get-Content], ItemNotFoundEx 
+   ception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+
+2026-07-27T20:50:57.804422Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.5 seconds
+Output:
+Get-Content : Cannot find path 
+'C:/Users/jat00/.codex/skills/.system/superpowers/6.2.0/skills/systematic-debugging/SKILL.md' because it does not 
+exist.
+At line:2 char:1
++ Get-Content -Raw -LiteralPath 'C:/Users/jat00/.codex/skills/.system/s ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:/Users/jat00/...ugging/SKILL.md:String) [Get-Content], ItemNotFoundEx 
+   ception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+
+2026-07-27T20:51:15.791875Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+WORKFLOW_AUDIT.md
+VISION.md
+vercel.json
+ts_errors.txt
+tsconfig.json
+tmp-test-setup.js
+tmp-fix.js
+test-ai.mjs
+test-ai.js
+temp_portal.txt
+tailwind.config.js
+STRIPE_ESTIMATE_PAYMENT.md
+src\proxy.ts
+prisma\seed.ts
+prisma\schema.prisma.tmp
+prisma\schema.prisma
+README.md
+eslint.config.mjs
+src\lib\ai-json.ts
+COGNEE_INGEST_DECISION.md
+seed-tags.js
+QA_REPORT_2026-04-07.md
+CONTRACT_EDITOR_REDESIGN.md
+QA_AGENT_PROMPT.md
+scraper.py
+seed-lien.mjs
+cloner.py
+src\lib\actions.ts
+components.json
+CLAUDE.md
+compare.py
+DESIGN_SYSTEM.md
+check-settings.mjs
+requirements.txt
+PROJECT_GUIDE.md
+ProbuildTodo.md
+src\lib\ai-estimate-transform.ts
+src\lib\billing-core.ts
+src\lib\auto-grant-project-access.ts
+src\lib\auth.ts
+src\lib\anthropic.ts
+src\lib\budget-math.ts
+src\lib\budget-actions.ts
+src\lib\build-pdf.ts
+src\lib\change-order-approval.ts
+next.config.ts
+bun.lock
+AGENT_CONTEXT.md
+FIX_PORTALPAYBUTTON_TOTAL.md
+src\lib\wa-tax.ts
+src\lib\utils.ts
+src\lib\tx-retry.ts
+src\lib\transactions-report.ts
+src\lib\time-expense-core.ts
+src\lib\time-expense-actions.ts
+src\lib\time-billing-report.ts
+src\lib\tax-cert.ts
+src\lib\supabase.ts
+src\lib\subcontractor-actions.ts
+src\lib\sub-portal-auth.ts
+docs\TESTING.md
+extension\README.md
+extension\manifest.json
+extension\background.js
+prisma\migrations\sprint5_baseline\migration.sql
+postcss.config.js
+qa-report\trace\xtermModule.DYP7pi_n.css
+playwright.config.ts
+qa-report\trace\uiMode.Vipi55dB.js
+playwright.config.prod.ts
+qa-report\trace\uiMode.html
+package.json
+package-lock.json
+qa-report\trace\uiMode.Btcz36p_.css
+OPTIMIZATIONS.md
+qa-report\trace\sw.bundle.js
+qa-report\trace\snapshot.html
+qa-report\trace\playwright-logo.svg
+src\app\DashboardClient.tsx
+qa-report\trace\manifest.webmanifest
+qa-report\trace\index.html
+qa-report\trace\index.CzXZzn5A.css
+qa-report\trace\index.C5466mMT.js
+qa-report\trace\defaultSettingsView.B4dS75f0.css
+qa-report\trace\codicon.DCmgc-ay.ttf
+qa-report\trace\codeMirrorModule.DYBRYzYX.css
+public\window.svg
+public\vercel.svg
+public\next.svg
+public\logo.png
+public\login-bg.png
+public\globe.svg
+public\file.svg
+scripts\backfill-signature-storage.mjs
+scripts\backfill-phone-e164.ts
+scripts\apply-pdf-contracts-schema.mjs
+scripts\apply-field-comments-schema.mjs
+scripts\apply-countersign-schema.mjs
+scripts\apply-co-countersign-schema.mjs
+scripts\add-admin.js
+scripts\estimate-template-seeds.ts
+scripts\download-hdri.ts
+scripts\download-assets.ts
+scripts\create-indexes.ts
+scripts\houzz-audit.js
+scripts\fix-template-formatting.mjs
+scripts\import-houzz.mjs
+docs\dashboard-snapshot.txt
+docs\dashboard-final.txt
+docs\CONTRACTS.md
+docs\houzz-audit.md
+docs\houzz-api-calls.md
+docs\leads-snapshot.txt
+qa-report\index.html
+migrations\session10_friendly_ids_and_integration.sql
+migrations\session10_float_to_decimal.sql
+migrations\phase2_unified_messaging.sql
+migrations\phase2b_client_message_read_at.sql
+migrations\phase1_dedup_leads.sql
+migrations\payment_reminders.sql
+migrations\apply_schema_help.sql
+migrations\apply_schema_help.ps1
+migrations\apply_schema_b.sql
+migrations\add_conversation_id_to_help_request.sql
+migrations\004_cost_plus_change_orders.sql
+docs\screenshots\timeline.png
+docs\screenshots\leads.png
+docs\screenshots\estimateform.png
+docs\screenshots\dashboard.png
+e2e\money-pipeline.spec.ts
+src\lib\studio\usdz-generator.ts
+src\lib\studio\units.ts
+src\lib\studio\templates.ts
+src\lib\studio\stacking.ts
+src\lib\studio\share-url.ts
+src\lib\studio\share-token.ts
+src\lib\studio\scan-import.ts
+src\lib\studio\render-prompt.ts
+src\lib\studio\materials.ts
+src\lib\studio\library.ts
+src\lib\studio\geometry.ts
+src\lib\studio\doc.ts
+src\lib\studio\catalog.ts
+src\lib\stripe.ts
+src\lib\stripe-estimate-settlement.ts
+src\lib\staff-status.ts
+src\lib\sms.ts
+src\lib\signature-storage.ts
+src\lib\sales-tax-report.ts
+src\lib\report-utils.ts
+src\lib\quickbooks.ts
+src\lib\quickbooks-payments.ts
+src\lib\project-status.ts
+src\lib\project-match.ts
+src\lib\project-files.ts
+src\lib\prisma.ts
+src\lib\prisma-helpers.ts
+src\lib\portal-auth.ts
+src\lib\phone.ts
+src\lib\permissions.ts
+src\lib\pdf.ts
+src\lib\pdf-richtext.ts
+src\lib\payouts-report.ts
+src\lib\payments-report.ts
+src\lib\payment-reminders.ts
+src\lib\payment-outbox.ts
+src\lib\payment-notifications.ts
+src\lib\open-invoices-report.ts
+src\lib\office-task-utils.ts
+src\lib\mobile-auth.ts
+src\lib\merge-fields.ts
+src\lib\letterhead.ts
+src\lib\lead-note-actions.ts
+src\lib\lead-drive.ts
+src\lib\lead-access.ts
+src\lib\integration-store.ts
+e2e\stripe-estimate-mirror.spec.ts
+e2e\reconcile-to-qbo.spec.ts
+e2e\quality-gate.spec.ts
+e2e\qa-timeclock-expenses.spec.ts
+e2e\qa-settings-company.spec.ts
+e2e\qa-schedule-tasks.spec.ts
+e2e\qa-navigation-audit.spec.ts
+e2e\qa-lead-messaging.spec.ts
+e2e\qa-lead-estimate-invoice.spec.ts
+e2e\qa-help-chat.spec.ts
+e2e\qa-client-portal.spec.ts
+e2e\prod-auth.setup.ts
+e2e\portal-schedule-calendar.spec.ts
+qa-report\results.json
+src\lib\crypto.ts
+src\lib\contract-styles.ts
+src\lib\contract-finalize.ts
+src\lib\company-timezone.ts
+src\lib\co-tax.ts
+src\lib\client-portal-auth.ts
+src\lib\client-actions.ts
+src\lib\change-order-core.ts
+src\lib\global-tracker-report.ts
+src\lib\geocode.ts
+src\lib\file-auth.ts
+src\lib\email.ts
+estimatesamples\Howard Primary Bath.pdf
+src\lib\gmail-sync.ts
+estimatesamples\Atherton Kitchen.pdf
+src\lib\gmail-client.ts
+estimatesamples\709 W 32ND ST VANCOUVER WA 98660 (2) (1).pdf
+src\lib\google-drive.ts
+estimatesamples\2220 E ST VANCOUVER WA (1).pdf
+src\lib\gpt-estimate.ts
+skills-lock.json
+seed-vendor-tags.mjs
+seed-templates.mjs
+HANDOFF.md
+scripts\probe-deploy-columns.mjs
+scripts\patch-menu.js
+scripts\migrate-takeoffs.mjs
+scripts\import-log-2026-04-21.json
+scripts\seed-estimate-templates.ts
+scripts\reset-signatures.mjs
+scripts\seed-residential-templates.mjs
+e2e\data.setup.ts
+e2e\coverage-expansion.spec.ts
+e2e\cost-plus-change-order.spec.ts
+e2e\auth.setup.ts
+e2e\auth-status.spec.ts
+e2e\estimate-editor.spec.ts
+e2e\deck-stacking.spec.ts
+e2e\financial-action-auth.spec.ts
+e2e\full-workflow.spec.ts
+qa-report\trace\assets\codeMirrorModule-DS0FLvoc.js
+src\app\apple-icon.png
+scripts\seed-test-contract.mjs
+src\app\manifest.ts
+qa-report\trace\assets\defaultSettingsView-GTWI-W_B.js
+scripts\verify-template-roundtrip.ts
+scripts\verify-gpt-estimate.ts
+scripts\verify-estimate-edit.ts
+scripts\verify-billing-tools.ts
+src\app\time-clock\page.tsx
+src\app\time-clock\error.tsx
+src\components\VersionWatcher.tsx
+src\components\UndoPaymentModal.tsx
+e2e\helpers\fail-loud.ts
+src\app\page.tsx
+src\app\page.module.css
+src\lib\help-chat\github.ts
+agent-prompts\G6-20-mobile-app.txt
+agent-prompts\G6-19-notification-center.txt
+agent-prompts\G6-18-global-search.txt
+
+2026-07-27T20:51:15.834066Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:51:28.900407Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:51:38.724116Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:51:44.975426Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:51:53.075098Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:01.320022Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:07.939900Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+playwright.config.ts-1-import { defineConfig, devices } from "@playwright/test";
+playwright.config.ts-2-
+playwright.config.ts-3-export default defineConfig({
+playwright.config.ts-4-  testDir: "./e2e",
+playwright.config.ts-5-  fullyParallel: true,
+playwright.config.ts-6-  forbidOnly: !!process.env.CI,
+playwright.config.ts-7-  retries: process.env.CI ? 2 : 0,
+playwright.config.ts-8-  workers: process.env.CI ? 1 : undefined,
+playwright.config.ts-9-  reporter: process.env.CI ? "github" : "list",
+playwright.config.ts-10-  timeout: 30_000,
+playwright.config.ts-11-  expect: { timeout: 10_000 },
+playwright.config.ts-12-  use: {
+playwright.config.ts:13:    baseURL: "http://localhost:3000",
+playwright.config.ts-14-    trace: "on-first-retry",
+playwright.config.ts-15-    screenshot: "only-on-failure",
+playwright.config.ts-16-  },
+playwright.config.ts-17-  projects: [
+playwright.config.ts-18-    {
+playwright.config.ts-19-      name: "data",
+playwright.config.ts-20-      testMatch: /data\.setup\.ts/,
+playwright.config.ts-21-    },
+playwright.config.ts-22-    {
+playwright.config.ts-23-      name: "setup",
+playwright.config.ts-24-      testMatch: /(^|[\\/])auth\.setup\.ts$/,
+playwright.config.ts-25-      // data first: on a fresh test DB the admin user must exist before login
+playwright.config.ts-26-      dependencies: ["data"],
+playwright.config.ts-27-    },
+playwright.config.ts-28-    {
+playwright.config.ts-29-      name: "chromium",
+playwright.config.ts-30-      use: {
+playwright.config.ts-31-        ...devices["Desktop Chrome"],
+playwright.config.ts:32:        storageState: "e2e/.auth/user.json",
+playwright.config.ts-33-      },
+playwright.config.ts-34-      dependencies: ["data", "setup"],
+playwright.config.ts-35-    },
+playwright.config.ts-36-  ],
+playwright.config.ts-37-  webServer: {
+playwright.config.ts-38-    command: process.env.CI ? "npm run start" : "npm run dev",
+playwright.config.ts-39-    url: "http://localhost:3000",
+playwright.config.ts-40-    reuseExistingServer: !process.env.CI,
+playwright.config.ts-41-    timeout: 120_000,
+playwright.config.ts-42-  },
+playwright.config.ts-43-});
+rg: e2e/*.ts: The filename, directory name, or volume label syntax is incorrect. (os error 123)
+
+2026-07-27T20:52:08.069971Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:16.221639Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:25.221812Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:33.508449Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:40.896801Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:52:52.279978Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:53:01.336911Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+
+2026-07-27T20:53:01.366577Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:53:10.099062Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:54:23.292252Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:54:39.939127Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:54:51.341136Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:00.932438Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to read file to update C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\e2e\cost-plus-change-order.spec.ts: failed to prepare fs sandbox: failed to prepare windows sandbox wrapper: windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed
+2026-07-27T20:55:00.960485Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:06.947950Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to read file to update C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\e2e\cost-plus-change-order.spec.ts: failed to prepare fs sandbox: failed to prepare windows sandbox wrapper: windows unelevated restricted-token sandbox cannot enforce split writable root sets directly; refusing to run unsandboxed
+2026-07-27T20:55:06.979450Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:13.183923Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:17.477474Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+Error: --codex-run-as-apply-patch requires a UTF-8 PATCH argument.
+
+2026-07-27T20:55:17.601656Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:22.327372Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:26.778830Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+Invalid patch: The last line of the patch must be '*** End Patch'
+
+2026-07-27T20:55:26.903412Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:33.101723Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:37.743760Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:45.733403Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+Invalid patch: The last line of the patch must be '*** End Patch'
+
+2026-07-27T20:55:45.862631Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:51.653724Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:55:58.681934Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+Set-Content : Access to the path 'C:\tmp\codex-patch.txt' is denied.
+At line:12 char:1
++ Set-Content -LiteralPath 'C:\tmp\codex-patch.txt' -Value $patchText - ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : PermissionDenied: (C:\tmp\codex-patch.txt:String) [Set-Content], UnauthorizedAccessExcep 
+   tion
+    + FullyQualifiedErrorId : GetContentWriterUnauthorizedAccessError,Microsoft.PowerShell.Commands.SetContentCommand
+ 
+Get-Content : Cannot find path 'C:\tmp\codex-patch.txt' because it does not exist.
+At line:13 char:8
++ $arg = Get-Content -Raw -LiteralPath 'C:\tmp\codex-patch.txt'
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\tmp\codex-patch.txt:String) [Get-Content], ItemNotFoundException
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+ 
+Error: --codex-run-as-apply-patch requires a UTF-8 PATCH argument.
+
+2026-07-27T20:55:58.810123Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:01.977023Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:08.447427Z ERROR codex_core::tools::router: error=`"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$patchText = @'"'
+*** Begin Patch
+*** Update File: e2e/cost-plus-change-order.spec.ts
+@@
+  invoiceReconcile: "'`${run}-invoice-reconcile`,
+  invoiceB: `${run}-invoice-b`,
++  invoiceGuard: `${run}-invoice-guard`,
+  receipt: `${run}-receipt`,
+*** End Patch
+'"'@
+"'$patchPath = Join-Path (Get-Location) '"'.codex-patch.tmp'
+Set-Content -LiteralPath "'$patchPath -Value $patchText -Encoding utf8NoBOM
+$arg = Get-Content -Raw -Encoding utf8 -LiteralPath $patchPath
+& apply_patch "$arg"
+Remove-Item -LiteralPath $patchPath -Force'` rejected: blocked by policy
+2026-07-27T20:56:08.584702Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:14.058720Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+Invalid patch: The last line of the patch must be '*** End Patch'
+
+2026-07-27T20:56:14.194623Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:17.972243Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+Invalid patch: The first line of the patch must be '*** Begin Patch'
+
+2026-07-27T20:56:18.007509Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:25.469137Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:33.372064Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:40.093419Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+
+2026-07-27T20:56:40.127145Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:56:47.010879Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+
+2026-07-27T20:56:57.900617Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+
+2026-07-27T20:58:13.474329Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T20:59:03.083371Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:00:13.139429Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+<anonymous_script>:16
+  "        {\n          id: IDS.invoiceB,\n          code: " + bt + "$" + "{run}-INV-B" + bt + ",\n          projectId: IDS.projectB,\n          clientId: IDS.clientB,\n          estimateId: IDS.estimateB,\n          status: "Draft",\n          subtotal: 0,\n          taxRate: 0,\n          taxAmount: 0,\n          totalAmount: 0,\n          balanceDue: 0,\n        },\n      ],",
+                                                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SyntaxError: missing ) after argument list
+    at [eval]:1:4643
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:283:30)
+    at evalTypeScript (node:internal/process/execution:295:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.12.0
+
+2026-07-27T21:00:30.994658Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+<anonymous_script>:19
+replaceOnce("    });\n    await prisma.projectFile.create({", "    });\n    await prisma.estimateItem.createMany({\n      data: [\n        { id: IDS.itemA, estimateId: IDS.estimateA, name: "Estimate A item", quantity: 1, unitCost: 10, total: 10 },\n        { id: IDS.itemB, estimateId: IDS.estimateB, name: "Estimate B item", quantity: 1, unitCost: 20, total: 20 },\n      ],\n    });\n    await prisma.projectFile.create({");
+                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SyntaxError: missing ) after argument list
+    at [eval]:1:4067
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:283:30)
+    at evalTypeScript (node:internal/process/execution:295:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.12.0
+
+2026-07-27T21:00:31.041122Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:00:52.751063Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:00:56.431591Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:01:05.698545Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:01:40.394289Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:01:57.762281Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:01.219218Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:03.730609Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:06.175942Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:08.313616Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:15.002196Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:22.903619Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:02:52.070431Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Output:
+
+2026-07-27T21:03:35.974215Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:03:41.412455Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:03:49.039021Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:03:51.557445Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:09.249845Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:11.986772Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:23.750258Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 1.4 seconds
+Output:
+<anonymous_script>:7
+  if (!source.includes(oldText)) throw new Error("missing anchor: " + oldText.slice(0, 90));
+                                 ^
+
+Error: missing anchor:         teamMembers: { id: true, name: true, email: true, hourlyRate: true },
+    at replaceOnce (eval at <anonymous> ([eval]:1:1), <anonymous>:7:40)
+    at eval (eval at <anonymous> ([eval]:1:1), <anonymous>:27:1)
+    at [eval]:1:1
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:283:30)
+    at evalTypeScript (node:internal/process/execution:295:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.12.0
+
+2026-07-27T21:04:23.782347Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:26.827660Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:39.950434Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:43.347119Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:04:46.279588Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:05:05.314370Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:05:22.343184Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:05:26.136167Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:06:08.634689Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 1.5 seconds
+Output:
+<anonymous_script>:7
+  if (!source.includes(oldText)) throw new Error("missing anchor: " + oldText.slice(0, 100));
+                                 ^
+
+Error: missing anchor: <td className="px-4 py-3 text-slate-600">{entry.changeOrder ? <span>{entry.changeOrder.code} � {entr
+    at replaceOnce (eval at <anonymous> ([eval]:1:1), <anonymous>:7:40)
+    at eval (eval at <anonymous> ([eval]:1:1), <anonymous>:33:1)
+    at [eval]:1:1
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:283:30)
+    at evalTypeScript (node:internal/process/execution:295:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.12.0
+
+2026-07-27T21:06:24.666587Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:06:41.938973Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:07:00.528771Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:07:03.401409Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:07:14.871616Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:07:47.671599Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:01.437432Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:05.404791Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:08.181053Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:10.618554Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:12.939178Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:14.821979Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:08:23.428848Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.3 seconds
+Total output lines: 707
+Output:
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:11: trailing whitespace.
++    costTypes: { id: string; name: string }[];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:12: trailing whitespace.
++    changeOrders: { id: string; code: string; title: string; estimateId: string }[];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:16: trailing whitespace.
++export default function NewExpenseEntryModal({ projectId, estimates, costCodes, costTypes, changeOrders, onClose }: Props) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:25: trailing whitespace.
++    const [description, setDescription] = useState("");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:26: trailing whitespace.
++    const [changeOrderId, setChangeOrderId] = useState("");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:27: trailing whitespace.
++    const [isBillable, setIsBillable] = useState(true);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:28: trailing whitespace.
++    const [receiptFile, setReceiptFile] = useState<File | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:29: trailing whitespace.
++    const [receiptFileId, setReceiptFileId] = useState<string | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:31: trailing whitespace.
++    const [receiptUploadError, setReceiptUploadError] = useState<string | null>(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:36: trailing whitespace.
++    function clearReceipt() {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:37: trailing whitespace.
++        setReceiptFile(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:38: trailing whitespace.
++        setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:39: trailing whitespace.
++        setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:40: trailing whitespace.
++        const input = document.getElementById("receipt-upload") as HTMLInputElement | null;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:41: trailing whitespace.
++        if (input) input.value = "";
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:42: trailing whitespace.
++    }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:43: trailing whitespace.
++
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:46: trailing whitespace.
++        setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:47: trailing whitespace.
++        setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:50: trailing whitespace.
++            try {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:51: trailing whitespace.
++                const formData = new FormData();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:52: trailing whitespace.
++                formData.append("file", file);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:53: trailing whitespace.
++                formData.append("projectId", projectId);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:54: trailing whitespace.
++                const res = await fetch("/api/receipts/parse", { method: "POST", body: formData });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:55: trailing whitespace.
++                if (res.ok) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:56: trailing whitespace.
++                    const result = await res.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:57: trailing whitespace.
++                    if (result.vendor) setVendor(result.vendor);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:58: trailing whitespace.
++                    if (result.total) setAmount(String(result.total));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:59: trailing whitespace.
++                    if (result.date) setDate(result.date);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:60: trailing whitespace.
++                    if (result.items?.length) setDescription(result.items.map((item: any) => item.description).filter(Boolean).join(", "));
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:61: trailing whitespace.
++                    toast.success("Receipt scanned successfully");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:62: trailing whitespace.
++                } else {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:63: trailing whitespace.
++                    toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:64: trailing whitespace.
++                }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:65: trailing whitespace.
++            } catch {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:66: trailing whitespace.
++                toast.warning("Receipt scan failed; you can still attach the receipt manually.");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:67: trailing whitespace.
++            }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:68: trailing whitespace.
++
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:69: trailing whitespace.
++            try {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:70: trailing whitespace.
++                const signRes = await fetch("/api/files/signed-upload", {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:71: trailing whitespace.
++                    method: "POST",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:72: trailing whitespace.
++                    headers: { "Content-Type": "application/json" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:73: trailing whitespace.
++                    body: JSON.stringify({
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:74: trailing whitespace.
++                        projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:75: trailing whitespace.
++                        visibility: "financial",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:76: trailing whitespace.
++                        files: [{ name: file.name, size: file.size, mimeType: file.type || "application/octet-stream" }],
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:77: trailing whitespace.
++                    }),
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:78: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:79: trailing whitespace.
++                const signData = await signRes.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:80: trailing whitespace.
++                if (!signRes.ok || !signData.uploads?.[0]) throw new Error(signData.error || "Receipt upload could not be prepared");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:81: trailing whitespace.
++                const upload = signData.uploads[0];
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:82: trailing whitespace.
++                const uploadRes = await fetch(upload.signedUrl, {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:83: trailing whitespace.
++                    method: "PUT",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:84: trailing whitespace.
++                    headers: { "Content-Type": file.type || "application/octet-stream", "x-upsert": "false" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:85: trailing whitespace.
++                    body: file,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:86: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:87: trailing whitespace.
++                if (!uploadRes.ok) throw new Error("Receipt storage upload failed");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:88: trailing whitespace.
++                const registerRes = await fetch("/api/files/register", {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:89: trailing whitespace.
++                    method: "POST",
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:90: trailing whitespace.
++                    headers: { "Content-Type": "application/json" },
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:91: trailing whitespace.
++                    body: JSON.stringify({ files: [{
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:92: trailing whitespace.
++                        name: upload.name,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:93: trailing whitespace.
++                        url: upload.publicUrl,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:94: trailing whitespace.
++                        size: upload.size,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:95: trailing whitespace.
++                        mimeType: upload.mimeType,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:96: trailing whitespace.
++                        projectId: upload.projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:97: trailing whitespace.
++                        visibility: upload.visibility,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:98: trailing whitespace.
++                    }] }),
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:99: trailing whitespace.
++                });
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:100: trailing whitespace.
++                const registered = await registerRes.json();
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:101: trailing whitespace.
++                if (!registerRes.ok || !registered.files?.[0]?.id) throw new Error(registered.error || "Receipt record could not be saved");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:102: trailing whitespace.
++                setReceiptFileId(registered.files[0].id);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:103: trailing whitespace.
++                setReceiptUploadError(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:104: trailing whitespace.
++            } catch (err) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:105: trailing whitespace.
++                const message = err instanceof Error ? err.message : "Receipt attachment failed";
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:106: trailing whitespace.
++                setReceiptFileId(null);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:107: trailing whitespace.
++                setReceiptUploadError(message);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:108: trailing whitespace.
++                toast.error("Receipt attachment failed: " + message);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:109: trailing whitespace.
++            }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:116: trailing whitespace.
++        if (!estimateId && !changeOrderId) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:124: trailing whitespace.
++        if (ocrLoading || receiptUploadError) {
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:125: trailing whitespace.
++            toast.error("Resolve the receipt attachment error or clear the receipt before saving");
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:126: trailing whitespace.
++            return;
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:127: trailing whitespace.
++        }
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:139: trailing whitespace.
++                projectId,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:140: trailing whitespace.
++                changeOrderId: changeOrderId || null,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:141: trailing whitespace.
++                isBillable,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:142: trailing whitespace.
++                receiptFileId: receiptFileId || undefined,
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:172: trailing whitespace.
++                            if (f) void handleReceiptOCR(f);
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:192: trailing whitespace.
++                {receiptUploadError && (
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:193: trailing whitespace.
++                    <div role="alert" className="mb-5 flex items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:194: trailing whitespace.
++                        <span>Receipt attachment failed: {receiptUploadError}</span>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:195: trailing whitespace.
++                        <button type="button" onClick={clearReceipt} className="font-semibold underline">Clear receipt</button>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:196: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:197: trailing whitespace.
++                )}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:199: trailing whitespace.
++                <form onSubmit={handleSubmit} className="space-y-4">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:200: trailing whitespace.
++                    <div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:201: trailing whitespace.
++                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:202: trailing whitespace.
++                        <select value={changeOrderId} onChange={e => { const value = e.target.value; setChangeOrderId(value); setItemId(""); const changeOrder = changeOrders.find(co => co.id === value); if (changeOrder?.estimateId) setEstimateId(changeOrder.estimateId); }} className="hui-input w-full text-sm">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:203: trailing whitespace.
++                            <option value="">Project expense (no change order)</option>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:204: trailing whitespace.
++                            {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:205: trailing whitespace.
++                        </select>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:206: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:265: trailing whitespace.
++                    <div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:266: trailing whitespace.
++                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Description</label>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:268: trailing whitespace.
++                    </div>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:269: trailing whitespace.
++
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:270: trailing whitespace.
++                    <label className="flex items-center gap-2 cursor-pointer">
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:271: trailing whitespace.
++                        <input type="checkbox" checked={isBillable} onChange={e => setIsBillable(e.target.checked)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:272: trailing whitespace.
++                        <span className="text-sm text-slate-700">Billable</span>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:273: trailing whitespace.
++                    </label>
+src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx:277: trailing whitespace.
++                        <button type="submit" disabled={saving || ocrLoading || Boolean(receiptUploadError)} className="hui-btn hui-btn-green text-sm px-4 py-2">
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:10: trailing whitespace.
++    teamMembers: { id: string; name: string | null; email: string; hourlyRate?: any; burdenRate?: any }[];
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:12: trailing whitespace.
++    currentUserId: string;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:13: trailing whitespace.
++    changeOrders: { id: string; code: string; title: string }[];
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:17: trailing whitespace.
++export default function NewTimeEntryModal({ projectId, teamMembers, costCodes, currentUserId, changeOrders, onClose }: Props) {
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:23: trailing whitespace.
++    const [isBillable, setIsBillable] = useState(false);
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:25: trailing whitespace.
++    const [notes, setNotes] = useState("");
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:26: trailing whitespace.
++    const [changeOrderId, setChangeOrderId] = useState("");
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:29: trailing whitespace.
++    const storedRate = selectedMember?.hourlyRate ? Number(selectedMember.hourlyRate) : 0;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:30: trailing whitespace.
++    const storedBurdenRate = selectedMember?.burdenRate ? Number(selectedMember.burdenRate) : 0;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:31: trailing whitespace.
++    const hoursValue = parseFloat(hours) || 0;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:32: trailing whitespace.
++    const laborPreview = hoursValue * storedRate;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:33: trailing whitespace.
++    const burdenPreview = hoursValue * storedBurdenRate;
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:51: trailing whitespace.
++                notes,
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:52: trailing whitespace.
++                changeOrderId: changeOrderId || null,
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:93: trailing whitespace.
++                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Stored rate ($/hr)</label>
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:94: trailing whitespace.
++                            <input type="text" value={formatCurrency(storedRate)} readOnly className="hui-input w-full text-sm bg-slate-50" />
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:108: trailing whitespace.
++                    <div>
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:109: trailing whitespace.
++                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-1 block">Change order</label>
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:110: trailing whitespace.
++                        <select value={changeOrderId} onChange={e => setChangeOrderId(e.target.value)} className="hui-input w-full text-sm">
+src/app/projects/[id]/time-expenses/NewTimeEntryModal.tsx:111: trailing whitespace.
++                            <option value="">Project time (no change order)</option>
+src/app/projects/[id]/time-expenses…2278 tokens truncated…Name="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Change order</th>
+src/app/projects/[id]/time-expenses/TimeTab.tsx:274: trailing whitespace.
++                                    <tr key={entry.id} data-testid={"time-entry-row-" + entry.id} className="hover:bg-slate-50 transition">
+src/app/projects/[id]/time-expenses/TimeTab.tsx:276: trailing whitespace.
++                                            <input type="checkbox" data-testid={"time-entry-select-" + entry.id} checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} disabled={Boolean(entry.changeOrder || entry.invoiceId || entry.invoicedAt)} title={entry.changeOrder ? "Change-order time must be billed through cost-plus billing" : entry.invoiceId || entry.invoicedAt ? "This time entry is already billed" : undefined} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" />
+src/app/projects/[id]/time-expenses/TimeTab.tsx:280: trailing whitespace.
++                                        <td className="px-4 py-3 text-slate-600">{entry.costCode ? `${entry.costCode.code} — ${entry.costCode.name}` : "—"}</td>
+src/app/projects/[id]/time-expenses/TimeTab.tsx:281: trailing whitespace.
++                                        <td className="px-4 py-3 text-slate-600">{entry.changeOrder ? <span>{entry.changeOrder.code} · {entry.invoiceId || entry.invoicedAt ? "Billed" : entry.isBillable ? "Billable" : "Not billable"}</span> : "—"}</td>
+src/lib/time-expense-actions.ts:6: trailing whitespace.
++import { revalidatePath } from "next/cache";
+src/lib/time-expense-actions.ts:7: trailing whitespace.
++import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+src/lib/time-expense-actions.ts:8: trailing whitespace.
++import {
+src/lib/time-expense-actions.ts:9: trailing whitespace.
++    createExpenseCore,
+src/lib/time-expense-actions.ts:10: trailing whitespace.
++    createTimeEntryFromStoredRatesCore,
+src/lib/time-expense-actions.ts:11: trailing whitespace.
++    tagExpensesToChangeOrderCore,
+src/lib/time-expense-actions.ts:12: trailing whitespace.
++    tagTimeEntriesToChangeOrderCore,
+src/lib/time-expense-actions.ts:13: trailing whitespace.
++} from "@/lib/time-expense-core";
+src/lib/time-expense-actions.ts:14: trailing whitespace.
++
+src/lib/time-expense-actions.ts:15: trailing whitespace.
++async function assertTimeExpenseProjectAccess(projectId: string) {
+src/lib/time-expense-actions.ts:16: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:17: trailing whitespace.
++    if (!user && await canUseDevAuthFallback()) return;
+src/lib/time-expense-actions.ts:18: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:19: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:20: trailing whitespace.
++    if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:21: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:30: trailing whitespace.
++    durationHours: number;
+src/lib/time-expense-actions.ts:31: trailing whitespace.
++    changeOrderId?: string | null;
+src/lib/time-expense-actions.ts:32: trailing whitespace.
++    isBillable?: boolean;
+src/lib/time-expense-actions.ts:36: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:37: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:38: trailing whitespace.
++    await assertTimeExpenseProjectAccess(data.projectId);
+src/lib/time-expense-actions.ts:39: trailing whitespace.
++    await createTimeEntryFromStoredRatesCore(data, session.user.email);
+src/lib/time-expense-actions.ts:45: trailing whitespace.
++export async function updateTimeEntry(
+src/lib/time-expense-actions.ts:55: trailing whitespace.
++) {
+src/lib/time-expense-actions.ts:56: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:57: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:58: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:59: trailing whitespace.
++    if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
+src/lib/time-expense-actions.ts:60: trailing whitespace.
++    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
+src/lib/time-expense-actions.ts:61: trailing whitespace.
++    const startTime = new Date(data.date);
+src/lib/time-expense-actions.ts:62: trailing whitespace.
++    if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
+src/lib/time-expense-actions.ts:63: trailing whitespace.
++    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true } });
+src/lib/time-expense-actions.ts:64: trailing whitespace.
++    if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:65: trailing whitespace.
++    if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+src/lib/time-expense-actions.ts:66: trailing whitespace.
++
+src/lib/time-expense-actions.ts:67: trailing whitespace.
++    const updated = await prisma.timeEntry.updateMany({
+src/lib/time-expense-actions.ts:68: trailing whitespace.
++        where: { id, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:75: trailing whitespace.
++        },
+src/lib/time-expense-actions.ts:76: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:77: trailing whitespace.
++    if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
+src/lib/time-expense-actions.ts:83: trailing whitespace.
++export async function deleteTimeEntry(id: string) {
+src/lib/time-expense-actions.ts:84: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:85: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:86: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:87: trailing whitespace.
++    const entry = await prisma.timeEntry.findUnique({ where: { id } });
+src/lib/time-expense-actions.ts:88: trailing whitespace.
++    if (!entry) throw new Error("Not found");
+src/lib/time-expense-actions.ts:89: trailing whitespace.
++    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:90: trailing whitespace.
++    if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
+src/lib/time-expense-actions.ts:91: trailing whitespace.
++
+src/lib/time-expense-actions.ts:92: trailing whitespace.
++    const deleted = await prisma.timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+src/lib/time-expense-actions.ts:93: trailing whitespace.
++    if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
+src/lib/time-expense-actions.ts:109: trailing whitespace.
++        select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
+src/lib/time-expense-actions.ts:113: trailing whitespace.
++        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
+src/lib/time-expense-actions.ts:121: trailing whitespace.
++        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:141: trailing whitespace.
++    description?: string;
+src/lib/time-expense-actions.ts:142: trailing whitespace.
++    receiptFileId?: string;
+src/lib/time-expense-actions.ts:143: trailing whitespace.
++    changeOrderId?: string | null;
+src/lib/time-expense-actions.ts:144: trailing whitespace.
++    isBillable?: boolean;
+src/lib/time-expense-actions.ts:145: trailing whitespace.
++    projectId: string;
+src/lib/time-expense-actions.ts:146: trailing whitespace.
++}) {
+src/lib/time-expense-actions.ts:147: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:148: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:149: trailing whitespace.
++    await assertTimeExpenseProjectAccess(data.projectId);
+src/lib/time-expense-actions.ts:150: trailing whitespace.
++    await createExpenseCore({
+src/lib/time-expense-actions.ts:151: trailing whitespace.
++        projectId: data.projectId,
+src/lib/time-expense-actions.ts:152: trailing whitespace.
++        estimateId: data.estimateId,
+src/lib/time-expense-actions.ts:153: trailing whitespace.
++        itemId: data.itemId,
+src/lib/time-expense-actions.ts:154: trailing whitespace.
++        costCodeId: data.costCodeId,
+src/lib/time-expense-actions.ts:155: trailing whitespace.
++        costTypeId: data.costTypeId,
+src/lib/time-expense-actions.ts:156: trailing whitespace.
++        amount: data.amount,
+src/lib/time-expense-actions.ts:157: trailing whitespace.
++        vendor: data.vendor,
+src/lib/time-expense-actions.ts:158: trailing whitespace.
++        date: data.date,
+src/lib/time-expense-actions.ts:159: trailing whitespace.
++        description: data.description,
+src/lib/time-expense-actions.ts:160: trailing whitespace.
++        receiptFileId: data.receiptFileId,
+src/lib/time-expense-actions.ts:161: trailing whitespace.
++        changeOrderId: data.changeOrderId,
+src/lib/time-expense-actions.ts:162: trailing whitespace.
++        isBillable: data.isBillable,
+src/lib/time-expense-actions.ts:163: trailing whitespace.
++    }, session.user.email);
+src/lib/time-expense-actions.ts:169: trailing whitespace.
++export async function deleteExpense(id: string, projectId: string) {
+src/lib/time-expense-actions.ts:170: trailing whitespace.
++    const user = await getCurrentUserWithPermissions();
+src/lib/time-expense-actions.ts:171: trailing whitespace.
++    if (!user) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:172: trailing whitespace.
++    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:173: trailing whitespace.
++    const expense = await prisma.expense.findUnique({
+src/lib/time-expense-actions.ts:174: trailing whitespace.
++        where: { id },
+src/lib/time-expense-actions.ts:175: trailing whitespace.
++        select: { invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+src/lib/time-expense-actions.ts:176: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:177: trailing whitespace.
++    if (!expense || expense.estimate.projectId !== projectId || !canAccessProject(user, expense.estimate.projectId)) {
+src/lib/time-expense-actions.ts:178: trailing whitespace.
++        throw new Error("Forbidden");
+src/lib/time-expense-actions.ts:179: trailing whitespace.
++    }
+src/lib/time-expense-actions.ts:180: trailing whitespace.
++    if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
+src/lib/time-expense-actions.ts:181: trailing whitespace.
++
+src/lib/time-expense-actions.ts:182: trailing whitespace.
++    const deleted = await prisma.expense.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+src/lib/time-expense-actions.ts:183: trailing whitespace.
++    if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
+src/lib/time-expense-actions.ts:189: trailing whitespace.
++export async function deleteExpenses(
+src/lib/time-expense-actions.ts:197: trailing whitespace.
++    const expenses = await prisma.expense.findMany({
+src/lib/time-expense-actions.ts:198: trailing whitespace.
++        where: { id: { in: ids } },
+src/lib/time-expense-actions.ts:199: trailing whitespace.
++        select: { id: true, invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+src/lib/time-expense-actions.ts:200: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:201: trailing whitespace.
++
+src/lib/time-expense-actions.ts:202: trailing whitespace.
++    const allowed = expenses.filter(
+src/lib/time-expense-actions.ts:203: trailing whitespace.
++        e => !e.invoiceId && !e.invoicedAt && e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
+src/lib/time-expense-actions.ts:212: trailing whitespace.
++    const result = await prisma.expense.deleteMany({
+src/lib/time-expense-actions.ts:213: trailing whitespace.
++        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+src/lib/time-expense-actions.ts:221: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:222: trailing whitespace.
++
+src/lib/time-expense-actions.ts:223: trailing whitespace.
++export async function tagTimeEntriesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+src/lib/time-expense-actions.ts:224: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:225: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:226: trailing whitespace.
++    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+src/lib/time-expense-actions.ts:227: trailing whitespace.
++    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+src/lib/time-expense-actions.ts:228: trailing whitespace.
++    await assertTimeExpenseProjectAccess(target.projectId);
+src/lib/time-expense-actions.ts:229: trailing whitespace.
++    const result = await tagTimeEntriesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+src/lib/time-expense-actions.ts:230: trailing whitespace.
++    revalidatePath(`/projects/${projectId}/time-expenses`);
+src/lib/time-expense-actions.ts:231: trailing whitespace.
++    return result;
+src/lib/time-expense-actions.ts:232: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:233: trailing whitespace.
++
+src/lib/time-expense-actions.ts:234: trailing whitespace.
++export async function tagExpensesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+src/lib/time-expense-actions.ts:235: trailing whitespace.
++    const session = await getServerSession(authOptions);
+src/lib/time-expense-actions.ts:236: trailing whitespace.
++    if (!session?.user?.email) throw new Error("Unauthorized");
+src/lib/time-expense-actions.ts:237: trailing whitespace.
++    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+src/lib/time-expense-actions.ts:238: trailing whitespace.
++    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+src/lib/time-expense-actions.ts:239: trailing whitespace.
++    await assertTimeExpenseProjectAccess(target.projectId);
+src/lib/time-expense-actions.ts:240: trailing whitespace.
++    const result = await tagExpensesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+src/lib/time-expense-actions.ts:241: trailing whitespace.
++    revalidatePath(`/projects/${projectId}/time-expenses`);
+src/lib/time-expense-actions.ts:242: trailing whitespace.
++    return result;
+src/lib/time-expense-actions.ts:243: trailing whitespace.
++}
+src/lib/time-expense-actions.ts:247: trailing whitespace.
++export async function getTimeEntries(projectId: string) {
+src/lib/time-expense-actions.ts:248: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:252: trailing whitespace.
++        include: {
+src/lib/time-expense-actions.ts:253: trailing whitespace.
++            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
+src/lib/time-expense-actions.ts:254: trailing whitespace.
++            costCode: { select: { id: true, name: true, code: true } },
+src/lib/time-expense-actions.ts:255: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:262: trailing whitespace.
++export async function getExpenses(projectId: string) {
+src/lib/time-expense-actions.ts:263: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:267: trailing whitespace.
++        include: {
+src/lib/time-expense-actions.ts:270: trailing whitespace.
++            item: { select: { id: true, name: true } },
+src/lib/time-expense-actions.ts:271: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:279: trailing whitespace.
++export async function getTimeExpenseData(projectId: string) {
+src/lib/time-expense-actions.ts:280: trailing whitespace.
++    await assertTimeExpenseProjectAccess(projectId);
+src/lib/time-expense-actions.ts:281: trailing whitespace.
++    const timeEntries = await prisma.timeEntry.findMany({
+src/lib/time-expense-actions.ts:284: trailing whitespace.
++            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
+src/lib/time-expense-actions.ts:285: trailing whitespace.
++            costCode: { select: { id: true, name: true, code: true } },
+src/lib/time-expense-actions.ts:286: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:296: trailing whitespace.
++            item: { select: { id: true, name: true } },
+src/lib/time-expense-actions.ts:297: trailing whitespace.
++            changeOrder: { select: { id: true, code: true, title: true } },
+src/lib/time-expense-actions.ts:313: trailing whitespace.
++        select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true },
+src/lib/time-expense-actions.ts:317: trailing whitespace.
++    const estimates = await prisma.estimate.findMany({
+src/lib/time-expense-actions.ts:324: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:325: trailing whitespace.
++
+src/lib/time-expense-actions.ts:326: trailing whitespace.
++    const changeOrders = await prisma.changeOrder.findMany({
+src/lib/time-expense-actions.ts:327: trailing whitespace.
++        where: { projectId, pricingType: "COST_PLUS", status: { in: ["Sent", "Approved"] } },
+src/lib/time-expense-actions.ts:328: trailing whitespace.
++        select: { id: true, code: true, title: true, status: true, estimateId: true },
+src/lib/time-expense-actions.ts:329: trailing whitespace.
++        orderBy: { createdAt: "desc" },
+src/lib/time-expense-actions.ts:330: trailing whitespace.
++    });
+src/lib/time-expense-actions.ts:331: trailing whitespace.
++
+src/lib/time-expense-actions.ts:332: trailing whitespace.
++    return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates, changeOrders };
+src/lib/time-expense-actions.ts:333: trailing whitespace.
++}
+warning: in the working copy of 'e2e/cost-plus-change-order.spec.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/company-timezone.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/lib/time-expense-core.ts', LF will be replaced by CRLF the next time Git touches it
+
+2026-07-27T21:09:21.061381Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:09:29.065476Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:09:42.882198Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:09:43.958319Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:09:56.136626Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:10:06.397448Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:10:21.344589Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:10:32.743218Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:10:43.933584Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:10:55.090310Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:06.287734Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:11.177586Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 60 seconds
+Output:
+
+> goldentouch-pro@0.1.0 build
+> npm run typecheck && npm run build:next
+
+
+> goldentouch-pro@0.1.0 typecheck
+> tsc --noEmit
+
+
+> goldentouch-pro@0.1.0 build:next
+> next build
+
+▲ Next.js 16.1.6 (Turbopack)
+- Experiments (use with caution):
+  · cpus: 1
+  · serverActions
+
+  Creating an optimized production build ...
+BUILD_EXIT=1
+node.exe : Turbopack build encountered 2 warnings:
+At C:\Users\jat00\AppData\Roaming\npm\npm.ps1:24 char:5
++     & "node$exe"  "$basedir/node_modules/npm/bin/npm-cli.js" $args
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Turbopack build encountered 2 warnings::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[next]/internal/font/google/geist_a71539c9.module.css
+Error while requesting resource
+There was an issue establishing a connection while requesting 
+https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap
+Import trace:
+  Server Component:
+    [next]/internal/font/google/geist_a71539c9.module.css
+    [next]/internal/font/google/geist_a71539c9.js
+    ./src/app/layout.tsx
+[next]/internal/font/google/geist_mono_8d43a2aa.module.css
+Error while requesting resource
+There was an issue establishing a connection while requesting 
+https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap
+Import trace:
+  Server Component:
+    [next]/internal/font/google/geist_mono_8d43a2aa.module.css
+    [next]/internal/font/google/geist_mono_8d43a2aa.js
+    ./src/app/layout.tsx
+> Build error occurred
+Error: Turbopack build failed with 2 errors:
+[next]/internal/font/google/geist_a71539c9.module.css
+next/font: error:
+Failed to fetch `Geist` from Google Fonts.
+Import trace:
+  Server Component:
+    [next]/internal/font/google/geist_a71539c9.module.css
+    [next]/internal/font/google/geist_a71539c9.js
+    ./src/app/layout.tsx
+[next]/internal/font/google/geist_mono_8d43a2aa.module.css
+next/font: error:
+Failed to fetch `Geist Mono` from Google Fonts.
+Import trace:
+  Server Component:
+    [next]/internal/font/google/geist_mono_8d43a2aa.module.css
+    [next]/internal/font/google/geist_mono_8d43a2aa.js
+    ./src/app/layout.tsx
+    at ignore-listed frames
+
+2026-07-27T21:11:11.221484Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:16.136511Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:23.753963Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 3.7 seconds
+Total output lines: 81
+Output:
+import type { Metadata, Viewport } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import Providers from "@/components/Providers";
+import AppLayout from "@/components/AppLayout";
+import { Toaster } from "sonner";
+import { getPublicCompanySettings } from "@/lib/actions";
+import { getSessionOrDev } from "@/lib/auth";
+import HelpChatWidgetWrapper from "@/components/HelpChatWidgetWrapper";
+import VersionWatcher from "@/components/VersionWatcher";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "Golden Touch Remodeling | Pro",
+  description: "High-end remodeling project management",
+  applicationName: "GTR Pro",
+  appleWebApp: {
+    capable: true,
+    title: "GTR Pro",
+    statusBarStyle: "black-translucent",
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#1e1e1e",
+  width: "device-width",
+  initialScale: 1,
+  // viewportFit:cover is required so env(safe-area-inset-*) resolves to real
+  // values on notched / home-indicator devices. We intentionally leave
+  // maximumScale/userScalable at their defaults to preserve pinch-zoom (WCAG 1.4.4).
+  viewportFit: "cover",
+};
+
+export default async function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  let settings = null;
+  let session: any = null;
+  try {
+    settings = await getPublicCompanySettings();
+    session = await getSessionOrDev();
+  } catch {
+    // During build-time static generation, DATABASE_URL may not exist â€” gracefully skip.
+  }
+
+  return (
+    <html lang="en">
+      <body className={`${geistSans.variable} ${geistMono.variable} bg-slate-50 text-slate-900 min-h-screen`}>
+        <Providers>
+          <AppLayout logoUrl={settings?.logoUrl ?? undefined}>
+            {children}
+          </AppLayout>
+          <HelpChatWidgetWrapper
+            userId={session?.user?.id}
+            userRole={session?.user?.role}
+          />
+        </Providers>
+        <Toaster position="bottom-right" richColors />
+        <VersionWatcher />
+      </body>
+    </html>
+  );
+}
+node_modules/next/dist\export\index.js:334:        nextFontManifest: require((0, _path.join)(distDir, 'server', `${_constants1.NEXT_FONT_MANIFEST}.json`)),
+node_modules/next/dist\shared\lib\constants.d.ts:62:export declare const NEXT_FONT_MANIFEST = "next-font-manifest";
+node_modules/next/dist\bundle-analyzer\_next\static\chunks\e9bdec1ab75a8ea4.js:1:(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["object"==typeof document?document.currentScript:void 0,31898,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"default",{enumerable:!0,get:function(){return _default}});let _jsxruntime=__turbopack_context__.r(5824),_handleisrerror=__turbopack_context__.r(84324),styles_error={fontFamily:'system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji"',height:"100vh",textAlign:"center",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"},styles_text={fontSize:"14px",fontWeight:400,lineHeight:"28px",margin:"0 8px"},_default=function DefaultGlobalError({error}){let digest=error?.digest;return(0,_jsxruntime.jsxs)("html",{id:"__next_error__",children:[(0,_jsxruntime.jsx)("head",{}),(0,_jsxruntime.jsxs)("body",{children:[(0,_jsxruntime.jsx)(_handleisrerror.HandleISRError,{error:error}),(0,_jsxruntime.jsx)("div",{style:styles_error,children:(0,_jsxruntime.jsxs)("div",{children:[(0,_jsxruntime.jsxs)("h2",{style:styles_text,children:["Application error: a ",digest?"server":"client","-side exception has occurred while loading ",window.location.hostname," (see the"," ",digest?"server logs":"browser console"," for more information)."]}),digest?(0,_jsxruntime.jsx)("p",{style:styles_text,children:`Digest: ${digest}`}):null]})})]})]})};("function"==typeof exports.default||"object"==typeof exports.default&&null!==exports.default)&&void 0===exports.default.__esModule&&(Object.defineProperty(exports.default,"__esModule",{value:!0}),Object.assign(exports.default,exports),module.exports=exports.default)},54287,(__turbopack_context__,module,exports)=>{var e={229:function(e){var r,n,u,t=e.exports={};function defaultSetTimout(){throw Error("setTimeout has not been defined")}function defaultClearTimeout(){throw Error("clearTimeout has not been defined")}try{r="function"==typeof setTimeout?setTimeout:defaultSetTimout}catch(e){r=defaultSetTimout}try{n="function"==typeof clearTimeout?clearTimeout:defaultClearTimeout}catch(e){n=defaultClearTimeout}function runTimeout(e){if(r===setTimeout)return setTimeout(e,0);if((r===defaultSetTimout||!r)&&setTimeout)return r=setTimeout,setTimeout(e,0);try{return r(e,0)}catch(t){try{return r.call(null,e,0)}catch(t){return r.call(this,e,0)}}}function runClearTimeout(e){if(n===clearTimeout)return clearTimeout(e);if((n===defaultClearTimeout||!n)&&clearTimeout)return n=clearTimeout,clearTimeout(e);try{return n(e)}catch(t){try{return n.call(null,e)}catch(t){return n.call(this,e)}}}var i=[],o=!1,a=-1;function cleanUpNextTick(){o&&u&&(o=!1,u.length?i=u.concat(i):a=-1,i.length&&drainQueue())}function drainQueue(){if(!o){var e=runTimeout(cleanUpNextTick);o=!0;for(var t=i.length;t;){for(u=i,i=[];++a<t;)u&&u[a].run();a=-1,t=i.length}u=null,o=!1,runClearTimeout(e)}}function Item(e,t){this.fun=e,this.array=t}function noop(){}t.nextTick=function(e){var t=Array(arguments.length-1);if(arguments.length>1)for(var r=1;r<arguments.length;r++)t[r-1]=arguments[r];i.push(new Item(e,t)),1!==i.length||o||runTimeout(drainQueue)},Item.prototype.run=function(){this.fun.apply(null,this.array)},t.title="browser",t.browser=!0,t.env={},t.argv=[],t.version="",t.versions={},t.on=noop,t.addListener=noop,t.once=noop,t.off=noop,t.removeListener=noop,t.removeAllListeners=noop,t.emit=noop,t.prependListener=noop,t.prependOnceListener=noop,t.listeners=function(e){return[]},t.binding=function(e){throw Error("process.binding is not supported")},t.cwd=function(){return"/"},t.chdir=function(e){throw Error("process.chdir is not supported")},t.umask=function(){return 0}}},t={};function __nccwpck_require__(r){var n=t[r];if(void 0!==n)return n.exports;var i=t[r]={exports:{}},o=!0;try{e[r](i,i.exports,__nccwpck_require__),o=!1}finally{o&&delete t[r]}return i.exports}__nccwpck_require__.ab="/ROOT/node_modules/.pnpm/next@16.0.8_@babel+core@7.26.10_@opentelemetry+api@1.6.0_@playwright+test@1.51.1_babel-plugin_y4u25fzudsmabx42pmnqiw4aiu/node_modules/next/dist/compiled/process/",module.exports=__nccwpck_require__(229)},84761,(__turbopack_context__,module,exports)=>{"use strict";var _global_process,_global_process1;module.exports=(null==(_global_process=__turbopack_context__.g.process)?void 0:_global_process.env)&&"object"==typeof(null==(_global_process1=__turbopack_context__.g.process)?void 0:_global_process1.env)?__turbopack_context__.g.process:__turbopack_context__.r(54287)},96322,(__turbopack_context__,module,exports)=>{"use strict";var REACT_ELEMENT_TYPE=Symbol.for("react.transitional.element");function jsxProd(type,config,maybeKey){var key=null;if(void 0!==maybeKey&&(key=""+maybeKey),void 0!==config.key&&(key=""+config.key),"key"in config)for(var propName in maybeKey={},config)"key"!==propName&&(maybeKey[propName]=config[propName]);else maybeKey=config;return{$$typeof:REACT_ELEMENT_TYPE,type:type,key:key,ref:void 0!==(config=maybeKey.ref)?config:null,props:maybeKey}}exports.Fragment=Symbol.for("react.fragment"),exports.jsx=jsxProd,exports.jsxs=jsxProd},5824,(__turbopack_context__,module,exports)=>{"use strict";module.exports=__turbopack_context__.r(96322)},76748,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),function _export(target,all){for(var name in all)Object.defineProperty(target,name,{enumerable:!0,get:all[name]})}(exports,{bindSnapshot:function(){return bindSnapshot},createAsyncLocalStorage:function(){return createAsyncLocalStorage},createSnapshot:function(){return createSnapshot}});let sharedAsyncLocalStorageNotAvailableError=Object.defineProperty(Error("Invariant: AsyncLocalStorage accessed in runtime where it is not available"),"__NEXT_ERROR_CODE",{value:"E504",enumerable:!1,configurable:!0});class FakeAsyncLocalStorage{disable(){throw sharedAsyncLocalStorageNotAvailableError}getStore(){}run(){throw sharedAsyncLocalStorageNotAvailableError}exit(){throw sharedAsyncLocalStorageNotAvailableError}enterWith(){throw sharedAsyncLocalStorageNotAvailableError}static bind(fn){return fn}}let maybeGlobalAsyncLocalStorage="undefined"!=typeof globalThis&&globalThis.AsyncLocalStorage;function createAsyncLocalStorage(){return maybeGlobalAsyncLocalStorage?new maybeGlobalAsyncLocalStorage:new FakeAsyncLocalStorage}function bindSnapshot(fn){return maybeGlobalAsyncLocalStorage?maybeGlobalAsyncLocalStorage.bind(fn):FakeAsyncLocalStorage.bind(fn)}function createSnapshot(){return maybeGlobalAsyncLocalStorage?maybeGlobalAsyncLocalStorage.snapshot():function(fn,...args){return fn(...args)}}},37083,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"workAsyncStorageInstance",{enumerable:!0,get:function(){return workAsyncStorageInstance}});let workAsyncStorageInstance=(0,__turbopack_context__.r(76748).createAsyncLocalStorage)()},27376,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"workAsyncStorage",{enumerable:!0,get:function(){return _workasyncstorageinstance.workAsyncStorageInstance}});let _workasyncstorageinstance=__turbopack_context__.r(37083)},84324,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"HandleISRError",{enumerable:!0,get:function(){return HandleISRError}});let workAsyncStorage="undefined"==typeof window?__turbopack_context__.r(27376).workAsyncStorage:void 0;function HandleISRError({error}){if(workAsyncStorage){let store=workAsyncStorage.getStore();if(store?.isStaticGeneration)throw error&&console.error(error),error}return null}("function"==typeof exports.default||"object"==typeof exports.default&&null!==exports.default)&&void 0===exports.default.__esModule&&(Object.defineProperty(exports.default,"__esModule",{value:!0}),Object.assign(exports.default,exports),module.exports=exports.default)},30655,(__turbopack_context__,module,exports)=>{"use strict";var __TURBOPACK__imported__module__84761__=__turbopack_context__.i(84761),REACT_ELEMENT_TYPE=Symbol.for("react.transitional.element"),REACT_PORTAL_TYPE=Symbol.for("react.portal"),REACT_FRAGMENT_TYPE=Symbol.for("react.fragment"),REACT_STRICT_MODE_TYPE=Symbol.for("react.strict_mode"),REACT_PROFILER_TYPE=Symbol.for("react.profiler"),REACT_CONSUMER_TYPE=Symbol.for("react.consumer"),REACT_CONTEXT_TYPE=Symbol.for("react.context"),REACT_FORWARD_REF_TYPE=Symbol.for("react.forward_ref"),REACT_SUSPENSE_TYPE=Symbol.for("react.suspense"),REACT_MEMO_TYPE=Symbol.for("react.memo"),REACT_LAZY_TYPE=Symbol.for("react.lazy"),REACT_ACTIVITY_TYPE=Symbol.for("react.activity"),REACT_VIEW_TRANSITION_TYPE=Symbol.for("react.view_transition"),MAYBE_ITERATOR_SYMBOL=Symbol.iterator;function getIteratorFn(maybeIterable){return null===maybeIterable||"object"!=typeof maybeIterable?null:"function"==typeof(maybeIterable=MAYBE_ITERATOR_SYMBOL&&maybeIterable[MAYBE_ITERATOR_SYMBOL]||maybeIterable["@@iterator"])?maybeIterable:null}var ReactNoopUpdateQueue={isMounted:function(){return!1},enqueueForceUpdate:function(){},enqueueReplaceState:function(){},enqueueSetState:function(){}},assign=Object.assign,emptyObject={};function Component(props,context,updater){this.props=props,this.context=context,this.refs=emptyObject,this.updater=updater||ReactNoopUpdateQueue}function ComponentDummy(){}function PureComponent(props,context,updater){this.props=props,this.context=context,this.refs=emptyObject,this.updater=updater||ReactNoopUpdateQueue}Component.prototype.isReactComponent={},Component.prototype.setState=function(partialState,callback){if("object"!=typeof partialState&&"function"!=typeof partialState&&null!=partialState)throw Error("takes an object of state variables to update or a function which returns an object of state variables.");this.updater.enqueueSetState(this,partialState,callback,"setState")},Component.prototype.forceUpdate=function(callback){this.updater.enqueueForceUpdate(this,callback,"forceUpdate")},ComponentDummy.prototype=Component.prototype;var pureComponentPrototype=PureComponent.prototype=new ComponentDummy;pureComponentPrototype.constructor=PureComponent,assign(pureComponentPrototype,Component.prototype),pureComponentPrototype.isPureReactComponent=!0;var isArrayImpl=Array.isArray;function noop(){}var ReactSharedInternals={H:null,A:null,T:null,S:null},hasOwnProperty=Object.prototype.hasOwnProperty;function ReactElement(type,key,props){var refProp=props.ref;return{$$typeof:REACT_ELEMENT_TYPE,type:type,key:key,ref:void 0!==refProp?refProp:null,props:props}}function cloneAndReplaceKey(oldElement,newKey){return ReactElement(oldElement.type,newKey,oldElement.props)}function isValidElement(object){return"object"==typeof object&&null!==object&&object.$$typeof===REACT_ELEMENT_TYPE}function escape(key){var escaperLookup={"=":"=0",":":"=2"};return"$"+key.replace(/[=:]/g,function(match){return escaperLookup[match]})}var userProvidedKeyEscapeRegex=/\/+/g;function getElementKey(element,index){return"object"==typeof element&&null!==element&&null!=element.key?escape(""+element.key):index.toString(36)}function resolveThenable(thenable){switch(thenable.status){case"fulfilled":return thenable.value;case"rejected":throw thenable.reason;default:switch("string"==typeof thenable.status?thenable.then(noop,noop):(thenable.status="pending",thenable.then(function(fulfilledValue){"pending"===thenable.status&&(thenable.status="fulfilled",thenable.value=fulfilledValue)},function(error){"pending"===thenable.status&&(thenable.status="rejected",thenable.reason=error)})),thenable.status){case"fulfilled":return thenable.value;case"rejected":throw thenable.reason}}throw thenable}function mapIntoArray(children,array,escapedPrefix,nameSoFar,callback){var type=typeof children;("undefined"===type||"boolean"===type)&&(children=null);var invokeCallback=!1;if(null===children)invokeCallback=!0;else switch(type){case"bigint":case"string":case"number":invokeCallback=!0;break;case"object":switch(children.$$typeof){case REACT_ELEMENT_TYPE:case REACT_PORTAL_TYPE:invokeCallback=!0;break;case REACT_LAZY_TYPE:return mapIntoArray((invokeCallback=children._init)(children._payload),array,escapedPrefix,nameSoFar,callback)}}if(invokeCallback)return callback=callback(children),invokeCallback=""===nameSoFar?"."+getElementKey(children,0):nameSoFar,isArrayImpl(callback)?(escapedPrefix="",null!=invokeCallback&&(escapedPrefix=invokeCallback.replace(userProvidedKeyEscapeRegex,"$&/")+"/"),mapIntoArray(callback,array,escapedPrefix,"",function(c){return c})):null!=callback&&(isValidElement(callback)&&(callback=cloneAndReplaceKey(callback,escapedPrefix+(null==callback.key||children&&children.key===callback.key?"":(""+callback.key).replace(userProvidedKeyEscapeRegex,"$&/")+"/")+invokeCallback)),array.push(callback)),1;invokeCallback=0;var nextNamePrefix=""===nameSoFar?".":nameSoFar+":";if(isArrayImpl(children))for(var i=0;i<children.length;i++)type=nextNamePrefix+getElementKey(nameSoFar=children[i],i),invokeCallback+=mapIntoArray(nameSoFar,array,escapedPrefix,type,callback);else if("function"==typeof(i=getIteratorFn(children)))for(children=i.call(children),i=0;!(nameSoFar=children.next()).done;)type=nextNamePrefix+getElementKey(nameSoFar=nameSoFar.value,i++),invokeCallback+=mapIntoArray(nameSoFar,array,escapedPrefix,type,callback);else if("object"===type){if("function"==typeof children.then)return mapIntoArray(resolveThenable(children),array,escapedPrefix,nameSoFar,callback);throw Error("Objects are not valid as a React child (found: "+("[object Object]"===(array=String(children))?"object with keys {"+Object.keys(children).join(", ")+"}":array)+"). If you meant to render a collection of children, use an array instead.")}return invokeCallback}function mapChildren(children,func,context){if(null==children)return children;var result=[],count=0;return mapIntoArray(children,result,"","",function(child){return func.call(context,child,count++)}),result}function lazyInitializer(payload){if(-1===payload._status){var ctor=payload._result;(ctor=ctor()).then(function(moduleObject){(0===payload._status||-1===payload._status)&&(payload._status=1,payload._result=moduleObject)},function(error){(0===payload._status||-1===payload._status)&&(payload._status=2,payload._result=error)}),-1===payload._status&&(payload._status=0,payload._result=ctor)}if(1===payload._status)return payload._result.default;throw payload._result}var reportGlobalError="function"==typeof reportError?reportError:function(error){if("object"==typeof window&&"function"==typeof window.ErrorEvent){var event=new window.ErrorEvent("error",{bubbles:!0,cancelable:!0,message:"object"==typeof error&&null!==error&&"string"==typeof error.message?String(error.message):String(error),error:error});if(!window.dispatchEvent(event))return}else if("object"==typeof __TURBOPACK__imported__module__84761__.default&&"function"==typeof __TURBOPACK__imported__module__84761__.default.emit)return void __TURBOPACK__imported__module__84761__.default.emit("uncaughtException",error);console.error(error)};function startTransition(scope){var prevTransition=ReactSharedInternals.T,currentTransition={};currentTransition.types=null!==prevTransition?prevTransition.types:null,ReactSharedInternals.T=currentTransition;try{var returnValue=scope(),onStartTransitionFinish=ReactSharedInternals.S;null!==onStartTransitionFinish&&onStartTransitionFinish(currentTransition,returnValue),"object"==typeof returnValue&&null!==returnValue&&"function"==typeof returnValue.then&&returnValue.then(noop,reportGlobalError)}catch(error){reportGlobalError(error)}finally{null!==prevTransition&&null!==currentTransition.types&&(prevTransition.types=currentTransition.types),ReactSharedInternals.T=prevTransition}}function addTransitionType(type){var transition=ReactSharedInternals.T;if(null!==transition){var transitionTypes=transition.types;null===transitionTypes?transition.types=[type]:-1===transitionTypes.indexOf(type)&&transitionTypes.push(type)}else startTransition(addTransitionType.bind(null,type))}exports.Activity=REACT_ACTIVITY_TYPE,exports.Children={map:mapChildren,forEach:function(children,forEachFunc,forEachContext){mapChildren(children,function(){forEachFunc.apply(this,arguments)},forEachContext)},count:function(children){var n=0;return mapChildren(children,function(){n++}),n},toArray:function(children){return mapChildren(children,function(child){return child})||[]},only:function(children){if(!isValidElement(children))throw Error("React.Children.only expected to receive a single React element child.");return children}},exports.Component=Component,exports.Fragment=REACT_FRAGMENT_TYPE,exports.Profiler=REACT_PROFILER_TYPE,exports.PureComponent=PureComponent,exports.StrictMode=REACT_STRICT_MODE_TYPE,exports.Suspense=REACT_SUSPENSE_TYPE,exports.ViewTransition=REACT_VIEW_TRANSITION_TYPE,exports.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE=ReactSharedInternals,exports.__COMPILER_RUNTIME={__proto__:null,c:function(size){return ReactSharedInternals.H.useMemoCache(size)}},exports.addTransitionType=addTransitionType,exports.cache=function(fn){return function(){return fn.apply(null,arguments)}},exports.cacheSignal=function(){return null},exports.cloneElement=function(element,config,child…252144 tokens truncated…rty(exports,"refreshReducer",{enumerable:!0,get:function(){return refreshReducer}});let _fetchserverresponse=__turbopack_context__.r(58041),_createhreffromurl=__turbopack_context__.r(20350),_applyrouterstatepatchtotree=__turbopack_context__.r(91062),_isnavigatingtonewrootlayout=__turbopack_context__.r(38779),_navigatereducer=__turbopack_context__.r(55393),_handlemutable=__turbopack_context__.r(7251),_filllazyitemstillleafwithhead=__turbopack_context__.r(21551),_approuter=__turbopack_context__.r(11259),_handlesegmentmismatch=__turbopack_context__.r(90127),_hasinterceptionrouteincurrenttree=__turbopack_context__.r(51804),_refetchinactiveparallelsegments=__turbopack_context__.r(59643),_cache=__turbopack_context__.r(86908);function refreshReducer(state,action){let{origin}=action,mutable={},href=state.canonicalUrl,currentTree=state.tree;mutable.preserveCustomHistoryState=!1;let cache=(0,_approuter.createEmptyCacheNode)(),includeNextUrl=(0,_hasinterceptionrouteincurrenttree.hasInterceptionRouteInCurrentTree)(state.tree);cache.lazyData=(0,_fetchserverresponse.fetchServerResponse)(new URL(href,origin),{flightRouterState:[currentTree[0],currentTree[1],currentTree[2],"refetch"],nextUrl:includeNextUrl?state.nextUrl:null});let navigatedAt=Date.now();return cache.lazyData.then(async result=>{if("string"==typeof result)return(0,_navigatereducer.handleExternalUrl)(state,mutable,result,state.pushRef.pendingPush);let{flightData,canonicalUrl,renderedSearch}=result;for(let normalizedFlightData of(cache.lazyData=null,flightData)){let{tree:treePatch,seedData:cacheNodeSeedData,head,isRootRender}=normalizedFlightData;if(!isRootRender)return console.log("REFRESH FAILED"),state;let newTree=(0,_applyrouterstatepatchtotree.applyRouterStatePatchToTree)([""],currentTree,treePatch,state.canonicalUrl);if(null===newTree)return(0,_handlesegmentmismatch.handleSegmentMismatch)(state,action,treePatch);if((0,_isnavigatingtonewrootlayout.isNavigatingToNewRootLayout)(currentTree,newTree))return(0,_navigatereducer.handleExternalUrl)(state,mutable,href,state.pushRef.pendingPush);if(mutable.canonicalUrl=(0,_createhreffromurl.createHrefFromUrl)(canonicalUrl),null!==cacheNodeSeedData){let rsc=cacheNodeSeedData[0],loading=cacheNodeSeedData[2];cache.rsc=rsc,cache.prefetchRsc=null,cache.loading=loading,(0,_filllazyitemstillleafwithhead.fillLazyItemsTillLeafWithHead)(navigatedAt,cache,void 0,treePatch,cacheNodeSeedData,head),(0,_cache.revalidateEntireCache)(state.nextUrl,newTree)}await (0,_refetchinactiveparallelsegments.refreshInactiveParallelSegments)({navigatedAt,state,updatedTree:newTree,updatedCache:cache,includeNextUrl,canonicalUrl:mutable.canonicalUrl||state.canonicalUrl}),mutable.cache=cache,mutable.patchedTree=newTree,mutable.renderedSearch=renderedSearch,currentTree=newTree}return(0,_handlemutable.handleMutable)(state,mutable)},()=>state)}("function"==typeof exports.default||"object"==typeof exports.default&&null!==exports.default)&&void 0===exports.default.__esModule&&(Object.defineProperty(exports.default,"__esModule",{value:!0}),Object.assign(exports.default,exports),module.exports=exports.default)},62e3,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"hmrRefreshReducer",{enumerable:!0,get:function(){return hmrRefreshReducer}}),__turbopack_context__.r(58041),__turbopack_context__.r(20350),__turbopack_context__.r(91062),__turbopack_context__.r(38779),__turbopack_context__.r(55393),__turbopack_context__.r(7251),__turbopack_context__.r(19910),__turbopack_context__.r(11259),__turbopack_context__.r(90127),__turbopack_context__.r(51804);let hmrRefreshReducer=function hmrRefreshReducerNoop(state,_action){return state};("function"==typeof exports.default||"object"==typeof exports.default&&null!==exports.default)&&void 0===exports.default.__esModule&&(Object.defineProperty(exports.default,"__esModule",{value:!0}),Object.assign(exports.default,exports),module.exports=exports.default)},14814,(__turbopack_context__,module,exports)=>{"use strict";Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"assignLocation",{enumerable:!0,get:function(){return assignLocation}});let _addbasepath=__turbopack_context__.r(22069);function assignLocation(location1,url){if(location1.startsWith(".")){let urlBase=url.origin+url.pathname;return new URL((urlBase.endsWith("/")?urlBase:urlBase+"/")+location1)}return new URL((0,_addbasepath.addBasePath)(location1),url.href)}("function"==typeof exports.default||"object"==typeof exports.default&&null!==exports.default)&&void 0===exports.default.__esModule&&(Object.defineProperty(exports.default,"__esModule",{value:!0}),Object.assign(exports.default,exports),module.exports=exports.default)},67813,(__turbopack_context__,module,exports)=>{"use strict";function extractInfoFromServerReferenceId(id){let infoByte=parseInt(id.slice(0,2),16),argMask=infoByte>>1&63,usedArgs=Array(6);for(let index=0;index<6;index++){let bit=argMask>>5-index&1;usedArgs[index]=1===bit}return{type:1==(infoByte>>7&1)?"use-cache":"server-action",usedArgs:usedArgs,hasRestArgs:1==(1&infoByte)}}function omitUnusedArgs(args,info){let filteredArgs=Array(args.length);for(let index=0;index<args.length;index++)(index<6&&info.usedArgs[index]||index>=6&&info.hasRestArgs)&&(filteredArgs[index]=args[index]);return filteredArgs}Object.defineProperty(exports,"__esModule",{value:!0}),function _export(target,all){for(var name in all)Object.defineProperty(target,name,{enumerable:!0,get:all[name]})}(exports,{extractInfoFromServerReferenceId:function(){return extractInfoFromServerReferenceId},omitUnusedArgs:function(){return omitUnusedArgs}})},61324,(__turbopack_context__,module,exports)=>{"use strict";let createDebugChannel;Object.defineProperty(exports,"__esModule",{value:!0}),Object.defineProperty(exports,"serverActionReducer",{enumerable:!0,get:function(){return serverActionReducer}});let _appcallserver=__turbopack_context__.r(69291),_appfindsourcemapurl=__turbopack_context__.r(32289),_approuterheaders=__turbopack_context__.r(95920),_unrecognizedactionerror=__turbopack_context__.r(42745),_client=__turbopack_context__.r(99169),_assignlocation=__turbopack_context__.r(14814),_createhreffromurl=__turbopack_context__.r(20350),_navigatereducer=__turbopack_context__.r(55393),_applyrouterstatepatchtotree=__turbopack_context__.r(91062),_isnavigatingtonewrootlayout=__turbopack_context__.r(38779),_handlemutable=__turbopack_context__.r(7251),_filllazyitemstillleafwithhead=__turbopack_context__.r(21551),_approuter=__turbopack_context__.r(11259),_hasinterceptionrouteincurrenttree=__turbopack_context__.r(51804),_handlesegmentmismatch=__turbopack_context__.r(90127),_refetchinactiveparallelsegments=__turbopack_context__.r(59643),_flightdatahelpers=__turbopack_context__.r(68247),_redirect=__turbopack_context__.r(17493),_redirecterror=__turbopack_context__.r(40859),_removebasepath=__turbopack_context__.r(48647),_hasbasepath=__turbopack_context__.r(5648),_serverreferenceinfo=__turbopack_context__.r(67813),_cache=__turbopack_context__.r(86908),createFromFetch=_client.createFromFetch;async function fetchServerAction(state,nextUrl,{actionId,actionArgs}){let redirectType,revalidatedParts,actionResult,actionFlightData,temporaryReferences=(0,_client.createTemporaryReferenceSet)(),info=(0,_serverreferenceinfo.extractInfoFromServerReferenceId)(actionId),usedArgs="use-cache"===info.type?(0,_serverreferenceinfo.omitUnusedArgs)(actionArgs,info):actionArgs,body=await (0,_client.encodeReply)(usedArgs,{temporaryReferences}),headers={Accept:_approuterheaders.RSC_CONTENT_TYPE_HEADER,[_approuterheaders.ACTION_HEADER]:actionId,[_approuterheaders.NEXT_ROUTER_STATE_TREE_HEADER]:(0,_flightdatahelpers.prepareFlightRouterStateForRequest)(state.tree)};nextUrl&&(headers[_approuterheaders.NEXT_URL]=nextUrl);let res=await fetch(state.canonicalUrl,{method:"POST",headers,body});if("1"===res.headers.get(_approuterheaders.NEXT_ACTION_NOT_FOUND_HEADER))throw Object.defineProperty(new _unrecognizedactionerror.UnrecognizedActionError(`Server Action "${actionId}" was not found on the server. 
+node_modules/next/dist\compiled\webpack\bundle5.js:29:var I;var P;var R;var $;var L;var q;var K;var ae;var ge;var be;var xe;var ve;var Ce;var Ne;var He;var Qe;var Je;var Ve;var Ke;var Ye;var Xe;var Ze;var et;(function(I){var P=typeof global==="object"?global:typeof self==="object"?self:typeof this==="object"?this:{};if(typeof define==="function"&&define.amd){define("tslib",["exports"],(function(v){I(createExporter(P,createExporter(v)))}))}else if(true&&typeof v.exports==="object"){I(createExporter(P,createExporter(v.exports)))}else{I(createExporter(P))}function createExporter(v,I){if(v!==P){if(typeof Object.create==="function"){Object.defineProperty(v,"__esModule",{value:true})}else{v.__esModule=true}}return function(P,R){return v[P]=I?I(P,R):R}}})((function(v){var tt=Object.setPrototypeOf||{__proto__:[]}instanceof Array&&function(v,I){v.__proto__=I}||function(v,I){for(var P in I)if(I.hasOwnProperty(P))v[P]=I[P]};I=function(v,I){tt(v,I);function __(){this.constructor=v}v.prototype=I===null?Object.create(I):(__.prototype=I.prototype,new __)};P=Object.assign||function(v){for(var I,P=1,R=arguments.length;P<R;P++){I=arguments[P];for(var $ in I)if(Object.prototype.hasOwnProperty.call(I,$))v[$]=I[$]}return v};R=function(v,I){var P={};for(var R in v)if(Object.prototype.hasOwnProperty.call(v,R)&&I.indexOf(R)<0)P[R]=v[R];if(v!=null&&typeof Object.getOwnPropertySymbols==="function")for(var $=0,R=Object.getOwnPropertySymbols(v);$<R.length;$++){if(I.indexOf(R[$])<0&&Object.prototype.propertyIsEnumerable.call(v,R[$]))P[R[$]]=v[R[$]]}return P};$=function(v,I,P,R){var $=arguments.length,L=$<3?I:R===null?R=Object.getOwnPropertyDescriptor(I,P):R,q;if(typeof Reflect==="object"&&typeof Reflect.decorate==="function")L=Reflect.decorate(v,I,P,R);else for(var K=v.length-1;K>=0;K--)if(q=v[K])L=($<3?q(L):$>3?q(I,P,L):q(I,P))||L;return $>3&&L&&Object.defineProperty(I,P,L),L};L=function(v,I){return function(P,R){I(P,R,v)}};q=function(v,I){if(typeof Reflect==="object"&&typeof Reflect.metadata==="function")return Reflect.metadata(v,I)};K=function(v,I,P,R){function adopt(v){return v instanceof P?v:new P((function(I){I(v)}))}return new(P||(P=Promise))((function(P,$){function fulfilled(v){try{step(R.next(v))}catch(v){$(v)}}function rejected(v){try{step(R["throw"](v))}catch(v){$(v)}}function step(v){v.done?P(v.value):adopt(v.value).then(fulfilled,rejected)}step((R=R.apply(v,I||[])).next())}))};ae=function(v,I){var P={label:0,sent:function(){if(L[0]&1)throw L[1];return L[1]},trys:[],ops:[]},R,$,L,q;return q={next:verb(0),throw:verb(1),return:verb(2)},typeof Symbol==="function"&&(q[Symbol.iterator]=function(){return this}),q;function verb(v){return function(I){return step([v,I])}}function step(q){if(R)throw new TypeError("Generator is already executing.");while(P)try{if(R=1,$&&(L=q[0]&2?$["return"]:q[0]?$["throw"]||((L=$["return"])&&L.call($),0):$.next)&&!(L=L.call($,q[1])).done)return L;if($=0,L)q=[q[0]&2,L.value];switch(q[0]){case 0:case 1:L=q;break;case 4:P.label++;return{value:q[1],done:false};case 5:P.label++;$=q[1];q=[0];continue;case 7:q=P.ops.pop();P.trys.pop();continue;default:if(!(L=P.trys,L=L.length>0&&L[L.length-1])&&(q[0]===6||q[0]===2)){P=0;continue}if(q[0]===3&&(!L||q[1]>L[0]&&q[1]<L[3])){P.label=q[1];break}if(q[0]===6&&P.label<L[1]){P.label=L[1];L=q;break}if(L&&P.label<L[2]){P.label=L[2];P.ops.push(q);break}if(L[2])P.ops.pop();P.trys.pop();continue}q=I.call(v,P)}catch(v){q=[6,v];$=0}finally{R=L=0}if(q[0]&5)throw q[1];return{value:q[0]?q[1]:void 0,done:true}}};et=function(v,I,P,R){if(R===undefined)R=P;v[R]=I[P]};ge=function(v,I){for(var P in v)if(P!=="default"&&!I.hasOwnProperty(P))I[P]=v[P]};be=function(v){var I=typeof Symbol==="function"&&Symbol.iterator,P=I&&v[I],R=0;if(P)return P.call(v);if(v&&typeof v.length==="number")return{next:function(){if(v&&R>=v.length)v=void 0;return{value:v&&v[R++],done:!v}}};throw new TypeError(I?"Object is not iterable.":"Symbol.iterator is not defined.")};xe=function(v,I){var P=typeof Symbol==="function"&&v[Symbol.iterator];if(!P)return v;var R=P.call(v),$,L=[],q;try{while((I===void 0||I-- >0)&&!($=R.next()).done)L.push($.value)}catch(v){q={error:v}}finally{try{if($&&!$.done&&(P=R["return"]))P.call(R)}finally{if(q)throw q.error}}return L};ve=function(){for(var v=[],I=0;I<arguments.length;I++)v=v.concat(xe(arguments[I]));return v};Ce=function(){for(var v=0,I=0,P=arguments.length;I<P;I++)v+=arguments[I].length;for(var R=Array(v),$=0,I=0;I<P;I++)for(var L=arguments[I],q=0,K=L.length;q<K;q++,$++)R[$]=L[q];return R};Ne=function(v){return this instanceof Ne?(this.v=v,this):new Ne(v)};He=function(v,I,P){if(!Symbol.asyncIterator)throw new TypeError("Symbol.asyncIterator is not defined.");var R=P.apply(v,I||[]),$,L=[];return $={},verb("next"),verb("throw"),verb("return"),$[Symbol.asyncIterator]=function(){return this},$;function verb(v){if(R[v])$[v]=function(I){return new Promise((function(P,R){L.push([v,I,P,R])>1||resume(v,I)}))}}function resume(v,I){try{step(R[v](I))}catch(v){settle(L[0][3],v)}}function step(v){v.value instanceof Ne?Promise.resolve(v.value.v).then(fulfill,reject):settle(L[0][2],v)}function fulfill(v){resume("next",v)}function reject(v){resume("throw",v)}function settle(v,I){if(v(I),L.shift(),L.length)resume(L[0][0],L[0][1])}};Qe=function(v){var I,P;return I={},verb("next"),verb("throw",(function(v){throw v})),verb("return"),I[Symbol.iterator]=function(){return this},I;function verb(R,$){I[R]=v[R]?function(I){return(P=!P)?{value:Ne(v[R](I)),done:R==="return"}:$?$(I):I}:$}};Je=function(v){if(!Symbol.asyncIterator)throw new TypeError("Symbol.asyncIterator is not defined.");var I=v[Symbol.asyncIterator],P;return I?I.call(v):(v=typeof be==="function"?be(v):v[Symbol.iterator](),P={},verb("next"),verb("throw"),verb("return"),P[Symbol.asyncIterator]=function(){return this},P);function verb(I){P[I]=v[I]&&function(P){return new Promise((function(R,$){P=v[I](P),settle(R,$,P.done,P.value)}))}}function settle(v,I,P,R){Promise.resolve(R).then((function(I){v({value:I,done:P})}),I)}};Ve=function(v,I){if(Object.defineProperty){Object.defineProperty(v,"raw",{value:I})}else{v.raw=I}return v};Ke=function(v){if(v&&v.__esModule)return v;var I={};if(v!=null)for(var P in v)if(Object.hasOwnProperty.call(v,P))I[P]=v[P];I["default"]=v;return I};Ye=function(v){return v&&v.__esModule?v:{default:v}};Xe=function(v,I){if(!I.has(v)){throw new TypeError("attempted to get private field on non-instance")}return I.get(v)};Ze=function(v,I,P){if(!I.has(v)){throw new TypeError("attempted to set private field on non-instance")}I.set(v,P);return P};v("__extends",I);v("__assign",P);v("__rest",R);v("__decorate",$);v("__param",L);v("__metadata",q);v("__awaiter",K);v("__generator",ae);v("__exportStar",ge);v("__createBinding",et);v("__values",be);v("__read",xe);v("__spread",ve);v("__spreadArrays",Ce);v("__await",Ne);v("__asyncGenerator",He);v("__asyncDelegator",Qe);v("__asyncValues",Je);v("__makeTemplateObject",Ve);v("__importStar",Ke);v("__importDefault",Ye);v("__classPrivateFieldGet",Xe);v("__classPrivateFieldSet",Ze)}))},42715:function(v,I,P){"use strict";const R=P(22580);const{JAVASCRIPT_MODULE_TYPE_AUTO:$,JAVASCRIPT_MODULE_TYPE_DYNAMIC:L,JAVASCRIPT_MODULE_TYPE_ESM:q}=P(89709);const K=P(95619);const ae=P(4554);const ge=P(93826);const be=P(31495);const xe=P(73824);const{toConstantDependency:ve,evaluateToString:Ce}=P(30667);const Ne=P(99540);const He=P(85983);function getReplacements(v,I){return{__webpack_require__:{expr:K.require,req:[K.require],type:"function",assign:false},__webpack_public_path__:{expr:K.publicPath,req:[K.publicPath],type:"string",assign:true},__webpack_base_uri__:{expr:K.baseURI,req:[K.baseURI],type:"string",assign:true},__webpack_modules__:{expr:K.moduleFactories,req:[K.moduleFactories],type:"object",assign:false},__webpack_chunk_load__:{expr:K.ensureChunk,req:[K.ensureChunk],type:"function",assign:true},__non_webpack_require__:{expr:v?`__WEBPACK_EXTERNAL_createRequire(${I}.url)`:"require",req:null,type:undefined,assign:true},__webpack_nonce__:{expr:K.scriptNonce,req:[K.scriptNonce],type:"string",assign:true},__webpack_hash__:{expr:`${K.getFullHash}()`,req:[K.getFullHash],type:"string",assign:false},__webpack_chunkname__:{expr:K.chunkName,req:[K.chunkName],type:"string",assign:false},__webpack_get_script_filename__:{expr:K.getChunkScriptFilename,req:[K.getChunkScriptFilename],type:"function",assign:true},__webpack_runtime_id__:{expr:K.runtimeId,req:[K.runtimeId],assign:false},"require.onError":{expr:K.uncaughtErrorHandler,req:[K.uncaughtErrorHandler],type:undefined,assign:true},__system_context__:{expr:K.systemContext,req:[K.systemContext],type:"object",assign:false},__webpack_share_scopes__:{expr:K.shareScopeMap,req:[K.shareScopeMap],type:"object",assign:false},__webpack_init_sharing__:{expr:K.initializeSharing,req:[K.initializeSharing],type:"function",assign:true}}}const Qe="APIPlugin";class APIPlugin{constructor(v={}){this.options=v}apply(v){v.hooks.compilation.tap(Qe,((v,{normalModuleFactory:I})=>{const P=v.outputOptions.importMetaName;const Je=getReplacements(this.options.module,P);v.dependencyTemplates.set(ge,new ge.Template);v.hooks.runtimeRequirementInTree.for(K.chunkName).tap(Qe,(I=>{v.addRuntimeModule(I,new Ne(I.name));return true}));v.hooks.runtimeRequirementInTree.for(K.getFullHash).tap(Qe,((I,P)=>{v.addRuntimeModule(I,new He);return true}));const Ve=xe.getCompilationHooks(v);Ve.renderModuleContent.tap(Qe,((v,I,P)=>{if(I.buildInfo.needCreateRequire){const v=P.runtimeTemplate.supportNodePrefixForCoreModules();const I=[new R(`import { createRequire as __WEBPACK_EXTERNAL_createRequire } from "${v?"node:":""}module";\n`,R.STAGE_HARMONY_IMPORTS,0,"external module node-commonjs")];P.chunkInitFragments.push(...I)}return v}));const handler=v=>{for(const I of Object.keys(Je)){const P=Je[I];v.hooks.expression.for(I).tap(Qe,(R=>{const $=ve(v,P.expr,P.req);if(I==="__non_webpack_require__"&&this.options.module){v.state.module.buildInfo.needCreateRequire=true}return $(R)}));if(P.assign===false){v.hooks.assign.for(I).tap(Qe,(v=>{const P=new ae(`${I} must not be assigned`);P.loc=v.loc;throw P}))}if(P.type){v.hooks.evaluateTypeof.for(I).tap(Qe,Ce(P.type))}}v.hooks.expression.for("__webpack_layer__").tap(Qe,(I=>{const P=new ge(JSON.stringify(v.state.module.layer),I.range);P.loc=I.loc;v.state.module.addPresentationalDependency(P);return true}));v.hooks.evaluateIdentifier.for("__webpack_layer__").tap(Qe,(I=>(v.state.module.layer===null?(new be).setNull():(new be).setString(v.state.module.layer)).setRange(I.range)));v.hooks.evaluateTypeof.for("__webpack_layer__").tap(Qe,(I=>(new be).setString(v.state.module.layer===null?"object":"string").setRange(I.range)));v.hooks.expression.for("__webpack_module__.id").tap(Qe,(I=>{v.state.module.buildInfo.moduleConcatenationBailout="__webpack_module__.id";const P=new ge(`${v.state.module.moduleArgument}.id`,I.range,[K.moduleId]);P.loc=I.loc;v.state.module.addPresentationalDependency(P);return true}));v.hooks.expression.for("__webpack_module__").tap(Qe,(I=>{v.state.module.buildInfo.moduleConcatenationBailout="__webpack_module__";const P=new ge(v.state.module.moduleArgument,I.range,[K.module]);P.loc=I.loc;v.state.module.addPresentationalDependency(P);return true}));v.hooks.evaluateTypeof.for("__webpack_module__").tap(Qe,Ce("object"))};I.hooks.parser.for($).tap(Qe,handler);I.hooks.parser.for(L).tap(Qe,handler);I.hooks.parser.for(q).tap(Qe,handler)}))}}v.exports=APIPlugin},86120:function(v,I,P){"use strict";const R=P(4554);const $=/at ([a-zA-Z0-9_.]*)/;function createMessage(v){return`Abstract method${v?` ${v}`:""}. Must be overridden.`}function Message(){this.stack=undefined;Error.captureStackTrace(this);const v=this.stack.split("\n")[3].match($);this.message=v&&v[1]?createMessage(v[1]):createMessage()}class AbstractMethodError extends R{constructor(){super((new Message).message);this.name="AbstractM
+2026-07-27T21:11:23.878645Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:34.678018Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 5.8 seconds
+Output:
+node_modules/next/dist\compiled\@next\font\google\index.js
+node_modules/next/dist\compiled\@next\font\dist\google\validate-google-font-function-call.js
+node_modules/next/dist\compiled\@next\font\dist\google\validate-google-font-function-call.d.ts
+node_modules/next/dist\compiled\@next\font\dist\google\loader.js
+node_modules/next/dist\compiled\@next\font\dist\google\index.d.ts
+node_modules/next/dist\compiled\@next\font\dist\google\get-font-axes.js
+node_modules/next/dist\build\babel\plugins\next-font-unsupported.js.map
+node_modules/next/dist\build\babel\plugins\next-font-unsupported.js
+node_modules/next/dist\telemetry\events\build.js.map
+node_modules/next/dist\telemetry\events\build.d.ts
+node_modules/next/dist\compiled\next-server\app-page-experimental.runtime.dev.js.map
+node_modules/@next\eslint-plugin-next\dist\rules\google-font-preconnect.js
+node_modules/@next\eslint-plugin-next\dist\rules\google-font-display.js
+node_modules/@next\eslint-plugin-next\dist\index.js
+node_modules/@next\eslint-plugin-next\dist\index.d.ts
+node_modules/next/dist\build\webpack\plugins\telemetry-plugin\telemetry-plugin.js.map
+node_modules/next/dist\build\webpack\plugins\telemetry-plugin\telemetry-plugin.js
+node_modules/next/dist\build\webpack\plugins\telemetry-plugin\telemetry-plugin.d.ts
+node_modules/next/dist\build\webpack\loaders\next-font-loader\index.js.map
+node_modules/next/dist\build\webpack\loaders\next-font-loader\index.js
+node_modules/next/dist\compiled\next-server\app-page-turbo-experimental.runtime.dev.js.map
+node_modules/next/dist\compiled\next-server\app-page-experimental.runtime.prod.js.map
+node_modules/next/dist\compiled\next-server\app-page-turbo.runtime.dev.js.map
+node_modules/next/dist\compiled\next-server\app-page-turbo-experimental.runtime.prod.js.map
+node_modules/next/dist\compiled\next-server\app-page-turbo.runtime.prod.js.map
+node_modules/next/dist\build\swc\options.js.map
+node_modules/next/dist\build\swc\options.js
+node_modules/next/dist\build\webpack\config\blocks\css\index.js
+node_modules/next/dist\compiled\next-server\app-page.runtime.prod.js.map
+node_modules/next/dist\compiled\next-server\app-page.runtime.dev.js.map
+node_modules/next/dist\build\webpack\config\blocks\css\index.js.map
+node_modules/next/dist\esm\build\babel\plugins\next-font-unsupported.js.map
+node_modules/next/dist\esm\build\babel\plugins\next-font-unsupported.js
+node_modules/next/dist\esm\build\swc\options.js
+node_modules/next/dist\esm\build\swc\options.js.map
+node_modules/next/dist\esm\build\webpack\config\blocks\css\index.js
+node_modules/next/dist\esm\build\webpack\config\blocks\css\index.js.map
+node_modules/next/dist\esm\build\webpack\loaders\next-font-loader\index.js
+node_modules/next/dist\esm\build\webpack\loaders\next-font-loader\index.js.map
+node_modules/next/dist\esm\build\webpack\plugins\telemetry-plugin\telemetry-plugin.js
+
+2026-07-27T21:11:34.836970Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:11:37.334026Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:12:15.497187Z ERROR codex_core::tools::router: error=`"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$env:DATABASE_URL='"'postgresql://postgres:local-build-only@127.0.0.1:5433/probuild?pgbouncer=true'; "'$env:DIRECT_URL='"'postgresql://postgres:local-build-only@127.0.0.1:5433/probuild'; "'$env:NEXTAUTH_SECRET='"'local-build-only-secret'; "'$env:CLERK_SECRET_KEY='"'local-build-only-key'; "'$backup='"'C:\\tmp\\pb-fix-layout-build-backup.tsx'; node -e \"const fs=require('fs'); const p='src/app/layout.tsx'; const s=fs.readFileSync(p,'utf8'); fs.writeFileSync(process.argv[1],s); const t=s.replace('import { Geist, Geist_Mono } from \\\"next/font/google\\\";\\\\n','').replace(/\\\\nconst geistSans = Geist\\\\([\\\\s\\\\S]*?\\\\n\\\\);\\\\n\\\\nconst geistMono = Geist_Mono\\\\([\\\\s\\\\S]*?\\\\n\\\\);\\\\n/,'\\\\n').replace('className={"'`${geistSans.variable} ${geistMono.variable} bg-slate-50 text-slate-900 min-h-screen`}'"','className=\\\"bg-slate-50 text-slate-900 min-h-screen\\\"'); fs.writeFileSync(p,t);\" "'$backup; try { $out=& npm run build 2>&1; $code=$LASTEXITCODE; $out | Select-Object -Last 180 } finally { node -e "const fs=require('"'fs'); fs.copyFileSync(process.argv[1],'src/app/layout.tsx');\" "'$backup; Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }; "OFFLINE_FONT_BYPASS_BUILD_EXIT=$code"; exit $code'` rejected: blocked by policy
+2026-07-27T21:12:21.357576Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:12:30.925912Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.4 seconds
+Output:
+true
+<ref *1> node:child_process:964
+    throw err;
+    ^
+
+Error: spawnSync git EPERM
+    at Object.spawnSync (node:internal/child_process:1120:20)
+    at spawnSync (node:child_process:911:24)
+    at Object.execFileSync (node:child_process:954:15)
+    at [eval]:1:143
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:283:30)
+    at evalTypeScript (node:internal/process/execution:295:3) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawnSync git',
+  path: 'git',
+  spawnargs: [
+    'show',
+    'HEAD:src/app/projects/[id]/time-expenses/NewExpenseEntryModal.tsx'
+  ],
+  error: [Circular *1],
+  status: null,
+  signal: null,
+  output: null,
+  pid: 0,
+  stdout: undefined,
+  stderr: undefined
+}
+
+Node.js v24.12.0
+
+2026-07-27T21:12:30.954190Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:12:42.375900Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:12:57.286559Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:02.932367Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:09.568778Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:14.989358Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:18.300540Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:24.076248Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:31.324780Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:38.541114Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:13:41.413887Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:04.408455Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:15.856215Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:27.013520Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:32.885707Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:42.887387Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 4.3 seconds
+Output:
+
+Running 50 tests using 8 workers
+
+PLAYWRIGHT_E2E_EXIT=1
+node.exe : node:internal/child_process:421
+At C:\Users\jat00\AppData\Roaming\npm\npx.ps1:24 char:5
++     & "node$exe"  "$basedir/node_modules/npm/bin/npx-cli.js" $args
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (node:internal/child_process:421:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    throw new ErrnoException(err, 'spawn');
+          ^
+Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:421:11)
+    at spawn (node:child_process:796:9)
+    at Object.fork (node:child_process:174:10)
+    at WorkerHost.startRunner (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intell
+igent-mcnulty-14a55c\node_modules\playwright\lib\runner\processHost.js:54:49)
+    at WorkerHost.start (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-
+mcnulty-14a55c\node_modules\playwright\lib\runner\workerHost.js:66:23)
+    at Dispatcher._runJobInWorker (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\in
+telligent-mcnulty-14a55c\node_modules\playwright\lib\runner\dispatcher.js:101:20) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawn'
+}
+Node.js v24.12.0
+
+2026-07-27T21:14:43.023826Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:14:51.110898Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 3.9 seconds
+Output:
+
+Running 50 tests using 1 worker
+
+PLAYWRIGHT_E2E_SINGLE_WORKER_EXIT=1
+node.exe : node:internal/child_process:421
+At C:\Users\jat00\AppData\Roaming\npm\npx.ps1:24 char:5
++     & "node$exe"  "$basedir/node_modules/npm/bin/npx-cli.js" $args
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (node:internal/child_process:421:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    throw new ErrnoException(err, 'spawn');
+          ^
+Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:421:11)
+    at spawn (node:child_process:796:9)
+    at Object.fork (node:child_process:174:10)
+    at WorkerHost.startRunner (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intell
+igent-mcnulty-14a55c\node_modules\playwright\lib\runner\processHost.js:54:49)
+    at WorkerHost.start (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-
+mcnulty-14a55c\node_modules\playwright\lib\runner\workerHost.js:66:23)
+    at Dispatcher._runJobInWorker (C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\in
+telligent-mcnulty-14a55c\node_modules\playwright\lib\runner\dispatcher.js:101:20) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawn'
+}
+Node.js v24.12.0
+
+2026-07-27T21:15:23.195885Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.1 seconds
+Output:
+Failed to write file C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site\.claude\worktrees\intelligent-mcnulty-14a55c\.specs\PB-pipeline-004-fix-report-20260727-1414.md
+
+2026-07-27T21:15:23.231850Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:15:44.633420Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:16:00.532409Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:16:17.918179Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:16:25.091915Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5
+2026-07-27T21:16:27.547833Z ERROR codex_models_manager::manager: failed to renew cache TTL: missing field `supports_reasoning_summaries` at line 88 column 5

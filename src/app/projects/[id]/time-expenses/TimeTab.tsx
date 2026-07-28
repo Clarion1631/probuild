@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useCallback } from "react";
 import { toast } from "sonner";
-import { deleteTimeEntry, deleteTimeEntries, getTimeEntries } from "@/lib/time-expense-actions";
+import { deleteTimeEntry, deleteTimeEntries, getTimeEntries, tagTimeEntriesToChangeOrder } from "@/lib/time-expense-actions";
 import { createInvoiceFromTimeEntries } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 
@@ -15,6 +15,10 @@ interface TimeEntry {
     laborCost: any;
     user: { id: string; name: string | null; email: string; hourlyRate?: any };
     costCode: { id: string; name: string; code: string } | null;
+    changeOrder: { id: string; code: string; title: string } | null;
+    invoiceId?: string | null;
+    invoicedAt?: string | Date | null;
+    isBillable?: boolean;
 }
 
 interface Props {
@@ -22,6 +26,7 @@ interface Props {
     entries: TimeEntry[];
     onAddNew: () => void;
     currentUser: { id: string; role: string; name: string };
+    changeOrders: { id: string; code: string; title: string }[];
 }
 
 function num(v: unknown): number {
@@ -36,12 +41,13 @@ function fmtMoney(v: number): string {
     return "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export default function TimeTab({ projectId, entries: initialEntries, onAddNew, currentUser }: Props) {
+export default function TimeTab({ projectId, entries: initialEntries, onAddNew, currentUser, changeOrders }: Props) {
     const router = useRouter();
     const [entries, setEntries] = useState<TimeEntry[]>(initialEntries);
     const [filter, setFilter] = useState("");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
+    const [bulkChangeOrderId, setBulkChangeOrderId] = useState("");
 
     const refreshEntries = useCallback(async () => {
         try {
@@ -79,9 +85,14 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
         });
     }
 
+    const selectableFiltered = useMemo(
+        () => filtered.filter((entry) => !entry.changeOrder && !entry.invoiceId && !entry.invoicedAt),
+        [filtered],
+    );
+
     function toggleAll() {
-        if (selectedIds.size === filtered.length) setSelectedIds(new Set());
-        else setSelectedIds(new Set(filtered.map(e => e.id)));
+        if (selectedIds.size === selectableFiltered.length) setSelectedIds(new Set());
+        else setSelectedIds(new Set(selectableFiltered.map((entry) => entry.id)));
     }
 
     async function handleDelete(id: string) {
@@ -167,6 +178,22 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                     />
                     {selectedIds.size > 0 && (
                         <>
+                            <select value={bulkChangeOrderId} onChange={e => setBulkChangeOrderId(e.target.value)} className="hui-input text-sm py-1.5 px-3">
+                                <option value="">Tag to change order…</option>
+                                {changeOrders.map(co => <option key={co.id} value={co.id}>{co.code} — {co.title}</option>)}
+                            </select>
+                            <button
+                                disabled={!bulkChangeOrderId}
+                                onClick={async () => {
+                                    try {
+                                        await tagTimeEntriesToChangeOrder(projectId, Array.from(selectedIds), bulkChangeOrderId);
+                                        toast.success("Time tagged to change order");
+                                        setSelectedIds(new Set());
+                                        await refreshEntries();
+                                    } catch (err: any) { toast.error(err.message || "Failed to tag time"); }
+                                }}
+                                className="hui-btn hui-btn-secondary text-sm px-3 py-1.5 disabled:opacity-50"
+                            >Tag selected</button>
                             <button
                                 onClick={async () => {
                                     setIsCreatingInvoice(true);
@@ -222,7 +249,7 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                     <h3 className="text-lg font-semibold text-slate-600 mb-1">No time entries yet</h3>
-                    <p className="text-sm text-slate-400">Click "New Entry" to log time for this project.</p>
+                    <p className="text-sm text-slate-400">Click &quot;New Entry&quot; to log time for this project.</p>
                 </div>
             ) : (
                 <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -231,11 +258,12 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
                                     <th className="px-4 py-3 text-left w-10">
-                                        <input type="checkbox" checked={selectedIds.size === filtered.length && filtered.length > 0} onChange={toggleAll} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                        <input type="checkbox" checked={selectedIds.size === selectableFiltered.length && selectableFiltered.length > 0} onChange={toggleAll} disabled={selectableFiltered.length === 0} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" title={selectableFiltered.length === 0 ? "No untagged, unbilled time entries can be invoiced" : "Select all eligible time entries"} />
                                     </th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Date</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Team Member</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Cost Code</th>
+                                    <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Change order</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Hours</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Cost</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider w-20"></th>
@@ -243,13 +271,14 @@ export default function TimeTab({ projectId, entries: initialEntries, onAddNew, 
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                                 {filtered.map(entry => (
-                                    <tr key={entry.id} className="hover:bg-slate-50 transition">
+                                    <tr key={entry.id} data-testid={"time-entry-row-" + entry.id} className="hover:bg-slate-50 transition">
                                         <td className="px-4 py-3">
-                                            <input type="checkbox" checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                            <input type="checkbox" data-testid={"time-entry-select-" + entry.id} checked={selectedIds.has(entry.id)} onChange={() => toggleSelect(entry.id)} disabled={Boolean(entry.changeOrder || entry.invoiceId || entry.invoicedAt)} title={entry.changeOrder ? "Change-order time must be billed through cost-plus billing" : entry.invoiceId || entry.invoicedAt ? "This time entry is already billed" : undefined} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-50" />
                                         </td>
                                         <td className="px-4 py-3 text-slate-600 tabular-nums">{new Date(entry.startTime).toLocaleDateString()}</td>
                                         <td className="px-4 py-3 font-medium text-hui-textMain">{entry.user.name || entry.user.email}</td>
                                         <td className="px-4 py-3 text-slate-600">{entry.costCode ? `${entry.costCode.code} — ${entry.costCode.name}` : "—"}</td>
+                                        <td className="px-4 py-3 text-slate-600">{entry.changeOrder ? <span>{entry.changeOrder.code} · {entry.invoiceId || entry.invoicedAt ? "Billed" : entry.isBillable ? "Billable" : "Not billable"}</span> : "—"}</td>
                                         <td className="px-4 py-3 text-right tabular-nums text-slate-600">{num(entry.durationHours).toFixed(1)}h</td>
                                         <td className="px-4 py-3 text-right tabular-nums font-medium text-hui-textMain">{fmtMoney(num(entry.laborCost))}</td>
                                         <td className="px-4 py-3 text-right">

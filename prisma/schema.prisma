@@ -516,6 +516,11 @@ model Expense {
   date        DateTime?
   description String?
   receiptUrl  String?
+  changeOrderId String?
+  changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
+  isBillable    Boolean      @default(false)
+  invoiceId     String?
+  invoicedAt    DateTime?
   status      String        @default("Pending") // Pending, Reviewed
 
   purchaseOrderId String?
@@ -524,6 +529,7 @@ model Expense {
   createdAt DateTime @default(now())
 
   @@index([estimateId])
+  @@index([changeOrderId])
 }
 
 model Invoice {
@@ -563,6 +569,8 @@ model PaymentSchedule {
   invoice               Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   name                  String
   amount                Decimal
+  pretaxAmount          Decimal?
+  taxAmount             Decimal?
   status                String    @default("Pending") // Pending, Paid, Canceled
   dueDate               DateTime?
   paymentDate           DateTime?
@@ -586,7 +594,11 @@ model PaymentSchedule {
 
   // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
-  sourceScheduleId String?
+  sourceScheduleId    String?
+  sourceChangeOrderId String?
+  sourceCoScheduleId  String? @unique
+  sourceCoSchedule    ChangeOrderPaymentSchedule? @relation("CoScheduleBilling", fields: [sourceCoScheduleId], references: [id], onDelete: SetNull)
+  coBilling           ChangeOrderBilling?
 
   // Optional link to the schedule task this milestone follows (copied from the
   // EstimatePaymentSchedule at invoicing; shifted with the task on start moves).
@@ -597,6 +609,7 @@ model PaymentSchedule {
   @@index([stripePaymentIntentId])
   @@index([qbInvoiceId])
   @@index([sourceScheduleId])
+  @@index([sourceChangeOrderId])
   @@index([scheduleTaskId])
 }
 
@@ -723,6 +736,12 @@ model TimeEntry {
 
   laborCost  Decimal?
   burdenCost Decimal?
+  notes      String?
+
+  changeOrderId String?
+  changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
+  isBillable    Boolean      @default(false)
+  invoiceId     String?
 
   scheduleTaskId String?
   scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id])
@@ -754,6 +773,7 @@ model TimeEntry {
   @@index([costTypeId])
   @@index([estimateItemId])
   @@index([scheduleTaskId])
+  @@index([changeOrderId])
 }
 
 model Contract {
@@ -841,6 +861,7 @@ model CompanySettings {
   logoUrl             String?
   licenseNumber       String?
   notificationEmail   String? // Where to send View/Sign alerts
+  timeZone           String  @default("America/Los_Angeles")
   // Google Drive (work account) - lead media folders. Set via Settings > Integrations.
   googleDriveRefreshToken String?
   googleDriveEmail        String?
@@ -1365,6 +1386,8 @@ model ChangeOrder {
   status      String   @default("Draft") // Draft, Sent, Approved, Declined
   totalAmount Decimal    @default(0)
   balanceDue  Decimal    @default(0)
+  pricingType String     @default("FIXED")
+  markupPercent Float?
 
   termsAndConditions String?
   memos              String?
@@ -1385,6 +1408,10 @@ model ChangeOrder {
 
   items            ChangeOrderItem[]
   paymentSchedules ChangeOrderPaymentSchedule[]
+  timeEntries       TimeEntry[]
+  expenses          Expense[]
+  billings          ChangeOrderBilling[]
+
   // Schedule tasks generated from this CO (provenance / idempotency).
   generatedScheduleTasks ScheduleTask[]
 
@@ -1423,12 +1450,32 @@ model ChangeOrderPaymentSchedule {
   dueDate       DateTime?
   order         Int         @default(0)
   createdAt     DateTime    @default(now())
+  billedMilestone PaymentSchedule? @relation("CoScheduleBilling")
 
   // Optional milestone anchor created by applyChangeOrderToSchedule.
   scheduleTaskId String?
   scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
 
   @@index([scheduleTaskId])
+}
+
+model ChangeOrderBilling {
+  id                String           @id @default(cuid())
+  changeOrderId     String
+  changeOrder       ChangeOrder      @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
+  paymentScheduleId String?          @unique
+  paymentSchedule   PaymentSchedule? @relation(fields: [paymentScheduleId], references: [id], onDelete: SetNull)
+  label             String
+  laborCents        Int
+  expenseCents      Int
+  markupCents       Int
+  taxCents          Int
+  totalCents        Int
+  snapshot          Json
+  createdAt         DateTime         @default(now())
+  createdBy         String?
+
+  @@index([changeOrderId])
 }
 
 model VendorTag {

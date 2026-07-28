@@ -21,9 +21,10 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 ];
 
 const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
 
 export function isPublicProxyBypass(pathname: string) {
-    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname) || CHANGE_ORDER_BILLING_PDF_PATTERN.test(pathname);
 }
 
 function hasNextAuthSessionCookie(req: any) {

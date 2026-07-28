@@ -211,10 +211,14 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         if (!valid.length) return;
         setIsSplitting(true);
         try {
-            await splitInvoiceMilestones(
+            const res = await splitInvoiceMilestones(
                 initialInvoice.id,
                 valid.map((r) => ({ name: r.name.trim(), amount: parseFloat(r.amount) })),
             );
+            if (!res.success) {
+                toast.error(res.error || "Failed to update payment schedule");
+                return;
+            }
             toast.success("Payment schedule updated");
             setShowSplit(false);
             router.refresh();
@@ -322,6 +326,10 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
         setIsDeleting(true);
         try {
             const res = await deleteInvoice(initialInvoice.id);
+            if (!res.success) {
+                toast.error(res.error || "Cannot delete this invoice");
+                return;
+            }
             toast.success("Invoice deleted");
             router.push(`/projects/${res.projectId}/invoices`);
         } catch (e: any) {

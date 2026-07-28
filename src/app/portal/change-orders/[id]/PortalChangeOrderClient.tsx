@@ -56,6 +56,8 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(initialData.estimate);
+    const isCostPlus = initialData.pricingType === "COST_PLUS";
+    const schedules = initialData.paymentSchedules || [];
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -146,6 +148,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     )}
 
+                    {isCostPlus && (
+                        <div className="mx-10 mt-6 p-5 bg-amber-50 border border-amber-200 rounded-lg">
+                            <p className="text-xs font-semibold text-amber-700 uppercase tracking-wider">Cost-plus terms</p>
+                            <p className="text-xl font-bold text-slate-900 mt-1">Cost + {initialData.markupPercent ?? 10}% + tax</p>
+                            <p className="text-sm text-slate-600 mt-2">This approval covers the scope and markup terms. Work is billed from actual time and materials; scope-line prices are non-binding estimates.</p>
+                        </div>
+                    )}
+
                     {/* Signed Badge */}
                     {isApproved && initialData.approvedBy && (
                         <div className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
@@ -197,7 +207,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="border-b-2 border-slate-200">
-                                    <th className="text-left py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider">Description</th>
+                                    <th className="text-left py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider">{isCostPlus ? "Scope estimate (not a fixed price)" : "Description"}</th>
                                     <th className="text-center py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-20">Qty</th>
                                     <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Unit Price</th>
                                     <th className="text-right py-3 font-semibold text-slate-600 uppercase text-xs tracking-wider w-28">Amount</th>
@@ -224,7 +234,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </table>
 
                         {/* Totals */}
-                        <div className="flex justify-end mt-6">
+                        {!isCostPlus ? <div className="flex justify-end mt-6">
                             <div className="w-72">
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Subtotal</span>
@@ -239,7 +249,16 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <span>{formatCurrency(total)}</span>
                                 </div>
                             </div>
-                        </div>
+                        </div> : <div className="flex justify-end mt-6"><div className="w-72 border-t-2 border-slate-800 pt-3 text-right"><p className="text-xs text-slate-500 uppercase">Approved terms</p><p className="text-lg font-bold text-amber-600">Cost + {initialData.markupPercent ?? 10}% + tax</p></div></div>}
+
+                        {!isCostPlus && schedules.length > 0 && (
+                            <div className="mt-8 border-t border-slate-200 pt-6">
+                                <h3 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment schedule</h3>
+                                <div className="space-y-2">
+                                    {schedules.map((row: any) => <div key={row.id} className="flex justify-between text-sm"><span>{row.name}{row.dueDate ? ` · ${new Date(row.dueDate).toLocaleDateString()}` : ""}</span><strong>{formatCurrency(row.amount)}</strong></div>)}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {/* Signature / Approval Area */}
@@ -249,7 +268,9 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                 <div className="text-center max-w-lg mx-auto">
                                     <h3 className="text-lg font-bold text-slate-800 mb-2">Ready to Approve?</h3>
                                     <p className="text-sm text-slate-500 mb-6">
-                                        By signing below, you authorize the project modifications and budget adjustments outlined in this Change Order.
+                                        {isCostPlus
+                                            ? `By signing below, you authorize the scope and cost + ${initialData.markupPercent ?? 10}% + tax terms. Actual time and materials will be billed later.`
+                                            : "By signing below, you authorize the project modifications and budget adjustments outlined in this Change Order."}
                                     </p>
 
                                     {!isApproving ? (
@@ -285,7 +306,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
                                                 <div className="bg-white border border-slate-200 rounded-md p-3">
                                                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                                                        <strong className="text-slate-700">ESIGN Act Disclosure:</strong> By signing above and clicking "Sign & Approve," I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA, (2) I have reviewed and agree to the modifications, and (3) I authorize the described work and payment adjustments.
+                                                        <strong className="text-slate-700">ESIGN Act Disclosure:</strong> By signing above and clicking &quot;Sign &amp; Approve,&quot; I confirm that (1) my drawn signature and typed name constitute my legal electronic signature under the U.S. ESIGN Act (15 U.S.C. § 7001) and UETA, (2) I have reviewed and agree to the modifications, and (3) I authorize the described work and payment adjustments.
                                                     </p>
                                                 </div>
 
@@ -319,6 +340,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                             </div>
                         </div>
                     )}
+
                 </div>
             </div>
         </div>

@@ -1092,10 +1092,18 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         y -= 20;
     }
 
+    if (co.pricingType === 'COST_PLUS') {
+        checkNewPage(70);
+        page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
+        y -= 16;
+        page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+        y -= 24;
+    }
+
     // Items table
     const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
 
-    page.drawText('ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
     const coQtyLabel = 'QTY'; const coQtyW = helveticaBold.widthOfTextAtSize(coQtyLabel, 8);
     page.drawText(coQtyLabel, { x: coCols.qty - coQtyW, y, size: 8, font: helveticaBold, color: colors.textMuted });
     const coUcLabel = 'UNIT COST'; const coUcW = helveticaBold.widthOfTextAtSize(coUcLabel, 8);
@@ -1151,12 +1159,29 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         page.drawText(value, { x: coCols.total - vw, y, size, font, color });
     };
 
-    drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
-    y -= 18;
-    drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
-    y -= 22;
-    checkNewPage(60);
-    drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
+    if (co.pricingType === 'COST_PLUS') {
+        drawCoTotalRow('Approved terms', `Cost + ${co.markupPercent ?? 10}% + tax`, 12, helveticaBold, colors.primary);
+    } else {
+        drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
+        y -= 18;
+        drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
+        y -= 22;
+        checkNewPage(60);
+        drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
+    }
+
+    if (co.pricingType === 'FIXED' && co.paymentSchedules.length > 0) {
+        y -= 38;
+        checkNewPage(60 + co.paymentSchedules.length * 18);
+        page.drawText('PAYMENT SCHEDULE', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
+        y -= 18;
+        for (const schedule of co.paymentSchedules) {
+            page.drawText(`${schedule.name}${schedule.dueDate ? ` · ${new Date(schedule.dueDate).toLocaleDateString('en-US')}` : ''}`, { x: margin, y, size: 9, font: helvetica, color: colors.textMain });
+            const value = formatCurrency(Number(schedule.amount));
+            page.drawText(value, { x: pageWidth - margin - helveticaBold.widthOfTextAtSize(value, 9), y, size: 9, font: helveticaBold, color: colors.textMain });
+            y -= 18;
+        }
+    }
 
     // Signatures — client approval and company countersignature are independent blocks.
     if (co.status === 'Approved' && co.approvedBy) {
@@ -1184,4 +1209,91 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
 
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
+}
+
+type BillingSnapshot = {
+    timeEntries?: Array<{ name?: string; date?: string; hours?: number; notes?: string | null; laborCents?: number; burdenCents?: number; totalCents?: number }>;
+    expenses?: Array<{ date?: string; vendor?: string | null; description?: string | null; receiptUrl?: string | null; amountCents?: number }>;
+};
+
+/** Generate the immutable itemized backup for one cost-plus billing run. */
+export async function generateChangeOrderBillingPdf(changeOrderId: string, billingId: string): Promise<Buffer> {
+    const billing = await prisma.changeOrderBilling.findFirst({
+        where: { id: billingId, changeOrderId },
+        include: { changeOrder: { include: { project: { include: { client: true } } } } },
+    });
+    if (!billing) throw new Error("Change-order billing not found");
+
+    const snapshot = (billing.snapshot ?? {}) as BillingSnapshot;
+    const company = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+    const doc = await PDFDocument.create();
+    const regular = await doc.embedFont(StandardFonts.Helvetica);
+    const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+    const pageWidth = 612;
+    const pageHeight = 792;
+    const margin = 48;
+    let page = doc.addPage([pageWidth, pageHeight]);
+    let y = pageHeight - margin;
+    const money = (cents: number | undefined) => formatCurrency((cents ?? 0) / 100);
+    const addPageIfNeeded = (height = 24) => {
+        if (y - height < 48) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+        }
+    };
+    const line = (label: string, amount: string, emphasize = false) => {
+        addPageIfNeeded();
+        const font = emphasize ? bold : regular;
+        page.drawText(label.slice(0, 72), { x: margin, y, size: emphasize ? 11 : 9, font, color: colors.textMain });
+        const width = font.widthOfTextAtSize(amount, emphasize ? 11 : 9);
+        page.drawText(amount, { x: pageWidth - margin - width, y, size: emphasize ? 11 : 9, font, color: colors.textMain });
+        y -= 18;
+    };
+
+    page.drawText(company?.companyName || "ProBuild", { x: margin, y, size: 12, font: bold, color: colors.primary });
+    y -= 28;
+    page.drawText("ITEMIZED TIME & MATERIALS BACKUP", { x: margin, y, size: 18, font: bold, color: colors.textMain });
+    y -= 22;
+    page.drawText(`${billing.changeOrder.code} — ${billing.changeOrder.title}`, { x: margin, y, size: 11, font: bold, color: colors.textMain });
+    y -= 16;
+    page.drawText(`${billing.changeOrder.project.name} · ${billing.changeOrder.project.client?.name || "Client"} · ${billing.label}`, { x: margin, y, size: 9, font: regular, color: colors.textMuted });
+    y -= 28;
+
+    page.drawText("TIME", { x: margin, y, size: 11, font: bold, color: colors.textMain });
+    y -= 20;
+    for (const row of snapshot.timeEntries ?? []) {
+        const date = row.date ? new Date(row.date).toLocaleDateString("en-US") : "";
+        const detail = `${date} · ${row.name || "Crew"} · ${row.hours ?? 0} hr${row.notes ? ` · ${row.notes}` : ""}`;
+        line(detail, money(row.totalCents ?? ((row.laborCents ?? 0) + (row.burdenCents ?? 0))));
+    }
+    if (!(snapshot.timeEntries?.length)) line("No time entries", "$0.00");
+
+    y -= 8;
+    addPageIfNeeded(40);
+    page.drawText("EXPENSES", { x: margin, y, size: 11, font: bold, color: colors.textMain });
+    y -= 20;
+    for (const row of snapshot.expenses ?? []) {
+        const date = row.date ? new Date(row.date).toLocaleDateString("en-US") : "";
+        const receipt = row.receiptUrl ? " · receipt on file" : "";
+        line(`${date} · ${row.vendor || "Expense"}${row.description ? ` · ${row.description}` : ""}${receipt}`, money(row.amountCents));
+        if (row.receiptUrl) {
+            addPageIfNeeded();
+            page.drawText(row.receiptUrl.slice(0, 90), { x: margin + 12, y, size: 7, font: regular, color: colors.textMuted });
+            y -= 14;
+        }
+    }
+    if (!(snapshot.expenses?.length)) line("No expenses", "$0.00");
+
+    y -= 12;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 22;
+    line("Labor", money(billing.laborCents));
+    line("Expenses", money(billing.expenseCents));
+    line("Markup", money(billing.markupCents));
+    line("Subtotal", money(billing.laborCents + billing.expenseCents + billing.markupCents));
+    line("Sales tax", money(billing.taxCents));
+    line("Total", money(billing.totalCents), true);
+
+    const bytes = await doc.save();
+    return Buffer.from(bytes);
 }

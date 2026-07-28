@@ -31,8 +31,10 @@ export default async function PortalChangeOrderPage({ params }: { params: Promis
         }
     }
 
+    // Serialize Decimal-backed values before the client boundary, then overlay
+    // the resolved (signed) private-storage signature URLs.
     const initialData = {
-        ...changeOrder,
+        ...JSON.parse(JSON.stringify(changeOrder)),
         clientSignatureUrl: await resolveDocUrl((changeOrder as any).clientSignatureUrl),
         companySignatureUrl: await resolveDocUrl((changeOrder as any).companySignatureUrl),
     };

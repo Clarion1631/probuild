@@ -178,7 +178,8 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
 
     // Stable per-milestone doc number: INV-00012-2 (position within the invoice's schedule)
     const position = invoice.payments.findIndex(p => p.id === schedule.id) + 1 || 1;
-    const docNumber = `${invoice.code}-${position}`;
+    const suffix = `-${position}`;
+    const docNumber = `${invoice.code.slice(0, Math.max(1, 21 - suffix.length))}${suffix}`;
 
     const projectName = invoice.project?.name || "Project";
     const amount = toNum(schedule.amount);
@@ -186,12 +187,17 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // Carry the sales tax explicitly so Vanessa's QBO sales-tax reporting sees
     // the liability. The milestone amount is tax-inclusive; split it using the
     // invoice's rate (each milestone carries its proportional share of tax).
-    const taxRate = toNum(invoice.taxRate);
     let tax: { preTaxAmount: number; taxAmount: number } | null = null;
-    if (taxRate > 0) {
+    if (schedule.pretaxAmount != null && schedule.taxAmount != null) {
+        tax = {
+            preTaxAmount: toNum(schedule.pretaxAmount),
+            taxAmount: toNum(schedule.taxAmount),
+        };
+    } else {
+        const taxRate = toNum(invoice.taxRate);
         const preTaxAmount = Math.round((amount / (1 + taxRate / 100)) * 100) / 100;
         const taxAmount = Math.round((amount - preTaxAmount) * 100) / 100;
-        if (taxAmount > 0) tax = { preTaxAmount, taxAmount };
+        if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
     const { qbId, total } = await createQBMilestoneInvoice(tokens, {
@@ -494,6 +500,12 @@ export async function reconcileMilestoneToQbo(
         if (schedule.status === "Paid" || schedule.status === "Canceled") {
             return { ok: false, error: "Cannot reconcile a paid or canceled milestone" };
         }
+        if (schedule.pretaxAmount != null || schedule.taxAmount != null) {
+            return {
+                ok: false,
+                error: "This milestone has a frozen ProBuild tax split and cannot be reconciled to a changed QuickBooks total. Void the QuickBooks invoice and rebill it in ProBuild.",
+            };
+        }
 
         const oldAmount = toNum(schedule.amount);
         // Idempotent: a re-submit with the same QBO total is a no-op.
@@ -520,14 +532,19 @@ export async function reconcileMilestoneToQbo(
         const newTotal = r2(allSchedules.reduce((sum, s) => sum + toNum(s.amount), 0));
         const totalPaid = r2(allSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0));
         const newBalance = Math.max(0, r2(newTotal - totalPaid));
+        const splitSchedules = allSchedules.filter((row) => row.pretaxAmount != null && row.taxAmount != null);
+        const legacySchedules = allSchedules.filter((row) => row.pretaxAmount == null || row.taxAmount == null);
+        const storedPretax = r2(splitSchedules.reduce((sum, row) => sum + toNum(row.pretaxAmount), 0));
+        const storedTax = r2(splitSchedules.reduce((sum, row) => sum + toNum(row.taxAmount), 0));
+        const residualTotal = r2(legacySchedules.reduce((sum, row) => sum + toNum(row.amount), 0));
         const invoiceRate = toNum(invoice.taxRate);
-        const tax = deriveInvoiceTaxFields(newTotal, invoiceRate, invoiceRate <= 0);
+        const residualTax = deriveInvoiceTaxFields(residualTotal, invoiceRate, invoiceRate <= 0);
         await t.invoice.update({
             where: { id: invoice.id },
             data: {
                 totalAmount: newTotal,
-                subtotal: tax.subtotal,
-                taxAmount: tax.taxAmount,
+                subtotal: r2(storedPretax + residualTax.subtotal),
+                taxAmount: r2(storedTax + residualTax.taxAmount),
                 balanceDue: newBalance,
                 status: newBalance <= 0 ? "Paid" : totalPaid > 0 ? "Partially Paid" : invoice.status,
             },

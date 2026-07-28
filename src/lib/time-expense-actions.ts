@@ -5,6 +5,12 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
+import {
+    createExpenseCore,
+    createTimeEntryFromStoredRatesCore,
+    tagExpensesToChangeOrderCore,
+    tagTimeEntriesToChangeOrderCore,
+} from "@/lib/time-expense-core";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -22,26 +28,15 @@ export async function createTimeEntry(data: {
     costCodeId: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
+    changeOrderId?: string | null;
     isBillable?: boolean;
     isTaxable?: boolean;
     notes?: string;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
-
-    const startTime = new Date(data.date);
-
-    await prisma.timeEntry.create({
-        data: {
-            projectId: data.projectId,
-            userId: data.userId,
-            costCodeId: data.costCodeId,
-            startTime,
-            durationHours: data.durationHours,
-            laborCost: data.laborCost,
-        },
-    });
+    await assertTimeExpenseProjectAccess(data.projectId);
+    await createTimeEntryFromStoredRatesCore(data, session.user.email);
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
@@ -58,13 +53,19 @@ export async function updateTimeEntry(
         laborCost: number;
     }
 ) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
-
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+    if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
+    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
     const startTime = new Date(data.date);
+    if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
+    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true } });
+    if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
+    if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
 
-    await prisma.timeEntry.update({
-        where: { id },
+    const updated = await prisma.timeEntry.updateMany({
+        where: { id, invoiceId: null, invoicedAt: null },
         data: {
             userId: data.userId,
             costCodeId: data.costCodeId,
@@ -73,19 +74,23 @@ export async function updateTimeEntry(
             laborCost: data.laborCost,
         },
     });
+    if (updated.count !== 1) throw new Error("Time entry was billed while it was being edited; refresh and try again");
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
 }
 
 export async function deleteTimeEntry(id: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
-
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     const entry = await prisma.timeEntry.findUnique({ where: { id } });
     if (!entry) throw new Error("Not found");
+    if (!canAccessProject(user, entry.projectId)) throw new Error("Forbidden");
+    if (entry.invoiceId || entry.invoicedAt) throw new Error("Billed time entries cannot be deleted");
 
-    await prisma.timeEntry.delete({ where: { id } });
+    const deleted = await prisma.timeEntry.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+    if (deleted.count !== 1) throw new Error("Time entry was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${entry.projectId}/time-expenses`);
     revalidatePath(`/projects/${entry.projectId}/budget`);
@@ -101,11 +106,11 @@ export async function deleteTimeEntries(
 
     const entries = await prisma.timeEntry.findMany({
         where: { id: { in: ids } },
-        select: { id: true, projectId: true, invoicedAt: true },
+        select: { id: true, projectId: true, invoiceId: true, invoicedAt: true },
     });
 
     const allowed = entries.filter(
-        e => !e.invoicedAt && canAccessProject(user, e.projectId)
+        e => !e.invoiceId && !e.invoicedAt && canAccessProject(user, e.projectId)
     );
     if (!allowed.length) return { deleted: 0 };
 
@@ -113,7 +118,7 @@ export async function deleteTimeEntries(
     const projectIds = new Set(allowed.map(e => e.projectId));
 
     const result = await prisma.timeEntry.deleteMany({
-        where: { id: { in: allowedIds } },
+        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
     });
 
     for (const projectId of projectIds) {
@@ -134,35 +139,48 @@ export async function createExpense(data: {
     vendor?: string;
     date?: string;
     description?: string;
-    receiptUrl?: string;
+    receiptFileId?: string;
+    changeOrderId?: string | null;
+    isBillable?: boolean;
     projectId: string;
 }) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
-
-    await prisma.expense.create({
-        data: {
-            estimateId: data.estimateId,
-            itemId: data.itemId || null,
-            costCodeId: data.costCodeId || null,
-            costTypeId: data.costTypeId || null,
-            amount: data.amount,
-            vendor: data.vendor || null,
-            date: data.date ? new Date(data.date) : null,
-            description: data.description || null,
-            receiptUrl: data.receiptUrl || null,
-        },
-    });
+    await assertTimeExpenseProjectAccess(data.projectId);
+    await createExpenseCore({
+        projectId: data.projectId,
+        estimateId: data.estimateId,
+        itemId: data.itemId,
+        costCodeId: data.costCodeId,
+        costTypeId: data.costTypeId,
+        amount: data.amount,
+        vendor: data.vendor,
+        date: data.date,
+        description: data.description,
+        receiptFileId: data.receiptFileId,
+        changeOrderId: data.changeOrderId,
+        isBillable: data.isBillable,
+    }, session.user.email);
 
     revalidatePath(`/projects/${data.projectId}/time-expenses`);
     revalidatePath(`/projects/${data.projectId}/budget`);
 }
 
 export async function deleteExpense(id: string, projectId: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    const user = await getCurrentUserWithPermissions();
+    if (!user) throw new Error("Unauthorized");
+    if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
+    const expense = await prisma.expense.findUnique({
+        where: { id },
+        select: { invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+    });
+    if (!expense || expense.estimate.projectId !== projectId || !canAccessProject(user, expense.estimate.projectId)) {
+        throw new Error("Forbidden");
+    }
+    if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
 
-    await prisma.expense.delete({ where: { id } });
+    const deleted = await prisma.expense.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+    if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${projectId}/time-expenses`);
     revalidatePath(`/projects/${projectId}/budget`);
@@ -178,11 +196,11 @@ export async function deleteExpenses(
 
     const expenses = await prisma.expense.findMany({
         where: { id: { in: ids } },
-        select: { id: true, estimate: { select: { projectId: true } } },
+        select: { id: true, invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
     });
 
     const allowed = expenses.filter(
-        e => e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
+        e => !e.invoiceId && !e.invoicedAt && e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
     );
     if (!allowed.length) return { deleted: 0 };
 
@@ -192,7 +210,7 @@ export async function deleteExpenses(
     );
 
     const result = await prisma.expense.deleteMany({
-        where: { id: { in: allowedIds } },
+        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
     });
 
     for (const projectId of projectIds) {
@@ -202,17 +220,39 @@ export async function deleteExpenses(
     return { deleted: result.count };
 }
 
+export async function tagTimeEntriesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+    await assertTimeExpenseProjectAccess(target.projectId);
+    const result = await tagTimeEntriesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+    revalidatePath(`/projects/${projectId}/time-expenses`);
+    return result;
+}
+
+export async function tagExpensesToChangeOrder(projectId: string, ids: string[], changeOrderId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Unauthorized");
+    const target = await prisma.changeOrder.findUnique({ where: { id: changeOrderId }, select: { projectId: true } });
+    if (!target || target.projectId !== projectId) throw new Error("Change order does not belong to the authorized project");
+    await assertTimeExpenseProjectAccess(target.projectId);
+    const result = await tagExpensesToChangeOrderCore({ ids, changeOrderId }, session.user.email);
+    revalidatePath(`/projects/${projectId}/time-expenses`);
+    return result;
+}
+
 // ─── Individual Data Fetching ─────────────────────────────────
 
 export async function getTimeEntries(projectId: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    await assertTimeExpenseProjectAccess(projectId);
 
     return prisma.timeEntry.findMany({
         where: { projectId },
         include: {
-            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },
+            changeOrder: { select: { id: true, code: true, title: true } },
             costType: { select: { id: true, name: true } },
         },
         orderBy: { startTime: "desc" },
@@ -220,8 +260,7 @@ export async function getTimeEntries(projectId: string) {
 }
 
 export async function getExpenses(projectId: string) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Unauthorized");
+    await assertTimeExpenseProjectAccess(projectId);
 
     return prisma.expense.findMany({
         where: { estimate: { projectId } },
@@ -229,6 +268,7 @@ export async function getExpenses(projectId: string) {
             costCode: { select: { id: true, name: true, code: true } },
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
+            changeOrder: { select: { id: true, code: true, title: true } },
         },
         orderBy: { createdAt: "desc" },
     });
@@ -241,8 +281,9 @@ export async function getTimeExpenseData(projectId: string) {
     const timeEntries = await prisma.timeEntry.findMany({
         where: { projectId },
         include: {
-            user: { select: { id: true, name: true, email: true, hourlyRate: true } },
+            user: { select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true } },
             costCode: { select: { id: true, name: true, code: true } },
+            changeOrder: { select: { id: true, code: true, title: true } },
         },
         orderBy: { startTime: "desc" },
     });
@@ -253,6 +294,7 @@ export async function getTimeExpenseData(projectId: string) {
             costCode: { select: { id: true, name: true, code: true } },
             costType: { select: { id: true, name: true } },
             item: { select: { id: true, name: true } },
+            changeOrder: { select: { id: true, code: true, title: true } },
         },
         orderBy: { createdAt: "desc" },
     });
@@ -268,7 +310,7 @@ export async function getTimeExpenseData(projectId: string) {
 
     const teamMembers = await prisma.user.findMany({
         where: { status: { not: "DISABLED" } },
-        select: { id: true, name: true, email: true, hourlyRate: true },
+        select: { id: true, name: true, email: true, hourlyRate: true, burdenRate: true },
         orderBy: { name: "asc" },
     });
 
@@ -281,5 +323,11 @@ export async function getTimeExpenseData(projectId: string) {
         },
     });
 
-    return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates };
+    const changeOrders = await prisma.changeOrder.findMany({
+        where: { projectId, pricingType: "COST_PLUS", status: { in: ["Sent", "Approved"] } },
+        select: { id: true, code: true, title: true, status: true, estimateId: true },
+        orderBy: { createdAt: "desc" },
+    });
+
+    return { timeEntries, expenses, costCodes, costTypes, teamMembers, estimates, changeOrders };
 }
