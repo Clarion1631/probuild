@@ -20,7 +20,7 @@ export default function OutgoingPaymentsCard({ projectId, outgoing }: { projectI
                     <Receipt size={32} />
                 </div>
                 <h3 className="text-lg font-bold text-gray-900 mb-2">Add Your First Expense!</h3>
-                <p className="text-sm text-gray-600 mb-6 px-4">Once you add current expenses, they'll pop up right here.</p>
+                <p className="text-sm text-gray-600 mb-6 px-4">Once you add current expenses, they&apos;ll pop up right here.</p>
                 <button 
                     onClick={() => router.push(`/projects/${projectId}/timeclock`)}
                     className="px-6 py-2.5 bg-gray-900 hover:bg-black text-white text-sm font-medium rounded-lg transition"

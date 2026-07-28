@@ -34,7 +34,7 @@ export default function ClipClient({ initialUrl, allProjects }: { initialUrl: st
         if (initialUrl) {
             void parseUrl(initialUrl);
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+         
     }, [initialUrl]);
 
     async function parseUrl(targetUrl: string) {

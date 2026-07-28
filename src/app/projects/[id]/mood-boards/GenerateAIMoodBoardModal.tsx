@@ -103,7 +103,7 @@ export default function GenerateAIMoodBoardModal({ projectId }: { projectId: str
                                         disabled={isGenerating}
                                     />
                                     <p className="text-xs text-slate-500 mt-1.5">
-                                        Provide a photo of the client's space. Gemini Vision will analyze it to suggest complementary styling elements.
+                                        Provide a photo of the client&apos;s space. Gemini Vision will analyze it to suggest complementary styling elements.
                                     </p>
                                 </div>
                             </div>

@@ -150,7 +150,7 @@ function SuggestItemModal({
                                 {parsing ? "Parsing…" : "Parse"}
                             </button>
                         </div>
-                        <p className="text-xs text-hui-textMuted mt-1">We'll try to pull the name and photo. Price stays with your project manager for now.</p>
+                        <p className="text-xs text-hui-textMuted mt-1">We&apos;ll try to pull the name and photo. Price stays with your project manager for now.</p>
                     </div>
 
                     <div>
@@ -230,7 +230,7 @@ export default function PortalSuggestionsSection({
             <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain">Your suggestions</h2>
-                    <p className="text-sm text-hui-textMuted">Items you've sent us, and where they stand.</p>
+                    <p className="text-sm text-hui-textMuted">Items you&apos;ve sent us, and where they stand.</p>
                 </div>
                 <button onClick={() => setModalOpen(true)} className="hui-btn hui-btn-green">
                     Suggest an item

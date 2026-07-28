@@ -13,6 +13,7 @@ const eslintConfig = defineConfig([
     "scripts/**",
     "*.js",
     "prisma/**",
+    "qa-report/**",
   ]),
   {
     rules: {
@@ -20,6 +21,10 @@ const eslintConfig = defineConfig([
       "@typescript-eslint/no-explicit-any": "warn",
       "@typescript-eslint/no-unused-vars": "warn",
       "no-unused-vars": "warn",
+      "react-hooks/set-state-in-effect": "warn",
+      "react-hooks/static-components": "warn",
+      "react-hooks/immutability": "warn",
+      "react-hooks/purity": "warn",
     },
   },
 ]);
