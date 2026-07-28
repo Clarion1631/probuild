@@ -16,7 +16,7 @@ import { resolveSessionClientId } from "./portal-auth";
 import { persistSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
@@ -9630,7 +9630,7 @@ export async function getSelectionBoardsForPortal(projectId: string) {
  */
 async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
     const visibility = await getPortalVisibility(projectId);
-    if (!visibility.isPortalEnabled || !visibility.showSelections) throw new Error("Unauthorized");
+    if (!visibility.isPortalEnabled || !visibility.showSelections) throw new PortalAuthError();
 
     const session = await getSessionOrDev();
     const role = (session?.user as { role?: string } | undefined)?.role;
@@ -9638,9 +9638,9 @@ async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaf
     if (isStaff) return { isStaff: true, clientId: null };
 
     const clientId = await resolveSessionClientId();
-    if (!clientId) throw new Error("Unauthorized");
+    if (!clientId) throw new PortalAuthError();
     const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
-    if (!project) throw new Error("Unauthorized");
+    if (!project) throw new PortalAuthError();
     return { isStaff: false, clientId };
 }
 
@@ -9651,7 +9651,7 @@ async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaf
  */
 async function assertPortalMoodBoardAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
     const visibility = await getPortalVisibility(projectId);
-    if (!visibility.isPortalEnabled || !visibility.showMoodBoards) throw new Error("Unauthorized");
+    if (!visibility.isPortalEnabled || !visibility.showMoodBoards) throw new PortalAuthError();
 
     const session = await getSessionOrDev();
     const role = (session?.user as { role?: string } | undefined)?.role;
@@ -9659,9 +9659,9 @@ async function assertPortalMoodBoardAccess(projectId: string): Promise<{ isStaff
     if (isStaff) return { isStaff: true, clientId: null };
 
     const clientId = await resolveSessionClientId();
-    if (!clientId) throw new Error("Unauthorized");
+    if (!clientId) throw new PortalAuthError();
     const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
-    if (!project) throw new Error("Unauthorized");
+    if (!project) throw new PortalAuthError();
     return { isStaff: false, clientId };
 }
 
@@ -9678,17 +9678,31 @@ export async function getPortalMoodBoardAccess(projectId: string): Promise<{ isS
  * project. Deliberately does NOT read PortalVisibility — those per-feature
  * flags decide what the CLIENT is shown and are enforced by the portal pages
  * themselves; applying them here would lock staff out of their own tools
- * whenever a project's portal is switched off. */
+ * whenever a project's portal is switched off.
+ *
+ * ADMIN/MANAGER get an unconditional global bypass. FIELD_CREW/FINANCE are
+ * staff but not global — they only read projects they're scoped to via
+ * ProjectAccess or a crew assignment, mirrored exactly from the same check in
+ * src/app/projects/[id]/layout.tsx via the shared canAccessProject() helper,
+ * so this read gate can't be wider than the page boundary that guards the
+ * rest of that project's staff UI. */
 async function assertProjectReadAccess(projectId: string): Promise<{ isStaff: boolean }> {
     const session = await getSessionOrDev();
     const role = (session?.user as { role?: string } | undefined)?.role;
-    const isStaff = role === "ADMIN" || role === "MANAGER" || role === "FIELD_CREW" || role === "FINANCE";
-    if (isStaff) return { isStaff: true };
+
+    if (role === "ADMIN" || role === "MANAGER") return { isStaff: true };
+
+    if (role === "FIELD_CREW" || role === "FINANCE") {
+        const email = session?.user?.email;
+        const user = email ? await getUserWithPermissionsByEmail(email) : null;
+        if (!user || !canAccessProject(user, projectId)) throw new PortalAuthError();
+        return { isStaff: true };
+    }
 
     const clientId = await resolveSessionClientId();
-    if (!clientId) throw new Error("Unauthorized");
+    if (!clientId) throw new PortalAuthError();
     const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
-    if (!project) throw new Error("Unauthorized");
+    if (!project) throw new PortalAuthError();
     return { isStaff: false };
 }
 
@@ -10398,13 +10412,20 @@ export async function getMoodBoards(projectId: string) {
 }
 
 export async function getMoodBoard(id: string) {
-    const board = await prisma.moodBoard.findUnique({
+    // Look up just the projectId to assert access on before loading the full
+    // board (items + project + client) — avoids fetching data the caller may
+    // not be authorized to see.
+    const boardRef = await prisma.moodBoard.findUnique({
+        where: { id },
+        select: { projectId: true },
+    });
+    if (!boardRef) return null;
+    await assertProjectReadAccess(boardRef.projectId);
+
+    return await prisma.moodBoard.findUnique({
         where: { id },
         include: { items: true, project: { include: { client: true } } },
     });
-    if (!board) return null;
-    await assertProjectReadAccess(board.projectId);
-    return board;
 }
 
 export async function createMoodBoard(projectId: string, title: string) {

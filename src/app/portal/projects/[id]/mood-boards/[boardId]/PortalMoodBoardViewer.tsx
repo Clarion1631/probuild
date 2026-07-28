@@ -60,7 +60,13 @@ export default function PortalMoodBoardViewer({
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [trayOpen, setTrayOpen] = useState(initialItems.length === 0);
     const [busy, setBusy] = useState(false);
-    const [pendingLibraryKeys, setPendingLibraryKeys] = useState<Set<string>>(new Set());
+    // Keyed on imageUrl (not the library entry's own key) because that's the
+    // domain the toggle mutates in — board items are matched back to a
+    // library tile by imageUrl. Mirrored into a ref so the guard is set
+    // synchronously before any await, so two rapid clicks on the same image
+    // can't both read a stale "not pending" state and pass the guard.
+    const pendingLibraryUrlsRef = useRef<Set<string>>(new Set());
+    const [pendingLibraryUrls, setPendingLibraryUrls] = useState<Set<string>>(new Set());
     const [uploadingPhoto, setUploadingPhoto] = useState(false);
     const [swatchColor, setSwatchColor] = useState("#3b82f6");
     const [noteText, setNoteText] = useState("");
@@ -95,11 +101,28 @@ export default function PortalMoodBoardViewer({
     };
 
     const handleToggleLibraryItem = async (entry: LibraryEntry) => {
-        if (pendingLibraryKeys.has(entry.key)) return;
-        setPendingLibraryKeys(prev => new Set(prev).add(entry.key));
+        if (pendingLibraryUrlsRef.current.has(entry.imageUrl)) return;
+        // Lock the ref synchronously, before any await — setState alone is
+        // async/batched and wouldn't reliably stop two rapid clicks on the
+        // same image from both passing this guard.
+        pendingLibraryUrlsRef.current.add(entry.imageUrl);
+        setPendingLibraryUrls(new Set(pendingLibraryUrlsRef.current));
         try {
-            const existing = items.find(i => i.type === "IMAGE" && i.content === entry.imageUrl);
-            if (existing) {
+            const matches = items.filter(i => i.type === "IMAGE" && i.content === entry.imageUrl);
+            if (matches.length > 0) {
+                // Multiple board items can share this URL. Only a
+                // client-added item (addedByClient) can be deleted by a
+                // client session server-side (portalDeleteMoodBoardItem) — so
+                // prefer removing one of those over an arbitrary match.
+                const existing = matches.find(i => i.addedByClient) ?? matches[0];
+                if (!isStaff && !existing.addedByClient) {
+                    // Every match is staff-placed and this is a client
+                    // session — the server would reject the delete with a
+                    // generic "Only items you added can be removed" error.
+                    // Don't even call it; tell the client why instead.
+                    toast.info("Your project manager placed this one — ask them if you'd like it taken off.");
+                    return;
+                }
                 await portalDeleteMoodBoardItem(boardId, existing.id);
                 setItems(prev => prev.filter(i => i.id !== existing.id));
                 toast.success("Removed from board");
@@ -120,11 +143,8 @@ export default function PortalMoodBoardViewer({
         } catch (e: any) {
             toast.error(e.message || "Failed to update board");
         } finally {
-            setPendingLibraryKeys(prev => {
-                const next = new Set(prev);
-                next.delete(entry.key);
-                return next;
-            });
+            pendingLibraryUrlsRef.current.delete(entry.imageUrl);
+            setPendingLibraryUrls(new Set(pendingLibraryUrlsRef.current));
         }
     };
 
@@ -267,7 +287,7 @@ export default function PortalMoodBoardViewer({
                                                         key={entry.key}
                                                         entry={entry}
                                                         isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
-                                                        isPending={pendingLibraryKeys.has(entry.key)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
                                                         onToggle={() => handleToggleLibraryItem(entry)}
                                                     />
                                                 ))}
@@ -284,7 +304,7 @@ export default function PortalMoodBoardViewer({
                                                         key={entry.key}
                                                         entry={entry}
                                                         isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
-                                                        isPending={pendingLibraryKeys.has(entry.key)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
                                                         onToggle={() => handleToggleLibraryItem(entry)}
                                                     />
                                                 ))}
@@ -301,7 +321,7 @@ export default function PortalMoodBoardViewer({
                                                         key={entry.key}
                                                         entry={entry}
                                                         isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
-                                                        isPending={pendingLibraryKeys.has(entry.key)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
                                                         onToggle={() => handleToggleLibraryItem(entry)}
                                                     />
                                                 ))}

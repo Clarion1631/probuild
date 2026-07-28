@@ -7,6 +7,7 @@ import {
     getSelectionProposalsForPortal,
     getPortalMoodBoardAccess,
 } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import { isHttpUrl } from "@/lib/url-safety";
 import Link from "next/link";
 import PortalMoodBoardViewer from "./PortalMoodBoardViewer";
@@ -33,7 +34,7 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
         ({ isStaff } = await getPortalMoodBoardAccess(id));
         board = await getMoodBoard(boardId);
     } catch (e) {
-        if (e instanceof Error && e.message === "Unauthorized") return notFound();
+        if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
         throw e;
     }
     if (!board || board.projectId !== id) return notFound();
@@ -65,14 +66,20 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
         getSelectionProposalsForPortal(id).catch(() => [] as Awaited<ReturnType<typeof getSelectionProposalsForPortal>>),
     ]);
 
-    // Dedupe by imageUrl WITHIN each group only — an option and a favorite may
-    // legitimately share the same image, so dedup must not cross groups.
-    function dedupeByImageUrl<T extends { imageUrl: string }>(entries: T[]): T[] {
-        const seen = new Set<string>();
+    // Dedupe by imageUrl ACROSS ALL GROUPS — a library tile is matched back to
+    // board items by imageUrl (see PortalMoodBoardViewer's toggle handler), so
+    // the same URL appearing in two groups would make every one of those
+    // tiles show as "on board" together and toggling off would remove an
+    // arbitrary matching item. `seenImageUrls` is shared across the three
+    // dedupeGlobal() calls below, so precedence follows call order:
+    // selection categories first, then suggestions, then favorites. Group
+    // ordering is otherwise unchanged.
+    const seenImageUrls = new Set<string>();
+    function dedupeGlobal<T extends { imageUrl: string }>(entries: T[]): T[] {
         const out: T[] = [];
         for (const entry of entries) {
-            if (seen.has(entry.imageUrl)) continue;
-            seen.add(entry.imageUrl);
+            if (seenImageUrls.has(entry.imageUrl)) continue;
+            seenImageUrls.add(entry.imageUrl);
             out.push(entry);
         }
         return out;
@@ -81,7 +88,7 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
     const categories = selectionCategories
         .map((cat) => ({
             categoryName: cat.name,
-            items: dedupeByImageUrl(
+            items: dedupeGlobal(
                 cat.options
                     .filter((opt) => isHttpUrl(opt.imageUrl))
                     .map((opt) => ({
@@ -94,13 +101,13 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
         }))
         .filter((cat) => cat.items.length > 0);
 
-    const suggestions = dedupeByImageUrl(
+    const suggestions = dedupeGlobal(
         proposals
             .filter((prop) => isHttpUrl((prop as any).imageUrl))
             .map((prop) => ({ key: `proposal-${prop.id}`, name: (prop as any).name || "Suggestion", imageUrl: (prop as any).imageUrl as string }))
     );
 
-    const favoriteEntries = dedupeByImageUrl(
+    const favoriteEntries = dedupeGlobal(
         favorites
             .filter((fav) => isHttpUrl((fav as any).product?.imageUrl))
             .map((fav) => ({ key: `favorite-${fav.id}`, name: (fav as any).product?.name || "Favorite", imageUrl: (fav as any).product.imageUrl as string }))

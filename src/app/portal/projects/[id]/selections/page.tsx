@@ -8,6 +8,7 @@ import {
     getSelectionProposalsForPortal,
     getProjectFavoritesForPortal,
 } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import Link from "next/link";
 import PortalSelectionsClient from "./PortalSelectionsClient";
 import PortalProjectFavorites from "./PortalProjectFavorites";
@@ -48,7 +49,7 @@ export default async function PortalSelectionsPage(props: { params: Promise<{ id
             getProjectFavoritesForPortal(id),
         ]);
     } catch (e) {
-        if (e instanceof Error && e.message === "Unauthorized") return notFound();
+        if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
         throw e;
     }
 
