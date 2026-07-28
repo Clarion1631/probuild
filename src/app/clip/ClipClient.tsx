@@ -20,7 +20,31 @@ const EMPTY_FORM = {
     category: "",
 };
 
-export default function ClipClient({ initialUrl, allProjects }: { initialUrl: string; allProjects: ProjectOption[] }) {
+export const SITE_BLOCKS_PARSE_MESSAGE =
+    "This site blocks automated reading. Tip: use the ProBuild Clip bookmarklet while on the product page — it reads the page directly.";
+
+interface ClipClientProps {
+    initialUrl: string;
+    // Present when opened from the bookmarklet, which already extracted these
+    // from the live page DOM (JSON-LD -> og/meta fallback) before opening this
+    // window — see buildBookmarkletHref in ProductLibraryClient.tsx.
+    initialName?: string;
+    initialPrice?: string;
+    initialCurrency?: string;
+    initialImage?: string;
+    initialVendor?: string;
+    allProjects: ProjectOption[];
+}
+
+export default function ClipClient({
+    initialUrl,
+    initialName,
+    initialPrice,
+    initialCurrency,
+    initialImage,
+    initialVendor,
+    allProjects,
+}: ClipClientProps) {
     const [url, setUrl] = useState(initialUrl);
     const [form, setForm] = useState(EMPTY_FORM);
     const [parsing, setParsing] = useState(false);
@@ -31,11 +55,39 @@ export default function ClipClient({ initialUrl, allProjects }: { initialUrl: st
     const [pickedProjectId, setPickedProjectId] = useState("");
 
     useEffect(() => {
-        if (initialUrl) {
+        // The bookmarklet already read the live page — prefill directly from
+        // its query params and skip the auto server-side parse call entirely
+        // (that's the whole point: a server fetch of a Lowe's/Home Depot page
+        // gets a 403 from their bot wall; the bookmarklet's in-page DOM read
+        // doesn't). The manual "Re-parse" button (parseUrl) still works as a
+        // fallback if the user wants to re-pull from the server.
+        const hasBookmarkletData = !!(initialName || initialPrice || initialImage || initialVendor);
+        if (hasBookmarkletData) {
+            let price = initialPrice || "";
+            let description = "";
+            const currency = (initialCurrency || "").trim().toUpperCase();
+            // Same currency handling as the server-side normalizeParsedProduct:
+            // a non-USD price can't just be treated as a USD number, so fold
+            // the original amount/currency into the description instead.
+            if (price && currency && currency !== "USD") {
+                description = `Listed price: ${price} ${currency}`;
+                price = "";
+            }
+            const safeImage = initialImage && isHttpUrl(initialImage) ? initialImage : "";
+            setForm((f) => ({
+                ...f,
+                name: (initialName || f.name).slice(0, 200),
+                imageUrl: safeImage || f.imageUrl,
+                price: price || f.price,
+                vendor: initialVendor || f.vendor,
+                description: description || f.description,
+            }));
+            setParsed(true);
+        } else if (initialUrl) {
             void parseUrl(initialUrl);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [initialUrl]);
+    }, []);
 
     async function parseUrl(targetUrl: string) {
         const trimmed = targetUrl.trim();
@@ -59,10 +111,10 @@ export default function ClipClient({ initialUrl, allProjects }: { initialUrl: st
             }));
             setParsed(true);
             if (!data.name) {
-                toast.info("Couldn't auto-detect this page — fill in details manually.");
+                toast.info(SITE_BLOCKS_PARSE_MESSAGE);
             }
         } catch (e: any) {
-            toast.error(e.message || "Couldn't parse that page");
+            toast.error(SITE_BLOCKS_PARSE_MESSAGE);
         } finally {
             setParsing(false);
         }

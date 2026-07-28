@@ -56,6 +56,50 @@ const EMPTY_FORM = {
     category: "",
 };
 
+export const SITE_BLOCKS_PARSE_MESSAGE =
+    "This site blocks automated reading. Tip: use the ProBuild Clip bookmarklet while on the product page — it reads the page directly.";
+
+/**
+ * Builds the "Get the Clipper" bookmarklet's javascript: URL. Unlike a plain
+ * "open /clip?url=..." link, this extracts product data from the LIVE page
+ * DOM (JSON-LD -> OpenGraph/meta fallback) before ever opening /clip — the
+ * same trick Houzz's clipper uses to beat bot walls like Lowe's/Home Depot's
+ * Akamai block, which returns a 403 to any server-side fetch regardless of
+ * User-Agent. The user's own browser already has the rendered page, so this
+ * never needs to fetch anything.
+ *
+ * Kept as one compact (not obfuscated, just short-named) IIFE so it fits
+ * comfortably as a draggable bookmark URL. Extraction logic verified against
+ * JSON-LD fixtures (array/object image, string/object brand, array offers,
+ * AggregateOffer.lowPrice) and a fake-DOM harness in a throwaway script
+ * before being embedded here — see the PR description for the harness.
+ */
+function buildBookmarkletHref(appUrl: string): string {
+    const js =
+        "(function(){function I(v){if(!v)return'';if(Array.isArray(v))v=v[0];if(v&&typeof v==='object')return v.url||'';return typeof v==='string'?v:''}" +
+        "function B(b){if(!b)return'';return typeof b==='string'?b:(b.name||'')}" +
+        "function O(o){if(!o)return{};if(Array.isArray(o))o=o[0];if(!o)return{};var p=o.price!=null?o.price:o.lowPrice;return{p:p,c:o.priceCurrency||''}}" +
+        "var nm='',im='',pr='',cu='',vd='';" +
+        "var ss=document.querySelectorAll('script[type=\"application/ld+json\"]');" +
+        "F:for(var i=0;i<ss.length;i++){var d;try{d=JSON.parse(ss[i].textContent)}catch(e){continue}" +
+        "var cs=Array.isArray(d)?d:[d];" +
+        "for(var c=0;c<cs.length;c++){var cd=cs[c];var ns=(cd&&cd['@graph'])?cd['@graph']:[cd];" +
+        "for(var n=0;n<ns.length;n++){var nd=ns[n];if(!nd)continue;var t=nd['@type'];var ts=Array.isArray(t)?t:[t];" +
+        "var isP=ts.some(function(x){return typeof x==='string'&&x.toLowerCase()==='product'});if(!isP)continue;" +
+        "nm=nd.name||'';im=I(nd.image);var of=O(nd.offers);pr=(of.p!=null?of.p:'');cu=of.c||'';vd=B(nd.brand);break F}}}" +
+        "function M(s){var e=document.querySelector(s);return e?(e.getAttribute('content')||''):''}" +
+        "if(!nm)nm=M('meta[property=\"og:title\"]')||document.title||'';" +
+        "if(!im)im=M('meta[property=\"og:image\"]');" +
+        "if(!pr)pr=M('meta[property=\"product:price:amount\"]');" +
+        "if(!cu)cu=M('meta[property=\"product:price:currency\"]');" +
+        "nm=String(nm).slice(0,200);im=String(im).slice(0,1000);" +
+        "var ps=[];function A(k,v){if(v)ps.push(k+'='+encodeURIComponent(v))}" +
+        "A('url',location.href);A('name',nm);A('price',pr);A('currency',cu);A('image',im);A('vendor',vd);" +
+        "window.open('" + appUrl + "/clip?'+ps.join('&'),'probuild-clip','width=480,height=720')" +
+        "})();";
+    return "javascript:" + js;
+}
+
 function formatPrice(value: number | string | null | undefined): string | null {
     if (value === null || value === undefined || value === "") return null;
     const num = Number(value);
@@ -168,12 +212,12 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                 vendorUrl: data.vendorUrl || url,
             }));
             if (!data.name) {
-                toast.info("Couldn't auto-detect product details — fill in the fields manually.");
+                toast.info(SITE_BLOCKS_PARSE_MESSAGE);
             } else {
                 toast.success("Product details pulled in — review and save.");
             }
         } catch (e: any) {
-            toast.error(e.message || "Failed to parse URL");
+            toast.error(SITE_BLOCKS_PARSE_MESSAGE);
         } finally {
             setParsing(false);
         }
@@ -243,8 +287,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
         }
     }
 
-    const bookmarkletHref =
-        "javascript:(function(){window.open('" + appUrl + "/clip?url='+encodeURIComponent(location.href),'probuild-clip','width=480,height=720');})();";
+    const bookmarkletHref = buildBookmarkletHref(appUrl);
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6">
