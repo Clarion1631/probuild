@@ -1740,6 +1740,7 @@ model MoodBoardItem {
   width       Float     @default(200)
   height      Float     @default(200)
   zIndex      Int       @default(1)
+  addedByClient Boolean @default(false)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 }

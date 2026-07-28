@@ -9419,11 +9419,24 @@ export async function deleteSelectionOption(id: string) {
 }
 
 export async function sendSelectionBoardToClient(boardId: string) {
+    await assertActiveStaff();
+
     const board = await prisma.selectionBoard.findUnique({
         where: { id: boardId },
-        include: { project: { include: { client: true } } },
+        include: {
+            project: { include: { client: true } },
+            categories: { include: { options: true } },
+        },
     });
     if (!board) throw new Error("Board not found");
+
+    if (board.categories.length === 0) {
+        throw new Error("Add at least one category before sending.");
+    }
+    const emptyCategories = board.categories.filter((c) => c.options.length === 0);
+    if (emptyCategories.length > 0) {
+        throw new Error(`Every category needs at least one option before sending. Missing options: ${emptyCategories.map((c) => c.name).join(", ")}`);
+    }
 
     await prisma.selectionBoard.update({
         where: { id: boardId },
@@ -9468,26 +9481,80 @@ export async function submitClientSelections(boardId: string, selections: Record
     });
     if (!board) throw new Error("Board not found");
 
-    // Reset all options then set selected ones
+    await assertPortalProjectOwnership(board.projectId);
+
+    if (board.status !== "Sent") {
+        throw new Error("This board is not open for selections.");
+    }
+
+    // Cheap pre-check against the snapshot read above, for a fast error
+    // before touching the transaction. This snapshot can go stale if staff
+    // edit the board's categories/options between this read and the claim
+    // below, so it is re-validated against fresh in-tx data after the claim
+    // succeeds — this pass is purely an early-exit convenience.
     for (const cat of board.categories) {
+        if (cat.options.length === 0) continue;
         const selectedOptionId = selections[cat.id];
-        for (const opt of cat.options) {
-            await prisma.selectionOption.update({
-                where: { id: opt.id },
-                data: { selected: opt.id === selectedOptionId },
-            });
+        if (!selectedOptionId || !cat.options.some((o) => o.id === selectedOptionId)) {
+            throw new Error("Please select an option for every category.");
         }
     }
 
-    await prisma.selectionBoard.update({
-        where: { id: boardId },
-        data: { status: "Selections Made" },
+    // Claim the board first, inside the transaction: updateMany only flips
+    // status if it's still "Sent", so two concurrent submits (or a resubmit
+    // racing a re-send) can't both write option selections — the loser gets
+    // count 0 and throws instead of silently double-applying.
+    const freshCategories = await prisma.$transaction(async (tx) => {
+        const claim = await tx.selectionBoard.updateMany({
+            where: { id: boardId, status: "Sent" },
+            data: { status: "Selections Made" },
+        });
+        if (claim.count === 0) {
+            throw new Error("This board is not open for selections.");
+        }
+
+        // Re-read categories+options inside the transaction, after the claim
+        // succeeds, and re-run the same validation against this fresh data —
+        // a staff edit that slipped in between the pre-check above and the
+        // claim (e.g. removing/replacing an option) throws here, which rolls
+        // back the claim instead of recording a selection against stale data.
+        const cats = await tx.selectionCategory.findMany({
+            where: { boardId },
+            include: { options: true },
+        });
+        for (const cat of cats) {
+            if (cat.options.length === 0) continue;
+            const selectedOptionId = selections[cat.id];
+            if (!selectedOptionId || !cat.options.some((o) => o.id === selectedOptionId)) {
+                throw new Error("Please select an option for every category.");
+            }
+        }
+
+        // Reset all options then set selected ones, per category.
+        for (const cat of cats) {
+            const selectedOptionId = selections[cat.id];
+            if (cat.options.length === 0) continue;
+            await tx.selectionOption.updateMany({
+                where: { categoryId: cat.id },
+                data: { selected: false },
+            });
+            const set = await tx.selectionOption.updateMany({
+                where: { id: selectedOptionId, categoryId: cat.id },
+                data: { selected: true },
+            });
+            if (set.count !== 1) {
+                throw new Error("Please select an option for every category.");
+            }
+        }
+
+        return cats;
     });
 
-    // Notify PM
+    // Notify PM — built from the fresh in-tx data captured above, not the
+    // pre-transaction snapshot.
     const settings = await getCachedCompanySettings();
     if (settings.notificationEmail) {
-        const selectedSummary = board.categories.map(cat => {
+        const selectedSummary = freshCategories.map(cat => {
             const selectedOpt = cat.options.find(o => selections[cat.id] === o.id);
             return `<li><strong>${cat.name}:</strong> ${selectedOpt?.name || 'None'}</li>`;
         }).join('');
@@ -9555,6 +9622,35 @@ async function assertPortalProjectOwnership(projectId: string): Promise<{ isStaf
     const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
     if (!project) throw new Error("Unauthorized");
     return { isStaff: false, clientId };
+}
+
+/**
+ * Ownership + visibility assertion for the portal-facing collaborative mood
+ * board actions below. Modeled exactly on assertPortalProjectOwnership above,
+ * gated on showMoodBoards instead of showSelections.
+ */
+async function assertPortalMoodBoardAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
+    const visibility = await getPortalVisibility(projectId);
+    if (!visibility.isPortalEnabled || !visibility.showMoodBoards) throw new Error("Unauthorized");
+
+    const session = await getSessionOrDev();
+    const role = (session?.user as { role?: string } | undefined)?.role;
+    const isStaff = role === "ADMIN" || role === "MANAGER";
+    if (isStaff) return { isStaff: true, clientId: null };
+
+    const clientId = await resolveSessionClientId();
+    if (!clientId) throw new Error("Unauthorized");
+    const project = await prisma.project.findFirst({ where: { id: projectId, clientId }, select: { id: true } });
+    if (!project) throw new Error("Unauthorized");
+    return { isStaff: false, clientId };
+}
+
+// Thin exported wrapper around assertPortalMoodBoardAccess for the portal
+// mood-board pages (server components), which need the same
+// ownership/visibility check the actions above enforce — throws on failure,
+// same as the internal function.
+export async function getPortalMoodBoardAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null }> {
+    return assertPortalMoodBoardAccess(projectId);
 }
 
 /** Persist boundary for any stored vendorUrl/imageUrl: only a plain http(s)
@@ -10269,6 +10365,7 @@ export async function getMoodBoard(id: string) {
 }
 
 export async function createMoodBoard(projectId: string, title: string) {
+    await assertActiveStaff();
     const board = await prisma.moodBoard.create({
         data: { projectId, title },
     });
@@ -10277,6 +10374,7 @@ export async function createMoodBoard(projectId: string, title: string) {
 }
 
 export async function deleteMoodBoard(id: string) {
+    await assertActiveStaff();
     const board = await prisma.moodBoard.findUnique({ where: { id } });
     if (!board) return { success: false };
     await prisma.moodBoard.delete({ where: { id } });
@@ -10284,6 +10382,11 @@ export async function deleteMoodBoard(id: string) {
     return { success: true };
 }
 
+// deletedIds: ids the staff editor removed locally since it loaded the board.
+// Only these are deleted server-side (filtered to ids actually belonging to
+// this board) — the old "delete everything not in the submitted array"
+// behavior would silently wipe items a client added via the portal after the
+// staff editor's initial load (see portalAddMoodBoardItem below).
 export async function saveMoodBoardItems(boardId: string, items: Array<{
     id?: string;
     type: string;
@@ -10293,23 +10396,33 @@ export async function saveMoodBoardItems(boardId: string, items: Array<{
     width: number;
     height: number;
     zIndex: number;
-}>) {
+}>, deletedIds?: string[]) {
+    await assertActiveStaff();
+
     const board = await prisma.moodBoard.findUnique({ where: { id: boardId } });
     if (!board) throw new Error("Board not found");
 
+    const skippedIds: string[] = [];
+
     await prisma.$transaction(async (tx) => {
-        const currentItemIds = items.filter(i => i.id && !i.id.startsWith("temp-")).map(i => i.id as string);
-        await tx.moodBoardItem.deleteMany({
-            where: {
-                moodBoardId: boardId,
-                id: { notIn: currentItemIds }
-            }
-        });
+        if (deletedIds && deletedIds.length > 0) {
+            await tx.moodBoardItem.deleteMany({
+                where: {
+                    moodBoardId: boardId,
+                    id: { in: deletedIds },
+                },
+            });
+        }
 
         for (const item of items) {
             if (item.id && !item.id.startsWith("temp-")) {
-                await tx.moodBoardItem.update({
-                    where: { id: item.id },
+                // updateMany (not update) so this is scoped to moodBoardId as
+                // well as id: an item the client deleted concurrently is
+                // silently skipped (matchCount 0) instead of throwing and
+                // rolling back the whole save, and a forged id belonging to
+                // another board is a no-op rather than cross-board writes.
+                const updated = await tx.moodBoardItem.updateMany({
+                    where: { id: item.id, moodBoardId: boardId },
                     data: {
                         type: item.type,
                         content: item.content,
@@ -10320,6 +10433,7 @@ export async function saveMoodBoardItems(boardId: string, items: Array<{
                         zIndex: item.zIndex,
                     }
                 });
+                if (updated.count === 0) skippedIds.push(item.id);
             } else {
                 await tx.moodBoardItem.create({
                     data: {
@@ -10338,7 +10452,157 @@ export async function saveMoodBoardItems(boardId: string, items: Array<{
     });
 
     revalidatePath(`/projects/${board.projectId}/mood-boards/${boardId}`);
+
+    // Return the persisted, ordered item list (real DB ids) so the caller can
+    // replace its local state — the editor re-sends "temp-*" ids on every
+    // save, so without this the client can't tell which temp ids became which
+    // real ids and would recreate them on the next save.
+    const persisted = await prisma.moodBoardItem.findMany({
+        where: { moodBoardId: boardId },
+        orderBy: { createdAt: "asc" },
+    });
+    return { success: true, items: persisted, skippedIds };
+}
+
+// ── Portal collaborative mood board actions ─────────────────────────────────
+// Staff and client share the same board: both can arrange (move/resize) any
+// item, but only the client's own added items (or staff, always) can delete
+// a given item. See assertPortalMoodBoardAccess above.
+
+const MOODBOARD_ITEM_TYPES = ["IMAGE", "TEXT", "SWATCH"] as const;
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+function clampMoodBoardCoord(value: number): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.min(5000, Math.max(0, n));
+}
+
+function clampMoodBoardSize(value: number): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 40;
+    return Math.min(2000, Math.max(40, n));
+}
+
+function clampMoodBoardZIndex(value: number): number {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return 1;
+    return Math.min(100000, Math.max(1, n));
+}
+
+export async function portalAddMoodBoardItem(boardId: string, data: {
+    type: string;
+    content: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}) {
+    const board = await prisma.moodBoard.findUnique({ where: { id: boardId } });
+    if (!board) throw new Error("Board not found");
+    const { isStaff } = await assertPortalMoodBoardAccess(board.projectId);
+
+    if (!MOODBOARD_ITEM_TYPES.includes(data.type as any)) {
+        throw new Error("Invalid item type");
+    }
+
+    let content: string;
+    if (data.type === "IMAGE") {
+        if (!isHttpUrl(data.content)) throw new Error("Invalid image URL");
+        content = data.content;
+    } else if (data.type === "SWATCH") {
+        if (!HEX_COLOR_RE.test(data.content?.trim() || "")) throw new Error("Invalid color — use a 6-digit hex code like #3b82f6");
+        content = data.content.trim();
+    } else {
+        const trimmed = (data.content || "").trim();
+        if (!trimmed) throw new Error("Note text is required");
+        if (trimmed.length > 500) throw new Error("Note text must be 500 characters or fewer");
+        content = trimmed;
+    }
+
+    const maxZ = await prisma.moodBoardItem.aggregate({
+        where: { moodBoardId: boardId },
+        _max: { zIndex: true },
+    });
+
+    const item = await prisma.moodBoardItem.create({
+        data: {
+            moodBoardId: boardId,
+            type: data.type,
+            content,
+            x: clampMoodBoardCoord(data.x),
+            y: clampMoodBoardCoord(data.y),
+            width: clampMoodBoardSize(data.width),
+            height: clampMoodBoardSize(data.height),
+            zIndex: (maxZ._max.zIndex ?? 0) + 1,
+            addedByClient: !isStaff,
+        },
+    });
+
+    revalidatePath(`/portal/projects/${board.projectId}/mood-boards/${boardId}`);
+    return item;
+}
+
+export async function portalMoveMoodBoardItem(boardId: string, itemId: string, data: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    zIndex?: number;
+}) {
+    const item = await prisma.moodBoardItem.findUnique({ where: { id: itemId } });
+    if (!item || item.moodBoardId !== boardId) throw new Error("Item not found");
+
+    const board = await prisma.moodBoard.findUnique({ where: { id: boardId } });
+    if (!board) throw new Error("Board not found");
+    await assertPortalMoodBoardAccess(board.projectId);
+
+    const updated = await prisma.moodBoardItem.update({
+        where: { id: itemId },
+        data: {
+            x: clampMoodBoardCoord(data.x),
+            y: clampMoodBoardCoord(data.y),
+            width: clampMoodBoardSize(data.width),
+            height: clampMoodBoardSize(data.height),
+            ...(data.zIndex != null ? { zIndex: clampMoodBoardZIndex(data.zIndex) } : {}),
+        },
+    });
+
+    revalidatePath(`/portal/projects/${board.projectId}/mood-boards/${boardId}`);
+    return updated;
+}
+
+export async function portalDeleteMoodBoardItem(boardId: string, itemId: string) {
+    const item = await prisma.moodBoardItem.findUnique({ where: { id: itemId } });
+    if (!item || item.moodBoardId !== boardId) throw new Error("Item not found");
+
+    const board = await prisma.moodBoard.findUnique({ where: { id: boardId } });
+    if (!board) throw new Error("Board not found");
+    const { isStaff } = await assertPortalMoodBoardAccess(board.projectId);
+
+    if (!isStaff && !item.addedByClient) {
+        throw new Error("Only items you added can be removed.");
+    }
+
+    await prisma.moodBoardItem.delete({ where: { id: itemId } });
+    revalidatePath(`/portal/projects/${board.projectId}/mood-boards/${boardId}`);
     return { success: true };
+}
+
+export async function portalCreateMoodBoard(projectId: string, title: string) {
+    await assertPortalMoodBoardAccess(projectId);
+
+    const trimmed = title?.trim();
+    if (!trimmed) throw new Error("Title is required");
+    if (trimmed.length > 120) throw new Error("Title must be 120 characters or fewer");
+
+    const board = await prisma.moodBoard.create({
+        data: { projectId, title: trimmed },
+    });
+
+    revalidatePath(`/portal/projects/${projectId}/mood-boards`);
+    revalidatePath(`/projects/${projectId}/mood-boards`);
+    return board;
 }
 
 // ─── Catalog Items ─────────────────────────────────────────────────────────
