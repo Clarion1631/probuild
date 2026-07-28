@@ -6293,6 +6293,10 @@ export async function approveContract(contractId: string, signatureName: string,
 
     try {
     await prisma.$transaction(async (tx) => {
+        // Recompute per attempt: if this callback is ever re-run (e.g. someone wraps this in
+        // withTxRetry), a flag left true by a previous attempt would make us delete a
+        // signature the successful attempt committed.
+        signatureDidNotLand = false;
         if (!isRecurring) {
             // CAS-bind the body we validated (and, when it carries a contractor block, that
             // the contractor pre-signature still exists) into the transition — text edits now
@@ -6510,6 +6514,10 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         let companySignatureLanded = false;
         try {
             await prisma.$transaction(async (tx) => {
+                // Recompute per attempt: if this callback is ever re-run (e.g. someone wraps
+                // this in withTxRetry), a stale value from a previous attempt would decide the
+                // wrong way about deleting a committed signature.
+                companySignatureLanded = false;
                 const guard = await tx.contract.updateMany({
                     where: { id: contractId, status: "Signed", companySignedAt: null },
                     data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
