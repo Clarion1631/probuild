@@ -222,7 +222,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                     Back to Team Members
                 </Link>
                 <div className="flex items-center justify-between">
-                    <h1 className="text-2xl font-semibold text-hui-textMain">Edit "{user.email}"</h1>
+                    <h1 className="text-2xl font-semibold text-hui-textMain">Edit &quot;{user.email}&quot;</h1>
                     <button
                         onClick={handleSave}
                         disabled={saving}

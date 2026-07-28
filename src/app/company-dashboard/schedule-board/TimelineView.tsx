@@ -267,7 +267,7 @@ export function TimelineView({
         const container = scrollContainerRef.current;
         if (!container) return;
         container.scrollLeft = TIMELINE_DAYS_BEFORE_ANCHOR * dayWidth;
-        // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the anchor month + zoom only
+         
     }, [data.month, dayWidth]);
 
     // "Today" button (ScheduleBoard header): scroll today into view even when

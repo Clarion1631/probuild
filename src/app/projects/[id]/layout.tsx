@@ -16,7 +16,7 @@ export default async function ProjectLayout({
 
     // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
     const isNumeric = (str: string) => /^\d+$/.test(str);
-    let resolvedId = id;
+    const resolvedId = id;
 
     if (isNumeric(id)) {
         const project = await prisma.project.findFirst({

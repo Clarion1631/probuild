@@ -17,7 +17,7 @@ export default async function LeadLayout({
 
     // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
     const isNumeric = (str: string) => /^\d+$/.test(str);
-    let resolvedId = id;
+    const resolvedId = id;
 
     if (isNumeric(id)) {
         const lead = await prisma.lead.findFirst({

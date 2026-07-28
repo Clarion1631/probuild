@@ -142,7 +142,7 @@ export default function GustoClient({
                     </li>
                     <li className="flex gap-2">
                         <span className="text-hui-primary mt-0.5">2.</span>
-                        <span>Click <strong>"Export to Gusto"</strong> to download a CSV with employee name, Gusto UUID, hours, date, and project.</span>
+                        <span>Click <strong>&quot;Export to Gusto&quot;</strong> to download a CSV with employee name, Gusto UUID, hours, date, and project.</span>
                     </li>
                     <li className="flex gap-2">
                         <span className="text-hui-primary mt-0.5">3.</span>

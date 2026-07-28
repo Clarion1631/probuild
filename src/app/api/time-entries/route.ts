@@ -12,7 +12,7 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
     const projectId = searchParams.get('projectId');
 
-    let whereClause: any = {};
+    const whereClause: any = {};
     if (user.role !== 'MANAGER' && user.role !== 'ADMIN') {
         whereClause.userId = user.id;
     }

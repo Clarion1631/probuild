@@ -130,7 +130,7 @@ export default async function PortalDashboard() {
 
             {projects.length === 0 && clientContracts.length === 0 ? (
                 <div className="hui-card p-8 text-center flex flex-col items-center">
-                    <p className="text-hui-textMuted">You don't have any projects yet. They will appear here once created by your team.</p>
+                    <p className="text-hui-textMuted">You don&apos;t have any projects yet. They will appear here once created by your team.</p>
                 </div>
             ) : projects.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
