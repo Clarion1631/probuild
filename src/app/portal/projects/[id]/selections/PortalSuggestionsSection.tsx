@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { submitSelectionProposal } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
+import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
+import { Link2 } from "lucide-react";
 
 const COULD_NOT_READ_PAGE_MESSAGE =
     "We couldn't read that page automatically. Just add the name (and a photo link if you have one) and we'll take it from there.";
@@ -157,7 +159,7 @@ function SuggestItemModal({
                                 {parsing ? "Parsing…" : "Parse"}
                             </button>
                         </div>
-                        <p className="text-xs text-hui-textMuted mt-1">We'll try to pull the name and photo. Price stays with your project manager for now.</p>
+                        <p className="text-xs text-hui-textMuted mt-1">We&apos;ll try to pull the name and photo. Price stays with your project manager for now.</p>
                     </div>
 
                     <div>
@@ -222,22 +224,61 @@ function SuggestItemModal({
     );
 }
 
+function GetTheClipperCard({ projectId, appUrl }: { projectId: string; appUrl: string }) {
+    const bookmarkletHref = buildClipperBookmarklet({
+        origin: appUrl,
+        targetPath: "/portal/clip",
+        extraParams: { projectId },
+    });
+
+    return (
+        <div className="hui-card p-5 mb-6 flex items-center justify-between gap-6 flex-wrap">
+            <div className="flex items-center gap-4">
+                <div className="w-11 h-11 bg-hui-primary/10 rounded-xl flex items-center justify-center shrink-0">
+                    <Link2 className="w-5 h-5 text-hui-primary" />
+                </div>
+                <div>
+                    <h2 className="text-base font-semibold text-hui-textMain">Get the Clipper</h2>
+                    <p className="text-sm text-hui-textMuted mt-0.5 max-w-md">
+                        Found something while shopping? Drag the ProBuild Clip button to your bookmarks bar.
+                        <br />
+                        On any product page, click it and the item comes straight here for your team to review.
+                    </p>
+                </div>
+            </div>
+            <a
+                href={bookmarkletHref}
+                onClick={(e) => e.preventDefault()}
+                className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing shrink-0"
+                title="Drag me to your bookmarks bar"
+            >
+                <Link2 className="w-4 h-4" />
+                ProBuild Clip
+            </a>
+        </div>
+    );
+}
+
 export default function PortalSuggestionsSection({
     projectId,
     initialProposals,
+    appUrl,
 }: {
     projectId: string;
     initialProposals: Proposal[];
+    appUrl: string;
 }) {
     const router = useRouter();
     const [modalOpen, setModalOpen] = useState(false);
 
     return (
-        <div className="hui-card p-6">
+        <div>
+            <GetTheClipperCard projectId={projectId} appUrl={appUrl} />
+            <div className="hui-card p-6">
             <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
                 <div>
                     <h2 className="text-xl font-bold text-hui-textMain">Your suggestions</h2>
-                    <p className="text-sm text-hui-textMuted">Items you've sent us, and where they stand.</p>
+                    <p className="text-sm text-hui-textMuted">Items you&apos;ve sent us, and where they stand.</p>
                 </div>
                 <button onClick={() => setModalOpen(true)} className="hui-btn hui-btn-green">
                     Suggest an item
@@ -300,6 +341,7 @@ export default function PortalSuggestionsSection({
                     })}
                 </div>
             )}
+            </div>
 
             <SuggestItemModal
                 projectId={projectId}

@@ -128,7 +128,7 @@ export default function PaymentMethodsClient({ initialSettings }: { initialSetti
                             <input type="radio" name="feeMode" checked={data.passProcessingFee} onChange={() => setData(prev => ({ ...prev, passProcessingFee: true }))} className="mt-0.5" />
                             <div>
                                 <div className="text-sm font-medium text-hui-textMain">Client pays the processing fee (Recommended)</div>
-                                <div className="text-xs text-hui-textMuted mt-0.5">A "Processing Fee" line item is added when the client pays by card.</div>
+                                <div className="text-xs text-hui-textMuted mt-0.5">A &quot;Processing Fee&quot; line item is added when the client pays by card.</div>
                                 {data.passProcessingFee && (
                                     <div className="flex items-center gap-3 mt-3">
                                         <div className="flex flex-col gap-1">

@@ -33,14 +33,14 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // ------------------------------------
     // 1. INCOMING PAYMENTS (Invoices + Retainers)
     // ------------------------------------
-    let validInvoiceStatuses = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
+    const validInvoiceStatuses = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
     if (includeUnissued) validInvoiceStatuses.push("Draft");
 
     // Include Sent/Viewed for the pendingApproval display bucket; Paid for completeness
-    let validEstimateStatuses = ["Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid"];
+    const validEstimateStatuses = ["Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid"];
     if (includeUnissued) validEstimateStatuses.push("Draft");
 
-    let validRetainerStatuses = ["Sent", "Paid", "Partially Paid"];
+    const validRetainerStatuses = ["Sent", "Paid", "Partially Paid"];
     if (includeUnissued) validRetainerStatuses.push("Draft");
 
     const invoices = await prisma.invoice.findMany({
@@ -109,7 +109,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         where: { estimate: { projectId } }
     });
 
-    let validPoStatuses = ["Sent", "Received", "Draft"]; // Include draft always in query, filter below
+    const validPoStatuses = ["Sent", "Received", "Draft"]; // Include draft always in query, filter below
     const pos = await prisma.purchaseOrder.findMany({
         where: { projectId }
     });
@@ -120,7 +120,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     let plannedExpenses = 0;
-    let overdueExpenses = 0;
+    const overdueExpenses = 0;
     let forecastedPoAmount = 0;
 
     for (const po of pos) {

@@ -76,7 +76,7 @@ export default function DocumentSignModal({ isOpen, onClose, mode, onSign }: Doc
                     {error && <p className="text-red-500 text-sm font-medium">{error}</p>}
 
                     <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg text-xs leading-relaxed text-slate-600">
-                        <strong>ESIGN Act Disclosure:</strong> By clicking "Adopt & Sign," I agree that my electronic signature and initials are the legally binding equivalent to my handwritten signature, under the U.S. Electronic Signatures in Global and National Commerce Act (ESIGN) and UETA.
+                        <strong>ESIGN Act Disclosure:</strong> By clicking &quot;Adopt & Sign,&quot; I agree that my electronic signature and initials are the legally binding equivalent to my handwritten signature, under the U.S. Electronic Signatures in Global and National Commerce Act (ESIGN) and UETA.
                     </div>
 
                     <div className="flex justify-end gap-3 pt-2">

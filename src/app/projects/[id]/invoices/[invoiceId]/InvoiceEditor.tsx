@@ -724,7 +724,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             <div className="px-6 py-3 border-b border-hui-border bg-indigo-50/40 flex items-center justify-between gap-4">
                                 <p className="text-xs text-hui-textMuted">
                                     Edit the name, amount, or due date of the pending milestones below. The total must stay
-                                    the same — use "Add extra charge" or a change order to change the invoice total.
+                                    the same — use &quot;Add extra charge&quot; or a change order to change the invoice total.
                                 </p>
                                 <div className="flex items-center gap-3 shrink-0">
                                     <span className={`text-xs font-medium whitespace-nowrap ${editTotalsMatch ? "text-emerald-600" : "text-red-600"}`}>
@@ -995,12 +995,12 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         </div>
                         <div className="px-6 py-4 space-y-3">
                             <p className="text-sm text-slate-700">
-                                Break the QuickBooks link for <strong>"{breakQBTarget.name}"</strong>?
+                                Break the QuickBooks link for <strong>&quot;{breakQBTarget.name}&quot;</strong>?
                             </p>
                             <p className="text-xs text-slate-500">
                                 Use this when the QuickBooks invoice was voided or deleted and this milestone is stuck
-                                on "Pending". It clears the QuickBooks link in ProBuild so you can re-create it fresh
-                                with "QuickBooks Link". It does NOT change the paid/unpaid status.
+                                on &quot;Pending&quot;. It clears the QuickBooks link in ProBuild so you can re-create it fresh
+                                with &quot;QuickBooks Link&quot;. It does NOT change the paid/unpaid status.
                             </p>
                             <label className="flex items-start gap-2 text-sm text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5 cursor-pointer">
                                 <input
@@ -1046,7 +1046,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         </div>
                         <div className="px-6 py-4">
                             <p className="text-sm text-slate-700">
-                                Delete <strong>"{deleteMilestoneTarget.name}"</strong>? This removes the milestone and
+                                Delete <strong>&quot;{deleteMilestoneTarget.name}&quot;</strong>? This removes the milestone and
                                 lowers the invoice total by its amount. This cannot be undone.
                             </p>
                         </div>
