@@ -23,6 +23,11 @@ export default function MoodBoardEditor({ board }: { board: any }) {
     const [saving, setSaving] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [selectedId, setSelectedId] = useState<string | null>(null);
+    // Ids present when this editor last loaded/saved — used to compute which
+    // items were removed locally (including ones a client added via the
+    // portal since this ref was last updated) so the server only deletes
+    // those, instead of wiping every id not in the current submitted array.
+    const initialIds = useRef<string[]>((board.items || []).map((i: Item) => i.id));
 
     // Click outside to deselect
     useEffect(() => {
@@ -38,8 +43,20 @@ export default function MoodBoardEditor({ board }: { board: any }) {
     const handleSave = async () => {
         setSaving(true);
         try {
-            await saveMoodBoardItems(board.id, items);
-            toast.success("Mood board saved!");
+            const currentIds = items.filter(i => !i.id.startsWith("temp-")).map(i => i.id);
+            const deletedIds = initialIds.current.filter(id => !currentIds.includes(id));
+            const result = await saveMoodBoardItems(board.id, items, deletedIds);
+            // Replace local state with the persisted items (real DB ids) so
+            // "temp-*" ids from this save don't get re-sent (and duplicated)
+            // on the next save.
+            setItems(result.items);
+            initialIds.current = result.items.map((i: Item) => i.id);
+            setSelectedId(null);
+            if (result.skippedIds && result.skippedIds.length > 0) {
+                toast.info("Some items changed elsewhere and were refreshed.");
+            } else {
+                toast.success("Mood board saved!");
+            }
         } catch (e: any) {
             toast.error(e.message || "Failed to save");
         } finally {

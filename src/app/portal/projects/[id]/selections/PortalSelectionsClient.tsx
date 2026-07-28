@@ -66,7 +66,7 @@ export default function PortalSelectionsClient({ boards }: { boards: Board[] }) 
         const board = boards.find(b => b.id === boardId);
         if (!board) return;
         
-        const missingCats = board.categories.filter(c => !selections[c.id]);
+        const missingCats = board.categories.filter(c => c.options.length > 0 && !selections[c.id]);
         if (missingCats.length > 0) {
             toast.error(`Please select an option for: ${missingCats.map(c => c.name).join(", ")}`);
             return;
@@ -107,13 +107,17 @@ export default function PortalSelectionsClient({ boards }: { boards: Board[] }) 
                                 )}
                             </div>
                             {!isSubmitted && (
-                                <button
-                                    onClick={() => handleSubmit(board.id)}
-                                    disabled={submitting[board.id]}
-                                    className="hui-btn hui-btn-green"
-                                >
-                                    {submitting[board.id] ? "Submitting..." : "Submit Selections"}
-                                </button>
+                                board.categories.some(c => c.options.length > 0) ? (
+                                    <button
+                                        onClick={() => handleSubmit(board.id)}
+                                        disabled={submitting[board.id]}
+                                        className="hui-btn hui-btn-green"
+                                    >
+                                        {submitting[board.id] ? "Submitting..." : "Submit Selections"}
+                                    </button>
+                                ) : (
+                                    <span className="text-sm text-hui-textMuted font-medium">Waiting on options</span>
+                                )
                             )}
                         </div>
 
@@ -122,13 +126,18 @@ export default function PortalSelectionsClient({ boards }: { boards: Board[] }) 
                                 <div key={cat.id}>
                                     <div className="flex items-center justify-between mb-4 border-b border-slate-200 pb-2">
                                         <h3 className="text-lg font-semibold text-slate-800">{cat.name}</h3>
-                                        {!isSubmitted && (
+                                        {!isSubmitted && cat.options.length > 0 && (
                                             <span className={`text-sm font-medium ${boardSelections[cat.id] ? 'text-green-600' : 'text-slate-400'}`}>
                                                 {boardSelections[cat.id] ? '✓ Option Selected' : 'Not Selected'}
                                             </span>
                                         )}
                                     </div>
-                                    
+
+                                    {cat.options.length === 0 ? (
+                                        <p className="text-sm text-slate-400 italic">
+                                            Your project manager is still adding options for this category — nothing to pick yet.
+                                        </p>
+                                    ) : (
                                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                                         {cat.options.map(opt => {
                                             const isSelected = boardSelections[cat.id] === opt.id;
@@ -204,6 +213,7 @@ export default function PortalSelectionsClient({ boards }: { boards: Board[] }) 
                                             );
                                         })}
                                     </div>
+                                    )}
                                 </div>
                             ))}
                         </div>
