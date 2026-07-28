@@ -182,8 +182,12 @@ function isSafeStoragePath(p) {
 /** A manifest `bucket` field is only ever used to pick which Supabase bucket to upload to and
  *  which local backup subdirectory to read from — never interpolated into SQL — but it still
  *  must not be usable to escape the backup directory or target an unexpected bucket. */
+// A manifest is untrusted input, and this value decides which bucket we upload INTO — so
+// allowlist it rather than merely rejecting traversal, mirroring ALLOWED_COLUMNS below.
+const ALLOWED_BUCKETS = new Set(["project-files", "secure-docs"]);
+
 function isSafeBucketName(b) {
-  return typeof b === "string" && b.length > 0 && !b.includes("/") && !b.includes("\\") && !b.includes("..");
+  return typeof b === "string" && ALLOWED_BUCKETS.has(b);
 }
 
 function sha256Buffer(buffer) {
