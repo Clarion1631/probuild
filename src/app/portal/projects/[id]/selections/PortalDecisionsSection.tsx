@@ -100,11 +100,13 @@ function MoveToPicker({
     item,
     decisions,
     currentDecisionId,
+    currentDecisionName,
     onMoved,
 }: {
     item: Candidate;
     decisions: DecisionData[];
     currentDecisionId: string | null;
+    currentDecisionName?: string | null;
     onMoved: () => void;
 }) {
     const [moving, setMoving] = useState(false);
@@ -124,6 +126,17 @@ function MoveToPicker({
         }
     }
 
+    // Callers (e.g. a candidate rendered inside its OWN DecisionCard) often
+    // pass a `decisions` list that excludes the candidate's current decision
+    // — that's the "other decisions you could move this to" set. But the
+    // controlled <select>'s value is always currentDecisionId, so if that id
+    // has no matching <option> the select renders blank and can look like
+    // the item is Unsorted even though it isn't. Guarantee a matching option
+    // exists regardless of what the caller's list contains.
+    const options = currentDecisionId && !decisions.some((d) => d.id === currentDecisionId)
+        ? [{ id: currentDecisionId, name: currentDecisionName || "This decision" }, ...decisions]
+        : decisions;
+
     return (
         <select
             className="hui-input text-xs py-1 w-full mt-2"
@@ -133,7 +146,7 @@ function MoveToPicker({
             title="Move to…"
         >
             <option value="">Unsorted</option>
-            {decisions.map((d) => (
+            {options.map((d) => (
                 <option key={d.id} value={d.id}>{d.name}</option>
             ))}
         </select>
@@ -272,6 +285,7 @@ function CandidateCard({
                     item={item}
                     decisions={allDecisions}
                     currentDecisionId={item.decisionId}
+                    currentDecisionName={decision?.name}
                     onMoved={onChanged}
                 />
             </div>

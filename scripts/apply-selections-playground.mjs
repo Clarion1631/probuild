@@ -1,11 +1,22 @@
 // One-off additive migration for the Client Selections Playground spec
 // (docs/specs/client-selections-playground.md), Phase 1.
-// Safe to re-run while the previous build is live. Additive DDL + a guarded
-// status remap only — no deletes, no drops, no destructive rewrites.
+// Safe to re-run while the previous build is live — every statement is
+// idempotent (IF NOT EXISTS / guarded DO $$ blocks / WHERE-scoped UPDATEs).
+// Additive DDL + a guarded status remap only — no deletes, no drops, no
+// destructive rewrites.
 //
-// Run only through the release orchestrator, and BEFORE deploying the build
-// that ships this schema (see the pre-deploy checklist in CLAUDE.md):
+// Run through the release orchestrator BEFORE deploying the build that
+// ships this schema (see the pre-deploy checklist in CLAUDE.md):
 //   node scripts/apply-selections-playground.mjs
+//
+// RUN IT AGAIN AFTER THE DEPLOY COMPLETES. The old build stays live for the
+// whole migration window and can still insert new 'Pending'/'Approved'/
+// 'Declined' SelectionProposal rows after the remap statements below have
+// already passed — a second, post-deploy run sweeps up those stragglers.
+// Every read/write path in actions.ts also treats the legacy strings
+// defensively in the meantime (see normalizeProposalStatus), so a straggler
+// never renders wrong or disappears — this second run just finishes the
+// cleanup.
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
 
@@ -39,8 +50,12 @@ const statements = [
      "pmNote" TEXT,
      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     "deletedAt" TIMESTAMP(3),
      CONSTRAINT "Decision_pkey" PRIMARY KEY ("id")
    )`,
+  // Defensive re-assert in case an earlier partial run of this script
+  // already created the table without this column.
+  `ALTER TABLE "Decision" ADD COLUMN IF NOT EXISTS "deletedAt" TIMESTAMP(3)`,
   `DO $$ BEGIN
      IF NOT EXISTS (
        SELECT 1 FROM pg_constraint
@@ -66,11 +81,34 @@ const statements = [
   // FK to SelectionProposal added AFTER SelectionProposal.decisionId below so
   // both tables/columns exist regardless of statement ordering assumptions.
   `CREATE INDEX IF NOT EXISTS "Decision_projectId_status_idx" ON "Decision" ("projectId", "status")`,
+  // Authoritative idempotency guard for importBoardPicksAsDecisions (rather
+  // than trusting a read-then-write) — nullable templateKey is fine,
+  // Postgres treats every NULL as distinct so ordinary decisions never
+  // collide with each other on this constraint.
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'Decision_projectId_templateKey_key'
+         AND conrelid = '"Decision"'::regclass
+     ) THEN
+       ALTER TABLE "Decision"
+         ADD CONSTRAINT "Decision_projectId_templateKey_key" UNIQUE ("projectId", "templateKey");
+     END IF;
+   END $$`,
 
   // ── SelectionProposal.decisionId ─────────────────────────────────────────
   `ALTER TABLE "SelectionProposal"
      ADD COLUMN IF NOT EXISTS "decisionId" TEXT`,
   `CREATE INDEX IF NOT EXISTS "SelectionProposal_decisionId_idx" ON "SelectionProposal" ("decisionId")`,
+  // Re-asserted defensively (already created by apply-product-library.mjs
+  // when SelectionProposal was first added) — IF NOT EXISTS makes this a
+  // no-op today, kept here so this script alone fully describes every
+  // index/constraint the Phase 1 code depends on.
+  `CREATE INDEX IF NOT EXISTS "SelectionProposal_projectId_status_idx" ON "SelectionProposal" ("projectId", "status")`,
+  // Database default must match prisma/schema.prisma's @default("Idea") —
+  // existing rows are untouched, this only changes what new inserts without
+  // an explicit status get.
+  `ALTER TABLE "SelectionProposal" ALTER COLUMN "status" SET DEFAULT 'Idea'`,
 
   // ── Decision.chosenItemId → SelectionProposal ────────────────────────────
   `DO $$ BEGIN
@@ -104,6 +142,25 @@ const statements = [
   // Data API access; server-side Prisma uses the owner role. Matches the
   // convention in scripts/apply-product-library.mjs.
   `ALTER TABLE "Decision" ENABLE ROW LEVEL SECURITY`,
+
+  // ── Pre-remap snapshot ────────────────────────────────────────────────────
+  // Prod check (2026-07-28): Hoppe has 13 SelectionProposal rows, all
+  // 'Pending', added today and the client is still actively adding — she's
+  // mid-flight. This captures the exact pre-migration status of every row
+  // before the remap below touches anything, so any remap is reversible
+  // precisely (UPDATE "SelectionProposal" sp SET status = b.status FROM
+  // "_SelectionProposalStatusBackup" b WHERE b.id = sp.id). ON CONFLICT DO
+  // NOTHING makes this safe to re-run — only the FIRST capture per row
+  // sticks, so a second run can't overwrite a true pre-migration snapshot
+  // with an already-remapped status. Never dropped by this script.
+  `CREATE TABLE IF NOT EXISTS "_SelectionProposalStatusBackup" (
+     "id" TEXT PRIMARY KEY,
+     "status" TEXT NOT NULL,
+     "capturedAt" TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `INSERT INTO "_SelectionProposalStatusBackup" ("id", "status")
+     SELECT "id", "status" FROM "SelectionProposal"
+     ON CONFLICT ("id") DO NOTHING`,
 
   // ── Status remap: SelectionProposal legacy → playground statuses ────────
   // "Nothing was rejected" per the spec — this is a rename, not a re-decide.

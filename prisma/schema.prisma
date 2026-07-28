@@ -1705,7 +1705,7 @@ model SelectionProposal {
   price        Decimal? @db.Decimal(12, 2) // clipped list price; team-context only — NEVER returned by any portal read path, in any status (docs/specs/client-selections-playground.md)
   vendorUrl    String?
   clientNote   String?
-  status       String   @default("Pending") // "Idea" | "Chosen" | "Archived" (new, docs/specs/client-selections-playground.md); legacy "Pending" | "Approved" | "Declined" rows remain readable, never rewritten in place except by the one-time migration script
+  status       String   @default("Idea") // "Idea" | "Chosen" | "Archived" (new, docs/specs/client-selections-playground.md); legacy "Pending" | "Approved" | "Declined" rows remain readable, never rewritten in place except by the migration script's remap
   pmNote       String?  // decline reason / approval comment, client-visible
   productId    String?  // ProductLibraryItem created on approval
   boardId      String?  // optional: SelectionBoard the PM approved it into
@@ -1744,8 +1744,18 @@ model Decision {
   pmNote          String?             // client-visible note from the flag path
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
+  // Soft delete only — deleteDecision never hard-deletes (Justin: "it's
+  // their playground", clients can delete any decision on their project, but
+  // "lose no customer data" still holds). Filtered out of every read below;
+  // the team can restore within 30 days (getRecentlyDeletedDecisions /
+  // restoreDecision).
+  deletedAt       DateTime?
 
   @@index([projectId, status])
+  // Authoritative idempotency guard for importBoardPicksAsDecisions — a
+  // nullable templateKey is fine, Postgres treats each NULL as distinct so
+  // ordinary (non-imported) decisions never collide with each other.
+  @@unique([projectId, templateKey])
 }
 
 model MoodBoard {
