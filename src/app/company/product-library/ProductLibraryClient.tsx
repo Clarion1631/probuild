@@ -10,6 +10,7 @@ import {
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
+import ClipperDragLink from "@/components/ClipperDragLink";
 import {
     Plus,
     Search,
@@ -21,6 +22,7 @@ import {
     Link2,
     FolderPlus,
     Clipboard,
+    Copy,
 } from "lucide-react";
 
 interface Product {
@@ -249,6 +251,15 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
 
     const bookmarkletHref = buildClipperBookmarklet({ origin: appUrl, targetPath: "/clip" });
 
+    async function handleCopyBookmarklet() {
+        try {
+            await navigator.clipboard.writeText(bookmarkletHref);
+            toast.success("Clipper code copied — create a new bookmark and paste this as the URL.");
+        } catch {
+            toast.error("Couldn't copy. Try dragging the button instead.");
+        }
+    }
+
     return (
         <div className="max-w-6xl mx-auto py-8 px-6">
             {/* Header */}
@@ -275,18 +286,29 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                         <h2 className="text-base font-semibold text-hui-textMain">Get the Clipper</h2>
                         <p className="text-sm text-hui-textMuted mt-0.5">
                             Drag this to your bookmarks bar. On any product page, click it to clip straight to the library.
+                            Bookmark bar drag not working? Copy the code, make a new bookmark, and paste it as the URL.
                         </p>
                     </div>
                 </div>
-                <a
-                    href={bookmarkletHref}
-                    onClick={(e) => e.preventDefault()}
-                    className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing shrink-0"
-                    title="Drag me to your bookmarks bar"
-                >
-                    <Link2 className="w-4 h-4" />
-                    ProBuild Clip
-                </a>
+                <div className="flex items-center gap-2 shrink-0">
+                    <ClipperDragLink
+                        href={bookmarkletHref}
+                        className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
+                        title="Drag me to your bookmarks bar"
+                    >
+                        <Link2 className="w-4 h-4" />
+                        ProBuild Clip
+                    </ClipperDragLink>
+                    <button
+                        type="button"
+                        onClick={handleCopyBookmarklet}
+                        className="hui-btn hui-btn-secondary flex items-center gap-2"
+                        title="Copy the clipper code"
+                    >
+                        <Copy className="w-4 h-4" />
+                        Copy
+                    </button>
+                </div>
             </div>
 
             {/* Search + category filter */}
