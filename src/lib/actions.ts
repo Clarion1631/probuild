@@ -10556,7 +10556,19 @@ export async function chooseItem(itemId: string) {
                 data: { status: "Idea" },
             });
         }
-        await tx.selectionProposal.update({ where: { id: itemId }, data: { status: "Chosen" } });
+        // CAS on the item too, not a blind by-id update: a concurrent
+        // assignItemToDecision/archiveItem can commit between our freshItem
+        // read above and this write. Pinning decisionId (and excluding
+        // Archived) means the item must still belong to THIS decision at
+        // write time, so we can never mark a moved/archived candidate Chosen
+        // and leave the decision pointing outside its own candidate list.
+        const itemClaim = await tx.selectionProposal.updateMany({
+            where: { id: itemId, decisionId, status: { notIn: ["Archived", "Declined"] } },
+            data: { status: "Chosen" },
+        });
+        if (itemClaim.count === 0) {
+            throw new Error("This item just changed — refresh and try again.");
+        }
     });
 
     revalidatePath(`/projects/${item.projectId}/selections`);
