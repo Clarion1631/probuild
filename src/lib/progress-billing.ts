@@ -250,6 +250,25 @@ export async function createProgressBillingCore(
             const line = input.lines[i];
             if (line.scheduleId) {
                 const schedule = scheduleCache.get(line.scheduleId)!;
+                // A sourceScheduleId pointing at a row that no longer exists means
+                // the estimate mirror is already inconsistent. Refuse up front —
+                // for ANY bill, full or partial. A partial would split
+                // invoice-side only; a full one settles later and its
+                // settle-time mirror silently no-ops, leaving the estimate
+                // showing the milestone still owed. (sourceScheduleId is not an
+                // FK, so this state is reachable.)
+                if (schedule.sourceScheduleId) {
+                    const mirror = await tx.estimatePaymentSchedule.findUnique({
+                        where: { id: schedule.sourceScheduleId },
+                        select: { id: true },
+                    });
+                    if (!mirror) {
+                        throw new Error(
+                            `"${schedule.name}" points at an estimate milestone that no longer exists — fix the estimate's payment schedule before billing this.`
+                        );
+                    }
+                }
+
                 const otherLines = await tx.progressBillingLine.findMany({
                     where: { scheduleId: line.scheduleId, billing: { status: { not: "Void" } } },
                     select: { splitAmount: true, billing: { select: { code: true } } },
@@ -288,7 +307,11 @@ export async function createProgressBillingCore(
             const scheduleAmount = toNum(schedule.amount);
             resolvedScheduleIds.set(i, schedule.id);
 
-            const isFullBill = splitAmount >= scheduleAmount - 0.005;
+            // Full only when it covers the milestone exactly or more — never via a
+            // half-cent tolerance, which would let a stored 100.004 be "fully"
+            // billed at 100.00 and silently drop the remainder when the amount is
+            // written back.
+            const isFullBill = splitAmount >= scheduleAmount;
             const remainder = isFullBill ? 0 : r2(scheduleAmount - splitAmount);
 
             // Claim runs on EVERY bill, full or partial — not just splits. A full
@@ -307,7 +330,9 @@ export async function createProgressBillingCore(
                     stripePaymentIntentId: null,
                     amount: schedule.amount,
                 },
-                data: { amount: splitAmount },
+                // A full bill writes the amount back UNCHANGED — the point of the
+                // claim there is the pinned WHERE, not the value.
+                data: { amount: isFullBill ? schedule.amount : splitAmount },
             });
             if (claim.count !== 1) {
                 throw new Error(`"${schedule.name}" changed while this billing was being built — refresh and try again.`);
@@ -318,11 +343,8 @@ export async function createProgressBillingCore(
             let newSourceScheduleId: string | null = null;
             if (schedule.sourceScheduleId) {
                 const originalEst = await tx.estimatePaymentSchedule.findUnique({ where: { id: schedule.sourceScheduleId } });
-                // A sourceScheduleId pointing at a row that no longer exists means
-                // the estimate mirror is already inconsistent. Refuse rather than
-                // silently splitting invoice-side only, which would leave the
-                // estimate overstating what is still owed (sourceScheduleId is not
-                // an FK, so this is reachable).
+                // Existence was already validated above (under the same lock and
+                // transaction); this re-read is just to get the row's fields.
                 if (!originalEst) {
                     throw new Error(
                         `"${schedule.name}" points at an estimate milestone that no longer exists — fix the estimate's payment schedule before billing this.`

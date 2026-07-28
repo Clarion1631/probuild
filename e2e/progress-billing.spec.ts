@@ -6,7 +6,7 @@ import {
     deleteProgressBillingCore,
     stageProgressBillingToQuickBooksCore,
 } from "../src/lib/progress-billing";
-import { settleProgressBillingPaidCore } from "../src/lib/quickbooks-payments";
+import { settleProgressBillingPaidCore, pushMilestoneToQuickBooks } from "../src/lib/quickbooks-payments";
 
 /**
  * Progress billing core regression net.
@@ -801,6 +801,69 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
                 lines: [{ scheduleId: psB, description: "Tiny B again", amount: 0.01 }],
             }),
         ).rejects.toThrow(/already billed/i);
+    });
+
+    test("refuses to bill a milestone whose estimate mirror row no longer exists — even on a FULL bill", async () => {
+        // The mirror check used to sit behind the full-bill early exit, so a full
+        // bill skipped it entirely and its settle-time mirror would later no-op,
+        // leaving the estimate showing the milestone still owed.
+        await ensureClientAndProject();
+        const suffix = "dangling-full";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "PB Dangling Full", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 1000, balanceDue: 1000 },
+        });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1000, balanceDue: 1000, taxRate: 0 },
+        });
+        await prisma.paymentSchedule.create({
+            data: { id: psId, invoiceId, name: "Orphaned mirror", amount: 1000, status: "Pending", sourceScheduleId: `${PFX}-eps-gone-${suffix}` },
+        });
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Full bill against a dangling mirror",
+                lines: [{ scheduleId: psId, description: "Orphaned mirror", amount: 1000 }], // FULL
+            }),
+        ).rejects.toThrow(/no longer exists/i);
+
+        const ps = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(ps!.amount)).toBe(1000); // untouched
+    });
+
+    test("legacy per-milestone QuickBooks staging refuses a milestone already claimed by a progress billing", async () => {
+        // Closes the double-collection hole: a FULL bill leaves the milestone
+        // Pending and unlinked, which is exactly the state pushMilestoneToQuickBooks
+        // otherwise accepts — it would create a SECOND collectible QBO invoice for
+        // money a progress billing already covers.
+        await ensureClientAndProject();
+        const suffix = "legacy-guard";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 500, balanceDue: 500, taxRate: 0 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Deposit", amount: 500, status: "Pending" } });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Covers the deposit",
+            lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
+        });
+
+        // The milestone is deliberately still Pending + unlinked after a full bill.
+        const ps = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(ps!.status).toBe("Pending");
+        expect(ps!.qbInvoiceId).toBeNull();
+
+        // The legacy rail must refuse it, naming the billing that owns it. This
+        // throws before any QuickBooks call, so it holds even with no QBO connection.
+        await expect(pushMilestoneToQuickBooks(psId)).rejects.toThrow(
+            new RegExp(`already covered by progress invoice ${billing.code}`, "i"),
+        );
     });
 
     test("refuses to bill a milestone whose estimate mirror row no longer exists", async () => {

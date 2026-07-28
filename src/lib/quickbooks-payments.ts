@@ -137,6 +137,22 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     if (!schedule) throw new Error("Payment milestone not found");
     if (schedule.status === "Paid") throw new Error("Milestone is already paid");
 
+    // A milestone already claimed by a progress billing must never get its own
+    // legacy QBO invoice: the billing stages one covering it, so a second one here
+    // would leave TWO collectible invoices for the same money. Checked (and
+    // re-checked below, immediately before the link write) because a full-milestone
+    // billing leaves the row Pending and unlinked — exactly the state this function
+    // otherwise accepts.
+    const claimedBy = await prisma.progressBillingLine.findFirst({
+        where: { scheduleId: paymentScheduleId, billing: { status: { not: "Void" } } },
+        select: { billing: { select: { code: true, status: true } } },
+    });
+    if (claimedBy) {
+        throw new Error(
+            `This milestone is already covered by progress invoice ${claimedBy.billing.code} (${claimedBy.billing.status}) — stage that instead of creating a separate QuickBooks invoice here.`
+        );
+    }
+
     const tokens = passedTokens ?? await getFreshQBTokens();
 
     if (schedule.qbInvoiceId) {
@@ -210,19 +226,34 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
     // silently out of sync. If the claim misses, the just-created QBO invoice is
     // deleted (compensation) instead of being attached to a row it no longer
     // describes.
-    const linked = await prisma.paymentSchedule.updateMany({
-        where: {
-            id: schedule.id,
-            status: "Pending",
-            qbPaymentId: null,
-            qbInvoiceId: null,
-            amount: schedule.amount,
-            name: schedule.name,
-            dueDate: schedule.dueDate,
-        },
-        // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
-        data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
-    });
+    // Taken under the invoice lock and paired with a progress-billing re-check:
+    // createProgressBillingCore locks the same invoice row, so the two paths
+    // serialize instead of interleaving. Without this a progress billing could
+    // claim this milestone in the window between the guard at the top of this
+    // function and the write below (a full-milestone billing leaves the row
+    // Pending and unlinked, so every pinned column here would still match) and
+    // the client would end up with two collectible QuickBooks invoices.
+    const linked = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+        const claimedNow = await tx.progressBillingLine.findFirst({
+            where: { scheduleId: schedule.id, billing: { status: { not: "Void" } } },
+            select: { id: true },
+        });
+        if (claimedNow) return { count: 0 };
+        return tx.paymentSchedule.updateMany({
+            where: {
+                id: schedule.id,
+                status: "Pending",
+                qbPaymentId: null,
+                qbInvoiceId: null,
+                amount: schedule.amount,
+                name: schedule.name,
+                dueDate: schedule.dueDate,
+            },
+            // qbSyncError: null — a fresh invoice clears any prior voided/notFound flag (self-heal).
+            data: { qbInvoiceId: qbId, qbInvoiceLink: payLink, qbSyncedAt: new Date(), qbSyncError: null },
+        });
+    }));
     if (linked.count !== 1) {
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
         if (!compensated) {
