@@ -858,7 +858,7 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                     <div className="text-center max-w-md">
                                         <h3 className="text-lg font-bold text-hui-textMain">AI-Powered Estimating</h3>
                                         <p className="text-sm text-slate-500 mt-2">
-                                            Upload your architect plans, then click <strong>"Analyze Plans & Estimate"</strong> in the Plans tab. 
+                                            Upload your architect plans, then click <strong>&quot;Analyze Plans & Estimate&quot;</strong> in the Plans tab. 
                                             AI will read the drawings, identify fixtures, measure dimensions, and generate a detailed line-item estimate.
                                         </p>
                                     </div>

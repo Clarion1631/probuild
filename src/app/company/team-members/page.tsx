@@ -235,7 +235,7 @@ export default function TeamPage() {
                         </div>
                         <form onSubmit={handleAddSubmit} className="p-6 space-y-4 text-sm">
                             <p className="text-hui-textMuted mb-2 leading-relaxed">
-                                Enter the team member's role and email address. They will be able to log in using their Google account to access the platform.
+                                Enter the team member&apos;s role and email address. They will be able to log in using their Google account to access the platform.
                             </p>
                             <div>
                                 <label className="block font-medium text-hui-textMain mb-1">Email Address <span className="text-red-500">*</span></label>

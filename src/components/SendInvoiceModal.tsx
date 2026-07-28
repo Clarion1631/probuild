@@ -60,15 +60,15 @@ export default function SendInvoiceModal({ invoiceId, clientEmail, onClose }: { 
                         <ul className="text-xs text-emerald-700 space-y-1.5">
                             <li className="flex items-start gap-2">
                                 <svg className="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                Client receives a professional email with a "View & Pay" button
+                                Client receives a professional email with a &quot;View & Pay&quot; button
                             </li>
                             <li className="flex items-start gap-2">
                                 <svg className="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                Invoice status will change to "Issued" if currently Draft
+                                Invoice status will change to &quot;Issued&quot; if currently Draft
                             </li>
                             <li className="flex items-start gap-2">
                                 <svg className="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                You'll receive a notification when they view it
+                                You&apos;ll receive a notification when they view it
                             </li>
                             <li className="flex items-start gap-2">
                                 <svg className="w-3.5 h-3.5 text-emerald-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>

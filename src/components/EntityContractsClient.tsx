@@ -509,7 +509,7 @@ export default function EntityContractsClient({
                                         placeholder="spouse@example.com, manager@company.com"
                                         className="hui-input w-full"
                                     />
-                                    <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client's additional email and the assigned manager. Edit as needed.</p>
+                                    <p className="text-[11px] text-slate-400 mt-1">Prefilled with the client&apos;s additional email and the assigned manager. Edit as needed.</p>
                                 </div>
                             </div>
                             <div className="flex gap-3 justify-end mt-6">

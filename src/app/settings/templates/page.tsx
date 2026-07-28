@@ -78,7 +78,7 @@ export default function EstimateTemplatesPage() {
             </div>
 
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800 mb-4">
-                <strong>To edit a template's contents:</strong> insert it into any estimate (Insert Assembly), adjust the items,
+                <strong>To edit a template&apos;s contents:</strong> insert it into any estimate (Insert Assembly), adjust the items,
                 select them and save as a template <em>with the same name</em> — it replaces the existing one instead of creating a duplicate.
             </div>
 

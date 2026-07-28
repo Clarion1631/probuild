@@ -64,7 +64,7 @@ export default function ClientCombobox({ name, defaultValue = "", onSelect }: { 
                             className="w-full text-left px-3 py-2 text-sm text-hui-primary bg-slate-50 font-medium hover:bg-slate-100 transition"
                             onClick={() => setIsOpen(false)}
                         >
-                            + Create New "{query}"
+                            + Create New &quot;{query}&quot;
                         </button>
                     ) : null}
                 </div>
