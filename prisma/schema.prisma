@@ -377,6 +377,10 @@ model Estimate {
   taxExempt           Boolean   @default(false)
   taxRateName         String?
   taxRatePercent      Decimal?
+  // Progress billing core: legacy estimates carry tax-inclusive milestone
+  // amounts (the historical behavior); new estimates set this false once the
+  // UI switches to tax-exclusive milestone entry. Read by progress-billing.ts.
+  taxInclusiveMilestones Boolean @default(true)
 
   // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
   targetMarginPercent Float     @default(25)
@@ -552,6 +556,7 @@ model Invoice {
   createdAt   DateTime  @default(now())
 
   payments PaymentSchedule[]
+  progressBillings ProgressBilling[]
 
   @@index([projectId])
   @@index([createdAt])
@@ -606,6 +611,62 @@ model PaymentSchedule {
   @@index([sourceScheduleId])
   @@index([sourceChangeOrderId])
   @@index([scheduleTaskId])
+}
+
+// Progress billing: the billable artifact the user builds by picking
+// milestones and/or a custom amount, writing one client-facing description,
+// and staging exactly ONE QuickBooks invoice. An approved change order is
+// billed by approving it — billChangeOrderCore (src/lib/billing-core.ts)
+// already adds it to the invoice as a normal PaymentSchedule milestone, so it
+// arrives here like any other milestone line rather than as its own line
+// type (a second rail for the same money would be a double-billing hole).
+// Milestones (PaymentSchedule) remain the record of what has been satisfied —
+// see src/lib/progress-billing.ts for the auto-split mechanic that keeps every
+// ProgressBillingLine mapped 1:1 to a whole milestone.
+model ProgressBilling {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  code        String   // "INV-00171-P1" — sequential per invoice
+  description String   // client-facing: what this payment covers
+  status      String   @default("Draft") // Draft | Staged | Sent | Paid | Void
+  subtotal    Decimal  @default(0)  // pre-tax
+  taxExempt   Boolean  @default(false)
+  taxRate     Decimal  @default(0)  // percent snapshot at build time
+  taxAmount   Decimal  @default(0)
+  total       Decimal  @default(0)  // subtotal + taxAmount
+  qbInvoiceId     String?
+  qbInvoiceLink   String?
+  qbInvoiceSentAt DateTime?
+  qbPaymentId     String?
+  qbSyncedAt      DateTime?
+  qbSyncError     String?
+  sentAt      DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime @default(now())
+  lines       ProgressBillingLine[]
+
+  @@index([invoiceId])
+  @@index([status])
+}
+
+model ProgressBillingLine {
+  id            String @id @default(cuid())
+  billingId     String
+  billing       ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
+  scheduleId    String?  // PaymentSchedule this line bills (null = custom line)
+  description   String
+  amount        Decimal  // pre-tax — feeds the QuickBooks taxable line
+  // What was actually carved out of the milestone, in the milestone's own units
+  // (gross on tax-inclusive/legacy jobs, pre-tax on new ones). Recorded rather
+  // than recomputed from `amount`: reconstructing it re-applies tax to a rounded
+  // number and can land a cent low, which let a second billing claim the
+  // difference on an already fully-billed milestone.
+  splitAmount   Decimal  @default(0)
+  order         Int      @default(0)
+
+  @@index([billingId])
+  @@index([scheduleId])
 }
 
 model Budget {
