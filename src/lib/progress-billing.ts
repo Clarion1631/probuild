@@ -252,13 +252,13 @@ export async function createProgressBillingCore(
                 const schedule = scheduleCache.get(line.scheduleId)!;
                 const otherLines = await tx.progressBillingLine.findMany({
                     where: { scheduleId: line.scheduleId, billing: { status: { not: "Void" } } },
-                    select: { amount: true, billing: { select: { code: true, taxRate: true, taxExempt: true } } },
+                    select: { splitAmount: true, billing: { select: { code: true } } },
                 });
-                const committed = r2(otherLines.reduce((sum, l) => {
-                    const preTax = toNum(l.amount);
-                    const gross = l.billing.taxExempt ? preTax : r2(preTax * (1 + toNum(l.billing.taxRate) / 100));
-                    return sum + (legacy ? gross : preTax);
-                }, 0));
+                // Sum the RECORDED split amounts. Reconstructing them from the
+                // pre-tax `amount` re-applies tax to an already-rounded number and
+                // can come out a cent low, which let a second billing claim that
+                // cent on a milestone that was already fully billed.
+                const committed = r2(otherLines.reduce((sum, l) => sum + toNum(l.splitAmount), 0));
                 const available = r2(toNum(schedule.amount) - committed);
                 if (splitAmounts[i] > available + 0.005) {
                     const codes = [...new Set(otherLines.map((l) => l.billing.code))].join(", ");
@@ -288,10 +288,16 @@ export async function createProgressBillingCore(
             const scheduleAmount = toNum(schedule.amount);
             resolvedScheduleIds.set(i, schedule.id);
 
-            if (splitAmount >= scheduleAmount - 0.005) continue; // full bill — no split needed
+            const isFullBill = splitAmount >= scheduleAmount - 0.005;
+            const remainder = isFullBill ? 0 : r2(scheduleAmount - splitAmount);
 
-            const remainder = r2(scheduleAmount - splitAmount);
-
+            // Claim runs on EVERY bill, full or partial — not just splits. A full
+            // bill writes the amount back unchanged, but the pinned WHERE is what
+            // proves the row is still Pending, unlinked and untouched since
+            // validation. Skipping it on full bills left a window where the legacy
+            // pushMilestoneToQuickBooks could link its own QBO invoice to this same
+            // milestone concurrently, leaving TWO collectible invoices for one
+            // milestone (Codex round-2 blocker).
             const claim = await tx.paymentSchedule.updateMany({
                 where: {
                     id: schedule.id,
@@ -307,10 +313,22 @@ export async function createProgressBillingCore(
                 throw new Error(`"${schedule.name}" changed while this billing was being built — refresh and try again.`);
             }
 
+            if (isFullBill) continue; // claimed above; nothing to carve
+
             let newSourceScheduleId: string | null = null;
             if (schedule.sourceScheduleId) {
                 const originalEst = await tx.estimatePaymentSchedule.findUnique({ where: { id: schedule.sourceScheduleId } });
-                if (originalEst) {
+                // A sourceScheduleId pointing at a row that no longer exists means
+                // the estimate mirror is already inconsistent. Refuse rather than
+                // silently splitting invoice-side only, which would leave the
+                // estimate overstating what is still owed (sourceScheduleId is not
+                // an FK, so this is reachable).
+                if (!originalEst) {
+                    throw new Error(
+                        `"${schedule.name}" points at an estimate milestone that no longer exists — fix the estimate's payment schedule before billing this.`
+                    );
+                }
+                {
                     const estClaim = await tx.estimatePaymentSchedule.updateMany({
                         where: {
                             id: originalEst.id,
@@ -437,6 +455,7 @@ export async function createProgressBillingCore(
                 scheduleId: resolvedScheduleIds.get(i) ?? null,
                 description: line.description.trim(),
                 amount: finalAmounts[i],
+                splitAmount: splitAmounts[i],
                 order: i,
             })),
         });
@@ -463,10 +482,10 @@ export type UpdateProgressBillingInput = {
  * Draft (safe — any split it already applied stays applied, see
  * deleteProgressBillingCore below) and create a fresh one.
  *
- * `billing.taxRate` always holds the invoice's real rate (see
- * createProgressBillingCore), so flipping `taxExempt` here correctly
- * recomputes tax at that rate rather than being stuck at whatever the rate
- * happened to be the first time the billing was saved exempt.
+ * Tax treatment is NOT editable here either, for the same reason: the milestone
+ * amounts were carved at creation from a total that depends on it, and changing
+ * one without the other desynchronizes what QuickBooks charges from what
+ * settlement credits. Delete and rebuild the Draft instead.
  */
 export async function updateProgressBillingCore(
     billingId: string,
@@ -485,16 +504,23 @@ export async function updateProgressBillingCore(
 
         const description = input.description !== undefined ? input.description.trim() : billing.description;
         if (!description) throw new Error("A description is required");
-        const taxExempt = input.taxExempt !== undefined ? !!input.taxExempt : billing.taxExempt;
 
-        const subtotal = toNum(billing.subtotal);
-        const rate = taxExempt ? 0 : toNum(billing.taxRate);
-        const taxAmount = taxExempt ? 0 : r2(subtotal * rate / 100);
-        const total = r2(subtotal + taxAmount);
+        // Description only — no money field is editable here. Flipping taxExempt
+        // used to recompute the billing's tax and total while leaving the milestone
+        // amounts carved at creation untouched: a legacy exempt $500 billing became
+        // $544 when un-exempted, so QuickBooks charged $544 while settlement only
+        // ever credited the $500 milestone, quietly stranding $44 (Codex round-2
+        // blocker). Changing tax treatment or amounts means deleting this Draft and
+        // creating a fresh one, which re-derives the splits from scratch.
+        if (input.taxExempt !== undefined && !!input.taxExempt !== billing.taxExempt) {
+            throw new Error(
+                "Tax treatment can't be changed on an existing draft — delete this draft and create a new one so the milestone amounts are recalculated."
+            );
+        }
 
         await tx.progressBilling.update({
             where: { id: billingId },
-            data: { description, taxExempt, taxAmount, total },
+            data: { description },
         });
 
         const withLines = await tx.progressBilling.findUnique({

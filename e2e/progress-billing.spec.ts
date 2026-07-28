@@ -706,7 +706,7 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
         expect(stillThere!.description).toBe("Original description"); // unchanged
     });
 
-    test("updates description/taxExempt on a Draft billing and recomputes tax", async () => {
+    test("updates the description on a Draft billing; money is untouched", async () => {
         await ensureClientAndProject();
         const suffix = "update";
         const invoiceId = `${PFX}-inv-${suffix}`;
@@ -725,18 +725,111 @@ test.describe.serial("updateProgressBillingCore / deleteProgressBillingCore", ()
         expect(num(billing.taxAmount)).toBe(40.44); // round(500 - 459.56)
         expect(num(billing.taxRate)).toBe(8.8); // real rate stored even though not exempt
 
-        const updated = await updateProgressBillingCore(billing.id, { description: "Revised description", taxExempt: true });
+        const updated = await updateProgressBillingCore(billing.id, { description: "Revised description" });
         expect(updated.description).toBe("Revised description");
-        expect(updated.taxExempt).toBe(true);
-        expect(num(updated.taxAmount)).toBe(0);
-        expect(num(updated.total)).toBe(num(updated.subtotal));
+        expect(num(updated.subtotal)).toBe(459.56);
+        expect(num(updated.taxAmount)).toBe(40.44);
+        expect(num(updated.total)).toBe(500);
+    });
 
-        // Un-exempting recomputes tax at the STORED real rate (item F.2) —
-        // never stuck at 0 from having been saved exempt once.
-        const reverted = await updateProgressBillingCore(billing.id, { taxExempt: false });
-        expect(num(reverted.taxRate)).toBe(8.8);
-        expect(num(reverted.taxAmount)).toBe(40.44);
-        expect(num(reverted.total)).toBe(500);
+    test("refuses to flip taxExempt on an existing draft (would desync QuickBooks from the milestone)", async () => {
+        // Round-2 blocker: un-exempting recomputed the billing's total ($500 →
+        // $544) while the milestone it carved stayed at $500, so QuickBooks would
+        // charge $544 and settlement would only ever credit $500.
+        await ensureClientAndProject();
+        const suffix = "update-exempt";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 500, balanceDue: 500, taxRate: 8.8 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psId, invoiceId, name: "Deposit", amount: 500, status: "Pending" } });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Exempt billing",
+            lines: [{ scheduleId: psId, description: "Deposit", amount: 500 }],
+            taxExempt: true,
+        });
+        expect(billing.taxExempt).toBe(true);
+        expect(num(billing.total)).toBe(500);
+
+        await expect(
+            updateProgressBillingCore(billing.id, { taxExempt: false }),
+        ).rejects.toThrow(/delete this draft/i);
+
+        // Nothing moved.
+        const after = await prisma.progressBilling.findUnique({ where: { id: billing.id } });
+        expect(after!.taxExempt).toBe(true);
+        expect(num(after!.total)).toBe(500);
+        const ps = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(ps!.amount)).toBe(500);
+    });
+
+    test("records splitAmount per line so a fully-billed milestone can't be re-billed for a rounding cent", async () => {
+        // Round-2 blocker: the guard rebuilt gross from the rounded pre-tax amount
+        // ($1.05 → $0.96 → $1.04) and left a cent claimable on a milestone that
+        // was already billed in full.
+        await ensureClientAndProject();
+        const suffix = "cent";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psA = `${PFX}-ps-a-${suffix}`;
+        const psB = `${PFX}-ps-b-${suffix}`;
+
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Issued", totalAmount: 2.05, balanceDue: 2.05, taxRate: 8.8 },
+        });
+        await prisma.paymentSchedule.create({ data: { id: psA, invoiceId, name: "Tiny A", amount: 1.0, status: "Pending" } });
+        await prisma.paymentSchedule.create({ data: { id: psB, invoiceId, name: "Tiny B", amount: 1.05, status: "Pending" } });
+
+        const billing = await createProgressBillingCore(invoiceId, {
+            description: "Two tiny lines",
+            lines: [
+                { scheduleId: psA, description: "Tiny A", amount: 1.0 },
+                { scheduleId: psB, description: "Tiny B", amount: 1.05 },
+            ],
+        });
+
+        // splitAmount is stored in milestone (gross) units, exactly as billed.
+        const lineB = billing.lines.find((l) => l.scheduleId === psB)!;
+        expect(num(lineB.splitAmount)).toBe(1.05);
+
+        // Both milestones are fully consumed — no cent left to claim.
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Sneak a cent",
+                lines: [{ scheduleId: psB, description: "Tiny B again", amount: 0.01 }],
+            }),
+        ).rejects.toThrow(/already billed/i);
+    });
+
+    test("refuses to bill a milestone whose estimate mirror row no longer exists", async () => {
+        await ensureClientAndProject();
+        const suffix = "dangling";
+        const estimateId = `${PFX}-est-${suffix}`;
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const psId = `${PFX}-ps-${suffix}`;
+
+        await prisma.estimate.create({
+            data: { id: estimateId, title: "PB Dangling", code: `EST-PB-${suffix}`, projectId: `${PFX}-project`, status: "Approved", totalAmount: 1000, balanceDue: 1000 },
+        });
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-PB-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, estimateId, status: "Issued", totalAmount: 1000, balanceDue: 1000, taxRate: 0 },
+        });
+        // sourceScheduleId is not an FK — point it at a row that does not exist.
+        await prisma.paymentSchedule.create({
+            data: { id: psId, invoiceId, name: "Orphaned mirror", amount: 1000, status: "Pending", sourceScheduleId: `${PFX}-eps-gone-${suffix}` },
+        });
+
+        await expect(
+            createProgressBillingCore(invoiceId, {
+                description: "Partial against a dangling mirror",
+                lines: [{ scheduleId: psId, description: "Orphaned mirror", amount: 400 }],
+            }),
+        ).rejects.toThrow(/no longer exists/i);
+
+        const ps = await prisma.paymentSchedule.findUnique({ where: { id: psId } });
+        expect(num(ps!.amount)).toBe(1000); // untouched
     });
 
     test("delete leaves an already-applied split intact", async () => {

@@ -643,7 +643,13 @@ model ProgressBillingLine {
   billing       ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
   scheduleId    String?  // PaymentSchedule this line bills (null = custom line)
   description   String
-  amount        Decimal  // pre-tax
+  amount        Decimal  // pre-tax — feeds the QuickBooks taxable line
+  // What was actually carved out of the milestone, in the milestone's own units
+  // (gross on tax-inclusive/legacy jobs, pre-tax on new ones). Recorded rather
+  // than recomputed from `amount`: reconstructing it re-applies tax to a rounded
+  // number and can land a cent low, which let a second billing claim the
+  // difference on an already fully-billed milestone.
+  splitAmount   Decimal  @default(0)
   order         Int      @default(0)
 
   @@index([billingId])

@@ -75,9 +75,13 @@ const statements = [
      "scheduleId" TEXT,
      "description" TEXT NOT NULL,
      "amount" DECIMAL(65,30) NOT NULL,
+     "splitAmount" DECIMAL(65,30) NOT NULL DEFAULT 0,
      "order" INTEGER NOT NULL DEFAULT 0,
      CONSTRAINT "ProgressBillingLine_pkey" PRIMARY KEY ("id")
    )`,
+  // Separate ADD COLUMN so a database that already has the table from an
+  // earlier run of this script still picks up splitAmount.
+  `ALTER TABLE "ProgressBillingLine" ADD COLUMN IF NOT EXISTS "splitAmount" DECIMAL(65,30) NOT NULL DEFAULT 0`,
   `DO $$ BEGIN
      IF NOT EXISTS (
        SELECT 1 FROM pg_constraint
