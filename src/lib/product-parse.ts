@@ -491,7 +491,10 @@ type RawExtract = {
 const MAX_NAME_LEN = 200;
 const MAX_VENDOR_LEN = 100;
 const MAX_DESCRIPTION_LEN = 2000;
-const MAX_PRICE = 9_999_999.99;
+// Exported so callers that clamp a price outside this module (e.g.
+// submitSelectionProposal's listPrice param in actions.ts) use the identical
+// bound instead of a second, driftable magic number.
+export const MAX_PRICE = 9_999_999.99;
 
 /**
  * Single normalization point for every extraction path (JSON-LD, OpenGraph,
