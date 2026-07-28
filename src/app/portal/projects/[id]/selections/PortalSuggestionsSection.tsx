@@ -6,7 +6,8 @@ import { toast } from "sonner";
 import { submitSelectionProposal } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
-import { Link2 } from "lucide-react";
+import ClipperDragLink from "@/components/ClipperDragLink";
+import { Link2, Copy } from "lucide-react";
 
 const COULD_NOT_READ_PAGE_MESSAGE =
     "We couldn't read that page automatically. Just add the name (and a photo link if you have one) and we'll take it from there.";
@@ -231,6 +232,15 @@ function GetTheClipperCard({ projectId, appUrl }: { projectId: string; appUrl: s
         extraParams: { projectId },
     });
 
+    async function handleCopyBookmarklet() {
+        try {
+            await navigator.clipboard.writeText(bookmarkletHref);
+            toast.success("Clipper code copied! Create a new bookmark and paste this in as the URL.");
+        } catch {
+            toast.error("Couldn't copy that — try dragging the button instead.");
+        }
+    }
+
     return (
         <div className="hui-card p-5 mb-6 flex items-center justify-between gap-6 flex-wrap">
             <div className="flex items-center gap-4">
@@ -243,18 +253,30 @@ function GetTheClipperCard({ projectId, appUrl }: { projectId: string; appUrl: s
                         Found something while shopping? Drag the ProBuild Clip button to your bookmarks bar.
                         <br />
                         On any product page, click it and the item comes straight here for your team to review.
+                        <br />
+                        Dragging not working on your device? Tap Copy, then make a new bookmark and paste it in as the URL.
                     </p>
                 </div>
             </div>
-            <a
-                href={bookmarkletHref}
-                onClick={(e) => e.preventDefault()}
-                className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing shrink-0"
-                title="Drag me to your bookmarks bar"
-            >
-                <Link2 className="w-4 h-4" />
-                ProBuild Clip
-            </a>
+            <div className="flex items-center gap-2 shrink-0">
+                <ClipperDragLink
+                    href={bookmarkletHref}
+                    className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
+                    title="Drag me to your bookmarks bar"
+                >
+                    <Link2 className="w-4 h-4" />
+                    ProBuild Clip
+                </ClipperDragLink>
+                <button
+                    type="button"
+                    onClick={handleCopyBookmarklet}
+                    className="hui-btn hui-btn-secondary flex items-center gap-2"
+                    title="Copy the clipper code"
+                >
+                    <Copy className="w-4 h-4" />
+                    Copy
+                </button>
+            </div>
         </div>
     );
 }
