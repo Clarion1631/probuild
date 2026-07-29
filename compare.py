@@ -92,7 +92,7 @@ URL_MAP = {
 
     "Project Overview":
         ("https://pro.houzz.com/manage/projects/2340349/overview",
-         "/projects/cmn7tlgiv0001phwqjzwk75or/overview"),
+         "/projects/cmpd6x38x007a1iiz5zsp62m6/overview"),
 
     # ── Leads ─────────────────────────────────────────────────────────────────
     "Leads List":
@@ -112,7 +112,7 @@ URL_MAP = {
     # ── Schedule ──────────────────────────────────────────────────────────────
     "Schedule":
         ("https://pro.houzz.com/manage/schedule/projects/2942703",
-         "/projects/cmn7tlgiv0001phwqjzwk75or/schedule"),
+         "/projects/cmpd6x38x007a1iiz5zsp62m6/schedule"),
 
     # ── Time & Expenses ───────────────────────────────────────────────────────
     "Time & Expenses":
@@ -136,17 +136,17 @@ URL_MAP = {
     # ── Daily Logs ────────────────────────────────────────────────────────────
     "Daily Logs":
         ("https://pro.houzz.com/manage/projects/2942703/daily-logs",
-         "/projects/cmn7tlgiv0001phwqjzwk75or/dailylogs"),
+         "/projects/cmpd6x38x007a1iiz5zsp62m6/dailylogs"),
 
     # ── Client Portal Config ──────────────────────────────────────────────────
     "Client Portal Config":
         ("https://pro.houzz.com/manage/cd/client-dash-edit/2942703",
-         "/projects/cmn7tlgiv0001phwqjzwk75or/client-portal"),
+         "/projects/cmpd6x38x007a1iiz5zsp62m6/client-portal"),
 
     # ── Project Tasks ─────────────────────────────────────────────────────────
     "Project Tasks":
         ("https://pro.houzz.com/manage/tasks/projects/2942703",
-         "/projects/cmn7tlgiv0001phwqjzwk75or/tasks"),
+         "/projects/cmpd6x38x007a1iiz5zsp62m6/tasks"),
 
     # ── Reports ───────────────────────────────────────────────────────────────
     "Report: Open Invoices":
