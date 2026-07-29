@@ -68,6 +68,8 @@ import {
 } from "./schedule-task-core";
 import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
+import { normalizeSelectionItemNote } from "./selection-item-notes";
+import { persistSelectionItemNote } from "./selection-item-note-persistence";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -10167,6 +10169,7 @@ export async function submitSelectionProposal(projectId: string, data: {
     const manualName = data.name?.trim();
     const url = data.url?.trim();
     if (!manualName && !url) throw new Error("A name or a product link is required");
+    const clientNote = normalizeSelectionItemNote(data.clientNote ?? "");
 
     let validDecisionId: string | null = null;
     if (data.decisionId) {
@@ -10207,7 +10210,7 @@ export async function submitSelectionProposal(projectId: string, data: {
             imageUrl: safeUrlOrNull(data.imageUrl) || safeUrlOrNull(parsed?.imageUrl),
             price: clampedListPrice ?? parsed?.price ?? null,
             vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
-            clientNote: data.clientNote?.trim() || null,
+            clientNote,
             status: "Idea",
             decisionId: validDecisionId,
         },
@@ -10638,6 +10641,30 @@ export async function renameDecision(decisionId: string, name: string) {
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
     return updated;
+}
+
+export async function updateSelectionItemNote(
+    itemId: string,
+    note: string,
+): Promise<{ success: true; note: string | null }> {
+    return persistSelectionItemNote(itemId, note, {
+        findItem: (id) =>
+            prisma.selectionProposal.findUnique({
+                where: { id },
+                select: { id: true, projectId: true, deletedAt: true },
+            }),
+        assertAccess: assertDecisionActorAccess,
+        updateNote: async (id, normalizedNote) => {
+            await prisma.selectionProposal.update({
+                where: { id },
+                data: { clientNote: normalizedNote },
+            });
+        },
+        revalidate: (projectId) => {
+            revalidatePath(`/projects/${projectId}/selections`);
+            revalidatePath(`/portal/projects/${projectId}/selections`);
+        },
+    });
 }
 
 export async function reorderDecisions(projectId: string, orderedIds: string[]) {
@@ -11219,6 +11246,7 @@ export async function addTeamCandidate(decisionId: string | null, data: {
     imageUrl?: string;
     price?: number;
     vendorUrl?: string;
+    clientNote?: string;
     projectId?: string;
 }) {
     const user = await assertActiveStaff();
@@ -11248,6 +11276,7 @@ export async function addTeamCandidate(decisionId: string | null, data: {
             imageUrl: safeUrlOrNull(data.imageUrl),
             price: data.price ?? null,
             vendorUrl: safeUrlOrNull(data.vendorUrl),
+            clientNote: normalizeSelectionItemNote(data.clientNote ?? ""),
             status: "Idea",
         },
     });
