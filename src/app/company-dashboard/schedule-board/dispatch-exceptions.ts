@@ -1,4 +1,5 @@
 import { isConflictedDay } from "./availability";
+import { classifyTaskEvidence, findContradiction, type EvidenceTaskInput } from "@/lib/task-evidence";
 
 export interface DispatchAssignmentInput {
     userId: string;
@@ -17,6 +18,11 @@ export interface DispatchTaskInput {
     type: string;
     blockedReason: string | null;
     assignments: DispatchAssignmentInput[];
+    // Evidence freshness. Optional so existing fixtures/callers keep compiling;
+    // absent is treated the same as "no direct evidence".
+    parentId?: string | null;
+    lastDirectEvidenceAt?: string | null;
+    lastIndirectEvidenceAt?: string | null;
 }
 
 export interface DispatchCrewInput {
@@ -74,6 +80,11 @@ export interface DispatchExceptionGroups {
     conflicts: DispatchConflictException[];
     blocked: DispatchTaskException[];
     crewless: DispatchProjectException[];
+    // Evidence gaps: the board says work is underway but nothing confirms it.
+    unknownState: DispatchTaskException[];
+    staleEvidence: DispatchTaskException[];
+    // Evidence contradicts the board — reason carries the specific mismatch.
+    needsReview: DispatchTaskException[];
 }
 
 export function isTaskActiveOnDay(task: Pick<DispatchTaskInput, "startDate" | "endDate" | "type">, dayKey: string): boolean {
@@ -134,10 +145,64 @@ export function getCrewlessJobs(projects: readonly DispatchProjectInput[], dayKe
         .map(project => ({ projectId: project.id, projectName: project.name }));
 }
 
+function evidenceTask(task: DispatchTaskInput): EvidenceTaskInput {
+    return {
+        id: task.id,
+        startDate: task.startDate,
+        endDate: task.endDate,
+        status: task.status,
+        type: task.type,
+        parentId: task.parentId ?? null,
+        lastDirectEvidenceAt: task.lastDirectEvidenceAt ?? null,
+        lastIndirectEvidenceAt: task.lastIndirectEvidenceAt ?? null,
+    };
+}
+
+function projectParentIds(project: DispatchProjectInput): Set<string> {
+    return new Set(project.tasks.map(task => task.parentId).filter((id): id is string => !!id));
+}
+
+/**
+ * Evidence-based exceptions, in one pass so the three groups stay mutually
+ * exclusive — a task with no evidence ever is `unknown`, never also `stale`.
+ */
+export function getEvidenceExceptions(
+    projects: readonly DispatchProjectInput[],
+    dayKey: string,
+    staleAfterDays = 2,
+): Pick<DispatchExceptionGroups, "unknownState" | "staleEvidence" | "needsReview"> {
+    const unknownState: DispatchTaskException[] = [];
+    const staleEvidence: DispatchTaskException[] = [];
+    const needsReview: DispatchTaskException[] = [];
+
+    for (const project of projects) {
+        if (project.status !== "In Progress") continue;
+        const parentIds = projectParentIds(project);
+        for (const task of project.tasks) {
+            const input = evidenceTask(task);
+            switch (classifyTaskEvidence(input, parentIds, dayKey, staleAfterDays)) {
+                case "unknown":
+                    unknownState.push(taskException(project, task));
+                    break;
+                case "stale":
+                    staleEvidence.push(taskException(project, task));
+                    break;
+                case "needsReview":
+                    needsReview.push({ ...taskException(project, task), reason: findContradiction(input) });
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    return { unknownState, staleEvidence, needsReview };
+}
+
 export function getDispatchExceptions(
     projects: readonly DispatchProjectInput[],
     conflicts: readonly DispatchCrewConflictInput[],
     dayKey: string,
+    staleAfterDays = 2,
 ): DispatchExceptionGroups {
     return {
         unstaffed: getUnstaffedToday(projects, dayKey),
@@ -145,5 +210,6 @@ export function getDispatchExceptions(
         conflicts: getTodayConflicts(conflicts, dayKey),
         blocked: getBlockedTasks(projects),
         crewless: getCrewlessJobs(projects, dayKey),
+        ...getEvidenceExceptions(projects, dayKey, staleAfterDays),
     };
 }

@@ -1,5 +1,7 @@
 import { prisma } from "./prisma";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
+import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
+import { toCompanyDayKey } from "./company-day";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -80,9 +82,21 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     if (!project) throw new Error("Project not found");
     if (!user) throw new Error("Crew member not found");
 
+    // Bind the punch to the schedule task it belongs to. This is the canonical
+    // create for manual time entry, so binding here covers every caller rather
+    // than each server action separately. startTime is already a company-local
+    // instant (date-only values are stored at local noon), so the day key is safe.
+    const scheduleTaskId = await resolveScheduleTaskIdForPunch({
+        userId: data.userId,
+        projectId,
+        dayKey: toCompanyDayKey(startTime),
+        estimateItemId: null,
+    });
+
     return prisma.timeEntry.create({
         data: {
             projectId,
+            scheduleTaskId,
             userId: data.userId,
             costCodeId: data.costCodeId || null,
             startTime,

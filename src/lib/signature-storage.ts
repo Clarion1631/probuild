@@ -191,10 +191,3 @@ export async function persistOwnedSignature(
     // succeeded but we couldn't construct an address" failure mode to guard against here.
     return { url: toSecureRef(storagePath), discard };
 }
-
-export async function persistSignature(
-    value: string | null | undefined,
-    keyPrefix: string,
-): Promise<string | null> {
-    return (await persistOwnedSignature(value, keyPrefix)).url;
-}

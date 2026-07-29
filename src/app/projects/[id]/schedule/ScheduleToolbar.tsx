@@ -2,6 +2,7 @@
 
 import { type ReactNode, useRef, useState } from "react";
 import type { EstimateSummary } from "./schedule-types";
+import MenuPortal from "./MenuPortal";
 import SchedulePublishButton from "./SchedulePublishButton";
 
 type ViewMode = "gantt" | "table" | "calendar";
@@ -77,7 +78,7 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
                 </button>
             </div>
             {open && (
-                <>
+                <MenuPortal>
                     <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
                     <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[160px] py-1 animate-in fade-in" style={{ top: pos.top, right: pos.right }}>
                         <button onClick={() => { onAddTask(); setOpen(false); }} className="w-full text-left px-3 py-2 hover:bg-slate-50 transition text-sm flex items-center gap-2">
@@ -89,7 +90,7 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
                             Milestone
                         </button>
                     </div>
-                </>
+                </MenuPortal>
             )}
         </div>
     );
@@ -111,6 +112,8 @@ export default function ScheduleToolbar({
     const hasEstimates = estimates.length > 0;
     const moreBtnRef = useRef<HTMLButtonElement>(null);
     const [moreMenuPos, setMoreMenuPos] = useState({ top: 0, right: 0 });
+    const aiBtnRef = useRef<HTMLButtonElement>(null);
+    const [aiMenuPos, setAiMenuPos] = useState({ top: 0, right: 0 });
 
     return (
         <>
@@ -168,19 +171,30 @@ export default function ScheduleToolbar({
                         {/* AI Schedule */}
                         <div className="relative">
                             <button
-                                onClick={() => hasEstimates ? onToggleAiMenu() : onAiSchedule()}
+                                ref={aiBtnRef}
+                                onClick={() => {
+                                    if (!hasEstimates) { onAiSchedule(); return; }
+                                    if (!showAiMenu && aiBtnRef.current) {
+                                        const rect = aiBtnRef.current.getBoundingClientRect();
+                                        setAiMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+                                    }
+                                    onToggleAiMenu();
+                                }}
                                 disabled={isAiGenerating}
                                 className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition border ${isAiGenerating ? "bg-gradient-to-r from-purple-500 to-indigo-500 text-white border-purple-600 animate-pulse" : "bg-gradient-to-r from-purple-50 to-indigo-50 text-purple-700 border-purple-200 hover:shadow-md hover:from-purple-100 hover:to-indigo-100"}`}
                             >
                                 ✨ {isAiGenerating ? "AI thinking..." : "AI Schedule"}
                             </button>
                             {showAiMenu && hasEstimates && (
-                                <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] py-1 animate-in fade-in">
-                                    <button onClick={() => onAiSchedule()} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>🧠</span> General Schedule</button>
-                                    {estimates.map(est => (
-                                        <button key={est.id} onClick={() => onAiSchedule(est.id)} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>📋</span> {est.title}</button>
-                                    ))}
-                                </div>
+                                <MenuPortal>
+                                    <div className="fixed inset-0 z-40" onClick={onToggleAiMenu} />
+                                    <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] py-1 animate-in fade-in" style={{ top: aiMenuPos.top, right: aiMenuPos.right }}>
+                                        <button onClick={() => onAiSchedule()} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>🧠</span> General Schedule</button>
+                                        {estimates.map(est => (
+                                            <button key={est.id} onClick={() => onAiSchedule(est.id)} className="w-full text-left px-3 py-2.5 hover:bg-purple-50 transition text-sm flex items-center gap-2"><span>📋</span> {est.title}</button>
+                                        ))}
+                                    </div>
+                                </MenuPortal>
                             )}
                         </div>
 
@@ -196,7 +210,7 @@ export default function ScheduleToolbar({
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
                             </button>
                             {showToolsMenu && (
-                                <>
+                                <MenuPortal>
                                     <div className="fixed inset-0 z-40" onClick={onToggleToolsMenu} />
                                     <div className="fixed bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[220px] py-1 animate-in fade-in" style={{ top: moreMenuPos.top, right: moreMenuPos.right }}>
                                         {/* View section */}
@@ -254,7 +268,7 @@ export default function ScheduleToolbar({
                                             Clear All Tasks
                                         </button>
                                     </div>
-                                </>
+                                </MenuPortal>
                             )}
                         </div>
                     </div>
