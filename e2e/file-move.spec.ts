@@ -135,6 +135,9 @@ test.describe("Project files — move into folders", () => {
 
         const claimed = await dragAtFolder(page, "dragover", { internal: [fileId] });
         expect(claimed, "folder tile must claim an internal file drag").toBe(true);
+        // The ring is the counterpart of the OS-drag assertion below: this drag
+        // lights the tile up, an OS drag must not.
+        await expect(page.locator(`[data-folder-id="${folderId}"]`)).toHaveClass(/ring-indigo-400/);
 
         await dragAtFolder(page, "drop", { internal: [fileId] });
 
@@ -154,8 +157,16 @@ test.describe("Project files — move into folders", () => {
         // A drag carrying real files belongs to the upload dropzone. If the folder
         // tile claimed it, dropping a file from the desktop onto a folder would be
         // swallowed as a move-of-nothing and the upload would silently vanish.
-        const claimed = await dragAtFolder(page, "dragover", { osFile: true });
-        expect(claimed, "folder tile must NOT claim an OS file drag").toBe(false);
+        //
+        // NOT asserted via defaultPrevented: the event bubbles, so the container
+        // dropzone legitimately claims OS drags and sets defaultPrevented on the
+        // same event. That flag cannot tell us WHICH element claimed it. The
+        // folder tile's own drop-target ring can.
+        await dragAtFolder(page, "dragover", { osFile: true });
+        await expect(
+            page.locator(`[data-folder-id="${folderId}"]`),
+            "folder tile must not light up as a drop target for an OS file drag",
+        ).not.toHaveClass(/ring-indigo-400/);
 
         // And the file is still where it was — the decline is a no-op, not a move.
         await expect(page.getByLabel(`Select ${name}`)).toBeVisible();
