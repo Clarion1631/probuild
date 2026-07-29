@@ -10848,17 +10848,26 @@ export async function flagDecision(decisionId: string, pmNote: string) {
     return { success: true };
 }
 
-export async function addTeamCandidate(decisionId: string, data: {
+export async function addTeamCandidate(decisionId: string | null, data: {
     name: string;
     description?: string;
     imageUrl?: string;
     price?: number;
     vendorUrl?: string;
+    projectId?: string;
 }) {
     const user = await assertActiveStaff();
-    const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { id: true, projectId: true, deletedAt: true } });
-    if (!decision || decision.deletedAt) throw new Error("Decision not found");
-    if (!canAccessProject(user, decision.projectId)) throw new Error("Forbidden");
+
+    let projectId: string;
+    if (decisionId) {
+        const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { id: true, projectId: true, deletedAt: true } });
+        if (!decision || decision.deletedAt) throw new Error("Decision not found");
+        projectId = decision.projectId;
+    } else {
+        if (!data.projectId) throw new Error("projectId is required when not adding into a decision");
+        projectId = data.projectId;
+    }
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
 
     const name = data.name?.trim();
     if (!name) throw new Error("Name is required");
@@ -10867,8 +10876,8 @@ export async function addTeamCandidate(decisionId: string, data: {
     // candidate, lands as Idea alongside the client's own picks.
     const candidate = await prisma.selectionProposal.create({
         data: {
-            projectId: decision.projectId,
-            decisionId: decision.id,
+            projectId,
+            decisionId: decisionId || null,
             name: name.slice(0, 200),
             description: data.description?.trim() || null,
             imageUrl: safeUrlOrNull(data.imageUrl),
@@ -10878,11 +10887,11 @@ export async function addTeamCandidate(decisionId: string, data: {
         },
     });
 
-    revalidatePath(`/projects/${decision.projectId}/selections`);
-    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+    revalidatePath(`/projects/${projectId}/selections`);
+    revalidatePath(`/portal/projects/${projectId}/selections`);
 
     await logActivity({
-        projectId: decision.projectId,
+        projectId,
         actorType: "TEAM",
         actorName: user.name || user.email,
         action: "added_team_candidate",
