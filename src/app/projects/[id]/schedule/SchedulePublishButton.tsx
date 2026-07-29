@@ -3,6 +3,7 @@
 import { useState, useRef, useTransition } from "react";
 import { toggleSchedulePublished, emailPortalLinkToClient } from "@/lib/actions";
 import { toast } from "sonner";
+import MenuPortal from "./MenuPortal";
 
 export default function SchedulePublishButton({
     projectId,
@@ -72,7 +73,7 @@ export default function SchedulePublishButton({
             </button>
 
             {showMenu && (
-                <>
+                <MenuPortal>
                     <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
                     <div className="fixed w-56 bg-white border border-slate-200 rounded-lg shadow-xl z-50 py-1" style={{ top: menuPos.top, right: menuPos.right }}>
                         <button
@@ -115,7 +116,7 @@ export default function SchedulePublishButton({
                                 : "Clients won't see the schedule until published"}
                         </div>
                     </div>
-                </>
+                </MenuPortal>
             )}
         </div>
     );
