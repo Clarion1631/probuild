@@ -236,6 +236,7 @@ model Project {
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
   paymentRemindersEnabled Boolean                  @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
+  portalStageOverride String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
   managerId           String?
   manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
@@ -265,6 +266,7 @@ model Project {
   activityLogs        ActivityLog[]
   productFavorites    ProjectProductFavorite[]
   selectionProposals  SelectionProposal[]
+  decisions           Decision[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -1701,10 +1703,10 @@ model SelectionProposal {
   name         String
   description  String?
   imageUrl     String?
-  price        Decimal? @db.Decimal(12, 2) // parsed list price; NOT shown to client until approved
+  price        Decimal? @db.Decimal(12, 2) // clipped list price; team-context only — NEVER returned by any portal read path, in any status (docs/specs/client-selections-playground.md)
   vendorUrl    String?
   clientNote   String?
-  status       String   @default("Pending") // "Pending" | "Approved" | "Declined"
+  status       String   @default("Idea") // "Idea" | "Chosen" | "Archived" (new, docs/specs/client-selections-playground.md); legacy "Pending" | "Approved" | "Declined" rows remain readable, never rewritten in place except by the migration script's remap
   pmNote       String?  // decline reason / approval comment, client-visible
   productId    String?  // ProductLibraryItem created on approval
   boardId      String?  // optional: SelectionBoard the PM approved it into
@@ -1713,8 +1715,48 @@ model SelectionProposal {
   decidedBy    User?    @relation(fields: [decidedById], references: [id])
   decidedAt    DateTime?
   createdAt    DateTime @default(now())
+  decisionId   String?  // Decision this candidate sits in; null = "Unsorted" in the playground
+  decision     Decision? @relation("DecisionCandidates", fields: [decisionId], references: [id], onDelete: SetNull)
+  chosenForDecision Decision? @relation("DecisionChosenItem") // back-relation only; the FK lives on Decision.chosenItemId
 
   @@index([projectId, status])
+  @@index([decisionId])
+}
+
+// Client Selections Playground — Phase 1 (docs/specs/client-selections-playground.md).
+// A Decision ("Sink Faucet") holds SelectionProposal candidates; choosing one
+// promotes it to the company's approved record. Additive alongside the legacy
+// SelectionBoard/SelectionCategory/SelectionOption flow, which is untouched.
+model Decision {
+  id              String              @id @default(cuid())
+  projectId       String
+  project         Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name            String              // "Sink Faucet"
+  area            String?             // "Master Bath" — grouping in the UI
+  status          String              @default("Open") // Open | Decided | Flagged | Ordered | Received
+  chosenItemId    String?             @unique
+  chosenItem      SelectionProposal?  @relation("DecisionChosenItem", fields: [chosenItemId], references: [id], onDelete: SetNull)
+  candidates      SelectionProposal[] @relation("DecisionCandidates")
+  sortOrder       Int                 @default(0)
+  templateKey     String?             // provenance when seeded from a template (Phase 2) or imported from a legacy board category ("board-import:<categoryId>")
+  // Phase 2 fields land here: dueDate, scheduleTaskId, leadTimeDays
+  createdByClient Boolean             @default(false)
+  decidedAt       DateTime?
+  pmNote          String?             // client-visible note from the flag path
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  // Soft delete only — deleteDecision never hard-deletes (Justin: "it's
+  // their playground", clients can delete any decision on their project, but
+  // "lose no customer data" still holds). Filtered out of every read below;
+  // the team can restore within 30 days (getRecentlyDeletedDecisions /
+  // restoreDecision).
+  deletedAt       DateTime?
+
+  @@index([projectId, status])
+  // Authoritative idempotency guard for importBoardPicksAsDecisions — a
+  // nullable templateKey is fine, Postgres treats each NULL as distinct so
+  // ordinary (non-imported) decisions never collide with each other.
+  @@unique([projectId, templateKey])
 }
 
 model MoodBoard {

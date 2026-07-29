@@ -54,6 +54,7 @@ import {
 } from "./task-materials-core";
 import { assertPortalProjectAccess } from "./portal-project-access";
 import {
+    CLIENT_STAGES,
     computeDailyLogSharedContentHash,
     getPortalScheduleTasksCore,
     setDailyLogPortalShareCore,
@@ -9906,12 +9907,26 @@ export async function submitSelectionProposal(projectId: string, data: {
     // when not supplied, same as every other field's precedence in this
     // function (client-supplied value wins, parse fills the gap).
     listPrice?: number;
+    // Playground: drop the new item straight into a decision instead of
+    // landing it Unsorted. Optional — validated against this project below,
+    // same TOCTOU-safe pattern as decideSelectionProposal's boardId/categoryId.
+    decisionId?: string;
 }) {
     await assertPortalProjectOwnership(projectId);
 
     const manualName = data.name?.trim();
     const url = data.url?.trim();
     if (!manualName && !url) throw new Error("A name or a product link is required");
+
+    let validDecisionId: string | null = null;
+    if (data.decisionId) {
+        const decision = await prisma.decision.findFirst({
+            where: { id: data.decisionId, projectId, deletedAt: null },
+            select: { id: true },
+        });
+        if (!decision) throw new Error("That decision doesn't belong to this project — refresh and try again.");
+        validDecisionId = decision.id;
+    }
 
     const clampedListPrice = clampListPrice(data.listPrice);
 
@@ -9943,27 +9958,31 @@ export async function submitSelectionProposal(projectId: string, data: {
             price: clampedListPrice ?? parsed?.price ?? null,
             vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
             clientNote: data.clientNote?.trim() || null,
-            status: "Pending",
+            status: "Idea",
+            decisionId: validDecisionId,
         },
     });
 
     const project = await prisma.project.findUnique({ where: { id: projectId }, include: { client: true } });
 
-    // Notify the team — same recipient/pattern as submitClientSelections.
+    // Notify the team — quiet informational note, not an action request. The
+    // client's own space is ungated now (docs/specs/client-selections-playground.md
+    // — "the event that matters is the client *deciding*"), so this is no
+    // longer framed as a suggestion awaiting approval.
     const settings = await getCachedCompanySettings();
     if (settings.notificationEmail && project) {
         await sendNotification(
             settings.notificationEmail,
-            `💡 New Client Suggestion — ${project.name}`,
+            `Client added a selection item — ${project.name}`,
             `<div style="font-family: sans-serif; color: #333;">
-                <h3>New Selection Suggestion</h3>
-                <p><strong>${project.client?.name || "Client"}</strong> suggested an item for project <strong>${project.name}</strong>:</p>
+                <h3>Client Added a Selection Item</h3>
+                <p><strong>${project.client?.name || "Client"}</strong> added an item to their selections for project <strong>${project.name}</strong>:</p>
                 <ul>
                     <li><strong>${name}</strong></li>
                     ${proposal.vendorUrl ? `<li><a href="${proposal.vendorUrl}">${proposal.vendorUrl}</a></li>` : ""}
                     ${proposal.clientNote ? `<li>Note: ${proposal.clientNote}</li>` : ""}
                 </ul>
-                <p>Review it on the project's Selections tab.</p>
+                <p>No action needed — it'll show up as a Decision once they choose one.</p>
             </div>`
         );
     }
@@ -9992,8 +10011,12 @@ export async function getSelectionProposalsForPortal(projectId: string) {
         where: { projectId },
         orderBy: { createdAt: "desc" },
     });
-    // Price stays hidden until a proposal is Approved.
-    return proposals.map((p) => (p.status === "Approved" ? p : { ...p, price: null }));
+    // Price is never shown to the client — no exceptions, no "unless
+    // Approved/Chosen" (docs/specs/client-selections-playground.md, "Decisions
+    // locked with Justin": GTR controls whether a number appears). Stricter
+    // than the old behavior here, which returned price once a proposal was
+    // Approved.
+    return proposals.map((p) => ({ ...p, price: null }));
 }
 
 export async function getSelectionProposals(projectId: string) {
@@ -10217,6 +10240,800 @@ export async function decideSelectionProposal(proposalId: string, input: {
 }
 
 // =============================================
+// Decisions — Client Selections Playground, Phase 1
+// (docs/specs/client-selections-playground.md)
+// =============================================
+
+/**
+ * Actor + access resolution shared by the decision-structure mutations below
+ * (createDecision, renameDecision, reorderDecisions, deleteDecision,
+ * assignItemToDecision) — the spec calls these out as "available to team
+ * too" rather than naming separate team actions, so one function serves both
+ * callers instead of near-duplicate exports. Staff editing from the team's
+ * own Selections tab go through assertActiveStaff + canAccessProject
+ * (portal-enabled/showSelections must NOT gate the team's own UI — same
+ * reasoning as decideSelectionProposal/getSelectionProposals above). Client
+ * callers fall through to assertPortalProjectOwnership, the same gate every
+ * other client-facing selections action in this file uses.
+ */
+async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; actorName: string }> {
+    const staffUser = await getCurrentUserWithPermissions();
+    if (staffUser) {
+        if (!canAccessProject(staffUser, projectId)) throw new Error("Forbidden");
+        return { isStaff: true, clientId: null, actorName: staffUser.name || staffUser.email };
+    }
+    if (await canUseDevAuthFallback()) {
+        const devSession = await getSessionOrDev();
+        const devRole = (devSession?.user as { role?: string } | undefined)?.role;
+        if (devRole) {
+            return { isStaff: true, clientId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
+        }
+    }
+    const { clientId } = await assertPortalProjectOwnership(projectId);
+    let actorName = "Client";
+    if (clientId) {
+        const client = await prisma.client.findUnique({ where: { id: clientId }, select: { name: true } });
+        if (client?.name) actorName = client.name;
+    }
+    return { isStaff: false, clientId, actorName };
+}
+
+/** Strip price from a SelectionProposal for any client-facing read — no
+ * exceptions, no "unless Chosen" (docs/specs/client-selections-playground.md,
+ * "Decisions locked with Justin": GTR controls whether a number appears). */
+function stripProposalPrice<T extends { price?: unknown }>(item: T): Omit<T, "price"> {
+    const { price, ...rest } = item;
+    return rest;
+}
+
+/** Deploy-window hazard: the old build stays live while
+ * apply-selections-playground.mjs's remap runs, so it can still insert new
+ * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
+ * statements have already passed (and the script may not have been re-run as
+ * a post-deploy sweep yet — see the note at the top of that script). Every
+ * new read/write path below treats these legacy strings as their playground
+ * equivalent defensively, so a straggler row never renders wrong or
+ * disappears while it waits to be swept up. */
+function normalizeProposalStatus(status: string): string {
+    if (status === "Pending") return "Idea";
+    if (status === "Approved") return "Chosen";
+    if (status === "Declined") return "Archived";
+    return status;
+}
+
+function normalizeProposal<T extends { status: string }>(item: T): T {
+    return { ...item, status: normalizeProposalStatus(item.status) };
+}
+
+// ── Reads ────────────────────────────────────────────────────────────────
+
+export async function getProjectDecisionsForPortal(projectId: string) {
+    await assertPortalProjectOwnership(projectId);
+    const [decisions, unsorted] = await Promise.all([
+        prisma.decision.findMany({
+            where: { projectId, deletedAt: null },
+            orderBy: { sortOrder: "asc" },
+            include: { candidates: { orderBy: { createdAt: "asc" } } },
+        }),
+        prisma.selectionProposal.findMany({
+            where: { projectId, decisionId: null },
+            orderBy: { createdAt: "desc" },
+        }),
+    ]);
+    return {
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => stripProposalPrice(normalizeProposal(c))) })),
+        unsorted: unsorted.map((p) => stripProposalPrice(normalizeProposal(p))),
+    };
+}
+
+export async function getProjectDecisions(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    // Team context — price included, unlike getProjectDecisionsForPortal
+    // above. Soft-deleted decisions are excluded here too — see
+    // getRecentlyDeletedDecisions for the restore tray.
+    const [decisions, unsorted] = await Promise.all([
+        prisma.decision.findMany({
+            where: { projectId, deletedAt: null },
+            orderBy: { sortOrder: "asc" },
+            include: { candidates: { orderBy: { createdAt: "asc" } } },
+        }),
+        prisma.selectionProposal.findMany({
+            where: { projectId, decisionId: null },
+            orderBy: { createdAt: "desc" },
+        }),
+    ]);
+    return {
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map(normalizeProposal) })),
+        unsorted: unsorted.map(normalizeProposal),
+    };
+}
+
+// ── Structure — shared by client + team (see assertDecisionActorAccess) ────
+
+export async function createDecision(projectId: string, data: { name: string; area?: string }) {
+    const actor = await assertDecisionActorAccess(projectId);
+    const name = data.name?.trim();
+    if (!name) throw new Error("Name is required");
+
+    const maxOrder = await prisma.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+    const decision = await prisma.decision.create({
+        data: {
+            projectId,
+            name: name.slice(0, 200),
+            area: data.area?.trim() || null,
+            createdByClient: !actor.isStaff,
+            sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/selections`);
+    revalidatePath(`/portal/projects/${projectId}/selections`);
+    return decision;
+}
+
+export async function renameDecision(decisionId: string, name: string) {
+    const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { projectId: true, deletedAt: true } });
+    if (!decision || decision.deletedAt) throw new Error("Decision not found");
+    await assertDecisionActorAccess(decision.projectId);
+
+    const trimmed = name?.trim();
+    if (!trimmed) throw new Error("Name is required");
+
+    const updated = await prisma.decision.update({
+        where: { id: decisionId },
+        data: { name: trimmed.slice(0, 200) },
+    });
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+    return updated;
+}
+
+export async function reorderDecisions(projectId: string, orderedIds: string[]) {
+    await assertDecisionActorAccess(projectId);
+
+    const existing = await prisma.decision.findMany({ where: { projectId, deletedAt: null }, select: { id: true } });
+    const validIds = new Set(existing.map((d) => d.id));
+    if (orderedIds.some((id) => !validIds.has(id))) {
+        throw new Error("One or more decisions don't belong to this project — refresh and try again.");
+    }
+
+    await prisma.$transaction(
+        orderedIds.map((id, index) => prisma.decision.update({ where: { id }, data: { sortOrder: index } }))
+    );
+
+    revalidatePath(`/projects/${projectId}/selections`);
+    revalidatePath(`/portal/projects/${projectId}/selections`);
+    return { success: true };
+}
+
+export async function deleteDecision(decisionId: string) {
+    const decision = await prisma.decision.findUnique({
+        where: { id: decisionId },
+        select: { projectId: true, status: true, deletedAt: true },
+    });
+    if (!decision || decision.deletedAt) return { success: false };
+    await assertDecisionActorAccess(decision.projectId);
+
+    // Ordered/Received are terminal — that's the company's purchasing
+    // record (Phase 3), not something either side deletes.
+    if (decision.status === "Ordered" || decision.status === "Received") {
+        throw new Error("This decision has already been ordered — it can't be deleted.");
+    }
+
+    // Soft delete only. "They can approve and unapprove themselves, delete
+    // stuff, it's their playground" (Justin, explicit) — clients can delete
+    // ANY decision on their own project, no createdByClient or status
+    // restriction. But "lose no customer data" still holds: nothing is
+    // actually destroyed. The row and its candidates stay intact with
+    // deletedAt set (candidates are left attached rather than scattered to
+    // Unsorted, so a restore brings the whole decision back exactly as it
+    // was) and every read below filters deletedAt out — invisible to the
+    // client, full control preserved. The team can restore within 30 days
+    // (getRecentlyDeletedDecisions / restoreDecision below). Any candidate
+    // still carrying "Chosen" resets to "Idea" and the decision's own
+    // chosenItemId/status reset alongside it, in the same transaction — a
+    // deleted decision has no live approved record, and this keeps the
+    // chooseItem/unchooseItem invariant (Decided+chosenItemId only ever
+    // points at an item actually marked Chosen) true even while deleted.
+    await prisma.$transaction(async (tx) => {
+        await tx.selectionProposal.updateMany({
+            where: { decisionId, status: "Chosen" },
+            data: { status: "Idea" },
+        });
+        await tx.decision.update({
+            where: { id: decisionId },
+            data: { deletedAt: new Date(), chosenItemId: null, status: "Open", decidedAt: null },
+        });
+    });
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+    return { success: true };
+}
+
+export async function assignItemToDecision(itemId: string, decisionId: string | null) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        select: { id: true, projectId: true },
+    });
+    if (!item) throw new Error("Item not found");
+    await assertDecisionActorAccess(item.projectId);
+
+    if (decisionId) {
+        const decision = await prisma.decision.findFirst({
+            where: { id: decisionId, projectId: item.projectId, deletedAt: null },
+            select: { id: true },
+        });
+        if (!decision) throw new Error("That decision doesn't belong to this project — refresh and try again.");
+    }
+
+    await prisma.$transaction(async (tx) => {
+        // Atomic CAS write, not a separate read-then-write: status:{notIn:
+        // [Chosen, Approved]} is evaluated by Postgres against the row's
+        // state AT UPDATE TIME (concurrent UPDATEs on the same row always
+        // serialize), so this can't be raced past by a chooseItem that
+        // claims the item mid-flight — whichever UPDATE lands second
+        // re-evaluates the WHERE against the just-committed row and fails to
+        // match (count 0) instead of silently moving a decision's approved
+        // record out from under it. "Approved" is the legacy-status
+        // equivalent of "Chosen" (see normalizeProposalStatus). An item
+        // that's Chosen but already sitting in the SAME decision we're
+        // "moving" it into is a no-op reassignment — allowed through.
+        const claim = await tx.selectionProposal.updateMany({
+            where: {
+                id: itemId,
+                OR: [
+                    { status: { notIn: ["Chosen", "Approved"] } },
+                    { status: { in: ["Chosen", "Approved"] }, decisionId },
+                ],
+            },
+            data: { decisionId },
+        });
+        if (claim.count === 0) {
+            throw new Error("Un-choose this item before moving it to a different decision.");
+        }
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+// ── Client-only: choose / un-choose / archive ───────────────────────────────
+
+export async function chooseItem(itemId: string) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        include: { decision: true, project: { include: { client: true } } },
+    });
+    if (!item) throw new Error("Item not found");
+    if (!item.decisionId || !item.decision || item.decision.deletedAt) {
+        throw new Error("Add this item to a decision before choosing it.");
+    }
+    if (["Archived", "Declined"].includes(normalizeProposalStatus(item.status))) {
+        throw new Error("This item has been archived — unarchive it before choosing it.");
+    }
+
+    await assertPortalProjectOwnership(item.projectId);
+
+    const decisionId = item.decision.id;
+    if (item.decision.status === "Ordered" || item.decision.status === "Received") {
+        throw new Error("Your team has already ordered this — message them if something needs to change.");
+    }
+
+    let alreadyChosen = false;
+    let previousChosenItemId: string | null = null;
+
+    // Transactional + CAS-guarded so a double-submit no-ops instead of
+    // re-notifying/re-writing. The "already done" signal comes from what
+    // THIS transaction observes (freshDecision/freshItem, read here), never
+    // from the pre-transaction snapshot above (item.decision) — two
+    // concurrent chooseItem calls both trusting that stale snapshot would
+    // both compute alreadyChosen=false and both fire the loud team email +
+    // activity row. Choosing a DIFFERENT candidate on an already-Decided (or
+    // Flagged — chooseItem must work from Flagged per spec) decision is a
+    // valid "change of mind" transition, not blocked here; only Ordered/
+    // Received are terminal.
+    await prisma.$transaction(async (tx) => {
+        const freshItem = await tx.selectionProposal.findUnique({
+            where: { id: itemId },
+            select: { status: true, decisionId: true },
+        });
+        if (!freshItem || freshItem.decisionId !== decisionId) {
+            throw new Error("This item is no longer in that decision — refresh and try again.");
+        }
+        if (["Archived", "Declined"].includes(normalizeProposalStatus(freshItem.status))) {
+            throw new Error("This item has been archived — unarchive it before choosing it.");
+        }
+
+        const freshDecision = await tx.decision.findUnique({
+            where: { id: decisionId },
+            select: { status: true, chosenItemId: true, deletedAt: true },
+        });
+        if (!freshDecision || freshDecision.deletedAt) throw new Error("Decision not found");
+        if (freshDecision.status === "Ordered" || freshDecision.status === "Received") {
+            throw new Error("Your team has already ordered this — message them if something needs to change.");
+        }
+        if (freshDecision.chosenItemId === itemId && freshDecision.status === "Decided") {
+            alreadyChosen = true;
+            return;
+        }
+
+        previousChosenItemId = freshDecision.chosenItemId;
+
+        // Compare-and-swap on the exact pre-image just read inside this
+        // transaction: Postgres re-evaluates this WHERE clause against the
+        // row's committed state at UPDATE time, so a concurrent
+        // chooseItem/unchooseItem/flagDecision racing us can't both "win" —
+        // the loser's UPDATE simply fails to match (count 0) once it
+        // acquires the row lock after the winner commits.
+        const claim = await tx.decision.updateMany({
+            where: { id: decisionId, status: freshDecision.status, chosenItemId: freshDecision.chosenItemId },
+            data: { chosenItemId: itemId, status: "Decided", decidedAt: new Date() },
+        });
+        if (claim.count === 0) {
+            // Someone else changed this decision between our read and our
+            // write. If the race landed on the exact outcome we wanted
+            // (duplicate submit), treat it as done instead of erroring.
+            const after = await tx.decision.findUnique({ where: { id: decisionId }, select: { status: true, chosenItemId: true } });
+            if (after?.chosenItemId === itemId && after.status === "Decided") {
+                alreadyChosen = true;
+                return;
+            }
+            throw new Error("This decision just changed — refresh and try again.");
+        }
+
+        // A previously-chosen sibling (switching candidates) reverts to Idea
+        // — never auto-archived, the runner-up still matters per spec.
+        if (previousChosenItemId && previousChosenItemId !== itemId) {
+            await tx.selectionProposal.updateMany({
+                where: { id: previousChosenItemId, status: "Chosen" },
+                data: { status: "Idea" },
+            });
+        }
+        // CAS on the item too, not a blind by-id update: a concurrent
+        // assignItemToDecision/archiveItem can commit between our freshItem
+        // read above and this write. Pinning decisionId (and excluding
+        // Archived) means the item must still belong to THIS decision at
+        // write time, so we can never mark a moved/archived candidate Chosen
+        // and leave the decision pointing outside its own candidate list.
+        const itemClaim = await tx.selectionProposal.updateMany({
+            where: { id: itemId, decisionId, status: { notIn: ["Archived", "Declined"] } },
+            data: { status: "Chosen" },
+        });
+        if (itemClaim.count === 0) {
+            throw new Error("This item just changed — refresh and try again.");
+        }
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+
+    if (alreadyChosen) {
+        return { success: true, alreadyChosen: true };
+    }
+
+    // Notify the team — the loud one, it demands action (Richard buys it).
+    // After-commit, non-fatal on failure, same pattern as
+    // decideSelectionProposal's client notification block.
+    try {
+        const settings = await getCachedCompanySettings();
+        if (settings.notificationEmail) {
+            await sendNotification(
+                settings.notificationEmail,
+                `Decision made: ${item.decision.name} — ${item.project.name}`,
+                `<div style="font-family: sans-serif; color: #333;">
+                    <h3>Client Decided</h3>
+                    <p><strong>${item.project.client?.name || "Client"}</strong> chose <strong>${item.name}</strong> for "<strong>${item.decision.name}</strong>" on project <strong>${item.project.name}</strong>.</p>
+                    <p>This is the approved record — ready to purchase.</p>
+                </div>`
+            );
+        }
+    } catch (err) {
+        console.error("[chooseItem] team notification failed:", err);
+    }
+
+    await logActivity({
+        projectId: item.projectId,
+        actorType: "CLIENT",
+        actorName: item.project.client?.name || "Client",
+        action: "chose_decision_item",
+        entityType: "Decision",
+        entityId: decisionId,
+        entityName: `${item.decision.name}: ${item.name}`,
+    });
+
+    return { success: true, alreadyChosen: false };
+}
+
+export async function unchooseItem(decisionId: string) {
+    const decision = await prisma.decision.findUnique({
+        where: { id: decisionId },
+        include: { project: { include: { client: true } } },
+    });
+    if (!decision || decision.deletedAt) throw new Error("Decision not found");
+
+    await assertPortalProjectOwnership(decision.projectId);
+
+    if (decision.status === "Ordered" || decision.status === "Received") {
+        throw new Error("Your team has already ordered this — message them if something needs to change.");
+    }
+
+    let noop = false;
+
+    // Same fix shape as chooseItem above: the "already done" signal comes
+    // from a fresh in-tx read, not the pre-transaction snapshot above, so a
+    // concurrent double-submit skips the duplicate activity row instead of
+    // writing it twice.
+    await prisma.$transaction(async (tx) => {
+        const freshDecision = await tx.decision.findUnique({
+            where: { id: decisionId },
+            select: { status: true, chosenItemId: true, deletedAt: true },
+        });
+        if (!freshDecision || freshDecision.deletedAt) throw new Error("Decision not found");
+        if (freshDecision.status === "Ordered" || freshDecision.status === "Received") {
+            throw new Error("Your team has already ordered this — message them if something needs to change.");
+        }
+        if (!freshDecision.chosenItemId) {
+            noop = true;
+            return;
+        }
+
+        const claim = await tx.decision.updateMany({
+            where: { id: decisionId, status: freshDecision.status, chosenItemId: freshDecision.chosenItemId },
+            data: { chosenItemId: null, status: "Open", decidedAt: null },
+        });
+        if (claim.count === 0) {
+            const after = await tx.decision.findUnique({ where: { id: decisionId }, select: { chosenItemId: true } });
+            if (!after?.chosenItemId) {
+                noop = true;
+                return;
+            }
+            throw new Error("This decision just changed — refresh and try again.");
+        }
+
+        await tx.selectionProposal.updateMany({
+            where: { id: freshDecision.chosenItemId, status: "Chosen" },
+            data: { status: "Idea" },
+        });
+    });
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+
+    if (!noop) {
+        await logActivity({
+            projectId: decision.projectId,
+            actorType: "CLIENT",
+            actorName: decision.project.client?.name || "Client",
+            action: "unchose_decision_item",
+            entityType: "Decision",
+            entityId: decision.id,
+            entityName: decision.name,
+        });
+    }
+
+    return { success: true };
+}
+
+export async function archiveItem(itemId: string) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        select: { id: true, projectId: true },
+    });
+    if (!item) throw new Error("Item not found");
+    await assertPortalProjectOwnership(item.projectId);
+
+    await prisma.$transaction(async (tx) => {
+        // Atomic CAS write: status not in [Chosen, Approved] (the legacy
+        // equivalent, see normalizeProposalStatus) is evaluated against the
+        // row at UPDATE time, so this can't be raced past by a concurrent
+        // chooseItem that just claimed this item as its decision's approved
+        // record — see assignItemToDecision above for the same pattern.
+        const claim = await tx.selectionProposal.updateMany({
+            where: { id: itemId, status: { notIn: ["Chosen", "Approved", "Archived"] } },
+            data: { status: "Archived" },
+        });
+        if (claim.count === 0) {
+            const fresh = await tx.selectionProposal.findUnique({ where: { id: itemId }, select: { status: true } });
+            // Already archived (or the legacy Declined-equivalent) — idempotent no-op.
+            if (!fresh || !["Archived", "Declined"].includes(fresh.status)) {
+                throw new Error("Un-choose this item before archiving it.");
+            }
+        }
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+export async function unarchiveItem(itemId: string) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        select: { id: true, projectId: true },
+    });
+    if (!item) throw new Error("Item not found");
+    await assertPortalProjectOwnership(item.projectId);
+
+    await prisma.selectionProposal.updateMany({
+        where: { id: itemId, status: { in: ["Archived", "Declined"] } },
+        data: { status: "Idea" },
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+// ── Team-only ────────────────────────────────────────────────────────────
+
+const RECENTLY_DELETED_WINDOW_DAYS = 30;
+
+/** Decisions a client (or team member) soft-deleted in the last 30 days —
+ * the "recently deleted" restore tray. deleteDecision never hard-deletes, so
+ * this is a plain filtered read, not a recovery from anywhere else. */
+export async function getRecentlyDeletedDecisions(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const cutoff = new Date(Date.now() - RECENTLY_DELETED_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    const decisions = await prisma.decision.findMany({
+        where: { projectId, deletedAt: { not: null, gte: cutoff } },
+        orderBy: { deletedAt: "desc" },
+        include: { candidates: { orderBy: { createdAt: "asc" } } },
+    });
+    return decisions;
+}
+
+export async function restoreDecision(decisionId: string) {
+    const decision = await prisma.decision.findUnique({
+        where: { id: decisionId },
+        select: { projectId: true, deletedAt: true },
+    });
+    if (!decision) throw new Error("Decision not found");
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, decision.projectId)) throw new Error("Forbidden");
+    if (!decision.deletedAt) {
+        return { success: true }; // already live — idempotent no-op
+    }
+
+    await prisma.decision.update({ where: { id: decisionId }, data: { deletedAt: null } });
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+
+    await logActivity({
+        projectId: decision.projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: "restored_decision",
+        entityType: "Decision",
+        entityId: decisionId,
+    });
+
+    return { success: true };
+}
+
+export async function flagDecision(decisionId: string, pmNote: string) {
+    const user = await assertActiveStaff();
+    const decision = await prisma.decision.findUnique({
+        where: { id: decisionId },
+        include: { project: { include: { client: true } }, chosenItem: true },
+    });
+    if (!decision || decision.deletedAt) throw new Error("Decision not found");
+    if (!canAccessProject(user, decision.projectId)) throw new Error("Forbidden");
+
+    const trimmedNote = pmNote?.trim();
+    if (!trimmedNote) throw new Error("A note is required so the client knows what to look at.");
+
+    // Only a Decided item can be flagged. chosenItemId is deliberately kept
+    // (not cleared) so the client still sees what was flagged — this is a
+    // flag, not a veto; it reopens the decision, chooseItem then works again
+    // from Flagged (see chooseItem above).
+    const claim = await prisma.decision.updateMany({
+        where: { id: decisionId, status: "Decided" },
+        data: { status: "Flagged", pmNote: trimmedNote },
+    });
+    if (claim.count === 0) {
+        throw new Error("Only a decided item can be flagged.");
+    }
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+
+    // Client email — "Team flags → client email" per the notifications rule.
+    try {
+        const clientEmail = decision.project.client?.email;
+        if (clientEmail) {
+            const settings = await getCachedCompanySettings();
+            const { buildClientPortalUrl } = await import("./client-portal-auth");
+            const portalUrl = await buildClientPortalUrl(decision.project.clientId, clientEmail, `/portal/projects/${decision.projectId}/selections`);
+            const cc = buildCc(clientEmail, (decision.project.client as any)?.additionalEmail);
+            await sendNotification(
+                clientEmail,
+                `A look is needed — ${decision.name} (${decision.project.name})`,
+                `<div style="font-family: sans-serif; color: #333;">
+                    <h2>Your Team Flagged a Decision</h2>
+                    <p>Hi ${decision.project.client?.name || "there"},</p>
+                    <p>Your team wants a second look at "<strong>${decision.name}</strong>"${decision.chosenItem ? ` — <strong>${decision.chosenItem.name}</strong>` : ""} on <strong>${decision.project.name}</strong>.</p>
+                    <p style="color:#555;">Note: "${trimmedNote}"</p>
+                    <p><a href="${portalUrl}" style="display:inline-block;padding:12px 24px;background:#4c9a2a;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">Review It</a></p>
+                    <p style="color:#666;font-size:13px;">— ${settings.companyName || "Your Project Team"}</p>
+                </div>`,
+                undefined,
+                { cc, copyToInternal: true }
+            );
+        }
+    } catch (err) {
+        console.error("[flagDecision] client notification failed:", err);
+    }
+
+    await logActivity({
+        projectId: decision.projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: "flagged_decision",
+        entityType: "Decision",
+        entityId: decision.id,
+        entityName: decision.name,
+    });
+
+    return { success: true };
+}
+
+export async function addTeamCandidate(decisionId: string, data: {
+    name: string;
+    description?: string;
+    imageUrl?: string;
+    price?: number;
+    vendorUrl?: string;
+}) {
+    const user = await assertActiveStaff();
+    const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { id: true, projectId: true, deletedAt: true } });
+    if (!decision || decision.deletedAt) throw new Error("Decision not found");
+    if (!canAccessProject(user, decision.projectId)) throw new Error("Forbidden");
+
+    const name = data.name?.trim();
+    if (!name) throw new Error("Name is required");
+
+    // A peer candidate ("Richard suggests") — ungated like any other
+    // candidate, lands as Idea alongside the client's own picks.
+    const candidate = await prisma.selectionProposal.create({
+        data: {
+            projectId: decision.projectId,
+            decisionId: decision.id,
+            name: name.slice(0, 200),
+            description: data.description?.trim() || null,
+            imageUrl: safeUrlOrNull(data.imageUrl),
+            price: data.price ?? null,
+            vendorUrl: safeUrlOrNull(data.vendorUrl),
+            status: "Idea",
+        },
+    });
+
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
+
+    await logActivity({
+        projectId: decision.projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: "added_team_candidate",
+        entityType: "SelectionProposal",
+        entityId: candidate.id,
+        entityName: candidate.name,
+    });
+
+    return candidate;
+}
+
+export async function importBoardPicksAsDecisions(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const boards = await prisma.selectionBoard.findMany({
+        where: { projectId },
+        include: { categories: { include: { options: true } } },
+    });
+
+    const importable = boards
+        .flatMap((b) => b.categories)
+        .map((cat) => ({ cat, chosen: cat.options.find((o) => o.selected) }))
+        .filter((x): x is { cat: typeof x.cat; chosen: NonNullable<typeof x.chosen> } => !!x.chosen);
+
+    if (importable.length === 0) {
+        return { created: 0, skipped: 0 };
+    }
+
+    // Guard re-runs with a stable marker (Decision.templateKey, reused here
+    // for board-import provenance rather than adding a new column) rather
+    // than matching on name — two categories could share a name, and the
+    // client may separately have their own decision with the same name.
+    const markers = importable.map(({ cat }) => `board-import:${cat.id}`);
+    const existing = await prisma.decision.findMany({
+        where: { projectId, templateKey: { in: markers } },
+        select: { templateKey: true },
+    });
+    const alreadyImported = new Set(existing.map((d) => d.templateKey));
+
+    const maxOrderRow = await prisma.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+    let nextOrder = (maxOrderRow._max.sortOrder ?? -1) + 1;
+
+    let created = 0;
+    let skipped = 0;
+
+    for (const { cat, chosen } of importable) {
+        const marker = `board-import:${cat.id}`;
+        if (alreadyImported.has(marker)) {
+            skipped++;
+            continue;
+        }
+        const sortOrder = nextOrder++;
+        try {
+            // Source board/category/option rows are only ever read here,
+            // never written — the mirror is a brand-new SelectionProposal +
+            // Decision. The pre-read alreadyImported check above is just an
+            // optimization; the authoritative idempotency guard is the
+            // Decision(projectId, templateKey) unique constraint — a
+            // concurrent second click racing this same loop hits P2002 on
+            // the decision.create below and the whole transaction rolls
+            // back (including the just-created proposal), so it's caught
+            // and counted as skipped rather than double-creating.
+            await prisma.$transaction(async (tx) => {
+                const proposal = await tx.selectionProposal.create({
+                    data: {
+                        projectId,
+                        name: chosen.name,
+                        description: chosen.description,
+                        imageUrl: safeUrlOrNull(chosen.imageUrl),
+                        price: chosen.price ?? null,
+                        vendorUrl: safeUrlOrNull(chosen.vendorUrl),
+                        status: "Chosen",
+                    },
+                });
+                const decision = await tx.decision.create({
+                    data: {
+                        projectId,
+                        name: cat.name,
+                        status: "Decided",
+                        chosenItemId: proposal.id,
+                        decidedAt: new Date(),
+                        templateKey: marker,
+                        createdByClient: false,
+                        sortOrder,
+                    },
+                });
+                await tx.selectionProposal.update({ where: { id: proposal.id }, data: { decisionId: decision.id } });
+            });
+            created++;
+        } catch (e: any) {
+            if (e?.code === "P2002") {
+                skipped++;
+                continue;
+            }
+            throw e;
+        }
+    }
+
+    revalidatePath(`/projects/${projectId}/selections`);
+    revalidatePath(`/portal/projects/${projectId}/selections`);
+
+    await logActivity({
+        projectId,
+        actorType: "TEAM",
+        actorName: user.name || user.email,
+        action: "imported_board_picks_as_decisions",
+        entityType: "Decision",
+        entityName: `${created} imported${skipped ? `, ${skipped} skipped` : ""}`,
+    });
+
+    return { created, skipped };
+}
+
+// =============================================
 // Daily Logs CRUD
 // =============================================
 
@@ -10432,6 +11249,46 @@ export async function setDailyLogPortalShare(
     revalidatePath(`/projects/${target.projectId}/dailylogs`);
     revalidatePath(`/portal/projects/${target.projectId}`);
     return result;
+}
+
+// Staff pin for the client portal project route: forces which stage reads as
+// "current" (earlier stages read done) when the schedule's keyword inference
+// lags reality. Pass null to clear and return to task-derived position.
+export async function setPortalStageOverride(projectId: string, stageLabel: string | null) {
+    const session = await getSessionOrDev();
+    const role = ((session?.user as any)?.role as string | null) ?? null;
+    if (!role || !["ADMIN", "MANAGER"].includes(role)) throw new Error("Forbidden");
+
+    if (stageLabel !== null && !CLIENT_STAGES.some(stage => stage.label === stageLabel)) {
+        throw new Error(`Unknown stage: ${stageLabel}`);
+    }
+
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { name: true, portalStageOverride: true },
+    });
+    if (!project) throw new Error("Project not found");
+    if (project.portalStageOverride === stageLabel) return { stageLabel };
+
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { portalStageOverride: stageLabel },
+    });
+
+    await logActivity({
+        projectId,
+        actorType: "TEAM",
+        actorName: session?.user?.name || session?.user?.email || "Team member",
+        action: stageLabel ? "set_portal_stage_override" : "cleared_portal_stage_override",
+        entityType: "project",
+        entityId: projectId,
+        entityName: project.name,
+        metadata: { from: project.portalStageOverride, to: stageLabel },
+    });
+
+    revalidatePath(`/portal/projects/${projectId}`);
+    revalidatePath(`/projects/${projectId}`);
+    return { stageLabel };
 }
 
 // =============================================
