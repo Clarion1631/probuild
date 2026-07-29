@@ -296,13 +296,19 @@ function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, nu
     return assigned;
 }
 
-export function buildProjectTracker(tasks: readonly PortalTrackerTask[]): ProjectTracker {
+export function buildProjectTracker(
+    tasks: readonly PortalTrackerTask[],
+    stageOverride?: string | null,
+): ProjectTracker {
     const assigned = assignStageIndexes(tasks);
     const tasksByStage = CLIENT_STAGES.map((_, stageIndex) =>
         tasks.filter(task => assigned.get(task.id) === stageIndex),
     );
 
     const allProjectTasksComplete = tasks.length > 0 && tasks.every(isComplete);
+    const overrideIndex = stageOverride
+        ? CLIENT_STAGES.findIndex(stage => stage.label === stageOverride)
+        : -1;
 
     let currentIndex = tasksByStage.findIndex(stageTasks =>
         stageTasks.length > 0
@@ -318,23 +324,16 @@ export function buildProjectTracker(tasks: readonly PortalTrackerTask[]): Projec
 
     const stages = CLIENT_STAGES.map((stage, index): ProjectTrackerStage => {
         const stageTasks = chronologicalTasks(tasksByStage[index]);
-        const stageComplete = stageTasks.length > 0 && stageTasks.every(isComplete);
-        const emptyButPassed = currentIndex > index && stageTasks.length === 0;
-        const complete = allProjectTasksComplete || stageComplete || emptyButPassed;
-        const pct = complete
-            ? 100
-            : stageTasks.length > 0
-                ? Math.round(stageTasks.reduce((sum, task) => sum + normalizedProgress(task), 0) / stageTasks.length)
-                : 0;
+        const taskPct = stageTasks.length > 0
+            ? Math.round(stageTasks.reduce((sum, task) => sum + normalizedProgress(task), 0) / stageTasks.length)
+            : 0;
 
+        // Second level of the rail: the real schedule under each stage.
+        // Appointments are crew logistics, not client-facing milestones.
         const visibleTasks = stageTasks.filter(task => task.type !== "appointment");
         const activeTask = visibleTasks.find(task => isStarted(task))
             ?? visibleTasks.find(task => !isComplete(task));
-
-        return {
-            label: stage.label,
-            state: complete ? "complete" : index === currentIndex ? "current" : "upcoming",
-            pct,
+        const detail = {
             taskCount: visibleTasks.length,
             doneCount: visibleTasks.filter(isComplete).length,
             tasks: visibleTasks.map((task): ProjectTrackerStageTask => ({
@@ -342,17 +341,51 @@ export function buildProjectTracker(tasks: readonly PortalTrackerTask[]): Projec
                 done: isComplete(task),
                 active: isStarted(task),
             })),
-            activeTaskName: index === currentIndex && activeTask
-                ? clientTaskName(activeTask.name)
-                : null,
+        };
+        const activeTaskName = activeTask ? clientTaskName(activeTask.name) : null;
+
+        if (overrideIndex >= 0) {
+            // A staff override pins the route position regardless of task math:
+            // earlier stages read done, the pinned stage is current (capped at
+            // 99 — 100 would read as complete), later stages keep honest pcts.
+            if (index < overrideIndex) {
+                return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
+            }
+            if (index === overrideIndex) {
+                return {
+                    label: stage.label,
+                    state: "current",
+                    pct: Math.min(taskPct, 99),
+                    ...detail,
+                    activeTaskName,
+                };
+            }
+            return { label: stage.label, state: "upcoming", pct: taskPct, ...detail, activeTaskName: null };
+        }
+
+        const stageComplete = stageTasks.length > 0 && stageTasks.every(isComplete);
+        const emptyButPassed = currentIndex > index && stageTasks.length === 0;
+        const complete = allProjectTasksComplete || stageComplete || emptyButPassed;
+
+        return {
+            label: stage.label,
+            state: complete ? "complete" : index === currentIndex ? "current" : "upcoming",
+            pct: complete ? 100 : taskPct,
+            ...detail,
+            activeTaskName: index === currentIndex ? activeTaskName : null,
         };
     });
 
     // Overall = mean of the per-stage percentages so the roundel can never
     // contradict the stage rail (empty-but-passed stages count as done).
-    const overallPct = tasks.length === 0
+    // While a stage is still current the total is held under 100, or pinning
+    // the last stage would round up to a "100% complete" badge above a rail
+    // that still shows work in progress.
+    const rawOverallPct = tasks.length === 0 && overrideIndex < 0
         ? 0
         : Math.round(stages.reduce((sum, stage) => sum + stage.pct, 0) / stages.length);
+    const hasCurrentStage = stages.some(stage => stage.state === "current");
+    const overallPct = hasCurrentStage ? Math.min(rawOverallPct, 99) : rawOverallPct;
 
     return { stages, overallPct };
 }
@@ -528,13 +561,13 @@ export async function getPortalProjectTrackerCore(
     const [project, tasks] = await Promise.all([
         prisma.project.findUnique({
             where: { id: projectId },
-            select: { color: true },
+            select: { color: true, portalStageOverride: true },
         }),
         getPortalScheduleTasksCore(projectId),
     ]);
     if (!project) throw new Error("Project not found");
 
-    const tracker = buildProjectTracker(tasks);
+    const tracker = buildProjectTracker(tasks, project.portalStageOverride);
     const whatsNext = chronologicalTasks(tasks)
         .filter(task =>
             task.type !== "appointment"

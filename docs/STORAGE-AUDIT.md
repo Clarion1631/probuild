@@ -82,7 +82,7 @@ Run in this order. Steps 1–3 are reversible; step 6 is not.
 
 Rollback before step 6 is a code revert — the public originals are still serving, so nothing is lost.
 
-7. **Sweep orphans** — `node scripts/sweep-orphaned-public-signatures.mjs --dest "<backup dir>" --apply`. The migration only moves objects a DB row points at, so it is blind to **orphans**: sensitive objects in storage that nothing references. These stay public forever otherwise. See below.
+7. **Sweep orphans** — `node scripts/sweep-orphaned-signature-objects.mjs --dest "<backup dir>" --apply`. The migration only moves objects a DB row points at, so it is blind to **orphans**: sensitive objects in storage that nothing references. These stay public forever otherwise, and — now that new signatures/PDFs write straight to the private `secure-docs` bucket — the same script also sweeps orphans left there by fail-closed retention in the signing cleanup paths (see below). Covers both buckets by default (`--bucket project-files|secure-docs|both`).
 
 ## Executed 2026-07-27
 

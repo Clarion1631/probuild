@@ -4,6 +4,7 @@ import { withTxRetry } from "./tx-retry";
 import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
+import { foldTaskEvidence } from "./task-evidence";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
@@ -2100,6 +2101,12 @@ export interface DashboardTaskRow {
     // comments, newest first — same TaskComment source the project schedule
     // page already shows, no new writes/schema.
     latestComments: DashboardTaskComment[];
+    // Evidence freshness (see lib/task-evidence.ts). Direct = someone worked
+    // this task (bound punch, completed punch item). Indirect = office activity
+    // near it (comment, material move, project-level daily log). Kept apart so
+    // one project daily log can't mark every overlapping task confirmed.
+    lastDirectEvidenceAt: string | null;
+    lastIndirectEvidenceAt: string | null;
 }
 
 export interface DashboardProjectRow extends PipelineProject {
@@ -2110,6 +2117,9 @@ export interface DashboardProjectRow extends PipelineProject {
     // Expandable task list with per-task crew (assignments carry user status so
     // the picker can render inactive-removable entries).
     tasks: DashboardTaskRow[];
+    // Recent punches the binding resolver left unattached — evidence collected
+    // but unusable. Surfaced so ambiguity can't quietly erode the coverage read.
+    unboundPunches: number;
 }
 
 export interface ProjectMonthStripRow {
@@ -2354,7 +2364,7 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject, materialCounts] = await Promise.all([
+    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches] = await Promise.all([
         prisma.scheduleTask.findMany({
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
@@ -2377,22 +2387,67 @@ export async function getCompanyDashboardData(
         }),
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
         getUnappliedChangeOrders(rowIds),
+        // All statuses, not just the three counted ones: `resolved` is the final
+        // transition, so filtering it out here would hide the most recent
+        // statusChangedAt. Resolved rows are dropped from the COUNTS below.
         prisma.taskMaterial.groupBy({
             by: ["taskId", "status"],
+            where: { task: { projectId: { in: rowIds } } },
+            _count: { id: true },
+            _max: { statusChangedAt: true },
+        }),
+        // ── Evidence aggregates (3 queries, batched — never per chip) ──
+        prisma.timeEntry.groupBy({
+            by: ["scheduleTaskId"],
+            where: { projectId: { in: rowIds }, scheduleTaskId: { not: null } },
+            _max: { startTime: true },
+        }),
+        prisma.taskPunchItem.groupBy({
+            by: ["taskId"],
+            where: { task: { projectId: { in: rowIds } }, completed: true },
+            _max: { completedAt: true },
+        }),
+        prisma.dailyLog.groupBy({
+            by: ["projectId"],
+            where: { projectId: { in: rowIds } },
+            _max: { date: true },
+        }),
+        // Punches the resolver couldn't tie to a task. Windowed to the recent
+        // past so pre-feature history doesn't pin this at a permanent large
+        // number — it's meant to show evidence we're losing NOW.
+        prisma.timeEntry.groupBy({
+            by: ["projectId"],
             where: {
-                task: { projectId: { in: rowIds } },
-                status: { in: ["pending", "staged", "missing"] },
+                projectId: { in: rowIds },
+                scheduleTaskId: null,
+                startTime: { gte: new Date(Date.now() - 14 * 86_400_000) },
             },
             _count: { id: true },
         }),
     ]);
     const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
+    const materialStatusAtByTask = new Map<string, Date>();
     for (const count of materialCounts) {
         const current = materialCountsByTask.get(count.taskId) ?? { pending: 0, staged: 0, missing: 0 };
         if (count.status === "pending" || count.status === "staged" || count.status === "missing") {
             current[count.status] = count._count.id;
         }
         materialCountsByTask.set(count.taskId, current);
+        const changedAt = count._max.statusChangedAt;
+        const seen = materialStatusAtByTask.get(count.taskId);
+        if (changedAt && (!seen || changedAt > seen)) materialStatusAtByTask.set(count.taskId, changedAt);
+    }
+    const punchAtByTask = new Map<string, Date>();
+    for (const row of punchEvidence) {
+        if (row.scheduleTaskId && row._max.startTime) punchAtByTask.set(row.scheduleTaskId, row._max.startTime);
+    }
+    const punchItemAtByTask = new Map<string, Date>();
+    for (const row of punchItemEvidence) {
+        if (row._max.completedAt) punchItemAtByTask.set(row.taskId, row._max.completedAt);
+    }
+    const dailyLogAtByProject = new Map<string, Date>();
+    for (const row of dailyLogEvidence) {
+        if (row._max.date) dailyLogAtByProject.set(row.projectId, row._max.date);
     }
     const tasksByProject = new Map<string, DashboardTaskRow[]>();
     for (const task of taskRows) {
@@ -2431,9 +2486,20 @@ export async function getCompanyDashboardData(
                 authorName: c.user?.name ?? c.user?.email ?? c.subcontractorName ?? "Unknown",
                 createdAt: c.createdAt.toISOString(),
             })),
+            // Comments are already loaded newest-first (take: 2), so the head IS
+            // the max createdAt — no fourth aggregate needed for it.
+            ...foldTaskEvidence({
+                lastTimeEntryAt: punchAtByTask.get(task.id),
+                lastPunchItemCompletedAt: punchItemAtByTask.get(task.id),
+                lastCommentAt: task.comments[0]?.createdAt,
+                lastMaterialStatusAt: materialStatusAtByTask.get(task.id),
+                lastProjectDailyLogAt: dailyLogAtByProject.get(task.projectId),
+            }),
         });
         tasksByProject.set(task.projectId, rows);
     }
+    const unboundPunchesByProject = new Map<string, number>();
+    for (const row of unboundPunches) unboundPunchesByProject.set(row.projectId, row._count.id);
     const hasQualifying = new Set(qualifying.map(q => q.projectId));
     const enrich = (p: PipelineProject): DashboardProjectRow => ({
         ...p,
@@ -2441,6 +2507,7 @@ export async function getCompanyDashboardData(
         hasQualifyingEstimate: hasQualifying.has(p.id),
         tasks: tasksByProject.get(p.id) ?? [],
         unappliedChangeOrders: unappliedByProject[p.id] ?? { count: 0, items: [] },
+        unboundPunches: unboundPunchesByProject.get(p.id) ?? 0,
     });
 
     // Picker list is pre-filtered to ACTIVATED, non-FINANCE (getTeamMembers
