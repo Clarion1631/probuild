@@ -7,16 +7,28 @@
 //
 // Usage: node scripts/apply-client-stage-schema.mjs
 import { PrismaClient } from "@prisma/client";
+import fs from "node:fs";
 
-const prisma = new PrismaClient();
+// Same resolution the sibling apply-*.mjs scripts use: env first, then the
+// checked-out .env files, since these are run by hand rather than by Next.
+function resolveDatabaseUrl() {
+    if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+    for (const file of [".env", ".env.local"]) {
+        if (!fs.existsSync(file)) continue;
+        const match = fs.readFileSync(file, "utf8").match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+        if (match) return match[1];
+    }
+    throw new Error("DATABASE_URL not found in env or .env files");
+}
+
+const url = resolveDatabaseUrl();
+const prisma = new PrismaClient({ datasources: { db: { url } } });
 
 const STATEMENTS = [
     `ALTER TABLE "ScheduleTask" ADD COLUMN IF NOT EXISTS "clientStage" TEXT;`,
 ];
 
 async function main() {
-    const url = process.env.DATABASE_URL ?? "";
-    if (!url) throw new Error("DATABASE_URL is not set");
     console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
 
     for (const sql of STATEMENTS) {
