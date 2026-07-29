@@ -13,7 +13,7 @@
 | Vercel project ID | `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL` |
 | Supabase project ref | `ghzdbzdnwjxazvmcefbh` |
 | Sentry org | `golden-touch-remodeling` (us.sentry.io) |
-| Known prod DB project ID | `cmn7tlgiv0001phwqjzwk75or` |
+| Prod test project ("Shop") | `cmpd6xca1009x1iizdf4suln3` |
 
 ## Vercel env vars (already configured)
 `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
@@ -127,7 +127,7 @@ python compare.py --local --page "Page Name"   # single page local test
 - Do not run compare.py as part of normal development — use ProbuildTodo.md as the roadmap instead
 
 ## Production data
-- Known prod project ID: `cmn7tlgiv0001phwqjzwk75or`
+- Prod test project ("Shop"): `cmpd6xca1009x1iizdf4suln3` — the sanctioned job for clicking through prod
 - Do NOT try psql, prisma direct connect, or supabase CLI to query prod — use the API
 
 ## Messaging component
