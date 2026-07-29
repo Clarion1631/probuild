@@ -8,6 +8,7 @@ import {
     type QboExpenseProjectCandidate,
     type QboExpenseSyncDependencies,
     type QboExpenseWrite,
+    type QboPurchaseNormalizationSkipReason,
     type QboPurchaseForImport,
 } from "../src/lib/qbo-expense-sync";
 
@@ -187,9 +188,10 @@ test("excludes an in-progress job that has no estimate", () => {
     assert.deepEqual(result, { kind: "skipped", reason: "no-estimate" });
 });
 
-type StoredExpense = QboExpenseWrite & {
+type StoredExpense = Omit<QboExpenseWrite, "status"> & {
     id: string;
     receiptUrl: string | null;
+    status: "Pending" | "Reviewed";
 };
 
 function createFakePrisma(initial: StoredExpense[] = []) {
@@ -284,7 +286,10 @@ function createSyncDependencies(
     purchases: QboPurchaseForImport[],
     projects: QboExpenseProjectCandidate[],
     upsert: QboExpenseSyncDependencies["upsertExpense"],
-    skipped: Array<{ qbPurchaseId: string; reason: string }> = [],
+    skipped: Array<{
+        qbPurchaseId: string;
+        reason: QboPurchaseNormalizationSkipReason;
+    }> = [],
 ): QboExpenseSyncDependencies {
     return {
         getTokens: async () => TOKENS,
