@@ -1,6 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { reconcileMilestoneToQbo } from "../src/lib/quickbooks-payments";
+import {
+    syncQboExpenses,
+    upsertQboExpense,
+    type QboExpensePersistenceClient,
+    type QboExpenseSyncDependencies,
+} from "../src/lib/qbo-expense-sync";
 
 /**
  * Deterministic, DB-level coverage for reconcileMilestoneToQbo — the QBO→ProBuild
@@ -113,6 +119,7 @@ const num = (v: unknown) => Number(v);
 test.describe.serial("reconcileMilestoneToQbo", () => {
     test.afterAll(async () => {
         try {
+            await prisma.expense.deleteMany({ where: { qbPurchaseId: { startsWith: `${PFX}-qbo-` } } });
             await prisma.paymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
             await prisma.invoice.deleteMany({ where: { id: { startsWith: PFX } } });
             await prisma.estimatePaymentSchedule.deleteMany({ where: { id: { startsWith: PFX } } });
@@ -235,5 +242,74 @@ test.describe.serial("reconcileMilestoneToQbo", () => {
         const ps = await prisma.paymentSchedule.findUnique({ where: { id: s.depositPsId } });
         expect(num(ps!.amount)).toBe(648); // not doubled
         expect(num(inv!.totalAmount)).toBe(1048); // not 1096
+    });
+
+    test("an imported finalized QBO expense is auditable on the linked active job", async ({ page }) => {
+        test.setTimeout(60_000);
+        const seeded = await seedLinked({ suffix: "qbo-expense-ui" });
+        const project = await prisma.project.findUniqueOrThrow({
+            where: { id: `${PFX}-project` },
+            select: {
+                id: true,
+                name: true,
+                status: true,
+                estimates: {
+                    where: { archivedAt: null },
+                    select: { id: true, createdAt: true },
+                },
+            },
+        });
+        const dependencies: QboExpenseSyncDependencies = {
+            getTokens: async () => ({
+                accessToken: "e2e-access",
+                refreshToken: "e2e-refresh",
+                realmId: "e2e-realm",
+            }),
+            readPurchases: async () => ({
+                purchases: [{
+                    qbPurchaseId: `${PFX}-qbo-purchase-ui`,
+                    syncToken: "0",
+                    txnDate: "2026-07-21",
+                    total: 321.45,
+                    vendor: "QBO UI Vendor",
+                    customerName: project.name,
+                    customerId: null,
+                    accountName: "Washington Trust Checking",
+                    memo: "QBO UI materials",
+                }],
+                skipped: [],
+            }),
+            listProjects: async () => [{
+                ...project,
+                qbCustomerId: null,
+            }],
+            upsertExpense: write =>
+                upsertQboExpense(
+                    prisma as unknown as QboExpensePersistenceClient,
+                    write,
+                ),
+            now: () => new Date("2026-07-29T12:00:00.000Z"),
+        };
+
+        const result = await syncQboExpenses(
+            { since: new Date("2026-01-01T00:00:00.000Z") },
+            dependencies,
+        );
+        expect(result).toEqual({ imported: 1, updated: 0, skipped: [] });
+
+        await page.goto(`/projects/${PFX}-project/time-expenses`);
+        await page.getByRole("button", { name: /Expenses \(/ }).click();
+
+        const row = page.getByRole("row").filter({ hasText: "QBO UI Vendor" });
+        await expect(row).toContainText("QBO UI Vendor");
+        await expect(row).toContainText("$321.45");
+        await expect(row).toContainText("7/21/2026");
+        await expect(row).toContainText("QuickBooks import");
+        await expect(row).toContainText("Finalized in QuickBooks");
+        await expect(row.getByRole("checkbox")).toBeDisabled();
+
+        // Keep the value referenced so the seed helper's linked estimate/invoice
+        // remains part of this test's setup and standard teardown path.
+        expect(seeded.estimateId).toContain("qbo-expense-ui");
     });
 });
