@@ -53,6 +53,9 @@ function trackerTask(
         type: input.type ?? "task",
         order: input.order ?? 0,
         costCodeName: input.costCodeName ?? null,
+        // Must be forwarded: dropping it silently made every clientStage case
+        // vacuous — the assertions passed while never exercising the tag at all.
+        clientStage: input.clientStage ?? null,
         scheduledTime: input.scheduledTime ?? null,
         confirmationStatus: input.confirmationStatus ?? null,
         assignments: input.assignments ?? [],
@@ -401,6 +404,31 @@ function runPureCases(): void {
     assert.equal(floorPlan.stages[0].state, "current");
     assert.equal(floorPlan.stages[0].label, "Planning & Permits");
     assert.equal(railRunsBackwards(floorPlan.stages), false);
+
+    // The task NAME outranks the cost code. Scoring both in one concatenated string
+    // gave every cost-code word positional priority, so this read as Rough-ins.
+    const nameBeatsCostCode = buildProjectTracker([
+        trackerTask({
+            id: "cc", name: "Final cleanup", costCodeName: "Electrical rough-in",
+            status: "In Progress", progress: 10,
+        }),
+    ]);
+    assert.equal(
+        nameBeatsCostCode.stages.find(stage => stage.state === "current")?.label,
+        "Punch list",
+    );
+
+    // Cost code still decides when the name says nothing about a stage.
+    const costCodeFallback = buildProjectTracker([
+        trackerTask({
+            id: "cf", name: "Zone 3 work order", costCodeName: "Drywall hang",
+            status: "In Progress", progress: 10,
+        }),
+    ]);
+    assert.equal(
+        costCodeFallback.stages.find(stage => stage.state === "current")?.label,
+        "Drywall",
+    );
 
     // Work finished early may not plant a checkmark ahead of the current stage.
     const earlyFraming = buildProjectTracker([

@@ -171,8 +171,8 @@ function isStarted(task: PortalTrackerTask): boolean {
  * client Demo, Framing, Rough-ins and Drywall were all done. Text position gets
  * both those names right; stage number only got one of them.
  */
-function keywordStageIndex(task: PortalTrackerTask): number | null {
-    const haystack = `${task.name} ${task.costCodeName ?? ""}`.toLowerCase();
+function bestStageInText(text: string): number | null {
+    const haystack = text.toLowerCase();
     const hits: { position: number; length: number; stageIndex: number }[] = [];
     CLIENT_STAGES.forEach((stage, stageIndex) => {
         stage.matchers.forEach(matcher => {
@@ -181,13 +181,22 @@ function keywordStageIndex(task: PortalTrackerTask): number | null {
         });
     });
     if (hits.length === 0) return null;
-    // Later in the name wins; on a tie the more specific (longer) word does.
+    // Later in the text wins; on a tie the more specific (longer) word does.
     return hits.reduce((best, hit) =>
         hit.position > best.position
         || (hit.position === best.position && hit.length > best.length)
             ? hit
             : best,
     ).stageIndex;
+}
+
+function keywordStageIndex(task: PortalTrackerTask): number | null {
+    // Rank inside ONE field at a time. Positions from different fields are not
+    // comparable, and gluing name+costCode into one haystack handed every cost-code
+    // word positional priority over the task's own name: "Final cleanup" under cost
+    // code "Electrical rough-in" read as Rough-ins instead of Punch list. The name
+    // is what the client actually sees, so it decides whenever it says anything.
+    return bestStageInText(task.name) ?? bestStageInText(task.costCodeName ?? "");
 }
 
 /**
