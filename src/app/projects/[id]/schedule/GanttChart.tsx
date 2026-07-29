@@ -37,6 +37,9 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
     const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
     const scrollRef = useRef<HTMLDivElement>(null);
+    // Only one colour picker is open at a time, so a single anchor ref is
+    // attached to whichever row's swatch is currently open.
+    const colorAnchorRef = useRef<HTMLButtonElement>(null);
     const dragRef = useRef<{ cleanup: () => void } | null>(null);
     const tasksRef = useRef<Task[]>([]);
 
@@ -348,14 +351,14 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                                 >
                                     <div className="relative mr-2">
                                         {task.type === "milestone" ? (
-                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-4 h-4 flex items-center justify-center" title="Milestone">
+                                            <button ref={colorPickerId === task.id ? colorAnchorRef : undefined} onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-4 h-4 flex items-center justify-center" title="Milestone">
                                                 <div className="w-3 h-3 rotate-45 border-2" style={{ backgroundColor: task.color, borderColor: task.color }} />
                                             </button>
                                         ) : (
-                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
+                                            <button ref={colorPickerId === task.id ? colorAnchorRef : undefined} onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                         )}
                                         {colorPickerId === task.id && (
-                                            <ColorPicker selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} className="absolute top-5 left-0 z-50 min-w-[200px]" />
+                                            <ColorPicker open anchorRef={colorAnchorRef} selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} />
                                         )}
                                     </div>
                                     <div className="flex-1 min-w-0">

@@ -19,8 +19,14 @@ export interface FloatingPopoverProps {
     anchorPoint?: FloatingPopoverAnchorPoint | null;
     onClose: () => void;
     children: ReactNode;
-    /** Panel width in px — the panel right-aligns to the trigger by default (matching the prior `absolute right-0` menus), then clamps into the viewport. */
+    /** Panel width in px — the panel aligns to the trigger per `align`, then clamps into the viewport. */
     width?: number;
+    /** Which trigger edge the panel aligns to. Default "right" (matching the prior `absolute right-0` menus); "left" replaces an `absolute left-0`. Ignored when `anchorPoint` is given. */
+    align?: "left" | "right";
+    /** Panel's own inner padding. Default true. Set false for menus whose items supply their own row padding (an `absolute … py-1` list), so they don't gain a second inset. */
+    padded?: boolean;
+    /** Built-in `×` close affordance. Default true. Set false when the content already owns its dismissal (e.g. ColorPicker's Done button) so there aren't two close controls. */
+    dismissible?: boolean;
     /** Non-interactive hover card mode (schedule-board task hover notes): the panel never captures pointer events, so it can never trap the mouse mid-hover. Default false (normal click/context menu). */
     pointerEventsNone?: boolean;
 }
@@ -35,7 +41,7 @@ export interface FloatingPopoverProps {
  * horizontally with an 8px viewport margin. Escape closes and returns focus
  * to the trigger; a pointerdown outside the panel and trigger also closes it.
  */
-export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224, pointerEventsNone = false }: FloatingPopoverProps) {
+export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, children, width = 224, align = "right", padded = true, dismissible = true, pointerEventsNone = false }: FloatingPopoverProps) {
     const panelRef = useRef<HTMLDivElement | null>(null);
     const contentRef = useRef<HTMLDivElement | null>(null);
     const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
@@ -65,8 +71,8 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             // viewport narrower than the panel pins to the margin instead of
             // going negative off-screen. A point anchor opens its LEFT edge at
             // the point (native context-menu convention) instead of
-            // right-aligning to it.
-            let left = anchorPoint ? rect.left : rect.right - panelWidth;
+            // aligning to a trigger edge.
+            let left = anchorPoint || align === "left" ? rect.left : rect.right - panelWidth;
             left = Math.max(Math.min(left, viewportWidth - panelWidth - VIEWPORT_MARGIN_PX), VIEWPORT_MARGIN_PX);
 
             const spaceBelow = viewportHeight - rect.bottom - ANCHOR_GAP_PX - VIEWPORT_MARGIN_PX;
@@ -114,7 +120,7 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             window.removeEventListener("scroll", place, true);
             panelObserver?.disconnect();
         };
-    }, [open, anchorRef, anchorPoint, width]);
+    }, [open, anchorRef, anchorPoint, width, align]);
 
     useEffect(() => {
         if (!open) return;
@@ -163,10 +169,10 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
                 overscrollBehaviorY: "contain",
                 visibility: position ? "visible" : "hidden",
             }}
-            className={`relative z-[200] rounded-md border border-hui-border bg-white p-3 text-left text-hui-textMain shadow-xl ${pointerEventsNone ? "pointer-events-none" : ""}`}
+            className={`relative z-[200] rounded-md border border-hui-border bg-white text-left text-hui-textMain shadow-xl ${padded ? "p-3" : ""} ${pointerEventsNone ? "pointer-events-none" : ""}`}
             onPointerDown={pointerEventsNone ? undefined : event => event.stopPropagation()}
         >
-            {!pointerEventsNone && (
+            {dismissible && !pointerEventsNone && (
                 <button
                     type="button"
                     aria-label="Close"
@@ -179,7 +185,7 @@ export function FloatingPopover({ open, anchorRef, anchorPoint, onClose, childre
             {/* Content wrapper: observed for size changes — the panel box
                 itself stops growing once maxHeight caps it, so observing the
                 panel alone misses menu→taller-view switches. */}
-            <div ref={contentRef} className={pointerEventsNone ? undefined : "pr-6"}>{children}</div>
+            <div ref={contentRef} className={dismissible && !pointerEventsNone ? "pr-6" : undefined}>{children}</div>
         </div>,
         document.body,
     );

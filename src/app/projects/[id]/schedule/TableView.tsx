@@ -17,6 +17,7 @@ import ScheduleEmptyState from "./ScheduleEmptyState";
 import RiskAnalysisModal from "./RiskAnalysisModal";
 import ColorPicker from "./ColorPicker";
 import ProgressPopover from "./ProgressPopover";
+import { FloatingPopover } from "@/app/company-dashboard/schedule-board/FloatingPopover";
 
 const GRID_COLS = "24px 32px minmax(200px,1fr) 70px 120px 120px 70px 110px 100px 130px 80px 80px 90px 40px";
 
@@ -82,6 +83,12 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
     const [progressPopoverId, setProgressPopoverId] = useState<string | null>(null);
     const [depsPickerId, setDepsPickerId] = useState<string | null>(null);
     const editRef = useRef<HTMLInputElement | HTMLSelectElement>(null);
+    // One popover of each kind is open at a time, so a single anchor ref per
+    // kind is attached to whichever row currently owns it.
+    const colorAnchorRef = useRef<HTMLButtonElement>(null);
+    const progressAnchorRef = useRef<HTMLButtonElement>(null);
+    const depsAnchorRef = useRef<HTMLButtonElement>(null);
+    const depsPickerAnchorRef = useRef<HTMLButtonElement>(null);
 
     useEffect(() => { if (editRef.current) editRef.current.focus(); }, [editingCell]);
 
@@ -558,9 +565,9 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             </div>
                                                             <div className="px-2 py-2 flex items-center">
                                                                 <div className="relative">
-                                                                    <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); setProgressPopoverId(null); }} className={`w-4 h-4 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
+                                                                    <button ref={colorPickerId === task.id ? colorAnchorRef : undefined} onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); setProgressPopoverId(null); }} className={`w-4 h-4 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                                                     {colorPickerId === task.id && (
-                                                                        <ColorPicker selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} className="absolute left-0 top-full mt-1 z-50 min-w-[200px]" />
+                                                                        <ColorPicker open anchorRef={colorAnchorRef} selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} />
                                                                     )}
                                                                 </div>
                                                             </div>
@@ -599,6 +606,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             <div className="px-3 py-2">
                                                                 <div className="relative inline-block" onClick={e => e.stopPropagation()}>
                                                                     <button
+                                                                        ref={progressPopoverId === task.id ? progressAnchorRef : undefined}
                                                                         onClick={() => {
                                                                             setProgressPopoverId(progressPopoverId === task.id ? null : task.id);
                                                                             setDepsPopoverId(null);
@@ -615,6 +623,8 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                                     </button>
                                                                     {progressPopoverId === task.id && (
                                                                         <ProgressPopover
+                                                                            open
+                                                                            anchorRef={progressAnchorRef}
                                                                             taskId={task.id}
                                                                             taskColor={task.color}
                                                                             progress={progress}
@@ -652,6 +662,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                             <div className="px-3 py-2">
                                                                 <div className="relative inline-block" onClick={e => e.stopPropagation()}>
                                                                     <button
+                                                                        ref={depsPopoverId === task.id ? depsAnchorRef : undefined}
                                                                         onClick={() => { setDepsPopoverId(depsPopoverId === task.id ? null : task.id); setDepsPickerId(null); setProgressPopoverId(null); }}
                                                                         className={`text-[10px] px-1.5 py-0.5 rounded font-medium transition ${task.dependencies.length > 0 ? "bg-slate-100 text-slate-600 hover:bg-indigo-100 hover:text-indigo-700" : "text-slate-300 hover:text-indigo-600 hover:bg-indigo-50"}`}
                                                                         title={task.dependencies.length > 0 ? "View / edit predecessors" : "Add a predecessor"}
@@ -659,7 +670,19 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                                         {task.dependencies.length > 0 ? `${task.dependencies.length} dep${task.dependencies.length !== 1 ? "s" : ""}` : "+ Link"}
                                                                     </button>
                                                                     {depsPopoverId === task.id && (
-                                                                        <div className="absolute left-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in">
+                                                                        <FloatingPopover
+                                                                            open
+                                                                            anchorRef={depsAnchorRef}
+                                                                            width={240}
+                                                                            align="left"
+                                                                            padded={false}
+                                                                            dismissible={false}
+                                                                            // The predecessor picker is its own portal, so a click
+                                                                            // inside it reads as "outside" this panel. While it's
+                                                                            // open, let it consume the dismissal instead.
+                                                                            onClose={() => { if (depsPickerId !== task.id) setDepsPopoverId(null); }}
+                                                                        >
+                                                                        <div className="py-1" onClick={e => e.stopPropagation()}>
                                                                             <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50 flex items-center justify-between">
                                                                                 <span>Predecessors</span>
                                                                                 <button onClick={() => setDepsPopoverId(null)} className="text-slate-400 hover:text-slate-700">
@@ -690,14 +713,15 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                                                                             )}
                                                                             <div className="border-t border-slate-100 my-1" />
                                                                             <div className="px-1 relative">
-                                                                                <button onClick={() => setDepsPickerId(depsPickerId === task.id ? null : task.id)} className="w-full text-left px-2 py-1.5 hover:bg-indigo-50 transition text-xs text-indigo-600 font-semibold rounded">
+                                                                                <button ref={depsPickerId === task.id ? depsPickerAnchorRef : undefined} onClick={() => setDepsPickerId(depsPickerId === task.id ? null : task.id)} className="w-full text-left px-2 py-1.5 hover:bg-indigo-50 transition text-xs text-indigo-600 font-semibold rounded">
                                                                                     + Add predecessor
                                                                                 </button>
                                                                                 {depsPickerId === task.id && (
-                                                                                    <DependencyPicker task={task} allTasks={tasks} onPick={(predId) => addPredecessor(task.id, predId)} onClose={() => setDepsPickerId(null)} align="left" />
+                                                                                    <DependencyPicker open anchorRef={depsPickerAnchorRef} task={task} allTasks={tasks} onPick={(predId) => addPredecessor(task.id, predId)} onClose={() => setDepsPickerId(null)} align="left" />
                                                                                 )}
                                                                             </div>
                                                                         </div>
+                                                                        </FloatingPopover>
                                                                     )}
                                                                 </div>
                                                             </div>

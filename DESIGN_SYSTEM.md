@@ -335,3 +335,48 @@ function StatusBadge({ status }: { status: string }) {
 7. **Empty states** — every list must have one. Use EmptyState component with icon, title, description, and CTA
 8. **No raw colors** — always use hui-* tokens or the status color table above
 9. **Spacing is consistent** — `mb-6` between major sections, `space-y-4` within form groups, `gap-4` in grids
+10. **Dropdowns and popovers render through `FloatingPopover`** — never `absolute … z-50` inside a page container. See below.
+
+---
+
+## Dropdowns, menus and popovers
+
+Use `FloatingPopover` (`src/app/company-dashboard/schedule-board/FloatingPopover.tsx`). It portals to
+`document.body`, positions from the trigger's live rect, flips above when there's no room below, clamps to the
+viewport, and closes on Escape / outside pointerdown.
+
+```tsx
+const anchorRef = useRef<HTMLButtonElement>(null);
+<button ref={anchorRef} onClick={() => setOpen(v => !v)}>Actions</button>
+{open && (
+    <FloatingPopover open anchorRef={anchorRef} onClose={() => setOpen(false)} width={240} padded={false} dismissible={false}>
+        <div className="py-1">…</div>
+    </FloatingPopover>
+)}
+```
+
+`padded={false}` when the items supply their own row padding; `dismissible={false}` when the content already has
+its own close affordance. Let the popover own the scrolling — content should not bring its own `w-*` / `max-h-*`
+scroller unless it needs a pinned header (a search box) above a scrolling list.
+
+**Why not `absolute … z-50`?** Two failure modes, both of which shipped and both of which look identical to the
+user — the menu is there in the DOM but invisible or unclickable:
+
+1. **Clipped.** An `absolute` menu is still laid out inside its scroll container. Any ancestor with
+   `overflow-auto` / `overflow-y-auto` / `overflow-hidden` cuts it off, and `overflow-y-auto` forces `overflow-x`
+   to `auto` too, so it clips on *both* axes. A menu on a row near the bottom of a list is the usual casualty.
+2. **Out-ranked.** `z-50` only ranks a menu *within its nearest stacking context*, not against the page. If any
+   ancestor creates one, the whole subtree is pinned at that ancestor's level and a sibling with an equal or
+   higher z-index — later in the DOM — paints straight over the open menu.
+
+An ancestor creates a stacking context when it has a `z-index` other than `auto` **and** either:
+- it is positioned (`relative` / `absolute` / `fixed` / `sticky`), or
+- **it is a flex or grid item** — a `z-index` applies to flex/grid children even with `position: static`.
+
+That second case is the one that bites. `<div className="w-80 shrink-0 flex flex-col z-10">` reads like a no-op
+because the element isn't positioned, but as a flex child it caps everything inside it at `z-10`.
+
+Both bugs are on the record. `ScheduleToolbar` was `relative z-20` and its `z-50` menus were painted over by the
+table's filter row (also `z-20`, later in the DOM). `EstimateEditor`'s header sits at `z-30` purely so its `⋮`
+menu beats the sidebar tab bar at `z-10`. If you find yourself raising a z-index to make a menu appear, reach for
+`FloatingPopover` instead — bumping the number only moves the problem to the next sibling.

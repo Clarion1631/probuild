@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useMemo, type RefObject } from "react";
 import Link from "next/link";
+import { FloatingPopover } from "@/app/company-dashboard/schedule-board/FloatingPopover";
 import { getTaskTimeEntries } from "@/lib/actions";
 import type { TimeEntryDetail } from "./schedule-types";
 
@@ -10,6 +11,9 @@ type DayGroup = { dateKey: string; label: string; entries: TimeEntryDetail[]; to
 type WeekGroup = { weekKey: string; label: string; days: DayGroup[]; total: number };
 
 export type ProgressPopoverProps = {
+    open: boolean;
+    /** The progress bar button the panel opens from. */
+    anchorRef: RefObject<HTMLElement | null>;
     taskId: string;
     taskColor: string;
     progress: number;
@@ -47,8 +51,7 @@ function fmt(n: number): string {
     return n % 1 === 0 ? String(n) : n.toFixed(1);
 }
 
-export default function ProgressPopover({ taskId, taskColor, progress, estimatedHours, actualHours, projectId, onClose }: ProgressPopoverProps) {
-    const containerRef = useRef<HTMLDivElement>(null);
+export default function ProgressPopover({ open, anchorRef, taskId, taskColor, progress, estimatedHours, actualHours, projectId, onClose }: ProgressPopoverProps) {
     const [entries, setEntries] = useState<TimeEntryDetail[]>([]);
     const [total, setTotal] = useState(0);
     const [loading, setLoading] = useState(true);
@@ -69,18 +72,6 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
         return () => { cancelled = true; };
     }, [taskId]);
 
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
-        }
-        function handleEsc(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleEsc);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleEsc);
-        };
-    }, [onClose]);
 
     function toggleSort(field: SortField) {
         if (sortField === field) setSortAsc(!sortAsc);
@@ -140,7 +131,10 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
     const arrow = (field: SortField) => sortField === field ? (sortAsc ? " ↑" : " ↓") : "";
 
     return (
-        <div ref={containerRef} className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-[360px] animate-in fade-in" onClick={e => e.stopPropagation()}>
+        <FloatingPopover open={open} anchorRef={anchorRef} onClose={onClose} width={360} padded={false} dismissible={false}>
+            {/* Portalled to body, but React events still bubble through the
+                React tree — without this the row's onClick would fire. */}
+            <div onClick={e => e.stopPropagation()}>
             {/* Header */}
             <div className="px-3 py-2 flex items-center justify-between border-b border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Time Entries</span>
@@ -241,6 +235,7 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
                     View all →
                 </Link>
             </div>
-        </div>
+            </div>
+        </FloatingPopover>
     );
 }

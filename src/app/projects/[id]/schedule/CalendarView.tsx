@@ -503,6 +503,7 @@ function QuickEditPopover({
     useEffect(() => { setNameDraft(task.name); }, [task.id, task.name]);
 
     const [showColorPicker, setShowColorPicker] = useState(false);
+    const colorAnchorRef = useRef<HTMLButtonElement>(null);
     const [punchItems, setPunchItems] = useState<PunchItem[]>([]);
     const [punchLoading, setPunchLoading] = useState(true);
     const [newPunch, setNewPunch] = useState("");
@@ -620,6 +621,7 @@ function QuickEditPopover({
                     <label className="text-slate-500 w-16">Color</label>
                     <div className="relative">
                         <button
+                            ref={colorAnchorRef}
                             type="button"
                             onClick={() => setShowColorPicker(v => !v)}
                             className={`w-5 h-5 rounded-full border border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"} hover:scale-110 transition`}
@@ -628,10 +630,11 @@ function QuickEditPopover({
                         />
                         {showColorPicker && (
                             <ColorPicker
+                                open
+                                anchorRef={colorAnchorRef}
                                 selected={task.color}
                                 onPick={c => onPatch({ color: c })}
                                 onClose={() => setShowColorPicker(false)}
-                                className="absolute left-0 top-7 z-50 min-w-[200px]"
                             />
                         )}
                     </div>

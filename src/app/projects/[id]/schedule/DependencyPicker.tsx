@@ -1,9 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState, type RefObject } from "react";
+import { FloatingPopover } from "@/app/company-dashboard/schedule-board/FloatingPopover";
 import type { Task } from "./schedule-types";
 
 export type DependencyPickerProps = {
+    open: boolean;
+    /** The "+ Add" button the panel opens from. */
+    anchorRef: RefObject<HTMLElement | null>;
     task: Task;
     allTasks: Task[];
     onPick: (predecessorId: string) => void;
@@ -31,9 +35,8 @@ function getReachableSuccessors(taskId: string, tasks: Task[]): Set<string> {
     return reachable;
 }
 
-export default function DependencyPicker({ task, allTasks, onPick, onClose, align = "right" }: DependencyPickerProps) {
+export default function DependencyPicker({ open, anchorRef, task, allTasks, onPick, onClose, align = "right" }: DependencyPickerProps) {
     const [query, setQuery] = useState("");
-    const ref = useRef<HTMLDivElement>(null);
 
     const candidates = useMemo(() => {
         const existing = new Set(task.dependencies.map(d => d.predecessorId));
@@ -47,23 +50,13 @@ export default function DependencyPicker({ task, allTasks, onPick, onClose, alig
         );
     }, [task.id, task.dependencies, allTasks, query]);
 
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-        }
-        function handleKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleKey);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleKey);
-        };
-    }, [onClose]);
-
     return (
+        <FloatingPopover open={open} anchorRef={anchorRef} onClose={onClose} width={260} align={align} padded={false} dismissible={false}>
+        {/* Keeps its own max-height so the search box stays pinned while only
+            the results scroll. React portals still bubble events through the
+            React tree, hence the stopPropagation. */}
         <div
-            ref={ref}
-            className={`absolute ${align === "right" ? "right-0" : "left-0"} top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] max-h-72 overflow-hidden flex flex-col animate-in fade-in`}
+            className="max-h-72 overflow-hidden flex flex-col"
             onClick={e => e.stopPropagation()}
         >
             <div className="p-2 border-b border-slate-100">
@@ -104,5 +97,6 @@ export default function DependencyPicker({ task, allTasks, onPick, onClose, alig
                 )}
             </div>
         </div>
+        </FloatingPopover>
     );
 }

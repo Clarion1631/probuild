@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { FloatingPopover } from "@/app/company-dashboard/schedule-board/FloatingPopover";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 import DependencyPicker from "./DependencyPicker";
@@ -77,6 +78,12 @@ export default function TaskDetailPanel({
     const [estimateQuery, setEstimateQuery] = useState("");
     const [showPredecessorMenu, setShowPredecessorMenu] = useState(false);
     const [showColorPicker, setShowColorPicker] = useState(false);
+    // Anchors for the panel's popovers — they render to document.body so they
+    // escape this panel's scroll container instead of being clipped by it.
+    const colorAnchorRef = useRef<HTMLButtonElement>(null);
+    const assignAnchorRef = useRef<HTMLButtonElement>(null);
+    const estimateAnchorRef = useRef<HTMLButtonElement>(null);
+    const predecessorAnchorRef = useRef<HTMLButtonElement>(null);
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
@@ -173,6 +180,7 @@ export default function TaskDetailPanel({
                 <div className="flex items-center gap-2.5 flex-1 min-w-0">
                     <div className="relative shrink-0">
                         <button
+                            ref={colorAnchorRef}
                             type="button"
                             onClick={() => setShowColorPicker(v => !v)}
                             title="Change color"
@@ -191,10 +199,11 @@ export default function TaskDetailPanel({
                         </button>
                         {showColorPicker && (
                             <ColorPicker
+                                open
+                                anchorRef={colorAnchorRef}
                                 selected={task.color}
                                 onPick={c => onColorChange(task.id, c)}
                                 onClose={() => setShowColorPicker(false)}
-                                className="absolute left-0 top-7 z-50 min-w-[200px]"
                             />
                         )}
                     </div>
@@ -360,7 +369,7 @@ export default function TaskDetailPanel({
                                         <button onClick={() => onUnlinkEstimateItem(task.id)} className="text-xs text-red-500 hover:text-red-700 font-semibold transition">Remove</button>
                                     ) : (
                                         <div className="relative">
-                                            <button onClick={handleShowEstimateLink} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
+                                            <button ref={estimateAnchorRef} onClick={handleShowEstimateLink} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Link</button>
                                             {showEstimateLinkMenu && (() => {
                                                 const taskTokens = tokenizeForMatch(task.name);
                                                 const query = estimateQuery.trim().toLowerCase();
@@ -407,7 +416,9 @@ export default function TaskDetailPanel({
                                                     return a[0].localeCompare(b[0]);
                                                 });
                                                 return (
-                                                    <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-80 max-h-72 flex flex-col animate-in fade-in">
+                                                    <FloatingPopover open anchorRef={estimateAnchorRef} onClose={() => setShowEstimateLinkMenu(false)} width={320} padded={false} dismissible={false}>
+                                                    {/* Keeps its own max-height so the search box stays pinned while only the results scroll. */}
+                                                    <div className="max-h-72 flex flex-col">
                                                         <div className="p-2.5 border-b border-hui-border" onClick={e => e.stopPropagation()}>
                                                             <input
                                                                 type="text"
@@ -445,6 +456,7 @@ export default function TaskDetailPanel({
                                                             )}
                                                         </div>
                                                     </div>
+                                                    </FloatingPopover>
                                                 );
                                             })()}
                                         </div>
@@ -485,9 +497,11 @@ export default function TaskDetailPanel({
                                     <div className="flex items-center justify-between mb-2">
                                         <label className={SECTION_LABEL}>Predecessors</label>
                                         <div className="relative">
-                                            <button onClick={() => setShowPredecessorMenu(v => !v)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
+                                            <button ref={predecessorAnchorRef} onClick={() => setShowPredecessorMenu(v => !v)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
                                             {showPredecessorMenu && (
                                                 <DependencyPicker
+                                                    open
+                                                    anchorRef={predecessorAnchorRef}
                                                     task={task}
                                                     allTasks={allTasks}
                                                     onPick={(predId) => onLinkPredecessor(predId)}
@@ -569,9 +583,10 @@ export default function TaskDetailPanel({
                                 <div className="flex items-center justify-between mb-2">
                                     <label className={SECTION_LABEL}>Assigned</label>
                                     <div className="relative">
-                                        <button disabled={crewReadOnly} onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition disabled:cursor-not-allowed disabled:text-slate-300">+ Add</button>
+                                        <button ref={assignAnchorRef} disabled={crewReadOnly} onClick={() => setShowAssignMenu(!showAssignMenu)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition disabled:cursor-not-allowed disabled:text-slate-300">+ Add</button>
                                         {showAssignMenu && !crewReadOnly && (
-                                            <div className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[240px] py-1 animate-in fade-in max-h-60 overflow-y-auto">
+                                            <FloatingPopover open anchorRef={assignAnchorRef} onClose={() => setShowAssignMenu(false)} width={240} padded={false} dismissible={false}>
+                                            <div className="py-1">
                                                 <div className="px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider bg-slate-50">Team Members</div>
                                                 {teamMembers.filter(m => !(task.assignments || []).some(a => a.userId === m.id)).map(m => (
                                                     <button key={m.id} onClick={() => { onAssign(m.id); setShowAssignMenu(false); }} className="w-full text-left px-3 py-2.5 hover:bg-slate-50 transition flex items-center gap-2 text-xs">
@@ -588,6 +603,7 @@ export default function TaskDetailPanel({
                                                 ))}
                                                 {teamMembers.length === 0 && subcontractors.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No options found</div>}
                                             </div>
+                                            </FloatingPopover>
                                         )}
                                     </div>
                                 </div>

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { FloatingPopover } from "@/app/company-dashboard/schedule-board/FloatingPopover";
 import { PRESET_COLORS } from "./schedule-utils";
 
 const RECENT_KEY = "probuild:scheduleRecentColors";
@@ -32,32 +33,24 @@ function pushRecentColor(hex: string) {
     try { window.localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch { /* quota exceeded — ignore */ }
 }
 
+// 8 swatches of w-5 (20px) with gap-1.5 (6px) plus the popover's own p-3:
+// 8*20 + 7*6 + 2*12 = 226. Rounded up so a swatch row never wraps.
+const PANEL_WIDTH_PX = 232;
+
 export type ColorPickerProps = {
+    open: boolean;
+    /** The swatch button the panel opens from. */
+    anchorRef: RefObject<HTMLElement | null>;
     selected: string;
     onPick: (hex: string) => void;
     onClose: () => void;
-    className?: string;
 };
 
-export default function ColorPicker({ selected, onPick, onClose, className }: ColorPickerProps) {
+export default function ColorPicker({ open, anchorRef, selected, onPick, onClose }: ColorPickerProps) {
     const [recent, setRecent] = useState<string[]>([]);
     const colorInputRef = useRef<HTMLInputElement>(null);
-    const containerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => { setRecent(getRecentColors()); }, []);
-
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
-        }
-        function handleEsc(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleEsc);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleEsc);
-        };
-    }, [onClose]);
 
     const selectedNorm = normalizeHex(selected);
 
@@ -73,11 +66,19 @@ export default function ColorPicker({ selected, onPick, onClose, className }: Co
     }
 
     return (
-        <div
-            ref={containerRef}
-            className={`bg-white border border-hui-border rounded-lg shadow-xl p-2.5 animate-in fade-in ${className ?? ""}`}
-            onClick={e => e.stopPropagation()}
+        <FloatingPopover
+            open={open}
+            anchorRef={anchorRef}
+            onClose={onClose}
+            width={PANEL_WIDTH_PX}
+            align="left"
+            dismissible={false}
         >
+            {/* React portals still bubble events through the React tree, so a
+                swatch click would reach the task row's onClick (select/link
+                mode) without this — the DOM move to document.body does not
+                stop it. */}
+            <div onClick={e => e.stopPropagation()}>
             <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Presets</div>
             <div className="grid grid-cols-8 gap-1.5">
                 {PRESET_COLORS.map(c => {
@@ -139,6 +140,7 @@ export default function ColorPicker({ selected, onPick, onClose, className }: Co
             >
                 Done
             </button>
-        </div>
+            </div>
+        </FloatingPopover>
     );
 }
