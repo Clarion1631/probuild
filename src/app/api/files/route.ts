@@ -260,6 +260,35 @@ export async function PATCH(req: NextRequest) {
             return NextResponse.json({ error: "Invalid visibility value" }, { status: 400 });
         }
 
+        // A move must never silently revoke the client's access.
+        //
+        // The portal only lists folders whose whole ancestor chain is "shared", and
+        // at the root only files with an EXPLICIT "shared" are listed. So dropping a
+        // client-visible file into a team folder — or dragging an inherited-shared
+        // file out to the root — removes it from the portal with no error and no
+        // trace. Bulk move made that a one-gesture mistake across many files.
+        //
+        // Refused only when the un-sharing is a SIDE EFFECT of the move. An explicit
+        // `visibility` in the same request is a deliberate choice and is honored, so
+        // the share/unshare toggle keeps working.
+        if (folderId !== undefined && visibility === undefined) {
+            const targetFolder = folderId
+                ? await prisma.fileFolder.findUnique({
+                    where: { id: folderId },
+                    select: { name: true, visibility: true },
+                })
+                : null;
+            const effectiveBefore = existing.visibility ?? existing.folder?.visibility ?? "team";
+            const effectiveAfter = existing.visibility ?? targetFolder?.visibility ?? "team";
+            if (effectiveBefore === "shared" && effectiveAfter !== "shared") {
+                return NextResponse.json({
+                    error: targetFolder
+                        ? `"${targetFolder.name}" is not shared with the client, so moving this file there would remove it from their portal. Share that folder first, or pass visibility explicitly to move it internally on purpose.`
+                        : "This file is only visible to the client because of the folder it sits in; moving it to the project root would remove it from their portal. Pass visibility \"shared\" to keep it client-visible.",
+                }, { status: 409 });
+            }
+        }
+
         const updateData: any = {};
         if (folderId !== undefined) updateData.folderId = folderId || null;
         if (name) updateData.name = name;

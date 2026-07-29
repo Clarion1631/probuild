@@ -2532,13 +2532,26 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     if (pdfBuffer && estimate?.projectId) {
         let filedSecureRef: string | null = null;
         try {
-            // Find or create a "Signed Documents" folder for this project
+            // Find or create a "Signed Documents" folder for this project.
+            //
+            // SHARED, deliberately: a client must be able to open their own signed
+            // estimate at any time. The portal only lists folders whose whole
+            // ancestor chain is "shared" (see api/portal/files), so a team folder
+            // here makes the document unreachable no matter what the file says —
+            // which is exactly how 13 signed documents across 6 projects ended up
+            // invisible to their clients. An existing team folder is promoted, since
+            // its whole purpose is to hold documents the client signed.
             let folder = await prisma.fileFolder.findFirst({
                 where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
             });
             if (!folder) {
                 folder = await prisma.fileFolder.create({
-                    data: { name: "Signed Documents", projectId: estimate.projectId },
+                    data: { name: "Signed Documents", projectId: estimate.projectId, visibility: "shared" },
+                });
+            } else if (folder.visibility !== "shared") {
+                folder = await prisma.fileFolder.update({
+                    where: { id: folder.id },
+                    data: { visibility: "shared" },
                 });
             }
 
@@ -2554,6 +2567,12 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     mimeType: "application/pdf",
                     projectId: estimate.projectId,
                     folderId: folder.id,
+                    // Explicit, not inherited: a null visibility only reads as shared
+                    // while the file sits inside a shared folder, so it would silently
+                    // un-share the moment anyone moved it or changed the folder. This
+                    // matches archiveExecutedContractPdf, which already files executed
+                    // contracts as explicitly shared.
+                    visibility: "shared",
                 },
             });
 
