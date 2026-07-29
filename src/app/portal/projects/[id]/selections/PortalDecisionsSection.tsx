@@ -22,8 +22,6 @@ import {
     unarchiveItem,
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
-import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
-import ClipperDragLink from "@/components/ClipperDragLink";
 import AddItemModal from "./AddItemModal";
 import {
     ImageOff,
@@ -40,8 +38,6 @@ import {
     ChevronDown,
     ChevronRight,
     Sparkles,
-    Link2,
-    Copy,
 } from "lucide-react";
 
 interface Candidate {
@@ -640,12 +636,10 @@ function AddDecisionModal({
 
 export default function PortalDecisionsSection({
     projectId,
-    appUrl,
     initialDecisions,
     initialUnsorted,
 }: {
     projectId: string;
-    appUrl: string;
     initialDecisions: DecisionData[];
     initialUnsorted: Candidate[];
 }) {
@@ -655,21 +649,6 @@ export default function PortalDecisionsSection({
     const [addDecisionOpen, setAddDecisionOpen] = useState(false);
     const [addUnsortedOpen, setAddUnsortedOpen] = useState(false);
     const [reordering, setReordering] = useState(false);
-
-    const bookmarkletHref = buildClipperBookmarklet({
-        origin: appUrl,
-        targetPath: "/portal/clip",
-        extraParams: { projectId },
-    });
-
-    async function handleCopyBookmarklet() {
-        try {
-            await navigator.clipboard.writeText(bookmarkletHref);
-            toast.success("Clipper code copied! Create a new bookmark and paste this in as the URL.");
-        } catch {
-            toast.error("Couldn't copy that — try dragging the button instead.");
-        }
-    }
 
     // initialDecisions/initialUnsorted are only the INITIAL values for
     // useState — resync whenever the server component re-fetches after
@@ -714,61 +693,17 @@ export default function PortalDecisionsSection({
 
     return (
         <div>
-            <div className="hui-card p-5 mb-6">
-                <div className="flex items-center justify-between gap-6 flex-wrap pb-4 border-b border-hui-border">
-                    <div className="flex items-center gap-4">
-                        <div className="w-11 h-11 bg-hui-primary/10 rounded-xl flex items-center justify-center shrink-0">
-                            <Link2 className="w-5 h-5 text-hui-primary" />
-                        </div>
-                        <div>
-                            <h2 className="text-base font-semibold text-hui-textMain">Get the Clipper</h2>
-                            <p className="text-sm text-hui-textMuted mt-0.5 max-w-md">
-                                Found something while shopping? Drag the ProBuild Clip button to your bookmarks bar.
-                                <br />
-                                On any product page, click it and the item lands right here for you to sort.
-                                <br />
-                                Dragging not working on your device? Tap Copy, then make a new bookmark and paste it in as the URL.
-                            </p>
-                        </div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                        <ClipperDragLink
-                            href={bookmarkletHref}
-                            className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
-                            title="Drag me to your bookmarks bar"
-                        >
-                            <Link2 className="w-4 h-4" />
-                            ProBuild Clip
-                        </ClipperDragLink>
-                        <button
-                            type="button"
-                            onClick={handleCopyBookmarklet}
-                            className="hui-btn hui-btn-secondary flex items-center gap-2"
-                            title="Copy the clipper code"
-                        >
-                            <Copy className="w-4 h-4" />
-                            Copy
-                        </button>
-                    </div>
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                <div>
+                    <h2 className="text-xl font-bold text-hui-textMain">Your Decisions</h2>
+                    <p className="text-sm text-hui-textMuted">
+                        Explore your options here, and let us know when you&apos;ve landed on one.
+                    </p>
                 </div>
-                <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
-                    <div>
-                        <h2 className="text-xl font-bold text-hui-textMain">Your Selections</h2>
-                        <p className="text-sm text-hui-textMuted">
-                            Explore your options here, and let us know when you&apos;ve landed on one.
-                        </p>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                        <button onClick={() => setAddUnsortedOpen(true)} className="hui-btn hui-btn-secondary flex items-center gap-1.5">
-                            <Plus className="w-4 h-4" />
-                            Add an item
-                        </button>
-                        <button onClick={() => setAddDecisionOpen(true)} className="hui-btn hui-btn-green flex items-center gap-1.5">
-                            <Plus className="w-4 h-4" />
-                            Add a decision
-                        </button>
-                    </div>
-                </div>
+                <button onClick={() => setAddDecisionOpen(true)} className="hui-btn hui-btn-green flex items-center gap-1.5">
+                    <Plus className="w-4 h-4" />
+                    Add a decision
+                </button>
             </div>
 
             {isEmpty ? (

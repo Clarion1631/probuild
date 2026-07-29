@@ -9310,8 +9310,6 @@ export async function sendPurchaseOrder(id: string, toEmail: string, message: st
 // =============================================
 
 export async function getSelectionBoards(projectId: string) {
-    const user = await assertActiveStaff();
-    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     return await prisma.selectionBoard.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -9327,8 +9325,7 @@ export async function getSelectionBoards(projectId: string) {
 }
 
 export async function getSelectionBoard(id: string) {
-    const user = await assertActiveStaff();
-    const board = await prisma.selectionBoard.findUnique({
+    return await prisma.selectionBoard.findUnique({
         where: { id },
         include: {
             project: { include: { client: true } },
@@ -9340,14 +9337,9 @@ export async function getSelectionBoard(id: string) {
             },
         },
     });
-    if (!board) return null;
-    if (!canAccessProject(user, board.projectId)) throw new Error("Forbidden");
-    return board;
 }
 
 export async function createSelectionBoard(projectId: string, title: string) {
-    const user = await assertActiveStaff();
-    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     const board = await prisma.selectionBoard.create({
         data: { projectId, title },
     });
@@ -9356,10 +9348,6 @@ export async function createSelectionBoard(projectId: string, title: string) {
 }
 
 export async function updateSelectionBoard(id: string, data: { title?: string; status?: string }) {
-    const user = await assertActiveStaff();
-    const existing = await prisma.selectionBoard.findUnique({ where: { id }, select: { projectId: true } });
-    if (!existing) throw new Error("Board not found");
-    if (!canAccessProject(user, existing.projectId)) throw new Error("Forbidden");
     const board = await prisma.selectionBoard.update({
         where: { id },
         data,
@@ -9369,20 +9357,14 @@ export async function updateSelectionBoard(id: string, data: { title?: string; s
 }
 
 export async function deleteSelectionBoard(id: string) {
-    const user = await assertActiveStaff();
     const board = await prisma.selectionBoard.findUnique({ where: { id } });
     if (!board) return { success: false };
-    if (!canAccessProject(user, board.projectId)) throw new Error("Forbidden");
     await prisma.selectionBoard.delete({ where: { id } });
     revalidatePath(`/projects/${board.projectId}/selections`);
     return { success: true };
 }
 
 export async function createSelectionCategory(boardId: string, name: string) {
-    const user = await assertActiveStaff();
-    const board = await prisma.selectionBoard.findUnique({ where: { id: boardId } });
-    if (!board) throw new Error("Board not found");
-    if (!canAccessProject(user, board.projectId)) throw new Error("Forbidden");
     const maxOrder = await prisma.selectionCategory.aggregate({
         where: { boardId },
         _max: { order: true },
@@ -9390,23 +9372,18 @@ export async function createSelectionCategory(boardId: string, name: string) {
     const cat = await prisma.selectionCategory.create({
         data: { boardId, name, order: (maxOrder._max.order ?? -1) + 1 },
     });
-    revalidatePath(`/projects/${board.projectId}/selections`);
+    const board = await prisma.selectionBoard.findUnique({ where: { id: boardId } });
+    if (board) revalidatePath(`/projects/${board.projectId}/selections`);
     return cat;
 }
 
 export async function updateSelectionCategory(id: string, data: { name?: string; order?: number }) {
-    const user = await assertActiveStaff();
-    const existing = await prisma.selectionCategory.findUnique({ where: { id }, include: { board: true } });
-    if (!existing) throw new Error("Category not found");
-    if (!canAccessProject(user, existing.board.projectId)) throw new Error("Forbidden");
     return await prisma.selectionCategory.update({ where: { id }, data });
 }
 
 export async function deleteSelectionCategory(id: string) {
-    const user = await assertActiveStaff();
     const cat = await prisma.selectionCategory.findUnique({ where: { id }, include: { board: true } });
     if (!cat) return { success: false };
-    if (!canAccessProject(user, cat.board.projectId)) throw new Error("Forbidden");
     await prisma.selectionCategory.delete({ where: { id } });
     revalidatePath(`/projects/${cat.board.projectId}/selections`);
     return { success: true };
@@ -9419,10 +9396,6 @@ export async function createSelectionOption(categoryId: string, data: {
     price?: number;
     vendorUrl?: string;
 }) {
-    const user = await assertActiveStaff();
-    const cat = await prisma.selectionCategory.findUnique({ where: { id: categoryId }, include: { board: true } });
-    if (!cat) throw new Error("Category not found");
-    if (!canAccessProject(user, cat.board.projectId)) throw new Error("Forbidden");
     const maxOrder = await prisma.selectionOption.aggregate({
         where: { categoryId },
         _max: { order: true },
@@ -9438,7 +9411,8 @@ export async function createSelectionOption(categoryId: string, data: {
             order: (maxOrder._max.order ?? -1) + 1,
         },
     });
-    revalidatePath(`/projects/${cat.board.projectId}/selections`);
+    const cat = await prisma.selectionCategory.findUnique({ where: { id: categoryId }, include: { board: true } });
+    if (cat) revalidatePath(`/projects/${cat.board.projectId}/selections`);
     return option;
 }
 
@@ -9450,31 +9424,22 @@ export async function updateSelectionOption(id: string, data: {
     vendorUrl?: string;
     selected?: boolean;
 }) {
-    const user = await assertActiveStaff();
-    const existing = await prisma.selectionOption.findUnique({
-        where: { id },
-        include: { category: { include: { board: true } } },
-    });
-    if (!existing) throw new Error("Option not found");
-    if (!canAccessProject(user, existing.category.board.projectId)) throw new Error("Forbidden");
     return await prisma.selectionOption.update({ where: { id }, data });
 }
 
 export async function deleteSelectionOption(id: string) {
-    const user = await assertActiveStaff();
     const option = await prisma.selectionOption.findUnique({
         where: { id },
         include: { category: { include: { board: true } } },
     });
     if (!option) return { success: false };
-    if (!canAccessProject(user, option.category.board.projectId)) throw new Error("Forbidden");
     await prisma.selectionOption.delete({ where: { id } });
     revalidatePath(`/projects/${option.category.board.projectId}/selections`);
     return { success: true };
 }
 
 export async function sendSelectionBoardToClient(boardId: string) {
-    const user = await assertActiveStaff();
+    await assertActiveStaff();
 
     const board = await prisma.selectionBoard.findUnique({
         where: { id: boardId },
@@ -9484,7 +9449,6 @@ export async function sendSelectionBoardToClient(boardId: string) {
         },
     });
     if (!board) throw new Error("Board not found");
-    if (!canAccessProject(user, board.projectId)) throw new Error("Forbidden");
 
     if (board.categories.length === 0) {
         throw new Error("Add at least one category before sending.");
@@ -10884,26 +10848,17 @@ export async function flagDecision(decisionId: string, pmNote: string) {
     return { success: true };
 }
 
-export async function addTeamCandidate(decisionId: string | null, data: {
+export async function addTeamCandidate(decisionId: string, data: {
     name: string;
     description?: string;
     imageUrl?: string;
     price?: number;
     vendorUrl?: string;
-    projectId?: string;
 }) {
     const user = await assertActiveStaff();
-
-    let projectId: string;
-    if (decisionId) {
-        const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { id: true, projectId: true, deletedAt: true } });
-        if (!decision || decision.deletedAt) throw new Error("Decision not found");
-        projectId = decision.projectId;
-    } else {
-        if (!data.projectId) throw new Error("projectId is required when not adding into a decision");
-        projectId = data.projectId;
-    }
-    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    const decision = await prisma.decision.findUnique({ where: { id: decisionId }, select: { id: true, projectId: true, deletedAt: true } });
+    if (!decision || decision.deletedAt) throw new Error("Decision not found");
+    if (!canAccessProject(user, decision.projectId)) throw new Error("Forbidden");
 
     const name = data.name?.trim();
     if (!name) throw new Error("Name is required");
@@ -10912,8 +10867,8 @@ export async function addTeamCandidate(decisionId: string | null, data: {
     // candidate, lands as Idea alongside the client's own picks.
     const candidate = await prisma.selectionProposal.create({
         data: {
-            projectId,
-            decisionId: decisionId || null,
+            projectId: decision.projectId,
+            decisionId: decision.id,
             name: name.slice(0, 200),
             description: data.description?.trim() || null,
             imageUrl: safeUrlOrNull(data.imageUrl),
@@ -10923,11 +10878,11 @@ export async function addTeamCandidate(decisionId: string | null, data: {
         },
     });
 
-    revalidatePath(`/projects/${projectId}/selections`);
-    revalidatePath(`/portal/projects/${projectId}/selections`);
+    revalidatePath(`/projects/${decision.projectId}/selections`);
+    revalidatePath(`/portal/projects/${decision.projectId}/selections`);
 
     await logActivity({
-        projectId,
+        projectId: decision.projectId,
         actorType: "TEAM",
         actorName: user.name || user.email,
         action: "added_team_candidate",
