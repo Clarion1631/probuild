@@ -61,7 +61,7 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
     return (
         <div className="relative">
             <div className="inline-flex items-center rounded-lg shadow-sm">
-                <button onClick={onAddTask} disabled={isAdding} className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-l-lg focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10">+ Task</button>
+                <button onClick={onAddTask} disabled={isAdding} className="inline-flex items-center justify-center h-[30px] px-4 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-l-lg focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10">+ Task</button>
                 <button
                     ref={btnRef}
                     onClick={() => {
@@ -72,7 +72,7 @@ function AddTaskDropdown({ isAdding, onAddTask, onAddMilestone }: { isAdding: bo
                         setOpen(v => !v);
                     }}
                     disabled={isAdding}
-                    className="inline-flex items-center justify-center px-2.5 py-2 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-r-lg border-l border-indigo-400/40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10"
+                    className="inline-flex items-center justify-center h-[30px] px-2.5 text-sm font-medium bg-slate-900 text-white hover:bg-slate-800 transition-colors rounded-r-lg border-l border-indigo-400/40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-900 focus:z-10"
                 >
                     <svg width="8" height="8" viewBox="0 0 12 12" fill="currentColor"><path d="M6 8.5L1.5 4h9z"/></svg>
                 </button>

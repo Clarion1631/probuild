@@ -32,6 +32,11 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editName, setEditName] = useState("");
     const [colorPickerId, setColorPickerId] = useState<string | null>(null);
+    // Anchor for the portalled color picker. The task list is a scroll pane
+    // nested in an overflow-hidden shell, so an absolutely-positioned panel is
+    // clipped for rows near the bottom. Only one picker is open at a time, so
+    // the ref attaches to the open row's swatch and is null otherwise.
+    const colorAnchorRef = useRef<HTMLButtonElement | null>(null);
     const [editingHoursId, setEditingHoursId] = useState<string | null>(null);
     const [editHoursVal, setEditHoursVal] = useState("");
     const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
@@ -348,14 +353,14 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                                 >
                                     <div className="relative mr-2">
                                         {task.type === "milestone" ? (
-                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-4 h-4 flex items-center justify-center" title="Milestone">
+                                            <button ref={colorPickerId === task.id ? colorAnchorRef : undefined} onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className="w-4 h-4 flex items-center justify-center" title="Milestone">
                                                 <div className="w-3 h-3 rotate-45 border-2" style={{ backgroundColor: task.color, borderColor: task.color }} />
                                             </button>
                                         ) : (
-                                            <button onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
+                                            <button ref={colorPickerId === task.id ? colorAnchorRef : undefined} onClick={e => { e.stopPropagation(); setColorPickerId(colorPickerId === task.id ? null : task.id); }} className={`w-3 h-3 rounded-full border-2 border-white shadow-sm ring-1 ${task.color?.toLowerCase() === "#ffffff" ? "ring-slate-400" : "ring-slate-200"}`} style={{ backgroundColor: task.color }} />
                                         )}
                                         {colorPickerId === task.id && (
-                                            <ColorPicker selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} className="absolute top-5 left-0 z-50 min-w-[200px]" />
+                                            <ColorPicker selected={task.color} onPick={c => actions.handleColorChange(task.id, c)} onClose={() => setColorPickerId(null)} anchorRef={colorAnchorRef} align="left" />
                                         )}
                                     </div>
                                     <div className="flex-1 min-w-0">

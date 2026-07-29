@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState, type RefObject } from "react";
+import { FloatingLayer } from "@/components/FloatingLayer";
 import type { Task } from "./schedule-types";
 
 export type DependencyPickerProps = {
@@ -8,6 +9,8 @@ export type DependencyPickerProps = {
     allTasks: Task[];
     onPick: (predecessorId: string) => void;
     onClose: () => void;
+    /** Trigger element the panel is anchored to. Callers sit inside scroll containers, so the panel is portalled rather than absolutely positioned. */
+    anchorRef: RefObject<HTMLElement | null>;
     align?: "left" | "right";
 };
 
@@ -31,9 +34,8 @@ function getReachableSuccessors(taskId: string, tasks: Task[]): Set<string> {
     return reachable;
 }
 
-export default function DependencyPicker({ task, allTasks, onPick, onClose, align = "right" }: DependencyPickerProps) {
+export default function DependencyPicker({ task, allTasks, onPick, onClose, anchorRef, align = "right" }: DependencyPickerProps) {
     const [query, setQuery] = useState("");
-    const ref = useRef<HTMLDivElement>(null);
 
     const candidates = useMemo(() => {
         const existing = new Set(task.dependencies.map(d => d.predecessorId));
@@ -47,24 +49,15 @@ export default function DependencyPicker({ task, allTasks, onPick, onClose, alig
         );
     }, [task.id, task.dependencies, allTasks, query]);
 
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-        }
-        function handleKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleKey);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleKey);
-        };
-    }, [onClose]);
+    // Escape and outside-pointerdown dismissal live in FloatingLayer.
 
     return (
-        <div
-            ref={ref}
-            className={`absolute ${align === "right" ? "right-0" : "left-0"} top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 min-w-[260px] max-h-72 overflow-hidden flex flex-col animate-in fade-in`}
-            onClick={e => e.stopPropagation()}
+        <FloatingLayer
+            open
+            anchorRef={anchorRef}
+            onClose={onClose}
+            align={align}
+            className="min-w-[260px] bg-white border border-hui-border rounded-lg shadow-xl flex flex-col animate-in fade-in"
         >
             <div className="p-2 border-b border-slate-100">
                 <input
@@ -76,7 +69,8 @@ export default function DependencyPicker({ task, allTasks, onPick, onClose, alig
                     className="hui-input text-xs w-full py-1"
                 />
             </div>
-            <div className="overflow-y-auto py-1">
+            {/* No scroller here — FloatingLayer caps the panel height and owns the scroll. */}
+            <div className="py-1">
                 {candidates.length === 0 ? (
                     <div className="px-3 py-2 text-xs text-slate-400 italic">
                         {allTasks.length <= 1
@@ -103,6 +97,6 @@ export default function DependencyPicker({ task, allTasks, onPick, onClose, alig
                     ))
                 )}
             </div>
-        </div>
+        </FloatingLayer>
     );
 }

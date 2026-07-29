@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
 import { CLIENT_STAGE_LABELS } from "@/lib/client-stages";
@@ -79,6 +79,10 @@ export default function TaskDetailPanel({
     const [estimateQuery, setEstimateQuery] = useState("");
     const [showPredecessorMenu, setShowPredecessorMenu] = useState(false);
     const [showColorPicker, setShowColorPicker] = useState(false);
+    // Anchors for the portalled popovers — this panel is a scroll container, so
+    // an absolutely-positioned panel would be clipped at its edge.
+    const colorAnchorRef = useRef<HTMLButtonElement | null>(null);
+    const predecessorAnchorRef = useRef<HTMLButtonElement | null>(null);
     const [newPunchName, setNewPunchName] = useState("");
     const [newComment, setNewComment] = useState("");
     const [nameDraft, setNameDraft] = useState(task.name);
@@ -176,6 +180,7 @@ export default function TaskDetailPanel({
                     <div className="relative shrink-0">
                         <button
                             type="button"
+                            ref={colorAnchorRef}
                             onClick={() => setShowColorPicker(v => !v)}
                             title="Change color"
                             className="block hover:scale-110 transition"
@@ -196,7 +201,8 @@ export default function TaskDetailPanel({
                                 selected={task.color}
                                 onPick={c => onColorChange(task.id, c)}
                                 onClose={() => setShowColorPicker(false)}
-                                className="absolute left-0 top-7 z-50 min-w-[200px]"
+                                anchorRef={colorAnchorRef}
+                                align="left"
                             />
                         )}
                     </div>
@@ -506,13 +512,14 @@ export default function TaskDetailPanel({
                                     <div className="flex items-center justify-between mb-2">
                                         <label className={SECTION_LABEL}>Predecessors</label>
                                         <div className="relative">
-                                            <button onClick={() => setShowPredecessorMenu(v => !v)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
+                                            <button ref={predecessorAnchorRef} onClick={() => setShowPredecessorMenu(v => !v)} className="text-xs text-indigo-600 font-semibold hover:text-indigo-800 transition">+ Add</button>
                                             {showPredecessorMenu && (
                                                 <DependencyPicker
                                                     task={task}
                                                     allTasks={allTasks}
                                                     onPick={(predId) => onLinkPredecessor(predId)}
                                                     onClose={() => setShowPredecessorMenu(false)}
+                                                    anchorRef={predecessorAnchorRef}
                                                 />
                                             )}
                                         </div>
