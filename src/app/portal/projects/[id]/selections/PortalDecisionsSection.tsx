@@ -20,6 +20,7 @@ import {
     unchooseItem,
     archiveItem,
     unarchiveItem,
+    deleteItem,
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
@@ -46,6 +47,7 @@ import {
 
 interface Candidate {
     id: string;
+    projectId: string;
     name: string;
     description: string | null;
     imageUrl: string | null;
@@ -71,6 +73,10 @@ interface DecisionData {
 
 const ARCHIVED = "Archived";
 const TERMINAL_STATUSES = ["Ordered", "Received"];
+const CLIPPER_COLLAPSED_KEY = "probuild.portal.clipperCollapsed";
+// Sentinel for MoveToPicker's inline "＋ New category" option — a real
+// decision id is a cuid, so it can never collide, and "" is already Unsorted.
+const NEW_DECISION = "__new__";
 
 function statusChip(status: string): { label: string; className: string } {
     switch (status) {
@@ -114,8 +120,18 @@ function MoveToPicker({
     onMoved: () => void;
 }) {
     const [moving, setMoving] = useState(false);
+    // Inline "＋ New category" so an item is never stranded: with no decisions
+    // on the project yet, this select used to offer exactly one option — the
+    // Unsorted the item was already in — while the card told the client to
+    // "move it into a decision to choose it".
+    const [creating, setCreating] = useState(false);
+    const [newName, setNewName] = useState("");
 
     async function handleChange(value: string) {
+        if (value === NEW_DECISION) {
+            setCreating(true);
+            return;
+        }
         const targetId = value === "" ? null : value;
         if (targetId === currentDecisionId) return;
         setMoving(true);
@@ -125,6 +141,24 @@ function MoveToPicker({
             onMoved();
         } catch (e: any) {
             toast.error(e.message || "Couldn't move that item.");
+        } finally {
+            setMoving(false);
+        }
+    }
+
+    async function handleCreateAndMove() {
+        const name = newName.trim();
+        if (!name) return;
+        setMoving(true);
+        try {
+            const decision = await createDecision(item.projectId, { name });
+            await assignItemToDecision(item.id, decision.id);
+            toast.success(`Moved into "${name}"`);
+            setCreating(false);
+            setNewName("");
+            onMoved();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't create that category.");
         } finally {
             setMoving(false);
         }
@@ -141,6 +175,40 @@ function MoveToPicker({
         ? [{ id: currentDecisionId, name: currentDecisionName || "This decision" }, ...decisions]
         : decisions;
 
+    if (creating) {
+        return (
+            <div className="mt-2 flex items-center gap-1.5">
+                <input
+                    type="text"
+                    value={newName}
+                    onChange={(e) => setNewName(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === "Enter") handleCreateAndMove();
+                        if (e.key === "Escape") setCreating(false);
+                    }}
+                    placeholder="Category name"
+                    className="hui-input text-xs py-1 flex-1 min-w-0"
+                    disabled={moving}
+                    autoFocus
+                />
+                <button
+                    onClick={handleCreateAndMove}
+                    disabled={moving || !newName.trim()}
+                    className="hui-btn hui-btn-green text-xs py-1 px-2 shrink-0 disabled:opacity-50"
+                >
+                    {moving ? "…" : "Add"}
+                </button>
+                <button
+                    onClick={() => { setCreating(false); setNewName(""); }}
+                    disabled={moving}
+                    className="text-xs text-hui-textMuted hover:text-hui-textMain shrink-0 px-1 disabled:opacity-50"
+                >
+                    <X className="w-3.5 h-3.5" />
+                </button>
+            </div>
+        );
+    }
+
     return (
         <select
             className="hui-input text-xs py-1 w-full mt-2"
@@ -153,6 +221,7 @@ function MoveToPicker({
             {options.map((d) => (
                 <option key={d.id} value={d.id}>{d.name}</option>
             ))}
+            <option value={NEW_DECISION}>＋ New category…</option>
         </select>
     );
 }
@@ -300,6 +369,11 @@ function CandidateCard({
 function ArchivedTray({ items, onChanged }: { items: Candidate[]; onChanged: () => void }) {
     const [open, setOpen] = useState(false);
     const [busyId, setBusyId] = useState<string | null>(null);
+    // Two-step inline confirm rather than window.confirm() — delete is
+    // recoverable (soft delete, see deleteItem) so a modal is overkill, and a
+    // native confirm() dialog blocks the page for anything driving this
+    // headlessly.
+    const [confirmingId, setConfirmingId] = useState<string | null>(null);
 
     if (items.length === 0) return null;
 
@@ -311,6 +385,20 @@ function ArchivedTray({ items, onChanged }: { items: Candidate[]; onChanged: () 
             onChanged();
         } catch (e: any) {
             toast.error(e.message || "Couldn't unarchive that item.");
+        } finally {
+            setBusyId(null);
+        }
+    }
+
+    async function handleDelete(id: string) {
+        setBusyId(id);
+        try {
+            await deleteItem(id);
+            toast.success("Deleted");
+            setConfirmingId(null);
+            onChanged();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't delete that item.");
         } finally {
             setBusyId(null);
         }
@@ -330,14 +418,44 @@ function ArchivedTray({ items, onChanged }: { items: Candidate[]; onChanged: () 
                     {items.map((item) => (
                         <div key={item.id} className="flex items-center justify-between gap-2 text-xs bg-slate-50 rounded-md px-2.5 py-1.5">
                             <span className="text-hui-textMuted truncate">{item.name}</span>
-                            <button
-                                onClick={() => handleUnarchive(item.id)}
-                                disabled={busyId === item.id}
-                                className="shrink-0 text-hui-primary hover:underline flex items-center gap-1 disabled:opacity-50"
-                            >
-                                <ArchiveRestore className="w-3 h-3" />
-                                Unarchive
-                            </button>
+                            {confirmingId === item.id ? (
+                                <span className="shrink-0 flex items-center gap-2">
+                                    <button
+                                        onClick={() => handleDelete(item.id)}
+                                        disabled={busyId === item.id}
+                                        className="text-red-600 font-medium hover:underline disabled:opacity-50"
+                                    >
+                                        {busyId === item.id ? "Deleting…" : "Delete for good"}
+                                    </button>
+                                    <button
+                                        onClick={() => setConfirmingId(null)}
+                                        disabled={busyId === item.id}
+                                        className="text-hui-textMuted hover:underline disabled:opacity-50"
+                                    >
+                                        Cancel
+                                    </button>
+                                </span>
+                            ) : (
+                                <span className="shrink-0 flex items-center gap-2.5">
+                                    <button
+                                        onClick={() => handleUnarchive(item.id)}
+                                        disabled={busyId === item.id}
+                                        className="text-hui-primary hover:underline flex items-center gap-1 disabled:opacity-50"
+                                    >
+                                        <ArchiveRestore className="w-3 h-3" />
+                                        Unarchive
+                                    </button>
+                                    <button
+                                        onClick={() => setConfirmingId(item.id)}
+                                        disabled={busyId === item.id}
+                                        title="Delete this item"
+                                        className="text-hui-textMuted hover:text-red-600 flex items-center gap-1 disabled:opacity-50"
+                                    >
+                                        <Trash2 className="w-3 h-3" />
+                                        Delete
+                                    </button>
+                                </span>
+                            )}
                         </div>
                     ))}
                 </div>
@@ -655,6 +773,30 @@ export default function PortalDecisionsSection({
     const [addDecisionOpen, setAddDecisionOpen] = useState(false);
     const [addUnsortedOpen, setAddUnsortedOpen] = useState(false);
     const [reordering, setReordering] = useState(false);
+    // Expanded by default so a first-time client still finds the clipper, but
+    // the collapse sticks per device once they've set it up — the setup blurb
+    // is a one-time read that otherwise pushes their actual selections below
+    // the fold on every visit. Read in an effect, not in the useState
+    // initializer: localStorage doesn't exist during SSR, and seeding state
+    // from it directly would hydrate-mismatch.
+    const [clipperOpen, setClipperOpen] = useState(true);
+
+    useEffect(() => {
+        try {
+            if (localStorage.getItem(CLIPPER_COLLAPSED_KEY) === "1") setClipperOpen(false);
+        } catch {
+            // Private mode / storage disabled — just leave it expanded.
+        }
+    }, []);
+
+    useEffect(() => {
+        try {
+            if (clipperOpen) localStorage.removeItem(CLIPPER_COLLAPSED_KEY);
+            else localStorage.setItem(CLIPPER_COLLAPSED_KEY, "1");
+        } catch {
+            // Non-fatal — the toggle still works for this session.
+        }
+    }, [clipperOpen]);
 
     const bookmarkletHref = buildClipperBookmarklet({
         origin: appUrl,
@@ -715,41 +857,55 @@ export default function PortalDecisionsSection({
     return (
         <div>
             <div className="hui-card p-5 mb-6">
-                <div className="flex items-center justify-between gap-6 flex-wrap pb-4 border-b border-hui-border">
-                    <div className="flex items-center gap-4">
+                <div className={`flex items-center justify-between gap-6 flex-wrap ${clipperOpen ? "pb-4 border-b border-hui-border" : "pb-3 border-b border-hui-border"}`}>
+                    <div className="flex items-center gap-4 min-w-0">
                         <div className="w-11 h-11 bg-hui-primary/10 rounded-xl flex items-center justify-center shrink-0">
                             <Link2 className="w-5 h-5 text-hui-primary" />
                         </div>
-                        <div>
-                            <h2 className="text-base font-semibold text-hui-textMain">Get the Clipper</h2>
-                            <p className="text-sm text-hui-textMuted mt-0.5 max-w-md">
-                                Found something while shopping? Drag the ProBuild Clip button to your bookmarks bar.
-                                <br />
-                                On any product page, click it and the item lands right here for you to sort.
-                                <br />
-                                Dragging not working on your device? Tap Copy, then make a new bookmark and paste it in as the URL.
-                            </p>
+                        <div className="min-w-0">
+                            <button
+                                type="button"
+                                onClick={() => setClipperOpen((v) => !v)}
+                                aria-expanded={clipperOpen}
+                                className="text-base font-semibold text-hui-textMain flex items-center gap-1 hover:text-hui-primary transition"
+                            >
+                                {clipperOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                                Get the Clipper
+                            </button>
+                            {clipperOpen ? (
+                                <p className="text-sm text-hui-textMuted mt-0.5 max-w-md">
+                                    Found something while shopping? Drag the ProBuild Clip button to your bookmarks bar.
+                                    <br />
+                                    On any product page, click it and the item lands right here for you to sort.
+                                    <br />
+                                    Dragging not working on your device? Tap Copy, then make a new bookmark and paste it in as the URL.
+                                </p>
+                            ) : (
+                                <p className="text-xs text-hui-textMuted mt-0.5 ml-5">Clip items straight from any store page.</p>
+                            )}
                         </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                        <ClipperDragLink
-                            href={bookmarkletHref}
-                            className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
-                            title="Drag me to your bookmarks bar"
-                        >
-                            <Link2 className="w-4 h-4" />
-                            ProBuild Clip
-                        </ClipperDragLink>
-                        <button
-                            type="button"
-                            onClick={handleCopyBookmarklet}
-                            className="hui-btn hui-btn-secondary flex items-center gap-2"
-                            title="Copy the clipper code"
-                        >
-                            <Copy className="w-4 h-4" />
-                            Copy
-                        </button>
-                    </div>
+                    {clipperOpen && (
+                        <div className="flex items-center gap-2 shrink-0">
+                            <ClipperDragLink
+                                href={bookmarkletHref}
+                                className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
+                                title="Drag me to your bookmarks bar"
+                            >
+                                <Link2 className="w-4 h-4" />
+                                ProBuild Clip
+                            </ClipperDragLink>
+                            <button
+                                type="button"
+                                onClick={handleCopyBookmarklet}
+                                className="hui-btn hui-btn-secondary flex items-center gap-2"
+                                title="Copy the clipper code"
+                            >
+                                <Copy className="w-4 h-4" />
+                                Copy
+                            </button>
+                        </div>
+                    )}
                 </div>
                 <div className="flex items-center justify-between gap-3 flex-wrap pt-4">
                     <div>
@@ -795,20 +951,10 @@ export default function PortalDecisionsSection({
                 </div>
             ) : (
                 <div className="space-y-5">
-                    {decisions.map((decision, i) => (
-                        <DecisionCard
-                            key={decision.id}
-                            decision={decision}
-                            allDecisions={decisions.filter((d) => d.id !== decision.id)}
-                            isFirst={i === 0}
-                            isLast={i === decisions.length - 1}
-                            reordering={reordering}
-                            projectId={projectId}
-                            onChanged={refresh}
-                            onMove={(direction) => handleMoveDecision(decision.id, direction)}
-                        />
-                    ))}
-
+                    {/* Unsorted sits ABOVE the decisions, not below: it's the
+                        inbox for anything just clipped, so it's the one block
+                        that needs acting on. Burying it under a long list of
+                        decisions meant new clips went unnoticed. */}
                     {(activeUnsorted.length > 0 || archivedUnsorted.length > 0) && (
                         <div className="hui-card p-5">
                             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -846,6 +992,20 @@ export default function PortalDecisionsSection({
                             <ArchivedTray items={archivedUnsorted} onChanged={refresh} />
                         </div>
                     )}
+
+                    {decisions.map((decision, i) => (
+                        <DecisionCard
+                            key={decision.id}
+                            decision={decision}
+                            allDecisions={decisions.filter((d) => d.id !== decision.id)}
+                            isFirst={i === 0}
+                            isLast={i === decisions.length - 1}
+                            reordering={reordering}
+                            projectId={projectId}
+                            onChanged={refresh}
+                            onMove={(direction) => handleMoveDecision(decision.id, direction)}
+                        />
+                    ))}
                 </div>
             )}
 

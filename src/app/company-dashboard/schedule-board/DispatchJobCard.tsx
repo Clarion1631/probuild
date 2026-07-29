@@ -4,6 +4,7 @@ import Link from "next/link";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import type { DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import { getFallbackProjectColor } from "@/app/projects/[id]/schedule/schedule-utils";
+import { classifyTaskEvidence, findContradiction, type EvidenceState } from "@/lib/task-evidence";
 
 const STATUS_STYLES: Record<string, string> = {
     "Not Started": "bg-slate-100 text-slate-700",
@@ -16,9 +17,45 @@ function initials(name: string): string {
     return name.split(/\s+/).filter(Boolean).map(part => part[0]).join("").toUpperCase().slice(0, 2) || "?";
 }
 
+// Evidence badge sits beside the materials badge — per-task indicators belong on
+// the dispatch card, never on the calendar chips (board no-clutter contract, and
+// it keeps drag geometry untouched).
+function describeTaskEvidence(
+    task: DashboardTaskRow,
+    parentIds: ReadonlySet<string>,
+    dayKey: string,
+): { state: EvidenceState; label: string; tone: string; title: string } | null {
+    const input = {
+        id: task.id,
+        startDate: task.startDate,
+        endDate: task.endDate,
+        status: task.status,
+        type: task.type,
+        parentId: task.parentId,
+        lastDirectEvidenceAt: task.lastDirectEvidenceAt,
+        lastIndirectEvidenceAt: task.lastIndirectEvidenceAt,
+    };
+    const state = classifyTaskEvidence(input, parentIds, dayKey);
+    const seenOn = task.lastDirectEvidenceAt?.slice(0, 10);
+    switch (state) {
+        case "confirmed":
+            return { state, label: "✓ confirmed", tone: "bg-green-100 text-green-700", title: `Field activity on ${seenOn}` };
+        case "stale":
+            return { state, label: "going stale", tone: "bg-amber-100 text-amber-800", title: `Last field activity ${seenOn}` };
+        case "unknown":
+            return { state, label: "no field update", tone: "bg-slate-100 text-slate-600", title: "No hours or punch-item activity has landed on this task" };
+        case "needsReview":
+            return { state, label: "needs review", tone: "bg-red-100 text-red-700", title: findContradiction(input) ?? "Evidence disagrees with the board" };
+        default:
+            return null;
+    }
+}
+
 interface DispatchJobCardProps {
     project: DashboardProjectRow;
     tasks: DashboardTaskRow[];
+    /** Local day the dispatch view is showing; drives evidence freshness. */
+    dayKey: string;
     highlighted: boolean;
     canCreate: boolean;
     crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
@@ -32,6 +69,7 @@ interface DispatchJobCardProps {
 export function DispatchJobCard({
     project,
     tasks,
+    dayKey,
     highlighted,
     canCreate,
     crewDrafts,
@@ -42,6 +80,9 @@ export function DispatchJobCard({
     onDraftCrewRemove,
 }: DispatchJobCardProps) {
     const projectColor = project.color || getFallbackProjectColor(project.id);
+    // Parents come from the FULL project task list, not today's filtered subset —
+    // a phase parent whose children are elsewhere in the week must still be excluded.
+    const taskParentIds = new Set(project.tasks.map(task => task.parentId).filter((id): id is string => !!id));
 
     return (
         <article
@@ -82,6 +123,7 @@ export function DispatchJobCard({
                             : task.pendingMaterials > 0
                                 ? "bg-amber-100 text-amber-800"
                                 : "bg-green-100 text-green-700";
+                        const evidenceBadge = describeTaskEvidence(task, taskParentIds, dayKey);
                         return (
                             <section key={task.id} data-dispatch-task-id={task.id} className="px-4 py-3">
                                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -100,6 +142,15 @@ export function DispatchJobCard({
                                                     title={`${task.stagedMaterials} staged, ${task.pendingMaterials} pending, ${task.missingMaterials} missing`}
                                                 >
                                                     {"\u{1F4E6}"} {materialCount} {"\u00B7"} {task.missingMaterials} missing
+                                                </span>
+                                            )}
+                                            {evidenceBadge && (
+                                                <span
+                                                    data-evidence-state={evidenceBadge.state}
+                                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${evidenceBadge.tone}`}
+                                                    title={evidenceBadge.title}
+                                                >
+                                                    {evidenceBadge.label}
                                                 </span>
                                             )}
                                         </div>

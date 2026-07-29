@@ -10,6 +10,15 @@ import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
 import {
+    MAX_UPLOAD_BASE64_CHARS,
+    uploadProjectFileCore,
+    uploadProjectFilesCore,
+} from "@/lib/project-file-core";
+import {
+    MCP_ACTOR_EMAILS,
+    type McpActorLabel,
+} from "@/lib/mcp-actor";
+import {
     applyChangeOrderToScheduleWithConfirmation,
     assignProjectCrewWithConfirmation,
     assignTaskCrew,
@@ -21,6 +30,16 @@ import {
     setTaskStatus,
     updateTaskDates,
 } from "@/lib/mcp-schedule-tools";
+import {
+    addPunchItemsWithConfirmation,
+    createDailyLogWithConfirmation,
+    createFolderWithConfirmation,
+    getProjectContacts,
+    listDailyLogs,
+    listProjectFiles,
+    listPunchItems,
+    moveFileWithConfirmation,
+} from "@/lib/mcp-pm-tools";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -85,7 +104,27 @@ const milestoneSchema = z.object({
     percentage: z.number().positive().max(100).describe("Percent of the estimate total; all milestones together must sum to exactly 100"),
 });
 
-const handler = createMcpHandler(
+type RouteMcpActor = {
+    actorLabel: McpActorLabel;
+    resolveActorUserId: () => Promise<string | null>;
+};
+
+function createRouteMcpActor(actorLabel: McpActorLabel): RouteMcpActor {
+    let actorUserId: Promise<string | null> | null = null;
+    return {
+        actorLabel,
+        resolveActorUserId: () => {
+            actorUserId ??= prisma.user.findUnique({
+                where: { email: MCP_ACTOR_EMAILS[actorLabel] },
+                select: { id: true },
+            }).then(user => user?.id ?? null);
+            return actorUserId;
+        },
+    };
+}
+
+function createHandler(actor: RouteMcpActor) {
+    return createMcpHandler(
     server => {
         server.registerTool(
             "list_projects",
@@ -398,7 +437,13 @@ const handler = createMcpHandler(
                         instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
                 }
-                const result = await sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, { reconcile }, "ChatGPT connector");
+                const result = await sendMilestoneInvoicesCore(
+                    invoiceId,
+                    paymentScheduleIds,
+                    overrideEmail,
+                    { reconcile },
+                    `SYSTEM:${actor.actorLabel}`,
+                );
                 return textResult(result);
             },
         );
@@ -644,7 +689,10 @@ const handler = createMcpHandler(
                     undefined,
                     customMessage,
                     undefined,
-                    process.env.MCP_SECRET,
+                    actor.actorLabel === "richard-ai"
+                        ? process.env.MCP_SECRET_RICHARD
+                        : process.env.MCP_SECRET,
+                    actor.actorLabel,
                 );
                 if (!result.success) return { ...textResult({ error: result.error }), isError: true };
                 return textResult({ ...result, note: "The customer reviews and signs via the portal link; signing auto-creates the invoice in ProBuild." });
@@ -915,107 +963,270 @@ const handler = createMcpHandler(
                     projectId: z.string().max(50).optional().describe("Target project id from list_projects / find_job (omit if using leadId)"),
                     leadId: z.string().max(50).optional().describe("Target lead id from list_leads / find_job (omit if using projectId)"),
                     fileName: z.string().min(1).max(200).describe("File name WITH extension, e.g. 'RFQ-plumbing-sub.pdf'. Allowed: pdf, doc/docx, xls/xlsx, csv, jpg/png/gif/webp/heic, txt, rtf, dwg, dxf"),
-                    contentBase64: z.string().min(1).max(4_400_000).describe("The file's raw bytes, standard base64-encoded (no data: URL prefix). Max ~3 MB decoded."),
+                    contentBase64: z.string().min(1).max(MAX_UPLOAD_BASE64_CHARS).describe("The file's raw bytes, standard base64-encoded (no data: URL prefix). Max ~3 MB decoded."),
                     folder: z.string().max(120).optional().describe("Optional top-level folder name on the job's Files tab, e.g. 'RFQs' — found case-insensitively or created"),
                     visibility: z.enum(["team", "shared"]).optional().describe("'team' = internal only (default); 'shared' = the customer sees it in their portal"),
                 },
             },
-            async ({ projectId, leadId, fileName, contentBase64, folder, visibility }) => {
-                if ((projectId ? 1 : 0) + (leadId ? 1 : 0) !== 1) {
-                    return { ...textResult({ error: "Provide exactly one of projectId or leadId (use find_job / list_projects / list_leads to resolve the target)." }), isError: true };
-                }
-                const ext = fileExtension(fileName);
-                if (!ALLOWED_FILE_EXTENSIONS.has(ext)) {
-                    return { ...textResult({ error: `File type "${ext || "(no extension)"}" not allowed. Allowed: ${[...ALLOWED_FILE_EXTENSIONS].join(", ")}.` }), isError: true };
-                }
-                // Closed/won jobs are accepted on purpose — find_job surfaces them and
-                // parking documents on a finished job is a normal filing action.
-                let targetProjectId: string | null = projectId ?? null;
-                let targetLeadId: string | null = leadId ?? null;
-                let movedToProjectNote: string | null = null;
-                if (targetProjectId) {
-                    const project = await prisma.project.findUnique({ where: { id: targetProjectId }, select: { id: true } });
-                    if (!project) return { ...textResult({ error: `No project with id ${targetProjectId}. Use find_job or list_projects.` }), isError: true };
-                } else {
-                    const lead = await prisma.lead.findUnique({ where: { id: targetLeadId! }, select: { id: true } });
-                    if (!lead) return { ...textResult({ error: `No lead with id ${targetLeadId}. Use find_job or list_leads.` }), isError: true };
-                    // A won lead becomes a project, and the customer portal only reads
-                    // project-owned folders — a "shared" folder filed on the lead would
-                    // be unreachable. Normalize converted leads to their project.
-                    const linkedProject = await prisma.project.findFirst({ where: { leadId: targetLeadId! }, select: { id: true, name: true } });
-                    if (linkedProject) {
-                        movedToProjectNote = `This lead was already converted to project "${linkedProject.name}" — the file was filed on the project.`;
-                        targetProjectId = linkedProject.id;
-                        targetLeadId = null;
-                    }
-                }
-
-                const b64 = contentBase64.replace(/\s+/g, "");
-                if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
-                    return { ...textResult({ error: "contentBase64 is not valid base64 — send the file's raw bytes standard-base64-encoded, without a data: URL prefix." }), isError: true };
-                }
-                const buffer = Buffer.from(b64, "base64");
-                if (buffer.length === 0) {
-                    return { ...textResult({ error: "contentBase64 decoded to 0 bytes." }), isError: true };
-                }
-                const MAX_UPLOAD_BYTES = 3_300_000; // stays under Vercel's 4.5 MB request cap after base64 expansion
-                if (buffer.length > MAX_UPLOAD_BYTES) {
-                    return { ...textResult({ error: `File is ${(buffer.length / 1_000_000).toFixed(1)} MB — the connector accepts up to ~3 MB. Upload larger files in ProBuild directly.` }), isError: true };
-                }
-
-                // Always store an EXPLICIT visibility (never null/inherit): the portal
-                // shows null-visibility files inside shared folders, so inheriting
-                // could silently expose a file this tool just reported as internal.
-                const fileVisibility = visibility ?? "team";
-
-                let folderId: string | null = null;
-                const folderName = folder?.trim();
-                if (folderName) {
-                    const scope = { projectId: targetProjectId, leadId: targetLeadId, parentId: null };
-                    const existing = await prisma.fileFolder.findFirst({
-                        where: { ...scope, name: { equals: folderName, mode: "insensitive" } },
-                        select: { id: true, name: true, visibility: true },
-                    });
-                    // The portal only traverses SHARED folders — a shared file inside a
-                    // team folder would be unreachable by the customer. Refuse the
-                    // combination rather than silently flipping an existing folder to
-                    // shared (that would expose everything already in it).
-                    if (existing && fileVisibility === "shared" && existing.visibility !== "shared") {
-                        return { ...textResult({ error: `Folder "${existing.name}" is not a shared folder, so the customer could never see a shared file inside it. Upload the shared file without a folder, use a folder that is already shared, or drop visibility to keep it internal.` }), isError: true };
-                    }
-                    folderId = existing
-                        ? existing.id
-                        // A folder created for a shared upload is created shared (it
-                        // contains only what this tool puts in it); otherwise team.
-                        : (await prisma.fileFolder.create({ data: { name: folderName, ...scope, visibility: fileVisibility === "shared" ? "shared" : "team" }, select: { id: true } })).id;
-                }
-
-                const saved = await saveProjectFile({
-                    buffer,
-                    fileName,
-                    mimeType: mimeTypeForFileName(fileName),
-                    projectId: targetProjectId,
-                    leadId: targetLeadId,
-                    folderId,
-                    visibility: fileVisibility,
+            async args => {
+                const actorUserId = actor.actorLabel === "richard-ai"
+                    ? await actor.resolveActorUserId()
+                    : null;
+                const result = await uploadProjectFileCore({
+                    ...args,
+                    actor: { actorLabel: actor.actorLabel, actorUserId },
                 });
-                if (!saved.ok) return { ...textResult({ error: saved.error }), isError: true };
+                if (!result.ok) {
+                    return { ...textResult({ error: result.error }), isError: true };
+                }
+                return textResult(result.data);
+            },
+        );
 
-                const filesUrl = targetProjectId
-                    ? `https://probuild.goldentouchremodeling.com/projects/${targetProjectId}/files`
-                    : `https://probuild.goldentouchremodeling.com/leads/${targetLeadId}/files`;
-                return textResult({
-                    fileId: saved.file.id,
-                    name: saved.file.name,
-                    sizeBytes: saved.file.size,
-                    folder: folderName ?? null,
-                    visibility: fileVisibility,
-                    url: filesUrl,
-                    ...(movedToProjectNote ? { movedToProject: movedToProjectNote } : {}),
-                    note: fileVisibility === "shared"
-                        ? "This file IS visible to the customer (in the client portal, once the job has a project with the portal's Files section enabled)."
-                        : "Internal file — the customer cannot see it.",
+        server.registerTool(
+            "upload_files",
+            {
+                title: "Upload multiple documents to a job's Files tab",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Uploads 1–8 documents to a project's or lead's Files tab in one call, with a combined decoded limit of ~3 MB. " +
+                    "The whole batch is validated before storage starts; storage failures are returned per file so only failures need retrying. " +
+                    "Files are INTERNAL by default. visibility 'shared' is customer-visible and must only be used when the user explicitly asks. " +
+                    "Standard project folders are created implicitly when the project has no folders.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional().describe("Target project id (omit if using leadId)"),
+                    leadId: z.string().max(50).optional().describe("Target lead id (omit if using projectId)"),
+                    defaultFolder: z.string().max(120).optional().describe("Default top-level folder for files that omit their own folder"),
+                    files: z.array(z.object({
+                        fileName: z.string().min(1).max(200),
+                        contentBase64: z.string().min(1).max(MAX_UPLOAD_BASE64_CHARS),
+                        folder: z.string().max(120).optional(),
+                        visibility: z.enum(["team", "shared"]).optional(),
+                    })).min(1).max(8),
+                },
+            },
+            async args => {
+                const actorUserId = actor.actorLabel === "richard-ai"
+                    ? await actor.resolveActorUserId()
+                    : null;
+                const result = await uploadProjectFilesCore({
+                    ...args,
+                    actor: { actorLabel: actor.actorLabel, actorUserId },
                 });
+                if (!result.ok) {
+                    return { ...textResult({ error: result.error }), isError: true };
+                }
+                return textResult(result.results);
+            },
+        );
+
+        server.registerTool(
+            "list_project_files",
+            {
+                title: "List a job's folder tree and files",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns a project's or lead's folder tree and file metadata (id, name, size, mime type, visibility, folder, created date). " +
+                    "Standard project folders are created implicitly when a project has no folders. This tool NEVER returns URLs; file download is not available through MCP.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional(),
+                    leadId: z.string().max(50).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await listProjectFiles(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list project files" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "create_folder",
+            {
+                title: "Create a folder on a job's Files tab",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Creates a top-level or nested team/shared folder on one project or lead. A shared child cannot be placed under a team folder. " +
+                    "TWO-STEP, SINGLE-USE: call without confirmToken for a preview, show it to the user, then repeat the exact arguments with the token after approval.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional(),
+                    leadId: z.string().max(50).optional(),
+                    name: z.string().trim().min(1).max(120),
+                    parentFolderId: z.string().max(50).optional(),
+                    visibility: z.enum(["team", "shared"]).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await createFolderWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId: null },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to create folder" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "move_file",
+            {
+                title: "Move a file within the same job",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Moves a ProjectFile to another folder (or the top level) on the SAME project/lead. Cross-job moves are refused. " +
+                    "A team file cannot move into a shared folder unless the same call explicitly passes visibility 'shared'; shared files cannot be hidden inside team folders. " +
+                    "TWO-STEP, SINGLE-USE: preview first, show the user, then repeat the exact arguments with confirmToken after approval.",
+                inputSchema: {
+                    fileId: z.string().max(50),
+                    folderId: z.string().max(50).nullable().describe("Destination folder id, or null for the job's top level"),
+                    visibility: z.enum(["team", "shared"]).optional().describe("Explicitly pass 'shared' to approve a customer-visibility change"),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await moveFileWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId: null },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to move file" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "list_daily_logs",
+            {
+                title: "List project daily logs",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Lists one project's daily logs with date, weather, crew on site, work performed, deliveries, issues, photo count, and portal-sharing state.",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                    since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
+                    limit: z.number().int().min(1).max(100).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await listDailyLogs(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list daily logs" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "create_daily_log",
+            {
+                title: "Create a project daily log",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Creates an internal daily log on a project. sharedToPortal is deliberately not exposed; portal sharing remains a human in-app decision. " +
+                    "Attach photos by ProjectFile id after upload_files—bytes are not re-sent. Every photo must be an image on the same project. " +
+                    "TWO-STEP, SINGLE-USE: preview first, show the user, then repeat the exact arguments with confirmToken after approval.",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                    weather: z.string().max(300).optional(),
+                    crewOnSite: z.string().max(1000).optional(),
+                    workPerformed: z.string().trim().min(1).max(20_000),
+                    materialsDelivered: z.string().max(20_000).optional(),
+                    issues: z.string().max(20_000).optional(),
+                    photos: z.array(z.object({
+                        fileId: z.string().max(50),
+                        caption: z.string().max(500).optional(),
+                    })).max(20).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    const actorUserId = await actor.resolveActorUserId();
+                    return textResult(await createDailyLogWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to create daily log" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "list_punch_items",
+            {
+                title: "List punch items by task or project",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Lists open, completed, or all punch items for exactly one task or project, including completedAt. This is read-only field evidence.",
+                inputSchema: {
+                    taskId: z.string().max(50).optional(),
+                    projectId: z.string().max(50).optional(),
+                    status: z.enum(["open", "completed", "all"]).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await listPunchItems(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list punch items" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "add_punch_items",
+            {
+                title: "Add punch items to a task",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Adds 1–30 ordered punch items to one schedule task. TWO-STEP, SINGLE-USE: preview the entire list, show it to the user, then repeat the exact arguments with confirmToken after approval.",
+                inputSchema: {
+                    taskId: z.string().max(50),
+                    items: z.array(z.string().trim().min(1).max(500)).min(1).max(30),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    const actorUserId = await actor.resolveActorUserId();
+                    return textResult(await addPunchItemsWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to add punch items" }), isError: true };
+                }
+            },
+        );
+
+        // complete_punch_item is deliberately cut/not registered: completion is
+        // direct field evidence and must only follow a human-reported completion,
+        // never a model "tidying up" a punch list.
+
+        server.registerTool(
+            "get_project_contacts",
+            {
+                title: "Get project contacts",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns the client, manager, assigned crew, and task subcontractors for one project. PII boundary: no rates, budgets, licenses, or addresses beyond the project location.",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await getProjectContacts(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to get project contacts" }), isError: true };
+                }
             },
         );
 
@@ -1306,7 +1517,7 @@ const handler = createMcpHandler(
                 try {
                     // Pass the approved snapshot's fingerprint — the send action re-reads the
                     // contract and refuses if the text no longer matches what the user confirmed.
-                    const result = await sendContractToClient(contractId, undefined, fingerprint);
+                    const result = await sendContractToClient(contractId, undefined, fingerprint, actor.actorLabel);
                     return textResult({ ...result, note: "The client reviews and signs via the emailed portal link. Track status with list_contracts / get_contract." });
                 } catch (e) {
                     return { ...textResult({ error: e instanceof Error ? e.message : "Send failed" }), isError: true };
@@ -1432,7 +1643,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await planSchedule(args));
+                    return textResult(await planSchedule(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to plan schedule" }), isError: true };
                 }
@@ -1455,7 +1666,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await updateTaskDates(args));
+                    return textResult(await updateTaskDates(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to update task dates" }), isError: true };
                 }
@@ -1478,7 +1689,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await setTaskStatus(args));
+                    return textResult(await setTaskStatus(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to set task status" }), isError: true };
                 }
@@ -1501,7 +1712,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await assignTaskCrew(args));
+                    return textResult(await assignTaskCrew(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to assign task crew" }), isError: true };
                 }
@@ -1550,7 +1761,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await setProjectStartDateWithConfirmation(args));
+                    return textResult(await setProjectStartDateWithConfirmation(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to set project start date" }), isError: true };
                 }
@@ -1576,7 +1787,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await generateProjectScheduleWithConfirmation(args));
+                    return textResult(await generateProjectScheduleWithConfirmation(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to generate schedule" }), isError: true };
                 }
@@ -1599,7 +1810,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await assignProjectCrewWithConfirmation(args));
+                    return textResult(await assignProjectCrewWithConfirmation(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to assign crew" }), isError: true };
                 }
@@ -1623,7 +1834,7 @@ const handler = createMcpHandler(
             },
             async args => {
                 try {
-                    return textResult(await applyChangeOrderToScheduleWithConfirmation(args));
+                    return textResult(await applyChangeOrderToScheduleWithConfirmation(args, actor.actorLabel));
                 } catch (e: any) {
                     return { ...textResult({ error: e?.message ?? "Failed to apply change order to schedule" }), isError: true };
                 }
@@ -1631,7 +1842,7 @@ const handler = createMcpHandler(
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.12.0" },
+        serverInfo: { name: "probuild", version: "1.13.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -1653,6 +1864,10 @@ const handler = createMcpHandler(
             "once Approved, log_time/log_expense record cost-plus actuals and bill_change_order previews then bills them; fixed orders bill directly → send_milestone_invoice emails the payment link and T&M backup. " +
             "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
+            "PROJECT MANAGEMENT: use find_job to resolve the project/lead; standard project folders are ensured implicitly by list_project_files and upload_files when needed. " +
+            "Use upload_files for up to 8 files / ~3 MB total, then create_daily_log with already-uploaded photo ProjectFile ids so image bytes are not sent twice. " +
+            "Use list_punch_items and add_punch_items for punch lists; punch completion is intentionally human-only. " +
+            "File download is not available through MCP. list_project_files returns metadata and folder structure, never URLs. " +
             "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +
             "for the next N days, with each project's crew and a crewConflicts block (double-bookings across overlapping project windows). " +
             "get_project_schedule returns one job's task-level plan; list_crew_availability returns only field-crew bookings/free days and never rates or financials. " +
@@ -1667,28 +1882,37 @@ const handler = createMcpHandler(
             "assign_project_crew replaces a project's crew with the given ACTIVATED user ids (full list, not a delta). " +
             "QuickBooks is handled server-side; never ask the user for QuickBooks credentials.",
     },
-    { basePath: "/api/mcp", maxDuration: 60 },
-);
+        { basePath: "/api/mcp", maxDuration: 60 },
+    );
+}
 
 // Shared-secret gate. Hash both sides to a fixed length before the timing-safe
 // compare so neither content nor secret length leaks through timing.
-function authorized(req: Request): boolean {
-    const secret = process.env.MCP_SECRET;
-    if (!secret) return false;
+export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
     const key = new URL(req.url).searchParams.get("key") ?? "";
-    const a = createHash("sha256").update(key).digest();
-    const b = createHash("sha256").update(secret).digest();
-    return timingSafeEqual(a, b);
+    const suppliedHash = createHash("sha256").update(key).digest();
+    let matched: McpActorLabel | null = null;
+    const candidates: Array<[McpActorLabel, string | undefined]> = [
+        ["justin-ai", process.env.MCP_SECRET],
+        ["richard-ai", process.env.MCP_SECRET_RICHARD],
+    ];
+    for (const [actorLabel, secret] of candidates) {
+        const configuredHash = createHash("sha256").update(secret ?? "").digest();
+        const equal = timingSafeEqual(suppliedHash, configuredHash);
+        if (key.length > 0 && secret && equal && matched === null) matched = actorLabel;
+    }
+    return matched;
 }
 
 function guarded(req: Request) {
-    if (!process.env.MCP_SECRET) {
+    if (!process.env.MCP_SECRET && !process.env.MCP_SECRET_RICHARD) {
         return Response.json({ error: "MCP connector not configured" }, { status: 503 });
     }
-    if (!authorized(req)) {
+    const actorLabel = resolveMcpActorLabel(req);
+    if (!actorLabel) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
     }
-    return handler(req);
+    return createHandler(createRouteMcpActor(actorLabel))(req);
 }
 
 export { guarded as GET, guarded as POST, guarded as DELETE };

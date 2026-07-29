@@ -11,6 +11,9 @@ import {
     tagExpensesToChangeOrderCore,
     tagTimeEntriesToChangeOrderCore,
 } from "@/lib/time-expense-core";
+import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -58,11 +61,26 @@ export async function updateTimeEntry(
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     if (!Number.isFinite(data.durationHours) || data.durationHours <= 0) throw new Error("Hours must be greater than zero");
     if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
-    const startTime = new Date(data.date);
-    if (Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
-    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true } });
+    // Date-only input goes through the company-timezone helper, not new Date():
+    // new Date("2026-07-27") is UTC midnight, which is the 26th in company time,
+    // so a plain parse silently moves the entry back a day. createTimeEntryCore
+    // already does this; the edit path did not.
+    const timeZone = await resolveCompanyTimeZone();
+    const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
+    if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
+    const current = await prisma.timeEntry.findUnique({ where: { id }, select: { projectId: true, invoiceId: true, invoicedAt: true, estimateItemId: true } });
     if (!current || current.projectId !== data.projectId || !canAccessProject(user, current.projectId)) throw new Error("Forbidden");
     if (current.invoiceId || current.invoicedAt) throw new Error("Billed time entries cannot be edited");
+
+    // Re-bind against the STORED row: this action never writes projectId, so a
+    // client-supplied one could attach another project's task, and dropping the
+    // estimate item would lose a good mobile binding on an ordinary hours edit.
+    const scheduleTaskId = await resolveScheduleTaskIdForPunch({
+        userId: data.userId,
+        projectId: current.projectId,
+        dayKey: toCompanyDayKey(startTime),
+        estimateItemId: current.estimateItemId,
+    });
 
     const updated = await prisma.timeEntry.updateMany({
         where: { id, invoiceId: null, invoicedAt: null },
@@ -70,6 +88,7 @@ export async function updateTimeEntry(
             userId: data.userId,
             costCodeId: data.costCodeId,
             startTime,
+            scheduleTaskId,
             durationHours: data.durationHours,
             laborCost: data.laborCost,
         },

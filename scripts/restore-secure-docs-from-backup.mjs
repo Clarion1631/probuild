@@ -1,31 +1,48 @@
 // EMERGENCY UNDO for the secure-docs migration. Restores documents that
 // migrate-secure-docs.mjs moved into the PRIVATE `secure-docs` bucket (and that
-// purge-migrated-public-docs.mjs / sweep-orphaned-public-signatures.mjs then deleted from the
-// PUBLIC `project-files` bucket) back into the public bucket, from the on-disk backup that
-// backup-migrated-public-docs.mjs (and the orphan sweep) produced before those deletions.
+// purge-migrated-public-docs.mjs then deleted from the PUBLIC `project-files` bucket) back
+// into the public bucket, from the on-disk backup that backup-migrated-public-docs.mjs
+// produced before those deletions.
 //
 // Run this ONLY if the private-bucket approach for sensitive documents has to be abandoned.
 // It re-publishes signatures, executed contract PDFs, signed estimate PDFs, and tax-exempt
 // certs to a PUBLIC bucket — that is the whole point, but it is a real security regression,
 // not a no-op, so --apply prints a loud banner saying so.
 //
-// BACKUP LAYOUT (input, produced by backup-migrated-public-docs.mjs / the orphan sweep):
-//   <source>/<storage-path>              the file itself, laid out at its original bucket path
-//   <source>/MANIFEST.json                { files: [{ table, column, id, path, size, sha256 }] }
-//   <source>/MANIFEST-orphans.json               { files: [{ path, size, sha256, orphan: true }] }
-//   <source>/MANIFEST-orphans-signatures.json    { files: [{ path, size, sha256, orphan: true }] }
-// All three manifest files are optional on disk (a given backup run may not have produced
-// every one) but at least one must be present, and be non-empty, or there is nothing to
-// restore. Missing manifest files are logged and skipped, not treated as an error.
+// By default this restores ONLY still-referenced migrated documents (MANIFEST.json — rows a
+// live DB column still points at via a `secure:<path>` ref). MANIFEST-orphans.json and
+// MANIFEST-orphans-signatures.json entries are objects sweep-orphaned-signature-objects.mjs
+// found UNREFERENCED by any DB row (~202 of them: client signatures, executed contracts).
+// They are retained on disk but deliberately NOT re-published — re-uploading them to a public
+// bucket would recreate exactly the exposure this whole project closed, for files nothing
+// needs. Pass --include-orphans to opt into restoring them anyway (rare; prints a loud
+// warning when used).
+//
+// BACKUP LAYOUT (input):
+//   MANIFEST.json (from backup-migrated-public-docs.mjs) is FLAT: the file for each entry
+//     lives at <source>/<path>, no bucket field — it only ever backed up project-files.
+//   MANIFEST-orphans.json / MANIFEST-orphans-signatures.json (from
+//     sweep-orphaned-signature-objects.mjs) are BUCKET-QUALIFIED: each entry carries a
+//     `bucket` field (`project-files` or `secure-docs`), and the file lives at
+//     <source>/<bucket>/<path> — because that sweep covers both buckets, and secure-docs
+//     objects can share the same path a project-files object once had. An entry's local file
+//     is resolved as <source>/<bucket>/<path> when it carries a `bucket`, else <source>/<path>.
+//   A file missing at its resolved local location is logged clearly and counted — it never
+//   fails the whole run.
+//   All three manifest files are optional on disk (a given backup run may not have produced
+//   every one) but at least one must be present, and be non-empty, or there is nothing to
+//   restore. Missing manifest files are logged and skipped, not treated as an error.
 //
 // Phase 1 — re-upload (needs SUPABASE_URL + SUPABASE_SERVICE_KEY):
-//   For every entry in every manifest present (MANIFEST.json AND both orphan manifests —
-//   an orphan is still a real object that used to live in the public bucket), read the local
-//   backup file, verify its sha256 against the manifest (refuse and count sha-mismatch if it
-//   doesn't match — corrupt data is never uploaded), then upload it to `project-files` at the
-//   manifest `path`. An existing object at that path with the same non-zero size as the
-//   manifest is treated as already-restored (idempotent — counted as already-present, not
-//   re-uploaded).
+//   For every MANIFEST.json entry, read the local backup file, verify its sha256 against the
+//   manifest (refuse and count sha-mismatch if it doesn't match — corrupt data is never
+//   uploaded), then upload it to `project-files` at the manifest `path`. An existing object at
+//   that path with the same non-zero size as the manifest is treated as already-restored
+//   (idempotent — counted as already-present, not re-uploaded).
+//   Orphan-manifest entries are skipped here by default (counted as skipped-orphan-archive,
+//   with a one-line reason) unless --include-orphans is passed, in which case they are
+//   uploaded back to the bucket recorded in their `bucket` field — never blindly to
+//   `project-files`, since a secure-docs orphan belongs back in secure-docs, not public.
 //
 // Phase 2 — revert DB refs (needs DATABASE_URL; only applies to MANIFEST.json entries):
 //   For each MANIFEST.json entry, build the legacy public URL
@@ -47,10 +64,13 @@
 // query.
 //
 // Usage:
-//   node scripts/restore-secure-docs-from-backup.mjs --source <dir>                      # dry run
-//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --apply              # write
-//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --phase upload       # re-upload only
-//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --phase db --apply   # DB revert only
+//   node scripts/restore-secure-docs-from-backup.mjs --source <dir>                        # dry run
+//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --apply                # write
+//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --phase upload         # re-upload only
+//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --phase db --apply     # DB revert only
+//   node scripts/restore-secure-docs-from-backup.mjs --source <dir> --apply --include-orphans
+//     # ALSO re-publishes unreferenced orphan-manifest entries. Rare — only for when someone
+//     # truly wants an unreferenced document back. Prints a loud warning when used.
 //
 // Requires (read from env or .env / .env.local):
 //   DATABASE_URL          Supabase transaction pooler URL (must include ?pgbouncer=true) — phase db/both
@@ -81,7 +101,7 @@ const ALLOWED_COLUMNS = new Set([
 ]);
 
 function parseArgs(argv) {
-  const out = { source: undefined, apply: false, phase: "both" };
+  const out = { source: undefined, apply: false, phase: "both", includeOrphans: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--source") out.source = argv[++i];
@@ -89,6 +109,7 @@ function parseArgs(argv) {
     else if (a === "--apply") out.apply = true;
     else if (a === "--phase") out.phase = argv[++i];
     else if (a.startsWith("--phase=")) out.phase = a.slice("--phase=".length);
+    else if (a === "--include-orphans") out.includeOrphans = true;
   }
   return out;
 }
@@ -96,7 +117,9 @@ function parseArgs(argv) {
 const ARGS = parseArgs(process.argv.slice(2));
 
 if (!ARGS.source) {
-  console.error("Usage: node scripts/restore-secure-docs-from-backup.mjs --source <dir> [--apply] [--phase upload|db|both]");
+  console.error(
+    "Usage: node scripts/restore-secure-docs-from-backup.mjs --source <dir> [--apply] [--phase upload|db|both] [--include-orphans]"
+  );
   console.error("Refusing to run without a required --source <dir> argument.");
   process.exit(1);
 }
@@ -109,6 +132,7 @@ const SOURCE = path.resolve(ARGS.source);
 const APPLY = ARGS.apply;
 const RUN_UPLOAD = ARGS.phase === "upload" || ARGS.phase === "both";
 const RUN_DB = ARGS.phase === "db" || ARGS.phase === "both";
+const INCLUDE_ORPHANS = ARGS.includeOrphans;
 
 if (!fs.existsSync(SOURCE) || !fs.statSync(SOURCE).isDirectory()) {
   console.error(`--source "${SOURCE}" does not exist or is not a directory.`);
@@ -153,6 +177,17 @@ function firstLine(e) {
 
 function isSafeStoragePath(p) {
   return typeof p === "string" && p.length > 0 && !p.startsWith("/") && !p.includes("..");
+}
+
+/** A manifest `bucket` field is only ever used to pick which Supabase bucket to upload to and
+ *  which local backup subdirectory to read from — never interpolated into SQL — but it still
+ *  must not be usable to escape the backup directory or target an unexpected bucket. */
+// A manifest is untrusted input, and this value decides which bucket we upload INTO — so
+// allowlist it rather than merely rejecting traversal, mirroring ALLOWED_COLUMNS below.
+const ALLOWED_BUCKETS = new Set(["project-files", "secure-docs"]);
+
+function isSafeBucketName(b) {
+  return typeof b === "string" && ALLOWED_BUCKETS.has(b);
 }
 
 function sha256Buffer(buffer) {
@@ -209,14 +244,16 @@ function emptyStats() {
     dbReverted: 0,
     skippedChanged: 0,
     skippedOrphan: 0,
+    skippedOrphanArchive: 0,
     failed: 0,
     totalBytesUploaded: 0,
   };
 }
 
 /** Phase 1: verify the local backup file against its manifest sha256, then upload it back to
- *  the public bucket at the manifest path. Idempotent — an existing object of the same
- *  non-zero size is treated as already-restored and left alone. */
+ *  its target bucket (project-files for MANIFEST.json entries; whatever `entry.bucket` says
+ *  for orphan-manifest entries) at the manifest path. Idempotent — an existing object of the
+ *  same non-zero size is treated as already-restored and left alone. */
 async function restoreOneFile(entry, stats) {
   const label = entry.table ? `${entry.table}.${entry.column} id=${entry.id}` : "(orphan)";
   const objectPath = entry.path;
@@ -227,7 +264,22 @@ async function restoreOneFile(entry, stats) {
     return;
   }
 
-  const localPath = path.join(SOURCE, objectPath);
+  // MANIFEST.json (from backup-migrated-public-docs.mjs) is flat, no `bucket` field, and only
+  // ever backed up project-files. MANIFEST-orphans*.json (from
+  // sweep-orphaned-signature-objects.mjs) is bucket-qualified: <source>/<bucket>/<path>, and
+  // the entry's `bucket` says which Supabase bucket to restore it to.
+  let targetBucket = PUBLIC_BUCKET;
+  let localPath = path.join(SOURCE, objectPath);
+  if (entry.bucket !== undefined) {
+    if (!isSafeBucketName(entry.bucket)) {
+      stats.failed++;
+      console.error(`  ✗ ${label}: unsafe manifest bucket "${entry.bucket}" — refusing to touch`);
+      return;
+    }
+    targetBucket = entry.bucket;
+    localPath = path.join(SOURCE, entry.bucket, objectPath);
+  }
+
   let buffer;
   try {
     buffer = fs.readFileSync(localPath);
@@ -246,30 +298,30 @@ async function restoreOneFile(entry, stats) {
     return;
   }
 
-  const existingSize = await getObjectSize(PUBLIC_BUCKET, objectPath);
+  const existingSize = await getObjectSize(targetBucket, objectPath);
   if (existingSize !== null && existingSize > 0 && existingSize === buffer.length) {
     stats.alreadyPresent++;
-    console.log(`  · ${label}: "${objectPath}" already present in ${PUBLIC_BUCKET} (${existingSize}b) — skipping`);
+    console.log(`  · ${label}: "${objectPath}" already present in ${targetBucket} (${existingSize}b) — skipping`);
     return;
   }
 
   if (!APPLY) {
     stats.uploaded++; // "would upload" in dry run
-    console.log(`  (dry run) would upload "${objectPath}" (${buffer.length}b) to ${PUBLIC_BUCKET}`);
+    console.log(`  (dry run) would upload "${objectPath}" (${buffer.length}b) to ${targetBucket}`);
     return;
   }
 
   const { error } = await supabase.storage
-    .from(PUBLIC_BUCKET)
+    .from(targetBucket)
     .upload(objectPath, buffer, { contentType: guessContentType(objectPath), upsert: true });
   if (error) {
     stats.failed++;
-    console.error(`  ✗ ${label}: upload of "${objectPath}" to ${PUBLIC_BUCKET} failed — ${firstLine(error)}`);
+    console.error(`  ✗ ${label}: upload of "${objectPath}" to ${targetBucket} failed — ${firstLine(error)}`);
     return;
   }
   stats.uploaded++;
   stats.totalBytesUploaded += buffer.length;
-  console.log(`  ✓ ${label}: uploaded "${objectPath}" (${buffer.length}b) to ${PUBLIC_BUCKET}`);
+  console.log(`  ✓ ${label}: uploaded "${objectPath}" (${buffer.length}b) to ${targetBucket}`);
 }
 
 /** Phase 2: CAS-revert one MANIFEST.json entry's DB column back to the legacy public URL,
@@ -353,6 +405,19 @@ function truncate(v, n = 120) {
     );
   }
 
+  if (INCLUDE_ORPHANS && RUN_UPLOAD) {
+    console.log(
+      "########################################################################\n" +
+        "# WARNING: --include-orphans is ALSO restoring orphan-manifest entries #\n" +
+        "# — documents that were UNREFERENCED by any DB row when swept. This    #\n" +
+        "# re-publishes unreferenced sensitive documents (client signatures,    #\n" +
+        "# executed contracts) to their original bucket, which may be the      #\n" +
+        "# PUBLIC bucket 'project-files'. This recreates the exact exposure the #\n" +
+        "# orphan sweep closed, for files nothing currently references.        #\n" +
+        "########################################################################\n"
+    );
+  }
+
   console.log("Loading manifests:");
   const manifestEntries = loadManifest("MANIFEST.json");
   const orphanEntries = loadManifest("MANIFEST-orphans.json");
@@ -370,11 +435,28 @@ function truncate(v, n = 120) {
   stats.scanned = allEntries.length;
 
   if (RUN_UPLOAD) {
-    console.log("Phase 1 — re-upload to project-files:");
-    for (const entry of allEntries) {
+    console.log("Phase 1 — re-upload migrated (still-referenced) documents:");
+    for (const entry of manifestEntries) {
       await restoreOneFile(entry, stats);
     }
     console.log("");
+
+    const orphanUploadEntries = [...orphanEntries, ...orphanSignatureEntries];
+    if (orphanUploadEntries.length > 0) {
+      if (INCLUDE_ORPHANS) {
+        console.log("Phase 1b — re-upload orphan-manifest entries (--include-orphans):");
+        for (const entry of orphanUploadEntries) {
+          await restoreOneFile(entry, stats);
+        }
+      } else {
+        stats.skippedOrphanArchive += orphanUploadEntries.length;
+        console.log(
+          `Phase 1b — skipping ${orphanUploadEntries.length} orphan-manifest entr${orphanUploadEntries.length === 1 ? "y" : "ies"}: ` +
+            `unreferenced by any DB row, so re-publishing them is not this restore's job — pass --include-orphans to restore them anyway.`
+        );
+      }
+      console.log("");
+    }
   }
 
   if (RUN_DB) {
@@ -390,7 +472,8 @@ function truncate(v, n = 120) {
   console.log(
     `Totals: scanned=${stats.scanned} uploaded=${stats.uploaded} already-present=${stats.alreadyPresent} ` +
       `sha-mismatch=${stats.shaMismatch} db-reverted=${stats.dbReverted} skipped-changed=${stats.skippedChanged} ` +
-      `skipped-orphan=${stats.skippedOrphan} failed=${stats.failed} total-bytes-uploaded=${stats.totalBytesUploaded}` +
+      `skipped-orphan=${stats.skippedOrphan} skipped-orphan-archive=${stats.skippedOrphanArchive} failed=${stats.failed} ` +
+      `total-bytes-uploaded=${stats.totalBytesUploaded}` +
       (APPLY ? "" : " (dry run)")
   );
 

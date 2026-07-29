@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
+import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
+import { toCompanyDayKey } from "@/lib/company-day";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -50,15 +52,24 @@ export async function POST(req: Request) {
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
 
+    const entryStartTime = startTime ? new Date(startTime) : new Date();
+    const scheduleTaskId = await resolveScheduleTaskIdForPunch({
+        userId: user.id,
+        projectId,
+        dayKey: toCompanyDayKey(entryStartTime),
+        estimateItemId,
+    });
+
     const timeEntry = await prisma.timeEntry.create({
         data: {
             userId: user.id,
             projectId,
             costCodeId: costCodeId || null,
             estimateItemId: estimateItemId || null,
-            startTime: startTime ? new Date(startTime) : new Date(),
+            startTime: entryStartTime,
             latitude,
             longitude,
+            scheduleTaskId,
         }
     });
 

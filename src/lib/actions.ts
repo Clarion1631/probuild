@@ -13,7 +13,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
-import { persistSignature } from "./signature-storage";
+import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
@@ -66,6 +66,8 @@ import {
     type CreateScheduleTaskInput,
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
+import { ensureStandardFolders } from "./project-folders";
+import { createDailyLogCore } from "./daily-log-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -1153,6 +1155,15 @@ export async function convertLeadToProject(leadId: string) {
     // Auto-grant access to eligible team members
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(project.id);
+
+    // The ProBuild Files tab gets its own canonical scaffold. This is
+    // deliberately independent of Drive provisioning and never rolls back a
+    // successfully-created project.
+    try {
+        await ensureStandardFolders(project.id);
+    } catch (folderErr) {
+        console.error("[Project folders] Failed to create the standard scaffold:", folderErr);
+    }
 
     // Provision Google Drive Folders in the background/async after project creation
     try {
@@ -4169,11 +4180,12 @@ async function assertInvoicePortalAccess(): Promise<string | null> {
 }
 
 async function assertEstimateSendPermission(mcpSecret?: string) {
-    const configuredSecret = process.env.MCP_SECRET;
-    if (mcpSecret && configuredSecret) {
-        const supplied = Buffer.from(mcpSecret);
-        const configured = Buffer.from(configuredSecret);
-        if (supplied.length === configured.length && timingSafeEqual(supplied, configured)) return;
+    if (mcpSecret) {
+        const supplied = createHash("sha256").update(mcpSecret).digest();
+        for (const configuredSecret of [process.env.MCP_SECRET, process.env.MCP_SECRET_RICHARD]) {
+            const configured = createHash("sha256").update(configuredSecret ?? "").digest();
+            if (configuredSecret && timingSafeEqual(supplied, configured)) return;
+        }
     }
     await assertEstimatePermission();
 }
@@ -5035,7 +5047,16 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string, mcpSecret?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendEstimateToClient(
+    estimateId: string,
+    templateId?: string,
+    overrideEmail?: string,
+    ccEmails?: string[],
+    customMessage?: string,
+    capturedPdfUrl?: string,
+    mcpSecret?: string,
+    mcpActorLabel?: "justin-ai" | "richard-ai",
+): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     await assertEstimateSendPermission(mcpSecret);
     try {
     // --- Server-side CC validation ---
@@ -5336,8 +5357,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         await logActivity({
             projectId: estimate.project?.id,
             leadId: estimate.lead?.id,
-            actorType: "TEAM",
-            actorName: session?.user?.name || session?.user?.email || "Team",
+            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
+            actorName: mcpActorLabel
+                ? `SYSTEM:${mcpActorLabel}`
+                : session?.user?.name || session?.user?.email || "Team",
             action: "sent_estimate",
             entityType: "estimate",
             entityId: estimateId,
@@ -5852,7 +5875,12 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
+export async function sendContractToClient(
+    contractId: string,
+    ccOverride?: string[],
+    expectedFingerprint?: string,
+    mcpActorLabel?: "justin-ai" | "richard-ai",
+) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5986,8 +6014,8 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
+            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
+            actorName: mcpActorLabel ? `SYSTEM:${mcpActorLabel}` : companyName,
             action: "sent_contract",
             entityType: "contract",
             entityId: contractId,
@@ -6029,6 +6057,63 @@ export async function getContractSendDefaults(contractId: string): Promise<{ toE
     return { toEmail: client?.email || null, autoCc };
 }
 
+/**
+ * Compensating delete for an uploaded signature after an AMBIGUOUS database outcome.
+ * A Prisma rejection does not prove the write rolled back — on the PgBouncer pooler a
+ * connection can drop after COMMIT — so probe for a surviving reference to this exact
+ * object first. Unknown outcome => KEEP the object: an orphan is sweepable
+ * (scripts/sweep-orphaned-signature-objects.mjs, which covers both the public project-files
+ * bucket and the private secure-docs bucket this upload lands in), a deleted e-signature is not.
+ */
+async function discardSignatureUnlessReferenced(
+    url: string | null,
+    discard: () => Promise<void>,
+    isReferenced: () => Promise<boolean>,
+    context: string,
+): Promise<void> {
+    if (!url) return;
+
+    // Typed `unknown` on purpose: the delete decision must fail closed even if a future
+    // probe returns something other than a boolean.
+    let referenced: unknown;
+    try {
+        referenced = await isReferenced();
+    } catch (error) {
+        try {
+            console.error(`[${context}] signature reference probe failed — keeping the upload (unknown outcome, refuse to delete)`, error);
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+        return;
+    }
+
+    // Fail closed: ONLY an explicit `false` authorises deletion. `true` means the write
+    // committed despite the rejection; anything else means we don't actually know.
+    if (referenced !== false) {
+        try {
+            console.warn(
+                referenced === true
+                    ? `[${context}] signature survived a rejected write — keeping the upload`
+                    : `[${context}] signature reference probe gave a non-boolean result — keeping the upload (unknown outcome, refuse to delete)`,
+                { url },
+            );
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+        return;
+    }
+
+    try {
+        await discard();
+    } catch (error) {
+        try {
+            console.error(`[${context}] signature cleanup failed`, error);
+        } catch {
+            // Logging must never replace the caller's primary error.
+        }
+    }
+}
+
 export async function signContractAsContractor(contractId: string, signerName: string, signatureDataUrl: string, expectedTitle: string, expectedBody: string) {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Not authenticated");
@@ -6048,8 +6133,20 @@ export async function signContractAsContractor(contractId: string, signerName: s
 
     // Move the signature image out of the DB column into Supabase Storage (avoids the
     // PgBouncer pooler message-size error on large high-DPI data-URLs). Falls back to the
-    // raw data-URL when Storage isn't configured. See persistSignature().
-    const contractorSignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    // raw data-URL when Storage isn't configured. See persistOwnedSignature().
+    const ownedContractorSignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/contractor`);
+    const contractorSignatureUrl = ownedContractorSignature.url;
+    const discardContractorSignature = async () => {
+        try {
+            await ownedContractorSignature.discard();
+        } catch (error) {
+            try {
+                console.error("[signContractAsContractor] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
+        }
+    };
     const ip = await getRequestIp();
     const signedAt = new Date();
 
@@ -6061,30 +6158,48 @@ export async function signContractAsContractor(contractId: string, signerName: s
     // triggers in updateContract), so a signature can never commit over a document that was
     // edited after the signer last saw it (Codex blockers: a sign request based on an old
     // document must not reintroduce a live signature on changed text OR a changed title).
-    await prisma.$transaction(async (tx) => {
-        const guard = await tx.contract.updateMany({
-            where: {
-                id: contractId,
-                contractorSignedAt: null,
-                title: expectedTitle,
-                body: expectedBody,
-            },
-            data: {
-                contractorSignedBy: signerName,
-                contractorSignedAt: signedAt,
-                contractorSignatureUrl,
-            },
+    try {
+        await prisma.$transaction(async (tx) => {
+            const guard = await tx.contract.updateMany({
+                where: {
+                    id: contractId,
+                    contractorSignedAt: null,
+                    title: expectedTitle,
+                    body: expectedBody,
+                },
+                data: {
+                    contractorSignedBy: signerName,
+                    contractorSignedAt: signedAt,
+                    contractorSignatureUrl,
+                },
+            });
+            if (guard.count === 0) {
+                const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
+                if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
+                throw new Error("The contract text changed after you opened it — review the current text and sign again.");
+            }
+            // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
+            await tx.contractSigningRecord.create({
+                data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
+            });
         });
-        if (guard.count === 0) {
-            const current = await tx.contract.findUnique({ where: { id: contractId }, select: { contractorSignedAt: true } });
-            if (current?.contractorSignedAt) throw new Error("Contract already signed by contractor");
-            throw new Error("The contract text changed after you opened it — review the current text and sign again.");
-        }
-        // Audit record for the contractor signature (captures IP + timestamp for the e-sign trail).
-        await tx.contractSigningRecord.create({
-            data: { contractId, signedBy: signerName, signedAt, signatureUrl: contractorSignatureUrl, ipAddress: ip, notes: "Contractor signature" },
-        });
-    });
+    } catch (error) {
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
+            contractorSignatureUrl,
+            discardContractorSignature,
+            async () => {
+                const [contractHit, recordHit] = await Promise.all([
+                    prisma.contract.findFirst({ where: { id: contractId, contractorSignatureUrl }, select: { id: true } }),
+                    prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl: contractorSignatureUrl }, select: { id: true } }),
+                ]);
+                return !!contractHit || !!recordHit;
+            },
+            "signContractAsContractor",
+        );
+        throw error;
+    }
 
     try {
         await updateExecutedPdfIfFinalized(contractId, ip);
@@ -6263,10 +6378,32 @@ export async function approveContract(contractId: string, signatureName: string,
     // Persist the signature image to Storage BEFORE the transaction so the network upload
     // stays out of the DB tx. The same URL is written to both the Contract and the
     // ContractSigningRecord audit row. Falls back to the data-URL when Storage is absent.
-    const signatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const ownedClientSignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/client`);
+    const signatureUrl = ownedClientSignature.url;
+    const discardClientSignature = async () => {
+        try {
+            await ownedClientSignature.discard();
+        } catch (error) {
+            try {
+                console.error("[approveContract] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
+        }
+    };
     const ip = await getRequestIp();
 
+    // Set inside the transaction when the CAS guard loses to a prior "already Signed" retry
+    // (the no-op early-return below) — the uploaded signature never gets written to the row
+    // in that case, so it must be discarded after the transaction settles.
+    let signatureDidNotLand = false;
+
+    try {
     await prisma.$transaction(async (tx) => {
+        // Recompute per attempt: if this callback is ever re-run (e.g. someone wraps this in
+        // withTxRetry), a flag left true by a previous attempt would make us delete a
+        // signature the successful attempt committed.
+        signatureDidNotLand = false;
         if (!isRecurring) {
             // CAS-bind the body we validated (and, when it carries a contractor block, that
             // the contractor pre-signature still exists) into the transition — text edits now
@@ -6292,7 +6429,12 @@ export async function approveContract(contractId: string, signatureName: string,
             if (transition.count === 0) {
                 // Already signed — allow finalize retry without overwriting audit data.
                 const current = await tx.contract.findUnique({ where: { id: contractId }, select: { status: true } });
-                if (current?.status === "Signed") return;
+                if (current?.status === "Signed") {
+                    // Idempotent retry — the row already carries a prior signature; this
+                    // upload never gets written, so it must be cleaned up after the tx commits.
+                    signatureDidNotLand = true;
+                    return;
+                }
                 if (current && ["Draft", "Sent", "Viewed"].includes(current.status)) {
                     // Still signable ⇒ the CAS missed: text was edited (or the contractor
                     // signature was cleared) between validation and commit.
@@ -6343,6 +6485,28 @@ export async function approveContract(contractId: string, signatureName: string,
             }
         });
     });
+    } catch (error) {
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
+            signatureUrl,
+            discardClientSignature,
+            async () => {
+                const [contractHit, recordHit] = await Promise.all([
+                    prisma.contract.findFirst({ where: { id: contractId, signatureUrl }, select: { id: true } }),
+                    prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl }, select: { id: true } }),
+                ]);
+                return !!contractHit || !!recordHit;
+            },
+            "approveContract",
+        );
+        throw error;
+    }
+    if (signatureDidNotLand) {
+        // Deterministic: the transaction committed and told us this upload was never
+        // written anywhere (idempotent retry against an already-Signed row).
+        await discardClientSignature();
+    }
 
     const settings = await getCachedCompanySettings();
     if (settings.notificationEmail && isNotificationEnabled(settings, "contractSigned")) {
@@ -6460,18 +6624,59 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     // record share a transaction so a failed audit insert rolls the signature back too — a retry
     // then redoes BOTH (never leaves companySignedAt set with no audit row).
     if (!contract.companySignedAt) {
-        const companySignatureUrl = await persistSignature(signatureDataUrl, `contracts/${contractId}/company`);
-        await prisma.$transaction(async (tx) => {
-            const guard = await tx.contract.updateMany({
-                where: { id: contractId, status: "Signed", companySignedAt: null },
-                data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
-            });
-            if (guard.count > 0) {
-                await tx.contractSigningRecord.create({
-                    data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
-                });
+        const ownedCompanySignature = await persistOwnedSignature(signatureDataUrl, `contracts/${contractId}/company`);
+        const companySignatureUrl = ownedCompanySignature.url;
+        const discardCompanySignature = async () => {
+            try {
+                await ownedCompanySignature.discard();
+            } catch (error) {
+                try {
+                    console.error("[countersignContractAsCompany] signature cleanup failed", error);
+                } catch {
+                    // Logging must never replace the caller's primary error.
+                }
             }
-        });
+        };
+        let companySignatureLanded = false;
+        try {
+            await prisma.$transaction(async (tx) => {
+                // Recompute per attempt: if this callback is ever re-run (e.g. someone wraps
+                // this in withTxRetry), a stale value from a previous attempt would decide the
+                // wrong way about deleting a committed signature.
+                companySignatureLanded = false;
+                const guard = await tx.contract.updateMany({
+                    where: { id: contractId, status: "Signed", companySignedAt: null },
+                    data: { companySignedBy: signerName, companySignedAt: now, companySignatureUrl },
+                });
+                if (guard.count > 0) {
+                    companySignatureLanded = true;
+                    await tx.contractSigningRecord.create({
+                        data: { contractId, signedBy: signerName, signedAt: now, signatureUrl: companySignatureUrl, ipAddress: ip, notes: "Company countersignature" },
+                    });
+                }
+            });
+        } catch (error) {
+            // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+            // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+            await discardSignatureUnlessReferenced(
+                companySignatureUrl,
+                discardCompanySignature,
+                async () => {
+                    const [contractHit, recordHit] = await Promise.all([
+                        prisma.contract.findFirst({ where: { id: contractId, companySignatureUrl }, select: { id: true } }),
+                        prisma.contractSigningRecord.findFirst({ where: { contractId, signatureUrl: companySignatureUrl }, select: { id: true } }),
+                    ]);
+                    return !!contractHit || !!recordHit;
+                },
+                "countersignContractAsCompany",
+            );
+            throw error;
+        }
+        if (!companySignatureLanded) {
+            // Deterministic: the transaction committed and told us via guard.count this
+            // upload lost the race and was never written anywhere.
+            await discardCompanySignature();
+        }
     }
 
     // Canonical state (covers a retry that recorded the signature but failed before finalizing).
@@ -7248,12 +7453,24 @@ export async function addTaskPunchItem(taskId: string, name: string) {
 }
 
 export async function togglePunchItem(id: string) {
-    const item = await prisma.taskPunchItem.findUnique({ where: { id } });
-    if (!item) return null;
-    return prisma.taskPunchItem.update({
-        where: { id },
-        data: { completed: !item.completed },
+    const current = await prisma.taskPunchItem.findUnique({ where: { id } });
+    if (!current) return null;
+    // Completing a punch item is now DIRECT field evidence on the schedule
+    // board, so this needs the same access gate as every other task mutation.
+    await assertScheduleTaskAccess(current.taskId);
+    const nextCompleted = !current.completed;
+    const nextCompletedAt = nextCompleted ? new Date() : null;
+    // Guarded flip: the WHERE clause pins the expected `completed` value, so two concurrent
+    // taps can't both read false and both write true. The loser's updateMany matches 0 rows
+    // and falls back to reading the winner's result instead of double-flipping.
+    const result = await prisma.taskPunchItem.updateMany({
+        where: { id, completed: current.completed },
+        data: { completed: nextCompleted, completedAt: nextCompletedAt },
     });
+    if (result.count === 0) {
+        return prisma.taskPunchItem.findUnique({ where: { id } });
+    }
+    return { ...current, completed: nextCompleted, completedAt: nextCompletedAt };
 }
 
 export async function deletePunchItem(id: string) {
@@ -8566,19 +8783,52 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 
     // Move the signature image into Storage (avoids the PgBouncer pooler message-size
     // error on large data-URLs); falls back to the data-URL when Storage isn't configured.
-    const companySignatureUrl = await persistSignature(signatureDataUrl, `change-orders/${id}/company`);
+    const ownedCompanySignature = await persistOwnedSignature(signatureDataUrl, `change-orders/${id}/company`);
+    const companySignatureUrl = ownedCompanySignature.url;
+    const discardCompanySignature = async () => {
+        try {
+            await ownedCompanySignature.discard();
+        } catch (error) {
+            try {
+                console.error("[countersignChangeOrderAsCompany] signature cleanup failed", error);
+            } catch {
+                // Logging must never replace the caller's primary error.
+            }
+        }
+    };
 
     // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
     // so two concurrent requests can't both succeed (eliminates TOCTOU race).
-    const result = await prisma.changeOrder.updateMany({
-        where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
-        data: {
-            companySignedBy: signerName.trim(),
-            companySignedAt: new Date(),
+    let result;
+    try {
+        result = await prisma.changeOrder.updateMany({
+            where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
+            data: {
+                companySignedBy: signerName.trim(),
+                companySignedAt: new Date(),
+                companySignatureUrl,
+            },
+        });
+    } catch (error) {
+        // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
+        // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
+        await discardSignatureUnlessReferenced(
             companySignatureUrl,
-        },
-    });
-    if (result.count === 0) throw new Error("Change order already countersigned by company");
+            discardCompanySignature,
+            async () => {
+                const hit = await prisma.changeOrder.findFirst({ where: { id, companySignatureUrl }, select: { id: true } });
+                return !!hit;
+            },
+            "countersignChangeOrderAsCompany",
+        );
+        throw error;
+    }
+    if (result.count === 0) {
+        // Deterministic: the updateMany itself reported zero rows matched — this upload
+        // never landed anywhere.
+        await discardCompanySignature();
+        throw new Error("Change order already countersigned by company");
+    }
 
     revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${existing.projectId}/change-orders`);
@@ -10008,7 +10258,7 @@ export async function submitSelectionProposal(projectId: string, data: {
 export async function getSelectionProposalsForPortal(projectId: string) {
     await assertPortalProjectOwnership(projectId);
     const proposals = await prisma.selectionProposal.findMany({
-        where: { projectId },
+        where: { projectId, deletedAt: null },
         orderBy: { createdAt: "desc" },
     });
     // Price is never shown to the client — no exceptions, no "unless
@@ -10023,7 +10273,7 @@ export async function getSelectionProposals(projectId: string) {
     const user = await assertActiveStaff();
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     return prisma.selectionProposal.findMany({
-        where: { projectId },
+        where: { projectId, deletedAt: null },
         orderBy: { createdAt: "desc" },
         include: { decidedBy: { select: { id: true, name: true, email: true } } },
     });
@@ -10313,10 +10563,10 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
         }),
         prisma.selectionProposal.findMany({
-            where: { projectId, decisionId: null },
+            where: { projectId, decisionId: null, deletedAt: null },
             orderBy: { createdAt: "desc" },
         }),
     ]);
@@ -10336,10 +10586,10 @@ export async function getProjectDecisions(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
         }),
         prisma.selectionProposal.findMany({
-            where: { projectId, decisionId: null },
+            where: { projectId, decisionId: null, deletedAt: null },
             orderBy: { createdAt: "desc" },
         }),
     ]);
@@ -10454,8 +10704,8 @@ export async function deleteDecision(decisionId: string) {
 }
 
 export async function assignItemToDecision(itemId: string, decisionId: string | null) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
@@ -10484,6 +10734,7 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
         const claim = await tx.selectionProposal.updateMany({
             where: {
                 id: itemId,
+                deletedAt: null,
                 OR: [
                     { status: { notIn: ["Chosen", "Approved"] } },
                     { status: { in: ["Chosen", "Approved"] }, decisionId },
@@ -10504,8 +10755,8 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
 
 export async function chooseItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         include: { decision: true, project: { include: { client: true } } },
     });
     if (!item) throw new Error("Item not found");
@@ -10600,7 +10851,7 @@ export async function chooseItem(itemId: string) {
         // write time, so we can never mark a moved/archived candidate Chosen
         // and leave the decision pointing outside its own candidate list.
         const itemClaim = await tx.selectionProposal.updateMany({
-            where: { id: itemId, decisionId, status: { notIn: ["Archived", "Declined"] } },
+            where: { id: itemId, decisionId, deletedAt: null, status: { notIn: ["Archived", "Declined"] } },
             data: { status: "Chosen" },
         });
         if (itemClaim.count === 0) {
@@ -10719,8 +10970,8 @@ export async function unchooseItem(decisionId: string) {
 }
 
 export async function archiveItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
@@ -10733,7 +10984,7 @@ export async function archiveItem(itemId: string) {
         // chooseItem that just claimed this item as its decision's approved
         // record — see assignItemToDecision above for the same pattern.
         const claim = await tx.selectionProposal.updateMany({
-            where: { id: itemId, status: { notIn: ["Chosen", "Approved", "Archived"] } },
+            where: { id: itemId, deletedAt: null, status: { notIn: ["Chosen", "Approved", "Archived"] } },
             data: { status: "Archived" },
         });
         if (claim.count === 0) {
@@ -10751,16 +11002,76 @@ export async function archiveItem(itemId: string) {
 }
 
 export async function unarchiveItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
     await assertPortalProjectOwnership(item.projectId);
 
     await prisma.selectionProposal.updateMany({
-        where: { id: itemId, status: { in: ["Archived", "Declined"] } },
+        where: { id: itemId, deletedAt: null, status: { in: ["Archived", "Declined"] } },
         data: { status: "Idea" },
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+/** Delete an archived item outright from the client's playground.
+ *
+ * Soft delete only, exactly like deleteDecision: the client sees it gone and
+ * every read filters deletedAt out, but the row survives so the team keeps a
+ * 30-day restore window (getRecentlyDeletedItems / restoreItem below). "It's
+ * their playground" — but "lose no customer data" still holds.
+ *
+ * Archived-only by design: this sits behind the archive tray, so an item is
+ * always one deliberate step (archive) away from deletable. That also keeps
+ * the invariant work trivial — an Archived item can't be any decision's
+ * chosenItemId, since chooseItem refuses archived rows and archiveItem
+ * refuses chosen ones. The CAS below re-checks that at UPDATE time rather
+ * than trusting the read above, so a concurrent unarchive→choose can't slip a
+ * live approved record out from under the delete. */
+export async function deleteItem(itemId: string) {
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
+        select: { id: true, projectId: true },
+    });
+    if (!item) return { success: false };
+    await assertPortalProjectOwnership(item.projectId);
+
+    const claim = await prisma.selectionProposal.updateMany({
+        where: { id: itemId, deletedAt: null, status: { in: ["Archived", "Declined"] } },
+        data: { deletedAt: new Date() },
+    });
+    if (claim.count === 0) {
+        throw new Error("Archive this item before deleting it.");
+    }
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+/** Team-only restore of a soft-deleted item. Comes back Archived (where it
+ * was when the client deleted it), not Idea — restoring shouldn't quietly put
+ * an item the client threw away back among their live options. Its decision
+ * link is untouched, so it lands back in the same archive tray it left. */
+export async function restoreItem(itemId: string) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        select: { id: true, projectId: true, deletedAt: true },
+    });
+    if (!item) throw new Error("Item not found");
+    if (!item.deletedAt) return { success: true };
+
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, item.projectId)) throw new Error("Forbidden");
+
+    await prisma.selectionProposal.updateMany({
+        where: { id: itemId, deletedAt: { not: null } },
+        data: { deletedAt: null, status: "Archived" },
     });
 
     revalidatePath(`/projects/${item.projectId}/selections`);
@@ -10783,9 +11094,27 @@ export async function getRecentlyDeletedDecisions(projectId: string) {
     const decisions = await prisma.decision.findMany({
         where: { projectId, deletedAt: { not: null, gte: cutoff } },
         orderBy: { deletedAt: "desc" },
-        include: { candidates: { orderBy: { createdAt: "asc" } } },
+        include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
     });
     return decisions;
+}
+
+/** Individual items a client soft-deleted from their archive in the last 30
+ * days — the item half of the same restore tray (see deleteItem). Deliberately
+ * excludes items that merely sit inside a soft-deleted DECISION: those are
+ * still live rows, restored as a set by restoreDecision, and listing them
+ * separately would offer a restore that puts an item back into a decision the
+ * client can't see. */
+export async function getRecentlyDeletedItems(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const cutoff = new Date(Date.now() - RECENTLY_DELETED_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    return prisma.selectionProposal.findMany({
+        where: { projectId, deletedAt: { not: null, gte: cutoff } },
+        orderBy: { deletedAt: "desc" },
+        include: { decision: { select: { id: true, name: true, deletedAt: true } } },
+    });
 }
 
 export async function restoreDecision(decisionId: string) {
@@ -11119,24 +11448,10 @@ export async function createDailyLog(projectId: string, data: {
 }) {
     // Hardened (dispatch-arc foundation): derive the author from an authorized staff session.
     const author = await assertDailyLogAccess(projectId);
-    const log = await prisma.dailyLog.create({
-        data: {
-            projectId,
-            date: new Date(data.date),
-            weather: data.weather || null,
-            crewOnSite: data.crewOnSite || null,
-            workPerformed: data.workPerformed,
-            materialsDelivered: data.materialsDelivered || null,
-            issues: data.issues || null,
-            createdById: author.id,
-            photos: data.photoUrls && data.photoUrls.length > 0 ? {
-                create: data.photoUrls.map(p => ({
-                    url: p.url,
-                    caption: p.caption || null,
-                })),
-            } : undefined,
-        },
-        include: { photos: true },
+    const log = await createDailyLogCore({
+        projectId,
+        actorUserId: author.id,
+        ...data,
     });
 
     revalidatePath(`/projects/${projectId}/dailylogs`);

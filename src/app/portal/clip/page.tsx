@@ -4,7 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { resolveSessionClientId } from "@/lib/portal-auth";
-import { getPortalVisibility } from "@/lib/actions";
+import { getPortalVisibility, getProjectDecisionsForPortal } from "@/lib/actions";
 import PortalClipClient from "./PortalClipClient";
 
 // The client-facing clipper capture popup — opened by the per-project
@@ -73,6 +73,11 @@ export default async function PortalClipPage(props: {
         return <NotAvailable message="Suggestions aren't available for this project right now." />;
     }
 
+    // The client's live categories, so a clip can land straight into one
+    // (or into a brand-new one) instead of always dropping Unsorted and
+    // needing a second trip through the Selections tab to sort it.
+    const { decisions } = await getProjectDecisionsForPortal(project.id);
+
     return (
         <PortalClipClient
             projectId={project.id}
@@ -82,6 +87,7 @@ export default async function PortalClipPage(props: {
             initialCurrency={currency || ""}
             initialImage={image || ""}
             initialVendor={vendor || ""}
+            decisions={decisions.map((d) => ({ id: d.id, name: d.name, area: d.area }))}
         />
     );
 }
