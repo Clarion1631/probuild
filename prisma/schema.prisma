@@ -236,6 +236,7 @@ model Project {
   tags                String?
   color               String?                      @default("#3b82f6") // Added color field
   paymentRemindersEnabled Boolean                  @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
+  portalStageOverride String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
   managerId           String?
   manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]

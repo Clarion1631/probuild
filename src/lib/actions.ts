@@ -54,6 +54,7 @@ import {
 } from "./task-materials-core";
 import { assertPortalProjectAccess } from "./portal-project-access";
 import {
+    CLIENT_STAGES,
     computeDailyLogSharedContentHash,
     getPortalScheduleTasksCore,
     setDailyLogPortalShareCore,
@@ -11221,6 +11222,46 @@ export async function setDailyLogPortalShare(
     revalidatePath(`/projects/${target.projectId}/dailylogs`);
     revalidatePath(`/portal/projects/${target.projectId}`);
     return result;
+}
+
+// Staff pin for the client portal project route: forces which stage reads as
+// "current" (earlier stages read done) when the schedule's keyword inference
+// lags reality. Pass null to clear and return to task-derived position.
+export async function setPortalStageOverride(projectId: string, stageLabel: string | null) {
+    const session = await getSessionOrDev();
+    const role = ((session?.user as any)?.role as string | null) ?? null;
+    if (!role || !["ADMIN", "MANAGER"].includes(role)) throw new Error("Forbidden");
+
+    if (stageLabel !== null && !CLIENT_STAGES.some(stage => stage.label === stageLabel)) {
+        throw new Error(`Unknown stage: ${stageLabel}`);
+    }
+
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { name: true, portalStageOverride: true },
+    });
+    if (!project) throw new Error("Project not found");
+    if (project.portalStageOverride === stageLabel) return { stageLabel };
+
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { portalStageOverride: stageLabel },
+    });
+
+    await logActivity({
+        projectId,
+        actorType: "TEAM",
+        actorName: session?.user?.name || session?.user?.email || "Team member",
+        action: stageLabel ? "set_portal_stage_override" : "cleared_portal_stage_override",
+        entityType: "project",
+        entityId: projectId,
+        entityName: project.name,
+        metadata: { from: project.portalStageOverride, to: stageLabel },
+    });
+
+    revalidatePath(`/portal/projects/${projectId}`);
+    revalidatePath(`/projects/${projectId}`);
+    return { stageLabel };
 }
 
 // =============================================
