@@ -3,6 +3,7 @@
 import { motion } from "framer-motion";
 import type { CrewConflict, DashboardProjectRow } from "@/lib/schedule-core";
 import { getDispatchExceptions } from "./dispatch-exceptions";
+import { summarizeEvidenceCoverage, sumEvidenceCoverage } from "@/lib/task-evidence";
 
 interface DispatchExceptionsProps {
     projects: DashboardProjectRow[];
@@ -55,7 +56,54 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
             title: groups.crewless.map(item => item.projectName).join("\n"),
             activate: () => groups.crewless[0] && onProjectFocus(groups.crewless[0].projectId),
         },
+        {
+            key: "needs-review",
+            label: "Needs review",
+            count: groups.needsReview.length,
+            tone: "border-red-300 bg-red-50 text-red-700",
+            title: groups.needsReview.map(item => `${item.projectName}: ${item.taskName}${item.reason ? ` — ${item.reason}` : ""}`).join("\n"),
+            activate: () => groups.needsReview[0] && onActivate(groups.needsReview[0].taskId),
+        },
+        {
+            key: "unknown-state",
+            label: "No field update",
+            count: groups.unknownState.length,
+            tone: "border-slate-300 bg-slate-100 text-slate-700",
+            title: groups.unknownState.map(item => `${item.projectName}: ${item.taskName}`).join("\n"),
+            activate: () => groups.unknownState[0] && onActivate(groups.unknownState[0].taskId),
+        },
+        {
+            key: "stale-evidence",
+            label: "Going stale",
+            count: groups.staleEvidence.length,
+            tone: "border-amber-300 bg-amber-50 text-amber-800",
+            title: groups.staleEvidence.map(item => `${item.projectName}: ${item.taskName}`).join("\n"),
+            activate: () => groups.staleEvidence[0] && onActivate(groups.staleEvidence[0].taskId),
+        },
     ].filter(pill => pill.count > 0);
+
+    // Counts, deliberately not a single "% true" score: recent activity proves
+    // someone worked, not that dates/crew/status are right, so a percentage
+    // would read healthy while the schedule was wrong.
+    const coverage = sumEvidenceCoverage(projects
+        .filter(project => project.status === "In Progress")
+        .map(project => summarizeEvidenceCoverage(
+            project.tasks,
+            new Set(project.tasks.map(task => task.parentId).filter((id): id is string => !!id)),
+            dayKey,
+            { unboundPunches: project.unboundPunches },
+        )));
+    // Render whenever there is anything to say — not just when eligible > 0.
+    // Unbound punches with no eligible task is precisely the case where the
+    // board would otherwise claim "Day clear" while dropping evidence.
+    const showCoverage = coverage.eligible > 0 || coverage.unboundPunches > 0 || coverage.needsReview > 0;
+    const coverageParts = [
+        coverage.eligible > 0 ? `${coverage.confirmed} of ${coverage.eligible} active tasks confirmed` : null,
+        coverage.stale > 0 ? `${coverage.stale} going stale` : null,
+        coverage.unknown > 0 ? `${coverage.unknown} with no field update` : null,
+        coverage.needsReview > 0 ? `${coverage.needsReview} needs review` : null,
+        coverage.unboundPunches > 0 ? `${coverage.unboundPunches} unlinked punches` : null,
+    ].filter((part): part is string => !!part);
 
     return (
         <motion.div
@@ -84,6 +132,11 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
                         </button>
                     ))}
                 </div>
+            )}
+            {showCoverage && (
+                <p className="mt-1.5 text-[11px] text-slate-500" aria-label="Evidence coverage">
+                    {coverageParts.join(" \u00b7 ")}
+                </p>
             )}
         </motion.div>
     );
