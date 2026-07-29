@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useMemo, type RefObject } from "react";
 import Link from "next/link";
+import { FloatingLayer } from "@/components/FloatingLayer";
 import { getTaskTimeEntries } from "@/lib/actions";
 import type { TimeEntryDetail } from "./schedule-types";
 
@@ -17,6 +18,8 @@ export type ProgressPopoverProps = {
     actualHours: number;
     projectId: string;
     onClose: () => void;
+    /** Trigger element the panel is anchored to. The table body scrolls, so the panel is portalled rather than absolutely positioned. */
+    anchorRef: RefObject<HTMLElement | null>;
 };
 
 function formatDate(d: string | Date): string {
@@ -47,8 +50,7 @@ function fmt(n: number): string {
     return n % 1 === 0 ? String(n) : n.toFixed(1);
 }
 
-export default function ProgressPopover({ taskId, taskColor, progress, estimatedHours, actualHours, projectId, onClose }: ProgressPopoverProps) {
-    const containerRef = useRef<HTMLDivElement>(null);
+export default function ProgressPopover({ taskId, taskColor, progress, estimatedHours, actualHours, projectId, onClose, anchorRef }: ProgressPopoverProps) {
     const [entries, setEntries] = useState<TimeEntryDetail[]>([]);
     const [total, setTotal] = useState(0);
     const [loading, setLoading] = useState(true);
@@ -69,18 +71,7 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
         return () => { cancelled = true; };
     }, [taskId]);
 
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
-        }
-        function handleEsc(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleEsc);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleEsc);
-        };
-    }, [onClose]);
+    // Escape and outside-pointerdown dismissal live in FloatingLayer.
 
     function toggleSort(field: SortField) {
         if (sortField === field) setSortAsc(!sortAsc);
@@ -140,7 +131,17 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
     const arrow = (field: SortField) => sortField === field ? (sortAsc ? " ↑" : " ↓") : "";
 
     return (
-        <div ref={containerRef} className="absolute right-0 top-full mt-1 bg-white border border-hui-border rounded-lg shadow-xl z-50 w-[360px] animate-in fade-in" onClick={e => e.stopPropagation()}>
+        // constrainHeight is off: this panel keeps its own inner scroller so the
+        // sticky column headers and the footer stay put while only rows scroll.
+        <FloatingLayer
+            open
+            anchorRef={anchorRef}
+            onClose={onClose}
+            align="right"
+            width={360}
+            constrainHeight={false}
+            className="bg-white border border-hui-border rounded-lg shadow-xl animate-in fade-in"
+        >
             {/* Header */}
             <div className="px-3 py-2 flex items-center justify-between border-b border-slate-100">
                 <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Time Entries</span>
@@ -241,6 +242,6 @@ export default function ProgressPopover({ taskId, taskColor, progress, estimated
                     View all →
                 </Link>
             </div>
-        </div>
+        </FloatingLayer>
     );
 }

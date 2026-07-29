@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { FloatingLayer } from "@/components/FloatingLayer";
 import { PRESET_COLORS } from "./schedule-utils";
 
 const RECENT_KEY = "probuild:scheduleRecentColors";
@@ -36,28 +37,18 @@ export type ColorPickerProps = {
     selected: string;
     onPick: (hex: string) => void;
     onClose: () => void;
-    className?: string;
+    /** Trigger element the panel is anchored to. Every caller sits inside a scroll container, so the panel is portalled rather than absolutely positioned. */
+    anchorRef: RefObject<HTMLElement | null>;
+    align?: "left" | "right";
 };
 
-export default function ColorPicker({ selected, onPick, onClose, className }: ColorPickerProps) {
+export default function ColorPicker({ selected, onPick, onClose, anchorRef, align = "left" }: ColorPickerProps) {
     const [recent, setRecent] = useState<string[]>([]);
     const colorInputRef = useRef<HTMLInputElement>(null);
-    const containerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => { setRecent(getRecentColors()); }, []);
 
-    useEffect(() => {
-        function handleClickOutside(e: MouseEvent) {
-            if (containerRef.current && !containerRef.current.contains(e.target as Node)) onClose();
-        }
-        function handleEsc(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
-        document.addEventListener("mousedown", handleClickOutside);
-        document.addEventListener("keydown", handleEsc);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-            document.removeEventListener("keydown", handleEsc);
-        };
-    }, [onClose]);
+    // Escape and outside-pointerdown dismissal live in FloatingLayer.
 
     const selectedNorm = normalizeHex(selected);
 
@@ -73,10 +64,12 @@ export default function ColorPicker({ selected, onPick, onClose, className }: Co
     }
 
     return (
-        <div
-            ref={containerRef}
-            className={`bg-white border border-hui-border rounded-lg shadow-xl p-2.5 animate-in fade-in ${className ?? ""}`}
-            onClick={e => e.stopPropagation()}
+        <FloatingLayer
+            open
+            anchorRef={anchorRef}
+            onClose={onClose}
+            align={align}
+            className="min-w-[200px] bg-white border border-hui-border rounded-lg shadow-xl p-2.5 animate-in fade-in"
         >
             <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Presets</div>
             <div className="grid grid-cols-8 gap-1.5">
@@ -139,6 +132,6 @@ export default function ColorPicker({ selected, onPick, onClose, className }: Co
             >
                 Done
             </button>
-        </div>
+        </FloatingLayer>
     );
 }
