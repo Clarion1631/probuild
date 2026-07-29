@@ -485,7 +485,7 @@ export async function appendQBInvoiceCustomerMemo(
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
 export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await qbQuery<any>(tokens, `SELECT * FROM Purchase WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`));
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
@@ -496,6 +496,32 @@ export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: numbe
         account: p.AccountRef?.name ?? null,
         memo: p.PrivateNote ?? null,
     }));
+}
+
+/**
+ * Read all posted QBO Purchase rows on or after a transaction date.
+ * Pagination matters for the initial historical backfill; a single QBO query
+ * page would silently stop after its MAXRESULTS boundary.
+ */
+export async function getQBPurchasesSince(tokens: QBTokens, since: Date): Promise<any[]> {
+    if (!Number.isFinite(since.getTime())) {
+        throw new Error("QBO purchase query requires a valid since date");
+    }
+
+    const sinceDate = since.toISOString().slice(0, 10);
+    const pageSize = 1000;
+    const purchases: any[] = [];
+
+    for (let startPosition = 1; ; startPosition += pageSize) {
+        const page = await qbQuery<any>(
+            tokens,
+            `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}' ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+        );
+        purchases.push(...page);
+        if (page.length < pageSize) break;
+    }
+
+    return purchases;
 }
 
 /** Posted customer payments (money in) from the books. */
