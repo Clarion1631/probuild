@@ -797,6 +797,7 @@ export default function FileBrowser({
                             {folders.map(folder => (
                                 <div
                                     key={folder.id}
+                                    data-folder-id={folder.id}
                                     onClick={() => renamingFolderId !== folder.id && navigateToFolder(folder.id, folder.name)}
                                     onDragOver={e => {
                                         // Only react to internal file drags — OS file drags bubble up to the container dropzone instead.

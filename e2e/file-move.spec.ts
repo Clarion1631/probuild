@@ -8,27 +8,26 @@ import { expect, test, type APIRequestContext, type Page } from "@playwright/tes
 // only claims the drag kind it owns. That discrimination is asserted directly
 // here (see "declines an OS file drag"), because a regression there breaks
 // uploading, which is louder than a broken move.
+//
+// Every test seeds its OWN files and tears them down: the whole point of these
+// tests is that files change folders, so sharing fixtures across tests makes
+// later tests depend on earlier ones having run (and having passed).
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const RUN = `movetest-${Date.now().toString(36)}`;
 const FOLDER_NAME = `ZZ E2E Move Target ${RUN}`;
-const FILE_NAMES = [`${RUN}-a.pdf`, `${RUN}-b.pdf`, `${RUN}-c.pdf`];
 
 let folderId = "";
-const fileIds: string[] = [];
+const createdFileIds = new Set<string>();
 
-async function seed(request: APIRequestContext) {
-    const folderRes = await request.post(`/api/files/folders?projectId=${PROJECT_ID}`, {
-        data: { name: FOLDER_NAME, projectId: PROJECT_ID, visibility: "team" },
-    });
-    expect(folderRes.ok(), `folder seed failed: ${await folderRes.text()}`).toBeTruthy();
-    folderId = (await folderRes.json()).id;
+async function ctx(playwright: any, baseURL: string | undefined, storageState: any): Promise<APIRequestContext> {
+    return playwright.request.newContext({ baseURL, storageState });
+}
 
-    // Register file rows directly: this suite exercises MOVE, not upload, so it
-    // does not need real bytes in storage.
-    const filesRes = await request.post("/api/files/register", {
+async function seedFiles(request: APIRequestContext, names: string[]): Promise<string[]> {
+    const res = await request.post("/api/files/register", {
         data: {
-            files: FILE_NAMES.map(name => ({
+            files: names.map(name => ({
                 name,
                 url: `https://example.invalid/${name}`,
                 projectId: PROJECT_ID,
@@ -37,34 +36,34 @@ async function seed(request: APIRequestContext) {
             })),
         },
     });
-    expect(filesRes.ok(), `file seed failed: ${await filesRes.text()}`).toBeTruthy();
-    const created = await filesRes.json();
-    for (const f of created.files ?? created) fileIds.push(f.id);
-    expect(fileIds).toHaveLength(FILE_NAMES.length);
+    expect(res.ok(), `file seed failed: ${await res.text()}`).toBeTruthy();
+    const ids: string[] = (await res.json()).files.map((f: { id: string }) => f.id);
+    ids.forEach(id => createdFileIds.add(id));
+    return ids;
 }
 
-async function openFiles(page: Page) {
+async function openFiles(page: Page, waitForFileName: string) {
     await page.goto(`/projects/${PROJECT_ID}/files`, { waitUntil: "load" });
-    await expect(page.getByRole("heading", { name: /Files/i }).first()).toBeVisible();
-    // Wait for the list to actually populate before interacting.
-    await expect(page.getByLabel(`Select ${FILE_NAMES[0]}`)).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByLabel(`Select ${waitForFileName}`)).toBeVisible({ timeout: 20_000 });
+    // The folder must be rendered before any drag can target it.
+    await expect(page.locator(`[data-folder-id="${folderId}"]`)).toBeVisible();
 }
 
 /**
- * Dispatch a real DragEvent carrying a real DataTransfer. Playwright's dragTo()
- * does not populate dataTransfer, which is the entire thing under test here.
+ * Dispatch a real DragEvent carrying a real DataTransfer at a folder tile.
+ * Playwright's dragTo() does not populate dataTransfer, which is the entire
+ * thing under test here. Targets by data-folder-id so this never depends on
+ * folder label text or DOM shape.
  */
-async function dispatchDrag(
+async function dragAtFolder(
     page: Page,
-    selectorText: string,
     type: "dragover" | "drop",
     payload: { internal: string[] } | { osFile: true },
 ): Promise<boolean> {
     return page.evaluate(
-        ({ selectorText, type, payload }) => {
-            const target = [...document.querySelectorAll<HTMLElement>("div,button,a")]
-                .find(el => el.textContent?.trim().startsWith(selectorText) && el.children.length < 8);
-            if (!target) throw new Error(`drop target not found: ${selectorText}`);
+        ({ folderId, type, payload }) => {
+            const target = document.querySelector<HTMLElement>(`[data-folder-id="${folderId}"]`);
+            if (!target) throw new Error(`folder tile ${folderId} not in DOM`);
             const dt = new DataTransfer();
             if ("osFile" in payload) {
                 dt.items.add(new File(["x"], "from-desktop.pdf", { type: "application/pdf" }));
@@ -73,70 +72,92 @@ async function dispatchDrag(
             }
             const ev = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt });
             target.dispatchEvent(ev);
-            // preventDefault() is how a handler says "this drag is mine".
+            // preventDefault() is how a drop handler says "this drag is mine".
             return ev.defaultPrevented;
         },
-        { selectorText, type, payload },
+        { folderId, type, payload },
     );
 }
 
 test.describe("Project files — move into folders", () => {
     test.beforeAll(async ({ playwright, baseURL, storageState }) => {
-        const request = await playwright.request.newContext({ baseURL, storageState });
-        await seed(request);
+        const request = await ctx(playwright, baseURL, storageState);
+        const res = await request.post(`/api/files/folders?projectId=${PROJECT_ID}`, {
+            data: { name: FOLDER_NAME, projectId: PROJECT_ID, visibility: "team" },
+        });
+        expect(res.ok(), `folder seed failed: ${await res.text()}`).toBeTruthy();
+        folderId = (await res.json()).id;
         await request.dispose();
     });
 
     test.afterAll(async ({ playwright, baseURL, storageState }) => {
-        const request = await playwright.request.newContext({ baseURL, storageState });
-        for (const id of fileIds) await request.delete(`/api/files?fileId=${id}`);
+        const request = await ctx(playwright, baseURL, storageState);
+        for (const id of createdFileIds) await request.delete(`/api/files?fileId=${id}`);
         if (folderId) await request.delete(`/api/files?folderId=${folderId}`);
         await request.dispose();
     });
 
-    test("bulk-moves selected files into a folder without drag", async ({ page }) => {
-        await openFiles(page);
+    test("bulk-moves selected files into a folder without drag", async ({ page, playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+        const names = [`${RUN}-bulk-a.pdf`, `${RUN}-bulk-b.pdf`, `${RUN}-bulk-keep.pdf`];
+        await seedFiles(request, names);
+        await request.dispose();
+
+        await openFiles(page, names[0]);
 
         // The no-drag path: this is what works on a tablet and by keyboard.
-        await page.getByLabel(`Select ${FILE_NAMES[0]}`).check();
-        await page.getByLabel(`Select ${FILE_NAMES[1]}`).check();
+        await page.getByLabel(`Select ${names[0]}`).check();
+        await page.getByLabel(`Select ${names[1]}`).check();
         await expect(page.getByText("2 selected")).toBeVisible();
 
         await page.getByRole("button", { name: "Move to folder" }).click();
         await page.getByRole("menuitem", { name: FOLDER_NAME }).click();
 
         // Both leave the root listing...
-        await expect(page.getByLabel(`Select ${FILE_NAMES[0]}`)).toHaveCount(0, { timeout: 15_000 });
-        await expect(page.getByLabel(`Select ${FILE_NAMES[1]}`)).toHaveCount(0);
-        // ...and the third is untouched, proving the move was scoped to the selection.
-        await expect(page.getByLabel(`Select ${FILE_NAMES[2]}`)).toBeVisible();
+        await expect(page.getByLabel(`Select ${names[0]}`)).toHaveCount(0, { timeout: 20_000 });
+        await expect(page.getByLabel(`Select ${names[1]}`)).toHaveCount(0);
+        // ...and the unselected one stays, proving the move was scoped to the selection.
+        await expect(page.getByLabel(`Select ${names[2]}`)).toBeVisible();
 
         // ...and land inside the folder.
-        await page.getByText(FOLDER_NAME).first().click();
-        await expect(page.getByLabel(`Select ${FILE_NAMES[0]}`)).toBeVisible({ timeout: 15_000 });
-        await expect(page.getByLabel(`Select ${FILE_NAMES[1]}`)).toBeVisible();
+        await page.locator(`[data-folder-id="${folderId}"]`).click();
+        await expect(page.getByLabel(`Select ${names[0]}`)).toBeVisible({ timeout: 20_000 });
+        await expect(page.getByLabel(`Select ${names[1]}`)).toBeVisible();
     });
 
-    test("accepts an internal file drag onto a folder tile", async ({ page }) => {
-        await openFiles(page);
+    test("accepts an internal file drag onto a folder tile", async ({ page, playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+        const name = `${RUN}-drag.pdf`;
+        const [fileId] = await seedFiles(request, [name]);
+        await request.dispose();
 
-        const claimed = await dispatchDrag(page, FOLDER_NAME, "dragover", { internal: [fileIds[2]] });
+        await openFiles(page, name);
+
+        const claimed = await dragAtFolder(page, "dragover", { internal: [fileId] });
         expect(claimed, "folder tile must claim an internal file drag").toBe(true);
 
-        await dispatchDrag(page, FOLDER_NAME, "drop", { internal: [fileIds[2]] });
+        await dragAtFolder(page, "drop", { internal: [fileId] });
 
-        await expect(page.getByLabel(`Select ${FILE_NAMES[2]}`)).toHaveCount(0, { timeout: 15_000 });
-        await page.getByText(FOLDER_NAME).first().click();
-        await expect(page.getByLabel(`Select ${FILE_NAMES[2]}`)).toBeVisible({ timeout: 15_000 });
+        await expect(page.getByLabel(`Select ${name}`)).toHaveCount(0, { timeout: 20_000 });
+        await page.locator(`[data-folder-id="${folderId}"]`).click();
+        await expect(page.getByLabel(`Select ${name}`)).toBeVisible({ timeout: 20_000 });
     });
 
-    test("declines an OS file drag so upload still works", async ({ page }) => {
-        await openFiles(page);
+    test("declines an OS file drag so upload still works", async ({ page, playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+        const name = `${RUN}-osdrag.pdf`;
+        await seedFiles(request, [name]);
+        await request.dispose();
+
+        await openFiles(page, name);
 
         // A drag carrying real files belongs to the upload dropzone. If the folder
         // tile claimed it, dropping a file from the desktop onto a folder would be
         // swallowed as a move-of-nothing and the upload would silently vanish.
-        const claimed = await dispatchDrag(page, FOLDER_NAME, "dragover", { osFile: true });
+        const claimed = await dragAtFolder(page, "dragover", { osFile: true });
         expect(claimed, "folder tile must NOT claim an OS file drag").toBe(false);
+
+        // And the file is still where it was — the decline is a no-op, not a move.
+        await expect(page.getByLabel(`Select ${name}`)).toBeVisible();
     });
 });
