@@ -14,6 +14,7 @@ type SyncMode = "incremental" | "backfill";
 export interface QboExpenseSyncHandlerDependencies {
     getIngestSecret(): string | undefined;
     getCronSecret(): string | undefined;
+    isCronEnabled(): boolean;
     getFreshTokens(): Promise<QBTokens>;
     syncExpenses(
         options: { since: Date },
@@ -134,6 +135,12 @@ export function createQboExpenseSyncHandlers(
                     { status: 401 },
                 );
             }
+            if (!dependencies.isCronEnabled()) {
+                return NextResponse.json(
+                    { ok: false, reason: "sync-disabled" },
+                    { status: 503 },
+                );
+            }
             const since = incrementalSince(
                 dependencies.now(),
                 dependencies.incrementalLookbackDays,
@@ -146,6 +153,7 @@ export function createQboExpenseSyncHandlers(
 const handlers = createQboExpenseSyncHandlers({
     getIngestSecret: () => process.env.RECEIPT_INGEST_SECRET,
     getCronSecret: () => process.env.CRON_SECRET,
+    isCronEnabled: () => process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false",
     getFreshTokens: getFreshQBTokens,
     syncExpenses: (options, runtime) =>
         syncQboExpenses(options, undefined, runtime),

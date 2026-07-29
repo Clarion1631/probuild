@@ -8,11 +8,12 @@ const TOKENS = {
     realmId: "test-realm",
 };
 
-function createHandlers() {
+function createHandlers(options: { cronEnabled?: boolean } = {}) {
     const calls: Array<{ since: Date; tokens: typeof TOKENS }> = [];
     const handlers = createQboExpenseSyncHandlers({
         getIngestSecret: () => "ingest-secret",
         getCronSecret: () => "cron-secret",
+        isCronEnabled: () => options.cronEnabled ?? true,
         getFreshTokens: async () => TOKENS,
         syncExpenses: async ({ since }, { tokens }) => {
             calls.push({ since, tokens });
@@ -117,4 +118,15 @@ test("GET requires Vercel cron authorization and runs incremental mode", async (
     assert.equal(response.status, 200);
     assert.equal(calls.length, 1);
     assert.equal((await response.json()).mode, "incremental");
+});
+
+test("GET can disable only the QBO expense cron without affecting manual backfill", async () => {
+    const { GET, calls } = createHandlers({ cronEnabled: false });
+    const response = await GET(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        headers: { authorization: "Bearer cron-secret" },
+    }));
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, reason: "sync-disabled" });
+    assert.equal(calls.length, 0);
 });
