@@ -349,7 +349,19 @@ export function buildProjectTracker(
             // earlier stages read done, the pinned stage is current (capped at
             // 99 — 100 would read as complete), later stages keep honest pcts.
             if (index < overrideIndex) {
-                return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
+                // Staff said we're past this stage, so it reads Done and stops
+                // there. Sending the task list would let the client open a
+                // green checkmark and find unticked work under it — the tasks
+                // are usually finished in the field and just never ticked here.
+                return {
+                    label: stage.label,
+                    state: "complete",
+                    pct: 100,
+                    taskCount: 0,
+                    doneCount: 0,
+                    tasks: [],
+                    activeTaskName: null,
+                };
             }
             if (index === overrideIndex) {
                 return {
