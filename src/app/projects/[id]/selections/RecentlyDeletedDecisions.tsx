@@ -1,6 +1,7 @@
 "use client";
 
-// Team-only 30-day restore tray for soft-deleted decisions.
+// Team-only 30-day restore tray for soft-deleted decisions AND for individual
+// items the client deleted out of their archive.
 // docs/specs/client-selections-playground.md Phase 1 — clients have full
 // control of their own space and can delete ANY decision (Justin: "it's
 // their playground"); nothing is destroyed, so the team gets a quiet
@@ -10,7 +11,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { restoreDecision } from "@/lib/actions";
+import { restoreDecision, restoreItem } from "@/lib/actions";
 import { ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
 
 interface DeletedDecision {
@@ -19,6 +20,13 @@ interface DeletedDecision {
     area: string | null;
     deletedAt: string;
     candidates: { id: string }[];
+}
+
+interface DeletedItem {
+    id: string;
+    name: string;
+    deletedAt: string;
+    decision: { id: string; name: string } | null;
 }
 
 function timeAgo(dateStr: string): string {
@@ -36,12 +44,15 @@ function timeAgo(dateStr: string): string {
 
 export default function RecentlyDeletedDecisions({
     initialDeleted,
+    initialDeletedItems,
 }: {
     projectId: string;
     initialDeleted: DeletedDecision[];
+    initialDeletedItems: DeletedItem[];
 }) {
     const router = useRouter();
     const [deleted, setDeleted] = useState<DeletedDecision[]>(initialDeleted);
+    const [deletedItems, setDeletedItems] = useState<DeletedItem[]>(initialDeletedItems);
     const [open, setOpen] = useState(false);
     const [restoringId, setRestoringId] = useState<string | null>(null);
 
@@ -51,8 +62,12 @@ export default function RecentlyDeletedDecisions({
     useEffect(() => {
         setDeleted(initialDeleted);
     }, [initialDeleted]);
+    useEffect(() => {
+        setDeletedItems(initialDeletedItems);
+    }, [initialDeletedItems]);
 
-    if (deleted.length === 0) return null;
+    const total = deleted.length + deletedItems.length;
+    if (total === 0) return null;
 
     async function handleRestore(id: string, name: string) {
         setRestoringId(id);
@@ -62,6 +77,19 @@ export default function RecentlyDeletedDecisions({
             router.refresh();
         } catch (e: any) {
             toast.error(e.message || "Couldn't restore that decision.");
+        } finally {
+            setRestoringId(null);
+        }
+    }
+
+    async function handleRestoreItem(id: string, name: string) {
+        setRestoringId(id);
+        try {
+            await restoreItem(id);
+            toast.success(`"${name}" restored to the client's archive`);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't restore that item.");
         } finally {
             setRestoringId(null);
         }
@@ -77,14 +105,33 @@ export default function RecentlyDeletedDecisions({
                     <span className="text-sm font-semibold text-hui-textMain flex items-center gap-1.5">
                         {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                         Recently deleted
-                        <span className="text-xs font-normal text-hui-textMuted">({deleted.length})</span>
+                        <span className="text-xs font-normal text-hui-textMuted">({total})</span>
                     </span>
-                    <p className="text-xs text-hui-textMuted mt-0.5 ml-5">Deleted decisions are kept for 30 days.</p>
+                    <p className="text-xs text-hui-textMuted mt-0.5 ml-5">Deleted decisions and items are kept for 30 days.</p>
                 </div>
             </button>
 
             {open && (
                 <div className="mt-3 divide-y divide-slate-100 border-t border-slate-100">
+                    {deletedItems.map((item) => (
+                        <div key={item.id} className="flex items-center justify-between gap-3 py-2.5">
+                            <div className="min-w-0">
+                                <p className="text-sm font-medium text-hui-textMain truncate">{item.name}</p>
+                                <p className="text-xs text-hui-textMuted mt-0.5">
+                                    Item{item.decision ? ` from "${item.decision.name}"` : " (unsorted)"} · deleted {timeAgo(item.deletedAt)}
+                                </p>
+                            </div>
+                            <button
+                                onClick={() => handleRestoreItem(item.id, item.name)}
+                                disabled={restoringId === item.id}
+                                title="Restores into the client's archive, not their live options"
+                                className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+                            >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                {restoringId === item.id ? "Restoring…" : "Restore"}
+                            </button>
+                        </div>
+                    ))}
                     {deleted.map((d) => (
                         <div key={d.id} className="flex items-center justify-between gap-3 py-2.5">
                             <div className="min-w-0">

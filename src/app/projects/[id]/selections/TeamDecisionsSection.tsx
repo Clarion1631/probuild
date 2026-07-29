@@ -67,6 +67,13 @@ interface DeletedDecision {
     candidates: { id: string }[];
 }
 
+interface DeletedItem {
+    id: string;
+    name: string;
+    deletedAt: string;
+    decision: { id: string; name: string } | null;
+}
+
 const ARCHIVED = "Archived";
 
 function formatPrice(value: number | string | null | undefined): string | null {
@@ -463,14 +470,19 @@ function AddDecisionModal({ projectId, open, onClose, onCreated }: { projectId: 
 export default function TeamDecisionsSection({
     projectId,
     initialDecisions,
+    initialUnsorted,
     initialRecentlyDeleted,
+    initialRecentlyDeletedItems,
 }: {
     projectId: string;
     initialDecisions: DecisionData[];
+    initialUnsorted: Candidate[];
     initialRecentlyDeleted: DeletedDecision[];
+    initialRecentlyDeletedItems: DeletedItem[];
 }) {
     const router = useRouter();
     const [decisions, setDecisions] = useState<DecisionData[]>(initialDecisions);
+    const [unsorted, setUnsorted] = useState<Candidate[]>(initialUnsorted);
     const [addDecisionOpen, setAddDecisionOpen] = useState(false);
     const [importing, setImporting] = useState(false);
 
@@ -480,6 +492,14 @@ export default function TeamDecisionsSection({
     useEffect(() => {
         setDecisions(initialDecisions);
     }, [initialDecisions]);
+    useEffect(() => {
+        setUnsorted(initialUnsorted);
+    }, [initialUnsorted]);
+
+    // Archived unsorted items stay out of the team's way — the client parked
+    // them deliberately, and they're still one click from restoration on the
+    // client side.
+    const activeUnsorted = unsorted.filter((c) => c.status !== ARCHIVED);
 
     function refresh() {
         router.refresh();
@@ -548,10 +568,29 @@ export default function TeamDecisionsSection({
 
             <ApprovedItemsTable decisions={decisions} />
 
-            {decisions.length === 0 ? (
-                <div className="hui-card p-10 text-center">
-                    <p className="text-sm text-hui-textMuted">No client decisions yet — they&apos;ll show up here as the client adds items to their playground.</p>
+            {/* Anything the client clipped but hasn't filed yet. Sits above the
+                decisions because it's the newest input and the only part that
+                may need a nudge — every clipper capture lands here first. */}
+            {activeUnsorted.length > 0 && (
+                <div className="hui-card p-5 mb-5">
+                    <h3 className="text-base font-semibold text-hui-textMain">Unsorted</h3>
+                    <p className="text-xs text-hui-textMuted mt-0.5 mb-3">
+                        Clipped by the client, not yet in a decision. They sort these themselves — this is just so you can see what&apos;s coming.
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {activeUnsorted.map((item) => (
+                            <CandidateCard key={item.id} item={item} isChosen={false} />
+                        ))}
+                    </div>
                 </div>
+            )}
+
+            {decisions.length === 0 ? (
+                activeUnsorted.length === 0 && (
+                    <div className="hui-card p-10 text-center">
+                        <p className="text-sm text-hui-textMuted">No client decisions yet — they&apos;ll show up here as the client adds items to their playground.</p>
+                    </div>
+                )
             ) : (
                 <div className="space-y-5">
                     {decisions.map((decision, i) => (
@@ -567,7 +606,11 @@ export default function TeamDecisionsSection({
                 </div>
             )}
 
-            <RecentlyDeletedDecisions projectId={projectId} initialDeleted={initialRecentlyDeleted} />
+            <RecentlyDeletedDecisions
+                projectId={projectId}
+                initialDeleted={initialRecentlyDeleted}
+                initialDeletedItems={initialRecentlyDeletedItems}
+            />
 
             <AddDecisionModal projectId={projectId} open={addDecisionOpen} onClose={() => setAddDecisionOpen(false)} onCreated={refresh} />
         </div>
