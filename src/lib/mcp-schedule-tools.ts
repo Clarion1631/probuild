@@ -24,9 +24,17 @@ import {
     type ScheduleTaskType,
 } from "./schedule-task-core";
 import { withTxRetry } from "./tx-retry";
+import {
+    mcpActivityActorName,
+    type McpActorLabel,
+} from "./mcp-actor";
 
 const CONFIRMATION_TTL_MS = 10 * 60 * 1_000;
-const MCP_ACTOR: ScheduleActor = { type: "SYSTEM", name: "ChatGPT connector" };
+const DEFAULT_MCP_ACTOR_LABEL: McpActorLabel = "justin-ai";
+
+function scheduleActor(actorLabel: McpActorLabel): ScheduleActor {
+    return { type: "SYSTEM", name: mcpActivityActorName(actorLabel) };
+}
 
 type CanonicalValue =
     | null
@@ -82,10 +90,11 @@ export function scheduleArgsHash(value: unknown): string {
     return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
-async function issueConfirmation(
+export async function issueConfirmation(
     toolName: string,
     args: unknown,
     preview: string,
+    actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL,
 ): Promise<McpConfirmationPreview> {
     const token = randomBytes(32).toString("hex");
     const expiresAt = new Date(Date.now() + CONFIRMATION_TTL_MS);
@@ -93,6 +102,7 @@ async function issueConfirmation(
         data: {
             token,
             toolName,
+            actorLabel,
             argsHash: scheduleArgsHash(args),
             preview,
             expiresAt,
@@ -108,12 +118,14 @@ async function issueConfirmation(
     };
 }
 
-async function executeConfirmed<T extends Record<string, unknown>>(
+export async function executeConfirmed<T extends Record<string, unknown>>(
     toolName: string,
     args: unknown,
     confirmToken: string,
     // eslint-disable-next-line no-unused-vars
     write: (tx: Prisma.TransactionClient) => Promise<T>,
+    actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL,
+    confirmationKind = "schedule",
 ): Promise<T & { confirmed: true }> {
     const argsHash = scheduleArgsHash(args);
     return withTxRetry(() => prisma.$transaction(async tx => {
@@ -121,22 +133,27 @@ async function executeConfirmed<T extends Record<string, unknown>>(
             where: { token: confirmToken },
             select: {
                 toolName: true,
+                actorLabel: true,
                 argsHash: true,
                 expiresAt: true,
                 consumedAt: true,
             },
         });
-        if (!row) throw new Error("Invalid schedule confirmation token");
+        if (!row) throw new Error(`Invalid ${confirmationKind} confirmation token`);
+        if (row.actorLabel !== actorLabel) {
+            throw new Error("Confirmation token belongs to a different MCP actor/key; request a new preview");
+        }
         if (row.toolName !== toolName || row.argsHash !== argsHash) {
             throw new Error("Confirmation token does not match this tool and its arguments; request a new preview");
         }
-        if (row.expiresAt <= new Date()) throw new Error("Schedule confirmation token has expired");
-        if (row.consumedAt) throw new Error("Schedule confirmation token was already used");
+        if (row.expiresAt <= new Date()) throw new Error(`${confirmationKind[0].toUpperCase()}${confirmationKind.slice(1)} confirmation token has expired`);
+        if (row.consumedAt) throw new Error(`${confirmationKind[0].toUpperCase()}${confirmationKind.slice(1)} confirmation token was already used`);
 
         const claim = await tx.mcpConfirmation.updateMany({
             where: {
                 token: confirmToken,
                 toolName,
+                actorLabel,
                 argsHash,
                 expiresAt: { gt: new Date() },
                 consumedAt: null,
@@ -144,7 +161,7 @@ async function executeConfirmed<T extends Record<string, unknown>>(
             data: { consumedAt: new Date() },
         });
         if (claim.count !== 1) {
-            throw new Error("Schedule confirmation token was already consumed by another request");
+            throw new Error(`${confirmationKind[0].toUpperCase()}${confirmationKind.slice(1)} confirmation token was already consumed by another request`);
         }
 
         const result = await write(tx);
@@ -359,7 +376,8 @@ export async function planSchedule(input: {
     projectId: string;
     tasks: PlanScheduleTaskInput[];
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     if (input.tasks.length === 0) throw new Error("plan_schedule requires at least one task");
     if (input.tasks.length > 50) throw new Error("plan_schedule accepts at most 50 tasks");
     const args = { projectId: input.projectId, tasks: input.tasks };
@@ -383,7 +401,7 @@ export async function planSchedule(input: {
                 return `${index + 1}. ${source.name.trim()} — ${source.startDate} to ${source.endDate}; crew: ${crew}${task.lead ? `; lead: ${task.lead.name}` : ""}`;
             }),
         ].join("\n");
-        return issueConfirmation("plan_schedule", args, preview);
+        return issueConfirmation("plan_schedule", args, preview, actorLabel);
     }
 
     return executeConfirmed("plan_schedule", args, input.confirmToken, async tx => {
@@ -395,7 +413,7 @@ export async function planSchedule(input: {
         const created = [];
         for (const task of input.tasks) {
             const resolved = await resolvePlanTask(tx, task);
-            created.push(await createScheduleTaskInTransaction(tx, input.projectId, resolved.create, MCP_ACTOR));
+            created.push(await createScheduleTaskInTransaction(tx, input.projectId, resolved.create, actor));
         }
         return {
             projectId: input.projectId,
@@ -406,7 +424,7 @@ export async function planSchedule(input: {
                 endDate: task.endDate.toISOString().slice(0, 10),
             })),
         };
-    });
+    }, actorLabel);
 }
 
 async function validateTaskDates(input: { taskId: string; startDate?: string; endDate?: string }) {
@@ -432,7 +450,8 @@ export async function updateTaskDates(input: {
     startDate?: string;
     endDate?: string;
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     const args = { taskId: input.taskId, startDate: input.startDate, endDate: input.endDate };
     if (!input.confirmToken) {
         const { task, startDate, endDate } = await validateTaskDates(args);
@@ -440,19 +459,20 @@ export async function updateTaskDates(input: {
             "update_task_dates",
             args,
             `Move "${task.name}" from ${task.startDate.toISOString().slice(0, 10)}–${task.endDate.toISOString().slice(0, 10)} to ${startDate.toISOString().slice(0, 10)}–${endDate.toISOString().slice(0, 10)}.`,
+            actorLabel,
         );
     }
     return executeConfirmed("update_task_dates", args, input.confirmToken, async tx => {
         const task = await updateScheduleTaskInTransaction(tx, input.taskId, {
             startDate: input.startDate,
             endDate: input.endDate,
-        }, MCP_ACTOR);
+        }, actor);
         return {
             taskId: task.id,
             startDate: task.startDate.toISOString().slice(0, 10),
             endDate: task.endDate.toISOString().slice(0, 10),
         };
-    });
+    }, actorLabel);
 }
 
 export async function setTaskStatus(input: {
@@ -460,7 +480,8 @@ export async function setTaskStatus(input: {
     status: ScheduleTaskStatus;
     blockedReason?: string;
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     if (!(SCHEDULE_TASK_STATUSES as readonly string[]).includes(input.status)) {
         throw new Error(`Invalid schedule task status "${input.status}"`);
     }
@@ -477,15 +498,16 @@ export async function setTaskStatus(input: {
             "set_task_status",
             args,
             `Change "${task.name}" from ${task.status} to ${input.status}${blockedReason ? ` — ${blockedReason}` : ""}.`,
+            actorLabel,
         );
     }
     return executeConfirmed("set_task_status", args, input.confirmToken, async tx => {
         const task = await updateScheduleTaskInTransaction(tx, input.taskId, {
             status: input.status,
             blockedReason,
-        }, MCP_ACTOR);
+        }, actor);
         return { taskId: task.id, status: task.status, blockedReason: task.blockedReason };
-    });
+    }, actorLabel);
 }
 
 export async function assignTaskCrew(input: {
@@ -493,7 +515,8 @@ export async function assignTaskCrew(input: {
     crewNames: string[];
     leadName?: string;
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     const crewNames = cleanCrewNames(input.crewNames);
     const args = { taskId: input.taskId, crewNames, leadName: input.leadName?.trim() || undefined };
     const resolve = async (tx: Prisma.TransactionClient) => {
@@ -516,6 +539,7 @@ export async function assignTaskCrew(input: {
             "assign_task_crew",
             args,
             `Replace crew on "${resolved.task.name}" with ${resolved.crew.map(member => member.name).join(", ") || "nobody"}${resolved.lead ? `; lead: ${resolved.lead.name}` : ""}.`,
+            actorLabel,
         );
     }
     return executeConfirmed("assign_task_crew", args, input.confirmToken, async tx => {
@@ -523,13 +547,13 @@ export async function assignTaskCrew(input: {
         await setTaskCrewInTransaction(tx, {
             taskId: input.taskId,
             userIds: resolved.crew.map(member => member.id),
-            actor: MCP_ACTOR,
+            actor,
         });
         const assignments = await setTaskLeadInTransaction(
             tx,
             input.taskId,
             resolved.lead?.id ?? null,
-            MCP_ACTOR,
+            actor,
         );
         return {
             taskId: input.taskId,
@@ -540,7 +564,7 @@ export async function assignTaskCrew(input: {
                 role: assignment.role,
             })),
         };
-    });
+    }, actorLabel);
 }
 
 export async function listCrewAvailability(input: { startDate: string; days: number }) {
@@ -606,7 +630,8 @@ export async function setProjectStartDateWithConfirmation(input: {
     startDate: string | null;
     shiftJobTasks?: boolean;
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     if (input.startDate !== null) parseStartDateInput(input.startDate);
     const args = {
         projectId: input.projectId,
@@ -623,6 +648,7 @@ export async function setProjectStartDateWithConfirmation(input: {
             "set_project_start_date",
             args,
             `Set "${project.name}" start date from ${project.startDate?.toISOString().slice(0, 10) ?? "unset"} to ${input.startDate ?? "unset"}${args.shiftJobTasks ? `; up to ${project._count.scheduleTasks} schedule tasks may shift with the job` : "; tasks will stay in place"}.`,
+            actorLabel,
         );
     }
     return executeConfirmed("set_project_start_date", args, input.confirmToken, async tx => {
@@ -630,7 +656,7 @@ export async function setProjectStartDateWithConfirmation(input: {
             projectId: input.projectId,
             startDate: input.startDate === null ? null : parseStartDateInput(input.startDate),
             shiftJobTasks: args.shiftJobTasks,
-            actor: MCP_ACTOR,
+            actor,
         });
         if (input.startDate !== null) {
             const taskCount = await tx.scheduleTask.count({ where: { projectId: input.projectId } });
@@ -643,20 +669,21 @@ export async function setProjectStartDateWithConfirmation(input: {
                     estimateId: qualifying.id,
                     mode: "merge",
                     requireEmptyProject: true,
-                    actor: MCP_ACTOR,
+                    actor,
                 });
                 result.notes.push(`Schedule auto-generated from estimate ${qualifying.code} (${generated.created.length} tasks).`);
             }
         }
         return result as unknown as Record<string, unknown>;
-    });
+    }, actorLabel);
 }
 
 export async function generateProjectScheduleWithConfirmation(input: {
     estimateId: string;
     mode?: "merge" | "regenerate";
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     const args = { estimateId: input.estimateId, mode: input.mode ?? "merge" };
     if (!input.confirmToken) {
         const estimate = await prisma.estimate.findUnique({
@@ -674,14 +701,16 @@ export async function generateProjectScheduleWithConfirmation(input: {
             "generate_project_schedule",
             args,
             `${args.mode === "regenerate" ? "Regenerate" : "Merge"} the schedule for "${estimate.project.name}" from estimate ${estimate.code}: ${estimate._count.items} estimate lines and ${estimate._count.paymentSchedules} payment milestones; ${estimate.project._count.scheduleTasks} tasks currently exist.`,
+            actorLabel,
         );
     }
     return executeConfirmed("generate_project_schedule", args, input.confirmToken, async tx =>
         generateScheduleFromEstimateInTransaction(tx, {
             estimateId: input.estimateId,
             mode: args.mode,
-            actor: MCP_ACTOR,
+            actor,
         }) as unknown as Promise<Record<string, unknown>>,
+        actorLabel,
     );
 }
 
@@ -689,7 +718,8 @@ export async function assignProjectCrewWithConfirmation(input: {
     projectId: string;
     userIds: string[];
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     const userIds = [...new Set(input.userIds)];
     const args = { projectId: input.projectId, userIds };
     if (!input.confirmToken) {
@@ -711,10 +741,12 @@ export async function assignProjectCrewWithConfirmation(input: {
             "assign_project_crew",
             args,
             `Replace project crew on "${project.name}" with ${users.map(user => user.name || user.email).join(", ") || "nobody"}.`,
+            actorLabel,
         );
     }
     return executeConfirmed("assign_project_crew", args, input.confirmToken, async tx =>
-        setProjectCrewInTransaction(tx, { projectId: input.projectId, userIds, actor: MCP_ACTOR }) as unknown as Promise<Record<string, unknown>>,
+        setProjectCrewInTransaction(tx, { projectId: input.projectId, userIds, actor }) as unknown as Promise<Record<string, unknown>>,
+        actorLabel,
     );
 }
 
@@ -722,7 +754,8 @@ export async function applyChangeOrderToScheduleWithConfirmation(input: {
     changeOrderId: string;
     mode?: "merge" | "regenerate";
     confirmToken?: string;
-}) {
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const actor = scheduleActor(actorLabel);
     const args = { changeOrderId: input.changeOrderId, mode: input.mode ?? "merge" };
     if (!input.confirmToken) {
         const changeOrder = await prisma.changeOrder.findUnique({
@@ -740,13 +773,15 @@ export async function applyChangeOrderToScheduleWithConfirmation(input: {
             "apply_change_order_to_schedule",
             args,
             `${args.mode === "regenerate" ? "Regenerate" : "Apply"} ${changeOrder.code} "${changeOrder.title}" on "${changeOrder.project.name}" to the schedule: ${changeOrder._count.items} items and ${changeOrder._count.paymentSchedules} milestones.`,
+            actorLabel,
         );
     }
     return executeConfirmed("apply_change_order_to_schedule", args, input.confirmToken, async tx =>
         applyChangeOrderToScheduleInTransaction(tx, {
             changeOrderId: input.changeOrderId,
             mode: args.mode,
-            actor: MCP_ACTOR,
+            actor,
         }) as unknown as Promise<Record<string, unknown>>,
+        actorLabel,
     );
 }

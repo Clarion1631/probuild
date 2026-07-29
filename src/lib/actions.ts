@@ -66,6 +66,8 @@ import {
     type CreateScheduleTaskInput,
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
+import { ensureStandardFolders } from "./project-folders";
+import { createDailyLogCore } from "./daily-log-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -1153,6 +1155,15 @@ export async function convertLeadToProject(leadId: string) {
     // Auto-grant access to eligible team members
     const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
     await autoGrantProjectAccessToEligibleUsers(project.id);
+
+    // The ProBuild Files tab gets its own canonical scaffold. This is
+    // deliberately independent of Drive provisioning and never rolls back a
+    // successfully-created project.
+    try {
+        await ensureStandardFolders(project.id);
+    } catch (folderErr) {
+        console.error("[Project folders] Failed to create the standard scaffold:", folderErr);
+    }
 
     // Provision Google Drive Folders in the background/async after project creation
     try {
@@ -4169,11 +4180,12 @@ async function assertInvoicePortalAccess(): Promise<string | null> {
 }
 
 async function assertEstimateSendPermission(mcpSecret?: string) {
-    const configuredSecret = process.env.MCP_SECRET;
-    if (mcpSecret && configuredSecret) {
-        const supplied = Buffer.from(mcpSecret);
-        const configured = Buffer.from(configuredSecret);
-        if (supplied.length === configured.length && timingSafeEqual(supplied, configured)) return;
+    if (mcpSecret) {
+        const supplied = createHash("sha256").update(mcpSecret).digest();
+        for (const configuredSecret of [process.env.MCP_SECRET, process.env.MCP_SECRET_RICHARD]) {
+            const configured = createHash("sha256").update(configuredSecret ?? "").digest();
+            if (configuredSecret && timingSafeEqual(supplied, configured)) return;
+        }
     }
     await assertEstimatePermission();
 }
@@ -5035,7 +5047,16 @@ export async function deleteDocumentTemplate(id: string) {
 // Send Estimate to Client
 // =============================================
 
-export async function sendEstimateToClient(estimateId: string, templateId?: string, overrideEmail?: string, ccEmails?: string[], customMessage?: string, capturedPdfUrl?: string, mcpSecret?: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendEstimateToClient(
+    estimateId: string,
+    templateId?: string,
+    overrideEmail?: string,
+    ccEmails?: string[],
+    customMessage?: string,
+    capturedPdfUrl?: string,
+    mcpSecret?: string,
+    mcpActorLabel?: "justin-ai" | "richard-ai",
+): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
     await assertEstimateSendPermission(mcpSecret);
     try {
     // --- Server-side CC validation ---
@@ -5336,8 +5357,10 @@ export async function sendEstimateToClient(estimateId: string, templateId?: stri
         await logActivity({
             projectId: estimate.project?.id,
             leadId: estimate.lead?.id,
-            actorType: "TEAM",
-            actorName: session?.user?.name || session?.user?.email || "Team",
+            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
+            actorName: mcpActorLabel
+                ? `SYSTEM:${mcpActorLabel}`
+                : session?.user?.name || session?.user?.email || "Team",
             action: "sent_estimate",
             entityType: "estimate",
             entityId: estimateId,
@@ -5852,7 +5875,12 @@ export async function deleteContract(id: string) {
     if (contract?.leadId) revalidatePath(`/leads/${contract.leadId}`);
 }
 
-export async function sendContractToClient(contractId: string, ccOverride?: string[], expectedFingerprint?: string) {
+export async function sendContractToClient(
+    contractId: string,
+    ccOverride?: string[],
+    expectedFingerprint?: string,
+    mcpActorLabel?: "justin-ai" | "richard-ai",
+) {
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5986,8 +6014,8 @@ export async function sendContractToClient(contractId: string, ccOverride?: stri
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
+            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
+            actorName: mcpActorLabel ? `SYSTEM:${mcpActorLabel}` : companyName,
             action: "sent_contract",
             entityType: "contract",
             entityId: contractId,
@@ -11341,24 +11369,10 @@ export async function createDailyLog(projectId: string, data: {
 }) {
     // Hardened (dispatch-arc foundation): derive the author from an authorized staff session.
     const author = await assertDailyLogAccess(projectId);
-    const log = await prisma.dailyLog.create({
-        data: {
-            projectId,
-            date: new Date(data.date),
-            weather: data.weather || null,
-            crewOnSite: data.crewOnSite || null,
-            workPerformed: data.workPerformed,
-            materialsDelivered: data.materialsDelivered || null,
-            issues: data.issues || null,
-            createdById: author.id,
-            photos: data.photoUrls && data.photoUrls.length > 0 ? {
-                create: data.photoUrls.map(p => ({
-                    url: p.url,
-                    caption: p.caption || null,
-                })),
-            } : undefined,
-        },
-        include: { photos: true },
+    const log = await createDailyLogCore({
+        projectId,
+        actorUserId: author.id,
+        ...data,
     });
 
     revalidatePath(`/projects/${projectId}/dailylogs`);

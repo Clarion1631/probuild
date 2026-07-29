@@ -56,6 +56,13 @@ export type SaveProjectFileInput = {
     // null = inherit from the folder (default "team"), matching /api/files.
     visibility?: string | null;
     uploadedById?: string | null;
+    activity?: {
+        actorName: string;
+        action: string;
+        entityType: string;
+        entityName: string;
+        metadata?: Record<string, unknown>;
+    };
 };
 
 export type SaveProjectFileResult =
@@ -86,7 +93,7 @@ export async function saveProjectFile(input: SaveProjectFileInput): Promise<Save
 
     const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
     try {
-        const record = await prisma.projectFile.create({
+        const createFile = (tx: Pick<typeof prisma, "projectFile">) => tx.projectFile.create({
             data: {
                 name: input.fileName,
                 url: urlData?.publicUrl || storagePath,
@@ -100,6 +107,27 @@ export async function saveProjectFile(input: SaveProjectFileInput): Promise<Save
             },
             select: { id: true, name: true, size: true, url: true },
         });
+        const record = input.activity
+            ? await prisma.$transaction(async tx => {
+                const file = await createFile(tx as typeof prisma);
+                await tx.activityLog.create({
+                    data: {
+                        projectId: input.projectId ?? null,
+                        leadId: input.leadId ?? null,
+                        actorType: "SYSTEM",
+                        actorName: input.activity!.actorName,
+                        action: input.activity!.action,
+                        entityType: input.activity!.entityType,
+                        entityId: file.id,
+                        entityName: input.activity!.entityName,
+                        metadata: input.activity!.metadata
+                            ? JSON.stringify(input.activity!.metadata)
+                            : null,
+                    },
+                });
+                return file;
+            })
+            : await createFile(prisma);
         return { ok: true, file: record };
     } catch (err: any) {
         // The object is already in storage; without the DB row it would be
