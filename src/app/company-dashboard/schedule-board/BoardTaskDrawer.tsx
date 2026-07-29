@@ -121,6 +121,7 @@ export function BoardTaskDrawer({ taskId, hasDraft, hasCrewDraft, teamMembers, o
                         onStatusChange={(id, status, blockedReason) => { void mutate(() => updateScheduleTask(id, { status, blockedReason: status === "Blocked" ? blockedReason : null }), "Could not update status"); }}
                         onNameChange={(id, name) => { void mutate(() => updateScheduleTask(id, { name }), "Could not update task name"); }}
                         onDoneWhenChange={(id, doneWhen) => { void mutate(() => updateScheduleTask(id, { doneWhen }), "Could not update completion criteria"); }}
+                        onClientStageChange={(id, clientStage) => { void mutate(() => updateScheduleTask(id, { clientStage }), "Could not update client stage"); }}
                         onDateChange={(id, field, value) => { void mutate(() => updateScheduleTask(id, { [field]: value }), "Could not update task dates"); }}
                         onEstimatedHoursChange={(id, estimatedHours) => { void mutate(() => updateScheduleTask(id, { estimatedHours }), "Could not update estimated hours"); }}
                         onColorChange={(id, color) => { void mutate(() => updateScheduleTask(id, { color }), "Could not update task color"); }}

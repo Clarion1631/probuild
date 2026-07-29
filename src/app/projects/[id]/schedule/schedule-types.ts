@@ -25,6 +25,7 @@ export type Task = {
     estimatedHours: number | null;
     doneWhen: string | null;
     blockedReason: string | null;
+    clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: "planned" | "requested" | "confirmed" | null;
     actualHours: number;

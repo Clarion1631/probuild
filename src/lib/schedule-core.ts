@@ -2089,6 +2089,7 @@ export interface DashboardTaskRow {
     type: string;
     doneWhen: string | null;
     blockedReason: string | null;
+    clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
     pendingMaterials: number;
@@ -2359,7 +2360,7 @@ export async function getCompanyDashboardData(
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
                 id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
-                doneWhen: true, blockedReason: true, scheduledTime: true, confirmationStatus: true,
+                doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
                     select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true } } },
@@ -2411,6 +2412,7 @@ export async function getCompanyDashboardData(
             type: task.type,
             doneWhen: task.doneWhen,
             blockedReason: task.blockedReason,
+            clientStage: task.clientStage,
             scheduledTime: task.scheduledTime,
             confirmationStatus: task.confirmationStatus,
             pendingMaterials: taskMaterialCounts.pending,

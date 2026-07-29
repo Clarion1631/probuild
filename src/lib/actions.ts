@@ -6720,6 +6720,7 @@ function serializeScheduleTaskForDetail(task: any) {
         type: task.type,
         doneWhen: task.doneWhen ?? null,
         blockedReason: task.blockedReason ?? null,
+        clientStage: task.clientStage ?? null,
         scheduledTime: task.scheduledTime ?? null,
         confirmationStatus: task.confirmationStatus ?? null,
         actualHours: task.timeEntries.reduce((sum: number, entry: { durationHours: number }) => sum + entry.durationHours, 0),
