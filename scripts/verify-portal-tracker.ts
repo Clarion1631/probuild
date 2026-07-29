@@ -188,6 +188,76 @@ function runPureCases(): void {
         "empty-but-passed stages must count toward the overall roundel",
     );
 
+    const framingTask = trackerTask({
+        id: "override-frame",
+        name: "Frame partition walls",
+        status: "Not Started",
+        progress: 0,
+        startDate: date(0),
+    });
+    const overrideForward = buildProjectTracker([framingTask], "Drywall");
+    assert.deepEqual(
+        overrideForward.stages.map(stage => stage.state),
+        ["complete", "complete", "complete", "complete", "current", "upcoming", "upcoming", "upcoming"],
+        "an override pins the current stage regardless of task positions",
+    );
+    assert.equal(overrideForward.overallPct, 50);
+
+    const overrideBackward = buildProjectTracker([
+        trackerTask({
+            id: "override-demo",
+            name: "Kitchen demolition",
+            status: "Complete",
+            progress: 100,
+            startDate: date(0),
+        }),
+    ], "Demo");
+    assert.equal(overrideBackward.stages[1].state, "current");
+    assert.equal(
+        overrideBackward.stages[1].pct,
+        99,
+        "an overridden current stage must clamp to 99 so it never reads complete",
+    );
+
+    const overrideUnknown = buildProjectTracker([framingTask], "Not A Stage");
+    assert.deepEqual(
+        overrideUnknown.stages.map(stage => stage.state),
+        emptyLeadingStages.stages.map(stage => stage.state),
+        "an unknown override label must fall back to task-derived position",
+    );
+
+    const overrideNoTasks = buildProjectTracker([], "Framing");
+    assert.equal(overrideNoTasks.stages[2].state, "current");
+    assert.equal(overrideNoTasks.overallPct, 25, "an override must drive the roundel even with no tasks");
+
+    const overrideFirst = buildProjectTracker([framingTask], "Planning & Permits");
+    assert.equal(overrideFirst.stages[0].state, "current");
+    assert.equal(overrideFirst.overallPct, 0);
+
+    const overrideLast = buildProjectTracker([framingTask], "Complete");
+    assert.equal(overrideLast.stages[7].state, "current");
+    assert.equal(overrideLast.overallPct, 88);
+
+    const overrideLastWithWork = buildProjectTracker([
+        trackerTask({ id: "closeout", name: "Project closeout", status: "Complete", progress: 100 }),
+    ], "Complete");
+    assert.equal(overrideLastWithWork.stages[7].state, "current");
+    assert.equal(
+        overrideLastWithWork.overallPct,
+        99,
+        "a current stage must never let the roundel round up to 100%",
+    );
+
+    const overrideWithAllComplete = buildProjectTracker([
+        trackerTask({ id: "ac-1", name: "Frame walls", status: "Complete", progress: 100 }),
+    ], "Drywall");
+    assert.equal(
+        overrideWithAllComplete.stages[4].state,
+        "current",
+        "an override must win over the all-tasks-complete shortcut",
+    );
+    assert.equal(overrideWithAllComplete.overallPct, 50);
+
     const nearestFallback = buildProjectTracker([
         trackerTask({
             id: "fallback-demo",

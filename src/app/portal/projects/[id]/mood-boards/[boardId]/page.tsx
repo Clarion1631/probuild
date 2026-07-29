@@ -7,6 +7,7 @@ import {
     getSelectionProposalsForPortal,
     getPortalMoodBoardAccess,
 } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import { isHttpUrl } from "@/lib/url-safety";
 import Link from "next/link";
 import PortalMoodBoardViewer from "./PortalMoodBoardViewer";
@@ -19,20 +20,24 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
         return notFound();
     }
 
-    const board = await getMoodBoard(boardId);
-    if (!board || board.projectId !== id) return notFound();
-
     // Ownership check: PortalVisibility only gates whether mood boards are
     // enabled for the project, not whether this session may see THIS
     // project's boards — without this a client authenticated on a different
-    // project could read another project's board by id.
+    // project could read another project's board by id. Runs before
+    // getMoodBoard both to avoid a wasted query for unauthorized visitors and
+    // because getMoodBoard now runs its own ownership check (on the board's
+    // actual project, which may differ from `id` for a bogus boardId) —
+    // sharing this try/catch means that throw is caught too.
     let isStaff: boolean;
+    let board: Awaited<ReturnType<typeof getMoodBoard>>;
     try {
         ({ isStaff } = await getPortalMoodBoardAccess(id));
+        board = await getMoodBoard(boardId);
     } catch (e) {
-        if (e instanceof Error && e.message === "Unauthorized") return notFound();
+        if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
         throw e;
     }
+    if (!board || board.projectId !== id) return notFound();
 
     // Staff add images from their own editor (MoodBoardEditor.tsx) — the
     // portal photo-upload tray posts to /api/portal/files, which always marks
@@ -40,32 +45,75 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
     // here.
     const canUpload = visibility.showFiles && !isStaff;
 
-    // Tray content the client can drop onto the board: project selection
-    // option images, plus their own favorites/suggestions — but favorites and
-    // proposals are gated on showSelections, which can be off while mood
-    // boards stay on, so both are best-effort and fall back to [] rather than
-    // taking the whole page down.
-    const [selectionImages, favorites, proposals] = await Promise.all([
-        prisma.selectionOption.findMany({
-            where: { category: { board: { projectId: id } }, imageUrl: { not: null } },
-            select: { id: true, name: true, imageUrl: true },
+    // Library content the client can toggle onto the board: project selection
+    // option images grouped by category, plus their own favorites/suggestions
+    // — but favorites and proposals are gated on showSelections, which can be
+    // off while mood boards stay on, so both are best-effort and fall back to
+    // [] rather than taking the whole page down.
+    const [selectionCategories, favorites, proposals] = await Promise.all([
+        prisma.selectionCategory.findMany({
+            where: { board: { projectId: id } },
+            orderBy: [{ board: { createdAt: "asc" } }, { order: "asc" }],
+            select: {
+                name: true,
+                options: {
+                    orderBy: { order: "asc" },
+                    select: { id: true, name: true, imageUrl: true, price: true },
+                },
+            },
         }),
         getProjectFavoritesForPortal(id).catch(() => [] as Awaited<ReturnType<typeof getProjectFavoritesForPortal>>),
         getSelectionProposalsForPortal(id).catch(() => [] as Awaited<ReturnType<typeof getSelectionProposalsForPortal>>),
     ]);
 
-    const trayByKey = new Map<string, { key: string; name: string; imageUrl: string }>();
-    for (const opt of selectionImages) {
-        if (isHttpUrl(opt.imageUrl)) trayByKey.set(`selection-${opt.id}`, { key: `selection-${opt.id}`, name: opt.name, imageUrl: opt.imageUrl });
+    // Dedupe by imageUrl ACROSS ALL GROUPS — a library tile is matched back to
+    // board items by imageUrl (see PortalMoodBoardViewer's toggle handler), so
+    // the same URL appearing in two groups would make every one of those
+    // tiles show as "on board" together and toggling off would remove an
+    // arbitrary matching item. `seenImageUrls` is shared across the three
+    // dedupeGlobal() calls below, so precedence follows call order:
+    // selection categories first, then suggestions, then favorites. Group
+    // ordering is otherwise unchanged.
+    const seenImageUrls = new Set<string>();
+    function dedupeGlobal<T extends { imageUrl: string }>(entries: T[]): T[] {
+        const out: T[] = [];
+        for (const entry of entries) {
+            if (seenImageUrls.has(entry.imageUrl)) continue;
+            seenImageUrls.add(entry.imageUrl);
+            out.push(entry);
+        }
+        return out;
     }
-    for (const fav of favorites) {
-        const imageUrl = (fav as any).product?.imageUrl;
-        if (isHttpUrl(imageUrl)) trayByKey.set(`favorite-${fav.id}`, { key: `favorite-${fav.id}`, name: (fav as any).product?.name || "Favorite", imageUrl });
-    }
-    for (const prop of proposals) {
-        if (isHttpUrl((prop as any).imageUrl)) trayByKey.set(`proposal-${prop.id}`, { key: `proposal-${prop.id}`, name: (prop as any).name || "Suggestion", imageUrl: (prop as any).imageUrl });
-    }
-    const tray = Array.from(trayByKey.values());
+
+    const categories = selectionCategories
+        .map((cat) => ({
+            categoryName: cat.name,
+            items: dedupeGlobal(
+                cat.options
+                    .filter((opt) => isHttpUrl(opt.imageUrl))
+                    .map((opt) => ({
+                        key: `option-${opt.id}`,
+                        name: opt.name,
+                        imageUrl: opt.imageUrl as string,
+                        price: opt.price != null ? Number(opt.price) : undefined,
+                    }))
+            ),
+        }))
+        .filter((cat) => cat.items.length > 0);
+
+    const suggestions = dedupeGlobal(
+        proposals
+            .filter((prop) => isHttpUrl((prop as any).imageUrl))
+            .map((prop) => ({ key: `proposal-${prop.id}`, name: (prop as any).name || "Suggestion", imageUrl: (prop as any).imageUrl as string }))
+    );
+
+    const favoriteEntries = dedupeGlobal(
+        favorites
+            .filter((fav) => isHttpUrl((fav as any).product?.imageUrl))
+            .map((fav) => ({ key: `favorite-${fav.id}`, name: (fav as any).product?.name || "Favorite", imageUrl: (fav as any).product.imageUrl as string }))
+    );
+
+    const library = { categories, suggestions, favorites: favoriteEntries };
 
     return (
         <div className="h-[calc(100vh-8rem)] flex flex-col p-4">
@@ -87,7 +135,7 @@ export default async function PortalMoodBoardCanvasPage(props: { params: Promise
                     items={JSON.parse(JSON.stringify(board.items))}
                     isStaff={isStaff}
                     canUpload={canUpload}
-                    tray={tray}
+                    library={JSON.parse(JSON.stringify(library))}
                 />
             </div>
         </div>

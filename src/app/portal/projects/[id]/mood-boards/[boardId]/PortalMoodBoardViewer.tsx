@@ -21,10 +21,22 @@ interface Item {
     addedByClient?: boolean;
 }
 
-interface TrayEntry {
+interface LibraryEntry {
     key: string;
     name: string;
     imageUrl: string;
+    price?: number;
+}
+
+interface LibraryCategory {
+    categoryName: string;
+    items: LibraryEntry[];
+}
+
+interface Library {
+    categories: LibraryCategory[];
+    suggestions: LibraryEntry[];
+    favorites: LibraryEntry[];
 }
 
 export default function PortalMoodBoardViewer({
@@ -33,14 +45,14 @@ export default function PortalMoodBoardViewer({
     items: initialItems,
     isStaff,
     canUpload,
-    tray,
+    library,
 }: {
     boardId: string;
     projectId: string;
     items: Item[];
     isStaff: boolean;
     canUpload: boolean;
-    tray: TrayEntry[];
+    library: Library;
 }) {
     const canvasRef = useRef<HTMLDivElement>(null);
     const photoInputRef = useRef<HTMLInputElement>(null);
@@ -48,9 +60,19 @@ export default function PortalMoodBoardViewer({
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [trayOpen, setTrayOpen] = useState(initialItems.length === 0);
     const [busy, setBusy] = useState(false);
+    // Keyed on imageUrl (not the library entry's own key) because that's the
+    // domain the toggle mutates in — board items are matched back to a
+    // library tile by imageUrl. Mirrored into a ref so the guard is set
+    // synchronously before any await, so two rapid clicks on the same image
+    // can't both read a stale "not pending" state and pass the guard.
+    const pendingLibraryUrlsRef = useRef<Set<string>>(new Set());
+    const [pendingLibraryUrls, setPendingLibraryUrls] = useState<Set<string>>(new Set());
     const [uploadingPhoto, setUploadingPhoto] = useState(false);
     const [swatchColor, setSwatchColor] = useState("#3b82f6");
     const [noteText, setNoteText] = useState("");
+
+    const onBoardImageUrls = new Set(items.filter(i => i.type === "IMAGE").map(i => i.content));
+    const isLibraryEmpty = library.categories.length === 0 && library.suggestions.length === 0 && library.favorites.length === 0;
 
     const updateLocal = (id: string, updates: Partial<Item>) => {
         setItems(prev => prev.map(i => (i.id === id ? { ...i, ...updates } : i)));
@@ -78,21 +100,51 @@ export default function PortalMoodBoardViewer({
         }
     };
 
-    const handleAddFromTray = async (entry: TrayEntry) => {
-        setBusy(true);
+    const handleToggleLibraryItem = async (entry: LibraryEntry) => {
+        if (pendingLibraryUrlsRef.current.has(entry.imageUrl)) return;
+        // Lock the ref synchronously, before any await — setState alone is
+        // async/batched and wouldn't reliably stop two rapid clicks on the
+        // same image from both passing this guard.
+        pendingLibraryUrlsRef.current.add(entry.imageUrl);
+        setPendingLibraryUrls(new Set(pendingLibraryUrlsRef.current));
         try {
-            const { x, y } = centerPosition(240);
-            const item = await portalAddMoodBoardItem(boardId, {
-                type: "IMAGE",
-                content: entry.imageUrl,
-                x, y, width: 240, height: 240,
-            });
-            setItems(prev => [...prev, item]);
-            toast.success("Added to board");
+            const matches = items.filter(i => i.type === "IMAGE" && i.content === entry.imageUrl);
+            if (matches.length > 0) {
+                // Multiple board items can share this URL. Only a
+                // client-added item (addedByClient) can be deleted by a
+                // client session server-side (portalDeleteMoodBoardItem) — so
+                // prefer removing one of those over an arbitrary match.
+                const existing = matches.find(i => i.addedByClient) ?? matches[0];
+                if (!isStaff && !existing.addedByClient) {
+                    // Every match is staff-placed and this is a client
+                    // session — the server would reject the delete with a
+                    // generic "Only items you added can be removed" error.
+                    // Don't even call it; tell the client why instead.
+                    toast.info("Your project manager placed this one — ask them if you'd like it taken off.");
+                    return;
+                }
+                await portalDeleteMoodBoardItem(boardId, existing.id);
+                setItems(prev => prev.filter(i => i.id !== existing.id));
+                toast.success("Removed from board");
+            } else {
+                // Deterministic per-add offset so repeated toggles don't stack
+                // items exactly on top of each other — no Math.random, so
+                // server-side revalidation/re-render doesn't shift positions.
+                const offset = (items.length % 5) * 24;
+                const { x, y } = centerPosition(240);
+                const item = await portalAddMoodBoardItem(boardId, {
+                    type: "IMAGE",
+                    content: entry.imageUrl,
+                    x: x + offset, y: y + offset, width: 240, height: 240,
+                });
+                setItems(prev => [...prev, item]);
+                toast.success("Added to board");
+            }
         } catch (e: any) {
-            toast.error(e.message || "Failed to add item");
+            toast.error(e.message || "Failed to update board");
         } finally {
-            setBusy(false);
+            pendingLibraryUrlsRef.current.delete(entry.imageUrl);
+            setPendingLibraryUrls(new Set(pendingLibraryUrlsRef.current));
         }
     };
 
@@ -220,22 +272,62 @@ export default function PortalMoodBoardViewer({
                 {trayOpen && (
                     <div className="w-full md:w-72 border-t md:border-t-0 md:border-l border-slate-200 bg-white overflow-y-auto p-4 space-y-6 shrink-0 max-h-[45vh] md:max-h-none">
                         <div>
-                            <h3 className="text-sm font-semibold text-slate-700 mb-2">From your project</h3>
-                            {tray.length === 0 ? (
-                                <p className="text-xs text-slate-400">Nothing here yet — favorites, suggestions, and selection photos will show up as they're added.</p>
+                            <h3 className="text-sm font-semibold text-slate-700">Project library</h3>
+                            <p className="text-xs text-slate-400 mb-2">Tap an item to place it on the board — tap again to take it off.</p>
+                            {isLibraryEmpty ? (
+                                <p className="text-xs text-slate-400">Options your project manager shares on the Selections tab will appear here.</p>
                             ) : (
-                                <div className="grid grid-cols-3 gap-2">
-                                    {tray.map(entry => (
-                                        <button
-                                            key={entry.key}
-                                            onClick={() => handleAddFromTray(entry)}
-                                            disabled={busy}
-                                            title={entry.name}
-                                            className="aspect-square rounded-md overflow-hidden border border-slate-200 hover:border-hui-primary transition disabled:opacity-50"
-                                        >
-                                            <img src={entry.imageUrl} alt={entry.name} className="w-full h-full object-cover" />
-                                        </button>
+                                <div className="space-y-4">
+                                    {library.categories.map((cat, idx) => (
+                                        <div key={`${idx}-${cat.categoryName}`}>
+                                            <h4 className="text-xs font-semibold text-slate-500 mb-2">{cat.categoryName}</h4>
+                                            <div className="grid grid-cols-3 gap-2">
+                                                {cat.items.map(entry => (
+                                                    <LibraryTile
+                                                        key={entry.key}
+                                                        entry={entry}
+                                                        isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
+                                                        onToggle={() => handleToggleLibraryItem(entry)}
+                                                    />
+                                                ))}
+                                            </div>
+                                        </div>
                                     ))}
+
+                                    {library.suggestions.length > 0 && (
+                                        <div>
+                                            <h4 className="text-xs font-semibold text-slate-500 mb-2">Your suggestions</h4>
+                                            <div className="grid grid-cols-3 gap-2">
+                                                {library.suggestions.map(entry => (
+                                                    <LibraryTile
+                                                        key={entry.key}
+                                                        entry={entry}
+                                                        isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
+                                                        onToggle={() => handleToggleLibraryItem(entry)}
+                                                    />
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {library.favorites.length > 0 && (
+                                        <div>
+                                            <h4 className="text-xs font-semibold text-slate-500 mb-2">Team favorites</h4>
+                                            <div className="grid grid-cols-3 gap-2">
+                                                {library.favorites.map(entry => (
+                                                    <LibraryTile
+                                                        key={entry.key}
+                                                        entry={entry}
+                                                        isOnBoard={onBoardImageUrls.has(entry.imageUrl)}
+                                                        isPending={pendingLibraryUrls.has(entry.imageUrl)}
+                                                        onToggle={() => handleToggleLibraryItem(entry)}
+                                                    />
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -294,6 +386,51 @@ export default function PortalMoodBoardViewer({
                 )}
             </div>
         </div>
+    );
+}
+
+function LibraryTile({
+    entry,
+    isOnBoard,
+    isPending,
+    onToggle,
+}: {
+    entry: LibraryEntry;
+    isOnBoard: boolean;
+    isPending: boolean;
+    onToggle: () => void;
+}) {
+    return (
+        <button
+            onClick={onToggle}
+            disabled={isPending}
+            title={entry.name}
+            className={`relative rounded-md overflow-hidden border transition disabled:opacity-50 ${
+                isOnBoard ? "border-green-500 ring-2 ring-green-200" : "border-slate-200 hover:border-hui-primary"
+            }`}
+        >
+            <div className="aspect-square w-full overflow-hidden bg-slate-100">
+                <img src={entry.imageUrl} alt={entry.name} className="w-full h-full object-cover" />
+            </div>
+            <div className="px-1 py-1 bg-white text-left">
+                <p className="text-[11px] text-slate-600 truncate">{entry.name}</p>
+                {entry.price != null && (
+                    <p className="text-[11px] text-hui-primary font-medium">+${Math.round(entry.price).toLocaleString()}</p>
+                )}
+            </div>
+
+            {isOnBoard && !isPending && (
+                <span className="absolute top-1 right-1 w-4 h-4 bg-green-500 rounded-full flex items-center justify-center text-white text-[10px] shadow">
+                    ✓
+                </span>
+            )}
+
+            {isPending && (
+                <span className="absolute inset-0 bg-white/70 flex items-center justify-center">
+                    <span className="w-4 h-4 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin" />
+                </span>
+            )}
+        </button>
     );
 }
 

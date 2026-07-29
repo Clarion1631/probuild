@@ -6,7 +6,7 @@ import {
     createProductLibraryItem,
     updateProductLibraryItem,
     deleteProductLibraryItem,
-    addProjectFavorite,
+    addTeamCandidate,
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
@@ -238,9 +238,16 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
         if (!addToProjectFor || !pickedProjectId) return;
         setAddingFavorite(true);
         try {
-            await addProjectFavorite(pickedProjectId, addToProjectFor.id, favoriteNote || undefined);
+            await addTeamCandidate(null, {
+                projectId: pickedProjectId,
+                name: addToProjectFor.name,
+                description: favoriteNote.trim() || undefined,
+                imageUrl: addToProjectFor.imageUrl || undefined,
+                vendorUrl: addToProjectFor.vendorUrl || undefined,
+                price: addToProjectFor.price != null ? Number(addToProjectFor.price) : undefined,
+            });
             const projectName = allProjects.find((p) => p.id === pickedProjectId)?.name || "project";
-            toast.success(`Added to ${projectName}'s favorites`);
+            toast.success(`Added to ${projectName}'s selections`);
             setAddToProjectFor(null);
         } catch (e: any) {
             toast.error(e.message || "Failed to add to project");
@@ -426,7 +433,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                                             className="text-xs font-medium text-hui-primary hover:text-hui-primaryHover flex items-center gap-1 transition"
                                         >
                                             <FolderPlus className="w-3.5 h-3.5" />
-                                            Add to project…
+                                            Add to project selections
                                         </button>
                                     </div>
                                 </div>
@@ -585,7 +592,7 @@ export default function ProductLibraryClient({ initialProducts, allProjects, app
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setAddToProjectFor(null)}>
                     <div className="bg-white rounded-xl shadow-2xl max-w-md w-full" onClick={(e) => e.stopPropagation()}>
                         <div className="px-6 py-4 border-b border-hui-border">
-                            <h3 className="text-lg font-bold text-hui-textMain">Add to project favorites</h3>
+                            <h3 className="text-lg font-bold text-hui-textMain">Add to project selections</h3>
                             <p className="text-xs text-hui-textMuted mt-0.5">{addToProjectFor.name}</p>
                         </div>
                         <div className="p-6 space-y-4">

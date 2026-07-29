@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
 import { getPortalVisibility, getMoodBoards, getPortalMoodBoardAccess } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import Link from "next/link";
 import PortalStartMoodBoardButton from "./PortalStartMoodBoardButton";
 
@@ -27,14 +28,14 @@ export default async function PortalMoodBoardsPage(props: { params: Promise<{ id
     // THIS project's boards — a client on a different project could
     // otherwise browse boards that aren't theirs.
     let isStaff: boolean;
+    let boards: Awaited<ReturnType<typeof getMoodBoards>>;
     try {
         ({ isStaff } = await getPortalMoodBoardAccess(id));
+        boards = await getMoodBoards(id);
     } catch (e) {
-        if (e instanceof Error && e.message === "Unauthorized") return notFound();
+        if (e instanceof PortalAuthError || (e instanceof Error && e.message === "Unauthorized")) return notFound();
         throw e;
     }
-
-    const boards = await getMoodBoards(id);
 
     return (
         <div className="max-w-5xl mx-auto py-8 px-4">
