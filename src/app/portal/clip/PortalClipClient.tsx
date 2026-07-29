@@ -2,9 +2,15 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { submitSelectionProposal } from "@/lib/actions";
+import { submitSelectionProposal, createDecision } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Check } from "lucide-react";
+
+interface ClipDecision {
+    id: string;
+    name: string;
+    area: string | null;
+}
 
 interface Props {
     projectId: string;
@@ -18,7 +24,14 @@ interface Props {
     // form only shows name / photo / note / source link. The source link
     // still gets the team to the vendor page directly.
     initialVendor: string;
+    // The client's own live decisions, so a clip can land straight into the
+    // category it belongs to instead of always dropping Unsorted.
+    decisions: ClipDecision[];
 }
+
+// Sentinel for the "＋ New category" option — a real decision id can never
+// collide with it (cuid), and "" is already taken by Unsorted.
+const NEW_CATEGORY = "__new__";
 
 // The client-facing clipper form. Prefilled entirely from the bookmarklet's
 // in-page DOM extraction (see PortalClipPage / buildClipperBookmarklet) — no
@@ -33,9 +46,16 @@ export default function PortalClipClient({
     initialPrice,
     initialCurrency,
     initialImage,
+    decisions,
 }: Props) {
     const [name, setName] = useState((initialName || "").slice(0, 200));
     const [note, setNote] = useState("");
+    const [decisionId, setDecisionId] = useState("");
+    const [newCategory, setNewCategory] = useState("");
+    // Remembers a category this popup already created, so a failed submit
+    // (network drop, validation) doesn't mint a second empty category when the
+    // client hits Send again. Cleared whenever they change the name.
+    const [createdDecisionId, setCreatedDecisionId] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState(false);
     const [sent, setSent] = useState(false);
 
@@ -54,13 +74,32 @@ export default function PortalClipClient({
     const currencyNote =
         !!initialPrice && currency && currency !== "USD" ? `Listed price: ${initialPrice} ${currency}` : undefined;
 
+    const creatingCategory = decisionId === NEW_CATEGORY;
+
     async function handleSubmit() {
         if (!name.trim()) {
             toast.error("Give it a name so your team knows what you're pointing at.");
             return;
         }
+        if (creatingCategory && !newCategory.trim()) {
+            toast.error("Name the new category, or pick Unsorted.");
+            return;
+        }
         setSubmitting(true);
         try {
+            // Create-then-clip, not one combined call: createDecision is the
+            // single writer for a decision (client-created ones are flagged
+            // createdByClient there), and submitSelectionProposal re-validates
+            // whatever id it's handed against this project anyway. Reuse the
+            // category if we already created it on an attempt that then failed
+            // to submit — otherwise every retry leaves another empty category
+            // behind.
+            let targetDecisionId = creatingCategory ? createdDecisionId ?? undefined : decisionId || undefined;
+            if (creatingCategory && !targetDecisionId) {
+                const created = await createDecision(projectId, { name: newCategory.trim() });
+                setCreatedDecisionId(created.id);
+                targetDecisionId = created.id;
+            }
             await submitSelectionProposal(projectId, {
                 url: initialUrl || undefined,
                 name: name.trim(),
@@ -68,6 +107,7 @@ export default function PortalClipClient({
                 imageUrl: safeImage || undefined,
                 clientNote: note.trim() || undefined,
                 listPrice,
+                decisionId: targetDecisionId,
             });
             setSent(true);
         } catch (e: any) {
@@ -81,6 +121,16 @@ export default function PortalClipClient({
         setSent(false);
         setName((initialName || "").slice(0, 200));
         setNote("");
+        // Category choice is deliberately NOT reset — clipping three faucets in
+        // a row shouldn't mean picking "Fixtures" three times. A category made
+        // via ＋ New on the last clip isn't in `decisions` (this popup never
+        // re-fetches), so fall back to Unsorted rather than leaving the select
+        // pointing at a stale sentinel that would create a duplicate category.
+        if (creatingCategory) {
+            setDecisionId("");
+            setNewCategory("");
+            setCreatedDecisionId(null);
+        }
     }
 
     if (sent) {
@@ -140,6 +190,41 @@ export default function PortalClipClient({
                     </div>
 
                     <div>
+                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Category</label>
+                        <select
+                            value={decisionId}
+                            onChange={(e) => setDecisionId(e.target.value)}
+                            className="hui-input w-full mt-1 text-sm"
+                            disabled={submitting}
+                        >
+                            <option value="">Unsorted — I&apos;ll sort it later</option>
+                            {decisions.map((d) => (
+                                <option key={d.id} value={d.id}>
+                                    {d.name}
+                                    {d.area ? ` · ${d.area}` : ""}
+                                </option>
+                            ))}
+                            <option value={NEW_CATEGORY}>＋ New category…</option>
+                        </select>
+                        {creatingCategory && (
+                            <input
+                                type="text"
+                                value={newCategory}
+                                onChange={(e) => {
+                                    setNewCategory(e.target.value);
+                                    // A different name means a different
+                                    // category — don't reuse the last one.
+                                    setCreatedDecisionId(null);
+                                }}
+                                className="hui-input w-full mt-2 text-sm"
+                                placeholder="Category name (e.g. Fixtures)"
+                                disabled={submitting}
+                                autoFocus
+                            />
+                        )}
+                    </div>
+
+                    <div>
                         <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
                             Note to your team <span className="normal-case font-normal">(optional)</span>
                         </label>
@@ -173,7 +258,7 @@ export default function PortalClipClient({
 
                     <button
                         onClick={handleSubmit}
-                        disabled={submitting || !name.trim()}
+                        disabled={submitting || !name.trim() || (creatingCategory && !newCategory.trim())}
                         className="hui-btn hui-btn-green w-full disabled:opacity-50"
                     >
                         {submitting ? "Sending..." : "Send to your project team"}

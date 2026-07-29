@@ -38,6 +38,7 @@ model User {
   dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
   createdTaskMaterials TaskMaterial[] @relation("TaskMaterialCreator")
   taskMaterialStatusChanges TaskMaterial[] @relation("TaskMaterialStatusChanger")
+  createdPunchItems TaskPunchItem[] @relation("TaskPunchItemCreator")
   clippedProducts    ProductLibraryItem[]
   addedFavorites     ProjectProductFavorite[]
   decidedProposals   SelectionProposal[]
@@ -1051,7 +1052,11 @@ model TaskPunchItem {
   assignee    String?
   photoUrl    String?
   order       Int          @default(0)
+  createdById String?
+  createdBy   User?        @relation("TaskPunchItemCreator", fields: [createdById], references: [id], onDelete: SetNull)
   createdAt   DateTime     @default(now())
+
+  @@index([createdById])
 }
 
 model TaskAssignment {
@@ -1070,6 +1075,7 @@ model McpConfirmation {
   id         String    @id @default(cuid())
   token      String    @unique
   toolName   String
+  actorLabel String    @default("justin-ai")
   argsHash   String
   preview    String
   createdAt  DateTime  @default(now())
@@ -1719,9 +1725,15 @@ model SelectionProposal {
   decisionId   String?  // Decision this candidate sits in; null = "Unsorted" in the playground
   decision     Decision? @relation("DecisionCandidates", fields: [decisionId], references: [id], onDelete: SetNull)
   chosenForDecision Decision? @relation("DecisionChosenItem") // back-relation only; the FK lives on Decision.chosenItemId
+  // Soft delete only, same rule as Decision.deletedAt — the client can delete
+  // an archived item outright from their own playground, but "lose no customer
+  // data" still holds: the row survives and the team can restore it for 30
+  // days (getRecentlyDeletedItems / restoreItem). Filtered out of every read.
+  deletedAt    DateTime?
 
   @@index([projectId, status])
   @@index([decisionId])
+  @@index([projectId, deletedAt])
 }
 
 // Client Selections Playground — Phase 1 (docs/specs/client-selections-playground.md).
