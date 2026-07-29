@@ -1,5 +1,6 @@
 import type { QBTokens } from "./quickbooks";
 import { getQBPurchasesSince } from "./quickbooks";
+import { findBestProjectNameMatches } from "./project-match";
 
 export interface QboPurchaseForImport {
     qbPurchaseId: string;
@@ -172,4 +173,80 @@ export async function listQboPurchasesForImport(
     since: Date,
 ): Promise<QboPurchaseForImport[]> {
     return (await readQboPurchasesForImport(tokens, since)).purchases;
+}
+
+export interface QboExpenseProjectCandidate {
+    id: string;
+    name: string;
+    status: string;
+    qbCustomerId?: string | null;
+    estimates: Array<{ id: string; createdAt: Date }>;
+}
+
+export type ActiveProjectMatch =
+    | { kind: "matched"; projectId: string; estimateId: string }
+    | {
+        kind: "skipped";
+        reason:
+            | "missing-customer"
+            | "no-active-project"
+            | "ambiguous-project"
+            | "no-estimate";
+    };
+
+function matchCandidateEstimate(project: QboExpenseProjectCandidate): ActiveProjectMatch {
+    const latestEstimate = [...project.estimates]
+        .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
+    if (!latestEstimate) return { kind: "skipped", reason: "no-estimate" };
+    return {
+        kind: "matched",
+        projectId: project.id,
+        estimateId: latestEstimate.id,
+    };
+}
+
+/**
+ * Resolve a Purchase to one and only one currently in-progress ProBuild job.
+ * Closed, waiting, substantially complete, ambiguous, and estimate-less jobs
+ * are all explicit skips; a financial import never guesses.
+ */
+export function findActiveProjectForQboPurchase(
+    input: Pick<QboPurchaseForImport, "customerId" | "customerName">,
+    projects: QboExpenseProjectCandidate[],
+): ActiveProjectMatch {
+    if (!input.customerId && !input.customerName) {
+        return { kind: "skipped", reason: "missing-customer" };
+    }
+
+    const activeProjects = projects.filter(project => project.status === "In Progress");
+    if (activeProjects.length === 0) {
+        return { kind: "skipped", reason: "no-active-project" };
+    }
+
+    if (input.customerId) {
+        const idMatches = activeProjects.filter(
+            project => project.qbCustomerId === input.customerId,
+        );
+        if (idMatches.length === 1) return matchCandidateEstimate(idMatches[0]);
+        if (idMatches.length > 1 && !input.customerName) {
+            return { kind: "skipped", reason: "ambiguous-project" };
+        }
+        if (idMatches.length > 1 && input.customerName) {
+            const nameMatches = findBestProjectNameMatches(input.customerName, idMatches);
+            if (nameMatches.length === 1) return matchCandidateEstimate(nameMatches[0]);
+            return { kind: "skipped", reason: "ambiguous-project" };
+        }
+    }
+
+    if (!input.customerName) {
+        return { kind: "skipped", reason: "no-active-project" };
+    }
+    const nameMatches = findBestProjectNameMatches(input.customerName, activeProjects);
+    if (nameMatches.length === 0) {
+        return { kind: "skipped", reason: "no-active-project" };
+    }
+    if (nameMatches.length > 1) {
+        return { kind: "skipped", reason: "ambiguous-project" };
+    }
+    return matchCandidateEstimate(nameMatches[0]);
 }
