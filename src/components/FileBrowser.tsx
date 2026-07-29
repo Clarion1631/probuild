@@ -98,6 +98,9 @@ export default function FileBrowser({
     const [renameFolderValue, setRenameFolderValue] = useState("");
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [loaded, setLoaded] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+    const [isBulkMoving, setIsBulkMoving] = useState(false);
 
     const fetchFiles = useCallback(async (folderId: string | null = currentFolder) => {
         const params = new URLSearchParams();
@@ -326,8 +329,7 @@ export default function FileBrowser({
         } catch { toast.error("Failed to update visibility"); }
     }
 
-    async function openMoveModal(fileId: string) {
-        setMoveFileId(fileId);
+    async function fetchAllFolders() {
         const params = new URLSearchParams();
         if (projectId) params.set("projectId", projectId);
         if (leadId) params.set("leadId", leadId);
@@ -337,6 +339,11 @@ export default function FileBrowser({
             const data = await res.json();
             setAllFolders(data);
         }
+    }
+
+    async function openMoveModal(fileId: string) {
+        setMoveFileId(fileId);
+        await fetchAllFolders();
     }
 
     async function handleMoveFile(targetFolderId: string | null) {
@@ -354,8 +361,53 @@ export default function FileBrowser({
         setMoveFileId(null);
     }
 
+    function toggleSelectFile(fileId: string) {
+        setSelectedIds(prev => {
+            const next = new Set(prev);
+            if (next.has(fileId)) next.delete(fileId); else next.add(fileId);
+            return next;
+        });
+    }
+
+    function toggleSelectAll() {
+        setSelectedIds(prev => (prev.size === files.length ? new Set() : new Set(files.map(f => f.id))));
+    }
+
+    // Moves one or more files to a folder (or the project root when targetFolderId is null).
+    // Loops the same PATCH /api/files endpoint used by the single-file modal so every file
+    // still goes through authorizeFileScope + the financial-folder guards — never bypassed.
+    async function moveFilesToFolder(fileIds: string[], targetFolderId: string | null) {
+        if (fileIds.length === 0) return;
+        setIsBulkMoving(true);
+        let succeededCount = 0;
+        let failedCount = 0;
+        for (const fileId of fileIds) {
+            try {
+                const res = await fetch("/api/files", {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fileId, folderId: targetFolderId }),
+                });
+                if (res.ok) succeededCount++; else failedCount++;
+            } catch {
+                failedCount++;
+            }
+        }
+        setSelectedIds(new Set());
+        setIsBulkMoving(false);
+        await fetchFiles(currentFolder);
+        if (failedCount === 0) {
+            toast.success(`Moved ${succeededCount} file${succeededCount !== 1 ? "s" : ""}`);
+        } else if (succeededCount === 0) {
+            toast.error(`Move failed for ${failedCount} file${failedCount !== 1 ? "s" : ""}`);
+        } else {
+            toast.error(`Moved ${succeededCount} of ${fileIds.length} — ${failedCount} failed`);
+        }
+    }
+
     function navigateToFolder(folderId: string | null, folderName: string) {
         if (folderId === currentFolder) return;
+        setSelectedIds(new Set());
         if (folderId === null) {
             setFolderPath([{ id: null, name: "All Files" }]);
         } else {
@@ -371,6 +423,9 @@ export default function FileBrowser({
     }
 
     function handleDrop(e: React.DragEvent) {
+        // Internal file-row drags carry "application/x-probuild-file", not "Files" — ignore
+        // those here so they fall through to whatever folder tile they were dropped on.
+        if (!Array.from(e.dataTransfer.types).includes("Files")) return;
         e.preventDefault();
         setDragOver(false);
         handleUpload(e.dataTransfer.files);
@@ -664,6 +719,34 @@ export default function FileBrowser({
                 </div>
             )}
 
+            {/* Bulk Action Bar */}
+            {selectedIds.size > 0 && (
+                <div className="flex items-center gap-3 mb-4 bg-indigo-50 border border-indigo-100 rounded-xl px-4 py-2.5">
+                    <p className="text-xs font-semibold text-indigo-700">{selectedIds.size} selected</p>
+                    <DropdownMenu onOpenChange={open => { if (open) fetchAllFolders(); }}>
+                        <DropdownMenuTrigger asChild>
+                            <button disabled={isBulkMoving} className="hui-btn hui-btn-secondary text-xs disabled:opacity-50">
+                                {isBulkMoving ? "Moving..." : "Move to folder"}
+                            </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-56 max-h-64 overflow-y-auto">
+                            <DropdownMenuItem onClick={() => moveFilesToFolder(Array.from(selectedIds), null)}>
+                                Project root
+                            </DropdownMenuItem>
+                            {allFolders.length > 0 && <DropdownMenuSeparator />}
+                            {allFolders.map(folder => (
+                                <DropdownMenuItem key={folder.id} onClick={() => moveFilesToFolder(Array.from(selectedIds), folder.id)}>
+                                    {folder.name}
+                                </DropdownMenuItem>
+                            ))}
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                    <button onClick={() => setSelectedIds(new Set())} className="text-xs font-medium text-slate-500 hover:text-slate-700 transition ml-auto">
+                        Clear
+                    </button>
+                </div>
+            )}
+
             {/* Drop Zone / Content */}
             <div
                 className={`flex-1 rounded-xl border-2 border-dashed transition-all ${
@@ -673,7 +756,12 @@ export default function FileBrowser({
                         ? "border-slate-200 bg-slate-50/50"
                         : "border-transparent bg-transparent"
                 }`}
-                onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                onDragOver={e => {
+                    // Only claim OS file drops here — internal file-row drags are handled by folder tiles.
+                    if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+                    e.preventDefault();
+                    setDragOver(true);
+                }}
                 onDragLeave={() => setDragOver(false)}
                 onDrop={handleDrop}
             >
@@ -710,7 +798,32 @@ export default function FileBrowser({
                                 <div
                                     key={folder.id}
                                     onClick={() => renamingFolderId !== folder.id && navigateToFolder(folder.id, folder.name)}
+                                    onDragOver={e => {
+                                        // Only react to internal file drags — OS file drags bubble up to the container dropzone instead.
+                                        if (!Array.from(e.dataTransfer.types).includes("application/x-probuild-file")) return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        setDragOverFolderId(folder.id);
+                                    }}
+                                    onDragLeave={e => {
+                                        if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                                        setDragOverFolderId(prev => (prev === folder.id ? null : prev));
+                                    }}
+                                    onDrop={e => {
+                                        if (!Array.from(e.dataTransfer.types).includes("application/x-probuild-file")) return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        setDragOverFolderId(null);
+                                        const raw = e.dataTransfer.getData("application/x-probuild-file");
+                                        if (!raw) return;
+                                        try {
+                                            const ids: string[] = JSON.parse(raw);
+                                            if (Array.isArray(ids) && ids.length > 0) moveFilesToFolder(ids, folder.id);
+                                        } catch {}
+                                    }}
                                     className={`group cursor-pointer transition-all ${
+                                        dragOverFolderId === folder.id ? "ring-2 ring-indigo-400 border-indigo-300" : ""
+                                    } ${
                                         viewMode === "grid"
                                             ? "bg-white rounded-xl border border-slate-200/80 p-4 hover:shadow-md hover:border-indigo-200"
                                             : "bg-white rounded-lg border border-slate-100 px-4 py-3 hover:bg-slate-50 flex items-center justify-between"
@@ -738,20 +851,53 @@ export default function FileBrowser({
                 {/* Files */}
                 {files.length > 0 && (
                     <div>
-                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-3">Files</p>
+                        <div className="flex items-center justify-between mb-3">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Files</p>
+                            <label className="flex items-center gap-1.5 text-[10px] font-medium text-slate-400 hover:text-slate-600 cursor-pointer select-none transition">
+                                <input
+                                    type="checkbox"
+                                    checked={files.length > 0 && selectedIds.size === files.length}
+                                    onChange={toggleSelectAll}
+                                    className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-3.5 h-3.5"
+                                />
+                                Select all
+                            </label>
+                        </div>
                         {viewMode === "grid" ? (
                             <div className="grid grid-cols-4 gap-3">
                                 {files.map(file => {
                                     const effVis = file.effectiveVisibility || "team";
                                     const isInherited = !file.visibility;
                                     return (
-                                        <div key={file.id} className="bg-white rounded-xl border border-slate-200/80 overflow-hidden hover:shadow-md transition group">
+                                        <div
+                                            key={file.id}
+                                            draggable
+                                            onDragStart={e => {
+                                                const ids = selectedIds.has(file.id) ? Array.from(selectedIds) : [file.id];
+                                                e.dataTransfer.setData("application/x-probuild-file", JSON.stringify(ids));
+                                                e.dataTransfer.effectAllowed = "move";
+                                            }}
+                                            className={`rounded-xl border overflow-hidden hover:shadow-md transition group ${
+                                                selectedIds.has(file.id) ? "border-indigo-300 ring-1 ring-indigo-200 bg-indigo-50/30" : "bg-white border-slate-200/80"
+                                            }`}
+                                        >
                                             <div className="h-32 bg-gradient-to-br from-slate-50 to-slate-100 flex items-center justify-center relative">
                                                 {isImage(file.mimeType) ? (
                                                     <img src={file.url} alt={file.name} className="h-full w-full object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
                                                 ) : (
                                                     <span className="text-3xl">{getFileIcon(file.mimeType)}</span>
                                                 )}
+                                                <div className="absolute top-2 left-2">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedIds.has(file.id)}
+                                                        onChange={() => toggleSelectFile(file.id)}
+                                                        onMouseDown={e => e.stopPropagation()}
+                                                        onClick={e => e.stopPropagation()}
+                                                        aria-label={`Select ${file.name}`}
+                                                        className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-4 h-4 bg-white/90"
+                                                    />
+                                                </div>
                                                 <div className="absolute top-2 right-2">
                                                     <FileContextMenu file={file} />
                                                 </div>
@@ -776,7 +922,24 @@ export default function FileBrowser({
                                     const effVis = file.effectiveVisibility || "team";
                                     const isInherited = !file.visibility;
                                     return (
-                                        <div key={file.id} className="px-4 py-3 flex items-center gap-3 hover:bg-slate-50/50 transition group">
+                                        <div
+                                            key={file.id}
+                                            draggable
+                                            onDragStart={e => {
+                                                const ids = selectedIds.has(file.id) ? Array.from(selectedIds) : [file.id];
+                                                e.dataTransfer.setData("application/x-probuild-file", JSON.stringify(ids));
+                                                e.dataTransfer.effectAllowed = "move";
+                                            }}
+                                            className={`px-4 py-3 flex items-center gap-3 hover:bg-slate-50/50 transition group ${selectedIds.has(file.id) ? "bg-indigo-50/50" : ""}`}
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedIds.has(file.id)}
+                                                onChange={() => toggleSelectFile(file.id)}
+                                                onMouseDown={e => e.stopPropagation()}
+                                                aria-label={`Select ${file.name}`}
+                                                className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary w-4 h-4 shrink-0"
+                                            />
                                             <div className="w-9 h-9 rounded-lg bg-slate-50 flex items-center justify-center shrink-0 border border-slate-100">
                                                 {isImage(file.mimeType) ? (
                                                     <img src={file.url} alt="" className="w-9 h-9 rounded-lg object-cover cursor-pointer" onClick={() => setPreviewFile(file)} />
