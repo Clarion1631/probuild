@@ -9355,14 +9355,14 @@ export async function createSelectionBoard(projectId: string, title: string) {
     return board;
 }
 
-export async function updateSelectionBoard(id: string, data: { title?: string; status?: string }) {
+export async function updateSelectionBoard(id: string, data: { title?: string }) {
     const user = await assertActiveStaff();
     const existing = await prisma.selectionBoard.findUnique({ where: { id }, select: { projectId: true } });
     if (!existing) throw new Error("Board not found");
     if (!canAccessProject(user, existing.projectId)) throw new Error("Forbidden");
     const board = await prisma.selectionBoard.update({
         where: { id },
-        data,
+        data: { title: data.title },
     });
     revalidatePath(`/projects/${board.projectId}/selections`);
     return board;
@@ -9476,30 +9476,34 @@ export async function deleteSelectionOption(id: string) {
 export async function sendSelectionBoardToClient(boardId: string) {
     const user = await assertActiveStaff();
 
-    const board = await prisma.selectionBoard.findUnique({
-        where: { id: boardId },
-        include: {
-            project: { include: { client: true } },
-            categories: { include: { options: true } },
-        },
+    const board = await prisma.$transaction(async (tx) => {
+        const b = await tx.selectionBoard.findUnique({
+            where: { id: boardId },
+            include: {
+                project: { include: { client: true } },
+                categories: { include: { options: true } },
+            },
+        });
+        if (!b) throw new Error("Board not found");
+        if (!canAccessProject(user, b.projectId)) throw new Error("Forbidden");
+
+        if (b.categories.length === 0) {
+            throw new Error("Add at least one category before sending.");
+        }
+        const emptyCategories = b.categories.filter((c) => c.options.length === 0);
+        if (emptyCategories.length > 0) {
+            throw new Error(`Every category needs at least one option before sending. Missing options: ${emptyCategories.map((c) => c.name).join(", ")}`);
+        }
+
+        await tx.selectionBoard.update({
+            where: { id: boardId },
+            data: { status: "Sent" },
+        });
+
+        return b;
     });
-    if (!board) throw new Error("Board not found");
-    if (!canAccessProject(user, board.projectId)) throw new Error("Forbidden");
 
-    if (board.categories.length === 0) {
-        throw new Error("Add at least one category before sending.");
-    }
-    const emptyCategories = board.categories.filter((c) => c.options.length === 0);
-    if (emptyCategories.length > 0) {
-        throw new Error(`Every category needs at least one option before sending. Missing options: ${emptyCategories.map((c) => c.name).join(", ")}`);
-    }
-
-    await prisma.selectionBoard.update({
-        where: { id: boardId },
-        data: { status: "Sent" },
-    });
-
-    // Email the client
+    // Email the client (outside the transaction — idempotent side effect)
     const clientEmail = board.project.client?.email;
     if (clientEmail) {
         const settings = await getCachedCompanySettings();

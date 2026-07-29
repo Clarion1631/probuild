@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { createProductLibraryItem, addProjectFavorite } from "@/lib/actions";
+import { createProductLibraryItem, addTeamCandidate } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Check, RefreshCw } from "lucide-react";
 
@@ -172,7 +172,14 @@ export default function ClipClient({
             const created = await saveToLibrary();
             if (created) {
                 const projectName = allProjects.find((p) => p.id === pickedProjectId)?.name || "project";
-                await addProjectFavorite(pickedProjectId, created.id);
+                await addTeamCandidate(null, {
+                    projectId: pickedProjectId,
+                    name: form.name.trim(),
+                    description: form.description || undefined,
+                    imageUrl: form.imageUrl || undefined,
+                    vendorUrl: url || undefined,
+                    price: form.price ? parseFloat(form.price) : undefined,
+                });
                 setSavedProduct({ id: created.id, toProject: projectName });
                 toast.success(`Saved and added to ${projectName}`);
             }
@@ -193,7 +200,7 @@ export default function ClipClient({
                     <h1 className="text-base font-bold text-hui-textMain">Clipped!</h1>
                     <p className="text-sm text-hui-textMuted mt-1">
                         {savedProduct.toProject
-                            ? `Saved to the library and added to ${savedProduct.toProject}'s favorites.`
+                            ? `Saved to the library and added to ${savedProduct.toProject}'s selections.`
                             : "Saved to the product library."}
                     </p>
                     <div className="flex flex-col gap-2 mt-6">
