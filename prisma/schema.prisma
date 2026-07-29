@@ -519,6 +519,11 @@ model Expense {
   date        DateTime?
   description String?
   receiptUrl  String?
+  // Stable identity for finalized money-out imported from QuickBooks Online.
+  // Nullable so existing/manual and receipt-intake expenses remain unchanged.
+  qbPurchaseId String?   @unique(map: "Expense_qbPurchaseId_key")
+  qbSyncToken  String?
+  qbSyncedAt   DateTime?
   changeOrderId String?
   changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
   isBillable    Boolean      @default(false)
