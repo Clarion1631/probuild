@@ -160,18 +160,34 @@ function isStarted(task: PortalTrackerTask): boolean {
 /**
  * Keyword bucket for a task, or null when nothing matches.
  *
- * Takes the LAST matching stage, not the first: a task named "Site prep and
- * Demo start" spans two stages and is announcing the transition, so it belongs
- * to Demo. Same reasoning rescues "Final electrical fixtures & cleanup", which
- * first-match sent all the way back to Rough-ins on the word "electric".
+ * Wins on the stage word that appears LAST IN THE TEXT, not the highest-numbered
+ * stage. A task named "Site prep and Demo start" spans two stages and is
+ * announcing the transition, so it belongs to Demo; "Final electrical fixtures &
+ * cleanup" belongs to Punch list, not back in Rough-ins on the word "electric".
+ *
+ * Ranking by stage number instead read "Review floor plan" as Finishes (on
+ * "floor") rather than Planning (on "plan") — and because earlier empty stages
+ * then read as passed, a job whose only task was reviewing a floor plan told the
+ * client Demo, Framing, Rough-ins and Drywall were all done. Text position gets
+ * both those names right; stage number only got one of them.
  */
 function keywordStageIndex(task: PortalTrackerTask): number | null {
     const haystack = `${task.name} ${task.costCodeName ?? ""}`.toLowerCase();
-    let match: number | null = null;
-    CLIENT_STAGES.forEach((stage, index) => {
-        if (stage.matchers.some(matcher => haystack.includes(matcher))) match = index;
+    const hits: { position: number; length: number; stageIndex: number }[] = [];
+    CLIENT_STAGES.forEach((stage, stageIndex) => {
+        stage.matchers.forEach(matcher => {
+            const position = haystack.lastIndexOf(matcher);
+            if (position >= 0) hits.push({ position, length: matcher.length, stageIndex });
+        });
     });
-    return match;
+    if (hits.length === 0) return null;
+    // Later in the name wins; on a tie the more specific (longer) word does.
+    return hits.reduce((best, hit) =>
+        hit.position > best.position
+        || (hit.position === best.position && hit.length > best.length)
+            ? hit
+            : best,
+    ).stageIndex;
 }
 
 /**
@@ -375,17 +391,43 @@ export function buildProjectTracker(
             return { label: stage.label, state: "upcoming", pct: taskPct, ...detail, activeTaskName: null };
         }
 
-        const stageComplete = stageTasks.length > 0 && stageTasks.every(isComplete);
-        const emptyButPassed = currentIndex > index && stageTasks.length === 0;
-        const complete = allProjectTasksComplete || stageComplete || emptyButPassed;
-
-        return {
-            label: stage.label,
-            state: complete ? "complete" : index === currentIndex ? "current" : "upcoming",
-            pct: complete ? 100 : taskPct,
-            ...detail,
-            activeTaskName: index === currentIndex ? activeTaskName : null,
-        };
+        // The rail is ONE position, not eight independent ones, so state comes
+        // purely from where currentIndex sits — the same shape as the pinned
+        // branch above. Deciding each stage's Done on its own tasks let a green
+        // Framing sit above an unfinished Demo, and let an untouched Demo read
+        // "upcoming" behind three finished stages: the backwards rail this whole
+        // change exists to kill.
+        if (allProjectTasksComplete || currentIndex < 0) {
+            return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
+        }
+        if (index < currentIndex) {
+            // Behind the current position. Reads Done with no task list, for the
+            // same reason the pinned branch hides it: letting the client open a
+            // green checkmark and find unticked work under it is worse than
+            // saying nothing. In the field this work is done, it just never got
+            // ticked here.
+            return {
+                label: stage.label,
+                state: "complete",
+                pct: 100,
+                taskCount: 0,
+                doneCount: 0,
+                tasks: [],
+                activeTaskName: null,
+            };
+        }
+        if (index === currentIndex) {
+            return {
+                label: stage.label,
+                state: "current",
+                pct: Math.min(taskPct, 99),
+                ...detail,
+                activeTaskName,
+            };
+        }
+        // Ahead of the current position. Work finished early keeps its real pct
+        // so the roundel still counts it; it just doesn't get the checkmark yet.
+        return { label: stage.label, state: "upcoming", pct: taskPct, ...detail, activeTaskName: null };
     });
 
     // Overall = mean of the per-stage percentages so the roundel can never

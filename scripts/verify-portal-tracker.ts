@@ -382,6 +382,60 @@ function runPureCases(): void {
         false,
     );
 
+    // --- Regressions: the rail must never run backwards (Codex review, PR #271) ---
+    // A "backwards" rail = any stage reading complete AFTER a stage that does not.
+    // The client sees a green checkmark below an unfinished stage and reads it as
+    // a bug in the software, because it is one.
+    const railRunsBackwards = (stages: readonly { state: string }[]): boolean => {
+        const firstOpen = stages.findIndex(stage => stage.state !== "complete");
+        return firstOpen >= 0 && stages.slice(firstOpen + 1).some(stage => stage.state === "complete");
+    };
+
+    // A stage word later in the NAME wins over a higher-numbered stage. Ranking by
+    // stage number read this as Finishes (on "floor"), which then marked Demo,
+    // Framing, Rough-ins and Drywall as passed — telling the client four stages
+    // were done on a job that had only ever reviewed a floor plan.
+    const floorPlan = buildProjectTracker([
+        trackerTask({ id: "fp", name: "Review floor plan", status: "In Progress", progress: 25 }),
+    ]);
+    assert.equal(floorPlan.stages[0].state, "current");
+    assert.equal(floorPlan.stages[0].label, "Planning & Permits");
+    assert.equal(railRunsBackwards(floorPlan.stages), false);
+
+    // Work finished early may not plant a checkmark ahead of the current stage.
+    const earlyFraming = buildProjectTracker([
+        trackerTask({ id: "d", name: "Demo work", status: "In Progress", progress: 50, startDate: date(-2) }),
+        trackerTask({ id: "f", name: "Framing work", status: "Complete", progress: 100, startDate: date(2) }),
+    ]);
+    assert.equal(railRunsBackwards(earlyFraming.stages), false);
+    const framingStage = earlyFraming.stages.find(stage => stage.label === "Framing");
+    assert.equal(framingStage?.state, "upcoming");
+    assert.equal(framingStage?.pct, 100, "early-finished work keeps its real pct for the roundel");
+
+    // An explicit clientStage behind the current position may not read "upcoming"
+    // while later stages read complete.
+    const laggingTag = buildProjectTracker([
+        trackerTask({
+            id: "late", name: "A", clientStage: "Finishes",
+            status: "In Progress", progress: 30, startDate: date(-2),
+        }),
+        trackerTask({
+            id: "early", name: "B", clientStage: "Demo",
+            status: "Not Started", progress: 0, startDate: date(1),
+        }),
+    ]);
+    assert.equal(railRunsBackwards(laggingTag.stages), false);
+
+    // An unrecognised clientStage is ignored, never trusted as a position.
+    const bogusTag = buildProjectTracker([
+        trackerTask({
+            id: "bogus", name: "Site prep", clientStage: "'; DROP TABLE--",
+            status: "In Progress", progress: 40,
+        }),
+    ]);
+    assert.equal(bogusTag.stages[0].state, "current");
+    assert.equal(railRunsBackwards(bogusTag.stages), false);
+
     console.log("PASS pure stage mapping, fallback, state, visitor, and hash cases");
 }
 
