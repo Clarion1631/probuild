@@ -10258,7 +10258,7 @@ export async function submitSelectionProposal(projectId: string, data: {
 export async function getSelectionProposalsForPortal(projectId: string) {
     await assertPortalProjectOwnership(projectId);
     const proposals = await prisma.selectionProposal.findMany({
-        where: { projectId },
+        where: { projectId, deletedAt: null },
         orderBy: { createdAt: "desc" },
     });
     // Price is never shown to the client — no exceptions, no "unless
@@ -10273,7 +10273,7 @@ export async function getSelectionProposals(projectId: string) {
     const user = await assertActiveStaff();
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     return prisma.selectionProposal.findMany({
-        where: { projectId },
+        where: { projectId, deletedAt: null },
         orderBy: { createdAt: "desc" },
         include: { decidedBy: { select: { id: true, name: true, email: true } } },
     });
@@ -10563,10 +10563,10 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
         }),
         prisma.selectionProposal.findMany({
-            where: { projectId, decisionId: null },
+            where: { projectId, decisionId: null, deletedAt: null },
             orderBy: { createdAt: "desc" },
         }),
     ]);
@@ -10586,10 +10586,10 @@ export async function getProjectDecisions(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
         }),
         prisma.selectionProposal.findMany({
-            where: { projectId, decisionId: null },
+            where: { projectId, decisionId: null, deletedAt: null },
             orderBy: { createdAt: "desc" },
         }),
     ]);
@@ -10704,8 +10704,8 @@ export async function deleteDecision(decisionId: string) {
 }
 
 export async function assignItemToDecision(itemId: string, decisionId: string | null) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
@@ -10734,6 +10734,7 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
         const claim = await tx.selectionProposal.updateMany({
             where: {
                 id: itemId,
+                deletedAt: null,
                 OR: [
                     { status: { notIn: ["Chosen", "Approved"] } },
                     { status: { in: ["Chosen", "Approved"] }, decisionId },
@@ -10754,8 +10755,8 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
 
 export async function chooseItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         include: { decision: true, project: { include: { client: true } } },
     });
     if (!item) throw new Error("Item not found");
@@ -10850,7 +10851,7 @@ export async function chooseItem(itemId: string) {
         // write time, so we can never mark a moved/archived candidate Chosen
         // and leave the decision pointing outside its own candidate list.
         const itemClaim = await tx.selectionProposal.updateMany({
-            where: { id: itemId, decisionId, status: { notIn: ["Archived", "Declined"] } },
+            where: { id: itemId, decisionId, deletedAt: null, status: { notIn: ["Archived", "Declined"] } },
             data: { status: "Chosen" },
         });
         if (itemClaim.count === 0) {
@@ -10969,8 +10970,8 @@ export async function unchooseItem(decisionId: string) {
 }
 
 export async function archiveItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
@@ -10983,7 +10984,7 @@ export async function archiveItem(itemId: string) {
         // chooseItem that just claimed this item as its decision's approved
         // record — see assignItemToDecision above for the same pattern.
         const claim = await tx.selectionProposal.updateMany({
-            where: { id: itemId, status: { notIn: ["Chosen", "Approved", "Archived"] } },
+            where: { id: itemId, deletedAt: null, status: { notIn: ["Chosen", "Approved", "Archived"] } },
             data: { status: "Archived" },
         });
         if (claim.count === 0) {
@@ -11001,16 +11002,76 @@ export async function archiveItem(itemId: string) {
 }
 
 export async function unarchiveItem(itemId: string) {
-    const item = await prisma.selectionProposal.findUnique({
-        where: { id: itemId },
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!item) throw new Error("Item not found");
     await assertPortalProjectOwnership(item.projectId);
 
     await prisma.selectionProposal.updateMany({
-        where: { id: itemId, status: { in: ["Archived", "Declined"] } },
+        where: { id: itemId, deletedAt: null, status: { in: ["Archived", "Declined"] } },
         data: { status: "Idea" },
+    });
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+/** Delete an archived item outright from the client's playground.
+ *
+ * Soft delete only, exactly like deleteDecision: the client sees it gone and
+ * every read filters deletedAt out, but the row survives so the team keeps a
+ * 30-day restore window (getRecentlyDeletedItems / restoreItem below). "It's
+ * their playground" — but "lose no customer data" still holds.
+ *
+ * Archived-only by design: this sits behind the archive tray, so an item is
+ * always one deliberate step (archive) away from deletable. That also keeps
+ * the invariant work trivial — an Archived item can't be any decision's
+ * chosenItemId, since chooseItem refuses archived rows and archiveItem
+ * refuses chosen ones. The CAS below re-checks that at UPDATE time rather
+ * than trusting the read above, so a concurrent unarchive→choose can't slip a
+ * live approved record out from under the delete. */
+export async function deleteItem(itemId: string) {
+    const item = await prisma.selectionProposal.findFirst({
+        where: { id: itemId, deletedAt: null },
+        select: { id: true, projectId: true },
+    });
+    if (!item) return { success: false };
+    await assertPortalProjectOwnership(item.projectId);
+
+    const claim = await prisma.selectionProposal.updateMany({
+        where: { id: itemId, deletedAt: null, status: { in: ["Archived", "Declined"] } },
+        data: { deletedAt: new Date() },
+    });
+    if (claim.count === 0) {
+        throw new Error("Archive this item before deleting it.");
+    }
+
+    revalidatePath(`/projects/${item.projectId}/selections`);
+    revalidatePath(`/portal/projects/${item.projectId}/selections`);
+    return { success: true };
+}
+
+/** Team-only restore of a soft-deleted item. Comes back Archived (where it
+ * was when the client deleted it), not Idea — restoring shouldn't quietly put
+ * an item the client threw away back among their live options. Its decision
+ * link is untouched, so it lands back in the same archive tray it left. */
+export async function restoreItem(itemId: string) {
+    const item = await prisma.selectionProposal.findUnique({
+        where: { id: itemId },
+        select: { id: true, projectId: true, deletedAt: true },
+    });
+    if (!item) throw new Error("Item not found");
+    if (!item.deletedAt) return { success: true };
+
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, item.projectId)) throw new Error("Forbidden");
+
+    await prisma.selectionProposal.updateMany({
+        where: { id: itemId, deletedAt: { not: null } },
+        data: { deletedAt: null, status: "Archived" },
     });
 
     revalidatePath(`/projects/${item.projectId}/selections`);
@@ -11033,9 +11094,27 @@ export async function getRecentlyDeletedDecisions(projectId: string) {
     const decisions = await prisma.decision.findMany({
         where: { projectId, deletedAt: { not: null, gte: cutoff } },
         orderBy: { deletedAt: "desc" },
-        include: { candidates: { orderBy: { createdAt: "asc" } } },
+        include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
     });
     return decisions;
+}
+
+/** Individual items a client soft-deleted from their archive in the last 30
+ * days — the item half of the same restore tray (see deleteItem). Deliberately
+ * excludes items that merely sit inside a soft-deleted DECISION: those are
+ * still live rows, restored as a set by restoreDecision, and listing them
+ * separately would offer a restore that puts an item back into a decision the
+ * client can't see. */
+export async function getRecentlyDeletedItems(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+
+    const cutoff = new Date(Date.now() - RECENTLY_DELETED_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    return prisma.selectionProposal.findMany({
+        where: { projectId, deletedAt: { not: null, gte: cutoff } },
+        orderBy: { deletedAt: "desc" },
+        include: { decision: { select: { id: true, name: true, deletedAt: true } } },
+    });
 }
 
 export async function restoreDecision(decisionId: string) {
