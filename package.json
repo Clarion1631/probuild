@@ -9,6 +9,7 @@
     "build": "npm run typecheck && npm run build:next",
     "start": "next start",
     "lint": "eslint",
+    "test:qbo-expense-sync": "tsx --test tests/qbo-expense-sync.test.ts tests/qbo-expense-sync-route.test.ts",
     "test:e2e": "playwright test",
     "test:qa": "npx playwright test e2e/quality-gate.spec.ts",
     "assets:download": "tsx scripts/download-assets.ts",

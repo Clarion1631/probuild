@@ -1,6 +1,8 @@
 import type { QBTokens } from "./quickbooks";
 import { getQBPurchasesSince } from "./quickbooks";
 import { findBestProjectNameMatches } from "./project-match";
+import { prisma } from "./prisma";
+import { getFreshQBTokens } from "./quickbooks-payments";
 
 export interface QboPurchaseForImport {
     qbPurchaseId: string;
@@ -249,4 +251,178 @@ export function findActiveProjectForQboPurchase(
         return { kind: "skipped", reason: "ambiguous-project" };
     }
     return matchCandidateEstimate(nameMatches[0]);
+}
+
+export interface QboExpenseWrite {
+    qbPurchaseId: string;
+    qbSyncToken: string;
+    qbSyncedAt: Date;
+    estimateId: string;
+    amount: number;
+    vendor: string | null;
+    date: Date | null;
+    description: string;
+    status: "Reviewed";
+}
+
+type ExpenseTransaction = {
+    expense: {
+        findUnique(args: {
+            where: { qbPurchaseId: string };
+            select?: { qbSyncToken: true };
+        }): Promise<{ qbSyncToken: string | null } | null>;
+        upsert(args: {
+            where: { qbPurchaseId: string };
+            create: QboExpenseWrite;
+            update: QboExpenseWrite;
+        }): Promise<unknown>;
+    };
+};
+
+export interface QboExpensePersistenceClient {
+    $transaction<T>(callback: (transaction: ExpenseTransaction) => Promise<T>): Promise<T>;
+}
+
+export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged";
+
+/**
+ * Atomically insert or update one imported QBO expense by its Purchase id.
+ * The update intentionally omits receiptUrl so an already-linked Drive receipt
+ * survives when QuickBooks publishes a newer sync token.
+ */
+export async function upsertQboExpense(
+    client: QboExpensePersistenceClient,
+    write: QboExpenseWrite,
+): Promise<QboExpenseUpsertResult> {
+    return client.$transaction(async transaction => {
+        const existing = await transaction.expense.findUnique({
+            where: { qbPurchaseId: write.qbPurchaseId },
+            select: { qbSyncToken: true },
+        });
+        if (existing?.qbSyncToken === write.qbSyncToken) return "unchanged";
+
+        await transaction.expense.upsert({
+            where: { qbPurchaseId: write.qbPurchaseId },
+            create: write,
+            update: write,
+        });
+        return existing ? "updated" : "imported";
+    });
+}
+
+export interface QboExpenseSyncDependencies {
+    getTokens(): Promise<QBTokens>;
+    readPurchases(tokens: QBTokens, since: Date): Promise<QboPurchaseReadResult>;
+    listProjects(): Promise<QboExpenseProjectCandidate[]>;
+    upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
+    now(): Date;
+}
+
+export interface QboExpenseSyncResult {
+    imported: number;
+    updated: number;
+    skipped: Array<{ qbPurchaseId: string; reason: string }>;
+}
+
+async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
+    const projects = await prisma.project.findMany({
+        where: { status: "In Progress" },
+        select: {
+            id: true,
+            name: true,
+            status: true,
+            client: { select: { qbCustomerId: true } },
+            estimates: {
+                where: { archivedAt: null },
+                select: { id: true, createdAt: true },
+                orderBy: { createdAt: "desc" },
+            },
+        },
+    });
+
+    return projects.map(project => ({
+        id: project.id,
+        name: project.name,
+        status: project.status,
+        qbCustomerId: project.client.qbCustomerId,
+        estimates: project.estimates,
+    }));
+}
+
+function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
+    return {
+        getTokens: getFreshQBTokens,
+        readPurchases: readQboPurchasesForImport,
+        listProjects: listInProgressProjects,
+        upsertExpense: write =>
+            upsertQboExpense(
+                prisma as unknown as QboExpensePersistenceClient,
+                write,
+            ),
+        now: () => new Date(),
+    };
+}
+
+function qboExpenseDescription(purchase: QboPurchaseForImport): string {
+    const detail = purchase.memo || purchase.vendor || "Finalized expense";
+    return `[QuickBooks import] ${detail}`.slice(0, 4000);
+}
+
+function qboTransactionDate(txnDate: string | null): Date | null {
+    if (!txnDate) return null;
+    const parsed = new Date(`${txnDate}T00:00:00.000Z`);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+/**
+ * Import finalized QBO money-out transactions for currently in-progress jobs.
+ * External QBO reads and project loading happen before the short per-row
+ * database transaction used by the upsert.
+ */
+export async function syncQboExpenses(
+    options: { since: Date },
+    dependencies: QboExpenseSyncDependencies = createDefaultSyncDependencies(),
+    runtime: { tokens?: QBTokens } = {},
+): Promise<QboExpenseSyncResult> {
+    if (!Number.isFinite(options.since.getTime())) {
+        throw new Error("QBO expense sync requires a valid since date");
+    }
+
+    const tokens = runtime.tokens ?? await dependencies.getTokens();
+    const [purchaseRead, projects] = await Promise.all([
+        dependencies.readPurchases(tokens, options.since),
+        dependencies.listProjects(),
+    ]);
+    const result: QboExpenseSyncResult = {
+        imported: 0,
+        updated: 0,
+        skipped: [...purchaseRead.skipped],
+    };
+
+    for (const purchase of purchaseRead.purchases) {
+        const match = findActiveProjectForQboPurchase(purchase, projects);
+        if (match.kind === "skipped") {
+            result.skipped.push({
+                qbPurchaseId: purchase.qbPurchaseId,
+                reason: match.reason,
+            });
+            continue;
+        }
+
+        const outcome = await dependencies.upsertExpense({
+            qbPurchaseId: purchase.qbPurchaseId,
+            qbSyncToken: purchase.syncToken,
+            qbSyncedAt: dependencies.now(),
+            estimateId: match.estimateId,
+            amount: purchase.total,
+            vendor: purchase.vendor,
+            date: qboTransactionDate(purchase.txnDate),
+            description: qboExpenseDescription(purchase),
+            status: "Reviewed",
+        });
+        if (outcome === "imported") result.imported += 1;
+        if (outcome === "updated") result.updated += 1;
+    }
+
+    return result;
 }
