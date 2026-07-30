@@ -9,6 +9,7 @@ interface Message {
   content: string;
   featureRequest?: { title: string; description: string };
   bugReport?: { title: string; description: string; steps: string };
+  activity?: { tool: string; ok: boolean }[];
 }
 
 interface ConversationSummary {
@@ -173,6 +174,7 @@ export default function HelpChatWidget({ userRole }: { userId?: string; userRole
       if (data.type === "bug_report" && data.title) {
         assistantMsg.bugReport = { title: data.title, description: data.description, steps: data.steps || "" };
       }
+      if (data.activity?.length) assistantMsg.activity = data.activity;
       setMessages((prev) => [...prev, assistantMsg]);
     } else {
       setMessages((prev) => [...prev, { role: "assistant", content: "Error: Failed to submit. Please try again." }]);
@@ -265,12 +267,21 @@ export default function HelpChatWidget({ userRole }: { userId?: string; userRole
                 {messages.length === 0 && (
                   <div className="text-center text-sm text-hui-textMuted mt-8">
                     <p className="font-medium text-hui-textMain mb-1">Hi! How can I help?</p>
-                    <p>Ask me anything about using ProBuild.</p>
+                    <p>Ask me anything — or ask me to do it, like &quot;build a contract for the Hoppe job&quot;.</p>
                   </div>
                 )}
                 {messages.map((msg, i) => (
                   <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
                     <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${msg.role === "user" ? "text-white" : "bg-white border border-hui-border text-hui-textMain"}`} style={msg.role === "user" ? { backgroundColor: "#4c9a2a" } : undefined}>
+                      {msg.activity && msg.activity.length > 0 && (
+                        <div className="mb-1.5 space-y-0.5">
+                          {msg.activity.map((a, ai) => (
+                            <p key={ai} className="text-[10px] text-hui-textMuted">
+                              {a.ok ? "✓" : "✗"} {a.tool.replace(/_/g, " ")}
+                            </p>
+                          ))}
+                        </div>
+                      )}
                       <p className="whitespace-pre-wrap">{msg.content}</p>
                       {msg.featureRequest && effectiveIsAdmin && (
                         <button onClick={() => submitFeatureRequest(msg.featureRequest!.title, msg.featureRequest!.description)} className="mt-2 text-xs hui-btn-green px-2 py-1 rounded">Submit as feature request?</button>
@@ -281,7 +292,7 @@ export default function HelpChatWidget({ userRole }: { userId?: string; userRole
                     </div>
                   </div>
                 ))}
-                {loading && <div className="flex justify-start"><div className="bg-white border border-hui-border rounded-lg px-3 py-2 text-sm text-hui-textMuted font-medium animate-pulse">Thinking...</div></div>}
+                {loading && <div className="flex justify-start"><div className="bg-white border border-hui-border rounded-lg px-3 py-2 text-sm text-hui-textMuted font-medium animate-pulse">Working on it...</div></div>}
                 <div ref={messagesEndRef} />
               </div>
               <div className="border-t border-hui-border px-3 py-2 bg-white">

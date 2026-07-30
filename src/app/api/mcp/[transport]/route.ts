@@ -9,6 +9,8 @@ import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrew
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
+import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
+import { logActivity } from "@/lib/activity-log";
 import {
     MAX_UPLOAD_BASE64_CHARS,
     uploadProjectFileCore,
@@ -16,6 +18,7 @@ import {
 } from "@/lib/project-file-core";
 import {
     MCP_ACTOR_EMAILS,
+    mcpActivityActorName,
     type McpActorLabel,
 } from "@/lib/mcp-actor";
 import {
@@ -107,6 +110,10 @@ const milestoneSchema = z.object({
 type RouteMcpActor = {
     actorLabel: McpActorLabel;
     resolveActorUserId: () => Promise<string | null>;
+    // Resolves the signed-in human help-agent.ts is acting for (via the
+    // trusted onBehalfOf query param — see guarded() below), so the audit
+    // trail can credit the actual person instead of just the connector.
+    resolveOnBehalfOf: () => Promise<{ id: string; name: string } | null>;
 };
 
 // The secret for the key that authenticated THIS request. Passing it to a send
@@ -116,8 +123,9 @@ function secretForActor(actorLabel: McpActorLabel): string | undefined {
     return actorLabel === "richard-ai" ? process.env.MCP_SECRET_RICHARD : process.env.MCP_SECRET;
 }
 
-function createRouteMcpActor(actorLabel: McpActorLabel): RouteMcpActor {
+function createRouteMcpActor(actorLabel: McpActorLabel, onBehalfOfId?: string | null): RouteMcpActor {
     let actorUserId: Promise<string | null> | null = null;
+    let onBehalfOf: Promise<{ id: string; name: string } | null> | null = null;
     return {
         actorLabel,
         resolveActorUserId: () => {
@@ -127,12 +135,318 @@ function createRouteMcpActor(actorLabel: McpActorLabel): RouteMcpActor {
             }).then(user => user?.id ?? null);
             return actorUserId;
         },
+        resolveOnBehalfOf: () => {
+            if (!onBehalfOfId) return Promise.resolve(null);
+            onBehalfOf ??= prisma.user.findUnique({
+                where: { id: onBehalfOfId },
+                select: { id: true, name: true, email: true },
+            }).then(user => (user ? { id: user.id, name: user.name || user.email || "a teammate" } : null))
+                .catch(() => null);
+            return onBehalfOf;
+        },
+    };
+}
+
+// Same convention as FileBrowser.tsx's formatBytes — human-readable size for
+// read_file / get_file_link output and error messages.
+function formatBytes(bytes: number): string {
+    if (bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+// ── Audit trail for connector writes ────────────────────────────────────────
+// Every write tool call gets an ActivityLog row (actorName/actorUserId identify
+// who — see src/lib/mcp-actor.ts), read back via get_activity_log below.
+// Derived by enumerating every server.registerTool(...) call below and taking
+// every tool WITHOUT annotations.readOnlyHint === true, plus read_file and
+// get_file_link (content access is worth an audit row even though they're reads).
+const WRITE_TOOLS = new Set([
+    "create_estimate", "update_estimate", "send_estimate",
+    "send_milestone_invoice", "resend_invoice", "create_invoice_from_estimate",
+    "create_change_order", "send_change_order", "bill_change_order",
+    "create_lead", "log_time", "log_expense",
+    "upload_file", "upload_files", "create_folder", "move_file",
+    "create_daily_log", "add_punch_items",
+    "create_contract", "update_contract", "send_contract",
+    "plan_schedule", "update_task_dates", "set_task_status", "assign_task_crew",
+    "set_project_start_date", "generate_project_schedule", "assign_project_crew",
+    "apply_change_order_to_schedule", "read_file", "get_file_link",
+]);
+// bill_change_order is deliberately NOT here: fixed-price orders bill without
+// emailing anyone, so "mcp_send_bill_change_order" would misreport a plain
+// billing action as a customer send. It stays in WRITE_TOOLS for auditing.
+const SEND_TOOLS = new Set([
+    "send_estimate", "send_contract", "send_change_order",
+    "send_milestone_invoice", "resend_invoice",
+]);
+const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
+    create_contract: "contract", update_contract: "contract", send_contract: "contract",
+    create_estimate: "estimate", update_estimate: "estimate", send_estimate: "estimate",
+    create_invoice_from_estimate: "invoice", send_milestone_invoice: "invoice", resend_invoice: "invoice",
+    create_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
+    apply_change_order_to_schedule: "change_order",
+    create_lead: "lead",
+    plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
+    upload_file: "file", upload_files: "file", read_file: "file", get_file_link: "file",
+    create_folder: "folder", move_file: "file",
+    create_daily_log: "daily_log",
+    add_punch_items: "punch_item",
+};
+
+// Args whose VALUE is payload rather than intent — recording even a prefix
+// would turn the activity log into a document store readable by anyone with
+// ADMIN/MANAGER via get_activity_log. Logged as a marker, never the content.
+const AUDIT_REDACTED_ARGS = new Set(["contentBase64", "fileBase64", "bodyHtml", "body", "customMessage"]);
+
+// Recursive sanitize (depth-capped): drop anything that looks like a
+// confirmation token, redact payload-bearing args outright, and cap remaining
+// string values so a huge line-item dump (or a nested payload like
+// upload_files' files[].contentBase64) can't blow up the log row or leak
+// content that only lives at a nested level.
+const SANITIZE_MAX_DEPTH = 5;
+function sanitizeMcpValue(value: unknown, depth: number): unknown {
+    if (depth > SANITIZE_MAX_DEPTH) {
+        if (Array.isArray(value)) return `[array: ${value.length} items, depth limit reached]`;
+        if (value && typeof value === "object") return "[object omitted: depth limit reached]";
+        // Still truncate primitives at the cap — returning them raw would let a
+        // payload nested one level past the limit through intact.
+        return typeof value === "string" && value.length > 200 ? `${value.slice(0, 200)}…` : value;
+    }
+    if (Array.isArray(value)) {
+        return value.map(item => sanitizeMcpValue(item, depth + 1));
+    }
+    if (value && typeof value === "object") {
+        const clean: Record<string, unknown> = {};
+        for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+            if (/token/i.test(key)) continue;
+            if (AUDIT_REDACTED_ARGS.has(key)) {
+                clean[key] = typeof v === "string" ? `[redacted: ${v.length} chars]` : "[redacted]";
+                continue;
+            }
+            clean[key] = sanitizeMcpValue(v, depth + 1);
+        }
+        return clean;
+    }
+    if (typeof value === "string" && value.length > 200) return `${value.slice(0, 200)}…`;
+    return value;
+}
+function sanitizeMcpArgs(args: Record<string, unknown> | undefined): Record<string, unknown> {
+    if (!args || typeof args !== "object") return {};
+    return sanitizeMcpValue(args, 0) as Record<string, unknown>;
+}
+
+// Every tool result is a textResult({...}) — a single JSON-text content block.
+// Reading the RESULT body is the only honest way to label a row: a junk or
+// expired confirmToken still returns a preview (nothing was written), and some
+// tools (sendMilestoneInvoicesCore, resendInvoiceCore) report a failed send as
+// an ordinary result with no top-level isError.
+function parseResultJson(result: unknown): any | null {
+    const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
+    const text = content?.find(c => c?.type === "text")?.text;
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch {
+        return null;
+    }
+}
+
+// Two-step tools answer an unconfirmed call with either { preview: true, ... }
+// (the send tools, minted here in the route) or { confirmationRequired: true,
+// ... } (issueConfirmation, used by the schedule/PM tools) — nothing was
+// written in either case.
+function isPreviewBody(body: any): boolean {
+    return !!body && (body.preview === true || body.confirmationRequired === true);
+}
+
+// A result body can report failure without ever setting isError — e.g.
+// sendMilestoneInvoicesCore/resendInvoiceCore return { success: false, error }
+// inside a plain textResult when the send didn't go out.
+function bodyReportsFailure(body: any): boolean {
+    return !!body && (body.success === false || (typeof body.error === "string" && body.error.length > 0));
+}
+
+function buildMcpAuditMetadata(toolName: string, actorLabel: McpActorLabel, args: Record<string, unknown> | undefined, errorText: string | undefined) {
+    const metadata: Record<string, unknown> = {
+        tool: toolName,
+        actorLabel,
+        args: sanitizeMcpArgs(args),
+        ...(errorText ? { error: errorText.slice(0, 500) } : {}),
+    };
+    if (JSON.stringify(metadata).length > 4000) {
+        metadata.args = "[omitted: too large]";
+    }
+    return metadata;
+}
+
+type AuditOwner = { projectId: string | null; leadId: string | null; entityId?: string; entityName?: string };
+
+// Attributes a tool call to a project/lead (and, where cheap, a human-readable
+// entity name) so get_activity_log can find it. A literal projectId/leadId arg
+// wins outright; otherwise resolve the owner from whichever entity id is
+// present — one findUnique for whichever matched. Every model here selects
+// only the owner columns it actually has (Invoice/ChangeOrder: projectId only;
+// Estimate/Contract/ScheduleTask/ProjectFile: both). Never throws — a failed
+// lookup degrades to nulls rather than breaking the tool call or the audit write.
+async function resolveAuditOwner(toolName: string, args: Record<string, unknown>): Promise<AuditOwner> {
+    const projectIdArg = typeof args.projectId === "string" && args.projectId ? args.projectId : null;
+    const leadIdArg = typeof args.leadId === "string" && args.leadId ? args.leadId : null;
+    if (projectIdArg || leadIdArg) {
+        return { projectId: projectIdArg, leadId: leadIdArg };
+    }
+
+    try {
+        if (typeof args.fileId === "string" && args.fileId) {
+            const file = await prisma.projectFile.findUnique({
+                where: { id: args.fileId },
+                select: { projectId: true, leadId: true, name: true },
+            });
+            if (file) return { projectId: file.projectId ?? null, leadId: file.leadId ?? null, entityId: args.fileId, entityName: file.name };
+        } else if (typeof args.estimateId === "string" && args.estimateId) {
+            const estimate = await prisma.estimate.findUnique({
+                where: { id: args.estimateId },
+                select: { projectId: true, leadId: true },
+            });
+            if (estimate) return { projectId: estimate.projectId ?? null, leadId: estimate.leadId ?? null, entityId: args.estimateId };
+        } else if (typeof args.invoiceId === "string" && args.invoiceId) {
+            const invoice = await prisma.invoice.findUnique({
+                where: { id: args.invoiceId },
+                select: { projectId: true },
+            });
+            if (invoice) return { projectId: invoice.projectId ?? null, leadId: null, entityId: args.invoiceId };
+        } else if (typeof args.contractId === "string" && args.contractId) {
+            const contract = await prisma.contract.findUnique({
+                where: { id: args.contractId },
+                select: { projectId: true, leadId: true, title: true },
+            });
+            if (contract) return { projectId: contract.projectId ?? null, leadId: contract.leadId ?? null, entityId: args.contractId, entityName: contract.title };
+        } else if (typeof args.changeOrderId === "string" && args.changeOrderId) {
+            const co = await prisma.changeOrder.findUnique({
+                where: { id: args.changeOrderId },
+                select: { projectId: true },
+            });
+            if (co) return { projectId: co.projectId ?? null, leadId: null, entityId: args.changeOrderId };
+        } else if (typeof args.taskId === "string" && args.taskId) {
+            const task = await prisma.scheduleTask.findUnique({
+                where: { id: args.taskId },
+                select: { projectId: true, leadId: true },
+            });
+            if (task) return { projectId: task.projectId ?? null, leadId: task.leadId ?? null, entityId: args.taskId };
+        } else if (typeof args.estimate === "string" && args.estimate) {
+            // update_estimate names its arg `estimate` and accepts either the
+            // code ("EST-00317") or the id — without this branch those writes
+            // log projectId:null and can't be found by job.
+            const estimate = await prisma.estimate.findFirst({
+                where: { OR: [{ id: args.estimate }, { code: args.estimate }] },
+                select: { id: true, projectId: true, leadId: true, code: true },
+            });
+            if (estimate) return { projectId: estimate.projectId ?? null, leadId: estimate.leadId ?? null, entityId: estimate.id, entityName: estimate.code };
+        }
+    } catch (err) {
+        console.error(`[MCP AUDIT] owner lookup for ${toolName} failed:`, err);
+    }
+    return { projectId: null, leadId: null };
+}
+
+async function logMcpAudit(toolName: string, args: Record<string, unknown> | undefined, actor: RouteMcpActor, result: unknown, thrown: unknown) {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const resultIsError = !!result && typeof result === "object" && (result as { isError?: boolean }).isError === true;
+    const parsedBody = parseResultJson(result);
+    const bodyFailed = bodyReportsFailure(parsedBody);
+    const failed = thrown !== undefined || resultIsError || bodyFailed;
+    const isPreview = !failed && isPreviewBody(parsedBody);
+
+    // Preview labelling generalizes to every write tool (not just SEND_TOOLS):
+    // any two-step tool that answered with a preview/confirmationRequired body
+    // wrote nothing. Otherwise SEND_TOOLS get the "send" label (executed or
+    // attempted-and-failed), everything else gets the plain mcp_<tool> label.
+    let action: string;
+    if (isPreview) {
+        action = `mcp_preview_${toolName}`;
+    } else if (SEND_TOOLS.has(toolName)) {
+        action = `mcp_send_${toolName}`;
+    } else {
+        action = `mcp_${toolName}`;
+    }
+    if (failed) action += "_failed";
+
+    const owner = await resolveAuditOwner(toolName, a);
+
+    let errorText: string | undefined;
+    if (thrown !== undefined) {
+        errorText = thrown instanceof Error ? thrown.message : String(thrown);
+    } else if (resultIsError) {
+        const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
+        errorText = content?.find(c => c?.type === "text")?.text ?? "Tool reported an error";
+    } else if (bodyFailed && typeof parsedBody?.error === "string") {
+        errorText = parsedBody.error;
+    }
+
+    // onBehalfOf (help-agent.ts's trusted side-channel) credits the actual
+    // human who typed in-app chat, instead of always naming the connector.
+    const onBehalfOf = await actor.resolveOnBehalfOf();
+    const actorName = onBehalfOf
+        ? `${mcpActivityActorName(actor.actorLabel)} (via ${onBehalfOf.name})`
+        : mcpActivityActorName(actor.actorLabel);
+    const actorUserId = onBehalfOf?.id ?? (await actor.resolveActorUserId()) ?? undefined;
+
+    await logActivity({
+        projectId: owner.projectId,
+        leadId: owner.leadId,
+        actorType: "TEAM",
+        actorName,
+        actorUserId,
+        action,
+        entityType: ENTITY_TYPE_BY_TOOL[toolName],
+        entityId: owner.entityId || undefined,
+        entityName: owner.entityName,
+        metadata: buildMcpAuditMetadata(toolName, actor.actorLabel, a, errorText),
+    });
+}
+
+// Monkeypatches registerTool so WRITE_TOOLS get an audit-log wrapper without
+// touching any of the tool bodies below. Must run before the first
+// registerTool call in the initializer.
+function wrapWriteTools(server: { registerTool: (...args: any[]) => unknown }, actor: RouteMcpActor) {
+    const originalRegisterTool = server.registerTool.bind(server);
+    server.registerTool = (name: string, config: unknown, cb: (...cbArgs: any[]) => unknown) => {
+        if (!WRITE_TOOLS.has(name)) {
+            return originalRegisterTool(name, config, cb);
+        }
+        const wrapped = async (args: Record<string, unknown>, extra?: unknown) => {
+            let result: unknown;
+            let thrown: unknown;
+            try {
+                result = await cb(args, extra);
+            } catch (err) {
+                thrown = err;
+            }
+            try {
+                await logMcpAudit(name, args, actor, result, thrown);
+            } catch (auditErr) {
+                // Logging must never break a tool call — but an audit trail
+                // that fails silently is worse than none, so make the gap
+                // loud enough to find in Vercel/Sentry logs.
+                console.error(
+                    `[MCP AUDIT FAILURE] tool=${name} actor=${actor.actorLabel} — the action ran but was NOT recorded:`,
+                    auditErr
+                );
+            }
+            if (thrown !== undefined) throw thrown;
+            return result;
+        };
+        return originalRegisterTool(name, config, wrapped);
     };
 }
 
 function createHandler(actor: RouteMcpActor) {
     return createMcpHandler(
     server => {
+        wrapWriteTools(server, actor);
+
         server.registerTool(
             "list_projects",
             {
@@ -1030,8 +1344,9 @@ function createHandler(actor: RouteMcpActor) {
                 title: "List a job's folder tree and files",
                 annotations: { readOnlyHint: true },
                 description:
-                    "Returns a project's or lead's folder tree and file metadata (id, name, size, mime type, visibility, folder, created date). " +
-                    "Standard project folders are created implicitly when a project has no folders. This tool NEVER returns URLs; file download is not available through MCP.",
+                    "Returns a project's or lead's folder tree and file metadata (id, name, size, mime type, visibility, folder, created date) — metadata only, no URLs. " +
+                    "Standard project folders are created implicitly when a project has no folders. " +
+                    "Pass a file's id to read_file for its extracted text, or to get_file_link for a view/download link.",
                 inputSchema: {
                     projectId: z.string().max(50).optional(),
                     leadId: z.string().max(50).optional(),
@@ -1043,6 +1358,199 @@ function createHandler(actor: RouteMcpActor) {
                 } catch (error) {
                     return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list project files" }), isError: true };
                 }
+            },
+        );
+
+        const READ_FILE_MAX_BYTES = 25_000_000;
+
+        function extractedTextResult(rawText: string, maxChars: number, sizeBytes?: number) {
+            const normalized = rawText.replace(/\n{3,}/g, "\n\n").trim();
+            const totalChars = normalized.length;
+            const truncated = totalChars > maxChars;
+            // A big PDF that yields almost no text is a drawing or a scan, not a
+            // document — the page content is vector/raster with no text layer.
+            // Verified: a 495 KB architectural foundation plan extracts 36 chars
+            // (just the title block). Say so, or the caller reports the tool as
+            // broken when it worked exactly as designed.
+            const looksLikeNoTextLayer = !!sizeBytes && sizeBytes > 100_000 && totalChars < 200;
+            return {
+                readable: true as const,
+                truncated,
+                totalChars,
+                ...(looksLikeNoTextLayer
+                    ? {
+                          likelyNoTextLayer: true,
+                          note:
+                              "Almost no text came out of a large file — this is very likely a drawing, plan sheet, or scanned page with no embedded text layer. What's below is all there is; the visual content can't be read this way. Open it in ProBuild to view it.",
+                      }
+                    : {}),
+                text: truncated ? normalized.slice(0, maxChars) : normalized,
+            };
+        }
+
+        server.registerTool(
+            "read_file",
+            {
+                title: "Read a file's contents",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns extracted text for PDFs, Word docs (.docx) and plain-text/CSV/JSON files on a job's Files tab, so the assistant can actually read a spec, scope sheet, or signed document. " +
+                    "Images and other binary formats return a description instead of content, plus a viewUrl link. Use the id from list_project_files.",
+                inputSchema: {
+                    fileId: z.string().max(50).describe("File id from list_project_files"),
+                    maxChars: z.number().int().min(500).max(50_000).optional().describe("Max characters of extracted text to return (default 20000)"),
+                    linkMinutes: z.number().int().min(1).max(120).optional().describe("How long the returned viewUrl stays valid, minutes (default 30)"),
+                },
+            },
+            async ({ fileId, maxChars, linkMinutes }) => {
+                const file = await prisma.projectFile.findUnique({
+                    where: { id: fileId },
+                    select: {
+                        id: true, name: true, url: true, size: true, mimeType: true, visibility: true,
+                        folderId: true, projectId: true, leadId: true,
+                        folder: { select: { id: true, name: true, visibility: true } },
+                    },
+                });
+                if (!file) return { ...textResult({ error: `No file with id ${fileId}. Use list_project_files.` }), isError: true };
+
+                const ext = fileExtension(file.name);
+                const mime = file.mimeType || "";
+                const isGenericMime = mime === "application/octet-stream" || !mime;
+                const effectiveMaxChars = maxChars ?? 20_000;
+                const effectiveLinkMinutes = linkMinutes ?? 30;
+                const viewUrl = await resolveDocUrl(file.url, effectiveLinkMinutes * 60);
+                // Only a `secure:` ref is actually a time-limited signed URL — an
+                // ordinary project upload's stored value is a permanent public URL
+                // that resolveDocUrl returns unchanged, so don't claim it expires.
+                // Prefix alone is not enough: a malformed ref like "secure:/bad"
+                // passes isSecureRef but fails secureRefPath and falls through to
+                // public resolution, so it must not be labelled as expiring.
+                const linkIsSigned = isSecureRef(file.url) && !!secureRefPath(file.url);
+                const base = {
+                    id: file.id, name: file.name, mimeType: file.mimeType, size: file.size, folder: file.folder?.name ?? null,
+                    viewUrl,
+                    ...(!viewUrl
+                        ? { viewUrlNote: "Could not generate a link for this file." }
+                        : linkIsSigned
+                            ? { expiresInMinutes: effectiveLinkMinutes }
+                            : { expires: false as const, viewUrlNote: "This is a permanent public link — it does not expire." }),
+                };
+
+                const isPdf = mime === "application/pdf" || (isGenericMime && ext === ".pdf");
+                const isDocx = mime.includes("wordprocessingml.document") || (isGenericMime && ext === ".docx");
+                const isPlainText = mime.startsWith("text/") || mime === "application/json" || [".txt", ".md", ".csv", ".json"].includes(ext);
+
+                // Decide readability from mimeType/extension BEFORE downloading
+                // anything — a 20MB photo should never be fetched just to be
+                // told "it's an image". Both branches still carry viewUrl — for
+                // an image or an unsupported type, the link IS the useful output.
+                if (!isPdf && !isDocx && !isPlainText) {
+                    if (mime.startsWith("image/")) {
+                        return textResult({ ...base, readable: false, kind: "image", note: "Images can't be converted to text. Open the link in viewUrl to view the photo." });
+                    }
+                    return textResult({ ...base, readable: false, kind: mime || ext || "unknown", note: "No text extractor for this type — use viewUrl to open it." });
+                }
+
+                // DB `size` ceiling check. This is now the ONLY size guard: the
+                // download below goes through downloadDocBytes against our own
+                // bucket, not an attacker-controlled endpoint, so there's no
+                // untrusted content-length header to double-check against.
+                if (file.size > READ_FILE_MAX_BYTES) {
+                    return { ...textResult({ error: `File is ${formatBytes(file.size)} — too large to read inline (max ${formatBytes(READ_FILE_MAX_BYTES)}).` }), isError: true };
+                }
+
+                const buffer = await downloadDocBytes(file.url);
+                if (!buffer) {
+                    return { ...textResult({ error: "Could not read the file's bytes from storage." }), isError: true };
+                }
+                // `ProjectFile.size` defaults to 0 and can be stale, so the check
+                // above is only a cheap early-out. Enforce the real ceiling here
+                // too — the memory is already spent (downloadDocBytes just read
+                // the whole object), but this still stops extraction from running
+                // against an oversized buffer. The bytes came from our own bucket,
+                // not an attacker-controlled endpoint, so there's no untrusted
+                // content-length to check earlier instead.
+                if (buffer.length > READ_FILE_MAX_BYTES) {
+                    return { ...textResult({ error: `File is ${formatBytes(buffer.length)} — too large to read inline (max ${formatBytes(READ_FILE_MAX_BYTES)}).` }), isError: true };
+                }
+
+                try {
+                    if (isPdf) {
+                        const pdfParseMod: any = await import("pdf-parse");
+                        const PDFParseCtor = pdfParseMod.PDFParse ?? pdfParseMod.default?.PDFParse;
+                        const parser = new PDFParseCtor({ data: buffer });
+                        let text: string;
+                        try {
+                            const result = await parser.getText();
+                            text = result?.text ?? "";
+                        } finally {
+                            await parser.destroy?.();
+                        }
+                        return textResult({ ...base, ...extractedTextResult(text, effectiveMaxChars, file.size) });
+                    }
+                    if (isDocx) {
+                        const mammothMod: any = await import("mammoth");
+                        const extractRawText = mammothMod.extractRawText ?? mammothMod.default?.extractRawText;
+                        const result = await extractRawText({ buffer });
+                        return textResult({ ...base, ...extractedTextResult(result?.value ?? "", effectiveMaxChars, file.size) });
+                    }
+                    // isPlainText is the only remaining possibility — isPdf,
+                    // isDocx and isPlainText are the sole gates past the early
+                    // return above.
+                    return textResult({ ...base, ...extractedTextResult(buffer.toString("utf-8"), effectiveMaxChars) });
+                } catch (err: any) {
+                    return { ...textResult({ error: `Could not extract text: ${err?.message || "unknown error"}` }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "get_file_link",
+            {
+                title: "Get a viewable link to a file",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns a link to open or download any file on a job's Files tab — use this for photos, drawings, and scans that read_file can't turn into text, " +
+                    "or whenever the user wants the actual document rather than its extracted text. The link expires after linkMinutes (default 30). Use the id from list_project_files.",
+                inputSchema: {
+                    fileId: z.string().max(50).describe("File id from list_project_files"),
+                    linkMinutes: z.number().int().min(1).max(120).optional().describe("How long the returned link stays valid, minutes (default 30)"),
+                },
+            },
+            async ({ fileId, linkMinutes }) => {
+                const file = await prisma.projectFile.findUnique({
+                    where: { id: fileId },
+                    select: {
+                        id: true, name: true, url: true, size: true, mimeType: true, visibility: true,
+                        folderId: true, projectId: true, leadId: true,
+                        folder: { select: { id: true, name: true, visibility: true } },
+                    },
+                });
+                if (!file) return { ...textResult({ error: `No file with id ${fileId}. Use list_project_files.` }), isError: true };
+
+                const effectiveLinkMinutes = linkMinutes ?? 30;
+                const viewUrl = await resolveDocUrl(file.url, effectiveLinkMinutes * 60);
+                if (!viewUrl) {
+                    return { ...textResult({ error: "Could not generate a viewable link for this file." }), isError: true };
+                }
+                // Only a `secure:` ref is actually a time-limited signed URL — an
+                // ordinary project upload's stored value is a permanent public URL
+                // that resolveDocUrl returns unchanged, so don't claim it expires.
+                // Prefix alone is not enough: a malformed ref like "secure:/bad"
+                // passes isSecureRef but fails secureRefPath and falls through to
+                // public resolution, so it must not be labelled as expiring.
+                const linkIsSigned = isSecureRef(file.url) && !!secureRefPath(file.url);
+                return textResult({
+                    id: file.id,
+                    name: file.name,
+                    mimeType: file.mimeType,
+                    size: formatBytes(file.size),
+                    folder: file.folder?.name ?? null,
+                    viewUrl,
+                    ...(linkIsSigned
+                        ? { expiresInMinutes: effectiveLinkMinutes }
+                        : { expires: false as const, note: "This is a permanent public link — it does not expire." }),
+                });
             },
         );
 
@@ -1844,9 +2352,70 @@ function createHandler(actor: RouteMcpActor) {
                 }
             },
         );
+
+        server.registerTool(
+            "get_activity_log",
+            {
+                title: "Review recent ProBuild activity",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns the audit trail of actions taken through connectors and the app — newest first: who did what, on which project/lead, and whether a customer-facing send " +
+                    "actually went out or was only previewed. Use to answer 'what did I just do?' or 'what changed on this project recently?'.",
+                inputSchema: {
+                    limit: z.number().int().min(1).max(100).optional().describe("Max rows to return (default 25)"),
+                    projectId: z.string().max(50).optional().describe("Restrict to one project's activity"),
+                    leadId: z.string().max(50).optional().describe("Restrict to one lead's activity"),
+                    actionContains: z.string().max(60).optional().describe("Case-insensitive substring filter on the action, e.g. 'send'"),
+                    sinceDays: z.number().int().min(1).max(90).optional().describe("How many days back to look (default 7)"),
+                },
+            },
+            async ({ limit, projectId, leadId, actionContains, sinceDays }) => {
+                const effectiveSinceDays = sinceDays ?? 7;
+                const where: Record<string, unknown> = {
+                    createdAt: { gte: new Date(Date.now() - effectiveSinceDays * 24 * 60 * 60 * 1000) },
+                };
+                if (projectId) where.projectId = projectId;
+                if (leadId) where.leadId = leadId;
+                if (actionContains) where.action = { contains: actionContains, mode: "insensitive" };
+
+                const logs = await prisma.activityLog.findMany({
+                    where,
+                    orderBy: { createdAt: "desc" },
+                    take: limit ?? 25,
+                    select: {
+                        createdAt: true,
+                        actorName: true,
+                        action: true,
+                        entityType: true,
+                        entityName: true,
+                        projectId: true,
+                        leadId: true,
+                        metadata: true,
+                    },
+                });
+
+                const projectIds = [...new Set(logs.map(l => l.projectId).filter((id): id is string => !!id))];
+                const projects = projectIds.length
+                    ? await prisma.project.findMany({ where: { id: { in: projectIds } }, select: { id: true, name: true } })
+                    : [];
+                const projectNameById = new Map(projects.map(p => [p.id, p.name]));
+
+                return textResult(logs.map(l => ({
+                    createdAt: l.createdAt,
+                    actorName: l.actorName,
+                    action: l.action,
+                    entityType: l.entityType,
+                    entityName: l.entityName,
+                    projectId: l.projectId,
+                    projectName: l.projectId ? (projectNameById.get(l.projectId) ?? null) : null,
+                    leadId: l.leadId,
+                    metadata: l.metadata ? JSON.parse(l.metadata) : null,
+                })));
+            },
+        );
     },
     {
-        serverInfo: { name: "probuild", version: "1.13.0" },
+        serverInfo: { name: "probuild", version: "1.14.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
@@ -1871,7 +2440,11 @@ function createHandler(actor: RouteMcpActor) {
             "PROJECT MANAGEMENT: use find_job to resolve the project/lead; standard project folders are ensured implicitly by list_project_files and upload_files when needed. " +
             "Use upload_files for up to 8 files / ~3 MB total, then create_daily_log with already-uploaded photo ProjectFile ids so image bytes are not sent twice. " +
             "Use list_punch_items and add_punch_items for punch lists; punch completion is intentionally human-only. " +
-            "File download is not available through MCP. list_project_files returns metadata and folder structure, never URLs. " +
+            "FILE ROUND TRIP: upload_file/upload_files puts documents in, list_project_files shows what's there (metadata and folder structure only, no URLs), " +
+            "read_file pulls a PDF/Word/text file's actual extracted text, and get_file_link returns a view/download link for anything "
+            + "(signed and expiring for private documents, a permanent public URL otherwise — the response says which). " +
+            "Photos, drawings, scans and signed PDFs typically have no text layer to extract, so get_file_link (not read_file) is the right tool for them. " +
+            "get_activity_log reviews the audit trail of connector actions — who did what, and whether a customer-facing send actually went out or was only previewed. " +
             "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +
             "for the next N days, with each project's crew and a crewConflicts block (double-bookings across overlapping project windows). " +
             "get_project_schedule returns one job's task-level plan; list_crew_availability returns only field-crew bookings/free days and never rates or financials. " +
@@ -1916,7 +2489,12 @@ function guarded(req: Request) {
     if (!actorLabel) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
     }
-    return createHandler(createRouteMcpActor(actorLabel))(req);
+    // Read ONLY after the key has authenticated — holding a valid key is
+    // already full trust, so this param grants nothing extra. It only lets
+    // help-agent.ts (the sole caller that sets it) credit the signed-in human
+    // in the audit trail instead of just the connector account.
+    const onBehalfOfId = new URL(req.url).searchParams.get("onBehalfOf");
+    return createHandler(createRouteMcpActor(actorLabel, onBehalfOfId))(req);
 }
 
 export { guarded as GET, guarded as POST, guarded as DELETE };

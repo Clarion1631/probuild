@@ -194,7 +194,7 @@ export async function listProjectFiles(input: OwnerInput) {
         },
         folders: roots,
         unfiled,
-        note: "No file URLs are returned. File download is not available through MCP.",
+        note: "No file URLs are returned here. Use read_file for extracted text or get_file_link for a viewable/download link.",
     };
 }
 

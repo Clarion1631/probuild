@@ -112,7 +112,7 @@ async function main() {
     // Static registry, security, migration, and no-Phase-2 contracts.
     assert.match(routeSource, /MCP_SECRET_RICHARD/);
     assert.match(routeSource, /timingSafeEqual/);
-    assert.match(routeSource, /serverInfo:\s*\{\s*name:\s*"probuild",\s*version:\s*"1\.13\.0"\s*\}/);
+    assert.match(routeSource, /serverInfo:\s*\{\s*name:\s*"probuild",\s*version:\s*"1\.14\.0"\s*\}/);
     for (const toolName of [
         "upload_file",
         "upload_files",
@@ -124,14 +124,20 @@ async function main() {
         "list_punch_items",
         "add_punch_items",
         "get_project_contacts",
+        "read_file",
+        "get_file_link",
     ]) {
         assert.match(routeSource, new RegExp(`"${toolName}"`), `${toolName} must be registered`);
     }
     assert.doesNotMatch(routeSource, /registerTool\(\s*"complete_punch_item"/);
     assert.match(routeSource, /complete_punch_item[\s\S]{0,300}(?:cut|absent|not registered|human reported)/i);
     assert.match(routeSource, /Project management/i);
-    assert.match(routeSource, /download is not available/i);
-    assert.match(routeSource, /list_project_files[\s\S]{0,800}(?:never returns|no) URLs/i);
+    // File download through MCP was deliberately enabled (read_file for text,
+    // get_file_link for a link), reversing the earlier "no download" contract.
+    // Reads must never dereference a stored URL — downloadDocBytes only.
+    assert.doesNotMatch(routeSource, /download is not available/i);
+    assert.match(routeSource, /downloadDocBytes/);
+    assert.match(routeSource, /resolveDocUrl/);
     assert.match(schemaSource, /model McpConfirmation \{[\s\S]*\bactorLabel\s+String/);
     assert.match(schemaSource, /model TaskPunchItem \{[\s\S]*\bcreatedById\s+String\?/);
     assert.match(applySource, /ADD COLUMN IF NOT EXISTS "actorLabel"/);
