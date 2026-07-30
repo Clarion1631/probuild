@@ -4,7 +4,7 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
 import { sendSMS } from "@/lib/sms";
-import { logActivity } from "@/lib/actions";
+import { logActivity } from "@/lib/activity-log";
 
 // GET /api/messages?projectId=X&subcontractorId=Y — list messages for a project thread
 export async function GET(request: Request) {

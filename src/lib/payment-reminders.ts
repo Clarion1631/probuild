@@ -6,8 +6,8 @@ import { formatCurrency } from "@/lib/utils";
 // Same writer as actions.ts's logActivity, but reached via a lazy dynamic import so this
 // module (imported by the cron route) never pulls in actions.ts's "use server"
 // surface — see billing-core.ts's logActivityLazy for the same convention.
-async function logActivityLazy(entry: Parameters<typeof import("./actions").logActivity>[0]) {
-    const { logActivity } = await import("./actions");
+async function logActivityLazy(entry: Parameters<typeof import("./activity-log").logActivity>[0]) {
+    const { logActivity } = await import("./activity-log");
     return logActivity(entry);
 }
 

@@ -161,6 +161,20 @@ async function main() {
     assert.match(actionSource, /const sendActor = await assertEstimateSendPermission\(mcpSecret\)/);
     assert.doesNotMatch(actionSource, /mcpActorLabel/);
     assert.match(actionSource, /actorName: sendActor\.name/);
+    // Permission says WHAT, not WHICH: both sends must scope the caller to the
+    // loaded document, or a non-admin holding contracts/estimates could send a
+    // document from a job they cannot access just by knowing its id.
+    assert.match(actionSource, /assertSendScope\(sendActor, \{ projectId: contract\.projectId/);
+    assert.match(actionSource, /assertSendScope\(sendActor, \{ projectId: estimate\.project\?\.id/);
+    // A supplied-but-empty machine secret must not be treated as "omitted".
+    assert.match(actionSource, /mcpSecret !== undefined && mcpSecret !== null/);
+    // The raw audit writer must NOT live on the "use server" surface, or callers
+    // can forge history (e.g. a sent_contract attributed to anyone).
+    assert.doesNotMatch(actionSource, /export async function logActivity/);
+    assert.ok(existsSync(new URL("../src/lib/activity-log.ts", import.meta.url)), "activity-log.ts must exist");
+    // The DIRECTIVE, not the phrase — the file's header comment explains why it is
+    // deliberately not a "use server" module.
+    assert.doesNotMatch(source("../src/lib/activity-log.ts"), /^\s*["']use server["']/m);
     assert.match(confirmationSource, /actorLabel/);
     assert.match(confirmationSource, /consumedAt:\s*null/);
     assert.match(confirmationSource, /expiresAt:\s*\{\s*gt:/);

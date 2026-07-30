@@ -45,8 +45,8 @@ function buildCc(primaryEmail: string, ...candidates: (string | null | undefined
     return out.length ? out : undefined;
 }
 
-async function logActivityLazy(entry: Parameters<typeof import("./actions").logActivity>[0]) {
-    const { logActivity } = await import("./actions");
+async function logActivityLazy(entry: Parameters<typeof import("./activity-log").logActivity>[0]) {
+    const { logActivity } = await import("./activity-log");
     return logActivity(entry);
 }
 
