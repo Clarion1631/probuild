@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getCurrentUserWithPermissions } from "@/lib/permissions";
+import { runHelpAgent } from "@/lib/help-agent";
+
+export const maxDuration = 300;
 
 type StructuredHelpResponse =
   | {
@@ -70,16 +72,14 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const session = await getServerSession(authOptions);
-  const sessionUserId = (session?.user as any)?.id;
-  const sessionUserRole = (session?.user as any)?.role;
+  const user = await getCurrentUserWithPermissions();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
-  const { question, currentPage, userId, userRole, conversationId } =
-    await req.json();
-  const effectiveUserId = sessionUserId || userId;
-  const effectiveUserRole = sessionUserRole || userRole || "USER";
+  const { question, currentPage, conversationId } = await req.json();
 
-  if (!question || !effectiveUserId) {
+  if (!question) {
     return NextResponse.json(
       { error: "Missing required fields" },
       { status: 400 }
@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
     let convoId = conversationId;
     if (convoId) {
       const existing = await prisma.chatConversation.findFirst({
-        where: { id: convoId, userId: effectiveUserId },
+        where: { id: convoId, userId: user.id },
       });
       if (!existing) convoId = null;
     }
@@ -98,12 +98,21 @@ export async function POST(req: NextRequest) {
     if (!convoId) {
       const convo = await prisma.chatConversation.create({
         data: {
-          userId: effectiveUserId,
+          userId: user.id,
           title: question.slice(0, 80),
         },
       });
       convoId = convo.id;
     }
+
+    // Load prior messages BEFORE persisting the current question, so it
+    // doesn't end up duplicated (once in priorMessages, once appended below).
+    const priorMessages = await prisma.chatMessage.findMany({
+      where: { conversationId: convoId },
+      orderBy: { createdAt: "asc" },
+      take: 20,
+      select: { role: true, content: true },
+    });
 
     await prisma.chatMessage.create({
       data: {
@@ -113,43 +122,16 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    const priorMessages = await prisma.chatMessage.findMany({
-      where: { conversationId: convoId },
-      orderBy: { createdAt: "asc" },
-      take: 20,
-      select: { role: true, content: true },
+    const { text, activity } = await runHelpAgent({
+      user,
+      question,
+      priorMessages: priorMessages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      })),
+      currentPage,
     });
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1024,
-        system: `You are a ProBuild help assistant. ProBuild is a construction/remodeling management platform with features for projects, estimates, invoices, leads, time tracking, daily logs, schedules, and reports. The user is on page "${currentPage || "unknown"}". Their role is ${effectiveUserRole}. Answer their question about how to use ProBuild concisely. If the question is about a feature that does not exist yet, respond with ONLY a valid JSON object: {"type":"feature_request","title":"short title","description":"detailed description"} If the user is describing a product bug or broken behavior, respond with ONLY a valid JSON object: {"type":"bug_report","title":"short title","description":"what is broken","steps":"how to reproduce"}. Return only JSON for those two cases, with no markdown wrapping.`,
-        messages: priorMessages.map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.content,
-        })),
-      }),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error("Anthropic API error:", err);
-      return NextResponse.json(
-        { error: "AI service error" },
-        { status: 502 }
-      );
-    }
-
-    const data = await response.json();
-    const text =
-      data.content?.[0]?.type === "text" ? data.content[0].text : "";
     const structuredResponse = parseStructuredResponse(text);
 
     await prisma.chatMessage.create({
@@ -167,6 +149,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       ...structuredResponse,
+      activity,
       conversationId: convoId,
     });
   } catch (error) {
