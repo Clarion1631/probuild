@@ -73,3 +73,44 @@ export async function isAncestorChainShared(folderId: string, projectId: string)
     }
     return true;
 }
+
+/**
+ * Would un-sharing this folder take away files the client can currently see?
+ *
+ * The portal shows a file inside a folder when the file's own visibility is
+ * "shared" or null AND every folder above it is "shared" (see api/portal/files +
+ * isAncestorChainShared). So flipping ONE folder off can hide files several
+ * levels down, including files explicitly marked "shared" — which is exactly the
+ * silent un-sharing the signed-documents work exists to prevent.
+ *
+ * Only descends through children that are themselves currently "shared": an
+ * already-unshared subtree is unreachable either way, so it cannot lose access.
+ * Bounded so a deep or cyclic tree cannot run away.
+ */
+export async function folderSubtreeExposesFiles(
+    folderId: string,
+    projectId: string,
+): Promise<boolean> {
+    const MAX_FOLDERS = 500;
+    const seen = new Set<string>([folderId]);
+    let frontier: string[] = [folderId];
+
+    while (frontier.length > 0 && seen.size <= MAX_FOLDERS) {
+        const exposed = await prisma.projectFile.count({
+            where: {
+                projectId,
+                folderId: { in: frontier },
+                OR: [{ visibility: "shared" }, { visibility: null }],
+            },
+        });
+        if (exposed > 0) return true;
+
+        const children = await prisma.fileFolder.findMany({
+            where: { parentId: { in: frontier }, visibility: "shared", projectId },
+            select: { id: true },
+        });
+        frontier = children.map(child => child.id).filter(id => !seen.has(id));
+        frontier.forEach(id => seen.add(id));
+    }
+    return false;
+}

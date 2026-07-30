@@ -3,7 +3,12 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { hasPermission } from "@/lib/permissions";
-import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
+import {
+    authorizeFileScope,
+    folderSubtreeExposesFiles,
+    isAncestorChainShared,
+    isAncestorFinancial,
+} from "@/lib/file-auth";
 
 // GET: list all folders for a project or lead
 export async function GET(req: NextRequest) {
@@ -122,6 +127,27 @@ export async function PATCH(req: NextRequest) {
     }
     if (visibility === "financial" && !hasPermission(user, "financialReports")) {
         return NextResponse.json({ error: "No permission to set financial visibility" }, { status: 403 });
+    }
+
+    // Un-sharing a folder hides everything the chain below it exposes, including
+    // files explicitly marked "shared", because the portal requires the WHOLE
+    // ancestor chain to be shared. The single-file endpoint refuses that; without
+    // the same gate here, flipping "Signed Documents" to team silently takes back
+    // every signed estimate the client could see — the exact regression the
+    // signed-documents fix was written to stop.
+    if (
+        visibility
+        && visibility !== "shared"
+        && existing.visibility === "shared"
+        && existing.projectId
+        && body.allowClientVisibilityLoss !== true
+    ) {
+        const reachable = await isAncestorChainShared(id, existing.projectId);
+        if (reachable && await folderSubtreeExposesFiles(id, existing.projectId)) {
+            return NextResponse.json({
+                error: `The client can currently see files in this folder, and changing it to "${visibility}" would remove their access. Move those files somewhere shared first, or pass allowClientVisibilityLoss: true to do it deliberately.`,
+            }, { status: 409 });
+        }
     }
 
     const updateData: any = {};

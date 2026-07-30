@@ -271,7 +271,10 @@ export async function PATCH(req: NextRequest) {
         // isAncestorChainShared). Any shorthand that just compares the file's own
         // visibility gets this wrong — an explicitly-shared file dropped into a team
         // folder keeps visibility "shared" while becoming completely unreachable.
-        if (folderId !== undefined) {
+        // Runs for a move OR a visibility-only change. Gating this on folderId
+        // alone let a plain { visibility: "team" } PATCH flip a file the client
+        // could see straight to internal without ever meeting the guard below.
+        if (folderId !== undefined || visibility !== undefined) {
             const targetFolder = folderId
                 ? await prisma.fileFolder.findUnique({
                     where: { id: folderId },
@@ -287,8 +290,13 @@ export async function PATCH(req: NextRequest) {
             // so NEITHER portal can reach it and the document silently disappears.
             // mcp-pm-tools.ts already enforces this on its own move tool.
             if (targetFolder) {
-                const sameOwner = (existing.projectId && targetFolder.projectId === existing.projectId)
-                    || (existing.leadId && targetFolder.leadId === existing.leadId);
+                // Exact owner tuple, not project-OR-lead. A row may carry BOTH ids,
+                // and matching on either one alone let a file owned by
+                // {project A, lead L} move into a folder owned by {project B, lead L}
+                // on the strength of the shared lead — after which the file keeps
+                // project A's projectId inside project B's folder.
+                const sameOwner = targetFolder.projectId === existing.projectId
+                    && targetFolder.leadId === existing.leadId;
                 if (!sameOwner) {
                     return NextResponse.json(
                         { error: "That folder belongs to a different project or lead" },
@@ -305,18 +313,25 @@ export async function PATCH(req: NextRequest) {
             };
 
             const nextVisibility = visibility !== undefined ? visibility : existing.visibility;
+            // Only a supplied folderId moves the file. Collapsing an absent folderId
+            // to null would treat every visibility-only change as a move to the
+            // project root and misjudge whether the client keeps access.
+            const nextFolderId = folderId !== undefined ? (folderId || null) : existing.folderId;
             const before = await clientCanSee(existing.visibility, existing.folderId);
-            const after = await clientCanSee(nextVisibility, folderId || null);
+            const after = await clientCanSee(nextVisibility, nextFolderId);
 
             // Refused only when the client LOSES access as a side effect. Passing an
             // explicit visibility is not a licence to hide the file — the caller has
             // to reach a destination the client can still see, or say so via
             // allowClientVisibilityLoss.
             if (before && !after && body.allowClientVisibilityLoss !== true) {
+                const moving = folderId !== undefined;
                 return NextResponse.json({
                     error: targetFolder
                         ? `The client can currently see "${existing.name}" in their portal, and "${targetFolder.name}" is not shared with them — this move would remove their access. Share that folder first, or pass allowClientVisibilityLoss: true to do it deliberately.`
-                        : `The client can currently see "${existing.name}" in their portal; moving it to the project root would remove their access unless it is explicitly shared. Pass visibility "shared", or allowClientVisibilityLoss: true to do it deliberately.`,
+                        : moving
+                            ? `The client can currently see "${existing.name}" in their portal; moving it to the project root would remove their access unless it is explicitly shared. Pass visibility "shared", or allowClientVisibilityLoss: true to do it deliberately.`
+                            : `The client can currently see "${existing.name}" in their portal; changing its visibility to "${nextVisibility ?? "inherited"}" would remove their access. Pass allowClientVisibilityLoss: true to do it deliberately.`,
                 }, { status: 409 });
             }
         }
