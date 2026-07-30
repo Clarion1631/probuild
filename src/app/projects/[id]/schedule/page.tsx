@@ -30,6 +30,7 @@ export default async function SchedulePage({ params }: { params: Promise<{ id: s
         estimatedHours: t.estimatedHours ?? null,
         doneWhen: t.doneWhen ?? null,
         blockedReason: t.blockedReason ?? null,
+        clientStage: t.clientStage ?? null,
         scheduledTime: t.scheduledTime ?? null,
         confirmationStatus: t.confirmationStatus ?? null,
         actualHours: (t.timeEntries || []).reduce((sum: number, te: any) => sum + (te.durationHours || 0), 0),

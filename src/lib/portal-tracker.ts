@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 
 import { prisma } from "@/lib/prisma";
 import {
+    CLIENT_STAGES,
+    CLIENT_STAGE_LABELS,
+    clientStageIndex,
+    type ClientStageDefinition,
+} from "@/lib/client-stages";
+import {
     assertPortalProjectAccess,
     assertPortalProjectAccessCore,
     portalVisibilityAllows,
@@ -13,57 +19,8 @@ export type { PortalProjectAccessInput };
 
 export type ClientStageState = "complete" | "current" | "upcoming";
 
-export type ClientStageDefinition = {
-    label: string;
-    matchers: readonly string[];
-};
-
-export const CLIENT_STAGES = [
-    {
-        label: "Planning & Permits",
-        matchers: [
-            "plan", "permit", "design", "preconstruction", "pre-construction",
-            "engineering", "architect", "site prep", "mobilization",
-        ],
-    },
-    {
-        label: "Demo",
-        matchers: ["demo", "demolition", "tear out", "tear-out", "removal", "abatement"],
-    },
-    {
-        label: "Framing",
-        matchers: ["frame", "framing", "structural", "sheathing", "carpentry"],
-    },
-    {
-        label: "Rough-ins",
-        matchers: [
-            "rough", "plumb", "electric", "hvac", "mechanical", "duct",
-            "wiring", "low voltage", "low-voltage",
-        ],
-    },
-    {
-        label: "Drywall",
-        matchers: ["drywall", "sheetrock", "gypsum", "insulation", "taping", "texture", "mud"],
-    },
-    {
-        label: "Finishes",
-        matchers: [
-            "finish", "paint", "tile", "cabinet", "floor", "counter", "trim",
-            "fixture", "appliance", "millwork", "backsplash",
-        ],
-    },
-    {
-        label: "Punch list",
-        matchers: [
-            "punch", "inspection", "touch up", "touch-up", "cleanup", "clean up",
-            "final walk", "correction",
-        ],
-    },
-    {
-        label: "Complete",
-        matchers: ["complete", "completion", "closeout", "close out", "handover", "handoff"],
-    },
-] as const satisfies readonly ClientStageDefinition[];
+export { CLIENT_STAGES, CLIENT_STAGE_LABELS, clientStageIndex };
+export type { ClientStageDefinition };
 
 export type PortalTrackerAssignment = {
     id: string;
@@ -93,6 +50,7 @@ export type PortalTrackerTask = {
     type: string;
     order: number;
     costCodeName: string | null;
+    clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
     assignments: PortalTrackerAssignment[];
@@ -100,10 +58,22 @@ export type PortalTrackerTask = {
     dependencies?: PortalTrackerDependency[];
 };
 
+export type ProjectTrackerStageTask = {
+    name: string;
+    done: boolean;
+    active: boolean;
+};
+
 export type ProjectTrackerStage = {
     label: string;
     state: ClientStageState;
     pct: number;
+    taskCount: number;
+    doneCount: number;
+    /** Tasks underneath this stage, in schedule order, for the expandable rail. */
+    tasks: ProjectTrackerStageTask[];
+    /** Name of the task actually underway, when this is the current stage. */
+    activeTaskName: string | null;
 };
 
 export type ProjectTracker = {
@@ -187,12 +157,98 @@ function isStarted(task: PortalTrackerTask): boolean {
         );
 }
 
-function stageMatchIndex(task: PortalTrackerTask): number | null {
-    const haystack = `${task.name} ${task.costCodeName ?? ""}`.toLowerCase();
-    const index = CLIENT_STAGES.findIndex(stage =>
-        stage.matchers.some(matcher => haystack.includes(matcher)),
-    );
-    return index >= 0 ? index : null;
+/**
+ * Keyword bucket for a task, or null when nothing matches.
+ *
+ * Wins on the stage word that appears LAST IN THE TEXT, not the highest-numbered
+ * stage. A task named "Site prep and Demo start" spans two stages and is
+ * announcing the transition, so it belongs to Demo; "Final electrical fixtures &
+ * cleanup" belongs to Punch list, not back in Rough-ins on the word "electric".
+ *
+ * Ranking by stage number instead read "Review floor plan" as Finishes (on
+ * "floor") rather than Planning (on "plan") — and because earlier empty stages
+ * then read as passed, a job whose only task was reviewing a floor plan told the
+ * client Demo, Framing, Rough-ins and Drywall were all done. Text position gets
+ * both those names right; stage number only got one of them.
+ */
+function bestStageInText(text: string): number | null {
+    const haystack = text.toLowerCase();
+    const hits: { position: number; length: number; stageIndex: number }[] = [];
+    CLIENT_STAGES.forEach((stage, stageIndex) => {
+        stage.matchers.forEach(matcher => {
+            const position = haystack.lastIndexOf(matcher);
+            if (position >= 0) hits.push({ position, length: matcher.length, stageIndex });
+        });
+    });
+    if (hits.length === 0) return null;
+    // Later in the text wins; on a tie the more specific (longer) word does.
+    return hits.reduce((best, hit) =>
+        hit.position > best.position
+        || (hit.position === best.position && hit.length > best.length)
+            ? hit
+            : best,
+    ).stageIndex;
+}
+
+function keywordStageIndex(task: PortalTrackerTask): number | null {
+    // Rank inside ONE field at a time. Positions from different fields are not
+    // comparable, and gluing name+costCode into one haystack handed every cost-code
+    // word positional priority over the task's own name: "Final cleanup" under cost
+    // code "Electrical rough-in" read as Rough-ins instead of Punch list. The name
+    // is what the client actually sees, so it decides whenever it says anything.
+    return bestStageInText(task.name) ?? bestStageInText(task.costCodeName ?? "");
+}
+
+/**
+ * Drops keyword anchors that contradict schedule order.
+ *
+ * Keyword matching has no idea when work actually happens, so a mid-project
+ * "inspection" lands in Punch list and a "Concrete Slab Pour & Finish" lands in
+ * Finishes — which makes the client rail run backwards. Keeping only the
+ * longest non-decreasing run of anchors throws out those outliers; the tasks
+ * they came from fall back to inheriting from their neighbours.
+ *
+ * Explicit clientStage values are never dropped — a human said so.
+ */
+type StageAnchor = { taskIndex: number; stageIndex: number };
+
+function monotonicAnchors(
+    keyword: readonly StageAnchor[],
+    pinned: readonly StageAnchor[],
+): StageAnchor[] {
+    // A keyword guess may not contradict what a human pinned around it.
+    const eligible = keyword.filter(anchor => {
+        const floor = pinned
+            .filter(p => p.taskIndex < anchor.taskIndex)
+            .reduce((max, p) => Math.max(max, p.stageIndex), Number.NEGATIVE_INFINITY);
+        const ceiling = pinned
+            .filter(p => p.taskIndex > anchor.taskIndex)
+            .reduce((min, p) => Math.min(min, p.stageIndex), Number.POSITIVE_INFINITY);
+        return anchor.stageIndex >= floor && anchor.stageIndex <= ceiling;
+    });
+    if (eligible.length === 0) return [];
+
+    // best[i] = length of the longest non-decreasing run ending at i.
+    const best = eligible.map(() => 1);
+    const previous = eligible.map(() => -1);
+    let endOfLongest = 0;
+
+    eligible.forEach((anchor, i) => {
+        for (let j = 0; j < i; j++) {
+            if (eligible[j].stageIndex <= anchor.stageIndex && best[j] + 1 > best[i]) {
+                best[i] = best[j] + 1;
+                previous[i] = j;
+            }
+        }
+        if (best[i] > best[endOfLongest]) endOfLongest = i;
+    });
+
+    const kept: StageAnchor[] = [];
+    for (let i = endOfLongest; i >= 0; i = previous[i]) {
+        kept.unshift({ taskIndex: eligible[i].taskIndex, stageIndex: eligible[i].stageIndex });
+        if (previous[i] === -1) break;
+    }
+    return kept;
 }
 
 function chronologicalTasks(tasks: readonly PortalTrackerTask[]): PortalTrackerTask[] {
@@ -208,18 +264,35 @@ function chronologicalTasks(tasks: readonly PortalTrackerTask[]): PortalTrackerT
 /**
  * Assigns every task to the eight client stages.
  *
- * Fallback: an unmatched task inherits the stage of the closest keyword-
- * matched task in chronological order (earlier anchor wins a tie). When the
- * project has no keyword matches at all, chronological tasks are distributed
- * proportionally across the ordered stages so the tracker remains useful for
+ * Precedence: an explicit clientStage wins outright, then a keyword match that
+ * survived the schedule-order check, then interpolation. An unmatched task
+ * inherits the stage of the closest surviving anchor (earlier anchor wins a
+ * tie). When a project has no anchors at all, chronological tasks are spread
+ * proportionally across the stages so the tracker still means something for
  * custom task naming.
  */
 function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, number> {
     const sorted = chronologicalTasks(tasks);
-    const direct = sorted.map(stageMatchIndex);
-    const anchors = direct
+    const pinnedStage = sorted.map(task => clientStageIndex(task.clientStage));
+    const keywordStage = sorted.map((task, i) =>
+        pinnedStage[i] === null ? keywordStageIndex(task) : null,
+    );
+
+    const toAnchors = (stages: readonly (number | null)[]): StageAnchor[] => stages
         .map((stageIndex, taskIndex) => stageIndex === null ? null : { taskIndex, stageIndex })
-        .filter((anchor): anchor is { taskIndex: number; stageIndex: number } => anchor !== null);
+        .filter((anchor): anchor is StageAnchor => anchor !== null);
+
+    const pinnedAnchors = toAnchors(pinnedStage);
+    const keptKeyword = monotonicAnchors(toAnchors(keywordStage), pinnedAnchors);
+    // A keyword guess the ordering pass threw out stops being trusted for its
+    // own task too, not just for its neighbours — otherwise the outlier stays
+    // parked in the wrong stage and the rail still runs backwards.
+    const keptByTask = new Map(keptKeyword.map(a => [a.taskIndex, a.stageIndex]));
+    const anchors = [...pinnedAnchors, ...keptKeyword].sort((a, b) => a.taskIndex - b.taskIndex);
+
+    const direct = sorted.map((_, i) =>
+        pinnedStage[i] ?? keptByTask.get(i) ?? null,
+    );
     const assigned = new Map<string, number>();
 
     sorted.forEach((task, taskIndex) => {
@@ -275,31 +348,95 @@ export function buildProjectTracker(
     if (currentIndex < 0 && tasks.length === 0) currentIndex = 0;
 
     const stages = CLIENT_STAGES.map((stage, index): ProjectTrackerStage => {
-        const stageTasks = tasksByStage[index];
+        const stageTasks = chronologicalTasks(tasksByStage[index]);
         const taskPct = stageTasks.length > 0
             ? Math.round(stageTasks.reduce((sum, task) => sum + normalizedProgress(task), 0) / stageTasks.length)
             : 0;
+
+        // Second level of the rail: the real schedule under each stage.
+        // Appointments are crew logistics, not client-facing milestones.
+        const visibleTasks = stageTasks.filter(task => task.type !== "appointment");
+        const activeTask = visibleTasks.find(task => isStarted(task))
+            ?? visibleTasks.find(task => !isComplete(task));
+        const detail = {
+            taskCount: visibleTasks.length,
+            doneCount: visibleTasks.filter(isComplete).length,
+            tasks: visibleTasks.map((task): ProjectTrackerStageTask => ({
+                name: clientTaskName(task.name),
+                done: isComplete(task),
+                active: isStarted(task),
+            })),
+        };
+        const activeTaskName = activeTask ? clientTaskName(activeTask.name) : null;
 
         if (overrideIndex >= 0) {
             // A staff override pins the route position regardless of task math:
             // earlier stages read done, the pinned stage is current (capped at
             // 99 — 100 would read as complete), later stages keep honest pcts.
-            if (index < overrideIndex) return { label: stage.label, state: "complete", pct: 100 };
-            if (index === overrideIndex) {
-                return { label: stage.label, state: "current", pct: Math.min(taskPct, 99) };
+            if (index < overrideIndex) {
+                // Staff said we're past this stage, so it reads Done and stops
+                // there. Sending the task list would let the client open a
+                // green checkmark and find unticked work under it — the tasks
+                // are usually finished in the field and just never ticked here.
+                return {
+                    label: stage.label,
+                    state: "complete",
+                    pct: 100,
+                    taskCount: 0,
+                    doneCount: 0,
+                    tasks: [],
+                    activeTaskName: null,
+                };
             }
-            return { label: stage.label, state: "upcoming", pct: taskPct };
+            if (index === overrideIndex) {
+                return {
+                    label: stage.label,
+                    state: "current",
+                    pct: Math.min(taskPct, 99),
+                    ...detail,
+                    activeTaskName,
+                };
+            }
+            return { label: stage.label, state: "upcoming", pct: taskPct, ...detail, activeTaskName: null };
         }
 
-        const stageComplete = stageTasks.length > 0 && stageTasks.every(isComplete);
-        const emptyButPassed = currentIndex > index && stageTasks.length === 0;
-        const complete = allProjectTasksComplete || stageComplete || emptyButPassed;
-
-        return {
-            label: stage.label,
-            state: complete ? "complete" : index === currentIndex ? "current" : "upcoming",
-            pct: complete ? 100 : taskPct,
-        };
+        // The rail is ONE position, not eight independent ones, so state comes
+        // purely from where currentIndex sits — the same shape as the pinned
+        // branch above. Deciding each stage's Done on its own tasks let a green
+        // Framing sit above an unfinished Demo, and let an untouched Demo read
+        // "upcoming" behind three finished stages: the backwards rail this whole
+        // change exists to kill.
+        if (allProjectTasksComplete || currentIndex < 0) {
+            return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
+        }
+        if (index < currentIndex) {
+            // Behind the current position. Reads Done with no task list, for the
+            // same reason the pinned branch hides it: letting the client open a
+            // green checkmark and find unticked work under it is worse than
+            // saying nothing. In the field this work is done, it just never got
+            // ticked here.
+            return {
+                label: stage.label,
+                state: "complete",
+                pct: 100,
+                taskCount: 0,
+                doneCount: 0,
+                tasks: [],
+                activeTaskName: null,
+            };
+        }
+        if (index === currentIndex) {
+            return {
+                label: stage.label,
+                state: "current",
+                pct: Math.min(taskPct, 99),
+                ...detail,
+                activeTaskName,
+            };
+        }
+        // Ahead of the current position. Work finished early keeps its real pct
+        // so the roundel still counts it; it just doesn't get the checkmark yet.
+        return { label: stage.label, state: "upcoming", pct: taskPct, ...detail, activeTaskName: null };
     });
 
     // Overall = mean of the per-stage percentages so the roundel can never
@@ -422,6 +559,7 @@ export async function getPortalScheduleTasksCore(projectId: string): Promise<Por
             status: true,
             type: true,
             order: true,
+            clientStage: true,
             scheduledTime: true,
             confirmationStatus: true,
             dependencies: {
@@ -463,6 +601,7 @@ export async function getPortalScheduleTasksCore(projectId: string): Promise<Por
         type: task.type,
         order: task.order,
         costCodeName: task.estimateItem?.costCode?.name ?? null,
+        clientStage: task.clientStage,
         scheduledTime: task.scheduledTime,
         confirmationStatus: task.confirmationStatus,
         dependencies: task.dependencies,

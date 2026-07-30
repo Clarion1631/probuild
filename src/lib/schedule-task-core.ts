@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
+import { CLIENT_STAGES, clientStageIndex } from "./client-stages";
 import {
     deriveEstimateItemHours,
     lockTaskAssignmentParent,
@@ -59,6 +60,8 @@ export interface UpdateScheduleTaskInput {
     blockedReason?: string | null;
     scheduledTime?: string | null;
     confirmationStatus?: ScheduleConfirmationStatus | null;
+    /** Client tracker stage override; null clears it back to auto-derive. */
+    clientStage?: string | null;
 }
 
 function assertScheduleTaskType(type: string): asserts type is ScheduleTaskType {
@@ -298,6 +301,16 @@ export async function updateScheduleTaskInTransaction(
     }
     if (data.type !== undefined) updateData.type = data.type;
     if (data.doneWhen !== undefined) updateData.doneWhen = data.doneWhen?.trim() || null;
+    if (data.clientStage !== undefined) {
+        const label = data.clientStage?.trim() || null;
+        if (label !== null && clientStageIndex(label) === null) {
+            throw new Error(`Unknown client stage "${label}"`);
+        }
+        // Store the canonical label so the tracker's lookup can stay exact.
+        updateData.clientStage = label === null
+            ? null
+            : CLIENT_STAGES[clientStageIndex(label)!].label;
+    }
     if (data.status !== undefined || data.blockedReason !== undefined) {
         if (nextStatus === "Blocked") {
             const reasonSource = data.blockedReason !== undefined ? data.blockedReason : persisted.blockedReason;

@@ -95,7 +95,7 @@ export function useScheduleActions(
             const start = newTaskStart;
             const end = newTaskType === "milestone" ? start : newTaskEnd;
             const task = await createScheduleTask(projectId, { name: newTaskName.trim(), startDate: start, endDate: end, type: newTaskType });
-            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
+            setTasks(prev => [...prev, { ...task, startDate: start, endDate: end, type: newTaskType, actualHours: 0, estimatedHours: null, doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null, dependencies: [], dependents: [], assignments: [], estimateItemId: null, estimateItem: null }]);
             toast.success(newTaskType === "milestone" ? "Milestone added" : "Task added");
             setShowNewTaskForm(false);
         } finally { setIsAdding(false); }
@@ -151,6 +151,17 @@ export function useScheduleActions(
         } catch (error) {
             setTasks(prev => prev.map(t => t.id === taskId ? { ...t, doneWhen: previous } : t));
             toast.error(error instanceof Error ? error.message : "Failed to update completion criteria");
+        }
+    }
+
+    async function handleClientStageChange(taskId: string, clientStage: string | null) {
+        const previous = tasksRef.current.find(t => t.id === taskId)?.clientStage ?? null;
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage } : t));
+        try {
+            await updateScheduleTask(taskId, { clientStage });
+        } catch (error) {
+            setTasks(prev => prev.map(t => t.id === taskId ? { ...t, clientStage: previous } : t));
+            toast.error(error instanceof Error ? error.message : "Failed to update client stage");
         }
     }
 
@@ -256,7 +267,7 @@ export function useScheduleActions(
                 type: "task",
                 assignee: null, order: t.order,
                 estimatedHours: t.estimatedHours, actualHours: 0,
-                doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null,
+                doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null,
                 dependencies: [], dependents: [], assignments: [],
                 estimateItemId: null, estimateItem: null,
             }));
@@ -299,7 +310,7 @@ export function useScheduleActions(
                 endDate: formatDate(new Date(t.endDate)),
                 type: "task" as const,
                 actualHours: 0, estimatedHours: null,
-                doneWhen: null, blockedReason: null, scheduledTime: null, confirmationStatus: null,
+                doneWhen: null, blockedReason: null, clientStage: null, scheduledTime: null, confirmationStatus: null,
                 dependencies: [], dependents: [], assignments: [],
                 estimateItemId: t.estimateItemId || null, estimateItem: null,
             }))]);
@@ -450,7 +461,7 @@ export function useScheduleActions(
         openNewTaskForm, handleAddTask,
 
         // Task CRUD
-        handleDateChange, handleStatusChange, handleDoneWhenChange, handleAppointmentChange, handleColorChange,
+        handleDateChange, handleStatusChange, handleDoneWhenChange, handleClientStageChange, handleAppointmentChange, handleColorChange,
         handleDelete, handleNameSave, handleEstimatedHoursSave,
         handleProgressChange, cascadeDependents,
 

@@ -1,6 +1,6 @@
 "use client";
 
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import Link from "next/link";
 import { motion, MotionConfig } from "framer-motion";
 import {
@@ -57,6 +57,10 @@ export default function PortalProjectTracker({
 }) {
     const currentIndex = data.stages.findIndex(stage => stage.state === "current");
     const visibleDays = data.whoIsComing.filter(hasVisitors);
+    const [openStage, setOpenStage] = useState<string | null>(null);
+    const openStageDetail = data.stages.find(
+        stage => stage.label === openStage && stage.tasks.length > 0,
+    );
 
     return (
         <MotionConfig reducedMotion="user">
@@ -164,6 +168,16 @@ export default function PortalProjectTracker({
                                             </div>
                                         )}
 
+                                        <button
+                                            type="button"
+                                            onClick={() => setOpenStage(
+                                                openStage === stage.label ? null : stage.label,
+                                            )}
+                                            disabled={stage.tasks.length === 0}
+                                            aria-expanded={openStage === stage.label}
+                                            aria-controls="stage-detail"
+                                            className="w-full rounded-xl px-1 py-1 text-center transition enabled:hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--project-accent)] disabled:cursor-default"
+                                        >
                                         <motion.div
                                             initial={{ scale: 0.88, opacity: 0 }}
                                             animate={{ scale: 1, opacity: 1 }}
@@ -208,17 +222,83 @@ export default function PortalProjectTracker({
                                             style={{ color: isCurrent ? "var(--project-accent)" : "#94a3b8" }}
                                         >
                                             {isCurrent
-                                                ? `${stage.pct}% now`
+                                                ? "In progress"
                                                 : isComplete
                                                     ? "Done"
                                                     : index === currentIndex + 1
                                                         ? "Next"
                                                         : "Upcoming"}
                                         </p>
+                                        {/* Second level: the real schedule underneath the stage. */}
+                                        {isCurrent && stage.activeTaskName ? (
+                                            <p className="mt-1 text-[0.66rem] font-semibold leading-4 text-slate-700">
+                                                {stage.activeTaskName}
+                                            </p>
+                                        ) : stage.taskCount > 0 ? (
+                                            <p className="mt-1 text-[0.66rem] leading-4 text-slate-500">
+                                                {isComplete
+                                                    ? `${stage.taskCount} ${stage.taskCount === 1 ? "task" : "tasks"}`
+                                                    : `${stage.doneCount} of ${stage.taskCount} done`}
+                                            </p>
+                                        ) : null}
+                                        </button>
                                     </li>
                                 );
                             })}
                         </ol>
+                    </div>
+
+                    <div id="stage-detail" aria-live="polite">
+                        {openStageDetail && (
+                            <motion.div
+                                initial={{ opacity: 0, height: 0 }}
+                                animate={{ opacity: 1, height: "auto" }}
+                                transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+                                className="overflow-hidden"
+                            >
+                                <div className="mt-2 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+                                    <p className="text-[0.68rem] font-extrabold uppercase tracking-[0.16em] text-slate-500">
+                                        {openStageDetail.label}
+                                    </p>
+                                    <ul className="mt-2.5 space-y-2">
+                                        {openStageDetail.tasks.map(task => (
+                                            <li
+                                                key={task.name}
+                                                className="flex items-start gap-2.5 text-sm leading-5"
+                                            >
+                                                <span
+                                                    aria-hidden="true"
+                                                    className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border"
+                                                    style={{
+                                                        borderColor: task.done || task.active
+                                                            ? "var(--project-accent)"
+                                                            : "#cbd5e1",
+                                                        backgroundColor: task.done
+                                                            ? "var(--project-accent)"
+                                                            : "transparent",
+                                                    }}
+                                                >
+                                                    {task.done && (
+                                                        <Check className="h-2.5 w-2.5 text-white" strokeWidth={4} />
+                                                    )}
+                                                </span>
+                                                <span className={task.done ? "text-slate-500" : "text-slate-800"}>
+                                                    {task.name}
+                                                    {task.active && (
+                                                        <span
+                                                            className="ml-2 rounded-full px-2 py-0.5 text-[0.6rem] font-bold uppercase tracking-wide text-white"
+                                                            style={{ backgroundColor: "var(--project-accent)" }}
+                                                        >
+                                                            now
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            </motion.div>
+                        )}
                     </div>
                 </div>
             </motion.section>

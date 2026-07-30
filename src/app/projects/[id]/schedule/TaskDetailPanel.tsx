@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Task, PunchItem, Comment, TeamMember, Subcontractor, EstimateItemSummary } from "./schedule-types";
 import { STATUS_OPTIONS, getInitials, formatCurrency } from "./schedule-utils";
+import { CLIENT_STAGE_LABELS } from "@/lib/client-stages";
 import DependencyPicker from "./DependencyPicker";
 import ColorPicker from "./ColorPicker";
 import { TaskMaterialsSection } from "./TaskMaterialsSection";
@@ -22,6 +23,7 @@ export type TaskDetailPanelProps = {
     onStatusChange: (taskId: string, status: string, blockedReason?: string) => void;
     onNameChange: (taskId: string, name: string) => void;
     onDoneWhenChange: (taskId: string, doneWhen: string | null) => void;
+    onClientStageChange: (taskId: string, clientStage: string | null) => void;
     onDateChange: (taskId: string, field: "startDate" | "endDate", value: string) => void;
     onEstimatedHoursChange: (taskId: string, hours: number) => void;
     onColorChange: (taskId: string, color: string) => void;
@@ -61,7 +63,7 @@ export type TaskDetailPanelProps = {
 
 export default function TaskDetailPanel({
     task, onClose, panelTab, setPanelTab,
-    onStatusChange, onNameChange, onDoneWhenChange, onDateChange, onEstimatedHoursChange, onColorChange, onDelete,
+    onStatusChange, onNameChange, onDoneWhenChange, onClientStageChange, onDateChange, onEstimatedHoursChange, onColorChange, onDelete,
     estimateItems, onLinkEstimateItem, onUnlinkEstimateItem, onFetchEstimateItems,
     teamMembers, subcontractors, onAssign, onUnassign, onSetLead, onAssignSub, onUnassignSub,
     punchItems, onAddPunch, onTogglePunch, onDeletePunch, onAiPunchlist, isAiPunching,
@@ -256,6 +258,25 @@ export default function TaskDetailPanel({
                                         className="hui-input text-sm mt-1.5 w-full"
                                         placeholder="The field result that marks this done"
                                     />
+                                </div>
+                                <div>
+                                    <label className={SECTION_LABEL} htmlFor={`client-stage-${task.id}`}>
+                                        Client stage
+                                    </label>
+                                    <select
+                                        id={`client-stage-${task.id}`}
+                                        value={task.clientStage ?? ""}
+                                        onChange={e => onClientStageChange(task.id, e.target.value || null)}
+                                        className="hui-input text-sm mt-1.5 w-full"
+                                    >
+                                        <option value="">Auto — match by task name</option>
+                                        {CLIENT_STAGE_LABELS.map(label => (
+                                            <option key={label} value={label}>{label}</option>
+                                        ))}
+                                    </select>
+                                    <p className="mt-1 text-xs text-hui-textMuted">
+                                        Which stage this task sits under on the client&apos;s project tracker.
+                                    </p>
                                 </div>
                                 <div>
                                     <label className={SECTION_LABEL}>Status</label>

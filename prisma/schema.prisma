@@ -941,6 +941,10 @@ model ScheduleTask {
   type           String         @default("task") // "task" | "milestone" | "appointment"
   doneWhen       String?        // Completion criteria shown to the field crew
   blockedReason  String?        // Required explanation while status is "Blocked"
+  // Client-facing stage on the portal tracker rail. Null = derive from the task
+  // name/cost code (see lib/portal-tracker.ts). Set explicitly to override when
+  // keyword matching guesses wrong — must be one of CLIENT_STAGES[].label.
+  clientStage    String?
   scheduledTime  String?        // "HH:MM" in America/Los_Angeles; appointment tasks only
   confirmationStatus String?    // "planned" | "requested" | "confirmed"; appointment tasks only
   estimateItemId String?        @unique

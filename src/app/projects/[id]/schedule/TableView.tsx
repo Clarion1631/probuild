@@ -751,6 +751,7 @@ export default function TableView({ projectId, projectName, tasks, setTasks, est
                         onStatusChange={actions.handleStatusChange}
                         onNameChange={actions.handleNameSave}
                         onDoneWhenChange={actions.handleDoneWhenChange}
+                        onClientStageChange={actions.handleClientStageChange}
                         onDateChange={actions.handleDateChange}
                         onEstimatedHoursChange={actions.handleEstimatedHoursSave}
                         onColorChange={actions.handleColorChange}

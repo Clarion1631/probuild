@@ -549,6 +549,7 @@ export default function GanttChart({ projectId, projectName, tasks, setTasks, es
                         onStatusChange={actions.handleStatusChange}
                         onNameChange={actions.handleNameSave}
                         onDoneWhenChange={actions.handleDoneWhenChange}
+                        onClientStageChange={actions.handleClientStageChange}
                         onDateChange={actions.handleDateChange}
                         onEstimatedHoursChange={actions.handleEstimatedHoursSave}
                         onColorChange={actions.handleColorChange}
