@@ -5,6 +5,7 @@ import {
   normalizeSelectionItemNote,
   SELECTION_ITEM_NOTE_MAX_LENGTH,
 } from "../src/lib/selection-item-notes";
+import { persistSelectionItemNote } from "../src/lib/selection-item-note-persistence-core";
 
 assert.equal(SELECTION_ITEM_NOTE_MAX_LENGTH, 2000);
 assert.equal(normalizeSelectionItemNote("  Master bath wall  "), "Master bath wall");
@@ -18,6 +19,19 @@ const actions = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
 const persistence = readFileSync(
   join(process.cwd(), "src/lib/selection-item-note-persistence.ts"),
   "utf8",
+);
+const persistenceCore = readFileSync(
+  join(process.cwd(), "src/lib/selection-item-note-persistence-core.ts"),
+  "utf8",
+);
+assert.match(
+  actions,
+  /import \{ persistSelectionItemNote \} from "\.\/selection-item-note-persistence";/,
+);
+assert.match(persistence, /import "server-only";/);
+assert.match(
+  persistence,
+  /export \{ persistSelectionItemNote \} from "\.\/selection-item-note-persistence-core";/,
 );
 const actorStart = actions.indexOf("async function assertDecisionActorAccess");
 assert.ok(actorStart >= 0, "assertDecisionActorAccess must remain available");
@@ -39,8 +53,8 @@ assert.ok(
 assert.ok(
   actionBody.includes("revalidatePath(`/portal/projects/${projectId}/selections`)"),
 );
-const authorizeIndex = persistence.indexOf("await dependencies.assertAccess(item.projectId)");
-const updateIndex = persistence.indexOf("await dependencies.updateNote");
+const authorizeIndex = persistenceCore.indexOf("await dependencies.assertAccess(item.projectId)");
+const updateIndex = persistenceCore.indexOf("await dependencies.updateNote");
 assert.ok(
   authorizeIndex >= 0 && updateIndex > authorizeIndex,
   "authorization must complete before the note write",
@@ -59,4 +73,32 @@ assert.match(
   /clientNote:\s*normalizeSelectionItemNote\(data\.clientNote\s*\?\?\s*""\)/,
 );
 
-console.log("selection item note contract verified");
+async function verifyRejectingAccessPreventsWrite(): Promise<void> {
+  let updateCalls = 0;
+
+  await assert.rejects(
+    persistSelectionItemNote("item-1", "  Master bath wall  ", {
+      findItem: async () => ({
+        id: "item-1",
+        projectId: "project-1",
+        deletedAt: null,
+      }),
+      assertAccess: async () => {
+        throw new Error("Forbidden");
+      },
+      updateNote: async () => {
+        updateCalls += 1;
+      },
+      revalidate: () => undefined,
+    }),
+    /Forbidden/,
+  );
+  assert.equal(updateCalls, 0, "rejecting access must prevent note writes");
+}
+
+verifyRejectingAccessPreventsWrite()
+  .then(() => console.log("selection item note contract verified"))
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
