@@ -278,6 +278,8 @@ test.describe.serial("reconcileMilestoneToQbo", () => {
                     memo: "QBO UI materials",
                 }],
                 skipped: [],
+                removed: [],
+                deactivations: [],
             }),
             listProjects: async () => [{
                 ...project,
@@ -288,6 +290,7 @@ test.describe.serial("reconcileMilestoneToQbo", () => {
                     prisma as unknown as QboExpensePersistenceClient,
                     write,
                 ),
+            deactivateExpense: async () => "unchanged",
             now: () => new Date("2026-07-29T12:00:00.000Z"),
         };
 
@@ -295,7 +298,7 @@ test.describe.serial("reconcileMilestoneToQbo", () => {
             { since: new Date("2026-01-01T00:00:00.000Z") },
             dependencies,
         );
-        expect(result).toEqual({ imported: 1, updated: 0, skipped: [] });
+        expect(result).toEqual({ imported: 1, updated: 0, removed: 0, skipped: [] });
 
         await page.goto(`/projects/${PFX}-project/time-expenses`);
         await page.getByRole("button", { name: /Expenses \(/ }).click();
