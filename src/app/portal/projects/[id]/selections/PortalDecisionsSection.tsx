@@ -25,6 +25,7 @@ import {
 import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
 import ClipperDragLink from "@/components/ClipperDragLink";
+import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
 import AddItemModal from "./AddItemModal";
 import {
     ImageOff,
@@ -283,6 +284,7 @@ function CandidateCard({
 
     return (
         <div
+            data-testid={`selection-item-${item.id}`}
             className={`relative rounded-lg border p-3 group ${
                 isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"
             }`}
@@ -311,9 +313,12 @@ function CandidateCard({
                 )}
             </div>
 
-            {item.clientNote && (
-                <p className="text-xs text-hui-textMuted mt-1 line-clamp-2">&quot;{item.clientNote}&quot;</p>
-            )}
+            <SelectionItemNote
+                itemId={item.id}
+                note={item.clientNote}
+                onSaved={onChanged}
+                className="mt-1"
+            />
 
             {isHttpUrl(item.vendorUrl) && (
                 <a
