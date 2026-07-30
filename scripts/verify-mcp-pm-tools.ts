@@ -89,7 +89,7 @@ async function main() {
         "../src/lib/daily-log-core.ts",
         "../src/lib/mcp-pm-tools.ts",
         "./seed-richard-ai-user.mjs",
-        "./backfill-standard-folders.mjs",
+        "./backfill-standard-folders.ts",
         "./apply-mcp-pm-schema.mjs",
     ];
     for (const path of expectedFiles) {
@@ -107,7 +107,7 @@ async function main() {
     const confirmationSource = source("../src/lib/mcp-schedule-tools.ts");
     const applySource = source("./apply-mcp-pm-schema.mjs");
     const seedSource = source("./seed-richard-ai-user.mjs");
-    const backfillSource = source("./backfill-standard-folders.mjs");
+    const backfillSource = source("./backfill-standard-folders.ts");
 
     // Static registry, security, migration, and no-Phase-2 contracts.
     assert.match(routeSource, /MCP_SECRET_RICHARD/);
@@ -138,7 +138,11 @@ async function main() {
     assert.match(applySource, /ADD COLUMN IF NOT EXISTS "createdById"/);
     assert.match(seedSource, /richard-ai@goldentouchremodeling\.com/);
     assert.match(seedSource, /Richard's AI/);
-    assert.match(seedSource, /ACTIVATED/);
+    // The attribution row must be a DISABLED service identity, never a live login.
+    // auth.ts admits any existing user that is not DISABLED, so an ACTIVATED row is
+    // a staff session waiting for someone to create the matching Google identity.
+    assert.match(seedSource, /status:\s*"DISABLED"/);
+    assert.doesNotMatch(seedSource, /status:\s*"ACTIVATED"/);
     assert.doesNotMatch(seedSource, /FIELD_CREW/);
     assert.match(backfillSource, /--write/);
     assert.match(backfillSource, /dry.run/i);
@@ -147,6 +151,16 @@ async function main() {
     assert.match(fileCoreSource, /visibility\s*\?\?\s*"team"/);
     assert.match(dailyCoreSource, /createdById:\s*actorUserId/);
     assert.match(actionSource, /createDailyLogCore/);
+    // Customer-facing sends are "use server" exports, i.e. remotely invokable
+    // endpoints. Contract send previously had NO authorization at all. Both sends
+    // must gate on the shared helper, and the audit actor must be DERIVED from
+    // whatever authenticated the call — never accepted as a parameter, or a caller
+    // can authenticate as itself and log the action as somebody else.
+    assert.match(actionSource, /assertContractSendPermission/);
+    assert.match(actionSource, /const sendActor = await assertContractSendPermission\(mcpSecret\)/);
+    assert.match(actionSource, /const sendActor = await assertEstimateSendPermission\(mcpSecret\)/);
+    assert.doesNotMatch(actionSource, /mcpActorLabel/);
+    assert.match(actionSource, /actorName: sendActor\.name/);
     assert.match(confirmationSource, /actorLabel/);
     assert.match(confirmationSource, /consumedAt:\s*null/);
     assert.match(confirmationSource, /expiresAt:\s*\{\s*gt:/);

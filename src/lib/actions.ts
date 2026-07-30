@@ -4106,7 +4106,7 @@ async function assertActiveStaff(): Promise<any> {
     throw new Error("Unauthorized");
 }
 
-async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings") {
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
@@ -4217,15 +4217,52 @@ async function assertInvoicePortalAccess(): Promise<string | null> {
     return resolveSessionClientId();
 }
 
-async function assertEstimateSendPermission(mcpSecret?: string) {
+export type SendActor = { type: "SYSTEM" | "TEAM"; name: string };
+
+/**
+ * Authorize a customer-facing document send, and return the actor PROVEN by
+ * whatever authenticated the call.
+ *
+ * The actor must never be its own argument. This module is "use server", so
+ * every parameter is attacker-controlled: a caller could authenticate as itself
+ * and then label the audit trail as somebody else. Deriving the label from the
+ * secret that actually matched makes that impossible.
+ */
+async function assertDocumentSendPermission(
+    mcpSecret: string | undefined,
+    permission: "estimates" | "contracts",
+): Promise<SendActor> {
     if (mcpSecret) {
         const supplied = createHash("sha256").update(mcpSecret).digest();
-        for (const configuredSecret of [process.env.MCP_SECRET, process.env.MCP_SECRET_RICHARD]) {
+        const candidates: Array<[string, string | undefined]> = [
+            ["justin-ai", process.env.MCP_SECRET],
+            ["richard-ai", process.env.MCP_SECRET_RICHARD],
+        ];
+        for (const [label, configuredSecret] of candidates) {
             const configured = createHash("sha256").update(configuredSecret ?? "").digest();
-            if (configuredSecret && timingSafeEqual(supplied, configured)) return;
+            if (configuredSecret && timingSafeEqual(supplied, configured)) {
+                return { type: "SYSTEM", name: "SYSTEM:" + label };
+            }
         }
+        // A supplied-but-wrong secret must NOT fall through to the session path:
+        // that would let a bad machine token ride in on a stray staff cookie.
+        throw new Error("Unauthorized");
     }
-    await assertEstimatePermission();
+    const user = await assertStaffPermission(permission);
+    return { type: "TEAM", name: user?.name || user?.email || "Team" };
+}
+
+async function assertEstimateSendPermission(mcpSecret?: string): Promise<SendActor> {
+    return assertDocumentSendPermission(mcpSecret, "estimates");
+}
+
+/**
+ * Contract sends had NO authorization at all: the Server Action went straight to
+ * reading and mutating the contract, and Server Actions are remotely invokable.
+ * Mirrors the estimate path so both are gated the same way.
+ */
+async function assertContractSendPermission(mcpSecret?: string): Promise<SendActor> {
+    return assertDocumentSendPermission(mcpSecret, "contracts");
 }
 
 export async function addInvoiceMilestone(
@@ -5093,9 +5130,9 @@ export async function sendEstimateToClient(
     customMessage?: string,
     capturedPdfUrl?: string,
     mcpSecret?: string,
-    mcpActorLabel?: "justin-ai" | "richard-ai",
 ): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
-    await assertEstimateSendPermission(mcpSecret);
+    // The actor is DERIVED from what authenticated this call, never passed in.
+    const sendActor = await assertEstimateSendPermission(mcpSecret);
     try {
     // --- Server-side CC validation ---
     const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -5391,14 +5428,12 @@ export async function sendEstimateToClient(
                 }).catch(() => {});
             }
         }
-        const session = await getServerSession(authOptions).catch(() => null);
         await logActivity({
             projectId: estimate.project?.id,
             leadId: estimate.lead?.id,
-            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
-            actorName: mcpActorLabel
-                ? `SYSTEM:${mcpActorLabel}`
-                : session?.user?.name || session?.user?.email || "Team",
+            // Trusted actor from assertEstimateSendPermission, not a caller argument.
+            actorType: sendActor.type,
+            actorName: sendActor.name,
             action: "sent_estimate",
             entityType: "estimate",
             entityId: estimateId,
@@ -5917,8 +5952,10 @@ export async function sendContractToClient(
     contractId: string,
     ccOverride?: string[],
     expectedFingerprint?: string,
-    mcpActorLabel?: "justin-ai" | "richard-ai",
+    mcpSecret?: string,
 ) {
+    // The actor is DERIVED from what authenticated this call, never passed in.
+    const sendActor = await assertContractSendPermission(mcpSecret);
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -6052,8 +6089,8 @@ export async function sendContractToClient(
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
-            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
-            actorName: mcpActorLabel ? `SYSTEM:${mcpActorLabel}` : companyName,
+            actorType: sendActor.type,
+            actorName: sendActor.name,
             action: "sent_contract",
             entityType: "contract",
             entityId: contractId,

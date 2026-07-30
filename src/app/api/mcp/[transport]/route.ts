@@ -109,6 +109,13 @@ type RouteMcpActor = {
     resolveActorUserId: () => Promise<string | null>;
 };
 
+// The secret for the key that authenticated THIS request. Passing it to a send
+// action is what proves the actor server-side — the action derives the audit
+// label from whichever secret matches, so it can never be spoofed by an argument.
+function secretForActor(actorLabel: McpActorLabel): string | undefined {
+    return actorLabel === "richard-ai" ? process.env.MCP_SECRET_RICHARD : process.env.MCP_SECRET;
+}
+
 function createRouteMcpActor(actorLabel: McpActorLabel): RouteMcpActor {
     let actorUserId: Promise<string | null> | null = null;
     return {
@@ -689,10 +696,7 @@ function createHandler(actor: RouteMcpActor) {
                     undefined,
                     customMessage,
                     undefined,
-                    actor.actorLabel === "richard-ai"
-                        ? process.env.MCP_SECRET_RICHARD
-                        : process.env.MCP_SECRET,
-                    actor.actorLabel,
+                    secretForActor(actor.actorLabel),
                 );
                 if (!result.success) return { ...textResult({ error: result.error }), isError: true };
                 return textResult({ ...result, note: "The customer reviews and signs via the portal link; signing auto-creates the invoice in ProBuild." });
@@ -1517,7 +1521,7 @@ function createHandler(actor: RouteMcpActor) {
                 try {
                     // Pass the approved snapshot's fingerprint — the send action re-reads the
                     // contract and refuses if the text no longer matches what the user confirmed.
-                    const result = await sendContractToClient(contractId, undefined, fingerprint, actor.actorLabel);
+                    const result = await sendContractToClient(contractId, undefined, fingerprint, secretForActor(actor.actorLabel));
                     return textResult({ ...result, note: "The client reviews and signs via the emailed portal link. Track status with list_contracts / get_contract." });
                 } catch (e) {
                     return { ...textResult({ error: e instanceof Error ? e.message : "Send failed" }), isError: true };
