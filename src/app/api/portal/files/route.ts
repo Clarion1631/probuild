@@ -91,14 +91,22 @@ export async function GET(req: NextRequest) {
         // Files: at the root, only explicit "shared". Inside a folder (which we've
         // already verified is shared above), include both explicit "shared" AND
         // null-visibility files (they inherit from the parent).
+        // Both constraints go under AND. Spreading two `OR` keys into one object
+        // silently dropped the first: with a leadId AND an open folder, the owner
+        // scope vanished and the query became "any file in this folder", so a file
+        // belonging to another project but linked to this project's shared folder
+        // was served to this client. The folder's own project is already checked by
+        // isAncestorChainShared above — this is the check on the FILE's project.
         const fileWhere: any = {
             folderId: folderId || null,
-            ...(leadId
-                ? { OR: [{ projectId }, { leadId }] }
-                : { projectId }),
-            ...(folderId
-                ? { OR: [{ visibility: "shared" }, { visibility: null }] }
-                : { visibility: "shared" }),
+            AND: [
+                { OR: leadId ? [{ projectId }, { leadId }] : [{ projectId }] },
+                {
+                    OR: folderId
+                        ? [{ visibility: "shared" }, { visibility: null }]
+                        : [{ visibility: "shared" }],
+                },
+            ],
         };
         const filesRaw = await prisma.projectFile.findMany({
             where: fileWhere,
