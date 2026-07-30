@@ -17,6 +17,7 @@ import {
     importBoardPicksAsDecisions,
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
+import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
 import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import {
@@ -99,7 +100,13 @@ function statusChip(status: string): { label: string; className: string } {
     }
 }
 
-function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
+function ApprovedItemsTable({
+    decisions,
+    onChanged,
+}: {
+    decisions: DecisionData[];
+    onChanged: () => void;
+}) {
     const approved = decisions
         .filter((d) => d.status === "Decided" && d.chosenItemId)
         .map((d) => ({ decision: d, item: d.candidates.find((c) => c.id === d.chosenItemId) }))
@@ -123,18 +130,30 @@ function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
                             <tr className="border-b border-hui-border bg-slate-50">
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Decision</th>
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Chosen item</th>
+                                <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Notes</th>
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Vendor</th>
                                 <th className="text-right px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">List price</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {approved.map(({ decision, item }) => (
-                                <tr key={decision.id} className="hover:bg-slate-50 transition">
+                                <tr
+                                    key={decision.id}
+                                    data-testid={`approved-item-${item.id}`}
+                                    className="hover:bg-slate-50 transition"
+                                >
                                     <td className="px-4 py-2.5 font-medium text-hui-textMain">
                                         {decision.name}
                                         {decision.area && <span className="text-hui-textMuted font-normal"> · {decision.area}</span>}
                                     </td>
                                     <td className="px-4 py-2.5 text-hui-textMain">{item.name}</td>
+                                    <td className="px-4 py-2.5 min-w-[220px]">
+                                        <SelectionItemNote
+                                            itemId={item.id}
+                                            note={item.clientNote}
+                                            onSaved={onChanged}
+                                        />
+                                    </td>
                                     <td className="px-4 py-2.5">
                                         {isHttpUrl(item.vendorUrl) ? (
                                             <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1">
@@ -158,10 +177,21 @@ function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
     );
 }
 
-function CandidateCard({ item, isChosen }: { item: Candidate; isChosen: boolean }) {
+function CandidateCard({
+    item,
+    isChosen,
+    onChanged,
+}: {
+    item: Candidate;
+    isChosen: boolean;
+    onChanged: () => void;
+}) {
     const price = formatPrice(item.price);
     return (
-        <div className={`rounded-lg border p-3 ${isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"}`}>
+        <div
+            data-testid={`selection-item-${item.id}`}
+            className={`rounded-lg border p-3 ${isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"}`}
+        >
             <div className="w-full h-28 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden">
                 {isHttpUrl(item.imageUrl) ? (
                     <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" />
@@ -183,7 +213,12 @@ function CandidateCard({ item, isChosen }: { item: Candidate; isChosen: boolean 
                     Vendor list price: <span className="font-semibold text-hui-textMain">{price}</span>
                 </p>
             )}
-            {item.clientNote && <p className="text-xs text-hui-textMuted mt-1 line-clamp-2">Client note: &quot;{item.clientNote}&quot;</p>}
+            <SelectionItemNote
+                itemId={item.id}
+                note={item.clientNote}
+                onSaved={onChanged}
+                className="mt-1"
+            />
             {isHttpUrl(item.vendorUrl) && (
                 <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1 mt-1.5">
                     <ExternalLink className="w-3 h-3" />
@@ -333,7 +368,7 @@ function DecisionCard({
                             <h3 className="text-lg font-bold text-hui-textMain">{decision.name}</h3>
                             {decision.area && <span className="text-xs text-hui-textMuted">· {decision.area}</span>}
                             <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${chip.className}`}>{chip.label}</span>
-                            <button onClick={() => setRenaming(true)} title="Rename" aria-label="Rename decision" className="text-slate-400 hover:text-hui-textMain transition">
+                            <button onClick={() => setRenaming(true)} title="Rename" aria-label="Edit decision title" className="text-slate-400 hover:text-hui-textMain transition">
                                 <Pencil className="w-3.5 h-3.5" />
                             </button>
                         </div>
@@ -371,7 +406,7 @@ function DecisionCard({
             ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     {active.map((item) => (
-                        <CandidateCard key={item.id} item={item} isChosen={decision.chosenItemId === item.id} />
+                        <CandidateCard key={item.id} item={item} isChosen={decision.chosenItemId === item.id} onChanged={onChanged} />
                     ))}
                 </div>
             )}
@@ -566,7 +601,7 @@ export default function TeamDecisionsSection({
                 </div>
             </div>
 
-            <ApprovedItemsTable decisions={decisions} />
+            <ApprovedItemsTable decisions={decisions} onChanged={refresh} />
 
             {/* Anything the client clipped but hasn't filed yet. Sits above the
                 decisions because it's the newest input and the only part that
@@ -579,7 +614,7 @@ export default function TeamDecisionsSection({
                     </p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                         {activeUnsorted.map((item) => (
-                            <CandidateCard key={item.id} item={item} isChosen={false} />
+                            <CandidateCard key={item.id} item={item} isChosen={false} onChanged={refresh} />
                         ))}
                     </div>
                 </div>

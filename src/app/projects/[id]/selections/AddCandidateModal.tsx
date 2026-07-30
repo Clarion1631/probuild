@@ -7,6 +7,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { addTeamCandidate } from "@/lib/actions";
+import { SELECTION_ITEM_NOTE_MAX_LENGTH } from "@/lib/selection-item-notes";
 
 export default function AddCandidateModal({
     decisionId,
@@ -26,15 +27,21 @@ export default function AddCandidateModal({
     const [imageUrl, setImageUrl] = useState("");
     const [vendorUrl, setVendorUrl] = useState("");
     const [price, setPrice] = useState("");
+    const [clientNote, setClientNote] = useState("");
     const [submitting, setSubmitting] = useState(false);
 
-    function handleClose() {
-        if (submitting) return;
+    function reset() {
         setName("");
         setDescription("");
         setImageUrl("");
         setVendorUrl("");
         setPrice("");
+        setClientNote("");
+    }
+
+    function handleClose() {
+        if (submitting) return;
+        reset();
         onClose();
     }
 
@@ -51,9 +58,11 @@ export default function AddCandidateModal({
                 imageUrl: imageUrl.trim() || undefined,
                 vendorUrl: vendorUrl.trim() || undefined,
                 price: price ? parseFloat(price) : undefined,
+                clientNote: clientNote.trim() || undefined,
             });
             toast.success("Added as a candidate");
-            handleClose();
+            reset();
+            onClose();
             onAdded();
         } catch (e: any) {
             toast.error(e.message || "Couldn't add that candidate.");
@@ -73,8 +82,8 @@ export default function AddCandidateModal({
                 </div>
                 <div className="p-6 space-y-4">
                     <div>
-                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Name</label>
-                        <input type="text" className="hui-input w-full mt-1" value={name} onChange={(e) => setName(e.target.value)} disabled={submitting} autoFocus />
+                        <label htmlFor="team-candidate-name" className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Name</label>
+                        <input id="team-candidate-name" type="text" className="hui-input w-full mt-1" value={name} onChange={(e) => setName(e.target.value)} disabled={submitting} autoFocus />
                     </div>
                     <div>
                         <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Vendor link</label>
@@ -93,6 +102,23 @@ export default function AddCandidateModal({
                     <div>
                         <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Description <span className="normal-case font-normal">(optional)</span></label>
                         <textarea className="hui-input w-full mt-1" rows={2} value={description} onChange={(e) => setDescription(e.target.value)} disabled={submitting} />
+                    </div>
+                    <div>
+                        <label
+                            htmlFor="team-candidate-note"
+                            className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider"
+                        >
+                            Note <span className="normal-case font-normal">(optional, client-visible)</span>
+                        </label>
+                        <textarea
+                            id="team-candidate-note"
+                            className="hui-input w-full mt-1"
+                            rows={3}
+                            value={clientNote}
+                            onChange={(event) => setClientNote(event.target.value)}
+                            maxLength={SELECTION_ITEM_NOTE_MAX_LENGTH}
+                            disabled={submitting}
+                        />
                     </div>
                 </div>
                 <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50 rounded-b-xl">
