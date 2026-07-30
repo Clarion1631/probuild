@@ -194,6 +194,87 @@ test.describe("Project files — move into folders", () => {
         await request.dispose();
     });
 
+    test("refuses a visibility-only change that un-shares a client-visible file", async ({ playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+        const res = await request.post("/api/files/register", {
+            data: {
+                files: [{
+                    name: `${RUN}-visonly.pdf`,
+                    url: `https://example.invalid/${RUN}-visonly.pdf`,
+                    projectId: PROJECT_ID,
+                    size: 1024,
+                    mimeType: "application/pdf",
+                    visibility: "shared",
+                }],
+            },
+        });
+        expect(res.ok()).toBeTruthy();
+        const fileId: string = (await res.json()).files[0].id;
+        createdFileIds.add(fileId);
+
+        // No folderId at all. The guard used to be gated on folderId being present,
+        // so this PATCH walked straight past it and hid the file from the client.
+        const blocked = await request.patch("/api/files", { data: { fileId, visibility: "team" } });
+        expect(blocked.status(), "a visibility-only un-share must be refused").toBe(409);
+        expect(await blocked.text()).toContain("would remove their access");
+
+        const allowed = await request.patch("/api/files", {
+            data: { fileId, visibility: "team", allowClientVisibilityLoss: true },
+        });
+        expect(allowed.ok(), `deliberate un-share must be allowed: ${await allowed.text()}`).toBeTruthy();
+        await request.dispose();
+    });
+
+    test("refuses un-sharing a folder that the client can currently see files in", async ({ playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+
+        // A shared folder holding a client-visible file. Flipping the FOLDER to team
+        // hides the file even though the file itself stays "shared", because the
+        // portal requires the whole ancestor chain to be shared — and the folder
+        // endpoint had no guard at all, so this was the way around the file one.
+        const mk = await request.post("/api/files/folders", {
+            data: { name: `${RUN}-shared-folder`, projectId: PROJECT_ID, visibility: "shared" },
+        });
+        expect(mk.ok(), `folder seed failed: ${await mk.text()}`).toBeTruthy();
+        const sharedFolderId: string = (await mk.json()).id;
+
+        const res = await request.post("/api/files/register", {
+            data: {
+                files: [{
+                    name: `${RUN}-infolder.pdf`,
+                    url: `https://example.invalid/${RUN}-infolder.pdf`,
+                    projectId: PROJECT_ID,
+                    folderId: sharedFolderId,
+                    size: 1024,
+                    mimeType: "application/pdf",
+                    visibility: "shared",
+                }],
+            },
+        });
+        expect(res.ok()).toBeTruthy();
+        createdFileIds.add((await res.json()).files[0].id);
+
+        const blocked = await request.patch("/api/files/folders", {
+            data: { id: sharedFolderId, visibility: "team" },
+        });
+        expect(blocked.status(), "un-sharing a folder with client-visible files must be refused").toBe(409);
+        expect(await blocked.text()).toContain("would remove their access");
+
+        const allowed = await request.patch("/api/files/folders", {
+            data: { id: sharedFolderId, visibility: "team", allowClientVisibilityLoss: true },
+        });
+        expect(allowed.ok(), `deliberate folder un-share must be allowed: ${await allowed.text()}`).toBeTruthy();
+
+        // Renaming must stay unaffected — the guard only fires on a visibility drop.
+        const renamed = await request.patch("/api/files/folders", {
+            data: { id: sharedFolderId, name: `${RUN}-renamed-folder` },
+        });
+        expect(renamed.ok(), `rename must not trip the guard: ${await renamed.text()}`).toBeTruthy();
+
+        await request.delete(`/api/files?folderId=${sharedFolderId}`).catch(() => {});
+        await request.dispose();
+    });
+
     test("declines an OS file drag so upload still works", async ({ page, playwright, baseURL, storageState }) => {
         const request = await ctx(playwright, baseURL, storageState);
         const name = `${RUN}-osdrag.pdf`;
