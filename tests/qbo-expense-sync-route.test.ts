@@ -9,14 +9,14 @@ const TOKENS = {
 };
 
 function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = {}) {
-    const calls: Array<{ since: Date; mode: "incremental" | "backfill"; tokens: typeof TOKENS }> = [];
+    const calls: Array<{ since: Date; until?: Date; mode: "incremental" | "backfill"; tokens: typeof TOKENS }> = [];
     const handlers = createQboExpenseSyncHandlers({
         getIngestSecret: () => "ingest-secret",
         getCronSecret: () => "cron-secret",
         isCronEnabled: () => options.cronEnabled ?? true,
         getFreshTokens: async () => TOKENS,
-        syncExpenses: async ({ since, mode }, { tokens }) => {
-            calls.push({ since, mode, tokens });
+        syncExpenses: async ({ since, until, mode }, { tokens }) => {
+            calls.push({ since, until, mode, tokens });
             if (options.syncError) throw options.syncError;
             return {
                 imported: 2,
@@ -109,7 +109,44 @@ test("POST runs a date-bounded historical backfill", async () => {
     assert.equal(body.mode, "backfill");
     assert.equal(body.since, "2024-01-15");
     assert.equal(calls[0].since.toISOString(), "2024-01-15T00:00:00.000Z");
+    assert.equal(calls[0].until, undefined);
     assert.equal(calls[0].mode, "backfill");
+});
+
+test("POST backfill accepts an inclusive until bound for chunked runs", async () => {
+    const { POST, calls } = createHandlers();
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        method: "POST",
+        body: JSON.stringify({ mode: "backfill", since: "2026-01-01", until: "2026-01-31" }),
+        headers: {
+            "content-type": "application/json",
+            "x-ingest-key": "ingest-secret",
+        },
+    }));
+
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.since, "2026-01-01");
+    assert.equal(body.until, "2026-01-31");
+    assert.equal(calls[0].since.toISOString(), "2026-01-01T00:00:00.000Z");
+    assert.equal(calls[0].until?.toISOString(), "2026-01-31T00:00:00.000Z");
+});
+
+test("POST backfill rejects a malformed until and an until before since", async () => {
+    const { POST, calls } = createHandlers();
+    for (const until of ["01/31/2026", "2025-12-31"]) {
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+            method: "POST",
+            body: JSON.stringify({ mode: "backfill", since: "2026-01-01", until }),
+            headers: {
+                "content-type": "application/json",
+                "x-ingest-key": "ingest-secret",
+            },
+        }));
+        assert.equal(response.status, 400);
+        assert.deepEqual(await response.json(), { ok: false, reason: "invalid-until" });
+    }
+    assert.equal(calls.length, 0);
 });
 
 test("GET requires Vercel cron authorization and runs incremental mode", async () => {

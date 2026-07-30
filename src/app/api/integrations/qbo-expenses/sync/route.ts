@@ -21,7 +21,7 @@ export interface QboExpenseSyncHandlerDependencies {
     isCronEnabled(): boolean;
     getFreshTokens(): Promise<QBTokens>;
     syncExpenses(
-        options: { since: Date; mode: SyncMode },
+        options: { since: Date; until?: Date; mode: SyncMode },
         runtime: { tokens: QBTokens },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
@@ -56,14 +56,15 @@ function incrementalSince(now: Date, lookbackDays: number): Date {
 export function createQboExpenseSyncHandlers(
     dependencies: QboExpenseSyncHandlerDependencies,
 ) {
-    async function run(mode: SyncMode, since: Date) {
+    async function run(mode: SyncMode, since: Date, until?: Date) {
         try {
             const tokens = await dependencies.getFreshTokens();
-            const result = await dependencies.syncExpenses({ since, mode }, { tokens });
+            const result = await dependencies.syncExpenses({ since, until, mode }, { tokens });
             return NextResponse.json({
                 ok: true,
                 mode,
                 since: since.toISOString().slice(0, 10),
+                ...(until ? { until: until.toISOString().slice(0, 10) } : {}),
                 ...result,
             });
         } catch (error) {
@@ -94,7 +95,7 @@ export function createQboExpenseSyncHandlers(
                 );
             }
 
-            let body: { mode?: unknown; since?: unknown };
+            let body: { mode?: unknown; since?: unknown; until?: unknown };
             try {
                 body = await request.json();
             } catch {
@@ -119,7 +120,20 @@ export function createQboExpenseSyncHandlers(
                         { status: 400 },
                     );
                 }
-                return run("backfill", since);
+                // Optional inclusive end date so a long historical backfill can
+                // be chunked into windows that each finish within maxDuration.
+                let until: Date | undefined;
+                if (body.until !== undefined) {
+                    const parsedUntil = parseBackfillDate(body.until, now);
+                    if (!parsedUntil || parsedUntil.getTime() < since.getTime()) {
+                        return NextResponse.json(
+                            { ok: false, reason: "invalid-until" },
+                            { status: 400 },
+                        );
+                    }
+                    until = parsedUntil;
+                }
+                return run("backfill", since, until);
             }
             return NextResponse.json(
                 { ok: false, reason: "invalid-mode" },

@@ -1,9 +1,13 @@
 // Runs the QBO expense sync backfill per docs/qbo-expense-sync-runbook.md,
-// then immediately reruns it to prove idempotency (run 2 should report
-// imported: 0, updated: 0, removed: 0 when QBO hasn't changed in between).
+// chunked into month-sized windows so each request finishes well inside the
+// serverless maxDuration (the full-range run hit FUNCTION_INVOCATION_TIMEOUT
+// twice in production). After the first pass it reruns every chunk to prove
+// idempotency (the rerun should report imported/updated/removed all 0 when
+// QBO hasn't changed in between).
 //
-// Usage: node scripts/run-qbo-backfill.mjs [since]   (default since: 2026-01-01)
-// Results are saved next to this script as qbo-backfill-run1.json / run2.json.
+// Usage: node scripts/run-qbo-backfill.mjs [since] [until]
+//   default since: 2026-01-01, default until: today (UTC)
+// Full per-chunk results are saved as scripts/qbo-backfill-results.json.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +15,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SYNC_URL = "https://probuild.goldentouchremodeling.com/api/integrations/qbo-expenses/sync";
 const since = process.argv[2] || "2026-01-01";
+const until = process.argv[3] || new Date().toISOString().slice(0, 10);
 
 function resolveIngestSecret() {
     if (process.env.RECEIPT_INGEST_SECRET) return process.env.RECEIPT_INGEST_SECRET;
@@ -23,31 +28,84 @@ function resolveIngestSecret() {
     throw new Error("RECEIPT_INGEST_SECRET not found in env or .env files (run: vercel env pull .env.production.local --environment=production)");
 }
 
-async function runSync(label, outFile) {
+// Inclusive month windows: [2026-01-01..2026-01-31], [2026-02-01..2026-02-29], ...
+function monthChunks(fromIso, toIso) {
+    const chunks = [];
+    let cursor = new Date(`${fromIso}T00:00:00.000Z`);
+    const end = new Date(`${toIso}T00:00:00.000Z`);
+    while (cursor.getTime() <= end.getTime()) {
+        const monthEnd = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 0));
+        const chunkEnd = monthEnd.getTime() < end.getTime() ? monthEnd : end;
+        chunks.push({
+            since: cursor.toISOString().slice(0, 10),
+            until: chunkEnd.toISOString().slice(0, 10),
+        });
+        cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
+    }
+    return chunks;
+}
+
+async function runChunk(chunk, attempt = 1) {
+    const started = Date.now();
     const res = await fetch(SYNC_URL, {
         method: "POST",
         headers: { "x-ingest-key": resolveIngestSecret(), "content-type": "application/json" },
-        body: JSON.stringify({ mode: "backfill", since }),
+        body: JSON.stringify({ mode: "backfill", since: chunk.since, until: chunk.until }),
     });
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
     const text = await res.text();
     let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
-    fs.writeFileSync(path.join(repoRoot, "scripts", outFile), JSON.stringify(json, null, 2));
-    console.log(`\n=== ${label} (HTTP ${res.status}) ===`);
-    console.log(`imported: ${json.imported}  updated: ${json.updated}  removed: ${json.removed}  skipped: ${json.skipped?.length ?? "?"}`);
-    if (json.skipped?.length) {
-        const byReason = {};
-        for (const s of json.skipped) byReason[s.reason] = (byReason[s.reason] || 0) + 1;
-        console.log("skipped by reason:", byReason);
+    try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 300) }; }
+    if (!res.ok) {
+        if (attempt < 2) {
+            console.log(`  ${chunk.since}..${chunk.until}: HTTP ${res.status} after ${seconds}s — retrying once`);
+            return runChunk(chunk, attempt + 1);
+        }
+        throw new Error(`Chunk ${chunk.since}..${chunk.until} failed twice: HTTP ${res.status} ${text.slice(0, 300)}`);
     }
-    if (!res.ok) throw new Error(`${label} failed: HTTP ${res.status} ${text.slice(0, 300)}`);
+    console.log(`  ${chunk.since}..${chunk.until}: imported ${json.imported}, updated ${json.updated}, removed ${json.removed}, skipped ${json.skipped?.length ?? 0} (${seconds}s)`);
     return json;
 }
 
-console.log(`Backfill since ${since} against ${SYNC_URL}`);
-const run1 = await runSync("Run 1 (backfill)", "qbo-backfill-run1.json");
-const run2 = await runSync("Run 2 (idempotency check)", "qbo-backfill-run2.json");
+function aggregate(results) {
+    const total = { imported: 0, updated: 0, removed: 0, skipped: [] };
+    for (const r of results) {
+        total.imported += r.imported;
+        total.updated += r.updated;
+        total.removed += r.removed;
+        total.skipped.push(...(r.skipped ?? []));
+    }
+    return total;
+}
 
-const idempotent = run2.imported === 0 && run2.updated === 0 && run2.removed === 0;
-console.log(`\nIdempotency: ${idempotent ? "PASS (0/0/0 on rerun)" : "ATTENTION — rerun was not a no-op (QBO may have changed between runs)"}`);
-console.log("Full results: scripts/qbo-backfill-run1.json / run2.json");
+function summarizeSkips(skipped) {
+    const byReason = {};
+    for (const s of skipped) byReason[s.reason] = (byReason[s.reason] || 0) + 1;
+    return byReason;
+}
+
+const chunks = monthChunks(since, until);
+console.log(`Backfill ${since}..${until} in ${chunks.length} month chunk(s) against ${SYNC_URL}`);
+
+console.log("\n=== Pass 1 (backfill) ===");
+const pass1 = [];
+for (const chunk of chunks) pass1.push(await runChunk(chunk));
+const total1 = aggregate(pass1);
+
+console.log("\n=== Pass 2 (idempotency check) ===");
+const pass2 = [];
+for (const chunk of chunks) pass2.push(await runChunk(chunk));
+const total2 = aggregate(pass2);
+
+fs.writeFileSync(
+    path.join(repoRoot, "scripts", "qbo-backfill-results.json"),
+    JSON.stringify({ since, until, chunks, pass1, pass2 }, null, 2),
+);
+
+console.log(`\nPass 1 totals: imported ${total1.imported}, updated ${total1.updated}, removed ${total1.removed}, skipped ${total1.skipped.length}`);
+if (total1.skipped.length) console.log("Pass 1 skips by reason:", summarizeSkips(total1.skipped));
+console.log(`Pass 2 totals: imported ${total2.imported}, updated ${total2.updated}, removed ${total2.removed}, skipped ${total2.skipped.length}`);
+
+const idempotent = total2.imported === 0 && total2.updated === 0 && total2.removed === 0;
+console.log(`Idempotency: ${idempotent ? "PASS (0/0/0 on rerun)" : "ATTENTION — rerun was not a no-op (QBO may have changed between passes)"}`);
+console.log("Full results: scripts/qbo-backfill-results.json");

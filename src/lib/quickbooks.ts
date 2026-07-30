@@ -503,19 +503,25 @@ export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: numbe
  * Pagination matters for the initial historical backfill; a single QBO query
  * page would silently stop after its MAXRESULTS boundary.
  */
-export async function getQBPurchasesSince(tokens: QBTokens, since: Date): Promise<any[]> {
+export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?: Date): Promise<any[]> {
     if (!Number.isFinite(since.getTime())) {
         throw new Error("QBO purchase query requires a valid since date");
     }
+    if (until && !Number.isFinite(until.getTime())) {
+        throw new Error("QBO purchase query requires a valid until date");
+    }
 
     const sinceDate = since.toISOString().slice(0, 10);
+    // Inclusive upper bound so callers can chunk a long backfill into
+    // date windows that each finish within the serverless duration limit.
+    const untilClause = until ? ` AND TxnDate <= '${until.toISOString().slice(0, 10)}'` : "";
     const pageSize = 1000;
     const purchases: any[] = [];
 
     for (let startPosition = 1; ; startPosition += pageSize) {
         const page = await qbQuery<any>(
             tokens,
-            `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}' ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+            `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}'${untilClause} ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
         );
         purchases.push(...page);
         if (page.length < pageSize) break;

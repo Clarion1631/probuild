@@ -256,8 +256,9 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
 export async function readQboPurchasesForImport(
     tokens: QBTokens,
     since: Date,
+    until?: Date,
 ): Promise<QboPurchaseReadResult> {
-    const rows = await getQBPurchasesSince(tokens, since);
+    const rows = await getQBPurchasesSince(tokens, since, until);
     return normalizeQboPurchaseRows(rows);
 }
 
@@ -591,6 +592,7 @@ export interface QboExpenseSyncDependencies {
         tokens: QBTokens,
         since: Date,
         mode: "incremental" | "backfill",
+        until?: Date,
     ): Promise<QboPurchaseReadResult>;
     listProjects(): Promise<QboExpenseProjectCandidate[]>;
     upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
@@ -633,10 +635,10 @@ async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
 function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
     return {
         getTokens: getFreshQBTokens,
-        readPurchases: (tokens, since, mode) =>
+        readPurchases: (tokens, since, mode, until) =>
             mode === "incremental"
                 ? readQboPurchaseChangesForImport(tokens, since)
-                : readQboPurchasesForImport(tokens, since),
+                : readQboPurchasesForImport(tokens, since, until),
         listProjects: listInProgressProjects,
         upsertExpense: write =>
             upsertQboExpense(
@@ -669,18 +671,26 @@ function qboTransactionDate(txnDate: string | null): Date | null {
  * database transaction used by the upsert.
  */
 export async function syncQboExpenses(
-    options: { since: Date; mode?: "incremental" | "backfill" },
+    options: { since: Date; until?: Date; mode?: "incremental" | "backfill" },
     dependencies: QboExpenseSyncDependencies = createDefaultSyncDependencies(),
     runtime: { tokens?: QBTokens } = {},
 ): Promise<QboExpenseSyncResult> {
     if (!Number.isFinite(options.since.getTime())) {
         throw new Error("QBO expense sync requires a valid since date");
     }
+    if (options.until) {
+        if (!Number.isFinite(options.until.getTime())) {
+            throw new Error("QBO expense sync requires a valid until date");
+        }
+        if (options.until.getTime() < options.since.getTime()) {
+            throw new Error("QBO expense sync until date must not precede since");
+        }
+    }
 
     const tokens = runtime.tokens ?? await dependencies.getTokens();
     const mode = options.mode ?? "backfill";
     const [purchaseRead, projects] = await Promise.all([
-        dependencies.readPurchases(tokens, options.since, mode),
+        dependencies.readPurchases(tokens, options.since, mode, options.until),
         dependencies.listProjects(),
     ]);
     const result: QboExpenseSyncResult = {

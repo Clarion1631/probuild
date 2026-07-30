@@ -509,6 +509,44 @@ test("sync imports once, is a no-op on repeat, and applies a newer QBO sync toke
     assert.equal(fake.rows.get("purchase-1")?.amount, 175);
 });
 
+test("sync forwards the optional until bound to the purchase reader and rejects an inverted window", async () => {
+    const fake = createFakePrisma();
+    const dependencies = createSyncDependencies(
+        [PURCHASE],
+        ACTIVE_PROJECTS,
+        (write) => upsertQboExpense(fake.client, write),
+    );
+    const readCalls: Array<{ since: Date; mode: string; until?: Date }> = [];
+    const innerRead = dependencies.readPurchases;
+    dependencies.readPurchases = async (tokens, since, mode, until) => {
+        readCalls.push({ since, mode, until });
+        return innerRead(tokens, since, mode, until);
+    };
+
+    await syncQboExpenses(
+        {
+            since: new Date("2026-01-01"),
+            until: new Date("2026-01-31"),
+            mode: "backfill",
+        },
+        dependencies,
+    );
+    assert.equal(readCalls.length, 1);
+    assert.equal(readCalls[0].until?.toISOString(), "2026-01-31T00:00:00.000Z");
+
+    await assert.rejects(
+        syncQboExpenses(
+            {
+                since: new Date("2026-02-01"),
+                until: new Date("2026-01-31"),
+            },
+            dependencies,
+        ),
+        /until date must not precede since/,
+    );
+    assert.equal(readCalls.length, 1);
+});
+
 test("sync reports and applies QBO removal signals", async () => {
     const fake = createFakePrisma([
         {
