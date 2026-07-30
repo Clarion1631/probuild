@@ -7,7 +7,11 @@ import {
 import type { QBTokens } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+// 300s: the first historical backfill reads every QBO Purchase page since the
+// requested date and exceeded 120s in production (FUNCTION_INVOCATION_TIMEOUT).
+// Incremental CDC runs stay well under the old limit; this only buys headroom
+// for backfills, which are manual and secret-gated.
+export const maxDuration = 300;
 
 type SyncMode = "incremental" | "backfill";
 
