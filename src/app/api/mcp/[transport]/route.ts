@@ -9,7 +9,7 @@ import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrew
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
-import { downloadDocBytes, resolveDocUrl, isSecureRef } from "@/lib/secure-storage";
+import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
 import { logActivity } from "@/lib/activity-log";
 import {
     MAX_UPLOAD_BASE64_CHARS,
@@ -211,7 +211,9 @@ function sanitizeMcpValue(value: unknown, depth: number): unknown {
     if (depth > SANITIZE_MAX_DEPTH) {
         if (Array.isArray(value)) return `[array: ${value.length} items, depth limit reached]`;
         if (value && typeof value === "object") return "[object omitted: depth limit reached]";
-        return value;
+        // Still truncate primitives at the cap — returning them raw would let a
+        // payload nested one level past the limit through intact.
+        return typeof value === "string" && value.length > 200 ? `${value.slice(0, 200)}…` : value;
     }
     if (Array.isArray(value)) {
         return value.map(item => sanitizeMcpValue(item, depth + 1));
@@ -333,6 +335,15 @@ async function resolveAuditOwner(toolName: string, args: Record<string, unknown>
                 select: { projectId: true, leadId: true },
             });
             if (task) return { projectId: task.projectId ?? null, leadId: task.leadId ?? null, entityId: args.taskId };
+        } else if (typeof args.estimate === "string" && args.estimate) {
+            // update_estimate names its arg `estimate` and accepts either the
+            // code ("EST-00317") or the id — without this branch those writes
+            // log projectId:null and can't be found by job.
+            const estimate = await prisma.estimate.findFirst({
+                where: { OR: [{ id: args.estimate }, { code: args.estimate }] },
+                select: { id: true, projectId: true, leadId: true, code: true },
+            });
+            if (estimate) return { projectId: estimate.projectId ?? null, leadId: estimate.leadId ?? null, entityId: estimate.id, entityName: estimate.code };
         }
     } catch (err) {
         console.error(`[MCP AUDIT] owner lookup for ${toolName} failed:`, err);
@@ -1335,7 +1346,7 @@ function createHandler(actor: RouteMcpActor) {
                 description:
                     "Returns a project's or lead's folder tree and file metadata (id, name, size, mime type, visibility, folder, created date) — metadata only, no URLs. " +
                     "Standard project folders are created implicitly when a project has no folders. " +
-                    "Pass a file's id to read_file for its extracted text, or to get_file_link for a time-limited view/download link.",
+                    "Pass a file's id to read_file for its extracted text, or to get_file_link for a view/download link.",
                 inputSchema: {
                     projectId: z.string().max(50).optional(),
                     leadId: z.string().max(50).optional(),
@@ -1411,7 +1422,10 @@ function createHandler(actor: RouteMcpActor) {
                 // Only a `secure:` ref is actually a time-limited signed URL — an
                 // ordinary project upload's stored value is a permanent public URL
                 // that resolveDocUrl returns unchanged, so don't claim it expires.
-                const linkIsSigned = isSecureRef(file.url);
+                // Prefix alone is not enough: a malformed ref like "secure:/bad"
+                // passes isSecureRef but fails secureRefPath and falls through to
+                // public resolution, so it must not be labelled as expiring.
+                const linkIsSigned = isSecureRef(file.url) && !!secureRefPath(file.url);
                 const base = {
                     id: file.id, name: file.name, mimeType: file.mimeType, size: file.size, folder: file.folder?.name ?? null,
                     viewUrl,
@@ -1496,7 +1510,7 @@ function createHandler(actor: RouteMcpActor) {
                 title: "Get a viewable link to a file",
                 annotations: { readOnlyHint: true },
                 description:
-                    "Returns a time-limited link to open or download any file on a job's Files tab — use this for photos, drawings, and scans that read_file can't turn into text, " +
+                    "Returns a link to open or download any file on a job's Files tab — use this for photos, drawings, and scans that read_file can't turn into text, " +
                     "or whenever the user wants the actual document rather than its extracted text. The link expires after linkMinutes (default 30). Use the id from list_project_files.",
                 inputSchema: {
                     fileId: z.string().max(50).describe("File id from list_project_files"),
@@ -1522,7 +1536,10 @@ function createHandler(actor: RouteMcpActor) {
                 // Only a `secure:` ref is actually a time-limited signed URL — an
                 // ordinary project upload's stored value is a permanent public URL
                 // that resolveDocUrl returns unchanged, so don't claim it expires.
-                const linkIsSigned = isSecureRef(file.url);
+                // Prefix alone is not enough: a malformed ref like "secure:/bad"
+                // passes isSecureRef but fails secureRefPath and falls through to
+                // public resolution, so it must not be labelled as expiring.
+                const linkIsSigned = isSecureRef(file.url) && !!secureRefPath(file.url);
                 return textResult({
                     id: file.id,
                     name: file.name,
@@ -2424,7 +2441,8 @@ function createHandler(actor: RouteMcpActor) {
             "Use upload_files for up to 8 files / ~3 MB total, then create_daily_log with already-uploaded photo ProjectFile ids so image bytes are not sent twice. " +
             "Use list_punch_items and add_punch_items for punch lists; punch completion is intentionally human-only. " +
             "FILE ROUND TRIP: upload_file/upload_files puts documents in, list_project_files shows what's there (metadata and folder structure only, no URLs), " +
-            "read_file pulls a PDF/Word/text file's actual extracted text, and get_file_link returns a time-limited view/download link for anything. " +
+            "read_file pulls a PDF/Word/text file's actual extracted text, and get_file_link returns a view/download link for anything "
+            + "(signed and expiring for private documents, a permanent public URL otherwise — the response says which). " +
             "Photos, drawings, scans and signed PDFs typically have no text layer to extract, so get_file_link (not read_file) is the right tool for them. " +
             "get_activity_log reviews the audit trail of connector actions — who did what, and whether a customer-facing send actually went out or was only previewed. " +
             "SCHEDULING: get_company_schedule answers 'what jobs are waiting to start?' and lists upcoming project starts (plus lead expected starts) " +

@@ -277,7 +277,8 @@ const UI_SEND_TOOLS = new Set([
   "send_change_order",
   "send_milestone_invoice",
   "resend_invoice",
-  "bill_change_order",
+  // bill_change_order is deliberately NOT here: it bills, it does not email.
+  // Blocking it would stop the in-app chat completing a non-sending write.
 ]);
 
 // Recursively redacts any object key that looks like a confirm/send token so
