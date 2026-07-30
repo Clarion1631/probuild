@@ -14,6 +14,7 @@ import {
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
+import { assertExpenseMutableOutsideQbo } from "@/lib/qbo-expense-guard";
 
 async function assertTimeExpenseProjectAccess(projectId: string) {
     const user = await getCurrentUserWithPermissions();
@@ -191,14 +192,22 @@ export async function deleteExpense(id: string, projectId: string) {
     if (!hasPermission(user, "timeClock")) throw new Error("Forbidden");
     const expense = await prisma.expense.findUnique({
         where: { id },
-        select: { invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+        select: {
+            qbPurchaseId: true,
+            invoiceId: true,
+            invoicedAt: true,
+            estimate: { select: { projectId: true } },
+        },
     });
     if (!expense || expense.estimate.projectId !== projectId || !canAccessProject(user, expense.estimate.projectId)) {
         throw new Error("Forbidden");
     }
+    assertExpenseMutableOutsideQbo(expense);
     if (expense.invoiceId || expense.invoicedAt) throw new Error("Billed expenses cannot be deleted");
 
-    const deleted = await prisma.expense.deleteMany({ where: { id, invoiceId: null, invoicedAt: null } });
+    const deleted = await prisma.expense.deleteMany({
+        where: { id, qbPurchaseId: null, invoiceId: null, invoicedAt: null },
+    });
     if (deleted.count !== 1) throw new Error("Expense was billed while it was being deleted; refresh and try again");
 
     revalidatePath(`/projects/${projectId}/time-expenses`);
@@ -215,12 +224,19 @@ export async function deleteExpenses(
 
     const expenses = await prisma.expense.findMany({
         where: { id: { in: ids } },
-        select: { id: true, invoiceId: true, invoicedAt: true, estimate: { select: { projectId: true } } },
+        select: {
+            id: true,
+            qbPurchaseId: true,
+            invoiceId: true,
+            invoicedAt: true,
+            estimate: { select: { projectId: true } },
+        },
     });
-
-    const allowed = expenses.filter(
-        e => !e.invoiceId && !e.invoicedAt && e.estimate?.projectId && canAccessProject(user, e.estimate.projectId)
+    const accessible = expenses.filter(
+        e => e.estimate?.projectId && canAccessProject(user, e.estimate.projectId),
     );
+    for (const expense of accessible) assertExpenseMutableOutsideQbo(expense);
+    const allowed = accessible.filter(e => !e.invoiceId && !e.invoicedAt);
     if (!allowed.length) return { deleted: 0 };
 
     const allowedIds = allowed.map(e => e.id);
@@ -229,7 +245,12 @@ export async function deleteExpenses(
     );
 
     const result = await prisma.expense.deleteMany({
-        where: { id: { in: allowedIds }, invoiceId: null, invoicedAt: null },
+        where: {
+            id: { in: allowedIds },
+            qbPurchaseId: null,
+            invoiceId: null,
+            invoicedAt: null,
+        },
     });
 
     for (const projectId of projectIds) {

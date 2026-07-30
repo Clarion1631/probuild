@@ -8,36 +8,57 @@ export default async function BookkeeperReceiptsPage() {
     const session = await getSessionOrDev();
     if (!session?.user) redirect("/login");
 
-    // All pending expenses (AI-parsed or manually submitted)
-    const pendingExpenses = await prisma.expense.findMany({
-        where: { status: "Pending" },
-        include: {
-            estimate: {
-                include: { project: { select: { id: true, name: true } } },
+    const [
+        pendingExpenses,
+        importedExpenses,
+        importedExpenseCount,
+        projects,
+        costCodes,
+    ] = await Promise.all([
+        // Receipt intake remains the pre-accounting review queue.
+        prisma.expense.findMany({
+            where: { status: "Pending" },
+            include: {
+                estimate: {
+                    include: { project: { select: { id: true, name: true } } },
+                },
+                costCode: { select: { code: true, name: true } },
             },
-            costCode: { select: { code: true, name: true } },
-        },
-        orderBy: { createdAt: "desc" },
-    });
-
-    const projects = await prisma.project.findMany({
-        where: { status: { not: "Closed" } },
-        select: { id: true, name: true },
-        orderBy: { name: "asc" },
-    });
-
-    const costCodes = await prisma.costCode.findMany({
-        where: { isActive: true },
-        select: { id: true, code: true, name: true },
-        orderBy: { code: "asc" },
-    });
+            orderBy: { createdAt: "desc" },
+        }),
+        // QBO imports are finalized records and never enter the actionable queue.
+        prisma.expense.findMany({
+            where: { qbPurchaseId: { not: null } },
+            include: {
+                estimate: {
+                    include: { project: { select: { id: true, name: true } } },
+                },
+                costCode: { select: { code: true, name: true } },
+            },
+            orderBy: { qbSyncedAt: "desc" },
+            take: 100,
+        }),
+        prisma.expense.count({
+            where: { qbPurchaseId: { not: null } },
+        }),
+        prisma.project.findMany({
+            where: { status: { not: "Closed" } },
+            select: { id: true, name: true },
+            orderBy: { name: "asc" },
+        }),
+        prisma.costCode.findMany({
+            where: { isActive: true },
+            select: { id: true, code: true, name: true },
+            orderBy: { code: "asc" },
+        }),
+    ]);
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
             <div>
                 <h1 className="text-2xl font-bold text-hui-textMain">Bookkeeper Review Queue</h1>
                 <p className="text-sm text-hui-textMuted mt-1">
-                    Review AI-parsed receipts and manually submitted expenses before they enter the books.
+                    Review receipt intake before accounting, and audit finalized expenses imported from QuickBooks.
                 </p>
             </div>
 
@@ -56,6 +77,8 @@ export default async function BookkeeperReceiptsPage() {
 
             <ReceiptQueueClient
                 expenses={JSON.parse(JSON.stringify(pendingExpenses))}
+                importedExpenses={JSON.parse(JSON.stringify(importedExpenses))}
+                importedExpenseCount={importedExpenseCount}
                 projects={projects}
                 costCodes={costCodes}
             />

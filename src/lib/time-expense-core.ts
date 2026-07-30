@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
+import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
 
 const cents = (value: number) => Math.round(value * 100);
 const dollars = (value: number) => cents(value) / 100;
@@ -227,13 +228,25 @@ export async function tagExpensesToChangeOrderCore(
     const changeOrder = await resolveChangeOrder(input.changeOrderId);
     const rows = await prisma.expense.findMany({
         where: { id: { in: input.ids } },
-        select: { id: true, estimate: { select: { projectId: true } }, invoiceId: true, invoicedAt: true },
+        select: {
+            id: true,
+            qbPurchaseId: true,
+            estimate: { select: { projectId: true } },
+            invoiceId: true,
+            invoicedAt: true,
+        },
     });
     if (rows.length !== new Set(input.ids).size) throw new Error("One or more expenses were not found");
     if (rows.some((row) => row.estimate.projectId !== changeOrder.projectId)) throw new Error("All expenses must belong to the change order project");
+    for (const row of rows) assertExpenseMutableOutsideQbo(row);
     if (rows.some((row) => row.invoiceId || row.invoicedAt)) throw new Error("Billed expenses cannot be retagged");
     const result = await prisma.expense.updateMany({
-        where: { id: { in: input.ids }, invoiceId: null, invoicedAt: null },
+        where: {
+            id: { in: input.ids },
+            qbPurchaseId: null,
+            invoiceId: null,
+            invoicedAt: null,
+        },
         data: { changeOrderId: input.changeOrderId, isBillable: input.isBillable ?? true },
     });
     return { updated: result.count };
