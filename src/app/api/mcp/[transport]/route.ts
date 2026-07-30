@@ -291,6 +291,49 @@ type AuditOwner = { projectId: string | null; leadId: string | null; entityId?: 
 // only the owner columns it actually has (Invoice/ChangeOrder: projectId only;
 // Estimate/Contract/ScheduleTask/ProjectFile: both). Never throws — a failed
 // lookup degrades to nulls rather than breaking the tool call or the audit write.
+// pdfjs (under pdf-parse) touches browser globals at MODULE LOAD time. Vercel's
+// server runtime resolves a build that needs DOMMatrix/Path2D/ImageData, which
+// a bare local `node` import does not — hence "DOMMatrix is not defined" only
+// once deployed, after passing locally and in CI. These stubs exist purely so
+// the module can load; pure text extraction never exercises them, and each is
+// installed only when genuinely absent so a real implementation always wins.
+function ensurePdfDomGlobals() {
+    const g = globalThis as any;
+    if (typeof g.DOMMatrix === "undefined") {
+        g.DOMMatrix = class DOMMatrix {
+            a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
+            m11 = 1; m12 = 0; m21 = 0; m22 = 1; m41 = 0; m42 = 0;
+            constructor(init?: number[] | string) {
+                if (Array.isArray(init) && init.length >= 6) {
+                    [this.a, this.b, this.c, this.d, this.e, this.f] = init as number[];
+                    this.m11 = this.a; this.m12 = this.b;
+                    this.m21 = this.c; this.m22 = this.d;
+                    this.m41 = this.e; this.m42 = this.f;
+                }
+            }
+            multiply() { return this; }
+            translate() { return this; }
+            scale() { return this; }
+            inverse() { return this; }
+        };
+    }
+    if (typeof g.Path2D === "undefined") {
+        g.Path2D = class Path2D {
+            addPath() {} moveTo() {} lineTo() {} bezierCurveTo() {}
+            quadraticCurveTo() {} closePath() {} rect() {} arc() {}
+        };
+    }
+    if (typeof g.ImageData === "undefined") {
+        g.ImageData = class ImageData {
+            data: Uint8ClampedArray; width: number; height: number;
+            constructor(width: number, height: number) {
+                this.width = width; this.height = height;
+                this.data = new Uint8ClampedArray(Math.max(0, width * height * 4));
+            }
+        };
+    }
+}
+
 async function resolveAuditOwner(toolName: string, args: Record<string, unknown>): Promise<AuditOwner> {
     const projectIdArg = typeof args.projectId === "string" && args.projectId ? args.projectId : null;
     const leadIdArg = typeof args.leadId === "string" && args.leadId ? args.leadId : null;
@@ -1476,6 +1519,7 @@ function createHandler(actor: RouteMcpActor) {
 
                 try {
                     if (isPdf) {
+                        ensurePdfDomGlobals();
                         const pdfParseMod: any = await import("pdf-parse");
                         const PDFParseCtor = pdfParseMod.PDFParse ?? pdfParseMod.default?.PDFParse;
                         const parser = new PDFParseCtor({ data: buffer });
@@ -1499,7 +1543,21 @@ function createHandler(actor: RouteMcpActor) {
                     // return above.
                     return textResult({ ...base, ...extractedTextResult(buffer.toString("utf-8"), effectiveMaxChars) });
                 } catch (err: any) {
-                    return { ...textResult({ error: `Could not extract text: ${err?.message || "unknown error"}` }), isError: true };
+                    // Degrade usefully rather than surfacing an internal error:
+                    // the link still works even when the text extractor can't
+                    // load or the PDF is malformed, and for drawings/scans the
+                    // link was always the answer anyway.
+                    return {
+                        ...textResult({
+                            error: `Could not extract text from "${file.name}": ${err?.message || "unknown error"}`,
+                            readable: false,
+                            viewUrl: base.viewUrl ?? null,
+                            note: base.viewUrl
+                                ? "Text extraction failed, but the file itself is fine — open viewUrl to view or download it."
+                                : "Text extraction failed. Use get_file_link to get a link to the file.",
+                        }),
+                        isError: true,
+                    };
                 }
             },
         );
