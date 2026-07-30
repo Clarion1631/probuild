@@ -13,6 +13,7 @@ const ids = {
   otherProject: `${run}-other-project`,
   decision: `${run}-decision`,
   candidate: `${run}-candidate`,
+  staffCandidate: `${run}-staff-candidate`,
   otherCandidate: `${run}-other-candidate`,
   restrictedStaff: `${run}-restricted-staff`,
 } as const;
@@ -47,6 +48,15 @@ test.describe.serial("selection item discussion threads", () => {
         projectId: ids.project,
         decisionId: ids.decision,
         name: "Warm Brass Sconce",
+        status: "Idea",
+      },
+    });
+    await prisma.selectionProposal.create({
+      data: {
+        id: ids.staffCandidate,
+        projectId: ids.project,
+        decisionId: ids.decision,
+        name: "Matte Black Faucet",
         status: "Idea",
       },
     });
@@ -178,5 +188,74 @@ test.describe.serial("selection item discussion threads", () => {
     expect(stored.readByClientAt).not.toBeNull();
 
     await context.close();
+  });
+
+  async function readNavBadgeCount(page: import("@playwright/test").Page): Promise<number> {
+    const badge = page.getByTestId("nav-badge-selection-boards");
+    if ((await badge.count()) === 0) return 0;
+    const text = (await badge.textContent()) ?? "0";
+    return Number(text.trim());
+  }
+
+  test("staff sees the unread pill and nav badge, expanding marks the thread read", async ({ page }) => {
+    // ids.staffCandidate is untouched by every earlier test in this serial
+    // suite, so "Discussion (1)" is exact here — the project-wide nav badge
+    // is not (other tests may leave their own unread comments behind), so
+    // that assertion checks the delta instead of an absolute count.
+    await page.goto(`/projects/${ids.project}/selections`);
+    const baselineBadgeCount = await readNavBadgeCount(page);
+
+    const comment = await prisma.selectionItemComment.create({
+      data: {
+        proposalId: ids.staffCandidate,
+        authorType: "CLIENT",
+        authorClientId: ids.client,
+        authorName: "Thread Client",
+        body: "Can we get this in a warmer finish?",
+        readByClientAt: new Date(),
+      },
+    });
+
+    await page.reload();
+    const card = page.getByTestId(`selection-item-${ids.staffCandidate}`);
+    await expect(card.getByTestId("selection-thread-toggle")).toContainText("Discussion (1)");
+    await expect(card.getByTestId("selection-thread-unread-pill")).toContainText("1 new");
+    expect(await readNavBadgeCount(page)).toBe(baselineBadgeCount + 1);
+
+    await card.getByTestId("selection-thread-toggle").click();
+    await expect(card.getByTestId(`selection-thread-comment-${comment.id}`)).toContainText(
+      "Can we get this in a warmer finish?",
+    );
+
+    await expect
+      .poll(async () => {
+        const row = await prisma.selectionItemComment.findUniqueOrThrow({ where: { id: comment.id } });
+        return row.readByTeamAt;
+      })
+      .not.toBeNull();
+
+    await page.reload();
+    await expect(page.getByTestId(`selection-item-${ids.staffCandidate}`).getByTestId("selection-thread-unread-pill")).toHaveCount(0);
+    expect(await readNavBadgeCount(page)).toBe(baselineBadgeCount);
+  });
+
+  test("staff replies from the CandidateCard composer", async ({ page }) => {
+    await page.goto(`/projects/${ids.project}/selections`);
+    const card = page.getByTestId(`selection-item-${ids.staffCandidate}`);
+    await card.getByTestId("selection-thread-toggle").click();
+    await card.getByTestId("selection-thread-composer").fill("We'll swap it for the warmer finish.");
+    await Promise.all([
+      page.waitForResponse((res) => res.url().includes("/api/selections/item-comments") && res.ok()),
+      card.getByTestId("selection-thread-post").click(),
+    ]);
+    await expect(
+      card.getByTestId(/selection-thread-comment-/).filter({ hasText: "We'll swap it for the warmer finish." }),
+    ).toBeVisible();
+
+    const staffComment = await prisma.selectionItemComment.findFirstOrThrow({
+      where: { proposalId: ids.staffCandidate, authorType: "TEAM" },
+    });
+    expect(staffComment.readByTeamAt).not.toBeNull();
+    expect(staffComment.readByClientAt).toBeNull();
   });
 });

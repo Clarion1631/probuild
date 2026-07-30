@@ -71,7 +71,11 @@ import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 import { persistSelectionItemNote } from "./selection-item-note-persistence";
-import { markSelectionItemThreadRead as markSelectionItemThreadReadCore } from "./selection-item-thread-core";
+import {
+    markSelectionItemThreadRead as markSelectionItemThreadReadCore,
+    parseThreadAttachments,
+    unreadThreadCommentCount,
+} from "./selection-item-thread-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -10665,6 +10669,24 @@ export async function getProjectDecisionsForPortal(projectId: string) {
     };
 }
 
+// Attaches parsed comments + the staff-side unread count to a candidate for
+// the thread UI (SelectionItemThread). Shared shape between the staff read
+// (below) and the portal read (getProjectDecisionsForPortal).
+function withThreadSummary<T extends { comments: {
+    id: string; authorType: string; authorUserId: string | null; authorClientId: string | null;
+    authorName: string; body: string; attachments: string | null; readByTeamAt: Date | null;
+    readByClientAt: Date | null; createdAt: Date;
+}[] }>(candidate: T, isStaff: boolean) {
+    const { comments, ...rest } = candidate;
+    return {
+        ...rest,
+        comments: comments.map((c) => ({ ...c, attachments: parseThreadAttachments(c.attachments) })),
+        unreadThreadCount: unreadThreadCommentCount(comments, isStaff),
+    };
+}
+
+const CANDIDATE_COMMENTS_INCLUDE = { comments: { orderBy: { createdAt: "asc" as const } } };
+
 export async function getProjectDecisions(projectId: string) {
     const user = await assertActiveStaff();
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
@@ -10675,17 +10697,26 @@ export async function getProjectDecisions(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map(normalizeProposal) })),
-        unsorted: unsorted.map(normalizeProposal),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
+        unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
+}
+
+/** Nav badge count — unread CLIENT comments across every (non-deleted) item
+ * on the project, for the project layout's "Selection Boards" link. */
+export async function getUnreadSelectionThreadCountForStaff(projectId: string): Promise<number> {
+    return prisma.selectionItemComment.count({
+        where: { authorType: "CLIENT", readByTeamAt: null, proposal: { projectId, deletedAt: null } },
+    });
 }
 
 // ── Structure — shared by client + team (see assertDecisionActorAccess) ────
@@ -10781,6 +10812,12 @@ export async function markSelectionItemThreadRead(itemId: string, seenCommentIds
                     data: { readByClientAt: new Date() },
                 });
             }
+        },
+        revalidate: (projectId) => {
+            revalidatePath(`/projects/${projectId}/selections`);
+            revalidatePath(`/portal/projects/${projectId}/selections`);
+            revalidatePath(`/projects/${projectId}`, "layout");
+            revalidatePath(`/portal/projects/${projectId}`);
         },
     });
 }

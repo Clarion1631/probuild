@@ -53,6 +53,30 @@ export type ThreadComment = {
     createdAt: Date;
 };
 
+/** Parses the stored attachments JSON column into the canonical shape, or
+ * an empty array when there are none / the column is malformed. */
+export function parseThreadAttachments(raw: string | null): ThreadAttachment[] {
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+/** Unread count for the viewing side — CLIENT posts are unread for staff
+ * until readByTeamAt is set; TEAM posts are unread for the client until
+ * readByClientAt is set. */
+export function unreadThreadCommentCount(
+    comments: Pick<ThreadComment, "authorType" | "readByTeamAt" | "readByClientAt">[],
+    isStaff: boolean,
+): number {
+    return comments.filter((c) =>
+        isStaff ? c.authorType === "CLIENT" && !c.readByTeamAt : c.authorType === "TEAM" && !c.readByClientAt,
+    ).length;
+}
+
 type PostSelectionItemCommentDependencies = {
     findItem: (itemId: string) => Promise<ThreadItem | null>;
     assertAccess: (projectId: string) => Promise<ThreadActor>;
@@ -141,6 +165,7 @@ type MarkSelectionItemThreadReadDependencies = {
     findItem: (itemId: string) => Promise<ThreadItem | null>;
     assertAccess: (projectId: string) => Promise<ThreadActor>;
     markRead: (proposalId: string, seenCommentIds: string[], isStaff: boolean) => Promise<void>;
+    revalidate: (projectId: string) => void;
 };
 
 /** Marks ONLY the ids the viewer actually rendered — marking all-null-for-item
@@ -157,4 +182,5 @@ export async function markSelectionItemThreadRead(
     const actor = await dependencies.assertAccess(item.projectId);
     if (seenCommentIds.length === 0) return;
     await dependencies.markRead(item.id, seenCommentIds, actor.isStaff);
+    dependencies.revalidate(item.projectId);
 }
