@@ -26,6 +26,7 @@ interface CostCode { id: string; code: string; name: string; }
 interface Props {
     expenses: Expense[];
     importedExpenses: Expense[];
+    importedExpenseCount: number;
     projects: Project[];
     costCodes: CostCode[];
 }
@@ -33,6 +34,7 @@ interface Props {
 export default function ReceiptQueueClient({
     expenses: initialExpenses,
     importedExpenses,
+    importedExpenseCount,
 }: Props) {
     const [expenses, setExpenses] = useState(initialExpenses);
     const [processing, setProcessing] = useState<string | null>(null);
@@ -135,7 +137,9 @@ export default function ReceiptQueueClient({
                         <h2 id="qbo-imports-heading" className="font-semibold text-hui-textMain">Finalized QuickBooks expenses</h2>
                         <p className="text-xs text-hui-textMuted mt-0.5">Read-only audit trail. Bank matching and reconciliation stay in QuickBooks.</p>
                     </div>
-                    <span className="text-sm text-hui-textMuted font-medium">{importedExpenses.length} recent</span>
+                    <span className="text-sm text-hui-textMuted font-medium">
+                        Showing {importedExpenses.length} of {importedExpenseCount}
+                    </span>
                 </div>
 
                 {importedExpenses.length === 0 ? (

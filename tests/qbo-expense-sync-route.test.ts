@@ -8,18 +8,20 @@ const TOKENS = {
     realmId: "test-realm",
 };
 
-function createHandlers(options: { cronEnabled?: boolean } = {}) {
-    const calls: Array<{ since: Date; tokens: typeof TOKENS }> = [];
+function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = {}) {
+    const calls: Array<{ since: Date; mode: "incremental" | "backfill"; tokens: typeof TOKENS }> = [];
     const handlers = createQboExpenseSyncHandlers({
         getIngestSecret: () => "ingest-secret",
         getCronSecret: () => "cron-secret",
         isCronEnabled: () => options.cronEnabled ?? true,
         getFreshTokens: async () => TOKENS,
-        syncExpenses: async ({ since }, { tokens }) => {
-            calls.push({ since, tokens });
+        syncExpenses: async ({ since, mode }, { tokens }) => {
+            calls.push({ since, mode, tokens });
+            if (options.syncError) throw options.syncError;
             return {
                 imported: 2,
                 updated: 1,
+                removed: 0,
                 skipped: [{ qbPurchaseId: "purchase-skipped", reason: "no-active-project" }],
             };
         },
@@ -83,10 +85,12 @@ test("POST runs an incremental sync over the configured rolling window", async (
         since: "2026-07-22",
         imported: 2,
         updated: 1,
+        removed: 0,
         skipped: [{ qbPurchaseId: "purchase-skipped", reason: "no-active-project" }],
     });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].since.toISOString(), "2026-07-22T12:00:00.000Z");
+    assert.equal(calls[0].mode, "incremental");
 });
 
 test("POST runs a date-bounded historical backfill", async () => {
@@ -105,6 +109,7 @@ test("POST runs a date-bounded historical backfill", async () => {
     assert.equal(body.mode, "backfill");
     assert.equal(body.since, "2024-01-15");
     assert.equal(calls[0].since.toISOString(), "2024-01-15T00:00:00.000Z");
+    assert.equal(calls[0].mode, "backfill");
 });
 
 test("GET requires Vercel cron authorization and runs incremental mode", async () => {
@@ -129,4 +134,21 @@ test("GET can disable only the QBO expense cron without affecting manual backfil
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { ok: false, reason: "sync-disabled" });
     assert.equal(calls.length, 0);
+});
+
+test("sync failures return a stable reason without exposing upstream QBO details", async () => {
+    const { POST } = createHandlers({
+        syncError: new Error("QB query failed: access_token=secret transaction body"),
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-expenses/sync", {
+        method: "POST",
+        body: JSON.stringify({ mode: "incremental" }),
+        headers: {
+            "content-type": "application/json",
+            "x-ingest-key": "ingest-secret",
+        },
+    }));
+
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), { ok: false, reason: "sync-failed" });
 });

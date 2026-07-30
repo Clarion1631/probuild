@@ -5,9 +5,8 @@ ALTER TABLE "Expense"
     ADD COLUMN IF NOT EXISTS "qbSyncToken" TEXT,
     ADD COLUMN IF NOT EXISTS "qbSyncedAt" TIMESTAMPTZ;
 
--- PostgreSQL permits multiple null values in a unique index. The partial
--- predicate keeps the index limited to imported QBO rows and makes the QBO
--- transaction id the atomic upsert/idempotency key.
+-- PostgreSQL permits multiple null values in a regular unique index. Keep this
+-- index non-partial so it matches Prisma's @unique contract and can support
+-- native unique lookups while leaving all manual expense nulls unaffected.
 CREATE UNIQUE INDEX IF NOT EXISTS "Expense_qbPurchaseId_key"
-    ON "Expense" ("qbPurchaseId")
-    WHERE "qbPurchaseId" IS NOT NULL;
+    ON "Expense" ("qbPurchaseId");

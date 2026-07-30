@@ -13,6 +13,7 @@ test("receipt audit surface renders QBO imports as finalized non-actionable reco
         expenses: [],
         projects: [],
         costCodes: [],
+        importedExpenseCount: 142,
         importedExpenses: [{
             id: "expense-qbo-1",
             qbPurchaseId: "purchase-1",
@@ -34,6 +35,7 @@ test("receipt audit surface renders QBO imports as finalized non-actionable reco
     assert.match(markup, /QBO UI Vendor/);
     assert.match(markup, /\$321\.45/);
     assert.match(markup, /Mueller Bathroom Remodel/);
+    assert.match(markup, /Showing 1 of 142/);
     assert.doesNotMatch(markup, />Approve</);
     assert.doesNotMatch(markup, />Reject</);
 });

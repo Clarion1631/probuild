@@ -8,7 +8,13 @@ export default async function BookkeeperReceiptsPage() {
     const session = await getSessionOrDev();
     if (!session?.user) redirect("/login");
 
-    const [pendingExpenses, importedExpenses, projects, costCodes] = await Promise.all([
+    const [
+        pendingExpenses,
+        importedExpenses,
+        importedExpenseCount,
+        projects,
+        costCodes,
+    ] = await Promise.all([
         // Receipt intake remains the pre-accounting review queue.
         prisma.expense.findMany({
             where: { status: "Pending" },
@@ -31,6 +37,9 @@ export default async function BookkeeperReceiptsPage() {
             },
             orderBy: { qbSyncedAt: "desc" },
             take: 100,
+        }),
+        prisma.expense.count({
+            where: { qbPurchaseId: { not: null } },
         }),
         prisma.project.findMany({
             where: { status: { not: "Closed" } },
@@ -69,6 +78,7 @@ export default async function BookkeeperReceiptsPage() {
             <ReceiptQueueClient
                 expenses={JSON.parse(JSON.stringify(pendingExpenses))}
                 importedExpenses={JSON.parse(JSON.stringify(importedExpenses))}
+                importedExpenseCount={importedExpenseCount}
                 projects={projects}
                 costCodes={costCodes}
             />

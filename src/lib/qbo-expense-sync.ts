@@ -1,5 +1,5 @@
 import type { QBTokens } from "./quickbooks";
-import { getQBPurchasesSince } from "./quickbooks";
+import { getQBPurchaseChangesSince, getQBPurchasesSince } from "./quickbooks";
 import { findBestProjectNameMatches } from "./project-match";
 import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
@@ -20,10 +20,30 @@ export type QboPurchaseNormalizationSkipReason =
     | "missing-purchase-id"
     | "missing-sync-token"
     | "invalid-amount"
-    | "multiple-customers";
+    | "invalid-transaction-date"
+    | "multiple-customers"
+    | "mixed-customer-allocation";
+
+export type QboPurchaseRemovalReason =
+    | "credit-card-refund"
+    | "deleted"
+    | "voided";
+
+export interface QboPurchaseRemoval {
+    qbPurchaseId: string;
+    qbSyncToken: string | null;
+    reason: QboPurchaseRemovalReason;
+}
 
 export type QboPurchaseNormalizationResult =
     | { kind: "purchase"; purchase: QboPurchaseForImport }
+    | ({ kind: "removed" } & QboPurchaseRemoval)
+    | {
+        kind: "ineligible";
+        qbPurchaseId: string;
+        qbSyncToken: string;
+        reason: "multiple-customers" | "mixed-customer-allocation";
+    }
     | {
         kind: "skipped";
         qbPurchaseId: string;
@@ -32,6 +52,12 @@ export type QboPurchaseNormalizationResult =
 
 export interface QboPurchaseReadResult {
     purchases: QboPurchaseForImport[];
+    removed: QboPurchaseRemoval[];
+    deactivations: Array<{
+        qbPurchaseId: string;
+        qbSyncToken: string;
+        reason: "multiple-customers" | "mixed-customer-allocation";
+    }>;
     skipped: Array<{ qbPurchaseId: string; reason: QboPurchaseNormalizationSkipReason }>;
 }
 
@@ -41,6 +67,7 @@ type QboReference = {
 };
 
 type QboPurchaseLine = {
+    Amount?: unknown;
     AccountBasedExpenseLineDetail?: { CustomerRef?: QboReference };
     ItemBasedExpenseLineDetail?: { CustomerRef?: QboReference };
 };
@@ -55,6 +82,8 @@ type RawQboPurchase = {
     CustomerRef?: QboReference;
     PrivateNote?: unknown;
     Line?: unknown;
+    Credit?: unknown;
+    status?: unknown;
 };
 
 function optionalString(value: unknown): string | null {
@@ -70,18 +99,38 @@ function customerReferenceKey(reference: QboReference): string | null {
     return id ? `id:${id}` : `name:${name!.toLowerCase()}`;
 }
 
-function collectCustomerReferences(purchase: RawQboPurchase): QboReference[] {
+function collectCustomerReferences(purchase: RawQboPurchase): {
+    references: QboReference[];
+    hasAssignedExpenseLine: boolean;
+    hasUnassignedExpenseLine: boolean;
+} {
     const references: QboReference[] = [];
     if (purchase.CustomerRef) references.push(purchase.CustomerRef);
+    let hasAssignedExpenseLine = false;
+    let hasUnassignedExpenseLine = false;
 
     if (Array.isArray(purchase.Line)) {
         for (const rawLine of purchase.Line) {
             if (!rawLine || typeof rawLine !== "object") continue;
             const line = rawLine as QboPurchaseLine;
+            const isExpenseLine = Boolean(
+                line.AccountBasedExpenseLineDetail ||
+                line.ItemBasedExpenseLineDetail,
+            );
+            if (!isExpenseLine) continue;
             const reference =
                 line.AccountBasedExpenseLineDetail?.CustomerRef ??
                 line.ItemBasedExpenseLineDetail?.CustomerRef;
-            if (reference) references.push(reference);
+            if (reference && customerReferenceKey(reference)) {
+                references.push(reference);
+                hasAssignedExpenseLine = true;
+            } else {
+                const amount = Number(line.Amount);
+                // Missing amounts are treated conservatively as monetary lines.
+                if (!Number.isFinite(amount) || amount > 0) {
+                    hasUnassignedExpenseLine = true;
+                }
+            }
         }
     }
 
@@ -90,7 +139,17 @@ function collectCustomerReferences(purchase: RawQboPurchase): QboReference[] {
         const key = customerReferenceKey(reference);
         if (key && !unique.has(key)) unique.set(key, reference);
     }
-    return [...unique.values()];
+    return {
+        references: [...unique.values()],
+        hasAssignedExpenseLine,
+        hasUnassignedExpenseLine,
+    };
+}
+
+function validQboTransactionDate(value: string | null): value is string {
+    if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 /**
@@ -112,28 +171,78 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
     }
 
     const syncToken = optionalString(purchase.SyncToken);
+    if (optionalString(purchase.status)?.toLowerCase() === "deleted") {
+        return {
+            kind: "removed",
+            qbPurchaseId,
+            qbSyncToken: syncToken,
+            reason: "deleted",
+        };
+    }
+    if (purchase.Credit === true) {
+        return {
+            kind: "removed",
+            qbPurchaseId,
+            qbSyncToken: syncToken,
+            reason: "credit-card-refund",
+        };
+    }
+
+    const total = Number(purchase.TotalAmt);
+    if (
+        purchase.TotalAmt !== null &&
+        purchase.TotalAmt !== undefined &&
+        Number.isFinite(total) &&
+        total === 0
+    ) {
+        return {
+            kind: "removed",
+            qbPurchaseId,
+            qbSyncToken: syncToken,
+            reason: "voided",
+        };
+    }
     if (!syncToken) {
         return { kind: "skipped", qbPurchaseId, reason: "missing-sync-token" };
     }
 
-    const total = Number(purchase.TotalAmt);
     if (!Number.isFinite(total) || total <= 0) {
         return { kind: "skipped", qbPurchaseId, reason: "invalid-amount" };
     }
 
-    const customerReferences = collectCustomerReferences(purchase);
-    if (customerReferences.length > 1) {
-        return { kind: "skipped", qbPurchaseId, reason: "multiple-customers" };
-    }
-    const customerReference = customerReferences[0];
-
     const txnDate = optionalString(purchase.TxnDate);
+    if (!validQboTransactionDate(txnDate)) {
+        return { kind: "skipped", qbPurchaseId, reason: "invalid-transaction-date" };
+    }
+
+    const customerAllocation = collectCustomerReferences(purchase);
+    if (
+        customerAllocation.hasAssignedExpenseLine &&
+        customerAllocation.hasUnassignedExpenseLine
+    ) {
+        return {
+            kind: "ineligible",
+            qbPurchaseId,
+            qbSyncToken: syncToken,
+            reason: "mixed-customer-allocation",
+        };
+    }
+    if (customerAllocation.references.length > 1) {
+        return {
+            kind: "ineligible",
+            qbPurchaseId,
+            qbSyncToken: syncToken,
+            reason: "multiple-customers",
+        };
+    }
+    const customerReference = customerAllocation.references[0];
+
     return {
         kind: "purchase",
         purchase: {
             qbPurchaseId,
             syncToken,
-            txnDate: txnDate && /^\d{4}-\d{2}-\d{2}$/.test(txnDate) ? txnDate : null,
+            txnDate,
             total,
             vendor: optionalString(purchase.EntityRef?.name),
             customerName: optionalString(customerReference?.name),
@@ -149,12 +258,45 @@ export async function readQboPurchasesForImport(
     since: Date,
 ): Promise<QboPurchaseReadResult> {
     const rows = await getQBPurchasesSince(tokens, since);
-    const result: QboPurchaseReadResult = { purchases: [], skipped: [] };
+    return normalizeQboPurchaseRows(rows);
+}
+
+export async function readQboPurchaseChangesForImport(
+    tokens: QBTokens,
+    since: Date,
+): Promise<QboPurchaseReadResult> {
+    const rows = await getQBPurchaseChangesSince(tokens, since);
+    return normalizeQboPurchaseRows(rows);
+}
+
+function normalizeQboPurchaseRows(rows: unknown[]): QboPurchaseReadResult {
+    const result: QboPurchaseReadResult = {
+        purchases: [],
+        removed: [],
+        deactivations: [],
+        skipped: [],
+    };
 
     for (const row of rows) {
         const normalized = normalizeQboPurchase(row);
         if (normalized.kind === "purchase") {
             result.purchases.push(normalized.purchase);
+        } else if (normalized.kind === "removed") {
+            result.removed.push({
+                qbPurchaseId: normalized.qbPurchaseId,
+                qbSyncToken: normalized.qbSyncToken,
+                reason: normalized.reason,
+            });
+        } else if (normalized.kind === "ineligible") {
+            result.deactivations.push({
+                qbPurchaseId: normalized.qbPurchaseId,
+                qbSyncToken: normalized.qbSyncToken,
+                reason: normalized.reason,
+            });
+            result.skipped.push({
+                qbPurchaseId: normalized.qbPurchaseId,
+                reason: normalized.reason,
+            });
         } else {
             result.skipped.push({
                 qbPurchaseId: normalized.qbPurchaseId,
@@ -266,15 +408,27 @@ export interface QboExpenseWrite {
 }
 
 type ExpenseTransaction = {
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
     expense: {
         findUnique(args: {
             where: { qbPurchaseId: string };
-            select?: { qbSyncToken: true };
-        }): Promise<{ qbSyncToken: string | null } | null>;
-        upsert(args: {
-            where: { qbPurchaseId: string };
-            create: QboExpenseWrite;
-            update: QboExpenseWrite;
+            select: Record<string, boolean>;
+        }): Promise<{
+            id: string;
+            qbSyncToken: string | null;
+            estimateId: string;
+            amount: unknown;
+            vendor: string | null;
+            date: Date | null;
+            description: string | null;
+            status: string;
+        } | null>;
+        create(args: {
+            data: QboExpenseWrite;
+        }): Promise<unknown>;
+        update(args: {
+            where: { id: string };
+            data: Partial<QboExpenseWrite>;
         }): Promise<unknown>;
     };
 };
@@ -285,15 +439,47 @@ export interface QboExpensePersistenceClient {
 
 export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged";
 
-function isNewerQboSyncToken(current: string | null, incoming: string): boolean {
+function isIncomingQboSyncTokenCurrent(current: string | null, incoming: string): boolean {
     if (current === null) return true;
-    if (current === incoming) return false;
+    if (current === incoming) return true;
     if (/^\d+$/.test(current) && /^\d+$/.test(incoming)) {
-        return BigInt(incoming) > BigInt(current);
+        return BigInt(incoming) >= BigInt(current);
     }
     // QBO documents SyncToken as an integer string. If an unexpected legacy
     // value exists locally, a different current QBO token is still preferable.
     return true;
+}
+
+function datesEqual(left: Date | null, right: Date | null): boolean {
+    return left?.getTime() === right?.getTime();
+}
+
+function expenseMatchesQboWrite(
+    existing: Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>,
+    write: QboExpenseWrite,
+): boolean {
+    if (!existing) return false;
+    return (
+        existing.qbSyncToken === write.qbSyncToken &&
+        existing.estimateId === write.estimateId &&
+        Number(existing.amount) === write.amount &&
+        existing.vendor === write.vendor &&
+        datesEqual(existing.date, write.date) &&
+        existing.description === write.description &&
+        existing.status === write.status
+    );
+}
+
+async function lockQboExpense(
+    transaction: ExpenseTransaction,
+    qbPurchaseId: string,
+): Promise<void> {
+    // Serialize all writers for one QBO Purchase id before reading its SyncToken.
+    // The hash can collide, which only adds harmless serialization.
+    await transaction.$queryRawUnsafe(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS lock_result",
+        qbPurchaseId,
+    );
 }
 
 /**
@@ -306,34 +492,116 @@ export async function upsertQboExpense(
     write: QboExpenseWrite,
 ): Promise<QboExpenseUpsertResult> {
     return client.$transaction(async transaction => {
+        await lockQboExpense(transaction, write.qbPurchaseId);
         const existing = await transaction.expense.findUnique({
             where: { qbPurchaseId: write.qbPurchaseId },
-            select: { qbSyncToken: true },
+            select: {
+                id: true,
+                qbSyncToken: true,
+                estimateId: true,
+                amount: true,
+                vendor: true,
+                date: true,
+                description: true,
+                status: true,
+            },
         });
-        if (existing && !isNewerQboSyncToken(existing.qbSyncToken, write.qbSyncToken)) {
+        if (
+            existing &&
+            !isIncomingQboSyncTokenCurrent(existing.qbSyncToken, write.qbSyncToken)
+        ) {
+            return "unchanged";
+        }
+        if (expenseMatchesQboWrite(existing, write)) return "unchanged";
+        if (!existing) {
+            await transaction.expense.create({ data: write });
+            return "imported";
+        }
+        await transaction.expense.update({
+            where: { id: existing.id },
+            data: write,
+        });
+        return "updated";
+    });
+}
+
+export interface QboExpenseRemovalWrite {
+    qbPurchaseId: string;
+    qbSyncToken: string | null;
+    reason: string;
+    qbSyncedAt: Date;
+}
+
+export type QboExpenseRemovalResult = "removed" | "unchanged";
+
+export async function deactivateQboExpense(
+    client: QboExpensePersistenceClient,
+    removal: QboExpenseRemovalWrite,
+): Promise<QboExpenseRemovalResult> {
+    return client.$transaction(async transaction => {
+        await lockQboExpense(transaction, removal.qbPurchaseId);
+        const existing = await transaction.expense.findUnique({
+            where: { qbPurchaseId: removal.qbPurchaseId },
+            select: {
+                id: true,
+                qbSyncToken: true,
+                estimateId: true,
+                amount: true,
+                vendor: true,
+                date: true,
+                description: true,
+                status: true,
+            },
+        });
+        if (!existing) return "unchanged";
+        if (
+            removal.qbSyncToken &&
+            !isIncomingQboSyncTokenCurrent(existing.qbSyncToken, removal.qbSyncToken)
+        ) {
             return "unchanged";
         }
 
-        await transaction.expense.upsert({
-            where: { qbPurchaseId: write.qbPurchaseId },
-            create: write,
-            update: write,
+        const description = `[QuickBooks import] Removed in QBO (${removal.reason})`;
+        const qbSyncToken = removal.qbSyncToken ?? existing.qbSyncToken;
+        if (
+            Number(existing.amount) === 0 &&
+            existing.description === description &&
+            existing.qbSyncToken === qbSyncToken &&
+            existing.status === "Reviewed"
+        ) {
+            return "unchanged";
+        }
+        await transaction.expense.update({
+            where: { id: existing.id },
+            data: {
+                amount: 0,
+                description,
+                status: "Reviewed",
+                qbSyncToken: qbSyncToken ?? undefined,
+                qbSyncedAt: removal.qbSyncedAt,
+            },
         });
-        return existing ? "updated" : "imported";
+        return "removed";
     });
 }
 
 export interface QboExpenseSyncDependencies {
     getTokens(): Promise<QBTokens>;
-    readPurchases(tokens: QBTokens, since: Date): Promise<QboPurchaseReadResult>;
+    readPurchases(
+        tokens: QBTokens,
+        since: Date,
+        mode: "incremental" | "backfill",
+    ): Promise<QboPurchaseReadResult>;
     listProjects(): Promise<QboExpenseProjectCandidate[]>;
     upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
+    deactivateExpense(write: QboExpenseRemovalWrite): Promise<QboExpenseRemovalResult>;
     now(): Date;
 }
 
 export interface QboExpenseSyncResult {
     imported: number;
     updated: number;
+    removed: number;
     skipped: Array<{ qbPurchaseId: string; reason: string }>;
 }
 
@@ -365,10 +633,18 @@ async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
 function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
     return {
         getTokens: getFreshQBTokens,
-        readPurchases: readQboPurchasesForImport,
+        readPurchases: (tokens, since, mode) =>
+            mode === "incremental"
+                ? readQboPurchaseChangesForImport(tokens, since)
+                : readQboPurchasesForImport(tokens, since),
         listProjects: listInProgressProjects,
         upsertExpense: write =>
             upsertQboExpense(
+                prisma as unknown as QboExpensePersistenceClient,
+                write,
+            ),
+        deactivateExpense: write =>
+            deactivateQboExpense(
                 prisma as unknown as QboExpensePersistenceClient,
                 write,
             ),
@@ -393,7 +669,7 @@ function qboTransactionDate(txnDate: string | null): Date | null {
  * database transaction used by the upsert.
  */
 export async function syncQboExpenses(
-    options: { since: Date },
+    options: { since: Date; mode?: "incremental" | "backfill" },
     dependencies: QboExpenseSyncDependencies = createDefaultSyncDependencies(),
     runtime: { tokens?: QBTokens } = {},
 ): Promise<QboExpenseSyncResult> {
@@ -402,15 +678,25 @@ export async function syncQboExpenses(
     }
 
     const tokens = runtime.tokens ?? await dependencies.getTokens();
+    const mode = options.mode ?? "backfill";
     const [purchaseRead, projects] = await Promise.all([
-        dependencies.readPurchases(tokens, options.since),
+        dependencies.readPurchases(tokens, options.since, mode),
         dependencies.listProjects(),
     ]);
     const result: QboExpenseSyncResult = {
         imported: 0,
         updated: 0,
+        removed: 0,
         skipped: [...purchaseRead.skipped],
     };
+
+    for (const removal of [...purchaseRead.removed, ...purchaseRead.deactivations]) {
+        const outcome = await dependencies.deactivateExpense({
+            ...removal,
+            qbSyncedAt: dependencies.now(),
+        });
+        if (outcome === "removed") result.removed += 1;
+    }
 
     for (const purchase of purchaseRead.purchases) {
         const match = findActiveProjectForQboPurchase(purchase, projects);
@@ -419,6 +705,13 @@ export async function syncQboExpenses(
                 qbPurchaseId: purchase.qbPurchaseId,
                 reason: match.reason,
             });
+            const outcome = await dependencies.deactivateExpense({
+                qbPurchaseId: purchase.qbPurchaseId,
+                qbSyncToken: purchase.syncToken,
+                qbSyncedAt: dependencies.now(),
+                reason: match.reason,
+            });
+            if (outcome === "removed") result.removed += 1;
             continue;
         }
 

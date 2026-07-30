@@ -17,7 +17,7 @@ export interface QboExpenseSyncHandlerDependencies {
     isCronEnabled(): boolean;
     getFreshTokens(): Promise<QBTokens>;
     syncExpenses(
-        options: { since: Date },
+        options: { since: Date; mode: SyncMode },
         runtime: { tokens: QBTokens },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
@@ -29,7 +29,8 @@ const DEFAULT_INCREMENTAL_LOOKBACK_DAYS = 7;
 function configuredLookbackDays(): number {
     const configured = Number(process.env.QBO_EXPENSE_SYNC_LOOKBACK_DAYS);
     if (!Number.isInteger(configured)) return DEFAULT_INCREMENTAL_LOOKBACK_DAYS;
-    return Math.min(90, Math.max(1, configured));
+    // QBO CDC accepts a maximum 30-day lookback.
+    return Math.min(30, Math.max(1, configured));
 }
 
 function parseBackfillDate(value: unknown, now: Date): Date | null {
@@ -48,19 +49,13 @@ function incrementalSince(now: Date, lookbackDays: number): Date {
     return new Date(now.getTime() - lookbackDays * 86_400_000);
 }
 
-function sanitizedError(error: unknown): string {
-    return error instanceof Error
-        ? error.message.slice(0, 300)
-        : "QBO expense sync failed";
-}
-
 export function createQboExpenseSyncHandlers(
     dependencies: QboExpenseSyncHandlerDependencies,
 ) {
     async function run(mode: SyncMode, since: Date) {
         try {
             const tokens = await dependencies.getFreshTokens();
-            const result = await dependencies.syncExpenses({ since }, { tokens });
+            const result = await dependencies.syncExpenses({ since, mode }, { tokens });
             return NextResponse.json({
                 ok: true,
                 mode,
@@ -74,8 +69,12 @@ export function createQboExpenseSyncHandlers(
                     { status: 503 },
                 );
             }
+            console.error(
+                "QBO expense sync failed",
+                error instanceof Error ? error.name : "UnknownError",
+            );
             return NextResponse.json(
-                { ok: false, reason: sanitizedError(error) },
+                { ok: false, reason: "sync-failed" },
                 { status: 500 },
             );
         }

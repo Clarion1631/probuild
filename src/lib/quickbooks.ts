@@ -524,6 +524,72 @@ export async function getQBPurchasesSince(tokens: QBTokens, since: Date): Promis
     return purchases;
 }
 
+/**
+ * Read Purchase rows changed since a timestamp using QBO Change Data Capture.
+ * Unlike a TxnDate query, CDC catches newly entered backdated purchases,
+ * corrections, voids, refunds, and deletion tombstones. QBO caps CDC lookback
+ * at 30 days and returns at most 1,000 entities, so truncated responses fail
+ * visibly instead of silently leaving local job costs stale.
+ */
+export async function getQBPurchaseChangesSince(
+    tokens: QBTokens,
+    since: Date,
+): Promise<any[]> {
+    if (!Number.isFinite(since.getTime())) {
+        throw new Error("QBO Purchase CDC requires a valid since date");
+    }
+
+    const params = new URLSearchParams({
+        entities: "Purchase",
+        changedSince: since.toISOString(),
+        minorversion: "73",
+    });
+    const response = await fetch(
+        `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
+        {
+            headers: {
+                Authorization: `Bearer ${tokens.accessToken}`,
+                Accept: "application/json",
+            },
+        },
+    );
+    if (!response.ok) {
+        throw new Error(`QBO Purchase CDC failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const cdcResponses = Array.isArray(payload?.CDCResponse)
+        ? payload.CDCResponse
+        : [];
+    const queryResponses = cdcResponses.flatMap((entry: any) =>
+        Array.isArray(entry?.QueryResponse) ? entry.QueryResponse : [],
+    );
+    const purchases: any[] = [];
+    for (const queryResponse of queryResponses) {
+        const page = Array.isArray(queryResponse?.Purchase)
+            ? queryResponse.Purchase
+            : [];
+        const totalCount = Number(queryResponse?.totalCount ?? page.length);
+        if (
+            page.length >= 1000 ||
+            (Number.isFinite(totalCount) && totalCount > page.length)
+        ) {
+            throw new Error("QBO Purchase CDC response was truncated");
+        }
+        purchases.push(...page);
+    }
+
+    // Keep the last representation if QBO includes the same id more than once.
+    const byId = new Map<string, any>();
+    const withoutId: any[] = [];
+    for (const purchase of purchases) {
+        const id = purchase?.Id === undefined ? "" : String(purchase.Id);
+        if (id) byId.set(id, purchase);
+        else withoutId.push(purchase);
+    }
+    return [...byId.values(), ...withoutId];
+}
+
 /** Posted customer payments (money in) from the books. */
 export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: number) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
