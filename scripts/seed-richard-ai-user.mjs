@@ -25,15 +25,23 @@ const prisma = new PrismaClient({
 try {
   const user = await prisma.user.upsert({
     where: { email: RICHARD_AI_EMAIL },
+    // DISABLED, deliberately. This row exists ONLY so MCP writes have something to
+    // attribute to; it must never be able to sign in. auth.ts admits any existing
+    // user whose status is not DISABLED (and even auto-activates PENDING), so an
+    // ACTIVATED row here is a staff login waiting for someone to create the matching
+    // Google identity — with FINANCE it would carry estimates, invoices, financial
+    // reports and change orders. DISABLED also keeps it out of crew resolution,
+    // which selects on ACTIVATED regardless of role. Attribution is unaffected:
+    // foreign keys reference the row id, not its status.
     update: {
       name: "Richard's AI",
-      status: "ACTIVATED",
+      status: "DISABLED",
       role: "FINANCE",
     },
     create: {
       email: RICHARD_AI_EMAIL,
       name: "Richard's AI",
-      status: "ACTIVATED",
+      status: "DISABLED",
       role: "FINANCE",
     },
     select: { id: true, email: true, name: true, status: true, role: true },

@@ -17,6 +17,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
+import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
@@ -1876,46 +1877,6 @@ export async function findOrCreateClientThread(projectId: string) {
     }
     if (!thread) throw new Error(`Failed to find or create MessageThread for project ${projectId}`);
     return thread;
-}
-
-export async function logActivity({
-    projectId,
-    leadId,
-    actorType,
-    actorName,
-    action,
-    entityType,
-    entityId,
-    entityName,
-    metadata,
-}: {
-    projectId?: string | null;
-    leadId?: string | null;
-    actorType: string;
-    actorName: string;
-    action: string;
-    entityType?: string;
-    entityId?: string;
-    entityName?: string;
-    metadata?: Record<string, unknown>;
-}) {
-    try {
-        await prisma.activityLog.create({
-            data: {
-                projectId: projectId ?? null,
-                leadId: leadId ?? null,
-                actorType,
-                actorName,
-                action,
-                entityType: entityType ?? null,
-                entityId: entityId ?? null,
-                entityName: entityName ?? null,
-                metadata: metadata ? JSON.stringify(metadata) : null,
-            },
-        });
-    } catch (err) {
-        console.error("[logActivity] Failed:", err);
-    }
 }
 
 export async function logPortalVisit(projectId: string, clientName: string) {
@@ -4106,7 +4067,7 @@ async function assertActiveStaff(): Promise<any> {
     throw new Error("Unauthorized");
 }
 
-async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings") {
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
@@ -4217,15 +4178,96 @@ async function assertInvoicePortalAccess(): Promise<string | null> {
     return resolveSessionClientId();
 }
 
-async function assertEstimateSendPermission(mcpSecret?: string) {
-    if (mcpSecret) {
-        const supplied = createHash("sha256").update(mcpSecret).digest();
-        for (const configuredSecret of [process.env.MCP_SECRET, process.env.MCP_SECRET_RICHARD]) {
-            const configured = createHash("sha256").update(configuredSecret ?? "").digest();
-            if (configuredSecret && timingSafeEqual(supplied, configured)) return;
+export type SendActor = { type: "SYSTEM" | "TEAM"; name: string };
+
+/**
+ * Actor plus the staff identity behind it. `user` is null for machine callers,
+ * which are company-wide by design; for humans it carries projectAccess so the
+ * caller can be scoped to the specific document AFTER it is loaded. Permission
+ * alone is not authorization: `contracts`/`estimates` says WHAT you may do, not
+ * WHICH job you may do it to.
+ */
+type SendPrincipal = SendActor & { user: any | null };
+
+/**
+ * Authorize a customer-facing document send, and return the actor PROVEN by
+ * whatever authenticated the call.
+ *
+ * The actor must never be its own argument. This module is "use server", so
+ * every parameter is attacker-controlled: a caller could authenticate as itself
+ * and then label the audit trail as somebody else. Deriving the label from the
+ * secret that actually matched makes that impossible.
+ */
+async function assertDocumentSendPermission(
+    mcpSecret: string | undefined,
+    permission: "estimates" | "contracts",
+): Promise<SendPrincipal> {
+    // Strict presence check, not truthiness. An empty string — or an
+    // attacker-supplied null/false/0 at runtime — must NOT be treated as
+    // "omitted", or a bad machine token silently falls through to the session
+    // path and rides in on whatever staff cookie happens to be attached.
+    // ONLY undefined counts as omitted. Excluding null here as well was the bug:
+    // it let an explicitly-supplied null skip validation and reach the staff-session
+    // path — precisely the fallback this check exists to prevent.
+    if (mcpSecret !== undefined) {
+        if (typeof mcpSecret !== "string" || mcpSecret.length === 0) {
+            throw new Error("Unauthorized");
         }
+        const supplied = createHash("sha256").update(mcpSecret).digest();
+        const candidates: Array<[string, string | undefined]> = [
+            ["justin-ai", process.env.MCP_SECRET],
+            ["richard-ai", process.env.MCP_SECRET_RICHARD],
+        ];
+        for (const [label, configuredSecret] of candidates) {
+            const configured = createHash("sha256").update(configuredSecret ?? "").digest();
+            if (configuredSecret && timingSafeEqual(supplied, configured)) {
+                return { type: "SYSTEM", name: "SYSTEM:" + label, user: null };
+            }
+        }
+        // A supplied-but-wrong secret must NOT fall through to the session path:
+        // that would let a bad machine token ride in on a stray staff cookie.
+        throw new Error("Unauthorized");
     }
-    await assertEstimatePermission();
+    const user = await assertStaffPermission(permission);
+    return { type: "TEAM", name: user?.name || user?.email || "Team", user };
+}
+
+/**
+ * Horizontal-access check for a loaded document. A remotely invoked Server Action
+ * cannot lean on the page layout that normally gates project access, so without
+ * this a non-admin holding `contracts` (or FINANCE holding `estimates`) could send
+ * a document belonging to a job they have no access to, just by knowing its id.
+ */
+function assertSendScope(
+    principal: SendPrincipal,
+    scope: { projectId?: string | null; leadId?: string | null },
+) {
+    // Fail CLOSED on an ownerless document, before the machine exemption. Both
+    // ownership columns are optional in the schema, and an ownerless estimate can
+    // still be emailed via overrideEmail — so "no project and no lead" previously
+    // fell straight through this function and was authorized by default.
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This document is not attached to a project or lead, so access cannot be checked");
+    }
+    if (!principal.user) return; // machine callers are company-wide by design
+    if (scope.projectId) {
+        if (!canAccessProject(principal.user, scope.projectId)) throw new Error("Forbidden");
+        return;
+    }
+    if (!hasPermission(principal.user, "leadAccess")) throw new Error("Forbidden");
+}
+
+async function assertEstimateSendPermission(mcpSecret?: string): Promise<SendPrincipal> {
+    return assertDocumentSendPermission(mcpSecret, "estimates");
+}
+
+/**
+ * Contract sends had NO authorization at all: the Server Action went straight to
+ * reading and mutating the contract, and Server Actions are remotely invokable.
+ * Mirrors the estimate path so both are gated the same way.
+ */
+async function assertContractSendPermission(mcpSecret?: string): Promise<SendPrincipal> {
+    return assertDocumentSendPermission(mcpSecret, "contracts");
 }
 
 export async function addInvoiceMilestone(
@@ -5093,9 +5135,9 @@ export async function sendEstimateToClient(
     customMessage?: string,
     capturedPdfUrl?: string,
     mcpSecret?: string,
-    mcpActorLabel?: "justin-ai" | "richard-ai",
 ): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
-    await assertEstimateSendPermission(mcpSecret);
+    // The actor is DERIVED from what authenticated this call, never passed in.
+    const sendActor = await assertEstimateSendPermission(mcpSecret);
     try {
     // --- Server-side CC validation ---
     const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -5131,6 +5173,7 @@ export async function sendEstimateToClient(
     });
 
     if (!estimate) return { success: false, error: "Estimate not found" };
+    assertSendScope(sendActor, { projectId: estimate.project?.id ?? null, leadId: estimate.lead?.id ?? null });
 
     const schedules = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
     const unpaidSchedules = schedules.filter(s => s.status !== "Paid");
@@ -5391,14 +5434,12 @@ export async function sendEstimateToClient(
                 }).catch(() => {});
             }
         }
-        const session = await getServerSession(authOptions).catch(() => null);
         await logActivity({
             projectId: estimate.project?.id,
             leadId: estimate.lead?.id,
-            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
-            actorName: mcpActorLabel
-                ? `SYSTEM:${mcpActorLabel}`
-                : session?.user?.name || session?.user?.email || "Team",
+            // Trusted actor from assertEstimateSendPermission, not a caller argument.
+            actorType: sendActor.type,
+            actorName: sendActor.name,
             action: "sent_estimate",
             entityType: "estimate",
             entityId: estimateId,
@@ -5917,8 +5958,10 @@ export async function sendContractToClient(
     contractId: string,
     ccOverride?: string[],
     expectedFingerprint?: string,
-    mcpActorLabel?: "justin-ai" | "richard-ai",
+    mcpSecret?: string,
 ) {
+    // The actor is DERIVED from what authenticated this call, never passed in.
+    const sendActor = await assertContractSendPermission(mcpSecret);
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
         include: {
@@ -5928,6 +5971,9 @@ export async function sendContractToClient(
     });
 
     if (!contract) throw new Error("Contract not found");
+    // Permission said WHAT; this says WHICH. Runs after the load, because the
+    // document is what tells us which project/lead the caller is reaching into.
+    assertSendScope(sendActor, { projectId: contract.projectId, leadId: contract.leadId });
 
     // MCP confirm-token guard: the caller previewed a specific document to the user and
     // binds that snapshot's hash here. If the contract changed between their preview and
@@ -6052,8 +6098,8 @@ export async function sendContractToClient(
     if (contract.projectId) {
         await logActivity({
             projectId: contract.projectId,
-            actorType: mcpActorLabel ? "SYSTEM" : "TEAM",
-            actorName: mcpActorLabel ? `SYSTEM:${mcpActorLabel}` : companyName,
+            actorType: sendActor.type,
+            actorName: sendActor.name,
             action: "sent_contract",
             entityType: "contract",
             entityId: contractId,
