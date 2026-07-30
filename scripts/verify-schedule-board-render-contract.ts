@@ -31,6 +31,7 @@ const layoutSource = src("../src/app/company-dashboard/schedule-board/useBarLayo
 const dragVisualSource = src("../src/app/company-dashboard/schedule-board/dragVisualLayer.ts");
 const cellActivationSource = src("../src/app/company-dashboard/schedule-board/emptyCellCreation.ts");
 const popoverSource = src("../src/app/company-dashboard/schedule-board/FloatingPopover.tsx");
+const floatingLayerSource = src("../src/components/FloatingLayer.tsx");
 const actionsSource = src("../src/lib/actions.ts");
 const coreSource = src("../src/lib/schedule-core.ts");
 const taskCoreSource = src("../src/lib/schedule-task-core.ts");
@@ -287,12 +288,18 @@ const setTaskCrewBody = coreSource.slice(coreSource.indexOf("async function runS
 assert.match(setTaskCrewBody, /toAdd\.map\(id => byId\.get\(id\)!\)\.filter\(u => u\.status !== "ACTIVATED"\)/);
 
 // ── Item 3: floating popovers escape clipping via a portal ──
-assert.match(popoverSource, /createPortal\(/);
-assert.match(popoverSource, /document\.body/);
-assert.match(popoverSource, /event\.key !== "Escape"/);
+// PR #272 consolidated every popover onto the shared FloatingLayer primitive, so
+// FloatingPopover is now a thin wrapper: the portal, the document.body target and
+// the Escape handler all live one layer down. The invariant is unchanged — assert
+// it where it now lives, and assert the delegation so the wrapper can't quietly
+// start rendering inline again.
+assert.match(popoverSource, /FloatingLayer/);
+assert.match(floatingLayerSource, /createPortal\(/);
+assert.match(floatingLayerSource, /document\.body/);
+assert.match(floatingLayerSource, /event\.key !== "Escape"/);
 // anchorRef is now optional (item 1 — an anchorPoint-only context menu has
 // no trigger element to refocus), hence the extra `?.` before `.current`.
-assert.match(popoverSource, /anchorRef\?\.current\?\.focus\(\)/);
+assert.match(floatingLayerSource, /anchorRef\?\.current\?\.focus\(\)/);
 // Interactive popovers expose an explicit close button, while non-interactive
 // hover cards do not. The button sits before/outside contentRef so it never
 // participates in the content ResizeObserver's measurements.
