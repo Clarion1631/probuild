@@ -77,8 +77,16 @@ export async function attachQboReceipt(
         data: { receiptUrl: publicUrl },
     });
     if (count === 0) {
-        // A manual upload raced us and won — drop the now-orphaned copy.
-        await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]).catch(() => {});
+        // Someone else linked a receipt first. Concurrent QBO attaches share
+        // this deterministic path, so only clean up when the winner's URL is a
+        // DIFFERENT object (a manual upload) — never delete what's now linked.
+        const current = await prisma.expense.findUnique({
+            where: { id: expense.id },
+            select: { receiptUrl: true },
+        });
+        if (current?.receiptUrl !== publicUrl) {
+            await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]).catch(() => {});
+        }
         return "already-linked";
     }
     return "attached";

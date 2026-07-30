@@ -5,10 +5,16 @@ import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 const MAX_RECEIPT_BYTES = 10 * 1024 * 1024; // 10 MB
 
+// Explicit allowlist compared on the MIME essence ("image/svg+xml; charset=x"
+// must not sneak past a startsWith check) — receipts are photos or PDFs.
+const ALLOWED_RECEIPT_TYPES = new Set([
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    "image/heic", "image/heif", "application/pdf",
+]);
+
 function isAllowedReceiptType(mimeType: string): boolean {
-    // SVG is an active format (scripts) — receipts are photos or PDFs.
-    if (mimeType === "image/svg+xml") return false;
-    return mimeType.startsWith("image/") || mimeType === "application/pdf";
+    const essence = mimeType.split(";")[0].trim().toLowerCase();
+    return ALLOWED_RECEIPT_TYPES.has(essence);
 }
 
 // Receipt uploads are ProBuild-owned metadata, unlike amounts/status which are
@@ -27,7 +33,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             select: { id: true, estimate: { select: { projectId: true } } },
         });
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
-        if (expense.estimate?.projectId && !canAccessProject(user, expense.estimate.projectId)) {
+        // Fail closed: an expense whose estimate has no project cannot be
+        // authorized against project access, so nobody uploads to it.
+        const projectId = expense.estimate?.projectId;
+        if (!projectId || !canAccessProject(user, projectId)) {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
