@@ -10655,10 +10655,16 @@ export async function updateSelectionItemNote(
             }),
         assertAccess: assertDecisionActorAccess,
         updateNote: async (id, normalizedNote) => {
-            await prisma.selectionProposal.update({
-                where: { id },
+            // CAS on deletedAt: the findItem check above is non-atomic with
+            // this write, so a concurrent soft-delete must make the update
+            // match zero rows rather than land a note on a deleted item.
+            const updated = await prisma.selectionProposal.updateMany({
+                where: { id, deletedAt: null },
                 data: { clientNote: normalizedNote },
             });
+            if (updated.count === 0) {
+                throw new Error("Item not found");
+            }
         },
         revalidate: (projectId) => {
             revalidatePath(`/projects/${projectId}/selections`);
