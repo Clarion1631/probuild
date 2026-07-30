@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import StatusBadge, { StatusType } from "@/components/StatusBadge";
 import PortalPayButton from "@/components/PortalPayButton";
 import PortalProjectTabs, { type PortalTab } from "@/components/PortalProjectTabs";
-import { getPortalVisibility } from "@/lib/actions";
+import { getPortalVisibility, getUnreadSelectionThreadCountForPortal } from "@/lib/actions";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
 import { resolveSessionClientId } from "@/lib/portal-auth";
@@ -89,7 +89,7 @@ export default async function PortalProjectDetail(props: {
     if (!project) return notFound();
 
     const visibility = await getPortalVisibility(projectId);
-    const [settings, trackerData, updatesFeed, sharedRooms] = await Promise.all([
+    const [settings, trackerData, updatesFeed, sharedRooms, unreadSelectionThreadCount] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
         visibility.showSchedule
             ? getPortalProjectTracker(projectId)
@@ -102,6 +102,9 @@ export default async function PortalProjectDetail(props: {
             select: { id: true, name: true, shareToken: true, thumbnail: true, updatedAt: true },
             orderBy: { updatedAt: "desc" },
         }),
+        visibility.showSelections
+            ? getUnreadSelectionThreadCountForPortal(projectId)
+            : Promise.resolve(0),
     ]);
 
     if (!visibility.isPortalEnabled) {
@@ -156,7 +159,7 @@ export default async function PortalProjectDetail(props: {
         { id: "invoices", label: "Invoices", count: invoiceCount, visible: visibility.showInvoices && invoiceCount > 0 },
         { id: "updates", label: "Updates", count: updateCount || undefined, visible: visibility.showDailyLogs },
         { id: "files", label: "Files", visible: visibility.showFiles },
-        { id: "selections", label: "Selections", visible: visibility.showSelections },
+        { id: "selections", label: "Selections", count: unreadSelectionThreadCount || undefined, visible: visibility.showSelections },
         { id: "designs", label: "Designs", visible: visibility.showMoodBoards || sharedRooms.length > 0 },
         { id: "change-orders", label: "Change Orders", count: changeOrderCount, visible: showChangeOrders && changeOrderCount > 0 },
     ];

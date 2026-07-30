@@ -10656,17 +10656,26 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => stripProposalPrice(normalizeProposal(c))) })),
-        unsorted: unsorted.map((p) => stripProposalPrice(normalizeProposal(p))),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripProposalPrice(normalizeProposal(c)), false)) })),
+        unsorted: unsorted.map((p) => withThreadSummary(stripProposalPrice(normalizeProposal(p)), false)),
     };
+}
+
+/** Portal Selections tab badge count — unread TEAM comments across every
+ * (non-deleted) item on the project. */
+export async function getUnreadSelectionThreadCountForPortal(projectId: string): Promise<number> {
+    return prisma.selectionItemComment.count({
+        where: { authorType: "TEAM", readByClientAt: null, proposal: { projectId, deletedAt: null } },
+    });
 }
 
 // Attaches parsed comments + the staff-side unread count to a candidate for

@@ -3,6 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import { canAccessProject } from "../src/lib/permissions";
 import { postSelectionItemComment } from "../src/lib/selection-item-thread-core";
+import { createComment } from "../src/lib/selection-item-thread-dependencies";
 
 const prisma = new PrismaClient();
 const run = `selection-threads-${process.pid}-${Date.now()}`;
@@ -257,5 +258,135 @@ test.describe.serial("selection item discussion threads", () => {
     });
     expect(staffComment.readByTeamAt).not.toBeNull();
     expect(staffComment.readByClientAt).toBeNull();
+  });
+
+  test("client sees the staff reply and pill on the portal, expanding marks it read", async ({ browser }) => {
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    // ids.staffCandidate already carries the TEAM reply posted by the
+    // preceding "staff replies" test — unread for the client side.
+    const card = page.getByTestId(`selection-item-${ids.staffCandidate}`);
+    await expect(card.getByTestId("selection-thread-unread-pill")).toBeVisible();
+    await card.getByTestId("selection-thread-toggle").click();
+    await expect(card.getByText("We'll swap it for the warmer finish.")).toBeVisible();
+
+    const staffComment = await prisma.selectionItemComment.findFirstOrThrow({
+      where: { proposalId: ids.staffCandidate, authorType: "TEAM" },
+    });
+    await expect
+      .poll(async () => {
+        const row = await prisma.selectionItemComment.findUniqueOrThrow({ where: { id: staffComment.id } });
+        return row.readByClientAt;
+      })
+      .not.toBeNull();
+
+    await page.reload();
+    await expect(page.getByTestId(`selection-item-${ids.staffCandidate}`).getByTestId("selection-thread-unread-pill")).toHaveCount(0);
+
+    await context.close();
+  });
+
+  // Attachment round-trip. This sandbox has no Supabase Storage credentials
+  // (and must never be pointed at production's — see docs/TESTING.md), so a
+  // real multipart upload through saveProjectFile() can't be exercised here.
+  // What IS provable without Storage:
+  //   - denied and invalid-extension posts short-circuit before any upload
+  //     attempt and leave zero ProjectFile rows (real HTTP route, below).
+  //   - the DB write trusts only the upload result's canonical {id,name,url}
+  //     shape (seam test against the real createComment, with a fake
+  //     uploadAttachments standing in for saveProjectFile).
+  // CI's Playwright job has real Storage secrets and can exercise the full
+  // multipart path end-to-end; this gap should be confirmed there or in a
+  // manually configured environment before this ships.
+
+  test("a denied actor with a file attached creates zero ProjectFile rows", async ({ browser }) => {
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    const beforeFiles = await prisma.projectFile.count({ where: { projectId: ids.otherProject } });
+    const beforeComments = await prisma.selectionItemComment.count({ where: { proposalId: ids.otherCandidate } });
+
+    const response = await page.request.post("/api/selections/item-comments", {
+      multipart: {
+        itemId: ids.otherCandidate,
+        body: "Trying to post on a project that isn't mine",
+        files: {
+          name: "swatch.pdf",
+          mimeType: "application/pdf",
+          buffer: Buffer.from("fake pdf bytes"),
+        },
+      },
+    });
+    expect(response.status()).toBe(403);
+
+    expect(await prisma.projectFile.count({ where: { projectId: ids.otherProject } })).toBe(beforeFiles);
+    expect(await prisma.selectionItemComment.count({ where: { proposalId: ids.otherCandidate } })).toBe(beforeComments);
+
+    await context.close();
+  });
+
+  test("an invalid file extension is rejected before any upload; zero ProjectFile rows", async ({ page }) => {
+    const beforeFiles = await prisma.projectFile.count({ where: { projectId: ids.project } });
+    const beforeComments = await prisma.selectionItemComment.count({ where: { proposalId: ids.candidate } });
+
+    const response = await page.request.post("/api/selections/item-comments", {
+      multipart: {
+        itemId: ids.candidate,
+        body: "Attaching a disallowed file type",
+        files: {
+          name: "installer.exe",
+          mimeType: "application/octet-stream",
+          buffer: Buffer.from("fake exe bytes"),
+        },
+      },
+    });
+    expect(response.status()).toBe(400);
+    const payload = await response.json();
+    expect(payload.error).toMatch(/File type not allowed/);
+
+    expect(await prisma.projectFile.count({ where: { projectId: ids.project } })).toBe(beforeFiles);
+    expect(await prisma.selectionItemComment.count({ where: { proposalId: ids.candidate } })).toBe(beforeComments);
+  });
+
+  test("stored attachment JSON is the canonical upload-result shape, not client-supplied data", async () => {
+    const fakeAttachments = [{ id: "fake-file-1", name: "swatch.pdf", url: "https://cdn.example.com/swatch.pdf" }];
+
+    const comment = await postSelectionItemComment(
+      ids.staffCandidate,
+      "See the attached swatch",
+      [{ name: "swatch.pdf", buffer: Buffer.from("test"), mimeType: "application/pdf", size: 4 }],
+      {
+        findItem: (id) =>
+          prisma.selectionProposal.findUnique({
+            where: { id },
+            select: { id: true, projectId: true, deletedAt: true, name: true },
+          }),
+        assertAccess: async () => ({ isStaff: true, clientId: null, userId: null, actorName: "Team" }),
+        // Stands in for saveProjectFile — proves createComment (the real
+        // production DB write) persists exactly what the upload step
+        // returns, nothing client-supplied.
+        uploadAttachments: async () => fakeAttachments,
+        createComment,
+        notify: async () => {},
+        revalidate: () => {},
+      },
+    );
+
+    expect(JSON.parse(comment.attachments!)).toEqual(fakeAttachments);
+    const stored = await prisma.selectionItemComment.findUniqueOrThrow({ where: { id: comment.id } });
+    expect(JSON.parse(stored.attachments!)).toEqual(fakeAttachments);
   });
 });

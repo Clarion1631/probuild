@@ -140,6 +140,7 @@ export function SelectionItemThread({
                                         {comment.attachments.map((attachment) => (
                                             <a
                                                 key={attachment.id}
+                                                data-testid={`selection-thread-attachment-${attachment.id}`}
                                                 href={attachment.url}
                                                 target="_blank"
                                                 rel="noopener noreferrer"
@@ -190,6 +191,7 @@ export function SelectionItemThread({
                                 <input
                                     type="file"
                                     multiple
+                                    data-testid="selection-thread-attach"
                                     className="hidden"
                                     onChange={handleFilePick}
                                     disabled={submitting || files.length >= MAX_FILES}

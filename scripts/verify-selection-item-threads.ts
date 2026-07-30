@@ -46,10 +46,27 @@ assert.ok(
 
 // CAS guard: the row-lock no-op write on deletedAt must exist in the
 // production createComment implementation.
+const dependencies = readFileSync(
+  join(process.cwd(), "src/lib/selection-item-thread-dependencies.ts"),
+  "utf8",
+);
 assert.match(
-  route,
+  dependencies,
   /where:\s*\{\s*id:\s*item\.id,\s*deletedAt:\s*null\s*\}/,
   "createComment must lock the proposal row with a deletedAt CAS guard before creating the comment",
+);
+
+// Provenance: CLIENT-posted attachments must keep uploadedByClient: true.
+assert.match(
+  dependencies,
+  /uploadedByClient:\s*!actor\.isStaff,/,
+  "uploadAttachments must pass uploadedByClient through to saveProjectFile",
+);
+const projectFiles = readFileSync(join(process.cwd(), "src/lib/project-files.ts"), "utf8");
+assert.match(
+  projectFiles,
+  /uploadedByClient:\s*input\.uploadedByClient\s*\?\?\s*false,/,
+  "saveProjectFile must persist the uploadedByClient input",
 );
 
 async function verifyRejectingAccessPreventsWrite(): Promise<void> {
