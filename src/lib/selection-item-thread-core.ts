@@ -45,6 +45,11 @@ export type ThreadItem = {
     projectId: string;
     deletedAt: Date | null;
     name: string;
+    // Null when the item is Unsorted. Carried through so createComment can
+    // re-guard against a concurrent decision soft-delete inside its own
+    // transaction (findThreadItem's check and the transaction commit are not
+    // atomic with each other).
+    decisionId: string | null;
 };
 
 export type ThreadActor = {

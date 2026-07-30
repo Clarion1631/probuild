@@ -189,6 +189,53 @@ assert.ok(
   "withThreadSummary's input type must no longer require authorUserId/authorClientId — they're not sent to the browser",
 );
 
+// ── Codex review round 2 follow-ups ─────────────────────────────────────
+
+// Item 1 (ordering): the route must no longer pre-check file count/size
+// before auth — that's the core's job now, strictly after findItem +
+// assertAccess. req.formData() already materializes the whole body
+// regardless, so there was no pre-buffer benefit to checking it earlier.
+assert.ok(
+  !route.includes("SELECTION_ITEM_COMMENT_MAX_FILES") && !route.includes("SELECTION_ITEM_COMMENT_MAX_FILE_BYTES"),
+  "the route must not re-implement file-count/size validation ahead of the core's post-auth checks",
+);
+assert.match(
+  route,
+  /await req\.formData\(\)/,
+  "the route must still parse the multipart body",
+);
+
+// Item 2 (TOCTOU): createComment's transaction must re-guard the parent
+// Decision's soft-delete state, not just the proposal's, using the same
+// row-lock-via-conditional-no-op-write pattern.
+assert.match(
+  dependencies,
+  /if \(item\.decisionId\) \{[\s\S]{0,300}tx\.decision\.updateMany\(\{[\s\S]{0,200}deletedAt:\s*null[\s\S]{0,200}decisionLocked\.count === 0/,
+  "createComment must CAS-lock the parent decision (when set) inside the same transaction as the proposal lock",
+);
+assert.match(
+  actions,
+  /proposal:\s*visibleProposal/,
+  "markSelectionItemThreadRead's markRead must filter out proposals whose parent decision is soft-deleted",
+);
+
+// Item 3 (response minimization): the route must return exactly the public
+// comment shape, not the raw DB row (which carries authorUserId/
+// authorClientId/readByTeamAt/readByClientAt/proposalId).
+assert.match(
+  route,
+  /comment:\s*\{\s*id:\s*comment\.id,\s*authorType:\s*comment\.authorType,\s*authorName:\s*comment\.authorName,\s*body:\s*comment\.body,\s*attachments:\s*parseThreadAttachments\(comment\.attachments\),\s*createdAt:\s*comment\.createdAt,\s*\}/,
+  "the POST response must map to exactly the six public comment fields",
+);
+
+// Item 6 (malformed multipart): a formData() parse failure must return a
+// safe 400, not fall through to the generic 500 branch.
+assert.match(
+  route,
+  /try \{[\s\S]{0,600}formData = await req\.formData\(\);[\s\S]{0,50}\} catch \{[\s\S]{0,100}status:\s*400/,
+  "a malformed multipart body must be caught and mapped to 400, not an uncaught 500",
+);
+
 async function verifyRejectingAccessPreventsWrite(): Promise<void> {
   let uploadCalls = 0;
   let createCalls = 0;

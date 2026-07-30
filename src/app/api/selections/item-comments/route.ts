@@ -3,10 +3,8 @@ import { assertDecisionActorAccess } from "@/lib/actions";
 import { PortalAuthError } from "@/lib/permissions";
 import { mimeTypeForFileName } from "@/lib/project-files";
 import {
+    parseThreadAttachments,
     postSelectionItemComment,
-    SELECTION_ITEM_COMMENT_MAX_FILES,
-    SELECTION_ITEM_COMMENT_MAX_FILE_BYTES,
-    SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES,
     ThreadNotFoundError,
     ThreadValidationError,
     type ThreadFileCandidate,
@@ -22,7 +20,17 @@ import {
 
 export async function POST(req: NextRequest) {
     try {
-        const formData = await req.formData();
+        let formData;
+        try {
+            // Vercel caps serverless function request bodies at 4.5MB — that
+            // platform limit is the effective outer bound on this parse; a
+            // request that exceeds it never reaches this line at all (the
+            // platform rejects it upstream). Anything under that ceiling
+            // that's still malformed multipart lands here as a parse error.
+            formData = await req.formData();
+        } catch {
+            return NextResponse.json({ error: "Invalid form data." }, { status: 400 });
+        }
         const itemId = formData.get("itemId") as string | null;
         const body = (formData.get("body") as string | null) ?? "";
         const fileEntries = formData.getAll("files").filter((f): f is File => f instanceof File && f.size > 0);
@@ -31,28 +39,13 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "itemId required" }, { status: 400 });
         }
 
-        // Enforce count/size from file METADATA before buffering any content
-        // into memory — file.size is available on the File object without
-        // reading its bytes. The core repeats these checks (defense in
-        // depth, and the seam tests exercise it directly), but there's no
-        // reason to buffer a batch that's already known to be oversized.
-        if (fileEntries.length > SELECTION_ITEM_COMMENT_MAX_FILES) {
-            return NextResponse.json(
-                { error: `You can attach up to ${SELECTION_ITEM_COMMENT_MAX_FILES} files at a time.` },
-                { status: 400 },
-            );
-        }
-        let totalMetadataBytes = 0;
-        for (const file of fileEntries) {
-            if (file.size > SELECTION_ITEM_COMMENT_MAX_FILE_BYTES) {
-                return NextResponse.json({ error: `${file.name} is too large (4 MB max).` }, { status: 400 });
-            }
-            totalMetadataBytes += file.size;
-        }
-        if (totalMetadataBytes + Buffer.byteLength(body, "utf8") > SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES) {
-            return NextResponse.json({ error: "Attachments plus message are too large (4 MB total max)." }, { status: 400 });
-        }
-
+        // File-count/size and body-length validation is the core's job, run
+        // strictly AFTER findItem + assertAccess (postSelectionItemComment's
+        // documented ordering) — checking it here first would leak
+        // validation detail to an anonymous/foreign caller before they've
+        // been authorized at all. req.formData() has also already
+        // materialized the whole body by this point, so there is no
+        // pre-buffering benefit to checking file metadata before this line.
         const files: ThreadFileCandidate[] = await Promise.all(
             fileEntries.map(async (file) => ({
                 name: file.name,
@@ -74,7 +67,22 @@ export async function POST(req: NextRequest) {
             revalidate,
         });
 
-        return NextResponse.json({ comment }, { status: 201 });
+        // Public shape only — exactly the fields the staff/portal loaders
+        // expose (SelectionItemThreadCommentView); internal ids and the
+        // opposite side's read timestamps never leave the server.
+        return NextResponse.json(
+            {
+                comment: {
+                    id: comment.id,
+                    authorType: comment.authorType,
+                    authorName: comment.authorName,
+                    body: comment.body,
+                    attachments: parseThreadAttachments(comment.attachments),
+                    createdAt: comment.createdAt,
+                },
+            },
+            { status: 201 },
+        );
     } catch (err) {
         if (err instanceof ThreadNotFoundError) {
             return NextResponse.json({ error: err.message }, { status: 404 });

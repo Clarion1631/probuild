@@ -49,10 +49,14 @@ export function SelectionItemThread({
     const [, startMarkRead] = useTransition();
     const previousUnreadCount = useRef(unreadCount);
 
-    // If the server-reported unread count goes UP (a new message arrived),
-    // the optimistic local override must not keep hiding the pill.
+    // Reset the optimistic override whenever the server-reported count
+    // CHANGES at all (not just when it goes up) — a drop to the value our
+    // own mark-read produced is harmless to reset (unreadCount is already 0
+    // there, so the pill stays hidden either way), and this is what makes a
+    // later, unrelated re-render pick up a genuinely fresh count instead of
+    // trusting a stale local override indefinitely.
     useEffect(() => {
-        if (unreadCount > previousUnreadCount.current) {
+        if (unreadCount !== previousUnreadCount.current) {
             setLocallyRead(false);
         }
         previousUnreadCount.current = unreadCount;
@@ -71,8 +75,11 @@ export function SelectionItemThread({
                     await markSelectionItemThreadRead(itemId, comments.map((c) => c.id));
                     onChanged();
                 } catch {
-                    // no-op — best-effort, a failed mark-read isn't worth
-                    // surfacing to the viewer.
+                    // The mark-read failed — the pill must not stay
+                    // incorrectly hidden with no way to recover (unreadCount
+                    // itself won't have changed, so the effect above won't
+                    // fire on its own).
+                    setLocallyRead(false);
                 }
             });
         }

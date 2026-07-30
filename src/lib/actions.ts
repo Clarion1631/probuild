@@ -10820,14 +10820,20 @@ export async function markSelectionItemThreadRead(itemId: string, seenCommentIds
         findItem: findThreadItem,
         assertAccess: assertDecisionActorAccess,
         markRead: async (proposalId, seenIds, isStaff) => {
+            // Mirrors the decision-soft-delete guard in createComment
+            // (selection-item-thread-dependencies.ts): findThreadItem's
+            // check up front and this write are not atomic with each other,
+            // so a decision soft-deleted in that window must still make this
+            // match zero rows rather than mark a since-invisible thread read.
+            const visibleProposal = { OR: [{ decisionId: null }, { decision: { deletedAt: null } }] };
             if (isStaff) {
                 await prisma.selectionItemComment.updateMany({
-                    where: { proposalId, id: { in: seenIds }, readByTeamAt: null },
+                    where: { proposalId, id: { in: seenIds }, readByTeamAt: null, proposal: visibleProposal },
                     data: { readByTeamAt: new Date() },
                 });
             } else {
                 await prisma.selectionItemComment.updateMany({
-                    where: { proposalId, id: { in: seenIds }, readByClientAt: null },
+                    where: { proposalId, id: { in: seenIds }, readByClientAt: null, proposal: visibleProposal },
                     data: { readByClientAt: new Date() },
                 });
             }

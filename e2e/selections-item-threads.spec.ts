@@ -194,8 +194,10 @@ test.describe.serial("selection item discussion threads", () => {
     });
     expect(response.ok()).toBe(true);
     const payload = await response.json();
+    // The response is trimmed to the public shape — authorType/id are part
+    // of it, but readByTeamAt/readByClientAt are staff/portal-internal and
+    // only asserted against the DB row below.
     expect(payload.comment.authorType).toBe("CLIENT");
-    expect(payload.comment.readByTeamAt).toBeNull();
 
     const stored = await prisma.selectionItemComment.findUniqueOrThrow({ where: { id: payload.comment.id } });
     expect(stored.authorType).toBe("CLIENT");
@@ -331,37 +333,63 @@ test.describe.serial("selection item discussion threads", () => {
       )}`,
     );
 
-    const beforeFiles = await prisma.projectFile.count({ where: { projectId: ids.project } });
-
-    const response = await page.request.post("/api/selections/item-comments", {
-      multipart: {
-        itemId: ids.multipartCandidate,
-        body: "Here's the pull we picked",
-        files: {
-          name: "swatch.png",
-          mimeType: "image/png",
-          buffer: Buffer.from("fake png bytes for e2e"),
+    let commentId: string | undefined;
+    let fileId: string | undefined;
+    try {
+      const response = await page.request.post("/api/selections/item-comments", {
+        multipart: {
+          itemId: ids.multipartCandidate,
+          body: "Here's the pull we picked",
+          files: {
+            name: "swatch.png",
+            mimeType: "image/png",
+            buffer: Buffer.from("fake png bytes for e2e"),
+          },
         },
-      },
-    });
-    expect(response.status()).toBe(201);
-    const payload = await response.json();
-    const attachments = JSON.parse(payload.comment.attachments);
-    expect(attachments).toHaveLength(1);
-    // Canonical shape only — exactly {id, name, url}, never `size`.
-    expect(Object.keys(attachments[0]).sort()).toEqual(["id", "name", "url"]);
+      });
+      expect(response.status()).toBe(201);
+      const payload = await response.json();
+      commentId = payload.comment.id;
+      // Route now returns the already-parsed public shape, not the raw
+      // stored JSON string.
+      const attachments = payload.comment.attachments;
+      expect(attachments).toHaveLength(1);
+      // Canonical shape only — exactly {id, name, url}, never `size`.
+      expect(Object.keys(attachments[0]).sort()).toEqual(["id", "name", "url"]);
+      fileId = attachments[0].id;
 
-    expect(await prisma.projectFile.count({ where: { projectId: ids.project } })).toBe(beforeFiles + 1);
-    const file = await prisma.projectFile.findUniqueOrThrow({ where: { id: attachments[0].id } });
-    expect(file.visibility).toBe("shared");
-    expect(file.uploadedByClient).toBe(true);
+      const file = await prisma.projectFile.findUniqueOrThrow({ where: { id: fileId } });
+      expect(file.visibility).toBe("shared");
+      expect(file.uploadedByClient).toBe(true);
 
-    await page.goto(`/portal/projects/${ids.project}/selections`);
-    const card = page.getByTestId(`selection-item-${ids.multipartCandidate}`);
-    await card.getByTestId("selection-thread-toggle").click();
-    await expect(card.getByTestId(`selection-thread-attachment-${attachments[0].id}`)).toContainText("swatch.png");
-
-    await context.close();
+      await page.goto(`/portal/projects/${ids.project}/selections`);
+      const card = page.getByTestId(`selection-item-${ids.multipartCandidate}`);
+      await card.getByTestId("selection-thread-toggle").click();
+      await expect(card.getByTestId(`selection-thread-attachment-${fileId}`)).toContainText("swatch.png");
+    } finally {
+      // This test is the only one in the suite that touches real Supabase
+      // Storage (CI's Playwright job has real credentials) — clean up
+      // exactly what it created, by exact id, so nothing accumulates in the
+      // live bucket across runs.
+      if (fileId) {
+        const file = await prisma.projectFile.findUnique({ where: { id: fileId }, select: { url: true } });
+        await prisma.projectFile.delete({ where: { id: fileId } }).catch(() => {});
+        if (file) {
+          const { getSupabase, STORAGE_BUCKET } = await import("../src/lib/supabase");
+          const supabase = getSupabase();
+          const marker = `/${STORAGE_BUCKET}/`;
+          const idx = file.url.indexOf(marker);
+          if (supabase && idx !== -1) {
+            const path = file.url.slice(idx + marker.length);
+            await supabase.storage.from(STORAGE_BUCKET).remove([path]).catch(() => {});
+          }
+        }
+      }
+      if (commentId) {
+        await prisma.selectionItemComment.delete({ where: { id: commentId } }).catch(() => {});
+      }
+      await context.close();
+    }
   });
 
   test("a denied actor with a file attached creates zero ProjectFile rows", async ({ browser }) => {
@@ -392,6 +420,35 @@ test.describe.serial("selection item discussion threads", () => {
 
     expect(await prisma.projectFile.count({ where: { projectId: ids.otherProject } })).toBe(beforeFiles);
     expect(await prisma.selectionItemComment.count({ where: { proposalId: ids.otherCandidate } })).toBe(beforeComments);
+
+    await context.close();
+  });
+
+  test("a denied actor with an over-the-limit file count still gets 403, not a validation 400", async ({ browser }) => {
+    // Proves the route no longer pre-checks file count/size before auth —
+    // an anonymous/foreign caller must never learn what would have been
+    // wrong with their payload before they're authorized at all.
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    // Playwright's plain `multipart` object only accepts one value per key —
+    // repeated "files" fields (matching the real composer's
+    // formData.append("files", file) for each attachment) need a real
+    // FormData instance instead.
+    const form = new FormData();
+    form.set("itemId", ids.otherCandidate);
+    form.set("body", "Too many files");
+    for (let i = 0; i < 6; i++) {
+      form.append("files", new File([new Uint8Array([1, 2, 3])], `swatch-${i}.pdf`, { type: "application/pdf" }));
+    }
+    const response = await page.request.post("/api/selections/item-comments", { multipart: form });
+    expect(response.status()).toBe(403);
 
     await context.close();
   });
@@ -541,5 +598,34 @@ test.describe.serial("selection item discussion threads", () => {
     await prisma.selectionItemComment.deleteMany({ where: { id: { in: [staleComment.id, controlComment.id] } } });
     await prisma.selectionProposal.delete({ where: { id: orphanedCandidateId } });
     await prisma.decision.delete({ where: { id: orphanedDecisionId } });
+  });
+
+  test("createComment's transaction re-guards a decision soft-deleted after findThreadItem already checked", async () => {
+    // Simulates the TOCTOU window directly: findThreadItem's own check
+    // happened (and would have passed, since deletedAt is null right up
+    // until the update below), but the decision is soft-deleted BETWEEN
+    // that check and this transaction running — the transaction's own
+    // CAS lock on the decision must still catch it.
+    const raceDecisionId = `${run}-race-decision`;
+    const raceCandidateId = `${run}-race-candidate`;
+    await prisma.decision.create({ data: { id: raceDecisionId, projectId: ids.project, name: "Race Condition Tile" } });
+    await prisma.selectionProposal.create({
+      data: { id: raceCandidateId, projectId: ids.project, decisionId: raceDecisionId, name: "Race Sample", status: "Idea" },
+    });
+    await prisma.decision.update({ where: { id: raceDecisionId }, data: { deletedAt: new Date() } });
+
+    await expect(
+      createComment({
+        item: { id: raceCandidateId, projectId: ids.project, deletedAt: null, name: "Race Sample", decisionId: raceDecisionId },
+        actor: { isStaff: true, clientId: null, userId: null, actorName: "Team" },
+        body: "This should never persist",
+        attachments: null,
+      }),
+    ).rejects.toThrow("Item not found");
+
+    expect(await prisma.selectionItemComment.count({ where: { proposalId: raceCandidateId } })).toBe(0);
+
+    await prisma.selectionProposal.delete({ where: { id: raceCandidateId } });
+    await prisma.decision.delete({ where: { id: raceDecisionId } });
   });
 });

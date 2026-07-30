@@ -162,6 +162,21 @@ export async function createComment(input: {
         if (locked.count === 0) {
             throw new ThreadNotFoundError();
         }
+        // Same row-lock-via-conditional-no-op-write pattern, extended to the
+        // parent Decision: findThreadItem's soft-deleted-decision check and
+        // this transaction's commit are not atomic with each other, so a
+        // decision that gets soft-deleted in that window must still fail the
+        // write here rather than silently landing a comment on an item no
+        // read path shows anymore.
+        if (item.decisionId) {
+            const decisionLocked = await tx.decision.updateMany({
+                where: { id: item.decisionId, deletedAt: null },
+                data: { deletedAt: null },
+            });
+            if (decisionLocked.count === 0) {
+                throw new ThreadNotFoundError();
+            }
+        }
         return tx.selectionItemComment.create({
             data: {
                 proposalId: item.id,
