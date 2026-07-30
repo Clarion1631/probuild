@@ -76,6 +76,7 @@ import {
     parseThreadAttachments,
     unreadThreadCommentCount,
 } from "./selection-item-thread-core";
+import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -10670,31 +10671,52 @@ export async function getProjectDecisionsForPortal(projectId: string) {
     };
 }
 
-/** Portal Selections tab badge count — unread TEAM comments across every
- * (non-deleted) item on the project. */
-export async function getUnreadSelectionThreadCountForPortal(projectId: string): Promise<number> {
-    return prisma.selectionItemComment.count({
-        where: { authorType: "TEAM", readByClientAt: null, proposal: { projectId, deletedAt: null } },
-    });
-}
-
-// Attaches parsed comments + the staff-side unread count to a candidate for
+// Attaches parsed comments + the viewer-side unread count to a candidate for
 // the thread UI (SelectionItemThread). Shared shape between the staff read
-// (below) and the portal read (getProjectDecisionsForPortal).
+// (below) and the portal read (getProjectDecisionsForPortal). Only the
+// fields the UI type actually needs are sent to the browser — internal ids
+// (authorUserId/authorClientId) and the opposite side's read timestamps
+// never leave the server; unreadThreadCount is derived from them here
+// instead of shipping them raw.
 function withThreadSummary<T extends { comments: {
-    id: string; authorType: string; authorUserId: string | null; authorClientId: string | null;
+    id: string; authorType: string;
     authorName: string; body: string; attachments: string | null; readByTeamAt: Date | null;
     readByClientAt: Date | null; createdAt: Date;
 }[] }>(candidate: T, isStaff: boolean) {
     const { comments, ...rest } = candidate;
     return {
         ...rest,
-        comments: comments.map((c) => ({ ...c, attachments: parseThreadAttachments(c.attachments) })),
+        comments: comments.map((c) => ({
+            id: c.id,
+            authorType: c.authorType,
+            authorName: c.authorName,
+            body: c.body,
+            attachments: parseThreadAttachments(c.attachments),
+            createdAt: c.createdAt,
+        })),
         unreadThreadCount: unreadThreadCommentCount(comments, isStaff),
     };
 }
 
-const CANDIDATE_COMMENTS_INCLUDE = { comments: { orderBy: { createdAt: "asc" as const } } };
+// authorUserId/authorClientId are deliberately NOT selected — nothing after
+// this fetch needs them (unreadThreadCommentCount only reads
+// authorType/readByTeamAt/readByClientAt), and withThreadSummary's job is to
+// keep internal ids out of the portal/staff payload in the first place.
+const CANDIDATE_COMMENTS_INCLUDE = {
+    comments: {
+        orderBy: { createdAt: "asc" as const },
+        select: {
+            id: true,
+            authorType: true,
+            authorName: true,
+            body: true,
+            attachments: true,
+            readByTeamAt: true,
+            readByClientAt: true,
+            createdAt: true,
+        },
+    },
+};
 
 export async function getProjectDecisions(projectId: string) {
     const user = await assertActiveStaff();
@@ -10718,14 +10740,6 @@ export async function getProjectDecisions(projectId: string) {
         decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
-}
-
-/** Nav badge count — unread CLIENT comments across every (non-deleted) item
- * on the project, for the project layout's "Selection Boards" link. */
-export async function getUnreadSelectionThreadCountForStaff(projectId: string): Promise<number> {
-    return prisma.selectionItemComment.count({
-        where: { authorType: "CLIENT", readByTeamAt: null, proposal: { projectId, deletedAt: null } },
-    });
 }
 
 // ── Structure — shared by client + team (see assertDecisionActorAccess) ────
@@ -10803,11 +10817,7 @@ export async function updateSelectionItemNote(
  * side. Called from the UI when a thread is expanded. */
 export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
     return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
-        findItem: (id) =>
-            prisma.selectionProposal.findUnique({
-                where: { id },
-                select: { id: true, projectId: true, deletedAt: true, name: true },
-            }),
+        findItem: findThreadItem,
         assertAccess: assertDecisionActorAccess,
         markRead: async (proposalId, seenIds, isStaff) => {
             if (isStaff) {

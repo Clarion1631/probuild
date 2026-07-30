@@ -3,7 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import { canAccessProject } from "../src/lib/permissions";
 import { postSelectionItemComment } from "../src/lib/selection-item-thread-core";
-import { createComment } from "../src/lib/selection-item-thread-dependencies";
+import { createComment, getUnreadSelectionThreadCountForStaff } from "../src/lib/selection-item-thread-dependencies";
 
 const prisma = new PrismaClient();
 const run = `selection-threads-${process.pid}-${Date.now()}`;
@@ -15,6 +15,7 @@ const ids = {
   decision: `${run}-decision`,
   candidate: `${run}-candidate`,
   staffCandidate: `${run}-staff-candidate`,
+  multipartCandidate: `${run}-multipart-candidate`,
   otherCandidate: `${run}-other-candidate`,
   restrictedStaff: `${run}-restricted-staff`,
 } as const;
@@ -58,6 +59,15 @@ test.describe.serial("selection item discussion threads", () => {
         projectId: ids.project,
         decisionId: ids.decision,
         name: "Matte Black Faucet",
+        status: "Idea",
+      },
+    });
+    await prisma.selectionProposal.create({
+      data: {
+        id: ids.multipartCandidate,
+        projectId: ids.project,
+        decisionId: ids.decision,
+        name: "Brushed Nickel Pull",
         status: "Idea",
       },
     });
@@ -299,18 +309,60 @@ test.describe.serial("selection item discussion threads", () => {
     await context.close();
   });
 
-  // Attachment round-trip. This sandbox has no Supabase Storage credentials
-  // (and must never be pointed at production's — see docs/TESTING.md), so a
-  // real multipart upload through saveProjectFile() can't be exercised here.
-  // What IS provable without Storage:
-  //   - denied and invalid-extension posts short-circuit before any upload
-  //     attempt and leave zero ProjectFile rows (real HTTP route, below).
-  //   - the DB write trusts only the upload result's canonical {id,name,url}
-  //     shape (seam test against the real createComment, with a fake
-  //     uploadAttachments standing in for saveProjectFile).
-  // CI's Playwright job has real Storage secrets and can exercise the full
-  // multipart path end-to-end; this gap should be confirmed there or in a
-  // manually configured environment before this ships.
+  // Attachment round-trip. A real multipart upload through saveProjectFile()
+  // needs real Supabase Storage credentials (SUPABASE_URL +
+  // SUPABASE_SERVICE_KEY) — present in CI's Playwright job, but this sandbox
+  // has neither, and per docs/TESTING.md must never be pointed at
+  // production's. The test below runs for real wherever those creds exist
+  // (CI, or a manually configured environment) and is skipped otherwise;
+  // meanwhile denied/invalid-extension posts and the canonical-shape DB
+  // write are provable without Storage at all (both below, always run).
+  const hasRealStorage = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_KEY;
+
+  test("client posts a real file through the route: shared ProjectFile, provenance, canonical shape, chip renders", async ({ browser }) => {
+    test.skip(!hasRealStorage, "requires real Supabase Storage credentials (SUPABASE_URL + SUPABASE_SERVICE_KEY) — see CI's Playwright job");
+
+    const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    const beforeFiles = await prisma.projectFile.count({ where: { projectId: ids.project } });
+
+    const response = await page.request.post("/api/selections/item-comments", {
+      multipart: {
+        itemId: ids.multipartCandidate,
+        body: "Here's the pull we picked",
+        files: {
+          name: "swatch.png",
+          mimeType: "image/png",
+          buffer: Buffer.from("fake png bytes for e2e"),
+        },
+      },
+    });
+    expect(response.status()).toBe(201);
+    const payload = await response.json();
+    const attachments = JSON.parse(payload.comment.attachments);
+    expect(attachments).toHaveLength(1);
+    // Canonical shape only — exactly {id, name, url}, never `size`.
+    expect(Object.keys(attachments[0]).sort()).toEqual(["id", "name", "url"]);
+
+    expect(await prisma.projectFile.count({ where: { projectId: ids.project } })).toBe(beforeFiles + 1);
+    const file = await prisma.projectFile.findUniqueOrThrow({ where: { id: attachments[0].id } });
+    expect(file.visibility).toBe("shared");
+    expect(file.uploadedByClient).toBe(true);
+
+    await page.goto(`/portal/projects/${ids.project}/selections`);
+    const card = page.getByTestId(`selection-item-${ids.multipartCandidate}`);
+    await card.getByTestId("selection-thread-toggle").click();
+    await expect(card.getByTestId(`selection-thread-attachment-${attachments[0].id}`)).toContainText("swatch.png");
+
+    await context.close();
+  });
 
   test("a denied actor with a file attached creates zero ProjectFile rows", async ({ browser }) => {
     const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
@@ -440,5 +492,54 @@ test.describe.serial("selection item discussion threads", () => {
     ).rejects.toThrow("Item not found");
 
     expect(cleanedUp.sort()).toEqual(["fake-file-A", "fake-file-B"]);
+  });
+
+  test("candidates under a soft-deleted decision are excluded from badges and are neither postable nor markable-read", async ({ page }) => {
+    const orphanedDecisionId = `${run}-orphaned-decision`;
+    const orphanedCandidateId = `${run}-orphaned-candidate`;
+    await prisma.decision.create({
+      data: { id: orphanedDecisionId, projectId: ids.project, name: "Discontinued Tile" },
+    });
+    await prisma.selectionProposal.create({
+      data: { id: orphanedCandidateId, projectId: ids.project, decisionId: orphanedDecisionId, name: "Old Sample", status: "Idea" },
+    });
+    // deleteDecision never touches the candidate's own deletedAt — it stays
+    // attached with decisionId pointing at the now-soft-deleted decision,
+    // exactly like a real client/staff delete would leave it.
+    await prisma.decision.update({ where: { id: orphanedDecisionId }, data: { deletedAt: new Date() } });
+    const staleComment = await prisma.selectionItemComment.create({
+      data: {
+        proposalId: orphanedCandidateId,
+        authorType: "CLIENT",
+        authorClientId: ids.client,
+        authorName: "Thread Client",
+        body: "Is this still available?",
+      },
+    });
+
+    const baselineUnread = await getUnreadSelectionThreadCountForStaff(ids.project);
+
+    // A second, visible CLIENT-authored unread comment on a live item —
+    // proves the badge count isn't just "always zero", it specifically
+    // excludes the orphaned one while still counting a real one.
+    const controlComment = await prisma.selectionItemComment.create({
+      data: {
+        proposalId: ids.candidate,
+        authorType: "CLIENT",
+        authorClientId: ids.client,
+        authorName: "Thread Client",
+        body: "Control comment on a live item",
+      },
+    });
+    expect(await getUnreadSelectionThreadCountForStaff(ids.project)).toBe(baselineUnread + 1);
+
+    const response = await page.request.post("/api/selections/item-comments", {
+      multipart: { itemId: orphanedCandidateId, body: "Trying to post on an orphaned item" },
+    });
+    expect(response.status()).toBe(404);
+
+    await prisma.selectionItemComment.deleteMany({ where: { id: { in: [staleComment.id, controlComment.id] } } });
+    await prisma.selectionProposal.delete({ where: { id: orphanedCandidateId } });
+    await prisma.decision.delete({ where: { id: orphanedDecisionId } });
   });
 });

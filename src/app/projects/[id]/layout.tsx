@@ -1,6 +1,7 @@
 ﻿import EntitySidebar from "@/components/EntitySidebar";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import { getUnreadMessageCount, getUnreadSelectionThreadCountForStaff } from "@/lib/actions";
+import { getUnreadMessageCount } from "@/lib/actions";
+import { getUnreadSelectionThreadCountForStaff } from "@/lib/selection-item-thread-dependencies";
 import { getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";

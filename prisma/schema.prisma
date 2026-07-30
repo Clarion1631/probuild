@@ -1767,6 +1767,12 @@ model SelectionItemComment {
   createdAt      DateTime          @default(now())
 
   @@index([proposalId, createdAt])
+  // Supports the unread nav-badge counts (getUnreadSelectionThreadCountForStaff
+  // / ForPortal in selection-item-thread-dependencies.ts), which filter on
+  // authorType + the viewer-side read timestamp before joining to the
+  // proposal's projectId.
+  @@index([authorType, readByTeamAt])
+  @@index([authorType, readByClientAt])
 }
 
 // Client Selections Playground — Phase 1 (docs/specs/client-selections-playground.md).

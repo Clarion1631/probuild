@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 import { markSelectionItemThreadRead } from "@/lib/actions";
@@ -23,6 +23,11 @@ interface SelectionItemThreadProps {
     unreadCount: number;
     onChanged: () => void;
     className?: string;
+    // Disambiguates DOM ids (id/aria-controls) when the same item's thread
+    // renders in more than one placement on the same page — e.g. a chosen
+    // item appears both in its own CandidateCard AND in the Approved Items
+    // table. Defaults to itemId, which is unique everywhere else.
+    instanceId?: string;
 }
 
 const MAX_FILES = 5;
@@ -33,25 +38,41 @@ export function SelectionItemThread({
     unreadCount,
     onChanged,
     className,
+    instanceId,
 }: SelectionItemThreadProps) {
+    const domId = `selection-thread-${instanceId ?? itemId}`;
     const [expanded, setExpanded] = useState(false);
     const [draft, setDraft] = useState("");
     const [files, setFiles] = useState<File[]>([]);
     const [submitting, setSubmitting] = useState(false);
+    const [locallyRead, setLocallyRead] = useState(false);
     const [, startMarkRead] = useTransition();
+    const previousUnreadCount = useRef(unreadCount);
+
+    // If the server-reported unread count goes UP (a new message arrived),
+    // the optimistic local override must not keep hiding the pill.
+    useEffect(() => {
+        if (unreadCount > previousUnreadCount.current) {
+            setLocallyRead(false);
+        }
+        previousUnreadCount.current = unreadCount;
+    }, [unreadCount]);
 
     function handleExpand() {
         const next = !expanded;
         setExpanded(next);
         if (next && comments.length > 0) {
-            // Optimistically clears the pill — best-effort, a failed mark-read
-            // isn't worth surfacing to the viewer.
+            // Optimistically clear the pill immediately, rather than waiting
+            // on the mark-read round trip + a parent refresh to reflect the
+            // server's new unreadCount.
+            setLocallyRead(true);
             startMarkRead(async () => {
                 try {
                     await markSelectionItemThreadRead(itemId, comments.map((c) => c.id));
                     onChanged();
                 } catch {
-                    // no-op
+                    // no-op — best-effort, a failed mark-read isn't worth
+                    // surfacing to the viewer.
                 }
             });
         }
@@ -104,12 +125,12 @@ export function SelectionItemThread({
                 type="button"
                 data-testid="selection-thread-toggle"
                 aria-expanded={expanded}
-                aria-controls={`selection-thread-${itemId}`}
+                aria-controls={domId}
                 onClick={handleExpand}
                 className="text-xs font-medium text-blue-600 hover:underline flex items-center gap-1.5"
             >
                 <span>💬 Discussion ({comments.length})</span>
-                {unreadCount > 0 && (
+                {unreadCount > 0 && !locallyRead && (
                     <span
                         data-testid="selection-thread-unread-pill"
                         className="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold text-white bg-red-500 rounded-full"
@@ -120,7 +141,7 @@ export function SelectionItemThread({
             </button>
 
             {expanded && (
-                <div id={`selection-thread-${itemId}`} className="mt-2 space-y-2 border-t border-slate-100 pt-2">
+                <div id={domId} className="mt-2 space-y-2 border-t border-slate-100 pt-2">
                     {comments.length === 0 ? (
                         <p className="text-xs text-hui-textMuted">No messages yet.</p>
                     ) : (

@@ -62,6 +62,7 @@ assert.match(
   /uploadedByClient:\s*!actor\.isStaff,/,
   "uploadAttachments must pass uploadedByClient through to saveProjectFile",
 );
+const actions = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
 const projectFiles = readFileSync(join(process.cwd(), "src/lib/project-files.ts"), "utf8");
 assert.match(
   projectFiles,
@@ -92,6 +93,100 @@ assert.match(
   dependencies,
   /cleanupAttachments\([^)]*\):\s*Promise<void>\s*\{\s*await Promise\.all\(attachments\.map\(\(attachment\) => deleteProjectFileAndStorage\(attachment\.id\)\)\);/,
   "cleanupAttachments must reuse deleteProjectFileAndStorage for every attachment",
+);
+
+// ── Codex review round 1 follow-ups ─────────────────────────────────────
+
+// BLOCKER: HTML injection — every client-controlled string interpolated
+// into the notification emails must be escaped.
+assert.match(dependencies, /function escapeHtml\(/, "dependencies must define an escapeHtml helper");
+assert.match(dependencies, /escapeHtml\(item\.name\)/, "item.name must be escaped before use in email HTML");
+assert.match(dependencies, /escapeHtml\(comment\.authorName\)/, "comment.authorName must be escaped before use in email HTML");
+assert.match(dependencies, /escapeHtml\(comment\.body\)/, "comment.body must be escaped before use in email HTML");
+
+// REAL ISSUE: ordering — assertAccess must resolve before ANY validation
+// (file count/size/body-length), not just before uploadAttachments.
+const findItemIdx = core.indexOf("const item = await dependencies.findItem(itemId);");
+const validationIdx = core.indexOf("SELECTION_ITEM_COMMENT_MAX_FILES) {");
+assert.ok(
+  findItemIdx >= 0 && assertAccessIndex > findItemIdx && validationIdx > assertAccessIndex,
+  "findItem then assertAccess must both resolve before file-count/size validation runs",
+);
+
+// REAL ISSUE: content-type spoofing — neither the route nor the upload
+// dependency may forward the client-supplied File.type/mimeType to storage.
+assert.ok(!route.includes("file.type"), "the route must never read the client-supplied File.type");
+assert.ok(
+  !dependencies.includes("file.mimeType ||") && !dependencies.includes("file.mimeType||"),
+  "uploadAttachments must not fall back to the passed-through mimeType — derive strictly from the extension",
+);
+assert.match(
+  dependencies,
+  /mimeType:\s*mimeTypeForFileName\(file\.name\)/,
+  "uploadAttachments must derive Content-Type strictly from the filename extension",
+);
+
+// REAL ISSUE: the unread-count reads must not be remotely invokable server
+// actions — they must live outside actions.ts ("use server") and actions.ts
+// must no longer export them.
+assert.ok(
+  !actions.includes("export async function getUnreadSelectionThreadCountForStaff"),
+  "getUnreadSelectionThreadCountForStaff must not be exported from the \"use server\" actions.ts",
+);
+assert.ok(
+  !actions.includes("export async function getUnreadSelectionThreadCountForPortal"),
+  "getUnreadSelectionThreadCountForPortal must not be exported from the \"use server\" actions.ts",
+);
+assert.match(
+  dependencies,
+  /export async function getUnreadSelectionThreadCountForStaff/,
+  "getUnreadSelectionThreadCountForStaff must live in the plain (non-\"use server\") dependencies module",
+);
+assert.match(
+  dependencies,
+  /export async function getUnreadSelectionThreadCountForPortal/,
+  "getUnreadSelectionThreadCountForPortal must live in the plain (non-\"use server\") dependencies module",
+);
+
+// REAL ISSUE: visibility — candidates under a soft-deleted decision must be
+// excluded from both badge counts and the postable/markable item lookup.
+assert.match(
+  dependencies,
+  /decision:\s*\{\s*select:\s*\{\s*deletedAt:\s*true\s*\}\s*\}/,
+  "findThreadItem must fetch the parent decision's deletedAt",
+);
+assert.match(
+  dependencies,
+  /proposal\.decisionId\s*&&\s*proposal\.decision\?\.deletedAt/,
+  "findThreadItem must treat a soft-deleted parent decision as not-found",
+);
+assert.match(
+  dependencies,
+  /decision:\s*\{\s*deletedAt:\s*null\s*\}/,
+  "the badge count queries must exclude proposals whose parent decision is soft-deleted",
+);
+
+// REAL ISSUE: index supporting the unread badge queries.
+const schema = readFileSync(join(process.cwd(), "prisma/schema.prisma"), "utf8");
+assert.match(schema, /@@index\(\[authorType, readByTeamAt\]\)/, "schema must index SelectionItemComment(authorType, readByTeamAt)");
+assert.match(schema, /@@index\(\[authorType, readByClientAt\]\)/, "schema must index SelectionItemComment(authorType, readByClientAt)");
+const applyScript = readFileSync(join(process.cwd(), "scripts/apply-selection-item-threads.mjs"), "utf8");
+assert.match(applyScript, /authorType.*readByTeamAt/, "apply script must create the (authorType, readByTeamAt) index");
+assert.match(applyScript, /authorType.*readByClientAt/, "apply script must create the (authorType, readByClientAt) index");
+
+// REAL ISSUE: canonical shape — only {id, name, url} may be persisted, never
+// the `size` field saveProjectFile's result also carries.
+assert.match(
+  dependencies,
+  /uploaded\.push\(\{\s*id:\s*result\.file\.id,\s*name:\s*result\.file\.name,\s*url:\s*result\.file\.url\s*\}\)/,
+  "uploadAttachments must strip saveProjectFile's result to exactly {id, name, url} before storing",
+);
+
+// REAL ISSUE: payload minimization — the portal/staff comment payload must
+// not spread internal ids or the opposite side's read timestamps.
+assert.ok(
+  !actions.includes("authorUserId: string | null; authorClientId: string | null;"),
+  "withThreadSummary's input type must no longer require authorUserId/authorClientId — they're not sent to the browser",
 );
 
 async function verifyRejectingAccessPreventsWrite(): Promise<void> {
@@ -187,10 +282,39 @@ async function verifyCreateCommentFailureCleansUpUploads(): Promise<void> {
   );
 }
 
+// REAL ISSUE (ordering): a denied actor must get the ACCESS error, not a
+// validation error, even when the payload is ALSO invalid (empty body, no
+// files) — proves assertAccess runs before validation, so an anonymous/
+// foreign caller never learns anything about what would have been wrong
+// with their input.
+async function verifyDenialPreemptsValidationErrors(): Promise<void> {
+  await assert.rejects(
+    postSelectionItemComment("item-1", "   ", [], {
+      findItem: async () => ({ id: "item-1", projectId: "project-1", deletedAt: null, name: "Vanity Light" }),
+      assertAccess: async () => {
+        throw new Error("Forbidden");
+      },
+      uploadAttachments: async () => {
+        throw new Error("uploadAttachments must never run when access is denied");
+      },
+      createComment: async () => {
+        throw new Error("createComment must never run when access is denied");
+      },
+      cleanupAttachments: async () => {
+        throw new Error("cleanupAttachments must never run when access is denied");
+      },
+      notify: async () => {},
+      revalidate: () => undefined,
+    }),
+    /Forbidden/,
+  );
+}
+
 Promise.all([
   verifyRejectingAccessPreventsWrite(),
   verifyEmptyBodyNoAttachmentRejected(),
   verifyCreateCommentFailureCleansUpUploads(),
+  verifyDenialPreemptsValidationErrors(),
 ])
   .then(() => console.log("selection item thread contract verified"))
   .catch((error) => {

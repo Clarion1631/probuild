@@ -1,17 +1,41 @@
+// Typed errors so callers (the API route) can map failures to the right
+// HTTP status without sniffing message strings — a validation error's
+// message is always safe to return verbatim (400); anything else collapses
+// to a generic 500 with the real error only ever reaching the server log.
+export class ThreadNotFoundError extends Error {
+    constructor() {
+        super("Item not found");
+        this.name = "ThreadNotFoundError";
+    }
+}
+
+export class ThreadValidationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ThreadValidationError";
+    }
+}
+
 export const SELECTION_ITEM_COMMENT_MAX_LENGTH = 4000 as const;
 export const SELECTION_ITEM_COMMENT_MAX_FILES = 5 as const;
-export const SELECTION_ITEM_COMMENT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+// Vercel caps serverless function request bodies at 4.5MB — an 8MB single
+// file was unreachable in production. Per-file AND total-batch caps both sit
+// at 4MB (leaving headroom under 4.5MB for multipart boundaries/headers and
+// the body text), so a single near-4MB file or several smaller ones both
+// stay under Vercel's real ceiling.
+export const SELECTION_ITEM_COMMENT_MAX_FILE_BYTES = 4 * 1024 * 1024;
+export const SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 
 /** Trims and length-checks a comment body. Does NOT require non-empty — a
  * post with at least one attachment and no text is valid (see
  * postSelectionItemComment's combined body-or-attachment check). */
 export function normalizeSelectionItemCommentBody(value: unknown): string {
     if (typeof value !== "string") {
-        throw new Error("Comment must be text.");
+        throw new ThreadValidationError("Comment must be text.");
     }
     const trimmed = value.trim();
     if (trimmed.length > SELECTION_ITEM_COMMENT_MAX_LENGTH) {
-        throw new Error("Comment must be 4,000 characters or fewer.");
+        throw new ThreadValidationError("Comment must be 4,000 characters or fewer.");
     }
     return trimmed;
 }
@@ -114,9 +138,13 @@ type PostSelectionItemCommentDependencies = {
 /**
  * Strict ordering (docs/superpowers/plans/2026-07-30-selection-item-threads.md):
  * 1. findItem — not-found on missing/deleted.
- * 2. assertAccess — nothing is validated or written before this passes.
- * 3. Validate — trimmed body 1..4000 chars OR at least one file; extension/
- *    size checks happen inside uploadAttachments using the now-known actor.
+ * 2. assertAccess — nothing is validated or written before this passes. An
+ *    anonymous or foreign caller always gets a 404/403 with no validation
+ *    detail — file-count/size/body-length errors are only ever surfaced to
+ *    an already-authorized actor.
+ * 3. Validate — trimmed body 1..4000 chars OR at least one file; per-file
+ *    and total-batch byte caps; extension checks happen inside
+ *    uploadAttachments using the now-known actor.
  * 4. uploadAttachments — LAST before the transaction.
  * 5. createComment — row-lock transaction + create + activity log.
  * Notify runs after commit, non-fatal.
@@ -127,26 +155,32 @@ export async function postSelectionItemComment(
     files: ThreadFileCandidate[],
     dependencies: PostSelectionItemCommentDependencies,
 ): Promise<ThreadComment> {
-    if (files.length > SELECTION_ITEM_COMMENT_MAX_FILES) {
-        throw new Error(`You can attach up to ${SELECTION_ITEM_COMMENT_MAX_FILES} files at a time.`);
+    const item = await dependencies.findItem(itemId);
+    if (!item || item.deletedAt) {
+        throw new ThreadNotFoundError();
     }
+
+    const actor = await dependencies.assertAccess(item.projectId);
+
+    if (files.length > SELECTION_ITEM_COMMENT_MAX_FILES) {
+        throw new ThreadValidationError(`You can attach up to ${SELECTION_ITEM_COMMENT_MAX_FILES} files at a time.`);
+    }
+    let totalBytes = 0;
     for (const file of files) {
         if (file.size > SELECTION_ITEM_COMMENT_MAX_FILE_BYTES) {
-            throw new Error(`${file.name} is too large (8 MB max).`);
+            throw new ThreadValidationError(`${file.name} is too large (4 MB max).`);
         }
+        totalBytes += file.size;
     }
 
     const normalizedBody = normalizeSelectionItemCommentBody(rawBody);
     if (!normalizedBody && files.length === 0) {
-        throw new Error("Write something or attach a file.");
+        throw new ThreadValidationError("Write something or attach a file.");
     }
-
-    const item = await dependencies.findItem(itemId);
-    if (!item || item.deletedAt) {
-        throw new Error("Item not found");
+    totalBytes += Buffer.byteLength(normalizedBody, "utf8");
+    if (totalBytes > SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES) {
+        throw new ThreadValidationError("Attachments plus message are too large (4 MB total max).");
     }
-
-    const actor = await dependencies.assertAccess(item.projectId);
 
     const attachments =
         files.length > 0 ? await dependencies.uploadAttachments(files, actor, item) : null;
@@ -197,7 +231,7 @@ export async function markSelectionItemThreadRead(
 ): Promise<void> {
     const item = await dependencies.findItem(itemId);
     if (!item || item.deletedAt) {
-        throw new Error("Item not found");
+        throw new ThreadNotFoundError();
     }
     const actor = await dependencies.assertAccess(item.projectId);
     if (seenCommentIds.length === 0) return;

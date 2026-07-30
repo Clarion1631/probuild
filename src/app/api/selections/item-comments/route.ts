@@ -1,9 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
 import { assertDecisionActorAccess } from "@/lib/actions";
+import { PortalAuthError } from "@/lib/permissions";
 import { mimeTypeForFileName } from "@/lib/project-files";
-import { postSelectionItemComment, type ThreadFileCandidate } from "@/lib/selection-item-thread-core";
-import { cleanupAttachments, createComment, notify, revalidate, uploadAttachments } from "@/lib/selection-item-thread-dependencies";
+import {
+    postSelectionItemComment,
+    SELECTION_ITEM_COMMENT_MAX_FILES,
+    SELECTION_ITEM_COMMENT_MAX_FILE_BYTES,
+    SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES,
+    ThreadNotFoundError,
+    ThreadValidationError,
+    type ThreadFileCandidate,
+} from "@/lib/selection-item-thread-core";
+import {
+    cleanupAttachments,
+    createComment,
+    findThreadItem,
+    notify,
+    revalidate,
+    uploadAttachments,
+} from "@/lib/selection-item-thread-dependencies";
 
 export async function POST(req: NextRequest) {
     try {
@@ -16,21 +31,41 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "itemId required" }, { status: 400 });
         }
 
+        // Enforce count/size from file METADATA before buffering any content
+        // into memory — file.size is available on the File object without
+        // reading its bytes. The core repeats these checks (defense in
+        // depth, and the seam tests exercise it directly), but there's no
+        // reason to buffer a batch that's already known to be oversized.
+        if (fileEntries.length > SELECTION_ITEM_COMMENT_MAX_FILES) {
+            return NextResponse.json(
+                { error: `You can attach up to ${SELECTION_ITEM_COMMENT_MAX_FILES} files at a time.` },
+                { status: 400 },
+            );
+        }
+        let totalMetadataBytes = 0;
+        for (const file of fileEntries) {
+            if (file.size > SELECTION_ITEM_COMMENT_MAX_FILE_BYTES) {
+                return NextResponse.json({ error: `${file.name} is too large (4 MB max).` }, { status: 400 });
+            }
+            totalMetadataBytes += file.size;
+        }
+        if (totalMetadataBytes + Buffer.byteLength(body, "utf8") > SELECTION_ITEM_COMMENT_MAX_TOTAL_BYTES) {
+            return NextResponse.json({ error: "Attachments plus message are too large (4 MB total max)." }, { status: 400 });
+        }
+
         const files: ThreadFileCandidate[] = await Promise.all(
             fileEntries.map(async (file) => ({
                 name: file.name,
                 buffer: Buffer.from(await file.arrayBuffer()),
-                mimeType: file.type || mimeTypeForFileName(file.name),
+                // Derived strictly from the extension, never from the
+                // client-supplied File.type (trivially spoofable).
+                mimeType: mimeTypeForFileName(file.name),
                 size: file.size,
             })),
         );
 
         const comment = await postSelectionItemComment(itemId, body, files, {
-            findItem: (id) =>
-                prisma.selectionProposal.findUnique({
-                    where: { id },
-                    select: { id: true, projectId: true, deletedAt: true, name: true },
-                }),
+            findItem: findThreadItem,
             assertAccess: assertDecisionActorAccess,
             uploadAttachments,
             createComment,
@@ -40,9 +75,17 @@ export async function POST(req: NextRequest) {
         });
 
         return NextResponse.json({ comment }, { status: 201 });
-    } catch (err: any) {
-        const message = err?.message || "Couldn't post that comment.";
-        const status = message === "Item not found" ? 404 : message === "Forbidden" || message === "Unauthorized" ? 403 : 400;
-        return NextResponse.json({ error: message }, { status });
+    } catch (err) {
+        if (err instanceof ThreadNotFoundError) {
+            return NextResponse.json({ error: err.message }, { status: 404 });
+        }
+        if (err instanceof PortalAuthError || (err instanceof Error && err.message === "Forbidden")) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (err instanceof ThreadValidationError) {
+            return NextResponse.json({ error: err.message }, { status: 400 });
+        }
+        console.error("[POST /api/selections/item-comments]", err);
+        return NextResponse.json({ error: "Couldn't post that comment." }, { status: 500 });
     }
 }

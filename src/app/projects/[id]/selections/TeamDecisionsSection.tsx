@@ -158,6 +158,7 @@ function ApprovedItemsTable({
                                         />
                                         <SelectionItemThread
                                             itemId={item.id}
+                                            instanceId={`approved-${item.id}`}
                                             comments={item.comments}
                                             unreadCount={item.unreadThreadCount}
                                             onChanged={onChanged}

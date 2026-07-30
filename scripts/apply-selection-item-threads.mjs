@@ -45,6 +45,11 @@ const statements = [
         END IF;
     END $$`,
     `CREATE INDEX IF NOT EXISTS "SelectionItemComment_proposalId_createdAt_idx" ON "SelectionItemComment" ("proposalId", "createdAt")`,
+    // Supports the unread nav-badge counts (getUnreadSelectionThreadCountForStaff
+    // / ForPortal), which filter on authorType + the viewer-side read
+    // timestamp before joining to the proposal's projectId.
+    `CREATE INDEX IF NOT EXISTS "SelectionItemComment_authorType_readByTeamAt_idx" ON "SelectionItemComment" ("authorType", "readByTeamAt")`,
+    `CREATE INDEX IF NOT EXISTS "SelectionItemComment_authorType_readByClientAt_idx" ON "SelectionItemComment" ("authorType", "readByClientAt")`,
     // Server-only table. RLS with no policies denies direct anon/authenticated
     // Data API access; server-side Prisma uses the owner role. Matches the
     // convention in scripts/apply-selections-playground.mjs.
