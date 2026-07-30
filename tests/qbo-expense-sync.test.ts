@@ -281,6 +281,46 @@ test("excludes a closed job even when its name is an exact match", () => {
     assert.deepEqual(result, { kind: "skipped", reason: "no-active-project" });
 });
 
+test("exact project name wins a prefix-collision tie (Shop vs Shop Shed, shared client)", () => {
+    const projects: QboExpenseProjectCandidate[] = [
+        {
+            id: "project-shop",
+            name: "Shop",
+            status: "In Progress",
+            qbCustomerId: "182",
+            estimates: [{ id: "estimate-shop", createdAt: new Date("2026-07-07T00:00:00.000Z") }],
+        },
+        {
+            id: "project-shop-shed",
+            name: "Shop Shed",
+            status: "In Progress",
+            qbCustomerId: "182", // same client, so id matching returns both
+            estimates: [{ id: "estimate-shed", createdAt: new Date("2026-07-01T00:00:00.000Z") }],
+        },
+    ];
+
+    // Tie via shared qbCustomerId, broken by exact name equality.
+    const byId = findActiveProjectForQboPurchase(
+        { customerId: "182", customerName: "Shop" },
+        projects,
+    );
+    assert.deepEqual(byId, { kind: "matched", projectId: "project-shop", estimateId: "estimate-shop" });
+
+    // Same tie via pure name matching (no customer id).
+    const byName = findActiveProjectForQboPurchase(
+        { customerId: null, customerName: "Shop" },
+        projects,
+    );
+    assert.deepEqual(byName, { kind: "matched", projectId: "project-shop", estimateId: "estimate-shop" });
+
+    // No exact-name candidate → still ambiguous, never guesses.
+    const stillAmbiguous = findActiveProjectForQboPurchase(
+        { customerId: "182", customerName: "Sho" },
+        projects,
+    );
+    assert.deepEqual(stillAmbiguous, { kind: "skipped", reason: "ambiguous-project" });
+});
+
 test("excludes an ambiguous best-name match", () => {
     const result = findActiveProjectForQboPurchase(PURCHASE, [
         {

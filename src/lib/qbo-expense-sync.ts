@@ -408,6 +408,17 @@ export function findActiveProjectForQboPurchase(
         return { kind: "skipped", reason: "no-active-project" };
     }
 
+    // Word-overlap scoring ties on prefix collisions ("Shop" vs "Shop Shed"
+    // under one client); an exact name match is unambiguous and wins the tie.
+    const exactNameTiebreak = (candidates: QboExpenseProjectCandidate[]) => {
+        if (!input.customerName) return null;
+        const label = input.customerName.trim().toLowerCase();
+        const exact = candidates.filter(
+            project => project.name.trim().toLowerCase() === label,
+        );
+        return exact.length === 1 ? exact[0] : null;
+    };
+
     if (input.customerId) {
         const idMatches = activeProjects.filter(
             project => project.qbCustomerId === input.customerId,
@@ -419,6 +430,8 @@ export function findActiveProjectForQboPurchase(
         if (idMatches.length > 1 && input.customerName) {
             const nameMatches = findBestProjectNameMatches(input.customerName, idMatches);
             if (nameMatches.length === 1) return matchCandidateEstimate(nameMatches[0]);
+            const exact = exactNameTiebreak(nameMatches.length ? nameMatches : idMatches);
+            if (exact) return matchCandidateEstimate(exact);
             return { kind: "skipped", reason: "ambiguous-project" };
         }
     }
@@ -431,6 +444,8 @@ export function findActiveProjectForQboPurchase(
         return { kind: "skipped", reason: "no-active-project" };
     }
     if (nameMatches.length > 1) {
+        const exact = exactNameTiebreak(nameMatches);
+        if (exact) return matchCandidateEstimate(exact);
         return { kind: "skipped", reason: "ambiguous-project" };
     }
     return matchCandidateEstimate(nameMatches[0]);
