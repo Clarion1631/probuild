@@ -7,16 +7,20 @@ import { computeProjectFinancials, type ProjectFinancials } from "@/lib/project-
 
 export const dynamic = "force-dynamic";
 
-// "Shop" is the sanctioned overhead bucket — see CLAUDE.md "Prod test project".
-// Its costs (expenses + labor) are company overhead, kept separate from job
-// profitability rather than dragging down any individual project's margin.
-const OVERHEAD_PROJECT_ID = "cmpd6xca1009x1iizdf4suln3";
+// "Shop" is the sanctioned overhead bucket — shares the sync's env var so the
+// two features can never point at different projects. Its costs (expenses +
+// labor) are company overhead, kept separate from job profitability rather
+// than dragging down any individual project's margin.
+const OVERHEAD_PROJECT_ID =
+    process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || "cmpd6xca1009x1iizdf4suln3";
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function StatCard({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "pos" | "neg" }) {
+    const valueColor =
+        tone === "pos" ? "text-green-700" : tone === "neg" ? "text-red-600" : "text-hui-textMain";
     return (
         <div className="hui-card p-5">
             <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">{label}</p>
-            <p className="text-2xl font-bold text-hui-textMain mt-1">{value}</p>
+            <p className={`text-2xl font-bold mt-1 ${valueColor}`}>{value}</p>
             {sub && <p className="text-xs text-hui-textMuted mt-1">{sub}</p>}
         </div>
     );
@@ -30,7 +34,7 @@ interface JobRow {
     laborCost: number;
     jobCost: number; // expenses + labor
     marginDollars: number; // collected - expenses - labor
-    marginPercent: number;
+    marginPercent: number | null; // null when nothing collected — a % of $0 is undefined, not 0
 }
 
 async function buildRow(project: { id: string; name: string; client: { name: string } }): Promise<JobRow> {
@@ -38,7 +42,7 @@ async function buildRow(project: { id: string; name: string; client: { name: str
     const laborCost = fin.totalTimeCost;
     const jobCost = fin.currentOutgoing + laborCost;
     const marginDollars = fin.currentIncoming - jobCost;
-    const marginPercent = fin.currentIncoming > 0 ? (marginDollars / fin.currentIncoming) * 100 : 0;
+    const marginPercent = fin.currentIncoming > 0 ? (marginDollars / fin.currentIncoming) * 100 : null;
     return {
         id: project.id,
         name: project.name,
@@ -95,7 +99,7 @@ export default async function CompanyFinancialsPage() {
     );
 
     const netPosition = totals.margin - overheadTotal;
-    const blendedMarginPercent = totals.paid > 0 ? (netPosition / totals.paid) * 100 : 0;
+    const blendedMarginPercent = totals.paid > 0 ? (netPosition / totals.paid) * 100 : null;
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
@@ -128,11 +132,13 @@ export default async function CompanyFinancialsPage() {
                     label="Net Position"
                     value={formatCurrency(netPosition)}
                     sub="Job margin − overhead"
+                    tone={netPosition >= 0 ? "pos" : "neg"}
                 />
                 <StatCard
                     label="Blended Margin"
-                    value={`${blendedMarginPercent.toFixed(1)}%`}
+                    value={blendedMarginPercent === null ? "—" : `${blendedMarginPercent.toFixed(1)}%`}
                     sub="Net position ÷ total incoming"
+                    tone={blendedMarginPercent === null ? undefined : blendedMarginPercent >= 0 ? "pos" : "neg"}
                 />
             </div>
 
@@ -169,8 +175,8 @@ export default async function CompanyFinancialsPage() {
                                 <td className={`px-4 py-3 text-right font-semibold ${r.marginDollars >= 0 ? "text-green-700" : "text-red-600"}`}>
                                     {formatCurrency(r.marginDollars)}
                                 </td>
-                                <td className={`px-4 py-3 text-right font-semibold ${r.marginPercent >= 0 ? "text-green-700" : "text-red-600"}`}>
-                                    {r.marginPercent.toFixed(1)}%
+                                <td className={`px-4 py-3 text-right font-semibold ${r.marginDollars >= 0 ? "text-green-700" : "text-red-600"}`}>
+                                    {r.marginPercent === null ? "—" : `${r.marginPercent.toFixed(1)}%`}
                                 </td>
                             </tr>
                         ))}

@@ -1,27 +1,33 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import {
+    canAccessProject,
+    canUseDevAuthFallback,
+    getCurrentUserWithPermissions,
+    hasPermission,
+} from "@/lib/permissions";
 import { computeProjectFinancials } from "@/lib/project-financials";
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
     const { id: projectId } = await params;
     const { searchParams } = new URL(req.url);
     const includeUnissued = searchParams.get("includeUnissued") === "true";
 
-    // Verify caller has access to this project (admins/managers bypass; others must have ProjectAccess)
-    const callerUser = await prisma.user.findUnique({
-        where: { email: session.user.email },
-        select: { id: true, role: true, projectAccess: { where: { projectId }, select: { projectId: true } } }
-    });
-    const isAdmin = callerUser && ["ADMIN", "MANAGER"].includes(callerUser.role);
-    if (!callerUser || (!isAdmin && callerUser.projectAccess.length === 0)) {
-        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    // Financial data policy (same as assertFinancialProjectAccess in
+    // lib/actions.ts): the financialReports permission is required, and
+    // FINANCE sees all projects while everyone else needs project access.
+    const user = await getCurrentUserWithPermissions();
+    if (!user) {
+        if (!(await canUseDevAuthFallback())) {
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        }
+    } else {
+        if (!hasPermission(user, "financialReports")) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (user.role !== "FINANCE" && !canAccessProject(user, projectId)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
     }
 
     const project = await prisma.project.findUnique({ where: { id: projectId } });

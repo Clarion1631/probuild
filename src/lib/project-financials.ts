@@ -81,6 +81,10 @@ export async function computeProjectFinancials(
     for (const inv of invoices) {
         invoicedTotal += Number(inv.totalAmount);
         for (const payment of inv.payments) {
+            // Canceled milestones are not receivables — counting them inflated
+            // outstanding/forecasted incoming (pre-existing bug, fixed here for
+            // both the rollup and the per-project Financial Overview).
+            if (payment.status === "Canceled") continue;
             if (payment.status === "Paid") {
                 currentIncoming += Number(payment.amount);
             } else {
