@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { PermissionKey, hasPermission, canAccessProject } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
+import { isAncestorFinancial } from "@/lib/file-auth";
 
 // Agent runtime for the in-app help chat: gives the assistant live access to
 // ProBuild's own MCP server (src/app/api/mcp/[transport]/route.ts) so it can
@@ -343,40 +344,89 @@ function redactSendTokenText(text: string): string {
 
 // Args that name an entity whose project must be access-checked for
 // project-scoped (non-ADMIN/MANAGER) users. A bare projectId arg is checked
-// directly; these resolve the parent project first. A null projectId (a
-// lead-scoped estimate/contract/task) is allowed through — lead access is
-// gated by the leadAccess permission, not per-project assignment.
-const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<string | null>> = {
+// directly; these resolve the parent project (and, for lead-owned entities,
+// the parent lead) first. fileId additionally carries visibility/folderId so
+// callers can apply the financial-folder gate (see projectScopeDenial below)
+// without a second round-trip. invoice/changeOrder have no leadId column, so
+// their lookups always report leadId: null.
+type EntityOwner = {
+  projectId: string | null;
+  leadId: string | null;
+  visibility?: string | null;
+  folderId?: string | null;
+};
+const ENTITY_PROJECT_LOOKUPS: Record<string, (id: string) => Promise<EntityOwner | null>> = {
   estimateId: async (id) =>
-    (await prisma.estimate.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
-  invoiceId: async (id) =>
-    (await prisma.invoice.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
+    prisma.estimate.findUnique({ where: { id }, select: { projectId: true, leadId: true } }),
+  invoiceId: async (id) => {
+    const invoice = await prisma.invoice.findUnique({ where: { id }, select: { projectId: true } });
+    return invoice ? { projectId: invoice.projectId, leadId: null } : null;
+  },
   contractId: async (id) =>
-    (await prisma.contract.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
-  changeOrderId: async (id) =>
-    (await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
+    prisma.contract.findUnique({ where: { id }, select: { projectId: true, leadId: true } }),
+  changeOrderId: async (id) => {
+    const co = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
+    return co ? { projectId: co.projectId, leadId: null } : null;
+  },
   taskId: async (id) =>
-    (await prisma.scheduleTask.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
+    prisma.scheduleTask.findUnique({ where: { id }, select: { projectId: true, leadId: true } }),
   fileId: async (id) =>
-    (await prisma.projectFile.findUnique({ where: { id }, select: { projectId: true } }))?.projectId ?? null,
+    prisma.projectFile.findUnique({
+      where: { id },
+      select: { projectId: true, leadId: true, visibility: true, folderId: true },
+    }),
 };
 
-// Returns null when allowed, or a denial message for a project the user
-// can't access (directly via args.projectId or implied via an entity id).
+// Returns null when allowed, or a denial message for:
+// - a project the user can't access (directly via args.projectId or implied
+//   via an entity id)
+// - an entity owned by a lead (no project) when the user lacks leadAccess
+// - a file in a financial folder, read via read_file/get_file_link, when the
+//   user lacks financialReports
 async function projectScopeDenial(
   user: HelpAgentUser,
+  toolName: string,
   args: Record<string, unknown>
 ): Promise<string | null> {
   if (ADMIN_ROLES.includes(user.role)) return null;
-  if (typeof args.projectId === "string" && args.projectId && !canAccessProject(user, args.projectId)) {
+
+  const hasProjectIdArg = typeof args.projectId === "string" && !!args.projectId;
+  if (hasProjectIdArg && !canAccessProject(user, args.projectId as string)) {
     return "Permission denied: you don't have access to that project.";
   }
+  // A tool called directly with a leadId (no projectId) targets a lead-owned
+  // entity — gated by leadAccess, not per-project assignment.
+  if (
+    !hasProjectIdArg &&
+    typeof args.leadId === "string" &&
+    args.leadId &&
+    !hasPermission(user, "leadAccess")
+  ) {
+    return "Permission denied: you don't have lead access.";
+  }
+
   for (const [argName, lookup] of Object.entries(ENTITY_PROJECT_LOOKUPS)) {
     const id = args[argName];
     if (typeof id !== "string" || !id) continue;
-    const projectId = await lookup(id);
-    if (projectId && !canAccessProject(user, projectId)) {
-      return "Permission denied: you don't have access to that project.";
+    const owner = await lookup(id);
+    if (!owner) continue;
+    if (owner.projectId) {
+      if (!canAccessProject(user, owner.projectId)) {
+        return "Permission denied: you don't have access to that project.";
+      }
+    } else if (owner.leadId && !hasPermission(user, "leadAccess")) {
+      return "Permission denied: you don't have lead access.";
+    }
+    if (
+      argName === "fileId" &&
+      (toolName === "read_file" || toolName === "get_file_link") &&
+      !hasPermission(user, "financialReports")
+    ) {
+      const isFinancial =
+        owner.visibility === "financial" || (await isAncestorFinancial(owner.folderId ?? null));
+      if (isFinancial) {
+        return "Permission denied: that file is in a financial folder.";
+      }
     }
   }
   return null;
@@ -504,7 +554,7 @@ Rules:
         resultContent =
           "In-app chat cannot execute sends. The preview is ready — the user completes the send from the ProBuild page (or via their connected ChatGPT/Claude).";
       } else {
-        const scopeDenial = await projectScopeDenial(user, args);
+        const scopeDenial = await projectScopeDenial(user, block.name, args);
         if (scopeDenial) {
           ok = false;
           denied = true;
