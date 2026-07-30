@@ -627,6 +627,34 @@ test("overhead triage: no-customer purchases import to the configured project; e
     assert.equal(writesWithout.length, 0);
 });
 
+test("a configured but unavailable overhead project skips without deactivating prior imports", async () => {
+    let deactivations = 0;
+    const dependencies = createSyncDependencies(
+        [{
+            ...PURCHASE,
+            qbPurchaseId: "purchase-overhead",
+            customerName: null,
+            customerId: null,
+            isEquityDraw: false,
+        }],
+        ACTIVE_PROJECTS, // configured id below does not exist here
+        async () => "imported",
+    );
+    dependencies.deactivateExpense = async () => { deactivations += 1; return "removed"; };
+
+    const result = await syncQboExpenses(
+        { since: new Date("2026-05-01"), overheadProjectId: "project-shop-missing" },
+        dependencies,
+    );
+
+    assert.equal(result.imported, 0);
+    assert.equal(result.removed, 0);
+    assert.equal(deactivations, 0);
+    assert.deepEqual(result.skipped, [
+        { qbPurchaseId: "purchase-overhead", reason: "overhead-project-unavailable" },
+    ]);
+});
+
 test("sync forwards the optional until bound to the purchase reader and rejects an inverted window", async () => {
     const fake = createFakePrisma();
     const dependencies = createSyncDependencies(

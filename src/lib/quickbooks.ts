@@ -120,6 +120,7 @@ export interface QBAttachable {
     ContentType?: string;
     Size?: number;
     TempDownloadUri?: string;
+    AttachableRef?: Array<{ EntityRef?: { value?: string; type?: string } }>;
 }
 
 /** List file attachments linked to a QBO Purchase (receipt images/PDFs). */
@@ -129,9 +130,18 @@ export async function getQBPurchaseAttachables(
 ): Promise<QBAttachable[]> {
     // QBO transaction ids are numeric; refuse anything else rather than escape it.
     if (!/^\d+$/.test(purchaseId)) return [];
-    return qbQuery<QBAttachable>(
+    const rows = await qbQuery<QBAttachable>(
         tokens,
         `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+    );
+    // Entity ids are only unique per entity type, so the value-only query can
+    // surface attachments from other transaction types — keep Purchase links.
+    return rows.filter(row =>
+        row.AttachableRef?.some(
+            ref =>
+                ref.EntityRef?.value === purchaseId &&
+                /^purchase$/i.test(ref.EntityRef?.type ?? ""),
+        ),
     );
 }
 

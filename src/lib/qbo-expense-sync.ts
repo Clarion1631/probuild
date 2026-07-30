@@ -263,9 +263,14 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
                 amount: Number.isFinite(amount) ? amount : null,
                 account,
             });
-            if (Number.isFinite(amount) && amount > 0) {
+            if (Number.isFinite(amount) && amount !== 0) {
                 monetaryLineCount += 1;
-                if (account && /equity|distribut/i.test(account)) equityLineCount += 1;
+                // Name-based on purpose: GTR's draws all live under
+                // "Shareholders' equity:Distributions". A false positive only
+                // produces a visible equity-draw skip, never a wrong import.
+                if (account && /\bequity\b|\bdistributions?\b|owner'?s?\s+draw/i.test(account)) {
+                    equityLineCount += 1;
+                }
             }
         }
     }
@@ -779,11 +784,11 @@ export async function syncQboExpenses(
     const overheadEstimateId =
         overheadTarget?.kind === "matched" ? overheadTarget.estimateId : null;
 
-    const attachReceipt = async (qbPurchaseId: string, outcome: QboExpenseUpsertResult) => {
-        // New/changed rows always try; backfill sweeps rows still missing a receipt.
-        const shouldAttach =
-            outcome === "imported" || outcome === "updated" || mode === "backfill";
-        if (!shouldAttach || !dependencies.attachReceipt) return;
+    const attachReceipt = async (qbPurchaseId: string) => {
+        // Attempt for every processed purchase: the helper exits after one
+        // indexed read when a receipt is already linked, and retrying here is
+        // what recovers from a transient failure on an earlier run.
+        if (!dependencies.attachReceipt) return;
         try {
             await dependencies.attachReceipt(tokens, qbPurchaseId);
         } catch (error) {
@@ -814,22 +819,34 @@ export async function syncQboExpenses(
                 });
                 if (outcome === "imported") result.imported += 1;
                 if (outcome === "updated") result.updated += 1;
-                await attachReceipt(purchase.qbPurchaseId, outcome);
+                await attachReceipt(purchase.qbPurchaseId);
+                continue;
+            }
+            if (isOverheadCandidate && options.overheadProjectId) {
+                // Overhead routing is configured but the target project is
+                // missing, not in progress, or estimate-less. Zeroing prior
+                // imports on a misconfiguration would wipe the whole triage
+                // bucket, so this skips WITHOUT mutating anything.
+                result.skipped.push({
+                    qbPurchaseId: purchase.qbPurchaseId,
+                    reason: "overhead-project-unavailable",
+                });
                 continue;
             }
 
+            const skipReason =
+                match.reason === "missing-customer" && purchase.isEquityDraw
+                    ? "equity-draw"
+                    : match.reason;
             result.skipped.push({
                 qbPurchaseId: purchase.qbPurchaseId,
-                reason:
-                    match.reason === "missing-customer" && purchase.isEquityDraw
-                        ? "equity-draw"
-                        : match.reason,
+                reason: skipReason,
             });
             const outcome = await dependencies.deactivateExpense({
                 qbPurchaseId: purchase.qbPurchaseId,
                 qbSyncToken: purchase.syncToken,
                 qbSyncedAt: dependencies.now(),
-                reason: match.reason,
+                reason: skipReason,
             });
             if (outcome === "removed") result.removed += 1;
             continue;
@@ -848,7 +865,7 @@ export async function syncQboExpenses(
         });
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
-        await attachReceipt(purchase.qbPurchaseId, outcome);
+        await attachReceipt(purchase.qbPurchaseId);
     }
 
     return result;

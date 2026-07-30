@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
+import { getCurrentUserWithPermissions, canAccessProject } from "@/lib/permissions";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 
 const MAX_RECEIPT_BYTES = 10 * 1024 * 1024; // 10 MB
 
 function isAllowedReceiptType(mimeType: string): boolean {
+    // SVG is an active format (scripts) — receipts are photos or PDFs.
+    if (mimeType === "image/svg+xml") return false;
     return mimeType.startsWith("image/") || mimeType === "application/pdf";
 }
 
@@ -15,18 +16,26 @@ function isAllowedReceiptType(mimeType: string): boolean {
 // this route intentionally does NOT call assertExpenseMutableOutsideQbo.
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
-        const session = await getServerSession(authOptions);
-        if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+        const user = await getCurrentUserWithPermissions();
+        if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
         const id = (await params).id;
         if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
-        const expense = await prisma.expense.findUnique({ where: { id }, select: { id: true } });
+        const expense = await prisma.expense.findUnique({
+            where: { id },
+            select: { id: true, estimate: { select: { projectId: true } } },
+        });
         if (!expense) return NextResponse.json({ error: "Expense not found" }, { status: 404 });
+        if (expense.estimate?.projectId && !canAccessProject(user, expense.estimate.projectId)) {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
 
         const formData = await req.formData();
-        const file = formData.get("file") as File | null;
-        if (!file) return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
+        const file = formData.get("file");
+        if (!(file instanceof File) || file.size === 0) {
+            return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
+        }
 
         if (!isAllowedReceiptType(file.type)) {
             return NextResponse.json({ error: "Unsupported file type. Use an image or PDF." }, { status: 400 });

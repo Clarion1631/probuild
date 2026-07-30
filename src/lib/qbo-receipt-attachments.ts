@@ -72,9 +72,14 @@ export async function attachQboReceipt(
     if (!publicUrl) throw new Error("Receipt upload produced no public URL");
 
     // Guarded: only fill an empty receiptUrl so manual uploads always win.
-    await prisma.expense.updateMany({
+    const { count } = await prisma.expense.updateMany({
         where: { id: expense.id, receiptUrl: null },
         data: { receiptUrl: publicUrl },
     });
+    if (count === 0) {
+        // A manual upload raced us and won — drop the now-orphaned copy.
+        await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]).catch(() => {});
+        return "already-linked";
+    }
     return "attached";
 }
