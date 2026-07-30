@@ -146,6 +146,54 @@ test.describe("Project files — move into folders", () => {
         await expect(page.getByLabel(`Select ${name}`)).toBeVisible({ timeout: 20_000 });
     });
 
+    test("refuses a move that would silently un-share a client-visible file", async ({ playwright, baseURL, storageState }) => {
+        const request = await ctx(playwright, baseURL, storageState);
+        // A client-visible file at the project root. FOLDER_NAME is a team folder,
+        // so moving it there would drop the file out of the portal entirely: the
+        // portal only lists folders whose whole ancestor chain is "shared".
+        const res = await request.post("/api/files/register", {
+            data: {
+                files: [{
+                    name: `${RUN}-shared.pdf`,
+                    url: `https://example.invalid/${RUN}-shared.pdf`,
+                    projectId: PROJECT_ID,
+                    size: 1024,
+                    mimeType: "application/pdf",
+                    visibility: "shared",
+                }],
+            },
+        });
+        expect(res.ok()).toBeTruthy();
+        const fileId: string = (await res.json()).files[0].id;
+        createdFileIds.add(fileId);
+
+        // Side-effect un-sharing is refused...
+        const blocked = await request.patch("/api/files", { data: { fileId, folderId } });
+        expect(blocked.status(), "moving a client-visible file into a team folder must be refused").toBe(409);
+        expect(await blocked.text()).toContain("would remove their access");
+
+        // ...and the file genuinely did not move.
+        const still = await request.get(`/api/files?projectId=${PROJECT_ID}`);
+        const rootNames: string[] = ((await still.json()).files ?? []).map((f: { name: string }) => f.name);
+        expect(rootNames).toContain(`${RUN}-shared.pdf`);
+
+        // Passing a visibility is NOT enough on its own. The file keeps visibility
+        // "shared" while landing somewhere the portal cannot traverse, so the client
+        // still loses access — the guard must not be satisfied by a field that does
+        // not change the outcome.
+        const stillBlocked = await request.patch("/api/files", {
+            data: { fileId, folderId, visibility: "shared" },
+        });
+        expect(stillBlocked.status(), "visibility alone must not bypass the guard").toBe(409);
+
+        // Only an explicit intent flag gets it through.
+        const allowed = await request.patch("/api/files", {
+            data: { fileId, folderId, allowClientVisibilityLoss: true },
+        });
+        expect(allowed.ok(), `deliberate move must be allowed: ${await allowed.text()}`).toBeTruthy();
+        await request.dispose();
+    });
+
     test("declines an OS file drag so upload still works", async ({ page, playwright, baseURL, storageState }) => {
         const request = await ctx(playwright, baseURL, storageState);
         const name = `${RUN}-osdrag.pdf`;

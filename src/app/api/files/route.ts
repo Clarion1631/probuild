@@ -4,7 +4,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSupabase, STORAGE_BUCKET } from "@/lib/supabase";
 import { hasPermission } from "@/lib/permissions";
-import { authorizeFileScope, isAncestorFinancial } from "@/lib/file-auth";
+import { authorizeFileScope, isAncestorFinancial, isAncestorChainShared } from "@/lib/file-auth";
 import { ALLOWED_FILE_EXTENSIONS } from "@/lib/project-files";
 import { resolveDocUrl, isSecureRef, removeSecureDoc } from "@/lib/secure-storage";
 
@@ -258,6 +258,67 @@ export async function PATCH(req: NextRequest) {
         const ALLOWED_VISIBILITY = new Set(["team", "shared", "financial"]);
         if (visibility !== undefined && visibility !== null && !ALLOWED_VISIBILITY.has(visibility)) {
             return NextResponse.json({ error: "Invalid visibility value" }, { status: 400 });
+        }
+
+        // ── Move safety ───────────────────────────────────────────────────────
+        //
+        // A move must never silently revoke the client's access, and must never
+        // strand a file on another project.
+        //
+        // Client visibility is NOT a single field. The portal's predicate is: at the
+        // project root, an EXPLICIT "shared"; inside a folder, visibility "shared" or
+        // null AND the folder's whole ancestor chain shared (api/portal/files +
+        // isAncestorChainShared). Any shorthand that just compares the file's own
+        // visibility gets this wrong — an explicitly-shared file dropped into a team
+        // folder keeps visibility "shared" while becoming completely unreachable.
+        if (folderId !== undefined) {
+            const targetFolder = folderId
+                ? await prisma.fileFolder.findUnique({
+                    where: { id: folderId },
+                    select: { id: true, name: true, projectId: true, leadId: true },
+                })
+                : null;
+            if (folderId && !targetFolder) {
+                return NextResponse.json({ error: "Target folder not found" }, { status: 404 });
+            }
+            // The target folder must belong to the same project/lead as the file.
+            // Without this, a caller authorized for project A could move its file into
+            // a folder id belonging to project B: the row keeps project A's projectId,
+            // so NEITHER portal can reach it and the document silently disappears.
+            // mcp-pm-tools.ts already enforces this on its own move tool.
+            if (targetFolder) {
+                const sameOwner = (existing.projectId && targetFolder.projectId === existing.projectId)
+                    || (existing.leadId && targetFolder.leadId === existing.leadId);
+                if (!sameOwner) {
+                    return NextResponse.json(
+                        { error: "That folder belongs to a different project or lead" },
+                        { status: 400 },
+                    );
+                }
+            }
+
+            const clientCanSee = async (vis: string | null, folder: string | null): Promise<boolean> => {
+                if (!existing.projectId) return false; // lead files aren't on the client portal
+                if (!folder) return vis === "shared";
+                if (vis !== "shared" && vis !== null) return false;
+                return isAncestorChainShared(folder, existing.projectId);
+            };
+
+            const nextVisibility = visibility !== undefined ? visibility : existing.visibility;
+            const before = await clientCanSee(existing.visibility, existing.folderId);
+            const after = await clientCanSee(nextVisibility, folderId || null);
+
+            // Refused only when the client LOSES access as a side effect. Passing an
+            // explicit visibility is not a licence to hide the file — the caller has
+            // to reach a destination the client can still see, or say so via
+            // allowClientVisibilityLoss.
+            if (before && !after && body.allowClientVisibilityLoss !== true) {
+                return NextResponse.json({
+                    error: targetFolder
+                        ? `The client can currently see "${existing.name}" in their portal, and "${targetFolder.name}" is not shared with them — this move would remove their access. Share that folder first, or pass allowClientVisibilityLoss: true to do it deliberately.`
+                        : `The client can currently see "${existing.name}" in their portal; moving it to the project root would remove their access unless it is explicitly shared. Pass visibility "shared", or allowClientVisibilityLoss: true to do it deliberately.`,
+                }, { status: 409 });
+            }
         }
 
         const updateData: any = {};
