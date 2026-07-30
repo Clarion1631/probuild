@@ -169,18 +169,26 @@ test.describe("Project files — move into folders", () => {
 
         // Side-effect un-sharing is refused...
         const blocked = await request.patch("/api/files", { data: { fileId, folderId } });
-        expect(blocked.status(), "moving a shared file into a team folder must be refused").toBe(409);
-        expect(await blocked.text()).toContain("not shared with the client");
+        expect(blocked.status(), "moving a client-visible file into a team folder must be refused").toBe(409);
+        expect(await blocked.text()).toContain("would remove their access");
 
         // ...and the file genuinely did not move.
         const still = await request.get(`/api/files?projectId=${PROJECT_ID}`);
         const rootNames: string[] = ((await still.json()).files ?? []).map((f: { name: string }) => f.name);
         expect(rootNames).toContain(`${RUN}-shared.pdf`);
 
-        // But an EXPLICIT visibility in the same call is a deliberate choice and is
-        // honored — otherwise the share/unshare toggle would be unusable.
+        // Passing a visibility is NOT enough on its own. The file keeps visibility
+        // "shared" while landing somewhere the portal cannot traverse, so the client
+        // still loses access — the guard must not be satisfied by a field that does
+        // not change the outcome.
+        const stillBlocked = await request.patch("/api/files", {
+            data: { fileId, folderId, visibility: "shared" },
+        });
+        expect(stillBlocked.status(), "visibility alone must not bypass the guard").toBe(409);
+
+        // Only an explicit intent flag gets it through.
         const allowed = await request.patch("/api/files", {
-            data: { fileId, folderId, visibility: "team" },
+            data: { fileId, folderId, allowClientVisibilityLoss: true },
         });
         expect(allowed.ok(), `deliberate move must be allowed: ${await allowed.text()}`).toBeTruthy();
         await request.dispose();

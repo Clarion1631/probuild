@@ -2532,27 +2532,44 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     if (pdfBuffer && estimate?.projectId) {
         let filedSecureRef: string | null = null;
         try {
-            // Find or create a "Signed Documents" folder for this project.
+            // Find or create a SHARED "Signed Documents" folder for this project.
             //
-            // SHARED, deliberately: a client must be able to open their own signed
-            // estimate at any time. The portal only lists folders whose whole
-            // ancestor chain is "shared" (see api/portal/files), so a team folder
-            // here makes the document unreachable no matter what the file says —
-            // which is exactly how 13 signed documents across 6 projects ended up
-            // invisible to their clients. An existing team folder is promoted, since
-            // its whole purpose is to hold documents the client signed.
+            // A client must be able to open their own signed estimate at any time.
+            // The portal only lists folders whose whole ancestor chain is "shared"
+            // (api/portal/files + isAncestorChainShared), so a team folder here makes
+            // the document unreachable no matter what the file says — which is
+            // exactly how 13 signed estimates across 6 projects ended up invisible to
+            // their clients.
+            //
+            // A same-named folder that is NOT shared is deliberately left alone
+            // rather than promoted: the name is not reserved, staff can create one,
+            // and flipping it would publish every null-visibility file already inside
+            // to the client as a side effect of approving an unrelated estimate. In
+            // that case the PDF is filed at the project root with explicit "shared" —
+            // exactly what archiveExecutedContractPdf does for executed contracts,
+            // which has always been client-visible and correct.
             let folder = await prisma.fileFolder.findFirst({
-                where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+                where: {
+                    projectId: estimate.projectId,
+                    name: "Signed Documents",
+                    parentId: null,
+                    visibility: "shared",
+                },
             });
             if (!folder) {
-                folder = await prisma.fileFolder.create({
-                    data: { name: "Signed Documents", projectId: estimate.projectId, visibility: "shared" },
+                const conflicting = await prisma.fileFolder.findFirst({
+                    where: { projectId: estimate.projectId, name: "Signed Documents", parentId: null },
+                    select: { id: true, visibility: true },
                 });
-            } else if (folder.visibility !== "shared") {
-                folder = await prisma.fileFolder.update({
-                    where: { id: folder.id },
-                    data: { visibility: "shared" },
-                });
+                if (conflicting) {
+                    console.warn(
+                        `[approveEstimate] "Signed Documents" exists on project ${estimate.projectId} with visibility "${conflicting.visibility}"; filing the signed PDF at the project root so the client can still reach it (promoting that folder could expose unrelated files).`,
+                    );
+                } else {
+                    folder = await prisma.fileFolder.create({
+                        data: { name: "Signed Documents", projectId: estimate.projectId, visibility: "shared" },
+                    });
+                }
             }
 
             // Upload to the private secure-docs bucket
@@ -2566,7 +2583,9 @@ export async function approveEstimate(estimateId: string, signatureName: string,
                     size: pdfBuffer.length,
                     mimeType: "application/pdf",
                     projectId: estimate.projectId,
-                    folderId: folder.id,
+                    // null => project root, which the client can still reach because
+                    // the visibility below is explicit.
+                    folderId: folder?.id ?? null,
                     // Explicit, not inherited: a null visibility only reads as shared
                     // while the file sits inside a shared folder, so it would silently
                     // un-share the moment anyone moved it or changed the folder. This

@@ -26,7 +26,10 @@ const write = process.argv.includes("--write");
 
 async function main() {
     const folders = await prisma.fileFolder.findMany({
-        where: { name: FOLDER_NAME },
+        // Project-scoped, top-level folders only. A nested one would additionally
+        // need every ancestor shared to be reachable, and a lead-scoped one has no
+        // client portal at all — promoting either would imply access it won't grant.
+        where: { name: FOLDER_NAME, parentId: null, projectId: { not: null } },
         select: {
             id: true,
             visibility: true,
@@ -41,7 +44,16 @@ async function main() {
 
     for (const folder of folders) {
         const needsFolder = folder.visibility !== "shared";
-        const staleFiles = folder.files.filter(f => f.visibility !== "shared");
+        // Only documents this system files itself (Signed_Estimate_* / Signed_*), and
+        // never one already marked "financial" or explicitly "team": those are
+        // deliberate staff-only choices, and a repair script must not overrule a
+        // human's explicit decision about what a client may see.
+        const staleFiles = folder.files.filter(f =>
+            /^Signed_/.test(f.name)
+            && f.visibility !== "shared"
+            && f.visibility !== "financial"
+            && f.visibility !== "team");
+        const skipped = folder.files.filter(f => !staleFiles.includes(f) && f.visibility !== "shared");
         if (!needsFolder && staleFiles.length === 0) continue;
         foldersToPromote += needsFolder ? 1 : 0;
         filesToStamp += staleFiles.length;
@@ -50,6 +62,9 @@ async function main() {
         if (folder.parentId) console.log("  ! nested folder — its ancestors must be shared too for the client to reach it");
         console.log(`  folder: ${folder.visibility}${needsFolder ? " -> shared" : " (already shared)"}`);
         for (const f of staleFiles) console.log(`    file: ${f.name} [${f.visibility ?? "inherited"}] -> shared`);
+        // Named explicitly rather than silently passed over: promoting the folder can
+        // still expose a null-visibility file the client could not previously reach.
+        for (const f of skipped) console.log(`    SKIPPED (left as-is): ${f.name} [${f.visibility ?? "inherited"}]`);
 
         if (write) {
             await prisma.$transaction(async tx => {
