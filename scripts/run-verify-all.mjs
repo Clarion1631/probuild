@@ -28,6 +28,21 @@ const SKIP = {
         "stale since PR #272 consolidated popovers onto FloatingLayer — ~18 assertions "
         + "describe internals that moved out of FloatingPopover. Needs each invariant "
         + "re-verified against FloatingLayer individually, not blanket-repointed.",
+
+    // The rest are DATA-DEPENDENT smoke scripts, not hermetic tests: they were
+    // written to be pointed at a populated database and assert against specific
+    // existing records. On a clean CI database they fail for lack of fixtures, not
+    // because anything is broken. Each needs to either seed what it needs or be
+    // reclassified as a manual tool. Verified reasons from the first real CI run:
+    "verify-billing-tools.ts": "needs an existing invoice (\"no invoice in DB to test against\")",
+    "verify-estimate-edit.ts": "hardcodes estimate EST-00145",
+    "verify-gpt-estimate.ts": "needs an existing lead (\"No lead found to test against\")",
+    "verify-template-roundtrip.ts": "hardcodes the \"Kitchen Remodel\" template",
+    "verify-phase3-co-schedule.ts": "needs seeded change-order + schedule fixtures",
+    "verify-schedule-board.ts": "needs seeded project/task fixtures",
+    "verify-company-schedule.ts":
+        "calls headers() outside a request scope, so it cannot run standalone at all "
+        + "(next-dynamic-api-wrong-context) — needs refactoring to take an explicit actor",
 };
 
 const all = readdirSync(scriptsDir)
