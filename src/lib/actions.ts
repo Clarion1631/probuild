@@ -4206,7 +4206,10 @@ async function assertDocumentSendPermission(
     // attacker-supplied null/false/0 at runtime — must NOT be treated as
     // "omitted", or a bad machine token silently falls through to the session
     // path and rides in on whatever staff cookie happens to be attached.
-    if (mcpSecret !== undefined && mcpSecret !== null) {
+    // ONLY undefined counts as omitted. Excluding null here as well was the bug:
+    // it let an explicitly-supplied null skip validation and reach the staff-session
+    // path — precisely the fallback this check exists to prevent.
+    if (mcpSecret !== undefined) {
         if (typeof mcpSecret !== "string" || mcpSecret.length === 0) {
             throw new Error("Unauthorized");
         }
@@ -4239,12 +4242,19 @@ function assertSendScope(
     principal: SendPrincipal,
     scope: { projectId?: string | null; leadId?: string | null },
 ) {
+    // Fail CLOSED on an ownerless document, before the machine exemption. Both
+    // ownership columns are optional in the schema, and an ownerless estimate can
+    // still be emailed via overrideEmail — so "no project and no lead" previously
+    // fell straight through this function and was authorized by default.
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This document is not attached to a project or lead, so access cannot be checked");
+    }
     if (!principal.user) return; // machine callers are company-wide by design
     if (scope.projectId) {
         if (!canAccessProject(principal.user, scope.projectId)) throw new Error("Forbidden");
         return;
     }
-    if (scope.leadId && !hasPermission(principal.user, "leadAccess")) throw new Error("Forbidden");
+    if (!hasPermission(principal.user, "leadAccess")) throw new Error("Forbidden");
 }
 
 async function assertEstimateSendPermission(mcpSecret?: string): Promise<SendPrincipal> {

@@ -166,8 +166,13 @@ async function main() {
     // document from a job they cannot access just by knowing its id.
     assert.match(actionSource, /assertSendScope\(sendActor, \{ projectId: contract\.projectId/);
     assert.match(actionSource, /assertSendScope\(sendActor, \{ projectId: estimate\.project\?\.id/);
-    // A supplied-but-empty machine secret must not be treated as "omitted".
-    assert.match(actionSource, /mcpSecret !== undefined && mcpSecret !== null/);
+    // ONLY undefined is omission. Excluding null too let an explicit null skip
+    // validation and reach the staff-session path — the very fallback being closed.
+    assert.match(actionSource, /if \(mcpSecret !== undefined\) \{/);
+    assert.doesNotMatch(actionSource, /mcpSecret !== undefined && mcpSecret !== null/);
+    // An ownerless document must fail CLOSED, and before the machine exemption:
+    // both ownership columns are optional and such a doc can still be emailed.
+    assert.match(actionSource, /if \(!scope\.projectId && !scope\.leadId\) \{[\s\S]{0,200}throw new Error/);
     // The raw audit writer must NOT live on the "use server" surface, or callers
     // can forge history (e.g. a sent_contract attributed to anyone).
     assert.doesNotMatch(actionSource, /export async function logActivity/);
