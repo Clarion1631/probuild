@@ -7,6 +7,16 @@ export const dynamic = "force-dynamic";
 
 const REPORT_SECTIONS = [
     {
+        heading: "Company Financials",
+        reports: [
+            {
+                title: "Company Financials",
+                description: "Are we profitable and is cash flow good, across the whole company? Incoming, outgoing, and margin per in-progress job (worst first), plus the Shop overhead bucket and net position.",
+                href: "/reports/company-financials",
+            },
+        ],
+    },
+    {
         heading: "Profitability",
         reports: [
             {

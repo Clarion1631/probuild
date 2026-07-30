@@ -6,6 +6,12 @@ import { usePermissions } from "@/components/PermissionsProvider";
 
 const NAV_SECTIONS = [
     {
+        heading: "Company Financials",
+        items: [
+            { label: "Company Financials", href: "/reports/company-financials" },
+        ],
+    },
+    {
         heading: "Payments",
         items: [
             { label: "Payments Received", href: "/reports/payments" },
