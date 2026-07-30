@@ -173,7 +173,16 @@ const handlers = createQboExpenseSyncHandlers({
     isCronEnabled: () => process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false",
     getFreshTokens: getFreshQBTokens,
     syncExpenses: (options, runtime) =>
-        syncQboExpenses(options, undefined, runtime),
+        syncQboExpenses(
+            {
+                ...options,
+                // No-customer purchases triage into this in-progress project
+                // (the Shop overhead bucket) instead of skipping invisibly.
+                overheadProjectId: process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || undefined,
+            },
+            undefined,
+            runtime,
+        ),
     now: () => new Date(),
     incrementalLookbackDays: configuredLookbackDays(),
 });

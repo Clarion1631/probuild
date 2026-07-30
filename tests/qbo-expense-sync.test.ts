@@ -29,6 +29,8 @@ const PURCHASE: QboPurchaseForImport = {
     customerId: "qbo-job-1",
     accountName: "Washington Trust Checking",
     memo: "Rough plumbing",
+    lines: [{ description: null, amount: null, account: null }],
+    isEquityDraw: false,
 };
 
 const ACTIVE_PROJECTS: QboExpenseProjectCandidate[] = [
@@ -80,6 +82,58 @@ test("normalizes a valid purchase with no customer for an explicit eligibility s
         assert.equal(result.purchase.customerId, null);
         assert.equal(result.purchase.customerName, null);
         assert.equal(result.purchase.total, 45.2);
+    }
+});
+
+test("captures line detail and flags an all-equity purchase as an owner draw", () => {
+    const equityDraw = normalizeQboPurchase({
+        Id: "purchase-draw",
+        SyncToken: "0",
+        TxnDate: "2026-06-14",
+        TotalAmt: 20,
+        Line: [{
+            Amount: 20,
+            Description: "haircut",
+            DetailType: "AccountBasedExpenseLineDetail",
+            AccountBasedExpenseLineDetail: {
+                AccountRef: { value: "eq-1", name: "Shareholders' equity:Distributions" },
+            },
+        }],
+    });
+    assert.equal(equityDraw.kind, "purchase");
+    if (equityDraw.kind === "purchase") {
+        assert.equal(equityDraw.purchase.isEquityDraw, true);
+        assert.deepEqual(equityDraw.purchase.lines, [
+            { description: "haircut", amount: 20, account: "Shareholders' equity:Distributions" },
+        ]);
+    }
+
+    const mixed = normalizeQboPurchase({
+        Id: "purchase-mixed-accounts",
+        SyncToken: "0",
+        TxnDate: "2026-06-14",
+        TotalAmt: 120,
+        Line: [
+            {
+                Amount: 20,
+                DetailType: "AccountBasedExpenseLineDetail",
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "eq-1", name: "Shareholders' equity:Distributions" },
+                },
+            },
+            {
+                Amount: 100,
+                Description: "Spray foam gun",
+                DetailType: "AccountBasedExpenseLineDetail",
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "cogs-1", name: "Cost of goods sold:Supplies & materials - COGS" },
+                },
+            },
+        ],
+    });
+    assert.equal(mixed.kind, "purchase");
+    if (mixed.kind === "purchase") {
+        assert.equal(mixed.purchase.isEquityDraw, false);
     }
 });
 
@@ -507,6 +561,70 @@ test("sync imports once, is a no-op on repeat, and applies a newer QBO sync toke
         skipped: [],
     });
     assert.equal(fake.rows.get("purchase-1")?.amount, 175);
+});
+
+test("overhead triage: no-customer purchases import to the configured project; equity draws stay out", async () => {
+    const writes: QboExpenseWrite[] = [];
+    const overheadProjects: QboExpenseProjectCandidate[] = [
+        ...ACTIVE_PROJECTS,
+        {
+            id: "project-shop",
+            name: "Shop",
+            status: "In Progress",
+            estimates: [{ id: "estimate-shop", createdAt: new Date("2026-07-07T00:00:00.000Z") }],
+        },
+    ];
+    const overheadPurchase: QboPurchaseForImport = {
+        ...PURCHASE,
+        qbPurchaseId: "purchase-overhead",
+        customerName: null,
+        customerId: null,
+        memo: "CLARK PUBLIC UTILITIES",
+        lines: [{ description: "electric", amount: 72.33, account: "Utilities" }],
+        isEquityDraw: false,
+    };
+    const drawPurchase: QboPurchaseForImport = {
+        ...PURCHASE,
+        qbPurchaseId: "purchase-draw",
+        customerName: null,
+        customerId: null,
+        memo: "haircut",
+        isEquityDraw: true,
+    };
+    const dependencies = createSyncDependencies(
+        [overheadPurchase, drawPurchase],
+        overheadProjects,
+        async write => { writes.push(write); return "imported"; },
+    );
+
+    const result = await syncQboExpenses(
+        { since: new Date("2026-05-01"), overheadProjectId: "project-shop" },
+        dependencies,
+    );
+
+    assert.equal(result.imported, 1);
+    assert.deepEqual(result.skipped, [
+        { qbPurchaseId: "purchase-draw", reason: "equity-draw" },
+    ]);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].estimateId, "estimate-shop");
+    assert.match(writes[0].description, /^\[Overhead\] CLARK PUBLIC UTILITIES \| Lines: electric \(\$72\.33\)/);
+
+    // Without the overhead project configured, behavior is unchanged.
+    const writesWithout: QboExpenseWrite[] = [];
+    const withoutOverhead = await syncQboExpenses(
+        { since: new Date("2026-05-01") },
+        createSyncDependencies(
+            [overheadPurchase],
+            overheadProjects,
+            async write => { writesWithout.push(write); return "imported"; },
+        ),
+    );
+    assert.equal(withoutOverhead.imported, 0);
+    assert.deepEqual(withoutOverhead.skipped, [
+        { qbPurchaseId: "purchase-overhead", reason: "missing-customer" },
+    ]);
+    assert.equal(writesWithout.length, 0);
 });
 
 test("sync forwards the optional until bound to the purchase reader and rejects an inverted window", async () => {

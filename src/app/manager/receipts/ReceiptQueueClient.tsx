@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 
@@ -13,6 +13,7 @@ interface Expense {
     vendor: string | null;
     date: string | null;
     status: string;
+    receiptUrl: string | null;
     estimate: {
         project: { id: string; name: string } | null;
     } | null;
@@ -33,11 +34,14 @@ interface Props {
 
 export default function ReceiptQueueClient({
     expenses: initialExpenses,
-    importedExpenses,
+    importedExpenses: initialImportedExpenses,
     importedExpenseCount,
 }: Props) {
     const [expenses, setExpenses] = useState(initialExpenses);
+    const [importedExpenses, setImportedExpenses] = useState(initialImportedExpenses);
     const [processing, setProcessing] = useState<string | null>(null);
+    const [uploadingId, setUploadingId] = useState<string | null>(null);
+    const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
     async function handleApprove(id: string) {
         setProcessing(id);
@@ -64,6 +68,23 @@ export default function ReceiptQueueClient({
             toast.error("Failed to reject expense");
         } finally {
             setProcessing(null);
+        }
+    }
+
+    async function handleUploadReceipt(id: string, file: File) {
+        setUploadingId(id);
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const res = await fetch(`/api/expenses/${id}/receipt`, { method: "POST", body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to upload receipt");
+            setImportedExpenses(prev => prev.map(e => e.id === id ? { ...e, receiptUrl: data.receiptUrl } : e));
+            toast.success("Receipt uploaded");
+        } catch (err: any) {
+            toast.error(err.message || "Failed to upload receipt");
+        } finally {
+            setUploadingId(null);
         }
     }
 
@@ -111,6 +132,16 @@ export default function ReceiptQueueClient({
                                 </div>
                             </div>
                             <div className="flex items-center gap-2 shrink-0">
+                                {exp.receiptUrl && (
+                                    <a
+                                        href={exp.receiptUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="hui-btn hui-btn-secondary text-sm text-blue-600 border-blue-200 hover:bg-blue-50"
+                                    >
+                                        View receipt
+                                    </a>
+                                )}
                                 <button
                                     onClick={() => handleReject(exp.id)}
                                     disabled={processing === exp.id}
@@ -165,8 +196,47 @@ export default function ReceiptQueueClient({
                                     {exp.qbSyncedAt && <span>Imported {new Date(exp.qbSyncedAt).toLocaleString()}</span>}
                                 </div>
                             </div>
-                            <div className="shrink-0 text-xs font-semibold uppercase tracking-wide text-indigo-600">
-                                QuickBooks import
+                            <div className="flex items-center gap-3 shrink-0">
+                                {exp.receiptUrl && (
+                                    <a
+                                        href={exp.receiptUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-sm text-blue-600 hover:underline"
+                                    >
+                                        View receipt
+                                    </a>
+                                )}
+                                <input
+                                    type="file"
+                                    accept="image/*,application/pdf"
+                                    className="hidden"
+                                    ref={el => { fileInputRefs.current[exp.id] = el; }}
+                                    onChange={e => {
+                                        const file = e.target.files?.[0];
+                                        if (file) handleUploadReceipt(exp.id, file);
+                                        e.target.value = "";
+                                    }}
+                                />
+                                <button
+                                    onClick={() => fileInputRefs.current[exp.id]?.click()}
+                                    disabled={uploadingId === exp.id}
+                                    className="text-slate-400 hover:text-hui-primary transition disabled:opacity-50"
+                                    title={exp.receiptUrl ? "Replace receipt" : "Upload receipt"}
+                                >
+                                    {uploadingId === exp.id ? (
+                                        <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-6.219-8.56" />
+                                        </svg>
+                                    ) : (
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
+                                        </svg>
+                                    )}
+                                </button>
+                                <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600">
+                                    QuickBooks import
+                                </div>
                             </div>
                         </div>
                     </div>

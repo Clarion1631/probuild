@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
 
@@ -50,6 +50,8 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [bulkChangeOrderId, setBulkChangeOrderId] = useState("");
+    const [uploadingId, setUploadingId] = useState<string | null>(null);
+    const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
     const refreshExpenses = useCallback(async () => {
         try {
@@ -130,6 +132,23 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
             await refreshExpenses();
         } catch (err: any) {
             toast.error(err.message || "Failed to delete");
+        }
+    }
+
+    async function handleUploadReceipt(id: string, file: File) {
+        setUploadingId(id);
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const res = await fetch(`/api/expenses/${id}/receipt`, { method: "POST", body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to upload receipt");
+            setExpenses(prev => prev.map(e => e.id === id ? { ...e, receiptUrl: data.receiptUrl } : e));
+            toast.success("Receipt uploaded");
+        } catch (err: any) {
+            toast.error(err.message || "Failed to upload receipt");
+        } finally {
+            setUploadingId(null);
         }
     }
 
@@ -270,6 +289,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Amount</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">Status</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">QB</th>
+                                    <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">Receipt</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider w-20"></th>
                                 </tr>
                             </thead>
@@ -320,6 +340,50 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                             ) : (
                                                 <span className="text-slate-300">—</span>
                                             )}
+                                        </td>
+                                        <td className="px-4 py-3">
+                                            <div className="flex items-center justify-center gap-2">
+                                                {expense.receiptUrl && (
+                                                    <a
+                                                        href={expense.receiptUrl}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="text-blue-500 hover:text-blue-700 transition"
+                                                        title="View receipt"
+                                                    >
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" />
+                                                        </svg>
+                                                    </a>
+                                                )}
+                                                <input
+                                                    type="file"
+                                                    accept="image/*,application/pdf"
+                                                    className="hidden"
+                                                    ref={el => { fileInputRefs.current[expense.id] = el; }}
+                                                    onChange={e => {
+                                                        const file = e.target.files?.[0];
+                                                        if (file) handleUploadReceipt(expense.id, file);
+                                                        e.target.value = "";
+                                                    }}
+                                                />
+                                                <button
+                                                    onClick={() => fileInputRefs.current[expense.id]?.click()}
+                                                    disabled={uploadingId === expense.id}
+                                                    className="text-slate-400 hover:text-hui-primary transition disabled:opacity-50"
+                                                    title={expense.receiptUrl ? "Replace receipt" : "Upload receipt"}
+                                                >
+                                                    {uploadingId === expense.id ? (
+                                                        <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-6.219-8.56" />
+                                                        </svg>
+                                                    ) : (
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
+                                                        </svg>
+                                                    )}
+                                                </button>
+                                            </div>
                                         </td>
                                         <td className="px-4 py-3 text-right">
                                             {!expense.qbPurchaseId && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (

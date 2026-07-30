@@ -4,6 +4,12 @@ import { findBestProjectNameMatches } from "./project-match";
 import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
 
+export interface QboPurchaseLineDetail {
+    description: string | null;
+    amount: number | null;
+    account: string | null;
+}
+
 export interface QboPurchaseForImport {
     qbPurchaseId: string;
     syncToken: string;
@@ -14,6 +20,10 @@ export interface QboPurchaseForImport {
     customerId: string | null;
     accountName: string | null;
     memo: string | null;
+    /** Expense line detail so imports carry "what was bought", not just a total. */
+    lines?: QboPurchaseLineDetail[];
+    /** True when every monetary line is an equity/distribution account — an owner draw, not a business expense. */
+    isEquityDraw?: boolean;
 }
 
 export type QboPurchaseNormalizationSkipReason =
@@ -68,7 +78,8 @@ type QboReference = {
 
 type QboPurchaseLine = {
     Amount?: unknown;
-    AccountBasedExpenseLineDetail?: { CustomerRef?: QboReference };
+    Description?: unknown;
+    AccountBasedExpenseLineDetail?: { CustomerRef?: QboReference; AccountRef?: QboReference };
     ItemBasedExpenseLineDetail?: { CustomerRef?: QboReference };
 };
 
@@ -237,6 +248,28 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
     }
     const customerReference = customerAllocation.references[0];
 
+    const lineDetails: QboPurchaseLineDetail[] = [];
+    let monetaryLineCount = 0;
+    let equityLineCount = 0;
+    if (Array.isArray(purchase.Line)) {
+        for (const rawLine of purchase.Line) {
+            if (!rawLine || typeof rawLine !== "object") continue;
+            const line = rawLine as QboPurchaseLine;
+            if (!line.AccountBasedExpenseLineDetail && !line.ItemBasedExpenseLineDetail) continue;
+            const amount = Number(line.Amount);
+            const account = optionalString(line.AccountBasedExpenseLineDetail?.AccountRef?.name);
+            lineDetails.push({
+                description: optionalString(line.Description),
+                amount: Number.isFinite(amount) ? amount : null,
+                account,
+            });
+            if (Number.isFinite(amount) && amount > 0) {
+                monetaryLineCount += 1;
+                if (account && /equity|distribut/i.test(account)) equityLineCount += 1;
+            }
+        }
+    }
+
     return {
         kind: "purchase",
         purchase: {
@@ -249,6 +282,8 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
             customerId: optionalString(customerReference?.value),
             accountName: optionalString(purchase.AccountRef?.name),
             memo: optionalString(purchase.PrivateNote),
+            lines: lineDetails,
+            isEquityDraw: monetaryLineCount > 0 && equityLineCount === monetaryLineCount,
         },
     };
 }
@@ -597,6 +632,8 @@ export interface QboExpenseSyncDependencies {
     listProjects(): Promise<QboExpenseProjectCandidate[]>;
     upsertExpense(write: QboExpenseWrite): Promise<QboExpenseUpsertResult>;
     deactivateExpense(write: QboExpenseRemovalWrite): Promise<QboExpenseRemovalResult>;
+    /** Optional: copy the QBO receipt attachment into ProBuild storage for this purchase. */
+    attachReceipt?(tokens: QBTokens, qbPurchaseId: string): Promise<void>;
     now(): Date;
 }
 
@@ -650,13 +687,28 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
                 prisma as unknown as QboExpensePersistenceClient,
                 write,
             ),
+        attachReceipt: async (tokens, qbPurchaseId) => {
+            const { attachQboReceipt } = await import("./qbo-receipt-attachments");
+            await attachQboReceipt(tokens, qbPurchaseId);
+        },
         now: () => new Date(),
     };
 }
 
-function qboExpenseDescription(purchase: QboPurchaseForImport): string {
+function qboExpenseDescription(
+    purchase: QboPurchaseForImport,
+    prefix = "[QuickBooks import]",
+): string {
     const detail = purchase.memo || purchase.vendor || "Finalized expense";
-    return `[QuickBooks import] ${detail}`.slice(0, 4000);
+    const lineParts = (purchase.lines ?? [])
+        .filter(line => line.description)
+        .map(line =>
+            line.amount !== null
+                ? `${line.description} ($${line.amount.toFixed(2)})`
+                : line.description!,
+        );
+    const suffix = lineParts.length ? ` | Lines: ${lineParts.join("; ")}` : "";
+    return `${prefix} ${detail}${suffix}`.slice(0, 4000);
 }
 
 function qboTransactionDate(txnDate: string | null): Date | null {
@@ -671,7 +723,13 @@ function qboTransactionDate(txnDate: string | null): Date | null {
  * database transaction used by the upsert.
  */
 export async function syncQboExpenses(
-    options: { since: Date; until?: Date; mode?: "incremental" | "backfill" },
+    options: {
+        since: Date;
+        until?: Date;
+        mode?: "incremental" | "backfill";
+        /** In-progress project that receives no-customer overhead purchases as a triage bucket. */
+        overheadProjectId?: string;
+    },
     dependencies: QboExpenseSyncDependencies = createDefaultSyncDependencies(),
     runtime: { tokens?: QBTokens } = {},
 ): Promise<QboExpenseSyncResult> {
@@ -708,12 +766,64 @@ export async function syncQboExpenses(
         if (outcome === "removed") result.removed += 1;
     }
 
+    // The overhead triage bucket must itself be an eligible in-progress project;
+    // when unset or ineligible, no-customer purchases skip exactly as before.
+    const overheadProject = options.overheadProjectId
+        ? projects.find(
+            project =>
+                project.id === options.overheadProjectId &&
+                project.status === "In Progress",
+        )
+        : undefined;
+    const overheadTarget = overheadProject ? matchCandidateEstimate(overheadProject) : null;
+    const overheadEstimateId =
+        overheadTarget?.kind === "matched" ? overheadTarget.estimateId : null;
+
+    const attachReceipt = async (qbPurchaseId: string, outcome: QboExpenseUpsertResult) => {
+        // New/changed rows always try; backfill sweeps rows still missing a receipt.
+        const shouldAttach =
+            outcome === "imported" || outcome === "updated" || mode === "backfill";
+        if (!shouldAttach || !dependencies.attachReceipt) return;
+        try {
+            await dependencies.attachReceipt(tokens, qbPurchaseId);
+        } catch (error) {
+            console.error(
+                "QBO receipt attach failed",
+                qbPurchaseId,
+                error instanceof Error ? error.name : "UnknownError",
+            );
+        }
+    };
+
     for (const purchase of purchaseRead.purchases) {
         const match = findActiveProjectForQboPurchase(purchase, projects);
         if (match.kind === "skipped") {
+            const isOverheadCandidate =
+                match.reason === "missing-customer" && !purchase.isEquityDraw;
+            if (isOverheadCandidate && overheadEstimateId) {
+                const outcome = await dependencies.upsertExpense({
+                    qbPurchaseId: purchase.qbPurchaseId,
+                    qbSyncToken: purchase.syncToken,
+                    qbSyncedAt: dependencies.now(),
+                    estimateId: overheadEstimateId,
+                    amount: purchase.total,
+                    vendor: purchase.vendor,
+                    date: qboTransactionDate(purchase.txnDate),
+                    description: qboExpenseDescription(purchase, "[Overhead]"),
+                    status: "Reviewed",
+                });
+                if (outcome === "imported") result.imported += 1;
+                if (outcome === "updated") result.updated += 1;
+                await attachReceipt(purchase.qbPurchaseId, outcome);
+                continue;
+            }
+
             result.skipped.push({
                 qbPurchaseId: purchase.qbPurchaseId,
-                reason: match.reason,
+                reason:
+                    match.reason === "missing-customer" && purchase.isEquityDraw
+                        ? "equity-draw"
+                        : match.reason,
             });
             const outcome = await dependencies.deactivateExpense({
                 qbPurchaseId: purchase.qbPurchaseId,
@@ -738,6 +848,7 @@ export async function syncQboExpenses(
         });
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
+        await attachReceipt(purchase.qbPurchaseId, outcome);
     }
 
     return result;

@@ -114,6 +114,27 @@ function escapeQBString(s: string): string {
     return s.replace(/'/g, "\\'");
 }
 
+export interface QBAttachable {
+    Id?: string;
+    FileName?: string;
+    ContentType?: string;
+    Size?: number;
+    TempDownloadUri?: string;
+}
+
+/** List file attachments linked to a QBO Purchase (receipt images/PDFs). */
+export async function getQBPurchaseAttachables(
+    tokens: QBTokens,
+    purchaseId: string,
+): Promise<QBAttachable[]> {
+    // QBO transaction ids are numeric; refuse anything else rather than escape it.
+    if (!/^\d+$/.test(purchaseId)) return [];
+    return qbQuery<QBAttachable>(
+        tokens,
+        `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+    );
+}
+
 /** Find a QBO customer by display name, creating it if missing. Returns the QBO customer Id. */
 export async function ensureQBCustomer(
     tokens: QBTokens,
