@@ -6115,7 +6115,11 @@ export async function sendContractToClient(
     if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
     if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
 
-    return { success: true, sentTo: client.email, clientName: client.name };
+    // Status re-read at return time, not from the transition above — the client can sign
+    // while the email/activity awaits run, and callers use this to lock their editors.
+    // "Sent" fallback only for the impossible row-deleted-mid-send case.
+    const finalRow = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+    return { success: true, sentTo: client.email, clientName: client.name, status: finalRow?.status ?? "Sent" };
 }
 
 // Prefill for the "Send contract" dialog: the primary recipient + the default CC set

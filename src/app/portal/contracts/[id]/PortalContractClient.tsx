@@ -474,7 +474,7 @@ export default function PortalContractClient({
                             </div>
                             <h2 className="text-2xl font-bold text-slate-800 mb-2">You&apos;re Signed</h2>
                             <p className="text-slate-500 mb-6 leading-relaxed">
-                                Thank you! {companyName} will countersign to finalize this contract. We&apos;ll email you the fully executed copy — it will also appear in your portal.
+                                Thank you! {companyName}{" "}will countersign to finalize this contract. We&apos;ll email you the fully executed copy — it will also appear in your portal.
                             </p>
                         </>
                     ) : (
@@ -549,7 +549,7 @@ export default function PortalContractClient({
                 <div className="max-w-4xl mx-auto mt-6 px-4 print:hidden">
                     <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 shadow-sm">
                         <h3 className="text-sm font-semibold text-amber-900">You&apos;ve signed — awaiting {companyName}&apos;s signature</h3>
-                        <p className="text-xs text-amber-700 mt-1">Thanks! {companyName} will countersign to finalize this contract. You&apos;ll receive the fully executed copy by email, and it will appear here too.</p>
+                        <p className="text-xs text-amber-700 mt-1">Thanks! {companyName}{" "}will countersign to finalize this contract. You&apos;ll receive the fully executed copy by email, and it will appear here too.</p>
                     </div>
                 </div>
             )}
