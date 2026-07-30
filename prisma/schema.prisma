@@ -1977,6 +1977,7 @@ model ActivityLog {
   leadId     String?  // lead-stage events (estimate sent/viewed before conversion); no FK — log survives lead deletion
   actorType  String   // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
   actorName  String
+  actorUserId String? // User.id of the acting team member, when known (e.g. MCP connector actor); no FK — log survives user deletion
   action     String   // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
   entityType String?  // "estimate", "invoice", "contract", "change_order", "message"
   entityId   String?
@@ -1987,6 +1988,7 @@ model ActivityLog {
   @@index([projectId, createdAt])
   @@index([entityType, entityId])
   @@index([leadId, createdAt])
+  @@index([actorUserId, createdAt])
 }
 
 model DispatchPublication {

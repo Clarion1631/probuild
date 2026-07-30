@@ -17,6 +17,7 @@ export type ActivityLogEntry = {
     leadId?: string | null;
     actorType: string;
     actorName: string;
+    actorUserId?: string | null;
     action: string;
     entityType?: string;
     entityId?: string;
@@ -30,6 +31,7 @@ export async function logActivity({
     leadId,
     actorType,
     actorName,
+    actorUserId,
     action,
     entityType,
     entityId,
@@ -43,6 +45,7 @@ export async function logActivity({
                 leadId: leadId ?? null,
                 actorType,
                 actorName,
+                actorUserId: actorUserId ?? null,
                 action,
                 entityType: entityType ?? null,
                 entityId: entityId ?? null,
