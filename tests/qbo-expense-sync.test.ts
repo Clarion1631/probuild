@@ -254,6 +254,18 @@ test("upsert is idempotent and updates only when the QBO sync token changes", as
     );
     assert.equal(fake.rows.get("purchase-1")?.amount, 140);
     assert.equal(fake.rows.size, 1);
+
+    assert.equal(
+        await upsertQboExpense(fake.client, {
+            ...WRITE,
+            qbSyncToken: "0",
+            amount: 10,
+            qbSyncedAt: new Date("2026-07-29T11:00:00.000Z"),
+        }),
+        "unchanged",
+    );
+    assert.equal(fake.rows.get("purchase-1")?.amount, 140);
+    assert.equal(fake.rows.get("purchase-1")?.qbSyncToken, "1");
 });
 
 test("upsert preserves an existing Drive receipt URL linked to the QBO purchase", async () => {

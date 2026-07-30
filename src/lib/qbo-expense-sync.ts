@@ -285,6 +285,17 @@ export interface QboExpensePersistenceClient {
 
 export type QboExpenseUpsertResult = "imported" | "updated" | "unchanged";
 
+function isNewerQboSyncToken(current: string | null, incoming: string): boolean {
+    if (current === null) return true;
+    if (current === incoming) return false;
+    if (/^\d+$/.test(current) && /^\d+$/.test(incoming)) {
+        return BigInt(incoming) > BigInt(current);
+    }
+    // QBO documents SyncToken as an integer string. If an unexpected legacy
+    // value exists locally, a different current QBO token is still preferable.
+    return true;
+}
+
 /**
  * Atomically insert or update one imported QBO expense by its Purchase id.
  * The update intentionally omits receiptUrl so an already-linked Drive receipt
@@ -299,7 +310,9 @@ export async function upsertQboExpense(
             where: { qbPurchaseId: write.qbPurchaseId },
             select: { qbSyncToken: true },
         });
-        if (existing?.qbSyncToken === write.qbSyncToken) return "unchanged";
+        if (existing && !isNewerQboSyncToken(existing.qbSyncToken, write.qbSyncToken)) {
+            return "unchanged";
+        }
 
         await transaction.expense.upsert({
             where: { qbPurchaseId: write.qbPurchaseId },
