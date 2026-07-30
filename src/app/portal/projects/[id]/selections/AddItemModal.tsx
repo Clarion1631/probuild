@@ -156,8 +156,9 @@ export default function AddItemModal({
                     </div>
 
                     <div>
-                        <label className="block text-sm font-medium text-hui-textMain mb-1">Item name</label>
+                        <label htmlFor="portal-add-item-name" className="block text-sm font-medium text-hui-textMain mb-1">Item name</label>
                         <input
+                            id="portal-add-item-name"
                             type="text"
                             className="hui-input"
                             placeholder="e.g. Brushed brass cabinet pulls"

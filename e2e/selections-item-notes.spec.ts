@@ -332,4 +332,96 @@ test.describe.serial("selection item notes", () => {
       }),
     ).toEqual({ clientNote: "Foreign note must remain unchanged" });
   });
+
+  test("Get the Clipper starts collapsed and resets closed after reload", async ({
+    browser,
+  }) => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    const toggle = page.getByRole("button", { name: "Get the Clipper" });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByRole("link", { name: "ProBuild Clip" })).toBeHidden();
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(page.getByRole("link", { name: "ProBuild Clip" })).toBeVisible();
+    await page.reload();
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await context.close();
+  });
+
+  test("manual and Clipper additions preserve their notes", async ({
+    browser,
+  }) => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await page.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+
+    // .first(): by this point in the serial suite the project also has a
+    // decision with its own scoped "Add an item" button rendered further down
+    // the page — the page-level Unsorted "Add an item" (which this test
+    // targets) is the first one in DOM order.
+    await page.getByRole("button", { name: "Add an item" }).first().click();
+    await page.getByLabel("Item name").fill("Manual Note Fixture");
+    await page.getByLabel("Note to your project team").fill("Manual note persisted");
+    await page.getByRole("button", { name: "Add item" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Add an item" }),
+    ).toBeHidden({ timeout: 25000 });
+    await expect(page.getByText("Manual note persisted")).toBeVisible();
+    const manualItem = await prisma.selectionProposal.findFirstOrThrow({
+      where: { projectId: ids.project, name: "Manual Note Fixture" },
+    });
+    const manualCard = page.getByTestId(`selection-item-${manualItem.id}`);
+    await manualCard.getByRole("combobox", { name: "Move to…" }).selectOption(ids.decision);
+    await expect
+      .poll(async () => {
+        const moved = await prisma.selectionProposal.findUnique({
+          where: { id: manualItem.id },
+          select: { decisionId: true, clientNote: true },
+        });
+        return moved;
+      })
+      .toEqual({
+        decisionId: ids.decision,
+        clientNote: "Manual note persisted",
+      });
+
+    await page.goto(
+      `/portal/clip?projectId=${encodeURIComponent(ids.project)}&url=${encodeURIComponent(
+        "https://example.com/clip-fixture",
+      )}&name=${encodeURIComponent("Clipper Note Fixture")}`,
+    );
+    await page.getByLabel("Note to your team").fill("Clipper note persisted");
+    await page.getByRole("button", { name: "Send to your project team" }).click();
+    await expect(page.getByText("Sent!")).toBeVisible();
+    await page.goto(`/portal/projects/${ids.project}/selections`);
+    await expect(page.getByText("Clipper note persisted")).toBeVisible();
+
+    const notes = await prisma.selectionProposal.findMany({
+      where: {
+        projectId: ids.project,
+        name: { in: ["Manual Note Fixture", "Clipper Note Fixture"] },
+      },
+      select: { name: true, clientNote: true },
+    });
+    expect(new Map(notes.map((item) => [item.name, item.clientNote]))).toEqual(
+      new Map([
+        ["Manual Note Fixture", "Manual note persisted"],
+        ["Clipper Note Fixture", "Clipper note persisted"],
+      ]),
+    );
+    await context.close();
+  });
 });

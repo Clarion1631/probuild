@@ -74,7 +74,6 @@ interface DecisionData {
 
 const ARCHIVED = "Archived";
 const TERMINAL_STATUSES = ["Ordered", "Received"];
-const CLIPPER_COLLAPSED_KEY = "probuild.portal.clipperCollapsed";
 // Sentinel for MoveToPicker's inline "＋ New category" option — a real
 // decision id is a cuid, so it can never collide, and "" is already Unsorted.
 const NEW_DECISION = "__new__";
@@ -778,30 +777,11 @@ export default function PortalDecisionsSection({
     const [addDecisionOpen, setAddDecisionOpen] = useState(false);
     const [addUnsortedOpen, setAddUnsortedOpen] = useState(false);
     const [reordering, setReordering] = useState(false);
-    // Expanded by default so a first-time client still finds the clipper, but
-    // the collapse sticks per device once they've set it up — the setup blurb
-    // is a one-time read that otherwise pushes their actual selections below
-    // the fold on every visit. Read in an effect, not in the useState
-    // initializer: localStorage doesn't exist during SSR, and seeding state
-    // from it directly would hydrate-mismatch.
-    const [clipperOpen, setClipperOpen] = useState(true);
-
-    useEffect(() => {
-        try {
-            if (localStorage.getItem(CLIPPER_COLLAPSED_KEY) === "1") setClipperOpen(false);
-        } catch {
-            // Private mode / storage disabled — just leave it expanded.
-        }
-    }, []);
-
-    useEffect(() => {
-        try {
-            if (clipperOpen) localStorage.removeItem(CLIPPER_COLLAPSED_KEY);
-            else localStorage.setItem(CLIPPER_COLLAPSED_KEY, "1");
-        } catch {
-            // Non-fatal — the toggle still works for this session.
-        }
-    }, [clipperOpen]);
+    // Collapsed by default and session-local — the setup blurb is a one-time
+    // read that otherwise pushes actual selections below the fold on every
+    // visit, but it resets closed on reload rather than persisting so a
+    // client who forgets how they left it always gets the compact view back.
+    const [clipperOpen, setClipperOpen] = useState(false);
 
     const bookmarkletHref = buildClipperBookmarklet({
         origin: appUrl,
@@ -872,6 +852,7 @@ export default function PortalDecisionsSection({
                                 type="button"
                                 onClick={() => setClipperOpen((v) => !v)}
                                 aria-expanded={clipperOpen}
+                                aria-controls="portal-clipper-content"
                                 className="text-base font-semibold text-hui-textMain flex items-center gap-1 hover:text-hui-primary transition"
                             >
                                 {clipperOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
@@ -891,11 +872,11 @@ export default function PortalDecisionsSection({
                         </div>
                     </div>
                     {clipperOpen && (
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div id="portal-clipper-content" className="flex items-center gap-2 shrink-0">
                             <ClipperDragLink
                                 href={bookmarkletHref}
                                 className="hui-btn hui-btn-secondary flex items-center gap-2 cursor-grab active:cursor-grabbing"
-                                title="Drag me to your bookmarks bar"
+                                title="Drag ProBuild Clip to your bookmarks bar"
                             >
                                 <Link2 className="w-4 h-4" />
                                 ProBuild Clip
