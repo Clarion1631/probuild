@@ -825,11 +825,12 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
 
   // NOTE: this pins the MCP server version exactly, so it must be bumped in
   // lockstep with serverInfo in the route. 1.12.0 -> 1.13.0 when the PM tools
-  // (files/folders, daily logs, punch, contacts) landed; the voice-first
+  // (files/folders, daily logs, punch, contacts) landed; 1.13.0 -> 1.14.0 when
+  // read_file/get_file_link and the connector audit trail landed; the voice-first
   // cost-plus tools asserted below are unaffected and must keep working.
-  test("CPCO10: MCP is v1.13.0 and exposes the required voice-first tools and UI copy", () => {
+  test("CPCO10: MCP is v1.14.0 and exposes the required voice-first tools and UI copy", () => {
     const mcp = readFileSync(join(process.cwd(), "src/app/api/mcp/[transport]/route.ts"), "utf8");
-    expect(mcp).toContain('version: "1.13.0"');
+    expect(mcp).toContain('version: "1.14.0"');
     for (const tool of ["list_change_orders", "log_time", "log_expense", "bill_change_order"]) {
       expect(mcp).toContain(`"${tool}"`);
     }
