@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { PermissionKey, hasPermission, canAccessProject } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 
@@ -20,11 +22,18 @@ interface McpClient {
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
 }
 
-// onBehalfOfUserId rides in the query string alongside the shared secret, read
-// by the MCP route's guarded() ONLY after the secret has authenticated the
-// request — holding the secret is already full trust, so this param grants
-// nothing extra. It just lets the route's audit log credit the signed-in
-// human instead of always naming the connector account.
+// onBehalfOfUserId rides in the query string alongside the shared secret, but
+// the route only HONORS it when the x-probuild-internal header proves the call
+// came from this server (see internalOnBehalfProof) — otherwise an external
+// connector could stamp any teammate's id onto its own writes and forge the
+// audit trail. It lets the route's audit log credit the signed-in human
+// instead of always naming the connector account.
+function internalOnBehalfProof(): string | null {
+  const secret = process.env.NEXTAUTH_SECRET;
+  if (!secret) return null;
+  return createHash("sha256").update(`mcp-onbehalf:${secret}`).digest("hex");
+}
+
 function mcpEndpoint(onBehalfOfUserId?: string | null): string | null {
   const secret = process.env.MCP_SECRET;
   if (!secret) return null;
@@ -61,6 +70,10 @@ async function mcpRequest(
     Accept: "application/json, text/event-stream",
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
+  // Proves to guarded() that this call originates from this server, so the
+  // route may honor onBehalfOf. A digest, never the secret itself.
+  const proof = internalOnBehalfProof();
+  if (proof) headers["x-probuild-internal"] = proof;
 
   let res: Response;
   try {
@@ -277,9 +290,16 @@ const UI_SEND_TOOLS = new Set([
   "send_change_order",
   "send_milestone_invoice",
   "resend_invoice",
-  // bill_change_order is deliberately NOT here: it bills, it does not email.
-  // Blocking it would stop the in-app chat completing a non-sending write.
 ]);
+
+// Tools that COMMIT a billing artifact in one call — a fixed-price
+// bill_change_order stages a real invoice milestone with no confirm step.
+// The help chat's tool loop also reads file contents (read_file), which makes
+// its input prompt-injectable: a PDF a client uploaded can carry instructions.
+// An injected "send" is already structurally blocked above; an injected "bill"
+// must be too. This blocks the in-app chat only — connector keys (ChatGPT /
+// Richard's AI) keep full billing power, per the standing full-access decision.
+const MONEY_COMMIT_TOOLS = new Set(["bill_change_order"]);
 
 // Recursively redacts any object key that looks like a confirm/send token so
 // a send preview returned to the model can never carry a usable token back
@@ -375,7 +395,9 @@ export async function runHelpAgent({
 }): Promise<HelpAgentResult> {
   const client = await mcpClient(user.id);
   const allTools = await client.listTools();
-  const allowedTools = allTools.filter((t) => isToolAllowedForUser(user, t.name));
+  const allowedTools = allTools.filter(
+    (t) => isToolAllowedForUser(user, t.name) && !MONEY_COMMIT_TOOLS.has(t.name),
+  );
   // The only names execution will accept — covers both "not permitted" and
   // "not a real tool on the server" (a hallucinated name must not reach MCP).
   const allowedToolNames = new Set(allowedTools.map((t) => t.name));
@@ -459,6 +481,14 @@ Rules:
         ok = false;
         denied = true;
         resultContent = "Tool budget for this request is exhausted — summarize progress so far.";
+      } else if (MONEY_COMMIT_TOOLS.has(block.name)) {
+        // Structural billing gate — see MONEY_COMMIT_TOOLS. Checked before the
+        // allowlist so the model gets the accurate refusal (the tool is also
+        // withheld from its tools array, making this defense in depth).
+        ok = false;
+        denied = true;
+        resultContent =
+          "In-app chat cannot bill a change order. Point the user at the project's Billing page (or their connected ChatGPT/Claude) to run the billing step themselves.";
       } else if (!allowedToolNames.has(block.name) || !isToolAllowedForUser(user, block.name)) {
         // Defense in depth: the tools array sent to the model is already
         // pre-filtered, but re-check at execution time so a denied,

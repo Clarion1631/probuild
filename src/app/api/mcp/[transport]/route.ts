@@ -2547,12 +2547,27 @@ function guarded(req: Request) {
     if (!actorLabel) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
     }
-    // Read ONLY after the key has authenticated — holding a valid key is
-    // already full trust, so this param grants nothing extra. It only lets
-    // help-agent.ts (the sole caller that sets it) credit the signed-in human
-    // in the audit trail instead of just the connector account.
+    // onBehalfOf rewrites the AUDIT attribution — actorUserId and the
+    // "(via <person>)" label — so a bare query param is not enough: an external
+    // connector holding a key could stamp any teammate's id onto its own writes
+    // and the audit trail would swear that person did it. Only help-agent.ts
+    // may set it, and it proves it is server-side code by sending a digest of a
+    // secret that never leaves the server. No proof → the param is ignored and
+    // attribution falls back to the key's own account (fail closed, not fatal).
     const onBehalfOfId = new URL(req.url).searchParams.get("onBehalfOf");
-    return createHandler(createRouteMcpActor(actorLabel, onBehalfOfId))(req);
+    const honoredOnBehalfOf =
+        onBehalfOfId && isInternalOnBehalfProof(req.headers.get("x-probuild-internal"))
+            ? onBehalfOfId
+            : null;
+    return createHandler(createRouteMcpActor(actorLabel, honoredOnBehalfOf))(req);
+}
+
+function isInternalOnBehalfProof(header: string | null): boolean {
+    const secret = process.env.NEXTAUTH_SECRET;
+    if (!secret || !header) return false;
+    const expected = createHash("sha256").update(`mcp-onbehalf:${secret}`).digest();
+    const provided = Buffer.from(header, "hex");
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
 }
 
 export { guarded as GET, guarded as POST, guarded as DELETE };
