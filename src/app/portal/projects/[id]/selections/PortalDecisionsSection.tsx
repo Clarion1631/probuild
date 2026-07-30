@@ -26,6 +26,7 @@ import { isHttpUrl } from "@/lib/url-safety";
 import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
 import ClipperDragLink from "@/components/ClipperDragLink";
 import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
+import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/components/selections/SelectionItemThread";
 import AddItemModal from "./AddItemModal";
 import {
     ImageOff,
@@ -58,6 +59,8 @@ interface Candidate {
     pmNote: string | null;
     decisionId: string | null;
     createdAt: string;
+    comments: SelectionItemThreadCommentView[];
+    unreadThreadCount: number;
 }
 
 interface DecisionData {
@@ -317,6 +320,13 @@ function CandidateCard({
                 note={item.clientNote}
                 onSaved={onChanged}
                 className="mt-1"
+            />
+            <SelectionItemThread
+                itemId={item.id}
+                comments={item.comments}
+                unreadCount={item.unreadThreadCount}
+                onChanged={onChanged}
+                className="mt-1.5"
             />
 
             {isHttpUrl(item.vendorUrl) && (

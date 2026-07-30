@@ -71,6 +71,12 @@ import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 import { persistSelectionItemNote } from "./selection-item-note-persistence";
+import {
+    markSelectionItemThreadRead as markSelectionItemThreadReadCore,
+    parseThreadAttachments,
+    unreadThreadCommentCount,
+} from "./selection-item-thread-core";
+import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -10594,17 +10600,17 @@ export async function decideSelectionProposal(proposalId: string, input: {
  * callers fall through to assertPortalProjectOwnership, the same gate every
  * other client-facing selections action in this file uses.
  */
-async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; actorName: string }> {
+export async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; userId: string | null; actorName: string }> {
     const staffUser = await getCurrentUserWithPermissions();
     if (staffUser) {
         if (!canAccessProject(staffUser, projectId)) throw new Error("Forbidden");
-        return { isStaff: true, clientId: null, actorName: staffUser.name || staffUser.email };
+        return { isStaff: true, clientId: null, userId: staffUser.id, actorName: staffUser.name || staffUser.email };
     }
     if (await canUseDevAuthFallback()) {
         const devSession = await getSessionOrDev();
         const devRole = (devSession?.user as { role?: string } | undefined)?.role;
         if (devRole) {
-            return { isStaff: true, clientId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
+            return { isStaff: true, clientId: null, userId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
         }
     }
     const { clientId } = await assertPortalProjectOwnership(projectId);
@@ -10613,7 +10619,7 @@ async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: 
         const client = await prisma.client.findUnique({ where: { id: clientId }, select: { name: true } });
         if (client?.name) actorName = client.name;
     }
-    return { isStaff: false, clientId, actorName };
+    return { isStaff: false, clientId, userId: null, actorName };
 }
 
 /** Strip price from a SelectionProposal for any client-facing read — no
@@ -10651,18 +10657,66 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => stripProposalPrice(normalizeProposal(c))) })),
-        unsorted: unsorted.map((p) => stripProposalPrice(normalizeProposal(p))),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripProposalPrice(normalizeProposal(c)), false)) })),
+        unsorted: unsorted.map((p) => withThreadSummary(stripProposalPrice(normalizeProposal(p)), false)),
     };
 }
+
+// Attaches parsed comments + the viewer-side unread count to a candidate for
+// the thread UI (SelectionItemThread). Shared shape between the staff read
+// (below) and the portal read (getProjectDecisionsForPortal). Only the
+// fields the UI type actually needs are sent to the browser — internal ids
+// (authorUserId/authorClientId) and the opposite side's read timestamps
+// never leave the server; unreadThreadCount is derived from them here
+// instead of shipping them raw.
+function withThreadSummary<T extends { comments: {
+    id: string; authorType: string;
+    authorName: string; body: string; attachments: string | null; readByTeamAt: Date | null;
+    readByClientAt: Date | null; createdAt: Date;
+}[] }>(candidate: T, isStaff: boolean) {
+    const { comments, ...rest } = candidate;
+    return {
+        ...rest,
+        comments: comments.map((c) => ({
+            id: c.id,
+            authorType: c.authorType,
+            authorName: c.authorName,
+            body: c.body,
+            attachments: parseThreadAttachments(c.attachments),
+            createdAt: c.createdAt,
+        })),
+        unreadThreadCount: unreadThreadCommentCount(comments, isStaff),
+    };
+}
+
+// authorUserId/authorClientId are deliberately NOT selected — nothing after
+// this fetch needs them (unreadThreadCommentCount only reads
+// authorType/readByTeamAt/readByClientAt), and withThreadSummary's job is to
+// keep internal ids out of the portal/staff payload in the first place.
+const CANDIDATE_COMMENTS_INCLUDE = {
+    comments: {
+        orderBy: { createdAt: "asc" as const },
+        select: {
+            id: true,
+            authorType: true,
+            authorName: true,
+            body: true,
+            attachments: true,
+            readByTeamAt: true,
+            readByClientAt: true,
+            createdAt: true,
+        },
+    },
+};
 
 export async function getProjectDecisions(projectId: string) {
     const user = await assertActiveStaff();
@@ -10674,16 +10728,17 @@ export async function getProjectDecisions(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map(normalizeProposal) })),
-        unsorted: unsorted.map(normalizeProposal),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
+        unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
 }
 
@@ -10754,6 +10809,40 @@ export async function updateSelectionItemNote(
         revalidate: (projectId) => {
             revalidatePath(`/projects/${projectId}/selections`);
             revalidatePath(`/portal/projects/${projectId}/selections`);
+        },
+    });
+}
+
+/** Marks only the comment ids the viewer actually rendered as read for their
+ * side. Called from the UI when a thread is expanded. */
+export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
+    return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
+        findItem: findThreadItem,
+        assertAccess: assertDecisionActorAccess,
+        markRead: async (proposalId, seenIds, isStaff) => {
+            // Mirrors the decision-soft-delete guard in createComment
+            // (selection-item-thread-dependencies.ts): findThreadItem's
+            // check up front and this write are not atomic with each other,
+            // so a decision soft-deleted in that window must still make this
+            // match zero rows rather than mark a since-invisible thread read.
+            const visibleProposal = { OR: [{ decisionId: null }, { decision: { deletedAt: null } }] };
+            if (isStaff) {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByTeamAt: null, proposal: visibleProposal },
+                    data: { readByTeamAt: new Date() },
+                });
+            } else {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByClientAt: null, proposal: visibleProposal },
+                    data: { readByClientAt: new Date() },
+                });
+            }
+        },
+        revalidate: (projectId) => {
+            revalidatePath(`/projects/${projectId}/selections`);
+            revalidatePath(`/portal/projects/${projectId}/selections`);
+            revalidatePath(`/projects/${projectId}`, "layout");
+            revalidatePath(`/portal/projects/${projectId}`);
         },
     });
 }

@@ -18,6 +18,7 @@ import {
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
+import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/components/selections/SelectionItemThread";
 import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import {
@@ -46,6 +47,8 @@ interface Candidate {
     decisionId: string | null;
     price: number | string | null;
     createdAt: string;
+    comments: SelectionItemThreadCommentView[];
+    unreadThreadCount: number;
 }
 
 interface DecisionData {
@@ -153,6 +156,14 @@ function ApprovedItemsTable({
                                             note={item.clientNote}
                                             onSaved={onChanged}
                                         />
+                                        <SelectionItemThread
+                                            itemId={item.id}
+                                            instanceId={`approved-${item.id}`}
+                                            comments={item.comments}
+                                            unreadCount={item.unreadThreadCount}
+                                            onChanged={onChanged}
+                                            className="mt-1.5"
+                                        />
                                     </td>
                                     <td className="px-4 py-2.5">
                                         {isHttpUrl(item.vendorUrl) ? (
@@ -218,6 +229,13 @@ function CandidateCard({
                 note={item.clientNote}
                 onSaved={onChanged}
                 className="mt-1"
+            />
+            <SelectionItemThread
+                itemId={item.id}
+                comments={item.comments}
+                unreadCount={item.unreadThreadCount}
+                onChanged={onChanged}
+                className="mt-1.5"
             />
             {isHttpUrl(item.vendorUrl) && (
                 <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1 mt-1.5">

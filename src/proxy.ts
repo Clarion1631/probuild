@@ -20,7 +20,12 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
     /^\/api\/projects\/[^/]+\/(?:cost-codes|buckets|estimate-items|estimates)\/?$/,
 ];
 
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+// api/selections/item-comments is reachable by BOTH portal clients (no
+// NextAuth session — just the client_portal_token cookie) and staff. It
+// self-authorizes both sides internally via assertDecisionActorAccess, the
+// same way every api/portal/* route does — bypassing the proxy here does not
+// bypass auth, it hands auth to the route handler instead.
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/item-comments)(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
 
 export function isPublicProxyBypass(pathname: string) {
@@ -111,6 +116,7 @@ export const config = {
          * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
          * - api/health (Exact public web-process deployment/liveness probe)
          * - api/version (Deployment-id probe for the stale-tab refresh banner)
+         * - api/selections/item-comments (self-authorizes staff + portal internally)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
@@ -120,6 +126,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

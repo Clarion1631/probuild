@@ -1,6 +1,7 @@
 ﻿import EntitySidebar from "@/components/EntitySidebar";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { getUnreadMessageCount } from "@/lib/actions";
+import { getUnreadSelectionThreadCountForStaff } from "@/lib/selection-item-thread-dependencies";
 import { getSessionOrDev } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
@@ -57,8 +58,9 @@ export default async function ProjectLayout({
         }
     }
 
-    const [unreadCount, project] = await Promise.all([
+    const [unreadCount, unreadSelectionThreadCount, project] = await Promise.all([
         getUnreadMessageCount(resolvedId, "TEAM"),
+        getUnreadSelectionThreadCountForStaff(resolvedId),
         prisma.project.findUnique({
             where: { id: resolvedId },
             select: {
@@ -79,6 +81,7 @@ export default async function ProjectLayout({
                 entity={{ type: "project", id: resolvedId, name: project?.name ?? "", clientName: project?.client?.name }}
                 linkedEntity={linkedEntity}
                 unreadMessageCount={unreadCount}
+                unreadSelectionThreadCount={unreadSelectionThreadCount}
             />
             <div className="flex-1 p-6 overflow-y-auto overflow-x-hidden w-full min-w-0">
                 <ErrorBoundary fallbackTitle="Project error">
