@@ -71,6 +71,7 @@ import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 import { persistSelectionItemNote } from "./selection-item-note-persistence";
+import { markSelectionItemThreadRead as markSelectionItemThreadReadCore } from "./selection-item-thread-core";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -10594,17 +10595,17 @@ export async function decideSelectionProposal(proposalId: string, input: {
  * callers fall through to assertPortalProjectOwnership, the same gate every
  * other client-facing selections action in this file uses.
  */
-async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; actorName: string }> {
+export async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; userId: string | null; actorName: string }> {
     const staffUser = await getCurrentUserWithPermissions();
     if (staffUser) {
         if (!canAccessProject(staffUser, projectId)) throw new Error("Forbidden");
-        return { isStaff: true, clientId: null, actorName: staffUser.name || staffUser.email };
+        return { isStaff: true, clientId: null, userId: staffUser.id, actorName: staffUser.name || staffUser.email };
     }
     if (await canUseDevAuthFallback()) {
         const devSession = await getSessionOrDev();
         const devRole = (devSession?.user as { role?: string } | undefined)?.role;
         if (devRole) {
-            return { isStaff: true, clientId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
+            return { isStaff: true, clientId: null, userId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
         }
     }
     const { clientId } = await assertPortalProjectOwnership(projectId);
@@ -10613,7 +10614,7 @@ async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: 
         const client = await prisma.client.findUnique({ where: { id: clientId }, select: { name: true } });
         if (client?.name) actorName = client.name;
     }
-    return { isStaff: false, clientId, actorName };
+    return { isStaff: false, clientId, userId: null, actorName };
 }
 
 /** Strip price from a SelectionProposal for any client-facing read — no
@@ -10754,6 +10755,32 @@ export async function updateSelectionItemNote(
         revalidate: (projectId) => {
             revalidatePath(`/projects/${projectId}/selections`);
             revalidatePath(`/portal/projects/${projectId}/selections`);
+        },
+    });
+}
+
+/** Marks only the comment ids the viewer actually rendered as read for their
+ * side. Called from the UI when a thread is expanded. */
+export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
+    return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
+        findItem: (id) =>
+            prisma.selectionProposal.findUnique({
+                where: { id },
+                select: { id: true, projectId: true, deletedAt: true, name: true },
+            }),
+        assertAccess: assertDecisionActorAccess,
+        markRead: async (proposalId, seenIds, isStaff) => {
+            if (isStaff) {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByTeamAt: null },
+                    data: { readByTeamAt: new Date() },
+                });
+            } else {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByClientAt: null },
+                    data: { readByClientAt: new Date() },
+                });
+            }
         },
     });
 }

@@ -1739,10 +1739,34 @@ model SelectionProposal {
   // data" still holds: the row survives and the team can restore it for 30
   // days (getRecentlyDeletedItems / restoreItem). Filtered out of every read.
   deletedAt    DateTime?
+  comments     SelectionItemComment[]
 
   @@index([projectId, status])
   @@index([decisionId])
   @@index([projectId, deletedAt])
+}
+
+// Per-item discussion thread, additive alongside the single clientNote status
+// annotation (docs/superpowers/plans/2026-07-30-selection-item-threads.md).
+// Coarse read-tracking (any-viewer, like ClientMessage.readAt) — right-sized
+// for a small team. Cascades with the proposal on hard delete; while the
+// proposal is soft-deleted the thread is neither readable nor writable (same
+// visibility rule as the item).
+model SelectionItemComment {
+  id             String            @id @default(cuid())
+  proposalId     String
+  proposal       SelectionProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  authorType     String            // "TEAM" | "CLIENT"
+  authorUserId   String?           // User.id when authorType TEAM
+  authorClientId String?           // Client.id when authorType CLIENT
+  authorName     String
+  body           String            // server-enforced max 4000 chars, trimmed, non-empty (or an attachment)
+  attachments    String?           // JSON [{id, name, url}] — same shape as ClientMessage
+  readByTeamAt   DateTime?         // null on CLIENT posts until any staff opens the thread
+  readByClientAt DateTime?         // null on TEAM posts until the client opens the thread
+  createdAt      DateTime          @default(now())
+
+  @@index([proposalId, createdAt])
 }
 
 // Client Selections Playground — Phase 1 (docs/specs/client-selections-playground.md).
