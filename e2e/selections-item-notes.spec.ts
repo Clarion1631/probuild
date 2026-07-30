@@ -187,6 +187,81 @@ test.describe.serial("selection item notes", () => {
     await context.close();
   });
 
+  test("staff adds a noted candidate, edits it, and sees it after approval", async ({
+    page,
+    browser,
+  }) => {
+    await page.goto(`/projects/${ids.project}/selections`);
+    await page.getByRole("button", { name: "Add a candidate" }).click();
+    await page.getByLabel("Name").fill("Team Suggested Sconce");
+    await page.getByLabel("Note").fill("Team note visible to the client");
+    await page.getByRole("button", { name: "Add candidate" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Add a candidate" }),
+    ).toBeHidden();
+
+    await expect
+      .poll(async () => {
+        return prisma.selectionProposal.findFirst({
+          where: {
+            projectId: ids.project,
+            name: "Team Suggested Sconce",
+          },
+          select: { id: true, clientNote: true },
+        });
+      })
+      .not.toBeNull();
+    const teamCandidate = await prisma.selectionProposal.findFirstOrThrow({
+      where: {
+        projectId: ids.project,
+        name: "Team Suggested Sconce",
+      },
+    });
+    expect(teamCandidate.clientNote).toBe("Team note visible to the client");
+
+    const clientContext = await browser.newContext();
+    const clientPage = await clientContext.newPage();
+    const token = await signClientPortalToken(ids.client, clientEmail);
+    await clientPage.goto(
+      `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(
+        `/portal/projects/${ids.project}/selections`,
+      )}`,
+    );
+    const clientCard = clientPage.getByTestId(
+      `selection-item-${teamCandidate.id}`,
+    );
+    await expect(
+      clientCard.getByText("Team note visible to the client"),
+    ).toBeVisible();
+    await clientCard.getByRole("button", { name: "This is the one" }).click();
+    await expect
+      .poll(async () => {
+        return prisma.decision.findUnique({
+          where: { id: ids.decision },
+          select: { chosenItemId: true, status: true },
+        });
+      })
+      .toEqual({
+        chosenItemId: teamCandidate.id,
+        status: "Decided",
+      });
+    await clientContext.close();
+
+    await page.reload();
+    const approvedRow = page.getByTestId(
+      `approved-item-${teamCandidate.id}`,
+    );
+    await expect(
+      approvedRow.getByText("Team note visible to the client"),
+    ).toBeVisible();
+    await approvedRow.getByRole("button", { name: "Edit note" }).click();
+    await approvedRow
+      .getByLabel("Selection item note")
+      .fill("Ready for purchasing");
+    await approvedRow.getByRole("button", { name: "Save note" }).click();
+    await expect(approvedRow.getByText("Ready for purchasing")).toBeVisible();
+  });
+
   test("foreign portal and restricted staff actors cannot change another project's note", async () => {
     const persistenceDependencies = (
       assertAccess: Parameters<
