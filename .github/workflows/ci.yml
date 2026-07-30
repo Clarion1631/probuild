@@ -139,6 +139,15 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
+      # These assert invariants nothing else does: money lock ordering, portal
+      # visibility, dispatch publication, evidence classification. CI never ran
+      # them before, and one had been failing unnoticed since PR #273 renamed a
+      # file it asserts on. Runs here because this job already has a throwaway
+      # Postgres with the schema pushed, so the DB-backed suites can execute for
+      # real instead of tripping their production guard.
+      - name: Run verify suites
+        run: node scripts/run-verify-all.mjs
+
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
