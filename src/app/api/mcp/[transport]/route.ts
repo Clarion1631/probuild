@@ -1476,17 +1476,23 @@ function createHandler(actor: RouteMcpActor) {
 
                 try {
                     if (isPdf) {
-                        // pdfjs (inside pdf-parse) loads @napi-rs/canvas through a
-                        // runtime createRequire, which no bundler's file tracing can
-                        // see — the deployed lambda shipped ZERO canvas files, which
-                        // is exactly the production "Setting up fake worker failed".
-                        // This literal import exists so Turbopack traces the package
-                        // (outputFileTracingIncludes is silently SKIPPED under
-                        // Turbopack, so that config alone cannot fix it); pdfjs then
-                        // installs the real DOMMatrix/Path2D/ImageData from it.
+                        // Serverless pdfjs needs two things a bundler can't trace:
+                        // @napi-rs/canvas (real DOMMatrix/Path2D/ImageData — loaded
+                        // via createRequire, so this literal import ships it) and
+                        // pdf.worker.mjs (dynamically imported by pdfjs, absent from
+                        // the lambda -> "Setting up fake worker failed" in prod).
+                        // pdf-parse's own fix for the latter is "pdf-parse/worker":
+                        // the whole worker embedded as an importable data: URL, wired
+                        // in through the official PDFParse.setWorker API. The package
+                        // documents Next.js + Vercel support via exactly this hook.
                         await import("@napi-rs/canvas").catch(() => null);
                         const pdfParseMod: any = await import("pdf-parse");
                         const PDFParseCtor = pdfParseMod.PDFParse ?? pdfParseMod.default?.PDFParse;
+                        const workerMod: any = await import("pdf-parse/worker").catch(() => null);
+                        const workerData = workerMod?.getData?.();
+                        if (workerData && typeof PDFParseCtor.setWorker === "function") {
+                            PDFParseCtor.setWorker(workerData);
+                        }
                         const parser = new PDFParseCtor({ data: buffer });
                         let text: string;
                         try {
