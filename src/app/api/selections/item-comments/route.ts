@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { assertDecisionActorAccess } from "@/lib/actions";
 import { mimeTypeForFileName } from "@/lib/project-files";
 import { postSelectionItemComment, type ThreadFileCandidate } from "@/lib/selection-item-thread-core";
-import { createComment, notify, revalidate, uploadAttachments } from "@/lib/selection-item-thread-dependencies";
+import { cleanupAttachments, createComment, notify, revalidate, uploadAttachments } from "@/lib/selection-item-thread-dependencies";
 
 export async function POST(req: NextRequest) {
     try {
@@ -34,6 +34,7 @@ export async function POST(req: NextRequest) {
             assertAccess: assertDecisionActorAccess,
             uploadAttachments,
             createComment,
+            cleanupAttachments,
             notify,
             revalidate,
         });

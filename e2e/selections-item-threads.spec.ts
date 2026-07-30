@@ -101,6 +101,9 @@ test.describe.serial("selection item discussion threads", () => {
       createComment: async () => {
         throw new Error("createComment must never run when access is denied");
       },
+      cleanupAttachments: async () => {
+        throw new Error("cleanupAttachments must never run when access is denied");
+      },
       notify: async () => {},
       revalidate: () => {},
     });
@@ -139,6 +142,9 @@ test.describe.serial("selection item discussion threads", () => {
       uploadAttachments: async () => [],
       createComment: async () => {
         throw new Error("createComment must never run for invalid input");
+      },
+      cleanupAttachments: async () => {
+        throw new Error("cleanupAttachments must never run for invalid input");
       },
       notify: async () => {},
       revalidate: () => {},
@@ -380,6 +386,9 @@ test.describe.serial("selection item discussion threads", () => {
         // returns, nothing client-supplied.
         uploadAttachments: async () => fakeAttachments,
         createComment,
+        cleanupAttachments: async () => {
+          throw new Error("cleanupAttachments must never run when createComment succeeds");
+        },
         notify: async () => {},
         revalidate: () => {},
       },
@@ -388,5 +397,48 @@ test.describe.serial("selection item discussion threads", () => {
     expect(JSON.parse(comment.attachments!)).toEqual(fakeAttachments);
     const stored = await prisma.selectionItemComment.findUniqueOrThrow({ where: { id: comment.id } });
     expect(JSON.parse(stored.attachments!)).toEqual(fakeAttachments);
+  });
+
+  test("createComment failing after a successful upload cleans up every uploaded attachment", async () => {
+    // The plan requires whole-batch cleanup for ANY failure after the first
+    // successful upload, "not just the transaction" — this proves the
+    // failure can happen one step LATER than uploadAttachments (e.g. the CAS
+    // row-lock losing a concurrent soft-delete race in the real
+    // createComment) and the core still cleans up every uploaded file.
+    const fakeAttachments = [
+      { id: "fake-file-A", name: "swatch-a.pdf", url: "https://cdn.example.com/swatch-a.pdf" },
+      { id: "fake-file-B", name: "swatch-b.pdf", url: "https://cdn.example.com/swatch-b.pdf" },
+    ];
+    const cleanedUp: string[] = [];
+
+    await expect(
+      postSelectionItemComment(
+        ids.staffCandidate,
+        "See the attached swatches",
+        [
+          { name: "swatch-a.pdf", buffer: Buffer.from("a"), mimeType: "application/pdf", size: 1 },
+          { name: "swatch-b.pdf", buffer: Buffer.from("b"), mimeType: "application/pdf", size: 1 },
+        ],
+        {
+          findItem: (id) =>
+            prisma.selectionProposal.findUnique({
+              where: { id },
+              select: { id: true, projectId: true, deletedAt: true, name: true },
+            }),
+          assertAccess: async () => ({ isStaff: true, clientId: null, userId: null, actorName: "Team" }),
+          uploadAttachments: async () => fakeAttachments,
+          createComment: async () => {
+            throw new Error("Item not found");
+          },
+          cleanupAttachments: async (attachments) => {
+            cleanedUp.push(...attachments.map((a) => a.id));
+          },
+          notify: async () => {},
+          revalidate: () => {},
+        },
+      ),
+    ).rejects.toThrow("Item not found");
+
+    expect(cleanedUp.sort()).toEqual(["fake-file-A", "fake-file-B"]);
   });
 });

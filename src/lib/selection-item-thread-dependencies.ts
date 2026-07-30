@@ -20,10 +20,12 @@ import type { ThreadActor, ThreadAttachment, ThreadFileCandidate, ThreadItem } f
 
 const DESIGN_FILES_FOLDER_NAME = "Design Files";
 
-// Deletes a ProjectFile row + its storage object, best-effort. Used for
-// whole-batch cleanup when a later file in an attachment batch fails to
-// upload — every already-created row/object in the batch is rolled back
-// before the caller rethrows.
+// Deletes a ProjectFile row + its storage object, best-effort. Used both by
+// uploadAttachments' own in-batch rollback (a later file in the batch fails
+// to upload) and by the core's cleanupAttachments dependency below (upload
+// succeeds but createComment throws afterward) — every already-created row/
+// object is rolled back before the caller rethrows, regardless of which step
+// failed.
 async function deleteProjectFileAndStorage(fileId: string): Promise<void> {
     const supabase = getSupabase();
     const file = await prisma.projectFile.findUnique({ where: { id: fileId }, select: { url: true } });
@@ -90,6 +92,15 @@ export async function uploadAttachments(
         await Promise.all(uploaded.map((file) => deleteProjectFileAndStorage(file.id)));
         throw err;
     }
+}
+
+// The core's cleanupAttachments dependency: called for EVERY uploaded
+// attachment when createComment throws after a successful upload (e.g. the
+// CAS row-lock losing a concurrent soft-delete race) — this is the path a
+// lone in-uploadAttachments rollback can't reach, since by then
+// uploadAttachments has already returned successfully.
+export async function cleanupAttachments(attachments: ThreadAttachment[]): Promise<void> {
+    await Promise.all(attachments.map((attachment) => deleteProjectFileAndStorage(attachment.id)));
 }
 
 export async function createComment(input: {

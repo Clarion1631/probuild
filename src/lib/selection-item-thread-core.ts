@@ -99,6 +99,14 @@ type PostSelectionItemCommentDependencies = {
         body: string;
         attachments: ThreadAttachment[] | null;
     }) => Promise<ThreadComment>;
+    // Best-effort per-file rollback (ProjectFile row + storage object). Called
+    // for EVERY uploaded attachment when createComment throws after a
+    // successful upload — the plan requires whole-batch cleanup for "any
+    // failure after the first successful upload, not just the transaction",
+    // and a lone uploadAttachments-side rollback can't reach a failure that
+    // happens one step later, in createComment (e.g. the CAS row-lock losing
+    // a concurrent soft-delete race).
+    cleanupAttachments: (attachments: ThreadAttachment[]) => Promise<void>;
     notify: (input: { item: ThreadItem; actor: ThreadActor; comment: ThreadComment }) => Promise<void>;
     revalidate: (projectId: string) => void;
 };
@@ -143,12 +151,24 @@ export async function postSelectionItemComment(
     const attachments =
         files.length > 0 ? await dependencies.uploadAttachments(files, actor, item) : null;
 
-    const comment = await dependencies.createComment({
-        item,
-        actor,
-        body: normalizedBody,
-        attachments,
-    });
+    let comment: ThreadComment;
+    try {
+        comment = await dependencies.createComment({
+            item,
+            actor,
+            body: normalizedBody,
+            attachments,
+        });
+    } catch (err) {
+        // Whole-batch cleanup covers ANY failure after the first successful
+        // upload, not just a failure inside uploadAttachments itself — a
+        // successful upload followed by createComment losing the CAS
+        // row-lock race must not orphan the uploaded files.
+        if (attachments && attachments.length > 0) {
+            await dependencies.cleanupAttachments(attachments);
+        }
+        throw err;
+    }
 
     dependencies.revalidate(item.projectId);
 
