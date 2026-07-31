@@ -37,9 +37,19 @@ export async function GET(req: NextRequest) {
             lastActivityAt: true,
             driveFolderUrl: true,
             client: { select: { name: true, primaryPhone: true } },
+            // Mobile Manage Jobs shows unconverted leads and lets a manager convert
+            // one directly (POST /api/manager/jobs with leadId) — it needs to know
+            // whether that lead already has a linked project (Project.leadId is @unique).
+            project: { select: { id: true } },
         },
     });
-    return NextResponse.json({ leads });
+    return NextResponse.json({
+        leads: leads.map(({ project, ...lead }) => ({
+            ...lead,
+            hasProject: !!project,
+            projectId: project?.id ?? null,
+        })),
+    });
 }
 
 export async function POST(req: NextRequest) {

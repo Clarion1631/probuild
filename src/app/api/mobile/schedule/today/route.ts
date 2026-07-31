@@ -64,6 +64,10 @@ export async function GET(req: Request) {
                 select: { role: true },
                 take: 1,
             },
+            // Linked estimate line item + its cost code — lets the mobile geofence
+            // "clock in here?" nudge preselect the matching phase for one-tap clock-in.
+            estimateItemId: true,
+            estimateItem: { select: { costCode: { select: { code: true, name: true } } } },
         },
     });
 
@@ -81,6 +85,8 @@ export async function GET(req: Request) {
         projectColor: t.project?.color ?? null,
         projectLocation: t.project?.location ?? null,
         isAssignedToMe: t.assignments.length > 0,
+        estimateItemId: t.estimateItemId ?? null,
+        costCode: t.estimateItem?.costCode ? { code: t.estimateItem.costCode.code, name: t.estimateItem.costCode.name } : null,
     }));
 
     return NextResponse.json({ tasks: out });
