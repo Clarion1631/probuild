@@ -26,6 +26,9 @@ export default function CashFlowByMonthChart({
                         contentStyle={{ borderRadius: 8, border: "none", boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)" }}
                     />
                     <Legend wrapperStyle={{ paddingTop: 12, fontSize: 12 }} iconType="circle" />
+                    {/* recharts v3 mishandles literal `false` children (a conditional
+                        {cond && <Bar/>} left the whole ComposedChart without geometry),
+                        so the overhead series always renders and uses `hide` instead. */}
                     <Bar name="Collected" dataKey="collected" stackId="in" fill="#0d9488" radius={[4, 4, 0, 0]} barSize={24} />
                     <Bar
                         name="Job costs"
@@ -35,18 +38,17 @@ export default function CashFlowByMonthChart({
                         radius={includeOverhead ? [0, 0, 0, 0] : [4, 4, 0, 0]}
                         barSize={24}
                     />
-                    {includeOverhead && (
-                        <Bar
-                            name="Overhead"
-                            dataKey="overhead"
-                            stackId="out"
-                            fill="#7c3aed"
-                            radius={[4, 4, 0, 0]}
-                            barSize={24}
-                            stroke="#fff"
-                            strokeWidth={2}
-                        />
-                    )}
+                    <Bar
+                        name="Overhead"
+                        dataKey="overhead"
+                        stackId="out"
+                        fill="#7c3aed"
+                        radius={[4, 4, 0, 0]}
+                        barSize={24}
+                        stroke="#fff"
+                        strokeWidth={2}
+                        hide={!includeOverhead}
+                    />
                     <Line name="Net" type="monotone" dataKey="net" stroke="#1e293b" strokeWidth={2} dot={{ r: 3, fill: "#1e293b" }} activeDot={{ r: 5 }} />
                 </ComposedChart>
             </ResponsiveContainer>
