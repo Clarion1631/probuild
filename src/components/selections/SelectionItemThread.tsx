@@ -147,6 +147,21 @@ export function SelectionItemThread({
                 )}
             </button>
 
+            {!expanded && comments.length > 0 && (
+                <p
+                    data-testid="selection-thread-latest-preview"
+                    className="mt-1 text-xs break-words text-hui-textMuted line-clamp-2"
+                >
+                    <span className="font-semibold text-hui-textMain">
+                        {comments[comments.length - 1].authorName}:
+                    </span>{" "}
+                    {comments[comments.length - 1].body ||
+                        (comments[comments.length - 1].attachments.length > 0
+                            ? "sent an attachment"
+                            : "")}
+                </p>
+            )}
+
             {expanded && (
                 <div id={domId} className="mt-2 space-y-2 border-t border-slate-100 pt-2">
                     {comments.length === 0 ? (

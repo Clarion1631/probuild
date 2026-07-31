@@ -122,7 +122,10 @@ export function SelectionItemNote({
                 ref={previewRef}
                 data-testid="selection-note-preview"
                 className={`whitespace-pre-wrap break-words text-xs text-hui-textMuted ${
-                    expanded ? "" : "line-clamp-2"
+                    // Notes are usually short — show them in full without a
+                    // click. Only genuinely long notes get clamped behind
+                    // Show more.
+                    expanded || displayedNote.length <= 240 ? "" : "line-clamp-2"
                 }`}
             >
                 {displayedNote}
