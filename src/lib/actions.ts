@@ -31,6 +31,7 @@ import { normalizeE164 } from "./phone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
+    createDecisionForSuggestion as aiSortCreateDecisionForSuggestion,
 } from "./selection-ai-sort-apply-core";
 import {
     createDecisionTemplate as createDecisionTemplateCore,
@@ -11143,6 +11144,13 @@ export async function applySuggestedDecision(itemId: string, decisionId: string)
 
 export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
     return aiSortDismissSelectionSuggestion(itemId);
+}
+
+export async function createDecisionForSuggestion(
+    projectId: string,
+    name: string,
+): Promise<{ decisionId: string; existed: boolean }> {
+    return aiSortCreateDecisionForSuggestion(projectId, name);
 }
 
 // ── Decision Templates + Schedule-Driven Due Dates (Phase 3 —

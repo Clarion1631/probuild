@@ -16,7 +16,7 @@
 import { useState, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
-import { applySuggestedDecision } from "@/lib/actions";
+import { applySuggestedDecision, createDecisionForSuggestion } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Sparkles } from "lucide-react";
 
@@ -26,6 +26,9 @@ export type AiSortSuggestionRow = {
     imageUrl: string | null;
     decisionId: string | null;
     decisionName: string | null;
+    // Advisory proposed category name — only ever non-null when decisionId
+    // is null (see selection-ai-sort-core.ts's mutual-exclusivity comment).
+    newCategoryName: string | null;
     confidence: "high" | "medium" | "low";
     reason: string;
 };
@@ -54,9 +57,21 @@ const OUTCOME_LABELS: Record<RowOutcome["status"], string> = {
 };
 
 const LEAVE_UNSORTED = "";
+// Sentinel prefix for the select's "Create <name>" option — distinguishes an
+// unresolved new-category choice from a real decisionId without needing a
+// second piece of per-row state. Stripped back to the raw name in
+// handleApply before resolving via createDecisionForSuggestion.
+const NEW_CATEGORY_PREFIX = "__new_category__:";
+function newCategoryOptionValue(name: string): string {
+    return `${NEW_CATEGORY_PREFIX}${name}`;
+}
+function parseNewCategoryOptionValue(value: string): string | null {
+    return value.startsWith(NEW_CATEGORY_PREFIX) ? value.slice(NEW_CATEGORY_PREFIX.length) : null;
+}
 
 export default function AiSortReviewModal({
     open,
+    projectId,
     rows,
     decisions,
     failedCount,
@@ -66,6 +81,7 @@ export default function AiSortReviewModal({
     onApplied,
 }: {
     open: boolean;
+    projectId: string;
     rows: AiSortSuggestionRow[];
     decisions: { id: string; name: string }[];
     // Items whose AI batch failed this run (excluded from `rows` entirely —
@@ -97,7 +113,14 @@ export default function AiSortReviewModal({
     const [seededRows, setSeededRows] = useState(rows);
     if (rows !== seededRows) {
         setSeededRows(rows);
-        setSelections(Object.fromEntries(rows.map((r) => [r.itemId, r.decisionId ?? LEAVE_UNSORTED])));
+        setSelections(
+            Object.fromEntries(
+                rows.map((r) => [
+                    r.itemId,
+                    r.decisionId ?? (r.newCategoryName ? newCategoryOptionValue(r.newCategoryName) : LEAVE_UNSORTED),
+                ]),
+            ),
+        );
         setRowOutcomes({});
     }
 
@@ -121,13 +144,49 @@ export default function AiSortReviewModal({
         setApplying(true);
         const outcomes: Record<string, RowOutcome> = {};
         let appliedCount = 0;
+        let createdCount = 0; // only names resolved with { existed: false } count
+
+        // Resolve each unique chosen "Create <name>" option ONCE, before any
+        // row is applied — multiple rows may share the same proposed name
+        // (e.g. two items both suggested "Backsplash"), and only one
+        // Decision must ever be created for it.
+        const chosenNewCategoryNames = Array.from(
+            new Set(
+                rows
+                    .map((row) => parseNewCategoryOptionValue(selections[row.itemId] ?? ""))
+                    .filter((name): name is string => name !== null),
+            ),
+        );
+        const resolvedDecisionIdByName: Record<string, string> = {};
+        for (const name of chosenNewCategoryNames) {
+            try {
+                const result = await createDecisionForSuggestion(projectId, name);
+                resolvedDecisionIdByName[name] = result.decisionId;
+                if (!result.existed) createdCount += 1;
+            } catch (e: any) {
+                // A create failure marks every row depending on this name as
+                // failed right away — the apply loop below skips them (no
+                // resolved decisionId to apply with), continuing everything
+                // else.
+                const message = e?.message || "Couldn't create category";
+                for (const row of rows) {
+                    if (parseNewCategoryOptionValue(selections[row.itemId] ?? "") === name) {
+                        outcomes[row.itemId] = { status: "failed", message };
+                    }
+                }
+            }
+        }
 
         // Sequential, not Promise.all — each row is its own CAS write and
         // the plan calls for skipped/failed rows to continue, not abort the
         // rest of the batch.
         for (const row of rows) {
-            const decisionId = selections[row.itemId];
-            if (!decisionId) continue; // deselected to "Leave unsorted" — no attempt, no outcome
+            if (outcomes[row.itemId]) continue; // its category create already failed above
+            const rawSelection = selections[row.itemId];
+            if (!rawSelection) continue; // deselected to "Leave unsorted" — no attempt, no outcome
+            const newCategoryName = parseNewCategoryOptionValue(rawSelection);
+            const decisionId = newCategoryName ? resolvedDecisionIdByName[newCategoryName] : rawSelection;
+            if (!decisionId) continue; // its category create failed above (already recorded)
             try {
                 const result = await applySuggestedDecision(row.itemId, decisionId);
                 if (result.applied) {
@@ -156,11 +215,12 @@ export default function AiSortReviewModal({
         }
 
         const attemptedHasIssues = Object.values(outcomes).some((o) => o.status !== "applied");
+        const createdSuffix = createdCount > 0 ? `, created ${createdCount} new categories` : "";
         // Refresh regardless — whatever DID apply is real and should show
         // up under its decision immediately.
         onApplied();
         if (!attemptedHasIssues) {
-            toast.success(`${appliedCount} sorted`);
+            toast.success(`${appliedCount} sorted${createdSuffix}`);
             onClose();
             return;
         }
@@ -168,7 +228,7 @@ export default function AiSortReviewModal({
         // Some rows were skipped or failed — do NOT auto-close. They're
         // annotated in place below; staff closes explicitly once they've
         // seen which ones need another look.
-        toast.info(`${appliedCount} sorted, ${attempted - appliedCount} need another look`);
+        toast.info(`${appliedCount} sorted, ${attempted - appliedCount} need another look${createdSuffix}`);
     }
 
     return (
@@ -249,6 +309,11 @@ export default function AiSortReviewModal({
                                                             disabled={applying}
                                                         >
                                                             <option value={LEAVE_UNSORTED}>Leave unsorted</option>
+                                                            {row.newCategoryName && (
+                                                                <option value={newCategoryOptionValue(row.newCategoryName)}>
+                                                                    {`Create "${row.newCategoryName}"`}
+                                                                </option>
+                                                            )}
                                                             {decisions.map((d) => (
                                                                 <option key={d.id} value={d.id}>{d.name}</option>
                                                             ))}

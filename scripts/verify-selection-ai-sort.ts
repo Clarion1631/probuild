@@ -9,6 +9,8 @@ import {
     type AiSortItemInput,
 } from "../src/lib/selection-ai-sort-core";
 import { mockSelectionAiSortComplete } from "../src/lib/selection-ai-sort-mock";
+import { prisma } from "../src/lib/prisma";
+import { createDecisionForSuggestion } from "../src/lib/selection-ai-sort-apply-core";
 
 const decisions: AiSortDecisionInput[] = [
     { id: "decision-fixtures", name: "Fixtures", area: "Kitchen" },
@@ -294,6 +296,159 @@ async function verifyMockDeterministicKeywordMatch(): Promise<void> {
     assert.equal(matched[0].confidence, "high");
 }
 
+// ── New categories follow-up ─────────────────────────────────────────────────
+// docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md
+
+// newCategoryName validation: trim, cap 60 chars, empty-after-trim -> null.
+// Only meaningful when decisionId is null — proven separately by the mutual-
+// exclusivity check below.
+async function verifyNewCategoryNameTrimmedCappedEmptyToNull(): Promise<void> {
+    const longName = "x".repeat(80);
+    const { suggestions } = await suggestDecisionsForItems(
+        { decisions, items },
+        {
+            complete: async () =>
+                JSON.stringify({
+                    suggestions: [
+                        { itemId: "item-1", decisionId: null, newCategoryName: "  Backsplash  ", confidence: "low", reason: "x" },
+                        { itemId: "item-2", decisionId: null, newCategoryName: longName, confidence: "low", reason: "x" },
+                    ],
+                }),
+        },
+    );
+    const item1 = suggestions.find((s) => s.itemId === "item-1");
+    assert.equal(item1!.newCategoryName, "Backsplash", "newCategoryName must be trimmed");
+
+    const item2 = suggestions.find((s) => s.itemId === "item-2");
+    assert.equal(item2!.newCategoryName!.length, 60, "newCategoryName must be capped at 60 characters");
+    assert.equal(item2!.newCategoryName, longName.slice(0, 60));
+
+    const { suggestions: emptySuggestions } = await suggestDecisionsForItems(
+        { decisions, items: [items[0]] },
+        {
+            complete: async () =>
+                JSON.stringify({
+                    suggestions: [{ itemId: "item-1", decisionId: null, newCategoryName: "   ", confidence: "low", reason: "x" }],
+                }),
+        },
+    );
+    assert.equal(emptySuggestions[0].newCategoryName, null, "an empty-after-trim newCategoryName must become null");
+}
+
+// Mutual exclusivity: a response entry claiming BOTH a valid decisionId AND a
+// newCategoryName is invalid only in that ONE field — the batch is NOT
+// invalidated/retried for this; newCategoryName is simply dropped and
+// decisionId is kept, per the plan's "advisory text, not an id" framing.
+async function verifyMutualExclusivityDropsNewCategoryNameKeepsDecisionId(): Promise<void> {
+    let calls = 0;
+    const { suggestions } = await suggestDecisionsForItems(
+        { decisions, items },
+        {
+            complete: async () => {
+                calls += 1;
+                return JSON.stringify({
+                    suggestions: [
+                        { itemId: "item-1", decisionId: "decision-fixtures", newCategoryName: "Should Be Dropped", confidence: "high", reason: "x" },
+                        { itemId: "item-2", decisionId: "decision-flooring", newCategoryName: null, confidence: "high", reason: "x" },
+                    ],
+                });
+            },
+        },
+    );
+    assert.equal(calls, 1, "a decisionId+newCategoryName conflict must NOT trigger a batch retry");
+    const item1 = suggestions.find((s) => s.itemId === "item-1");
+    assert.equal(item1!.decisionId, "decision-fixtures", "decisionId must be kept");
+    assert.equal(item1!.newCategoryName, null, "newCategoryName must be dropped when decisionId is also present");
+}
+
+// Mock + knownCategories integration: when no offered decision fits, the
+// mock proposes a newCategoryName ONLY when the item's name/description/
+// clientNote contains a knownCategories entry (case-insensitive); otherwise
+// null. Deterministic, no real AI.
+async function verifyMockProposesKnownCategoryFromVocabulary(): Promise<void> {
+    const noMatchDecisions: AiSortDecisionInput[] = [{ id: "d-unrelated", name: "Plumbing Fixtures", area: null }];
+    const backsplashItem: AiSortItemInput = {
+        id: "item-backsplash",
+        name: "Zellige Backsplash Tile",
+        description: null,
+        clientNote: null,
+        vendorUrl: null,
+    };
+    const noVocabItem: AiSortItemInput = {
+        id: "item-no-vocab",
+        name: "Mystery Widget",
+        description: null,
+        clientNote: null,
+        vendorUrl: null,
+    };
+    const { suggestions } = await suggestDecisionsForItems(
+        { decisions: noMatchDecisions, items: [backsplashItem, noVocabItem], knownCategories: ["Backsplash", "Countertops"] },
+        { complete: mockSelectionAiSortComplete },
+    );
+    const backsplashSuggestion = suggestions.find((s) => s.itemId === "item-backsplash");
+    assert.equal(backsplashSuggestion!.decisionId, null);
+    assert.equal(backsplashSuggestion!.newCategoryName, "Backsplash", "mock must propose the matching knownCategories entry");
+
+    const noVocabSuggestion = suggestions.find((s) => s.itemId === "item-no-vocab");
+    assert.equal(noVocabSuggestion!.newCategoryName, null, "no knownCategories match -> null, never invented");
+}
+
+// createDecisionForSuggestion: auth-before-lookup, advisory-lock transaction,
+// and normalizeForDedupe reuse (case-insensitive) against a real disposable
+// DB — mirrors applyDecisionTemplate's own verified behavior
+// (decision-template-apply-core.ts).
+async function verifyCreateDecisionForSuggestionAuthLockAndDedupe(): Promise<void> {
+    const run = `verify-ai-sort-newcat-${process.pid}-${Date.now()}`;
+    const clientId = `${run}-client`;
+    const projectId = `${run}-project`;
+
+    await prisma.client.create({ data: { id: clientId, name: "Verify Client", initials: "VC", email: `${run}@example.com` } });
+    await prisma.project.create({ data: { id: projectId, name: "Verify Project", clientId, status: "In Progress" } });
+
+    try {
+        // Auth-before-lookup: assertAccess must run and reject BEFORE any
+        // Prisma call this function makes — proven by an assertAccess that
+        // throws and asserting zero decisions exist afterward (nothing was
+        // read or written).
+        let assertAccessCalled = false;
+        await assert.rejects(
+            createDecisionForSuggestion(projectId, "Backsplash", {
+                assertAccess: async () => {
+                    assertAccessCalled = true;
+                    throw new Error("Forbidden");
+                },
+            }),
+            /Forbidden/,
+        );
+        assert.ok(assertAccessCalled, "assertAccess must be called");
+        const noneYet = await prisma.decision.count({ where: { projectId } });
+        assert.equal(noneYet, 0, "a rejected auth check must leave zero decisions created");
+
+        const noopDeps = { assertAccess: async () => {}, revalidate: () => {} };
+
+        // First call creates.
+        const first = await createDecisionForSuggestion(projectId, "Backsplash", noopDeps);
+        assert.equal(first.existed, false, "the first resolution of a new name must create a Decision");
+
+        // A LIVE decision already existing with a different-case name is
+        // reused, never duplicated (normalizeForDedupe, case-insensitive).
+        const second = await createDecisionForSuggestion(projectId, "backsplash", noopDeps);
+        assert.equal(second.existed, true, "a different-case match against a live decision must be reused, not duplicated");
+        assert.equal(second.decisionId, first.decisionId);
+
+        const count = await prisma.decision.count({ where: { projectId, deletedAt: null } });
+        assert.equal(count, 1, "exactly one Decision must exist after two resolutions of the same name (case-insensitive)");
+
+        const created = await prisma.decision.findUniqueOrThrow({ where: { id: first.decisionId } });
+        assert.equal(created.createdByClient, false, "a category created from an AI suggestion is staff-originated, not client-originated");
+        assert.equal(created.templateKey, null, "a category created this way carries no templateKey provenance");
+    } finally {
+        await prisma.decision.deleteMany({ where: { projectId } });
+        await prisma.project.delete({ where: { id: projectId } });
+        await prisma.client.delete({ where: { id: clientId } });
+    }
+}
+
 // ── Static assertions ───────────────────────────────────────────────────────
 
 const core = readFileSync(join(process.cwd(), "src/lib/selection-ai-sort-core.ts"), "utf8");
@@ -465,9 +620,14 @@ assert.match(
 // auto-close the modal when any row was skipped or failed.
 assert.match(modal, /const \[rowOutcomes, setRowOutcomes\] = useState</, "the modal must track a per-row outcome (applied/skipped/failed), not just aggregate counters");
 assert.match(modal, /status: "applied" \| "skipped" \| "failed"/, "row outcomes must distinguish applied/skipped/failed");
+// Suffix loosened (new-categories follow-up
+// docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md) to
+// allow the createdSuffix (", created N new categories") appended to the
+// same success toast — the invariant this protects (auto-close + success
+// toast ONLY when every attempted row applied cleanly) is unchanged.
 assert.match(
     modal,
-    /if \(!attemptedHasIssues\) \{\s*toast\.success\(`\$\{appliedCount\} sorted`\);\s*onClose\(\);\s*return;\s*\}/,
+    /if \(!attemptedHasIssues\) \{\s*toast\.success\(`\$\{appliedCount\} sorted\$\{createdSuffix\}`\);\s*onClose\(\);\s*return;\s*\}/,
     "the modal must only auto-close + show a success toast when every attempted row applied cleanly",
 );
 assert.ok(
@@ -585,6 +745,141 @@ const submitIdx = actions.indexOf("export async function submitSelectionProposal
 const submitSlice = actions.slice(submitIdx, submitIdx + 6000);
 assert.match(submitSlice, /stripSuggestionFields\(/, "submitSelectionProposal's return must strip suggestion fields");
 
+// ── New categories follow-up: static assertions ─────────────────────────────
+// docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md
+
+// Prompt: knownCategories is serialized the same way as decisions/items
+// (JSON.stringify + escapeFenceClosers), not hand-interpolated.
+assert.match(
+    core,
+    /const knownCategoriesJson = escapeFenceClosers\(\s*JSON\.stringify\(/,
+    "buildPrompt must serialize knownCategories via JSON.stringify + escapeFenceClosers, the same treatment as decisions/items",
+);
+assert.match(core, /<knownCategories>/, "the prompt must include a <knownCategories> block");
+
+// Mutual exclusivity: newCategoryName is only ever validated/kept when
+// decisionId is null — a response entry carrying both drops newCategoryName,
+// never invalidates the batch.
+assert.match(
+    core,
+    /const newCategoryName = decisionId === null \? validateNewCategoryName\(e\.newCategoryName\) : null;/,
+    "newCategoryName must only be populated when decisionId is null — mutual exclusivity enforced per-entry, not as a whole-batch validity failure",
+);
+
+// newCategoryName validation: trim, cap at 60, empty -> null — same shape as
+// the other truncate()-based field validators in this file.
+assert.match(
+    core,
+    /function validateNewCategoryName\(raw: unknown\): string \| null \{/,
+    "core must define a validateNewCategoryName validator",
+);
+
+// Route: knownCategories loaded from distinct names of items belonging to
+// ACTIVE (archivedAt null) DecisionTemplates, alphabetical, capped at 150 —
+// and threaded into the core call and the response.
+assert.match(
+    route,
+    /prisma\.decisionTemplateItem\.findMany\(\{\s*where:\s*\{\s*template:\s*\{\s*archivedAt:\s*null\s*\}\s*\},\s*select:\s*\{\s*name:\s*true\s*\},\s*distinct:\s*\[\s*"name"\s*\],\s*orderBy:\s*\{\s*name:\s*"asc"\s*\},\s*take:\s*150,?\s*\}\)/,
+    "the route must load knownCategories from distinct names of items on ACTIVE DecisionTemplates, alphabetical, capped at 150",
+);
+assert.match(
+    route,
+    /\{ decisions: decisionInputs, items: itemInputs, knownCategories \}/,
+    "the route must pass knownCategories into suggestDecisionsForItems",
+);
+assert.match(
+    route,
+    /newCategoryName:\s*s\.newCategoryName,/,
+    "each suggestion in the response must carry newCategoryName",
+);
+// Persistence is unchanged by this follow-up — a new-category suggestion is
+// modal-only, never written to suggestedDecisionId (which can only ever
+// reference a real Decision.id).
+assert.ok(
+    !route.includes("suggestedCategoryName"),
+    "no new persisted column for the new-category text — it is never written to the DB by the suggest route",
+);
+
+// Modal: the row type carries newCategoryName, a sentinel-value pair
+// distinguishes an unresolved "Create <name>" choice from a real decisionId,
+// and the option only renders for rows that have one.
+assert.match(modal, /newCategoryName:\s*string \| null;/, "AiSortSuggestionRow must carry newCategoryName");
+assert.match(
+    modal,
+    /function newCategoryOptionValue\(name: string\): string \{/,
+    "the modal must encode a chosen new-category name as a distinct select-option value, not conflate it with a real decisionId",
+);
+assert.match(
+    modal,
+    /function parseNewCategoryOptionValue\(value: string\): string \| null \{/,
+    "the modal must be able to decode a new-category option value back to its raw name",
+);
+assert.match(
+    modal,
+    /\{row\.newCategoryName && \(\s*<option value=\{newCategoryOptionValue\(row\.newCategoryName\)\}>/,
+    "the Create option must only render for rows that actually have a newCategoryName",
+);
+assert.match(
+    modal,
+    /const result = await createDecisionForSuggestion\(projectId, name\);/,
+    "Apply must resolve each unique chosen new-category name via createDecisionForSuggestion",
+);
+assert.match(
+    modal,
+    /new Set\(\s*rows\s*\.map\(\(row\) => parseNewCategoryOptionValue\(selections\[row\.itemId\] \?\? ""\)\)/,
+    "Apply must resolve each unique new-category name exactly ONCE, not once per row",
+);
+assert.match(
+    modal,
+    /created \$\{createdCount\} new categories/,
+    "the toast must mention how many new categories were created",
+);
+assert.match(
+    modal,
+    /if \(!result\.existed\) createdCount \+= 1;/,
+    "createdCount must only count names resolved with existed: false, not reused (existed: true) categories",
+);
+
+// createDecisionForSuggestion: auth-before-lookup (no Prisma call precedes
+// assertAccess), advisory-lock transaction (applyDecisionTemplate's own
+// pattern — decision-template-apply-core.ts), normalizeForDedupe reuse, no
+// templateKey, createdByClient false.
+const createFnIdx = applyCore.indexOf("export async function createDecisionForSuggestion(");
+assert.ok(createFnIdx >= 0, "createDecisionForSuggestion must be exported from selection-ai-sort-apply-core.ts");
+const createFnSlice = applyCore.slice(createFnIdx);
+const authIdx = createFnSlice.indexOf("await assertAccess(projectId);");
+const firstPrismaIdx = createFnSlice.indexOf("prisma.$transaction");
+assert.ok(authIdx >= 0 && firstPrismaIdx > authIdx, "createDecisionForSuggestion must call assertAccess BEFORE any Prisma call — no lookup may precede authorization");
+assert.match(
+    createFnSlice,
+    /await tx\.\$executeRaw`SELECT pg_advisory_xact_lock\(hashtext\(\$\{projectId\}\)\)`;/,
+    "createDecisionForSuggestion must open its transaction with the same project-scoped advisory lock as applyDecisionTemplate",
+);
+assert.match(
+    createFnSlice,
+    /normalizeForDedupe\(trimmed\)/,
+    "createDecisionForSuggestion must dedupe using the shared normalizeForDedupe comparison",
+);
+assert.match(
+    createFnSlice,
+    /existed:\s*true/,
+    "createDecisionForSuggestion must report a dedupe match as existed: true",
+);
+assert.match(
+    createFnSlice,
+    /createdByClient:\s*false,/,
+    "a category created from an AI suggestion must be createdByClient: false (staff-originated)",
+);
+assert.ok(
+    !/tx\.decision\.create\(\{\s*data:\s*\{[^}]*templateKey/.test(createFnSlice),
+    "createDecisionForSuggestion must not set a templateKey — it has no DecisionTemplate provenance",
+);
+assert.match(
+    actions,
+    /export async function createDecisionForSuggestion\(\s*projectId: string,\s*name: string,\s*\): Promise<\{ decisionId: string; existed: boolean \}> \{\s*return aiSortCreateDecisionForSuggestion\(projectId, name\);/,
+    "actions.ts's createDecisionForSuggestion must delegate to the testable core",
+);
+
 // Schema + migration script: additive columns, no FK (advisory-only).
 assert.match(schema, /suggestedDecisionId\s+String\?/, "schema must declare suggestedDecisionId as an optional, non-FK column");
 assert.match(schema, /suggestedAt\s+DateTime\?/, "schema must declare suggestedAt");
@@ -603,9 +898,14 @@ Promise.all([
     verifyTruncatedResponseRetriesThenFails(),
     verifyRetrySucceedsOnSecondAttempt(),
     verifyMockDeterministicKeywordMatch(),
+    verifyNewCategoryNameTrimmedCappedEmptyToNull(),
+    verifyMutualExclusivityDropsNewCategoryNameKeepsDecisionId(),
+    verifyMockProposesKnownCategoryFromVocabulary(),
+    verifyCreateDecisionForSuggestionAuthLockAndDedupe(),
 ])
     .then(() => console.log("selection ai-sort contract verified"))
     .catch((error) => {
         console.error(error);
         process.exitCode = 1;
-    });
+    })
+    .finally(() => prisma.$disconnect());

@@ -42,6 +42,20 @@ const ids = {
     soloPoisonProject: `${run}-solo-poison-project`,
     soloPoisonItem: `${run}-solo-poison-item`,
     adversarialItem: `${run}-adversarial-item`,
+    // New-categories follow-up
+    // (docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md)
+    // — dedicated projects so the shared knownCategories vocabulary
+    // ("Backsplash", from an active DecisionTemplate item) and the
+    // dedupe-reuse scenario don't interact with each other or the rest of
+    // this serial suite's decisions/items.
+    newCatTemplate: `${run}-newcat-template`,
+    newCatTemplateItem: `${run}-newcat-template-item`,
+    newCatProject: `${run}-newcat-project`,
+    newCatItemA: `${run}-newcat-item-a`,
+    newCatItemB: `${run}-newcat-item-b`,
+    newCatReuseProject: `${run}-newcat-reuse-project`,
+    newCatExistingDecision: `${run}-newcat-existing-decision`,
+    newCatReuseItem: `${run}-newcat-reuse-item`,
 } as const;
 const clientEmail = `${run}@example.com`;
 
@@ -137,12 +151,72 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
                 status: "Idea",
             },
         });
+
+        // New-categories follow-up fixtures. An ACTIVE DecisionTemplate item
+        // named "Backsplash" is the knownCategories vocabulary the route
+        // loads (distinct names across every active template, global — not
+        // project-scoped), so the mock can deterministically propose it for
+        // an item that matches no offered decision.
+        await prisma.decisionTemplate.create({
+            data: {
+                id: ids.newCatTemplate,
+                name: `${run} New Category Template`,
+                items: { create: [{ id: ids.newCatTemplateItem, name: "Backsplash", order: 0 }] },
+            },
+        });
+        await prisma.project.create({
+            data: { id: ids.newCatProject, name: "AI Sort New Category Project", clientId: ids.client, status: "In Progress" },
+        });
+        // Two items whose names both contain "Backsplash" but match neither
+        // "Fixtures" nor "Flooring" — the mock proposes newCategoryName
+        // "Backsplash" for both, from the knownCategories vocabulary above.
+        await prisma.selectionProposal.create({
+            data: { id: ids.newCatItemA, projectId: ids.newCatProject, name: "Zellige Backsplash Tile", status: "Idea" },
+        });
+        await prisma.selectionProposal.create({
+            data: { id: ids.newCatItemB, projectId: ids.newCatProject, name: "Subway Backsplash Sample", status: "Idea" },
+        });
+
+        // A SEPARATE project with a pre-existing LIVE decision named
+        // "backsplash" (lowercase) — an item here proposes "Backsplash"
+        // (capitalized, from the template) via its clientNote, never its
+        // name, so it can't match the existing decision through the mock's
+        // ordinary name-keyword path; createDecisionForSuggestion must
+        // resolve it by reusing the existing decision (case-insensitive),
+        // never creating a duplicate.
+        await prisma.project.create({
+            data: { id: ids.newCatReuseProject, name: "AI Sort New Category Reuse Project", clientId: ids.client, status: "In Progress" },
+        });
+        await prisma.decision.create({
+            data: { id: ids.newCatExistingDecision, projectId: ids.newCatReuseProject, name: "backsplash" },
+        });
+        await prisma.selectionProposal.create({
+            data: {
+                id: ids.newCatReuseItem,
+                projectId: ids.newCatReuseProject,
+                name: "Elegant Tile Sample",
+                clientNote: "For the backsplash accent wall",
+                status: "Idea",
+            },
+        });
     });
 
     test.afterAll(async () => {
         await prisma.project.deleteMany({
-            where: { id: { in: [ids.project, ids.otherProject, ids.batchProject, ids.soloPoisonProject] } },
+            where: {
+                id: {
+                    in: [
+                        ids.project,
+                        ids.otherProject,
+                        ids.batchProject,
+                        ids.soloPoisonProject,
+                        ids.newCatProject,
+                        ids.newCatReuseProject,
+                    ],
+                },
+            },
         });
+        await prisma.decisionTemplate.deleteMany({ where: { id: ids.newCatTemplate } });
         await prisma.client.deleteMany({ where: { id: ids.client } });
         await prisma.user.deleteMany({ where: { id: ids.restrictedStaff } });
         await prisma.$disconnect();
@@ -546,5 +620,83 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
 
         const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.a11yItem } });
         expect(item.decisionId).toBeNull();
+    });
+
+    // ── New categories: AI suggests a category for items that fit no
+    // offered decision (docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md) ──
+
+    test("new-category suggestion: two items sharing the proposed category create exactly one decision, both filed", async ({ page }) => {
+        await page.goto(`/projects/${ids.newCatProject}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+
+        // Neither item matches an offered decision — both get the
+        // "Create "Backsplash"" option, pre-selected.
+        const selectA = modal.getByTestId(`ai-sort-row-select-${ids.newCatItemA}`);
+        const selectB = modal.getByTestId(`ai-sort-row-select-${ids.newCatItemB}`);
+        await expect(selectA.locator("option:checked")).toHaveText('Create "Backsplash"');
+        await expect(selectB.locator("option:checked")).toHaveText('Create "Backsplash"');
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        // Toast mentions the new category was created.
+        await expect(page.locator("[data-sonner-toast]").last()).toContainText(/new categor/i);
+
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemA } });
+                return item.decisionId;
+            })
+            .not.toBeNull();
+
+        const itemA = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemA } });
+        const itemB = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemB } });
+        expect(itemA.decisionId).not.toBeNull();
+        // Both items resolved the SAME "Create" choice to the SAME decision
+        // — exactly one Decision must exist for it, never one per row.
+        expect(itemB.decisionId).toBe(itemA.decisionId);
+
+        const backsplashDecisions = await prisma.decision.findMany({
+            where: { projectId: ids.newCatProject, name: "Backsplash", deletedAt: null },
+        });
+        expect(backsplashDecisions.length).toBe(1);
+        expect(backsplashDecisions[0].id).toBe(itemA.decisionId);
+    });
+
+    test("Apply reuses an existing live decision with a different case, never duplicating it", async ({ page }) => {
+        await page.goto(`/projects/${ids.newCatReuseProject}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        const select = modal.getByTestId(`ai-sort-row-select-${ids.newCatReuseItem}`);
+        await expect(select.locator("option:checked")).toHaveText('Create "Backsplash"');
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatReuseItem } });
+                return item.decisionId;
+            })
+            .toBe(ids.newCatExistingDecision);
+
+        // Reused the pre-existing "backsplash" decision (different case) —
+        // no second "Backsplash"/"backsplash" decision was created.
+        const allBackslashDecisions = await prisma.decision.findMany({
+            where: { projectId: ids.newCatReuseProject, deletedAt: null, name: { in: ["backsplash", "Backsplash"] } },
+        });
+        expect(allBackslashDecisions.length).toBe(1);
+        expect(allBackslashDecisions[0].id).toBe(ids.newCatExistingDecision);
     });
 });
