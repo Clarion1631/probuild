@@ -4,7 +4,7 @@
  * Docs: https://developer.intuit.com/app/developer/qbo/docs/api/accounting
  */
 
-const QB_API_BASE = process.env.QB_SANDBOX === "true"
+export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
     : "https://quickbooks.api.intuit.com/v3/company";
 
@@ -74,7 +74,7 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
 }
 
 /** Make an authenticated call to the QB API, auto-refreshing if needed */
-async function qbFetch(
+export async function qbFetch(
     path: string,
     tokens: QBTokens,
     opts: RequestInit = {}
@@ -92,7 +92,7 @@ async function qbFetch(
 }
 
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
-async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
+export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
     const res = await fetch(url, {
         headers: {
@@ -110,7 +110,7 @@ async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
     return key ? response[key] : [];
 }
 
-function escapeQBString(s: string): string {
+export function escapeQBString(s: string): string {
     return s.replace(/'/g, "\\'");
 }
 

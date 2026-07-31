@@ -10,6 +10,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:qbo-expense-sync": "tsx --test tests/qbo-expense-sync.test.ts tests/qbo-expense-sync-route.test.ts tests/qbo-expense-sync-ui.test.tsx tests/qbo-purchase-changes.test.ts tests/qbo-expense-guard.test.ts",
+    "test:qbo-receipt-push": "tsx --test tests/qbo-receipt-push.test.ts",
     "test:e2e": "playwright test",
     "test:qa": "npx playwright test e2e/quality-gate.spec.ts",
     "assets:download": "tsx scripts/download-assets.ts",
