@@ -18,8 +18,11 @@ const ids = {
 } as const;
 const clientEmail = `${run}@example.com`;
 const distinctivePrice = "9876.54";
+// Must exceed 240 chars: notes at or under that length render unclamped with no
+// Show more toggle (SelectionItemNote.tsx), and this fixture exercises the
+// clamp/expand mechanics.
 const longNote =
-  "Use this in the primary bathroom on the vanity wall. The warm brass finish should match the mirror, cabinet pulls, sconces, faucet, and towel hardware.";
+  "Use this in the primary bathroom on the vanity wall. The warm brass finish should match the mirror, cabinet pulls, sconces, faucet, and towel hardware. Double-check the finish against the sample board in the office before ordering, and confirm the lead time with the vendor so it lands before the plumbing trim-out week.";
 
 test.describe.serial("selection item notes", () => {
   test.beforeAll(async () => {
