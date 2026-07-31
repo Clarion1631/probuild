@@ -15,6 +15,7 @@ import {
     getFallbackProjectColor,
     PRESET_COLORS,
 } from "@/app/projects/[id]/schedule/schedule-utils";
+import ColorWheel from "@/app/projects/[id]/schedule/ColorWheel";
 import { getEffectiveProjectRange } from "./useBarLayout";
 import { BoardDrawerShell } from "./BoardDrawerShell";
 import { CrewPicker } from "./CrewPickers";
@@ -223,6 +224,14 @@ function ProjectDrawerContent({
                                 />
                             );
                         })}
+                    </div>
+                    <div className="mt-4 border-t border-hui-border pt-4">
+                        <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">Custom</p>
+                        <ColorWheel
+                            value={projectColor}
+                            onCommit={submitColor}
+                            disabled={isDrawerActionPending}
+                        />
                     </div>
                 </section>
             </div>
