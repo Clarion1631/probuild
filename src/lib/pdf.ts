@@ -892,7 +892,8 @@ export async function generateInvoicePdf(
     if (!invoice) throw new Error('Invoice not found');
 
     const requestedIds = new Set(opts?.requestedMilestoneIds ?? []);
-    const requestedPayments = invoice.payments.filter(p => requestedIds.has(p.id) && p.status !== 'Paid' && p.status !== 'Canceled');
+    // Pending-only — same predicate as the portal's focus mode and markInvoiceViewed.
+    const requestedPayments = invoice.payments.filter(p => requestedIds.has(p.id) && p.status === 'Pending');
 
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
 
@@ -974,7 +975,7 @@ export async function generateInvoicePdf(
 
         page.drawText(displayName, { x: invCols.name, y, size: 10, font: helvetica, color: colors.textMain });
 
-        const isRequested = requestedIds.has(payment.id) && payment.status !== 'Paid' && payment.status !== 'Canceled';
+        const isRequested = requestedIds.has(payment.id) && payment.status === 'Pending';
         const statusStr = isRequested ? 'Requested' : (payment.status || 'Pending');
         const statusFont = isRequested ? helveticaBold : helvetica;
         const statusW = statusFont.widthOfTextAtSize(statusStr, 10);

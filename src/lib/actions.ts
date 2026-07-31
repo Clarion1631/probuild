@@ -2821,8 +2821,9 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
         // The milestones the client was actually looking at (focused portal view).
+        // Pending-only — same predicate as the portal's focus mode and the PDF.
         const focusedPayments = invoice.payments.filter(
-            p => claimedFocusIds.includes(p.id) && p.status !== "Paid" && p.status !== "Canceled"
+            p => claimedFocusIds.includes(p.id) && p.status === "Pending"
         );
         const focusedTotal = focusedPayments.reduce((sum, p) => sum + Number(p.amount), 0);
         try {
