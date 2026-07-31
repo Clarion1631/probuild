@@ -544,11 +544,18 @@ assert.match(
 // (Next.js decides whether to invoke the middleware at all from the
 // matcher), matching the existing api/selections/item-comments precedent.
 const proxy = readFileSync(join(process.cwd(), "src/proxy.ts"), "utf8");
+// Broadened (not just "item-comments|ai-sort") when
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md added
+// api/selections/link-schedule as a third sibling route in the same
+// alternation — this assertion just needs item-comments and ai-sort to both
+// still be present in the bypass group, in either order relative to any
+// later addition.
 assert.match(
     proxy,
-    /selections\\\/\(\?:item-comments\|ai-sort\)/,
+    /selections\\\/\(\?:[^)]*item-comments[^)]*\)/,
     "PUBLIC_PROXY_BYPASS_PATTERN must bypass api/selections/ai-sort (self-authorizing, staff-only) the same way it does item-comments",
 );
+assert.match(proxy, /selections\\\/\(\?:[^)]*ai-sort[^)]*\)/, "the bypass alternation must still include ai-sort");
 assert.match(
     proxy,
     /api\/selections\/item-comments\|api\/selections\/ai-sort/,

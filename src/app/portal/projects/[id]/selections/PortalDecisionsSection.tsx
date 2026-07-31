@@ -27,6 +27,7 @@ import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
 import ClipperDragLink from "@/components/ClipperDragLink";
 import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
 import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/components/selections/SelectionItemThread";
+import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import AddItemModal from "./AddItemModal";
 import {
     ImageOff,
@@ -73,6 +74,27 @@ interface DecisionData {
     sortOrder: number;
     pmNote: string | null;
     candidates: Candidate[];
+    // Schedule-driven due dates (Phase 3) — computed value only; the portal
+    // never receives the raw dueDate/scheduleTaskId/leadTimeDays fields
+    // (stripped server-side, see stripDueDateFields in actions.ts).
+    effectiveDueDate: string | null;
+}
+
+// Read-only "Decide by" line — undecided decisions only (Open/Flagged);
+// Decided/Ordered/Received show nothing regardless of effectiveDueDate.
+function DecideByLine({ status, effectiveDueDate }: { status: string; effectiveDueDate: string | null }) {
+    if (status !== "Open" && status !== "Flagged") return null;
+    if (!effectiveDueDate) return null;
+    const date = new Date(effectiveDueDate);
+    const urgency = dueDateUrgency(date);
+    return (
+        <p data-testid="portal-decide-by" className="text-xs mt-1">
+            <span className="text-hui-textMuted">Decide by {formatDueDateShort(date)}</span>
+            {urgency && (
+                <span className={`ml-1.5 px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
+            )}
+        </p>
+    );
 }
 
 const ARCHIVED = "Archived";
@@ -579,6 +601,7 @@ function DecisionCard({
                             </button>
                         </div>
                     )}
+                    <DecideByLine status={decision.status} effectiveDueDate={decision.effectiveDueDate} />
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                     <button

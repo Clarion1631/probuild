@@ -1,13 +1,24 @@
-import { getProjectDecisions, getRecentlyDeletedDecisions, getRecentlyDeletedItems } from "@/lib/actions";
+import { getProjectDecisions, getRecentlyDeletedDecisions, getRecentlyDeletedItems, listProjectScheduleTasksForLinking } from "@/lib/actions";
+import { getSessionOrDev } from "@/lib/auth";
+import { getUserWithPermissionsByEmail, isAdminOrManager } from "@/lib/permissions";
 import TeamDecisionsSection from "./TeamDecisionsSection";
 
 export default async function SelectionsPage(props: { params: Promise<{ id: string }> }) {
     const { id } = await props.params;
-    const [decisionsData, recentlyDeleted, recentlyDeletedItems] = await Promise.all([
+    const [decisionsData, recentlyDeleted, recentlyDeletedItems, scheduleTasks] = await Promise.all([
         getProjectDecisions(id),
         getRecentlyDeletedDecisions(id),
         getRecentlyDeletedItems(id),
+        listProjectScheduleTasksForLinking(id),
     ]);
+
+    // ADMIN/MANAGER-only manual due-date override input (Phase 3 —
+    // docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) —
+    // dev sessions without a matching User row default to ADMIN, same
+    // passthrough other staff-gated pages use.
+    const session = await getSessionOrDev();
+    const user = session?.user?.email ? await getUserWithPermissionsByEmail(session.user.email) : null;
+    const effectiveUser = user ?? (process.env.NODE_ENV === "development" ? { role: "ADMIN" } : { role: "" });
 
     return (
         <div className="max-w-5xl mx-auto">
@@ -25,6 +36,8 @@ export default async function SelectionsPage(props: { params: Promise<{ id: stri
                 initialUnsorted={JSON.parse(JSON.stringify(decisionsData.unsorted))}
                 initialRecentlyDeleted={JSON.parse(JSON.stringify(recentlyDeleted))}
                 initialRecentlyDeletedItems={JSON.parse(JSON.stringify(recentlyDeletedItems))}
+                isAdminOrManager={isAdminOrManager(effectiveUser)}
+                scheduleTasks={JSON.parse(JSON.stringify(scheduleTasks))}
             />
         </div>
     );

@@ -24,6 +24,10 @@ import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/comp
 import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal";
+import LinkScheduleReviewModal, { type LinkScheduleSuggestionRow } from "./LinkScheduleReviewModal";
+import ApplyTemplateModal from "./ApplyTemplateModal";
+import DecisionDueDateEditPopover, { type ProjectScheduleTaskOption } from "./DecisionDueDateEditPopover";
+import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import {
     ImageOff,
     ExternalLink,
@@ -39,6 +43,7 @@ import {
     Sparkles,
     Check,
     X,
+    Calendar,
 } from "lucide-react";
 
 interface Candidate {
@@ -71,6 +76,16 @@ interface DecisionData {
     sortOrder: number;
     pmNote: string | null;
     candidates: Candidate[];
+    // Schedule-driven due dates (Phase 3) — raw link/override fields (staff
+    // read only; the portal read strips these) plus the computed value.
+    scheduleTaskId: string | null;
+    leadTimeDays: number | null;
+    dueDate: string | null;
+    effectiveDueDate: string | null;
+    // Staff-only display state (Codex review round 1, issue 7) — never sent
+    // to the portal.
+    isManual: boolean;
+    linkState: "linked" | "dangling" | "none";
 }
 
 interface DeletedDecision {
@@ -111,6 +126,41 @@ function statusChip(status: string): { label: string; className: string } {
         default:
             return { label: "Open", className: "bg-slate-100 text-slate-600" };
     }
+}
+
+// Undecided-only urgency badge (Open/Flagged) — Decided/Ordered/Received
+// show nothing regardless of effectiveDueDate (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md). A
+// small "manual" marker appears when the date came from the ADMIN/MANAGER
+// override rather than schedule derivation (Codex review round 1, issue 7)
+// — otherwise a manually-set date is visually indistinguishable from a
+// derived one.
+function DecideByBadge({
+    status,
+    effectiveDueDate,
+    isManual,
+}: {
+    status: string;
+    effectiveDueDate: string | null;
+    isManual: boolean;
+}) {
+    if (status !== "Open" && status !== "Flagged") return null;
+    if (!effectiveDueDate) return null;
+    const date = new Date(effectiveDueDate);
+    const urgency = dueDateUrgency(date);
+    return (
+        <span data-testid="decide-by-badge" className="inline-flex items-center gap-1 text-xs">
+            <span className="text-hui-textMuted">Decide by {formatDueDateShort(date)}</span>
+            {isManual && (
+                <span data-testid="decide-by-manual-marker" title="Manually set — always wins over the schedule link" className="px-1.5 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700">
+                    manual
+                </span>
+            )}
+            {urgency && (
+                <span className={`px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
+            )}
+        </span>
+    );
 }
 
 function ApprovedItemsTable({
@@ -284,7 +334,9 @@ function CandidateCard({
                         disabled={suggestionBusy !== null}
                         title={`Sort into ${suggestion.decisionName}`}
                         aria-label={`Apply AI suggestion: sort into ${suggestion.decisionName}`}
-                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                        // Affirmative action — filled green, not just a subtle
+                        // hover tint, so it reads as "apply" at a glance.
+                        className="w-5 h-5 rounded-full flex items-center justify-center bg-hui-primary text-white hover:bg-hui-primaryHover disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary focus-visible:ring-offset-1"
                     >
                         <Check className="w-3 h-3" />
                     </button>
@@ -295,7 +347,9 @@ function CandidateCard({
                         disabled={suggestionBusy !== null}
                         title="Dismiss suggestion"
                         aria-label="Dismiss AI suggestion"
-                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                        // Dismiss stays subtle (unfilled) but with a clearly
+                        // visible hover/focus state, distinct from apply.
+                        className="w-5 h-5 rounded-full flex items-center justify-center text-hui-textMuted hover:bg-red-50 hover:text-red-600 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-1"
                     >
                         <X className="w-3 h-3" />
                     </button>
@@ -390,12 +444,16 @@ function DecisionCard({
     isLast,
     onChanged,
     onMove,
+    isAdminOrManager,
+    scheduleTasks,
 }: {
     decision: DecisionData;
     isFirst: boolean;
     isLast: boolean;
     onChanged: () => void;
     onMove: (direction: "up" | "down") => void;
+    isAdminOrManager: boolean;
+    scheduleTasks: ProjectScheduleTaskOption[];
 }) {
     const [renaming, setRenaming] = useState(false);
     const [nameDraft, setNameDraft] = useState(decision.name);
@@ -466,6 +524,18 @@ function DecisionCard({
                             <button onClick={() => setRenaming(true)} title="Rename" aria-label="Edit decision title" className="text-slate-400 hover:text-hui-textMain transition">
                                 <Pencil className="w-3.5 h-3.5" />
                             </button>
+                            <DecideByBadge status={decision.status} effectiveDueDate={decision.effectiveDueDate} isManual={decision.isManual} />
+                            <DecisionDueDateEditPopover
+                                decisionId={decision.id}
+                                decisionName={decision.name}
+                                scheduleTaskId={decision.scheduleTaskId}
+                                leadTimeDays={decision.leadTimeDays}
+                                dueDate={decision.dueDate}
+                                linkState={decision.linkState}
+                                tasks={scheduleTasks}
+                                isAdminOrManager={isAdminOrManager}
+                                onSaved={onChanged}
+                            />
                         </div>
                     )}
                 </div>
@@ -603,12 +673,16 @@ export default function TeamDecisionsSection({
     initialUnsorted,
     initialRecentlyDeleted,
     initialRecentlyDeletedItems,
+    isAdminOrManager,
+    scheduleTasks,
 }: {
     projectId: string;
     initialDecisions: DecisionData[];
     initialUnsorted: Candidate[];
     initialRecentlyDeleted: DeletedDecision[];
     initialRecentlyDeletedItems: DeletedItem[];
+    isAdminOrManager: boolean;
+    scheduleTasks: ProjectScheduleTaskOption[];
 }) {
     const router = useRouter();
     const [decisions, setDecisions] = useState<DecisionData[]>(initialDecisions);
@@ -625,6 +699,12 @@ export default function TeamDecisionsSection({
     const [aiSortDecisions, setAiSortDecisions] = useState<{ id: string; name: string }[]>([]);
     const [aiSortFailedCount, setAiSortFailedCount] = useState(0);
     const [aiSortModalOpen, setAiSortModalOpen] = useState(false);
+
+    const [linking, setLinking] = useState(false);
+    const [linkScheduleRows, setLinkScheduleRows] = useState<LinkScheduleSuggestionRow[]>([]);
+    const [linkScheduleTasks, setLinkScheduleTasks] = useState<{ id: string; name: string; startDate: string }[]>([]);
+    const [linkScheduleFailedCount, setLinkScheduleFailedCount] = useState(0);
+    const [linkScheduleModalOpen, setLinkScheduleModalOpen] = useState(false);
 
     // initialDecisions is only the INITIAL value for useState — resync when
     // the server component re-fetches after router.refresh() (same fix
@@ -698,6 +778,39 @@ export default function TeamDecisionsSection({
         }
     }
 
+    async function handleLinkToSchedule() {
+        setLinking(true);
+        try {
+            const res = await fetch("/api/selections/link-schedule", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(body.error || "Couldn't get schedule-link suggestions.");
+            }
+
+            const rows: LinkScheduleSuggestionRow[] = Array.isArray(body.suggestions) ? body.suggestions : [];
+            const tasks: { id: string; name: string; startDate: string }[] = Array.isArray(body.tasks) ? body.tasks : [];
+            const failedCount = Array.isArray(body.failedDecisionIds) ? body.failedDecisionIds.length : 0;
+
+            if (rows.length === 0) {
+                toast.info("No undecided decisions to link.");
+                return;
+            }
+
+            setLinkScheduleRows(rows);
+            setLinkScheduleTasks(tasks);
+            setLinkScheduleFailedCount(failedCount);
+            setLinkScheduleModalOpen(true);
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't get schedule-link suggestions.");
+        } finally {
+            setLinking(false);
+        }
+    }
+
     async function handleMoveDecision(decisionId: string, direction: "up" | "down") {
         const index = decisions.findIndex((d) => d.id === decisionId);
         if (index === -1) return;
@@ -752,6 +865,30 @@ export default function TeamDecisionsSection({
                         <Download className="w-4 h-4" />
                         {importing ? "Importing…" : "Import picks from selection boards"}
                     </button>
+                    <LinkScheduleReviewModal
+                        open={linkScheduleModalOpen}
+                        rows={linkScheduleRows}
+                        tasks={linkScheduleTasks}
+                        failedCount={linkScheduleFailedCount}
+                        trigger={
+                            <button
+                                data-testid="link-to-schedule-button"
+                                // Also disabled while the review modal is open —
+                                // a second run mid-review would silently replace
+                                // the rows being looked at (same reasoning as
+                                // Sort with AI's disabled condition).
+                                disabled={linking || linkScheduleModalOpen}
+                                className="hui-btn hui-btn-accent text-sm flex items-center gap-1.5 disabled:opacity-50"
+                            >
+                                <Calendar className="w-4 h-4" />
+                                {linking ? "Linking…" : "Link to schedule"}
+                            </button>
+                        }
+                        onTriggerClick={handleLinkToSchedule}
+                        onClose={() => setLinkScheduleModalOpen(false)}
+                        onApplied={refresh}
+                    />
+                    <ApplyTemplateModal projectId={projectId} onApplied={refresh} />
                     <button onClick={() => setAddDecisionOpen(true)} className="hui-btn hui-btn-green text-sm flex items-center gap-1.5">
                         <Plus className="w-4 h-4" />
                         Add a decision
@@ -773,18 +910,31 @@ export default function TeamDecisionsSection({
                                 Clipped by the client, not yet in a decision. They sort these themselves — this is just so you can see what&apos;s coming.
                             </p>
                         </div>
-                        <button
-                            data-testid="sort-with-ai-button"
-                            onClick={handleSortWithAi}
-                            // Also disabled while the review modal is open —
-                            // a second run mid-review would silently replace
-                            // the rows the staffer is currently looking at.
-                            disabled={sorting || aiSortModalOpen}
-                            className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
-                        >
-                            <Sparkles className="w-3.5 h-3.5" />
-                            {sorting ? "Sorting…" : "Sort with AI"}
-                        </button>
+                        <AiSortReviewModal
+                            open={aiSortModalOpen}
+                            rows={aiSortRows}
+                            decisions={aiSortDecisions}
+                            failedCount={aiSortFailedCount}
+                            trigger={
+                                <button
+                                    data-testid="sort-with-ai-button"
+                                    // Also disabled while the review modal is
+                                    // open — a second run mid-review would
+                                    // silently replace the rows the staffer is
+                                    // currently looking at.
+                                    disabled={sorting || aiSortModalOpen}
+                                    // text-sm + py-2 (not the old text-xs/py-1.5)
+                                    // to clear the ~36px minimum hit-target height.
+                                    className="hui-btn hui-btn-accent text-sm py-2 px-3 flex items-center gap-1.5 disabled:opacity-50"
+                                >
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    {sorting ? "Sorting…" : "Sort with AI"}
+                                </button>
+                            }
+                            onTriggerClick={handleSortWithAi}
+                            onClose={() => setAiSortModalOpen(false)}
+                            onApplied={refresh}
+                        />
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                         {activeUnsorted.map((item) => (
@@ -810,6 +960,8 @@ export default function TeamDecisionsSection({
                             isLast={i === decisions.length - 1}
                             onChanged={refresh}
                             onMove={(direction) => handleMoveDecision(decision.id, direction)}
+                            isAdminOrManager={isAdminOrManager}
+                            scheduleTasks={scheduleTasks}
                         />
                     ))}
                 </div>
@@ -822,15 +974,6 @@ export default function TeamDecisionsSection({
             />
 
             <AddDecisionModal projectId={projectId} open={addDecisionOpen} onClose={() => setAddDecisionOpen(false)} onCreated={refresh} />
-
-            <AiSortReviewModal
-                open={aiSortModalOpen}
-                rows={aiSortRows}
-                decisions={aiSortDecisions}
-                failedCount={aiSortFailedCount}
-                onClose={() => setAiSortModalOpen(false)}
-                onApplied={refresh}
-            />
         </div>
     );
 }
