@@ -50,8 +50,16 @@ export async function mockSelectionAiSortComplete(prompt: string): Promise<strin
 
     const suggestions = items.map(({ id, name, description, clientNote }) => {
         const lowerName = name.toLowerCase();
+        // Both the existing-decision match AND the new-category match are
+        // checked against the SAME haystack (name + description + clientNote)
+        // — consistency the two branches previously lacked (decision
+        // matching only looked at `name`, category matching already used the
+        // full haystack), which could let an item that clearly matches an
+        // offered decision via its note/description fall through to
+        // inventing a new category instead of just using the real one.
+        const haystack = `${name} ${description ?? ""} ${clientNote ?? ""}`.toLowerCase();
         const match = decisions.find(
-            (d) => lowerName.includes(d.name.toLowerCase()) || d.name.toLowerCase().includes(lowerName),
+            (d) => haystack.includes(d.name.toLowerCase()) || d.name.toLowerCase().includes(lowerName),
         );
         if (match) {
             return {
@@ -66,7 +74,6 @@ export async function mockSelectionAiSortComplete(prompt: string): Promise<strin
         // No offered decision fits — deterministically propose a
         // newCategoryName when the item's name/description/note contains a
         // knownCategories entry (case-insensitive substring), else null.
-        const haystack = `${name} ${description ?? ""} ${clientNote ?? ""}`.toLowerCase();
         const categoryMatch = knownCategories.find((c) => haystack.includes(c.toLowerCase()));
         return {
             itemId: id,

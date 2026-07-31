@@ -11,6 +11,13 @@ import {
 import { mockSelectionAiSortComplete } from "../src/lib/selection-ai-sort-mock";
 import { prisma } from "../src/lib/prisma";
 import { createDecisionForSuggestion } from "../src/lib/selection-ai-sort-apply-core";
+import { normalizeForDedupe } from "../src/lib/decision-template-core";
+import {
+    newCategoryOptionValue,
+    resolveNewCategoryPlan,
+    buildRowApplyPlans,
+    type NewCategoryResolution,
+} from "../src/lib/selection-ai-sort-review-plan";
 
 const decisions: AiSortDecisionInput[] = [
     { id: "decision-fixtures", name: "Fixtures", area: "Kitchen" },
@@ -299,11 +306,14 @@ async function verifyMockDeterministicKeywordMatch(): Promise<void> {
 // ── New categories follow-up ─────────────────────────────────────────────────
 // docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md
 
-// newCategoryName validation: trim, cap 60 chars, empty-after-trim -> null.
-// Only meaningful when decisionId is null — proven separately by the mutual-
-// exclusivity check below.
+// newCategoryName validation: trim, cap 120 chars (Codex review issue 2 —
+// raised from 60 to match the knownCategories vocabulary max/
+// createDecisionForSuggestion's own 120-char validation, so a 61-120 char
+// vocabulary name is never truncated into a DIFFERENT string that defeats
+// dedupe), empty-after-trim -> null. Only meaningful when decisionId is
+// null — proven separately by the mutual-exclusivity check below.
 async function verifyNewCategoryNameTrimmedCappedEmptyToNull(): Promise<void> {
-    const longName = "x".repeat(80);
+    const longName = "x".repeat(150);
     const { suggestions } = await suggestDecisionsForItems(
         { decisions, items },
         {
@@ -320,8 +330,8 @@ async function verifyNewCategoryNameTrimmedCappedEmptyToNull(): Promise<void> {
     assert.equal(item1!.newCategoryName, "Backsplash", "newCategoryName must be trimmed");
 
     const item2 = suggestions.find((s) => s.itemId === "item-2");
-    assert.equal(item2!.newCategoryName!.length, 60, "newCategoryName must be capped at 60 characters");
-    assert.equal(item2!.newCategoryName, longName.slice(0, 60));
+    assert.equal(item2!.newCategoryName!.length, 120, "newCategoryName must be capped at 120 characters");
+    assert.equal(item2!.newCategoryName, longName.slice(0, 120));
 
     const { suggestions: emptySuggestions } = await suggestDecisionsForItems(
         { decisions, items: [items[0]] },
@@ -393,6 +403,30 @@ async function verifyMockProposesKnownCategoryFromVocabulary(): Promise<void> {
     assert.equal(noVocabSuggestion!.newCategoryName, null, "no knownCategories match -> null, never invented");
 }
 
+// Match priority (Codex review issue 4a): an item whose CLIENTNOTE (not its
+// bare name) contains an offered decision's name AND a knownCategories
+// vocabulary word must resolve to the existing decision — never invent a
+// new category when a real match exists. Exercises the mock's unified
+// haystack (name+description+clientNote) directly, independent of the full
+// e2e/UI flow.
+async function verifyMockMatchPriorityOverNewCategory(): Promise<void> {
+    const offeredDecisions: AiSortDecisionInput[] = [{ id: "d-fixtures", name: "Fixtures", area: null }];
+    const ambiguousItem: AiSortItemInput = {
+        id: "item-ambiguous",
+        name: "Trim Kit", // bare name matches neither Fixtures nor the vocabulary
+        description: null,
+        clientNote: "For the Fixtures wall, near the Backsplash",
+        vendorUrl: null,
+    };
+    const { suggestions } = await suggestDecisionsForItems(
+        { decisions: offeredDecisions, items: [ambiguousItem], knownCategories: ["Backsplash"] },
+        { complete: mockSelectionAiSortComplete },
+    );
+    const suggestion = suggestions.find((s) => s.itemId === "item-ambiguous");
+    assert.equal(suggestion!.decisionId, "d-fixtures", "an item matching an offered decision via its clientNote must resolve to that decision");
+    assert.equal(suggestion!.newCategoryName, null, "a new category must never be invented when a real decision match exists");
+}
+
 // createDecisionForSuggestion: auth-before-lookup, advisory-lock transaction,
 // and normalizeForDedupe reuse (case-insensitive) against a real disposable
 // DB — mirrors applyDecisionTemplate's own verified behavior
@@ -447,6 +481,69 @@ async function verifyCreateDecisionForSuggestionAuthLockAndDedupe(): Promise<voi
         await prisma.project.delete({ where: { id: projectId } });
         await prisma.client.delete({ where: { id: clientId } });
     }
+}
+
+// resolveNewCategoryPlan/buildRowApplyPlans (selection-ai-sort-review-plan.ts,
+// Codex review issue 4b): pure planning helpers, no DOM/React/network — the
+// modal's Apply flow is a thin loop around these. Unit-tested directly here
+// for exactly the two invariants the review called out: a shared name is
+// resolved once (not once per row), and a create failure marks every row
+// depending on it as failed while an INDEPENDENT row (a different name, or a
+// direct decisionId) proceeds untouched.
+async function verifySharedNewCategoryNameResolvedOnce(): Promise<void> {
+    const rows = [{ itemId: "row-1" }, { itemId: "row-2" }, { itemId: "row-3" }];
+    const selections: Record<string, string> = {
+        "row-1": newCategoryOptionValue("Backsplash"),
+        "row-2": newCategoryOptionValue(" backsplash "), // different raw text, same normalized key
+        "row-3": "", // leave unsorted
+    };
+    const plan = resolveNewCategoryPlan(rows, selections, normalizeForDedupe);
+
+    assert.equal(plan.uniqueNewCategoryNames.size, 1, "two rows selecting the same category (any casing/whitespace) must group into exactly ONE entry to resolve");
+    assert.equal(plan.rowPlans.get("row-1")?.kind, "newCategory");
+    assert.equal(plan.rowPlans.get("row-2")?.kind, "newCategory");
+    assert.equal(plan.rowPlans.get("row-3")?.kind, "leave", "an empty selection must plan as leave-unsorted");
+
+    // A literal "__proto__" category name must not silently vanish into
+    // Object.prototype (Codex review issue 3) — it must round-trip as a
+    // real, lookupable Map entry.
+    const protoRows = [{ itemId: "row-proto" }];
+    const protoSelections = { "row-proto": newCategoryOptionValue("__proto__") };
+    const protoPlan = resolveNewCategoryPlan(protoRows, protoSelections, normalizeForDedupe);
+    assert.equal(protoPlan.uniqueNewCategoryNames.get(normalizeForDedupe("__proto__")), "__proto__");
+    assert.equal(protoPlan.rowPlans.get("row-proto")?.kind, "newCategory");
+}
+
+async function verifyCreateFailureFailsDependentRowsOnlyIndependentRowsProceed(): Promise<void> {
+    const rows = [
+        { itemId: "row-a1" }, // newCategory "Alpha" — will fail
+        { itemId: "row-a2" }, // newCategory "Alpha" — same failing name
+        { itemId: "row-b" }, // newCategory "Beta" — independent, succeeds
+        { itemId: "row-direct" }, // a real decisionId, untouched by any create
+    ];
+    const selections: Record<string, string> = {
+        "row-a1": newCategoryOptionValue("Alpha"),
+        "row-a2": newCategoryOptionValue("Alpha"),
+        "row-b": newCategoryOptionValue("Beta"),
+        "row-direct": "decision-existing",
+    };
+    const plan = resolveNewCategoryPlan(rows, selections, normalizeForDedupe);
+    assert.equal(plan.uniqueNewCategoryNames.size, 2, "Alpha and Beta are independent names — two entries to resolve");
+
+    const resolutions = new Map<string, NewCategoryResolution>();
+    for (const [key, rawName] of plan.uniqueNewCategoryNames) {
+        resolutions.set(key, rawName === "Alpha" ? { error: "boom" } : { decisionId: "decision-beta" });
+    }
+
+    const applyPlans = buildRowApplyPlans(rows, plan, normalizeForDedupe, resolutions);
+    assert.equal(applyPlans.get("row-a1")?.kind, "failed", "a row depending on a FAILED create must be marked failed");
+    assert.equal(applyPlans.get("row-a2")?.kind, "failed", "every row sharing the failed name must be marked failed, not just the first");
+    const betaPlan = applyPlans.get("row-b");
+    assert.equal(betaPlan?.kind, "apply", "an INDEPENDENT row (different name, which succeeded) must still proceed");
+    assert.equal((betaPlan as { decisionId: string }).decisionId, "decision-beta");
+    const directPlan = applyPlans.get("row-direct");
+    assert.equal(directPlan?.kind, "apply", "a row targeting a real decisionId directly must be untouched by any create call");
+    assert.equal((directPlan as { decisionId: string }).decisionId, "decision-existing");
 }
 
 // ── Static assertions ───────────────────────────────────────────────────────
@@ -732,6 +829,28 @@ assert.match(
     "assignItemToDecision must clear suggestedDecisionId/suggestedAt in the same conditional write",
 );
 
+// createDecision (Codex review issue 1 — one-sided lock): the manual create
+// path must take the SAME project-scoped advisory lock as
+// createDecisionForSuggestion/applyDecisionTemplate before reading max
+// sortOrder + creating, so a manual create can never race an AI-sort
+// "Create <name>" resolution (or another manual create) on sortOrder
+// ordering. Behavior otherwise unchanged — no dedupe added here, manual
+// duplicate names are still allowed.
+const createDecisionIdx = actions.indexOf("export async function createDecision(");
+assert.ok(createDecisionIdx >= 0, "createDecision must be exported from actions.ts");
+const createDecisionSlice = actions.slice(createDecisionIdx, createDecisionIdx + 1500);
+assert.match(
+    createDecisionSlice,
+    /await tx\.\$executeRaw`SELECT pg_advisory_xact_lock\(hashtext\(\$\{projectId\}\)\)`;/,
+    "createDecision must open its transaction with the same project-scoped advisory lock as createDecisionForSuggestion/applyDecisionTemplate",
+);
+const createDecisionMaxOrderIdx = createDecisionSlice.indexOf("tx.decision.aggregate");
+const createDecisionLockIdx = createDecisionSlice.indexOf("pg_advisory_xact_lock");
+assert.ok(
+    createDecisionLockIdx >= 0 && createDecisionMaxOrderIdx > createDecisionLockIdx,
+    "createDecision must take the lock BEFORE reading max sortOrder — otherwise the race window it's meant to close stays open",
+);
+
 // Portal field stripping: every portal-facing SelectionProposal read must
 // strip suggestedDecisionId/suggestedAt via stripSuggestionFields.
 assert.match(actions, /function stripSuggestionFields</, "actions.ts must define stripSuggestionFields");
@@ -757,6 +876,19 @@ assert.match(
 );
 assert.match(core, /<knownCategories>/, "the prompt must include a <knownCategories> block");
 
+// Mock match-priority consistency (Codex review issue 4a): the
+// existing-decision match and the new-category match must be checked
+// against the SAME haystack (name + description + clientNote) — previously
+// only the category branch used the full haystack, so an item that clearly
+// matched an offered decision via its note/description (not its bare name)
+// could fall through to inventing a new category instead of using the real
+// decision.
+assert.match(
+    mockSource,
+    /const haystack = `\$\{name\} \$\{description \?\? ""\} \$\{clientNote \?\? ""\}`\.toLowerCase\(\);\s*\n\s*const match = decisions\.find\(\s*\(d\) => haystack\.includes\(d\.name\.toLowerCase\(\)\)/,
+    "the mock's decision-match check must search the full name+description+clientNote haystack, the same one the category-match branch uses — not just the item's bare name",
+);
+
 // Mutual exclusivity: newCategoryName is only ever validated/kept when
 // decisionId is null — a response entry carrying both drops newCategoryName,
 // never invalidates the batch.
@@ -766,8 +898,10 @@ assert.match(
     "newCategoryName must only be populated when decisionId is null — mutual exclusivity enforced per-entry, not as a whole-batch validity failure",
 );
 
-// newCategoryName validation: trim, cap at 60, empty -> null — same shape as
-// the other truncate()-based field validators in this file.
+// newCategoryName validation: trim, cap at 120 (matches the vocabulary max
+// and createDecisionForSuggestion's own validation — Codex review issue 2),
+// empty -> null — same shape as the other truncate()-based field validators
+// in this file.
 assert.match(
     core,
     /function validateNewCategoryName\(raw: unknown\): string \| null \{/,
@@ -800,19 +934,23 @@ assert.ok(
     "no new persisted column for the new-category text — it is never written to the DB by the suggest route",
 );
 
-// Modal: the row type carries newCategoryName, a sentinel-value pair
-// distinguishes an unresolved "Create <name>" choice from a real decisionId,
-// and the option only renders for rows that have one.
+// Modal: the row type carries newCategoryName, and the option only renders
+// for rows that have one. The sentinel-value encoding + resolve-then-apply
+// planning were extracted into selection-ai-sort-review-plan.ts (Codex
+// review issue 4b — unit-testable pure helpers) and issue 3 (a plain object
+// keyed by an untrusted category name risked __proto__ pollution; every
+// name -> id/result mapping is a Map there instead).
+const reviewPlan = readFileSync(join(process.cwd(), "src/lib/selection-ai-sort-review-plan.ts"), "utf8");
 assert.match(modal, /newCategoryName:\s*string \| null;/, "AiSortSuggestionRow must carry newCategoryName");
 assert.match(
     modal,
-    /function newCategoryOptionValue\(name: string\): string \{/,
-    "the modal must encode a chosen new-category name as a distinct select-option value, not conflate it with a real decisionId",
+    /import \{\s*newCategoryOptionValue,\s*resolveNewCategoryPlan,\s*buildRowApplyPlans,/,
+    "the modal must import its new-category planning helpers from selection-ai-sort-review-plan.ts, not define them inline",
 );
 assert.match(
     modal,
-    /function parseNewCategoryOptionValue\(value: string\): string \| null \{/,
-    "the modal must be able to decode a new-category option value back to its raw name",
+    /import \{ normalizeForDedupe \} from "@\/lib\/decision-template-core";/,
+    "the modal must group chosen new-category names using the SAME normalizeForDedupe comparison the server uses (Codex review nit i)",
 );
 assert.match(
     modal,
@@ -821,13 +959,23 @@ assert.match(
 );
 assert.match(
     modal,
-    /const result = await createDecisionForSuggestion\(projectId, name\);/,
-    "Apply must resolve each unique chosen new-category name via createDecisionForSuggestion",
+    /const plan = resolveNewCategoryPlan\(rows, selections, normalizeForDedupe\);/,
+    "Apply must plan via resolveNewCategoryPlan, grouped by normalizeForDedupe",
 );
 assert.match(
     modal,
-    /new Set\(\s*rows\s*\.map\(\(row\) => parseNewCategoryOptionValue\(selections\[row\.itemId\] \?\? ""\)\)/,
-    "Apply must resolve each unique new-category name exactly ONCE, not once per row",
+    /for \(const \[key, rawName\] of plan\.uniqueNewCategoryNames\) \{/,
+    "Apply must resolve each unique new-category name exactly ONCE (iterating the deduped plan.uniqueNewCategoryNames Map), not once per row",
+);
+assert.match(
+    modal,
+    /const result = await createDecisionForSuggestion\(projectId, rawName\);/,
+    "each unique name must be resolved via createDecisionForSuggestion",
+);
+assert.match(
+    modal,
+    /const rowApplyPlans = buildRowApplyPlans\(rows, plan, normalizeForDedupe, resolutions\);/,
+    "Apply must combine the plan with the awaited create results via buildRowApplyPlans before applying any row",
 );
 assert.match(
     modal,
@@ -838,6 +986,24 @@ assert.match(
     modal,
     /if \(!result\.existed\) createdCount \+= 1;/,
     "createdCount must only count names resolved with existed: false, not reused (existed: true) categories",
+);
+
+// selection-ai-sort-review-plan.ts: every name -> id/result mapping is a
+// Map, never a plain object (Codex review issue 3 — __proto__ pollution).
+assert.match(
+    reviewPlan,
+    /uniqueNewCategoryNames:\s*Map<string, string>;/,
+    "resolveNewCategoryPlan's uniqueNewCategoryNames must be a Map, not a plain object keyed by an untrusted category name",
+);
+assert.match(
+    reviewPlan,
+    /rowPlans:\s*Map<string, NewCategoryRowPlan>;/,
+    "resolveNewCategoryPlan's rowPlans must be a Map",
+);
+assert.match(
+    reviewPlan,
+    /resolutions:\s*Map<string, NewCategoryResolution>,/,
+    "buildRowApplyPlans must take its create-result lookup as a Map",
 );
 
 // createDecisionForSuggestion: auth-before-lookup (no Prisma call precedes
@@ -901,7 +1067,10 @@ Promise.all([
     verifyNewCategoryNameTrimmedCappedEmptyToNull(),
     verifyMutualExclusivityDropsNewCategoryNameKeepsDecisionId(),
     verifyMockProposesKnownCategoryFromVocabulary(),
+    verifyMockMatchPriorityOverNewCategory(),
     verifyCreateDecisionForSuggestionAuthLockAndDedupe(),
+    verifySharedNewCategoryNameResolvedOnce(),
+    verifyCreateFailureFailsDependentRowsOnlyIndependentRowsProceed(),
 ])
     .then(() => console.log("selection ai-sort contract verified"))
     .catch((error) => {

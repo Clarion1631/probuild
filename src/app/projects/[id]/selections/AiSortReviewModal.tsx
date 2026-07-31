@@ -19,6 +19,13 @@ import { toast } from "sonner";
 import { applySuggestedDecision, createDecisionForSuggestion } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Sparkles } from "lucide-react";
+import { normalizeForDedupe } from "@/lib/decision-template-core";
+import {
+    newCategoryOptionValue,
+    resolveNewCategoryPlan,
+    buildRowApplyPlans,
+    type NewCategoryResolution,
+} from "@/lib/selection-ai-sort-review-plan";
 
 export type AiSortSuggestionRow = {
     itemId: string;
@@ -57,17 +64,12 @@ const OUTCOME_LABELS: Record<RowOutcome["status"], string> = {
 };
 
 const LEAVE_UNSORTED = "";
-// Sentinel prefix for the select's "Create <name>" option — distinguishes an
-// unresolved new-category choice from a real decisionId without needing a
-// second piece of per-row state. Stripped back to the raw name in
-// handleApply before resolving via createDecisionForSuggestion.
-const NEW_CATEGORY_PREFIX = "__new_category__:";
-function newCategoryOptionValue(name: string): string {
-    return `${NEW_CATEGORY_PREFIX}${name}`;
-}
-function parseNewCategoryOptionValue(value: string): string | null {
-    return value.startsWith(NEW_CATEGORY_PREFIX) ? value.slice(NEW_CATEGORY_PREFIX.length) : null;
-}
+// The select's "Create <name>" option value is sentinel-encoded and the
+// resolve-then-apply planning is pure — both live in
+// selection-ai-sort-review-plan.ts so they're unit-testable without a DOM
+// (Codex review, new-categories follow-up, issue 4b) and so the grouping
+// Map can never collide with Object.prototype the way a plain object keyed
+// by an untrusted string could (issue 3).
 
 export default function AiSortReviewModal({
     open,
@@ -146,49 +148,48 @@ export default function AiSortReviewModal({
         let appliedCount = 0;
         let createdCount = 0; // only names resolved with { existed: false } count
 
-        // Resolve each unique chosen "Create <name>" option ONCE, before any
-        // row is applied — multiple rows may share the same proposed name
-        // (e.g. two items both suggested "Backsplash"), and only one
-        // Decision must ever be created for it.
-        const chosenNewCategoryNames = Array.from(
-            new Set(
-                rows
-                    .map((row) => parseNewCategoryOptionValue(selections[row.itemId] ?? ""))
-                    .filter((name): name is string => name !== null),
-            ),
-        );
-        const resolvedDecisionIdByName: Record<string, string> = {};
-        for (const name of chosenNewCategoryNames) {
+        // Pure planning step (selection-ai-sort-review-plan.ts): decide each
+        // row's target (leave / real decisionId / unresolved "Create <name>")
+        // and de-duplicate the new-category names that actually need
+        // resolving — grouped by normalizeForDedupe, the SAME comparison the
+        // server uses, so "Backsplash" and " backsplash " group together
+        // client-side exactly the way createDecisionForSuggestion's own
+        // dedupe would treat them.
+        const plan = resolveNewCategoryPlan(rows, selections, normalizeForDedupe);
+
+        // Resolve each unique chosen name ONCE, before any row is applied —
+        // multiple rows may share the same proposed name (e.g. two items
+        // both suggested "Backsplash"), and only one Decision must ever be
+        // created for it.
+        const resolutions = new Map<string, NewCategoryResolution>();
+        for (const [key, rawName] of plan.uniqueNewCategoryNames) {
             try {
-                const result = await createDecisionForSuggestion(projectId, name);
-                resolvedDecisionIdByName[name] = result.decisionId;
+                const result = await createDecisionForSuggestion(projectId, rawName);
+                resolutions.set(key, { decisionId: result.decisionId });
                 if (!result.existed) createdCount += 1;
             } catch (e: any) {
-                // A create failure marks every row depending on this name as
-                // failed right away — the apply loop below skips them (no
-                // resolved decisionId to apply with), continuing everything
-                // else.
-                const message = e?.message || "Couldn't create category";
-                for (const row of rows) {
-                    if (parseNewCategoryOptionValue(selections[row.itemId] ?? "") === name) {
-                        outcomes[row.itemId] = { status: "failed", message };
-                    }
-                }
+                resolutions.set(key, { error: e?.message || "Couldn't create category" });
             }
         }
+
+        const rowApplyPlans = buildRowApplyPlans(rows, plan, normalizeForDedupe, resolutions);
 
         // Sequential, not Promise.all — each row is its own CAS write and
         // the plan calls for skipped/failed rows to continue, not abort the
         // rest of the batch.
         for (const row of rows) {
-            if (outcomes[row.itemId]) continue; // its category create already failed above
-            const rawSelection = selections[row.itemId];
-            if (!rawSelection) continue; // deselected to "Leave unsorted" — no attempt, no outcome
-            const newCategoryName = parseNewCategoryOptionValue(rawSelection);
-            const decisionId = newCategoryName ? resolvedDecisionIdByName[newCategoryName] : rawSelection;
-            if (!decisionId) continue; // its category create failed above (already recorded)
+            const rowApplyPlan = rowApplyPlans.get(row.itemId);
+            if (!rowApplyPlan || rowApplyPlan.kind === "leave") continue; // no attempt, no outcome
+            if (rowApplyPlan.kind === "failed") {
+                // Its category's create call failed — marked immediately,
+                // no applySuggestedDecision attempt for it. Independent rows
+                // (a different, successfully-resolved name, or a real
+                // decisionId) are untouched and still proceed below.
+                outcomes[row.itemId] = { status: "failed", message: rowApplyPlan.message };
+                continue;
+            }
             try {
-                const result = await applySuggestedDecision(row.itemId, decisionId);
+                const result = await applySuggestedDecision(row.itemId, rowApplyPlan.decisionId);
                 if (result.applied) {
                     outcomes[row.itemId] = { status: "applied" };
                     appliedCount += 1;

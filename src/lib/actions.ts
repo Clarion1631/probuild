@@ -10919,15 +10919,29 @@ export async function createDecision(projectId: string, data: { name: string; ar
     const name = data.name?.trim();
     if (!name) throw new Error("Name is required");
 
-    const maxOrder = await prisma.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
-    const decision = await prisma.decision.create({
-        data: {
-            projectId,
-            name: name.slice(0, 200),
-            area: data.area?.trim() || null,
-            createdByClient: !actor.isStaff,
-            sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
-        },
+    // Codex review (selection-ai-sort new-categories follow-up), issue 1:
+    // createDecisionForSuggestion (selection-ai-sort-apply-core.ts) takes the
+    // project's advisory lock before reading max sortOrder + creating, but
+    // this manual path didn't — a manual create racing an AI-sort "Create
+    // <name>" resolution (or another manual create) could read the same
+    // max-sortOrder snapshot and both write, producing colliding sortOrder.
+    // Same lock, same transaction shape as applyDecisionTemplate/
+    // createDecisionForSuggestion. Behavior is otherwise UNCHANGED — manual
+    // duplicate names are still allowed (no dedupe check added here); this
+    // only closes the ordering race window.
+    const decision = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${projectId}))`;
+
+        const maxOrder = await tx.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+        return tx.decision.create({
+            data: {
+                projectId,
+                name: name.slice(0, 200),
+                area: data.area?.trim() || null,
+                createdByClient: !actor.isStaff,
+                sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
+            },
+        });
     });
 
     revalidatePath(`/projects/${projectId}/selections`);

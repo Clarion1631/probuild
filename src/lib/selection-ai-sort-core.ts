@@ -74,9 +74,15 @@ const BATCH_SIZE = 25;
 const NAME_MAX = 120;
 const NOTE_MAX = 200;
 const REASON_MAX = 200;
-// Cap for an AI-proposed new category name — short enough to read as a
-// trade-standard category label ("Backsplash Tile"), not a full sentence.
-const NEW_CATEGORY_NAME_MAX = 60;
+// Cap for an AI-proposed new category name. Codex review, issue 2: this was
+// 60, but the knownCategories vocabulary (DecisionTemplateItem.name) and
+// createDecisionForSuggestion's own validation both allow up to 120 —  a
+// 61-120 char vocabulary name would get truncated HERE into a different
+// string than the one createDecisionForSuggestion (and any future
+// normalizeForDedupe comparison) sees, defeating dedupe. Matches NAME_MAX/
+// ITEM_NAME_MAX (decision-template-core.ts) so the cap is consistent
+// end to end: vocabulary max === prompt cap === action validation max.
+const NEW_CATEGORY_NAME_MAX = 120;
 // One retry per batch before the batch fails — never silently converted to
 // "no match".
 const MAX_ATTEMPTS = 2;
