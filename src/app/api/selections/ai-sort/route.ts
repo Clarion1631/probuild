@@ -69,6 +69,21 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ suggestions: [], failedItemIds: [], decisions: [] });
         }
 
+        // Vocabulary the AI can propose FROM when nothing offered fits —
+        // distinct item names across every ACTIVE (non-archived)
+        // DecisionTemplate, alphabetical, capped at 150 so the prompt stays
+        // bounded. ADMIN-controlled (DecisionTemplate CRUD), not
+        // client-entered, but still run through escapeFenceClosers in
+        // buildPrompt for defense in depth.
+        const knownCategoryItems = await prisma.decisionTemplateItem.findMany({
+            where: { template: { archivedAt: null } },
+            select: { name: true },
+            distinct: ["name"],
+            orderBy: { name: "asc" },
+            take: 150,
+        });
+        const knownCategories = knownCategoryItems.map((i) => i.name);
+
         const decisionInputs: AiSortDecisionInput[] = decisions.map((d) => ({
             id: d.id,
             name: d.name,
@@ -88,7 +103,7 @@ export async function POST(req: NextRequest) {
         // throws (mapped to 502 below) when EVERY batch failed and there is
         // nothing to persist or return at all.
         const { suggestions, failedItemIds } = await suggestDecisionsForItems(
-            { decisions: decisionInputs, items: itemInputs },
+            { decisions: decisionInputs, items: itemInputs, knownCategories },
             { complete: completeSelectionAiSort },
         );
 
@@ -122,6 +137,7 @@ export async function POST(req: NextRequest) {
                     imageUrl: item?.imageUrl ?? null,
                     decisionId: s.decisionId,
                     decisionName: s.decisionId ? (decisionNames.get(s.decisionId) ?? null) : null,
+                    newCategoryName: s.newCategoryName,
                     confidence: s.confidence,
                     reason: s.reason,
                 };

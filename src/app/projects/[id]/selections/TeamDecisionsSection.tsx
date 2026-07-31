@@ -916,6 +916,7 @@ export default function TeamDecisionsSection({
                         </div>
                         <AiSortReviewModal
                             open={aiSortModalOpen}
+                            projectId={projectId}
                             rows={aiSortRows}
                             decisions={aiSortDecisions}
                             failedCount={aiSortFailedCount}
