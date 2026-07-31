@@ -219,6 +219,29 @@ assert.match(
     "actions.ts's dismissSelectionSuggestion must delegate to the testable core",
 );
 
+// Proxy bypass: in production, next-auth's withAuth middleware intercepts
+// EVERY non-bypassed path and redirects an unauthenticated request to
+// /login BEFORE the route handler ever runs — discovered the hard way while
+// verifying this route against a real production build (`next start`), the
+// only way this bug surfaces (the proxy short-circuits entirely under
+// NODE_ENV=development, masking it there). Without this bypass, a portal
+// client's POST to /api/selections/ai-sort never reaches the route's own
+// 403 logic at all; it gets a 200 login-page redirect instead. Must be
+// present in BOTH the runtime bypass regex and the static config.matcher
+// (Next.js decides whether to invoke the middleware at all from the
+// matcher), matching the existing api/selections/item-comments precedent.
+const proxy = readFileSync(join(process.cwd(), "src/proxy.ts"), "utf8");
+assert.match(
+    proxy,
+    /selections\\\/\(\?:item-comments\|ai-sort\)/,
+    "PUBLIC_PROXY_BYPASS_PATTERN must bypass api/selections/ai-sort (self-authorizing, staff-only) the same way it does item-comments",
+);
+assert.match(
+    proxy,
+    /api\/selections\/item-comments\|api\/selections\/ai-sort/,
+    "config.matcher's negative lookahead must also exclude api/selections/ai-sort, or the proxy function is never even invoked to apply the bypass",
+);
+
 // assignItemToDecision must clear the suggestion fields in the same write —
 // an assigned or manually-filed item carries no stale chip.
 const assignIdx = actions.indexOf("export async function assignItemToDecision(");
