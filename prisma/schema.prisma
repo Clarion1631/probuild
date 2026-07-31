@@ -1797,8 +1797,20 @@ model Decision {
   chosenItem      SelectionProposal?  @relation("DecisionChosenItem", fields: [chosenItemId], references: [id], onDelete: SetNull)
   candidates      SelectionProposal[] @relation("DecisionCandidates")
   sortOrder       Int                 @default(0)
-  templateKey     String?             // provenance when seeded from a template (Phase 2) or imported from a legacy board category ("board-import:<categoryId>")
-  // Phase 2 fields land here: dueDate, scheduleTaskId, leadTimeDays
+  templateKey     String?             // provenance when seeded from a template (Phase 3) or imported from a legacy board category ("board-import:<categoryId>") — per-item key "decision-template:<templateId>:<itemId>" when applied from a DecisionTemplate
+  // Phase 3 — Decision Templates + Schedule-Driven Due Dates
+  // (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+  // scheduleTaskId is advisory, NOT an FK — same rationale as
+  // suggestedDecisionId on SelectionProposal: schedule tasks get deleted/
+  // regenerated, and read paths validate against live tasks, treating a
+  // dangling id as "not linked" rather than an error.
+  scheduleTaskId  String?             // linked ScheduleTask.id — advisory, no FK
+  leadTimeDays    Int?                // days before the linked task's startDate the decision is due
+  // MANUAL OVERRIDE ONLY — written exclusively by setDecisionDueDateOverride.
+  // Linking, unlinking, template apply, and schedule changes never touch this
+  // column. effectiveDueDate is computed on read (dueDate ?? derived from the
+  // linked task minus leadTimeDays) — see decision-due-date.ts.
+  dueDate         DateTime?
   createdByClient Boolean             @default(false)
   decidedAt       DateTime?
   pmNote          String?             // client-visible note from the flag path
@@ -1816,6 +1828,36 @@ model Decision {
   // nullable templateKey is fine, Postgres treats each NULL as distinct so
   // ordinary (non-imported) decisions never collide with each other.
   @@unique([projectId, templateKey])
+}
+
+// Decision Templates — Phase 3 (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+// Editable in-app templates at /templates/selections (ADMIN/MANAGER CRUD),
+// applied to a project (any staff with canAccessProject) to seed a Decision
+// per item. Archived, never hard-deleted — projects that already applied a
+// template keep working. Server-only table: RLS enabled with no policies
+// (scripts/apply-selection-templates.mjs), same convention as
+// SelectionItemComment.
+model DecisionTemplate {
+  id          String                 @id @default(cuid())
+  name        String                 // "Kitchen Remodel"
+  description String?
+  archivedAt  DateTime?              // archive, not delete — applied projects keep working
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  items       DecisionTemplateItem[]
+}
+
+model DecisionTemplateItem {
+  id                  String           @id @default(cuid())
+  templateId          String
+  template            DecisionTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  name                String           // "Cabinets"
+  area                String?
+  defaultLeadTimeDays Int?             // suggested lead time when this decision links to a phase
+  scheduleHint        String?          // free text ("cabinet install", "05-PLUMBING") to help AI matching
+  order               Int              @default(0)
+
+  @@index([templateId, order])
 }
 
 model MoodBoard {

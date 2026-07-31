@@ -22,6 +22,19 @@ Three safeguards now exist — keep all three intact:
    `DATABASE_URL`/`DIRECT_URL` at it. No Supabase secret is exposed to the
    e2e job. The DB dies with the runner.
 
+   **Storage is hermetic too (July 2026).** The job sets `E2E_STORAGE_MOCK=1`,
+   which makes `getSupabase()` return an in-memory stub
+   (`src/lib/supabase-storage-mock.ts`) instead of a real client — so
+   attachment/PDF/signature paths work in e2e without a storage service key
+   and can never write objects into the live bucket. (`SUPABASE_URL` itself
+   stays set: it's non-secret trust config for the SSRF hostname allowlist
+   and attachment gating.) The job also sets `SELECTION_AI_MOCK=1` so the
+   selection AI features use their deterministic mocks instead of calling the
+   real Anthropic API. Both flags are inert on Vercel; the storage mock
+   additionally requires `PLAYWRIGHT_TEST_SECRET` to be set (see
+   `isE2eStorageMockEnabled()` in `src/lib/supabase.ts`), since it fakes
+   successful writes and must never engage outside a test environment.
+
 2. **`e2e/data.setup.ts` refuses to run against the live DB.**
    It aborts if `DATABASE_URL` (env or `.env`) looks like Supabase, unless
    `ALLOW_PROD_E2E=1` is explicitly set. Local `.env` points at prod, so a
@@ -59,6 +72,8 @@ docker run --rm -d --name probuild-e2e -p 5433:5432 -e POSTGRES_PASSWORD=probuil
 $env:DATABASE_URL = "postgresql://postgres:probuild@localhost:5433/postgres?pgbouncer=true"
 $env:DIRECT_URL   = "postgresql://postgres:probuild@localhost:5433/postgres"
 $env:PLAYWRIGHT_TEST_SECRET = "any-local-secret"
+$env:E2E_STORAGE_MOCK = "1"     # in-memory storage stub — never the live bucket
+$env:SELECTION_AI_MOCK = "1"    # deterministic AI mocks — no real Anthropic calls
 npx prisma db push --skip-generate
 npx playwright test
 ```

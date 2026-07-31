@@ -18,6 +18,9 @@
 import { prisma } from "./prisma";
 import { getCurrentUserWithPermissions, canAccessProject } from "./permissions";
 import { revalidatePath } from "next/cache";
+import { normalizeForDedupe } from "./decision-template-core";
+
+const NEW_CATEGORY_NAME_MAX = 120;
 
 /** Staff-only access check — deliberately NOT assertDecisionActorAccess
  * (which also admits portal clients): the portal never sees suggestions, so
@@ -104,4 +107,75 @@ export async function dismissSelectionSuggestion(
 
     revalidate(item.projectId);
     return { success: true };
+}
+
+export type CreateDecisionForSuggestionResult = { decisionId: string; existed: boolean };
+
+/**
+ * Resolves the review modal's "Create <name>" option to a real Decision —
+ * called once per unique chosen new-category name (never once per row; the
+ * modal dedupes before calling this). AUTH FIRST: unlike
+ * applySuggestedDecision/dismissSelectionSuggestion above (which must look up
+ * the item first to even KNOW its projectId), the caller already has
+ * projectId directly here, so there is no lookup that legitimately needs to
+ * happen before authorization — assertAccess runs before any Prisma call at
+ * all (the round-2 lesson from decision-template-apply-core.ts's
+ * requireProjectStaff).
+ *
+ * Runs inside ONE transaction opened with the same project-scoped Postgres
+ * advisory lock as applyDecisionTemplate (decision-template-apply-core.ts) —
+ * two concurrent "Create <name>" resolutions for the same category (e.g. two
+ * staff both applying AI-sort review modals, or this racing a manual
+ * createDecision) must not both read the same "does this name already
+ * exist" snapshot and then both create, producing duplicate-looking
+ * decisions. pg_advisory_xact_lock auto-releases at transaction end.
+ *
+ * Dedupe uses normalizeForDedupe (same shared comparison as
+ * applyDecisionTemplate) against every LIVE decision on the project: a match
+ * is reused ({ existed: true }), never duplicated — re-resolving the same
+ * category name (e.g. a retried Apply) is always safe.
+ */
+export async function createDecisionForSuggestion(
+    projectId: string,
+    name: string,
+    deps: AiSortApplyDependencies = {},
+): Promise<CreateDecisionForSuggestionResult> {
+    const assertAccess = deps.assertAccess ?? assertAiSortStaffAccess;
+    const revalidate = deps.revalidate ?? realRevalidate;
+
+    await assertAccess(projectId);
+
+    const trimmed = (name ?? "").trim();
+    if (!trimmed || trimmed.length > NEW_CATEGORY_NAME_MAX) {
+        throw new Error(`Category name must be 1-${NEW_CATEGORY_NAME_MAX} characters`);
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+        // $executeRaw, not $queryRaw — pg_advisory_xact_lock returns void.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${projectId}))`;
+
+        const nameNormalized = normalizeForDedupe(trimmed);
+        const existingDecisions = await tx.decision.findMany({
+            where: { projectId, deletedAt: null },
+            select: { id: true, name: true },
+        });
+        const existing = existingDecisions.find((d) => normalizeForDedupe(d.name) === nameNormalized);
+        if (existing) {
+            return { decisionId: existing.id, existed: true };
+        }
+
+        const maxOrder = await tx.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+        const decision = await tx.decision.create({
+            data: {
+                projectId,
+                name: trimmed,
+                sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
+                createdByClient: false,
+            },
+        });
+        return { decisionId: decision.id, existed: false };
+    });
+
+    revalidate(projectId);
+    return result;
 }

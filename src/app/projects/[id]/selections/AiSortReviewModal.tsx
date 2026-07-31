@@ -13,12 +13,19 @@
 // aria-labelledby/aria-describedby (via Dialog.Title/Dialog.Description) for
 // free, instead of hand-rolling any of it on a plain div.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
-import { applySuggestedDecision } from "@/lib/actions";
+import { applySuggestedDecision, createDecisionForSuggestion } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Sparkles } from "lucide-react";
+import { normalizeForDedupe } from "@/lib/decision-template-core";
+import {
+    newCategoryOptionValue,
+    resolveNewCategoryPlan,
+    buildRowApplyPlans,
+    type NewCategoryResolution,
+} from "@/lib/selection-ai-sort-review-plan";
 
 export type AiSortSuggestionRow = {
     itemId: string;
@@ -26,6 +33,9 @@ export type AiSortSuggestionRow = {
     imageUrl: string | null;
     decisionId: string | null;
     decisionName: string | null;
+    // Advisory proposed category name — only ever non-null when decisionId
+    // is null (see selection-ai-sort-core.ts's mutual-exclusivity comment).
+    newCategoryName: string | null;
     confidence: "high" | "medium" | "low";
     reason: string;
 };
@@ -54,22 +64,42 @@ const OUTCOME_LABELS: Record<RowOutcome["status"], string> = {
 };
 
 const LEAVE_UNSORTED = "";
+// The select's "Create <name>" option value is sentinel-encoded and the
+// resolve-then-apply planning is pure — both live in
+// selection-ai-sort-review-plan.ts so they're unit-testable without a DOM
+// (Codex review, new-categories follow-up, issue 4b) and so the grouping
+// Map can never collide with Object.prototype the way a plain object keyed
+// by an untrusted string could (issue 3).
 
 export default function AiSortReviewModal({
     open,
+    projectId,
     rows,
     decisions,
     failedCount,
+    trigger,
+    onTriggerClick,
     onClose,
     onApplied,
 }: {
     open: boolean;
+    projectId: string;
     rows: AiSortSuggestionRow[];
     decisions: { id: string; name: string }[];
     // Items whose AI batch failed this run (excluded from `rows` entirely —
     // never a silent "no match") — surfaced as a banner so staff know some
     // items still need a rerun, not that nothing was wrong.
     failedCount: number;
+    // Codex review round 1 (on the sibling schedule-templates feature) also
+    // flagged this modal's trigger for the same gap: the "Sort with AI"
+    // button was a plain <button> next to an independently-opened
+    // Dialog.Root, missing the Trigger's ARIA wiring and close-focus
+    // restoration. Rendered as Dialog.Trigger (asChild) here instead — `open`
+    // stays fully parent-controlled (the fetch that populates `rows` must
+    // finish before the modal makes sense to show), so onTriggerClick runs
+    // the existing fetch-then-decide logic instead of Radix auto-opening.
+    trigger: ReactNode;
+    onTriggerClick: () => void;
     onClose: () => void;
     onApplied: () => void;
 }) {
@@ -85,7 +115,14 @@ export default function AiSortReviewModal({
     const [seededRows, setSeededRows] = useState(rows);
     if (rows !== seededRows) {
         setSeededRows(rows);
-        setSelections(Object.fromEntries(rows.map((r) => [r.itemId, r.decisionId ?? LEAVE_UNSORTED])));
+        setSelections(
+            Object.fromEntries(
+                rows.map((r) => [
+                    r.itemId,
+                    r.decisionId ?? (r.newCategoryName ? newCategoryOptionValue(r.newCategoryName) : LEAVE_UNSORTED),
+                ]),
+            ),
+        );
         setRowOutcomes({});
     }
 
@@ -97,19 +134,62 @@ export default function AiSortReviewModal({
         onClose();
     }
 
+    function handleOpenChange(next: boolean) {
+        if (next) {
+            onTriggerClick();
+            return;
+        }
+        handleClose();
+    }
+
     async function handleApply() {
         setApplying(true);
         const outcomes: Record<string, RowOutcome> = {};
         let appliedCount = 0;
+        let createdCount = 0; // only names resolved with { existed: false } count
+
+        // Pure planning step (selection-ai-sort-review-plan.ts): decide each
+        // row's target (leave / real decisionId / unresolved "Create <name>")
+        // and de-duplicate the new-category names that actually need
+        // resolving — grouped by normalizeForDedupe, the SAME comparison the
+        // server uses, so "Backsplash" and " backsplash " group together
+        // client-side exactly the way createDecisionForSuggestion's own
+        // dedupe would treat them.
+        const plan = resolveNewCategoryPlan(rows, selections, normalizeForDedupe);
+
+        // Resolve each unique chosen name ONCE, before any row is applied —
+        // multiple rows may share the same proposed name (e.g. two items
+        // both suggested "Backsplash"), and only one Decision must ever be
+        // created for it.
+        const resolutions = new Map<string, NewCategoryResolution>();
+        for (const [key, rawName] of plan.uniqueNewCategoryNames) {
+            try {
+                const result = await createDecisionForSuggestion(projectId, rawName);
+                resolutions.set(key, { decisionId: result.decisionId });
+                if (!result.existed) createdCount += 1;
+            } catch (e: any) {
+                resolutions.set(key, { error: e?.message || "Couldn't create category" });
+            }
+        }
+
+        const rowApplyPlans = buildRowApplyPlans(rows, plan, normalizeForDedupe, resolutions);
 
         // Sequential, not Promise.all — each row is its own CAS write and
         // the plan calls for skipped/failed rows to continue, not abort the
         // rest of the batch.
         for (const row of rows) {
-            const decisionId = selections[row.itemId];
-            if (!decisionId) continue; // deselected to "Leave unsorted" — no attempt, no outcome
+            const rowApplyPlan = rowApplyPlans.get(row.itemId);
+            if (!rowApplyPlan || rowApplyPlan.kind === "leave") continue; // no attempt, no outcome
+            if (rowApplyPlan.kind === "failed") {
+                // Its category's create call failed — marked immediately,
+                // no applySuggestedDecision attempt for it. Independent rows
+                // (a different, successfully-resolved name, or a real
+                // decisionId) are untouched and still proceed below.
+                outcomes[row.itemId] = { status: "failed", message: rowApplyPlan.message };
+                continue;
+            }
             try {
-                const result = await applySuggestedDecision(row.itemId, decisionId);
+                const result = await applySuggestedDecision(row.itemId, rowApplyPlan.decisionId);
                 if (result.applied) {
                     outcomes[row.itemId] = { status: "applied" };
                     appliedCount += 1;
@@ -136,11 +216,12 @@ export default function AiSortReviewModal({
         }
 
         const attemptedHasIssues = Object.values(outcomes).some((o) => o.status !== "applied");
+        const createdSuffix = createdCount > 0 ? `, created ${createdCount} new categories` : "";
         // Refresh regardless — whatever DID apply is real and should show
         // up under its decision immediately.
         onApplied();
         if (!attemptedHasIssues) {
-            toast.success(`${appliedCount} sorted`);
+            toast.success(`${appliedCount} sorted${createdSuffix}`);
             onClose();
             return;
         }
@@ -148,11 +229,12 @@ export default function AiSortReviewModal({
         // Some rows were skipped or failed — do NOT auto-close. They're
         // annotated in place below; staff closes explicitly once they've
         // seen which ones need another look.
-        toast.info(`${appliedCount} sorted, ${attempted - appliedCount} need another look`);
+        toast.info(`${appliedCount} sorted, ${attempted - appliedCount} need another look${createdSuffix}`);
     }
 
     return (
-        <Dialog.Root open={open} onOpenChange={(next) => { if (!next) handleClose(); }}>
+        <Dialog.Root open={open} onOpenChange={handleOpenChange}>
+            <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
             <Dialog.Portal>
                 <Dialog.Overlay className="fixed inset-0 bg-black/40 z-50" />
                 <Dialog.Content
@@ -228,6 +310,11 @@ export default function AiSortReviewModal({
                                                             disabled={applying}
                                                         >
                                                             <option value={LEAVE_UNSORTED}>Leave unsorted</option>
+                                                            {row.newCategoryName && (
+                                                                <option value={newCategoryOptionValue(row.newCategoryName)}>
+                                                                    {`Create "${row.newCategoryName}"`}
+                                                                </option>
+                                                            )}
                                                             {decisions.map((d) => (
                                                                 <option key={d.id} value={d.id}>{d.name}</option>
                                                             ))}

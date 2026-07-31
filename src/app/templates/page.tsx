@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
-import { getDocumentTemplates } from "@/lib/actions";
+import { getDocumentTemplates, listDecisionTemplates } from "@/lib/actions";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +10,10 @@ export default async function TemplatesHubPage() {
     if (!session?.user) return redirect("/login");
 
     const docTemplates = await getDocumentTemplates();
+    // Decision Templates are ADMIN/MANAGER-only (see /templates/selections'
+    // own server gate) — a non-admin staffer viewing this hub still sees the
+    // card (clicking it redirects them back here), just without a count.
+    const selectionTemplateCount = await listDecisionTemplates().then((t) => t.filter((x) => !x.archivedAt).length).catch(() => null);
 
     const cards = [
         {
@@ -42,8 +46,7 @@ export default async function TemplatesHubPage() {
             title: "Selection Board Templates",
             description: "Reusable selection boards for common project types.",
             href: "/templates/selections",
-            count: null,
-            comingSoon: true,
+            count: selectionTemplateCount,
             icon: (
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16" />

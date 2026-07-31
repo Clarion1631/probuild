@@ -31,7 +31,10 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // caller (docs/superpowers/plans/2026-07-30-selection-ai-sort.md) — without
 // this bypass, withAuth's redirect-to-/login would intercept the request
 // first and a portal client would never see the 403 the route promises.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+// api/selections/link-schedule is the same shape (staff-only, self-
+// authorizing, must return a clean 403) for the schedule-linking AI
+// suggestion route (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
 
 export function isPublicProxyBypass(pathname: string) {
@@ -125,6 +128,8 @@ export const config = {
          * - api/selections/item-comments (self-authorizes staff + portal internally)
          * - api/selections/ai-sort (staff-only; self-authorizes, must return a
          *   clean 403 to a portal client rather than a login redirect)
+         * - api/selections/link-schedule (staff-only; self-authorizes, same
+         *   403-not-redirect requirement as ai-sort)
          * - login (The login page itself)
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
@@ -134,6 +139,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };
