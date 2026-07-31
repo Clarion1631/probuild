@@ -1,9 +1,16 @@
 import Link from "next/link";
+import type { ReactNode } from "react";
 import { prisma } from "@/lib/prisma";
 import { formatCurrency } from "@/lib/utils";
 import { getSessionOrDev } from "@/lib/auth";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { computeProjectFinancials, type ProjectFinancials } from "@/lib/project-financials";
+import { parseCompanyFinancialsChartFilters, getCompanyFinancialsChartData } from "@/lib/company-financials-charts";
+import CompanyFinancialsFilters from "./components/company-financials-filters";
+import CashFlowByMonthChart from "./components/cash-flow-by-month-chart";
+import SpendByProjectChart from "./components/spend-by-project-chart";
+import ArAgingChart from "./components/ar-aging-chart";
+import OverheadRatioChart from "./components/overhead-ratio-chart";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +29,36 @@ function StatCard({ label, value, sub, tone }: { label: string; value: string; s
             <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">{label}</p>
             <p className={`text-2xl font-bold mt-1 ${valueColor}`}>{value}</p>
             {sub && <p className="text-xs text-hui-textMuted mt-1">{sub}</p>}
+        </div>
+    );
+}
+
+function ChartPanel({
+    title,
+    subtitle,
+    isEmpty,
+    height = 320,
+    className,
+    children,
+}: {
+    title: string;
+    subtitle: string;
+    isEmpty: boolean;
+    height?: number;
+    className?: string;
+    children: ReactNode;
+}) {
+    return (
+        <div className={`hui-card p-5 ${className ?? ""}`}>
+            <h2 className="text-base font-semibold text-hui-textMain mb-1">{title}</h2>
+            <p className="text-xs text-hui-textMuted mb-3">{subtitle}</p>
+            {isEmpty ? (
+                <div className="flex items-center justify-center text-sm text-hui-textMuted" style={{ height }}>
+                    No data in this range.
+                </div>
+            ) : (
+                children
+            )}
         </div>
     );
 }
@@ -55,7 +92,11 @@ async function buildRow(project: { id: string; name: string; client: { name: str
     };
 }
 
-export default async function CompanyFinancialsPage() {
+export default async function CompanyFinancialsPage({
+    searchParams,
+}: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     const session = await getSessionOrDev();
     if (!session?.user) {
         return <div className="p-8 text-red-500">Access Denied.</div>;
@@ -78,8 +119,21 @@ export default async function CompanyFinancialsPage() {
         }),
     ]);
 
-    const jobRows = await Promise.all(jobProjects.map(buildRow));
+    const params = await searchParams;
+    const allProjectIds = jobProjects.map((p) => p.id);
+    const chartFilters = parseCompanyFinancialsChartFilters(params, allProjectIds);
+
+    const [jobRows, chartData] = await Promise.all([
+        Promise.all(jobProjects.map(buildRow)),
+        getCompanyFinancialsChartData(chartFilters, jobProjects),
+    ]);
     jobRows.sort((a, b) => a.marginDollars - b.marginDollars); // worst first
+
+    const cashFlowEmpty = chartData.cashFlow.length === 0;
+    const spendEmpty = chartData.spendByProject.data.length === 0;
+    const arEmpty = chartData.arAging.every((b) => b.amount === 0);
+    const overheadRatioEmpty =
+        chartData.overheadRatio.length === 0 || chartData.overheadRatio.every((p) => p.ratio === null);
 
     const overheadRow = overheadProject ? await buildRow(overheadProject) : null;
     const overheadTotal = overheadRow ? overheadRow.jobCost : 0;
@@ -140,6 +194,48 @@ export default async function CompanyFinancialsPage() {
                     sub="Net position ÷ total incoming"
                     tone={blendedMarginPercent === null ? undefined : blendedMarginPercent >= 0 ? "pos" : "neg"}
                 />
+            </div>
+
+            {/* KPI chart filters */}
+            <CompanyFinancialsFilters
+                presetValue={chartFilters.preset}
+                selectedProjectIds={chartFilters.projectIds}
+                allProjects={jobProjects.map((p) => ({ id: p.id, name: p.name }))}
+                includeOverhead={chartFilters.includeOverhead}
+            />
+
+            {/* KPI charts */}
+            <ChartPanel
+                title="Cash flow by month"
+                subtitle="Collected vs. job costs and overhead, with net position."
+                isEmpty={cashFlowEmpty}
+            >
+                <CashFlowByMonthChart data={chartData.cashFlow} includeOverhead={chartFilters.includeOverhead} />
+            </ChartPanel>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <ChartPanel
+                    title="Spend by project"
+                    subtitle="Top 5 projects by all-time spend, plus everything else."
+                    isEmpty={spendEmpty}
+                    className="md:col-span-2"
+                >
+                    <SpendByProjectChart series={chartData.spendByProject.series} data={chartData.spendByProject.data} />
+                </ChartPanel>
+                <ChartPanel title="AR aging" subtitle="Outstanding balances as of today." isEmpty={arEmpty}>
+                    <ArAgingChart data={chartData.arAging} />
+                </ChartPanel>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <ChartPanel
+                    title="Overhead ratio"
+                    subtitle="Overhead spend ÷ money in, per month."
+                    isEmpty={overheadRatioEmpty}
+                    height={220}
+                >
+                    <OverheadRatioChart data={chartData.overheadRatio} />
+                </ChartPanel>
             </div>
 
             {/* Jobs table */}
