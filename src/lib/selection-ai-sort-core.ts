@@ -83,6 +83,23 @@ function vendorHost(url: string | null): string | null {
     }
 }
 
+// JSON.stringify escapes quotes/backslashes/control chars but NOT a literal
+// "<" or "/" — client text containing the literal sequence "</items>" (or
+// "</decisions>") would still land verbatim in the serialized block below
+// and could prematurely close the XML-ish fence, exactly like the raw
+// quoted-string interpolation this replaced. Fixed at the source: every
+// "</" in the serialized JSON is rewritten to "<\/" using JSON's legal
+// solidus escape — valid JSON (`\/` decodes to `/`), so JSON.parse (and the
+// model) reconstruct the exact original string, but the raw prompt TEXT
+// never contains a literal "</" for a crafted field to hide inside. Safe to
+// apply to the whole serialized string: in JSON.stringify's own output,
+// "<" and "/" characters can only ever originate from string VALUES (the
+// object keys here are fixed ASCII identifiers), never from JSON
+// structural syntax itself.
+function escapeFenceClosers(json: string): string {
+    return json.replace(/<\//g, "<\\/");
+}
+
 // Decisions/items are serialized as JSON (not hand-quoted strings) so any
 // quote, newline, or fence-like sequence in a client-entered name/
 // description/note is inherently escaped — it can never prematurely close a
@@ -90,23 +107,27 @@ function vendorHost(url: string | null): string | null {
 // untrusted-DATA framing below, this is the same defense
 // api/ai/change-order-detect/route.ts uses for free-text project/log
 // content.
-function buildPrompt(decisions: AiSortDecisionInput[], items: AiSortItemInput[]): string {
-    const decisionsJson = JSON.stringify(
-        decisions.map((d) => ({
-            id: d.id,
-            name: truncate(d.name, NAME_MAX),
-            area: truncate(d.area, NAME_MAX) || null,
-        })),
+export function buildPrompt(decisions: AiSortDecisionInput[], items: AiSortItemInput[]): string {
+    const decisionsJson = escapeFenceClosers(
+        JSON.stringify(
+            decisions.map((d) => ({
+                id: d.id,
+                name: truncate(d.name, NAME_MAX),
+                area: truncate(d.area, NAME_MAX) || null,
+            })),
+        ),
     );
 
-    const itemsJson = JSON.stringify(
-        items.map((it) => ({
-            id: it.id,
-            name: truncate(it.name, NAME_MAX),
-            description: truncate(it.description, NOTE_MAX) || null,
-            clientNote: truncate(it.clientNote, NOTE_MAX) || null,
-            vendor: vendorHost(it.vendorUrl),
-        })),
+    const itemsJson = escapeFenceClosers(
+        JSON.stringify(
+            items.map((it) => ({
+                id: it.id,
+                name: truncate(it.name, NAME_MAX),
+                description: truncate(it.description, NOTE_MAX) || null,
+                clientNote: truncate(it.clientNote, NOTE_MAX) || null,
+                vendor: vendorHost(it.vendorUrl),
+            })),
+        ),
     );
 
     return `You are helping a remodeling contractor sort unsorted selection items into the right decision category for their project.

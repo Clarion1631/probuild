@@ -52,6 +52,7 @@ export async function POST(req: NextRequest) {
         const [decisions, unsortedItems] = await Promise.all([
             prisma.decision.findMany({
                 where: { projectId, deletedAt: null },
+                orderBy: { sortOrder: "asc" },
                 select: { id: true, name: true, area: true },
             }),
             // Unsorted only — decisionId: null. Manually filed items (already

@@ -7,8 +7,15 @@
 // exercises the identical extractJsonObject/validation path the production
 // dependency does — only the suggestion CONTENT differs, never the
 // auth/validation path.
-const DECISIONS_BLOCK = /<decisions>\s*([\s\S]*?)\s*<\/decisions>/;
-const ITEMS_BLOCK = /<items>\s*([\s\S]*?)\s*<\/items>/;
+// Greedy (not non-greedy) — matches from the first opening tag to the LAST
+// occurrence of the closing tag, so the mock parses the full block even if
+// an embedded closer-like sequence slipped through somehow. Defense in
+// depth: the core's buildPrompt() already neutralizes any literal "</" in
+// client-controlled fields before this ever runs (see escapeFenceClosers in
+// selection-ai-sort-core.ts), so in practice only the real closing tag can
+// appear — but the mock stays robust independent of that guarantee.
+const DECISIONS_BLOCK = /<decisions>\s*([\s\S]*)\s*<\/decisions>/;
+const ITEMS_BLOCK = /<items>\s*([\s\S]*)\s*<\/items>/;
 
 type MockDecision = { id: string; name: string };
 type MockItem = { id: string; name: string };
