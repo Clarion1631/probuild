@@ -1,63 +1,76 @@
 /**
- * PROBUILD QBO-PURCHASE STEP — drop-in file for the "QBO Automation" Apps
- * Script project. This REPLACES the email-to-QBO path (sendToQBO.gs, which
- * emails the receipt image to golden_touch_remodeling_llc+expenses@assist
- * .intuit.com and lets Intuit's own AI parse/finalize it) once
+ * PROBUILD QBO-PURCHASE STEP — drop-in REPLACEMENT for step 5 ("EMAIL TO
+ * QUICKBOOKS" — the sendToQBO(...) call) in runReceiptAutomation.gs, once
  * QBO_RECEIPT_PUSH_ENABLED=true is set in ProBuild's Vercel env.
  *
- * What it does: POSTs the SAME doc info object sendToProBuild.gs already
- * builds (categoryGroups etc.) to ProBuild's
- * /api/integrations/qbo-receipts/create endpoint. ProBuild resolves the
- * project -> QBO customer, creates ONE finalized QBO Purchase job-coded at
- * the line level (Vendor/Bank account/customer already set — no bookkeeper
- * triage needed), and best-effort attaches the receipt image/PDF. QBO is
- * still the source of record; ProBuild is just doing the same data entry a
- * human would.
+ * What it does: POSTs the same doc info the automation already parsed to
+ * ProBuild's /api/integrations/qbo-receipts/create endpoint. ProBuild
+ * resolves the EXACT-matching project -> its own QBO customer (named after
+ * the job), creates ONE finalized QBO Purchase job-coded at the line level
+ * (vendor/bank account/customer already set — no bookkeeper triage needed),
+ * and best-effort attaches the receipt image/PDF. QBO is still the source of
+ * record; ProBuild is just doing the same data entry a human would, and every
+ * validation on the ProBuild side is terminal-on-doubt rather than a guess —
+ * see the reason codes handled in the alert email below.
  *
- * IMPORTANT — this does not remove the old email-to-QBO path. Call this
- * function FIRST; only skip/disable sendToQBO's email step once this has
- * been ok:true in production for a while. Until then, keep BOTH wired:
- *   - ok:true  -> mark state.qboApi = purchaseId and skip the legacy email
- *                 (no duplicate Purchase — the email path would create a
- *                 second, unlinked transaction in QBO for the same receipt).
- *   - ok:false -> log + park with an alert, mirroring sendToProBuild's
- *                 conventions, and let the EXISTING sendToQBO email path run
- *                 as the fallback so the receipt still lands in the books.
+ * sendToQBO's real signature (runReceiptAutomation.gs:898), mirrored exactly
+ * for the fallback call below:
+ *   sendToQBO(file, ctx, aiData, isCheck, totalAmount, dateStr, memo,
+ *             checkNum, cleanInv, possibleDuplicate, attachment)
  *
- * Robustness, same philosophy as sendToProBuild.gs:
- *  - state.qboApi guards re-sends (file description JSON) — a truthy value
- *    (the purchase id) means "already handled, do nothing".
- *  - HTTP != 200 is treated as retryable (throw) — the file stays in place
- *    and the next automation pass retries. ProBuild's own idempotency
- *    (DocNumber = Drive fileId) makes a retry safe even if the first attempt
- *    actually succeeded before the response was lost.
- *  - ok:false is TERMINAL, not retryable (a name-mismatch or a bad amount
- *    split won't fix itself on a retry) — alert a human and fall back to the
- *    legacy email-to-QBO path so the money still gets recorded.
- *  - Files over 7MB skip the base64 attachment (ProBuild's own 8MB decoded
- *    cap plus base64's ~33% overhead) — the Purchase still gets created,
- *    just without an inline attachment; ProBuild logs "skipped" in that case.
+ * Response handling:
+ *   - HTTP 401           -> alert loudly (the ingest key is misconfigured —
+ *                           a deployment problem, not a per-file problem),
+ *                           then throw (retryable; the automation's own
+ *                           at-most-once "emailing" guard is untouched here
+ *                           since sendToQBO never ran).
+ *   - HTTP != 200 and 401 -> throw (retryable: ProBuild unreachable / 5xx).
+ *   - HTTP 200, ok:true   -> persist state.qboApi = purchaseId BEFORE any
+ *                           logging/alerting, so an exception in those calls
+ *                           can never strand this file in a re-sendable state.
+ *   - HTTP 200, ok:false  -> TERMINAL for the API push (a name mismatch, a
+ *                           missing vendor/date, a bad amount split, or the
+ *                           push being disabled won't fix itself on a retry).
+ *                           Call the LEGACY sendToQBO(...) email sender
+ *                           DIRECTLY as the fallback so the receipt still
+ *                           gets recorded. Only AFTER that call returns
+ *                           (i.e. does NOT throw) do we persist
+ *                           state.qboApi = "email-fallback:<reason>" and
+ *                           alert a human to fix the root cause.
+ *
+ * This does NOT remove the legacy email-to-QBO path — sendToQBO(...) stays
+ * in runReceiptAutomation.gs as-is and is the fallback used above. Only the
+ * PRIMARY call site (step 5) changes, from calling sendToQBO(...) directly
+ * to calling sendReceiptToQuickBooksViaAPI(...) below, which calls
+ * sendToQBO(...) itself on ok:false.
  */
 
 const PROBUILD_QBO_PUSH_URL = "https://probuild.goldentouchremodeling.com/api/integrations/qbo-receipts/create";
-const MAX_QBO_PUSH_ATTACHMENT_BYTES = 7 * 1024 * 1024; // stay under ProBuild's 8MB decoded cap after base64 overhead
+// Vercel's request body limit is 4.5MB and base64 inflates raw bytes by ~4/3
+// (33%), so the RAW file is capped at 3MB (~4MB encoded) to stay well under it.
+const MAX_QBO_PUSH_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 
 /**
  * @param {GoogleAppsScript.Drive.File} file
- * @param {object} ctx - same automation context sendToProBuild uses (ctx.projectName, ctx.isShop)
- * @param {object} aiData - Gemini/Claude-parsed doc fields (aiData.vendor, aiData.check_number, ...)
+ * @param {object} ctx - automation context (ctx.projectName, ctx.isShop)
+ * @param {object} aiData - AI-parsed doc fields (aiData.vendor, ...)
  * @param {boolean} isCheck
  * @param {object} categoryGroups - same shape sendExpensesToProBuild builds Line groups from
  * @param {number} totalAmount
  * @param {string} dateStr - YYYY-MM-DD
- * @param {string} cleanInv
  * @param {string} memo
+ * @param {string} checkNum
+ * @param {string} cleanInv
+ * @param {boolean} possibleDuplicate - passed straight through to sendToQBO's fallback call
+ * @param {GoogleAppsScript.Base.Blob} attachment - passed straight through to sendToQBO's fallback call (from qboAttachment_(file))
  * @param {object} state - the file's persisted automation state (read/written via getState/setState)
  */
-function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroups, totalAmount, dateStr, cleanInv, memo, state) {
-  if (state.qboApi) return; // already pushed on a previous pass
+function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroups, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, state) {
+  if (state.qboApi) return; // already handled on a previous pass
 
-  // Shop/overhead expenses have no ProBuild project to code the line to.
+  // Shop/overhead expenses have no ProBuild project to code the line to —
+  // this is the one skip that ISN'T a fallback-to-email case, because the
+  // legacy sendToQBO email path handles shop docs exactly the same way today.
   if (ctx.isShop) {
     state.qboApi = "skipped-shop";
     setState(file, state);
@@ -86,7 +99,7 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroup
     vendor: aiData.vendor || "Unknown",
     date: dateStr,
     invoice: cleanInv,
-    checkNumber: aiData.check_number || "",
+    checkNumber: checkNum || "",
     memo: memo || "",
     totalAmount: Number(totalAmount),
     fileId: file.getId(),
@@ -94,8 +107,7 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroup
     groups: groups
   };
 
-  // Attach the receipt image/PDF inline as base64 when it's small enough —
-  // ProBuild uses this to attach the file to the QBO Purchase directly.
+  // Attach the receipt image/PDF inline as base64 when it's small enough.
   const blob = file.getBlob();
   if (blob.getBytes().length <= MAX_QBO_PUSH_ATTACHMENT_BYTES) {
     payload.fileBase64 = Utilities.base64Encode(blob.getBytes());
@@ -111,46 +123,78 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroup
   });
 
   const code = res.getResponseCode();
+
+  if (code === 401) {
+    // The ingest key ProBuild expects doesn't match Script Properties — a
+    // deployment problem, not a per-file problem. Alert loudly AND throw:
+    // this file retries automatically once the key is fixed, and no receipt
+    // has been lost (neither the API push nor the email fallback have run).
+    MailApp.sendEmail(ALERT_EMAIL,
+      "QuickBooks API push misconfigured (401 unauthorized)",
+      'ProBuild rejected the request for "' + file.getName() + '" as unauthorized.\n' +
+      "Check that Script Properties' RECEIPT_INGEST_SECRET matches ProBuild's RECEIPT_INGEST_SECRET env var.\n" +
+      "No receipt has been lost — this file will retry automatically once the key is fixed.");
+    throw new Error("ProBuild QBO push HTTP 401 (unauthorized) — check RECEIPT_INGEST_SECRET.");
+  }
+
   if (code !== 200) {
-    // ProBuild unreachable / server error -> retry on the next pass. The old
-    // email-to-QBO path has NOT run yet, so nothing is duplicated by retrying.
+    // ProBuild unreachable / server error -> retry on the next pass. Neither
+    // the API push nor the email fallback have run yet, so nothing is lost.
     throw new Error("ProBuild QBO push HTTP " + code + ": " + res.getContentText().slice(0, 300));
   }
 
   const body = JSON.parse(res.getContentText());
+
   if (body.ok) {
+    // Persist success BEFORE any logging below, so an exception in Logger.log
+    // (however unlikely) can never strand this file in a re-sendable state
+    // and risk a duplicate Purchase attempt on the next pass.
     state.qboApi = body.qbPurchaseId;
     setState(file, state);
     Logger.log("   >> QuickBooks (via ProBuild API): " +
       (body.alreadyExists ? "already pushed, purchase " + body.qbPurchaseId
         : "purchase " + body.qbPurchaseId + " created (attachment: " + (body.attachment || "n/a") + ")"));
-    // Do NOT also run the legacy sendToQBO email step for this file — that
-    // would create a second, unlinked Purchase for the same receipt.
-  } else {
-    // Not retryable (project name doesn't match, amount split doesn't add up,
-    // push disabled, QuickBooks not connected, ...). Fall back to the legacy
-    // email-to-QBO path so the receipt still gets recorded, and alert a human.
-    state.qboApi = "failed:" + (body.reason || "unknown");
-    setState(file, state);
-    MailApp.sendEmail(ALERT_EMAIL,
-      "QuickBooks API push needs attention: " + file.getName(),
-      'ProBuild did not accept "' + file.getName() + '" for the direct QuickBooks push.\n' +
-      "Reason: " + (body.reason || "unknown") + "\n" +
-      "Drive folder: " + ctx.projectName + "\n" +
-      "Falling back to the email-to-QuickBooks path for this file — it will still be recorded, " +
-      "just without job-level coding until this is fixed.\n" +
-      (body.reason === "project-not-matched"
-        ? "Fix: rename the Drive folder to match the ProBuild project name (or create the project in ProBuild)."
-        : body.reason === "amount-mismatch"
-          ? "Fix: the category split totals don't add up to the document total — check the AI parse for this receipt."
-          : body.reason === "push-disabled"
-            ? "QBO_RECEIPT_PUSH_ENABLED is not \"true\" in ProBuild's env — this is expected until the feature is turned on."
-            : body.reason === "quickbooks-not-connected"
-              ? "Reconnect QuickBooks in ProBuild Settings -> Integrations."
-              : "See ProBuild logs for details."));
-    // state.qboApi is now a "failed:..." string (truthy), so this function
-    // won't retry — but it is NOT a call to sendToQBO here. The caller
-    // (runReceiptAutomation.gs) must still invoke the existing sendToQBO
-    // email step whenever state.qboApi is not a real purchase id.
+    return;
   }
+
+  // ok:false is TERMINAL for the API push — a name mismatch, a missing
+  // vendor/date, or a bad amount split won't fix itself on a retry. Fall
+  // back to the EXISTING email-to-QuickBooks path so the receipt still gets
+  // recorded, mirroring its real signature exactly:
+  //   sendToQBO(file, ctx, aiData, isCheck, totalAmount, dateStr, memo,
+  //             checkNum, cleanInv, possibleDuplicate, attachment)
+  sendToQBO(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment);
+
+  // Only reached if sendToQBO did NOT throw — i.e. the email fallback
+  // actually went out. If it throws, this whole function throws with it and
+  // state.qboApi stays unset, so the NEXT pass retries the API push first
+  // (safe — it's idempotent by DocNumber/requestid) before falling back again.
+  state.qboApi = "email-fallback:" + (body.reason || "unknown");
+  setState(file, state);
+
+  MailApp.sendEmail(ALERT_EMAIL,
+    "QuickBooks API push needs attention: " + file.getName(),
+    'ProBuild did not accept "' + file.getName() + '" for the direct QuickBooks push — sent via the legacy email path instead.\n' +
+    "Reason: " + (body.reason || "unknown") + (body.detail ? " (" + body.detail + ")" : "") + "\n" +
+    "Drive folder: " + ctx.projectName + "\n" +
+    "The receipt IS booked in QuickBooks now (via email), just without job-level coding until this is fixed.\n" +
+    (body.reason === "project-not-matched"
+      ? "Fix: rename the Drive folder to match the ProBuild project name EXACTLY (case/whitespace aside) — matching is exact now, no fuzzy fallback."
+      : body.reason === "missing-vendor"
+        ? "Fix: the AI parse found no usable vendor name for this document — check it manually."
+        : body.reason === "invalid-date"
+          ? "Fix: the AI parse produced no usable, calendar-valid date for this document — check it manually."
+          : (body.reason === "amount-mismatch" || body.reason === "invalid-group-amount")
+            ? "Fix: the category split totals don't add up to the document total, or a group amount was zero/negative — check the AI parse for this receipt."
+            : body.reason === "duplicate-name"
+              ? "Fix: QuickBooks already has a vendor with a conflicting name — resolve the duplicate manually in QuickBooks, then re-run."
+              : body.reason === "docnumber-conflict"
+                ? "Fix: this Drive file id collides with a DIFFERENT existing QuickBooks Purchase — investigate manually before re-running."
+                : body.reason === "push-disabled"
+                  ? "QBO_RECEIPT_PUSH_ENABLED is not \"true\" in ProBuild's env — expected until the feature is turned on."
+                  : body.reason === "quickbooks-not-connected"
+                    ? "Reconnect QuickBooks in ProBuild Settings -> Integrations."
+                    : body.reason === "qbo-fault"
+                      ? "QuickBooks itself rejected the transaction (fault " + (body.detail || "unknown") + ") — see ProBuild logs."
+                      : "See ProBuild logs for details."));
 }

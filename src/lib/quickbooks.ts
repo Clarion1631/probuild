@@ -79,7 +79,12 @@ export async function qbFetch(
     tokens: QBTokens,
     opts: RequestInit = {}
 ): Promise<Response> {
-    const url = `${QB_API_BASE}/${tokens.realmId}${path}?minorversion=73`;
+    // Callers that already put their own query string on `path` (e.g.
+    // "/purchase?requestid=...") get "&minorversion=73" appended instead of a
+    // second "?" — every existing call site passes a bare path, so this is
+    // backward compatible.
+    const separator = path.includes("?") ? "&" : "?";
+    const url = `${QB_API_BASE}/${tokens.realmId}${path}${separator}minorversion=73`;
     return fetch(url, {
         ...opts,
         headers: {
@@ -111,7 +116,10 @@ export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise
 }
 
 export function escapeQBString(s: string): string {
-    return s.replace(/'/g, "\\'");
+    // Backslash MUST be escaped before the apostrophe escape, or an input
+    // ending in a literal backslash (e.g. "Smith\\") would have its escaped
+    // apostrophe's own backslash re-escaped, breaking out of the quoted string.
+    return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
 export interface QBAttachable {
