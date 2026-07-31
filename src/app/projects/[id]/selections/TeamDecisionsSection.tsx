@@ -617,6 +617,13 @@ export default function TeamDecisionsSection({
     const [importing, setImporting] = useState(false);
     const [sorting, setSorting] = useState(false);
     const [aiSortRows, setAiSortRows] = useState<AiSortSuggestionRow[]>([]);
+    // The live decisions list for the review modal's selects comes straight
+    // from the ai-sort response, NOT the page's own `decisions` state — the
+    // route already re-queried live decisions in the same request that
+    // produced the suggestions, so the modal never has to join fresh
+    // suggestions against this component's possibly-stale snapshot.
+    const [aiSortDecisions, setAiSortDecisions] = useState<{ id: string; name: string }[]>([]);
+    const [aiSortFailedCount, setAiSortFailedCount] = useState(0);
     const [aiSortModalOpen, setAiSortModalOpen] = useState(false);
 
     // initialDecisions is only the INITIAL value for useState — resync when
@@ -661,40 +668,28 @@ export default function TeamDecisionsSection({
             if (!res.ok) {
                 throw new Error(body.error || "Couldn't get AI suggestions.");
             }
-            const apiSuggestions: {
-                itemId: string;
-                decisionId: string | null;
-                decisionName: string | null;
-                confidence: "high" | "medium" | "low";
-                reason: string;
-            }[] = body.suggestions || [];
 
-            if (apiSuggestions.length === 0) {
+            // The route response already carries everything the modal
+            // renders (item name/imageUrl, live decisions) — rendered
+            // as-is, never joined against this component's own state.
+            const rows: AiSortSuggestionRow[] = Array.isArray(body.suggestions) ? body.suggestions : [];
+            const responseDecisions: { id: string; name: string }[] = Array.isArray(body.decisions)
+                ? body.decisions
+                : [];
+            const failedCount = Array.isArray(body.failedItemIds) ? body.failedItemIds.length : 0;
+
+            if (rows.length === 0) {
                 toast.info("No unsorted items to sort.");
                 return;
             }
 
-            const unsortedById = new Map(activeUnsorted.map((item) => [item.id, item]));
-            const rows: AiSortSuggestionRow[] = apiSuggestions
-                .map((s) => {
-                    const item = unsortedById.get(s.itemId);
-                    if (!item) return null;
-                    return {
-                        itemId: s.itemId,
-                        name: item.name,
-                        imageUrl: item.imageUrl,
-                        decisionId: s.decisionId,
-                        decisionName: s.decisionName,
-                        confidence: s.confidence,
-                        reason: s.reason,
-                    };
-                })
-                .filter((r): r is AiSortSuggestionRow => r !== null);
-
             setAiSortRows(rows);
+            setAiSortDecisions(responseDecisions);
+            setAiSortFailedCount(failedCount);
             setAiSortModalOpen(true);
-            // The route already persisted every suggestion — refresh now so
-            // the chips render immediately even if the modal is cancelled.
+            // The route already persisted every successful suggestion —
+            // refresh now so the chips render immediately even if the modal
+            // is cancelled.
             refresh();
         } catch (e: any) {
             toast.error(e.message || "Couldn't get AI suggestions.");
@@ -781,7 +776,10 @@ export default function TeamDecisionsSection({
                         <button
                             data-testid="sort-with-ai-button"
                             onClick={handleSortWithAi}
-                            disabled={sorting}
+                            // Also disabled while the review modal is open —
+                            // a second run mid-review would silently replace
+                            // the rows the staffer is currently looking at.
+                            disabled={sorting || aiSortModalOpen}
                             className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
                         >
                             <Sparkles className="w-3.5 h-3.5" />
@@ -828,7 +826,8 @@ export default function TeamDecisionsSection({
             <AiSortReviewModal
                 open={aiSortModalOpen}
                 rows={aiSortRows}
-                decisions={decisions.map((d) => ({ id: d.id, name: d.name }))}
+                decisions={aiSortDecisions}
+                failedCount={aiSortFailedCount}
                 onClose={() => setAiSortModalOpen(false)}
                 onApplied={refresh}
             />

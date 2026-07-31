@@ -59,13 +59,13 @@ export async function POST(req: NextRequest) {
             // filing may be a deliberate override.
             prisma.selectionProposal.findMany({
                 where: { projectId, decisionId: null, deletedAt: null, status: "Idea" },
-                select: { id: true, name: true, description: true, clientNote: true, vendorUrl: true },
+                select: { id: true, name: true, imageUrl: true, description: true, clientNote: true, vendorUrl: true },
             }),
         ]);
 
         // Empty unsorted → short-circuit without ever calling the AI.
         if (unsortedItems.length === 0) {
-            return NextResponse.json({ suggestions: [] });
+            return NextResponse.json({ suggestions: [], failedItemIds: [], decisions: [] });
         }
 
         const decisionInputs: AiSortDecisionInput[] = decisions.map((d) => ({
@@ -81,14 +81,21 @@ export async function POST(req: NextRequest) {
             vendorUrl: it.vendorUrl,
         }));
 
-        const { suggestions } = await suggestDecisionsForItems(
+        // Batches are independent (see suggestDecisionsForItems) — a batch
+        // that fails after its retry contributes its item ids to
+        // failedItemIds rather than aborting the whole run; this only
+        // throws (mapped to 502 below) when EVERY batch failed and there is
+        // nothing to persist or return at all.
+        const { suggestions, failedItemIds } = await suggestDecisionsForItems(
             { decisions: decisionInputs, items: itemInputs },
             { complete: completeSelectionAiSort },
         );
 
         // Conditional persist — decisionId: null in the WHERE so a
         // concurrent manual assignment (staff filed it themselves mid-run)
-        // wins and is never clobbered by a stale suggestion.
+        // wins and is never clobbered by a stale suggestion. Only the
+        // successful suggestions are persisted; a failed batch's items are
+        // left untouched (no suggestion written for them).
         await Promise.all(
             suggestions.map((s) =>
                 prisma.selectionProposal.updateMany({
@@ -98,15 +105,28 @@ export async function POST(req: NextRequest) {
             ),
         );
 
+        // The response carries everything the review modal renders — the
+        // item's own {name, imageUrl} (from the same query above) and the
+        // live {id, name} decisions list — so the modal never has to join
+        // fresh suggestions against a stale client-side snapshot of
+        // unsorted items or decisions.
         const decisionNames = new Map(decisions.map((d) => [d.id, d.name]));
+        const unsortedItemsById = new Map(unsortedItems.map((it) => [it.id, it]));
         return NextResponse.json({
-            suggestions: suggestions.map((s) => ({
-                itemId: s.itemId,
-                decisionId: s.decisionId,
-                decisionName: s.decisionId ? (decisionNames.get(s.decisionId) ?? null) : null,
-                confidence: s.confidence,
-                reason: s.reason,
-            })),
+            suggestions: suggestions.map((s) => {
+                const item = unsortedItemsById.get(s.itemId);
+                return {
+                    itemId: s.itemId,
+                    name: item?.name ?? "",
+                    imageUrl: item?.imageUrl ?? null,
+                    decisionId: s.decisionId,
+                    decisionName: s.decisionId ? (decisionNames.get(s.decisionId) ?? null) : null,
+                    confidence: s.confidence,
+                    reason: s.reason,
+                };
+            }),
+            failedItemIds,
+            decisions: decisions.map((d) => ({ id: d.id, name: d.name })),
         });
     } catch (err) {
         if (err instanceof AiSortUnavailableError) {

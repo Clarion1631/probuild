@@ -7,9 +7,15 @@ import { canAccessProject } from "../src/lib/permissions";
 // selection-item-note-persistence.ts), which is not resolvable outside a
 // Next.js build context and breaks a direct import from a Playwright spec.
 import { applySuggestedDecision, dismissSelectionSuggestion } from "../src/lib/selection-ai-sort-apply-core";
+// Test-only marker recognized by the deterministic mock — forces a batch to
+// return a deliberately invalid (duplicate itemId) response. Lets these
+// specs exercise the real strict-cardinality retry-then-fail path, and
+// batch isolation across multiple batches, end to end with no real AI.
+import { FORCE_INVALID_BATCH_MARKER } from "../src/lib/selection-ai-sort-mock";
 
 const prisma = new PrismaClient();
 const run = `selection-ai-sort-${process.pid}-${Date.now()}`;
+const BATCH_GOOD_ITEM_COUNT = 25; // matches BATCH_SIZE in selection-ai-sort-core.ts
 const ids = {
     client: `${run}-client`,
     project: `${run}-project`,
@@ -27,6 +33,14 @@ const ids = {
     uiReviewItem: `${run}-ui-review-item`,
     uiChipItem: `${run}-ui-chip-item`,
     uiDismissItem: `${run}-ui-dismiss-item`,
+    a11yItem: `${run}-a11y-item`,
+    // Batch isolation / strict-contract fixtures — dedicated projects so
+    // their item counts (25 + 1, and a lone poison) aren't disturbed by
+    // items created/consumed elsewhere in this serial suite.
+    batchProject: `${run}-batch-project`,
+    batchPoisonItem: `${run}-batch-poison-item`,
+    soloPoisonProject: `${run}-solo-poison-project`,
+    soloPoisonItem: `${run}-solo-poison-item`,
 } as const;
 const clientEmail = `${run}@example.com`;
 
@@ -82,10 +96,52 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
         await prisma.selectionProposal.create({
             data: { id: ids.portalItem, projectId: ids.project, name: "Portal Isolation Fixtures Item", status: "Idea" },
         });
+
+        // Batch isolation: 25 "good" items (always classify fine — a real
+        // batch's worth) + 1 "poison" item carrying the marker that forces
+        // its hosting batch to return an invalid (duplicate itemId)
+        // response. Whichever batch(es) these land in, the run must still
+        // persist/return every batch that succeeded.
+        await prisma.project.create({
+            data: { id: ids.batchProject, name: "AI Sort Batch Isolation Project", clientId: ids.client, status: "In Progress" },
+        });
+        await prisma.selectionProposal.createMany({
+            data: Array.from({ length: BATCH_GOOD_ITEM_COUNT }, (_, i) => ({
+                id: `${run}-batch-good-${i}`,
+                projectId: ids.batchProject,
+                name: `Batch Good Item ${i}`,
+                status: "Idea",
+            })),
+        });
+        await prisma.selectionProposal.create({
+            data: {
+                id: ids.batchPoisonItem,
+                projectId: ids.batchProject,
+                name: `Poison Item ${FORCE_INVALID_BATCH_MARKER}`,
+                status: "Idea",
+            },
+        });
+
+        // All-batches-fail: a project whose ONLY unsorted item is the
+        // poison item — the run has nothing that succeeded at all, so this
+        // must be the one case that surfaces as a 502.
+        await prisma.project.create({
+            data: { id: ids.soloPoisonProject, name: "AI Sort All-Batches-Fail Project", clientId: ids.client, status: "In Progress" },
+        });
+        await prisma.selectionProposal.create({
+            data: {
+                id: ids.soloPoisonItem,
+                projectId: ids.soloPoisonProject,
+                name: `Solo Poison Item ${FORCE_INVALID_BATCH_MARKER}`,
+                status: "Idea",
+            },
+        });
     });
 
     test.afterAll(async () => {
-        await prisma.project.deleteMany({ where: { id: { in: [ids.project, ids.otherProject] } } });
+        await prisma.project.deleteMany({
+            where: { id: { in: [ids.project, ids.otherProject, ids.batchProject, ids.soloPoisonProject] } },
+        });
         await prisma.client.deleteMany({ where: { id: ids.client } });
         await prisma.user.deleteMany({ where: { id: ids.restrictedStaff } });
         await prisma.$disconnect();
@@ -165,6 +221,46 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
 
         const storedAssigned = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.assignedItem } });
         expect(storedAssigned.suggestedDecisionId).toBeNull();
+    });
+
+    test("a batch that fails strict cardinality is isolated — other batches still persist; partial success returned as 200", async ({ page }) => {
+        const response = await page.request.post("/api/selections/ai-sort", {
+            data: { projectId: ids.batchProject },
+        });
+        expect(response.status()).toBe(200);
+        const payload = await response.json();
+
+        // Order-independent invariants (Prisma's findMany doesn't guarantee
+        // which batch the poison item lands in): every one of the 26 seeded
+        // items is accounted for exactly once, the poison item is never
+        // among the successes, and at least one other batch succeeded —
+        // proving one batch's failure neither aborts nor discards the rest.
+        expect(payload.suggestions.length + payload.failedItemIds.length).toBe(BATCH_GOOD_ITEM_COUNT + 1);
+        expect(payload.failedItemIds).toContain(ids.batchPoisonItem);
+        expect(payload.suggestions.some((s: { itemId: string }) => s.itemId === ids.batchPoisonItem)).toBe(false);
+        expect(payload.suggestions.length).toBeGreaterThan(0);
+
+        const poison = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.batchPoisonItem } });
+        expect(poison.suggestedDecisionId).toBeNull();
+        expect(poison.suggestedAt).toBeNull();
+
+        // Persisted rows match exactly what the response reported as
+        // successful — nothing extra written, nothing successful dropped.
+        const persistedCount = await prisma.selectionProposal.count({
+            where: { projectId: ids.batchProject, suggestedAt: { not: null } },
+        });
+        expect(persistedCount).toBe(payload.suggestions.length);
+    });
+
+    test("when the only batch fails every attempt, the route returns 502 (never a silent null match)", async ({ page }) => {
+        const response = await page.request.post("/api/selections/ai-sort", {
+            data: { projectId: ids.soloPoisonProject },
+        });
+        expect(response.status()).toBe(502);
+
+        const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.soloPoisonItem } });
+        expect(item.suggestedDecisionId).toBeNull();
+        expect(item.suggestedAt).toBeNull();
     });
 
     // Direct calls below inject a no-op assertAccess/revalidate — the real
@@ -388,5 +484,32 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
 
         await page.reload();
         await expect(page.getByTestId(`selection-item-${ids.uiDismissItem}`).getByTestId(`selection-suggestion-chip-${ids.uiDismissItem}`)).toHaveCount(0);
+    });
+
+    test("review modal accessibility: role=dialog is present, Sort with AI stays disabled while open, Escape closes without applying", async ({ page }) => {
+        await prisma.selectionProposal.create({
+            data: { id: ids.a11yItem, projectId: ids.project, name: "Landing Fixtures Sconce", status: "Idea" },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        // Radix Dialog.Content applies role="dialog"/aria-modal="true"
+        // automatically — this is the same element as ai-sort-modal.
+        await expect(page.getByRole("dialog")).toBeVisible();
+        // A second "Sort with AI" run mid-review must not silently replace
+        // the rows being reviewed.
+        await expect(page.getByTestId("sort-with-ai-button")).toBeDisabled();
+
+        await page.keyboard.press("Escape");
+        await expect(modal).not.toBeVisible();
+
+        const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.a11yItem } });
+        expect(item.decisionId).toBeNull();
     });
 });
