@@ -411,7 +411,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     />
 
                     {/* Bill To */}
-                    <div className="px-5 sm:px-10 pt-6 pb-0">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 pt-6 pb-0">
                         <div className="grid grid-cols-1 gap-6 sm:grid-cols-3 sm:gap-8">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
@@ -480,11 +480,11 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     {/* Line Items — editor-matched layout */}
                     <div className="bg-white">
                         {/* Column headers */}
-                        <div className="hidden sm:flex text-[11px] font-bold text-slate-400 border-b border-slate-200 px-10 py-3.5 uppercase tracking-wider">
-                            <div className="flex-1">Item Description</div>
-                            <div className="w-20 text-right">Qty</div>
-                            <div className="w-32 text-right">Unit Price</div>
-                            <div className="w-32 text-right">Amount</div>
+                        <div className="flex text-[11px] font-bold text-slate-400 border-b border-slate-200 px-5 sm:px-10 py-3.5 uppercase tracking-wider">
+                            <div className="flex-1"><span className="hidden sm:inline">Item Description</span></div>
+                            <div className="w-12 sm:w-20 text-right">Qty</div>
+                            <div className="w-20 sm:w-32 text-right">Unit Price</div>
+                            <div className="w-24 sm:w-32 text-right">Amount</div>
                         </div>
 
                         <div className="divide-y divide-slate-100/80">
@@ -509,8 +509,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                         <div className="text-sm font-medium text-slate-700">{sub.name}</div>
                                                         {sub.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{sub.description}</div>}
                                                     </div>
-                                                    <div className="w-14 sm:w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
-                                                    <div className="w-24 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
+                                                    <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
+                                                    <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
                                                     <div className="w-24 sm:w-32 text-right text-sm font-semibold text-slate-700">{formatCurrency(Number(sub.total))}</div>
                                                 </div>
                                             ))}
@@ -525,8 +525,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                             <div className="text-sm font-medium text-slate-800">{item.name}</div>
                                             {item.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{item.description}</div>}
                                         </div>
-                                        <div className="w-14 sm:w-20 text-right text-sm text-slate-500">{item.quantity}</div>
-                                        <div className="w-24 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
+                                        <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{item.quantity}</div>
+                                        <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
                                         <div className="w-24 sm:w-32 text-right text-sm font-semibold text-slate-800">{formatCurrency(itemTotal)}</div>
                                     </div>
                                 );

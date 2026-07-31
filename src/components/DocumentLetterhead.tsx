@@ -39,7 +39,7 @@ function CompanyInfoLines({ config }: { config: LetterheadConfig }) {
 export default function DocumentLetterhead({ config, rightContent }: DocumentLetterheadProps) {
   if (config.mode === "custom_image" && config.customImageUrl) {
     return (
-      <div className="border-b border-slate-200">
+      <div data-pdf-row="true" className="border-b border-slate-200">
         <img
           src={config.customImageUrl}
           alt="Letterhead"
@@ -66,7 +66,7 @@ export default function DocumentLetterhead({ config, rightContent }: DocumentLet
   const isCenter = config.logoPosition === "center";
 
   return (
-    <div className="px-5 sm:px-10 pt-10 pb-8 border-b border-slate-200 print:px-6">
+    <div data-pdf-row="true" className="px-5 sm:px-10 pt-10 pb-8 border-b border-slate-200 print:px-6">
       {config.showDivider && (
         <div
           className="h-1 -mt-10 -mx-5 sm:-mx-10 mb-8 print:-mx-6"
