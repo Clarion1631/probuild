@@ -25,6 +25,8 @@ import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal";
 import LinkScheduleReviewModal, { type LinkScheduleSuggestionRow } from "./LinkScheduleReviewModal";
+import DecisionDueDateEditPopover, { type ProjectScheduleTaskOption } from "./DecisionDueDateEditPopover";
+import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import {
     ImageOff,
     ExternalLink,
@@ -73,6 +75,12 @@ interface DecisionData {
     sortOrder: number;
     pmNote: string | null;
     candidates: Candidate[];
+    // Schedule-driven due dates (Phase 3) — raw link/override fields (staff
+    // read only; the portal read strips these) plus the computed value.
+    scheduleTaskId: string | null;
+    leadTimeDays: number | null;
+    dueDate: string | null;
+    effectiveDueDate: string | null;
 }
 
 interface DeletedDecision {
@@ -113,6 +121,24 @@ function statusChip(status: string): { label: string; className: string } {
         default:
             return { label: "Open", className: "bg-slate-100 text-slate-600" };
     }
+}
+
+// Undecided-only urgency badge (Open/Flagged) — Decided/Ordered/Received
+// show nothing regardless of effectiveDueDate (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+function DecideByBadge({ status, effectiveDueDate }: { status: string; effectiveDueDate: string | null }) {
+    if (status !== "Open" && status !== "Flagged") return null;
+    if (!effectiveDueDate) return null;
+    const date = new Date(effectiveDueDate);
+    const urgency = dueDateUrgency(date);
+    return (
+        <span data-testid="decide-by-badge" className="inline-flex items-center gap-1 text-xs">
+            <span className="text-hui-textMuted">Decide by {formatDueDateShort(date)}</span>
+            {urgency && (
+                <span className={`px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
+            )}
+        </span>
+    );
 }
 
 function ApprovedItemsTable({
@@ -392,12 +418,16 @@ function DecisionCard({
     isLast,
     onChanged,
     onMove,
+    isAdminOrManager,
+    scheduleTasks,
 }: {
     decision: DecisionData;
     isFirst: boolean;
     isLast: boolean;
     onChanged: () => void;
     onMove: (direction: "up" | "down") => void;
+    isAdminOrManager: boolean;
+    scheduleTasks: ProjectScheduleTaskOption[];
 }) {
     const [renaming, setRenaming] = useState(false);
     const [nameDraft, setNameDraft] = useState(decision.name);
@@ -468,6 +498,17 @@ function DecisionCard({
                             <button onClick={() => setRenaming(true)} title="Rename" aria-label="Edit decision title" className="text-slate-400 hover:text-hui-textMain transition">
                                 <Pencil className="w-3.5 h-3.5" />
                             </button>
+                            <DecideByBadge status={decision.status} effectiveDueDate={decision.effectiveDueDate} />
+                            <DecisionDueDateEditPopover
+                                decisionId={decision.id}
+                                decisionName={decision.name}
+                                scheduleTaskId={decision.scheduleTaskId}
+                                leadTimeDays={decision.leadTimeDays}
+                                dueDate={decision.dueDate}
+                                tasks={scheduleTasks}
+                                isAdminOrManager={isAdminOrManager}
+                                onSaved={onChanged}
+                            />
                         </div>
                     )}
                 </div>
@@ -605,12 +646,16 @@ export default function TeamDecisionsSection({
     initialUnsorted,
     initialRecentlyDeleted,
     initialRecentlyDeletedItems,
+    isAdminOrManager,
+    scheduleTasks,
 }: {
     projectId: string;
     initialDecisions: DecisionData[];
     initialUnsorted: Candidate[];
     initialRecentlyDeleted: DeletedDecision[];
     initialRecentlyDeletedItems: DeletedItem[];
+    isAdminOrManager: boolean;
+    scheduleTasks: ProjectScheduleTaskOption[];
 }) {
     const router = useRouter();
     const [decisions, setDecisions] = useState<DecisionData[]>(initialDecisions);
@@ -864,6 +909,8 @@ export default function TeamDecisionsSection({
                             isLast={i === decisions.length - 1}
                             onChanged={refresh}
                             onMove={(direction) => handleMoveDecision(decision.id, direction)}
+                            isAdminOrManager={isAdminOrManager}
+                            scheduleTasks={scheduleTasks}
                         />
                     ))}
                 </div>

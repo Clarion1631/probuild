@@ -10871,6 +10871,20 @@ export async function getProjectDecisions(projectId: string) {
     };
 }
 
+/** Project schedule tasks for the per-decision edit popover's manual link
+ * select (Phase 3 — docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+ * Staff-only, ordered by startDate — the same shape the link-schedule
+ * review modal already renders selects from. */
+export async function listProjectScheduleTasksForLinking(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { startDate: "asc" },
+        select: { id: true, name: true, startDate: true },
+    });
+}
+
 // ── Structure — shared by client + team (see assertDecisionActorAccess) ────
 
 export async function createDecision(projectId: string, data: { name: string; area?: string }) {

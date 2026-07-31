@@ -39,6 +39,9 @@ const aiSortCore = read("src/lib/selection-ai-sort-core.ts");
 const permissions = read("src/lib/permissions.ts");
 const actions = read("src/lib/actions.ts");
 const proxy = read("src/proxy.ts");
+const teamDecisionsSection = read("src/app/projects/[id]/selections/TeamDecisionsSection.tsx");
+const portalDecisionsSection = read("src/app/portal/projects/[id]/selections/PortalDecisionsSection.tsx");
+const dueDateEditPopover = read("src/app/projects/[id]/selections/DecisionDueDateEditPopover.tsx");
 
 // ── Schema / migration ──────────────────────────────────────────────────────
 
@@ -243,6 +246,27 @@ const stripDueDateFieldsSlice = actions.slice(stripDueDateFieldsIdx, stripDueDat
 assert.match(stripDueDateFieldsSlice, /dueDate/);
 assert.match(stripDueDateFieldsSlice, /scheduleTaskId/);
 assert.match(stripDueDateFieldsSlice, /leadTimeDays/);
+
+// ── Due-date display: undecided-only gating, ADMIN/MANAGER-only override
+//    input, portal read-only (no write actions imported) ───────────────────
+
+assert.match(teamDecisionsSection, /function DecideByBadge/, "staff selections page must render a Decide-by badge");
+const decideByBadgeIdx = teamDecisionsSection.indexOf("function DecideByBadge");
+const decideByBadgeSlice = teamDecisionsSection.slice(decideByBadgeIdx, decideByBadgeIdx + 400);
+assert.match(decideByBadgeSlice, /status !== "Open" && status !== "Flagged"/, "Decide-by badge must gate on undecided statuses only (Open/Flagged)");
+
+assert.match(portalDecisionsSection, /function DecideByLine/, "portal selections page must render a read-only Decide-by line");
+const decideByLineIdx = portalDecisionsSection.indexOf("function DecideByLine");
+const decideByLineSlice = portalDecisionsSection.slice(decideByLineIdx, decideByLineIdx + 400);
+assert.match(decideByLineSlice, /status !== "Open" && status !== "Flagged"/, "portal Decide-by line must gate on undecided statuses only (Open/Flagged)");
+assert.ok(
+    !/linkDecisionToSchedule|setDecisionDueDateOverride/.test(portalDecisionsSection),
+    "the portal component must never import/call linkDecisionToSchedule or setDecisionDueDateOverride — portal-side editing is out of scope for this phase",
+);
+
+assert.match(dueDateEditPopover, /isAdminOrManager/, "the edit popover must gate the manual override input on isAdminOrManager");
+const popoverOverrideIdx = dueDateEditPopover.indexOf("Manual override");
+assert.ok(popoverOverrideIdx > -1, "popover must label the override section");
 
 Promise.all([
     verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(),

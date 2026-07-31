@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { isAdminOrManager, canAccessProject } from "../src/lib/permissions";
+import { signClientPortalToken } from "../src/lib/client-portal-auth";
 // Imported from the plain core modules, NOT src/lib/actions.ts — actions.ts
 // is a "use server" file that transitively imports "server-only", which is
 // not resolvable outside a Next.js build context (see
@@ -37,15 +38,19 @@ let template2Id = "";
 // e2e/selections-ai-sort.spec.ts. Assignable to every deps.revalidate shape
 // used below (0-arg and 1-arg) since JS/TS allow calling with fewer params.
 const NOOP_REVALIDATE = () => {};
+const clientEmail = `${run}@example.com`;
 
 test.describe.serial("Decision templates + schedule-driven due dates", () => {
     test.beforeAll(async () => {
-        await prisma.client.create({ data: { id: ids.client, name: "Templates Client", initials: "TP" } });
+        await prisma.client.create({ data: { id: ids.client, name: "Templates Client", initials: "TP", email: clientEmail } });
         await prisma.project.create({
             data: { id: ids.project, name: "Templates Project", clientId: ids.client, status: "In Progress" },
         });
         await prisma.project.create({
             data: { id: ids.otherProject, name: "Templates Other Project", clientId: ids.client, status: "In Progress" },
+        });
+        await prisma.portalVisibility.create({
+            data: { projectId: ids.project, isPortalEnabled: true, showSelections: true },
         });
         await prisma.user.create({
             data: { id: ids.admin, email: `${run}-admin@example.com`, name: "Templates Admin", role: "ADMIN", status: "ACTIVATED" },
@@ -392,5 +397,66 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
         const linked = await prisma.decision.findUniqueOrThrow({ where: { id: uiDecision.id } });
         expect(linked.scheduleTaskId).toBe(uiTask.id);
         expect(linked.leadTimeDays).not.toBeNull();
+    });
+
+    // ── Case 6: portal shows "Decide by" with the correct date; raw
+    //    dueDate/scheduleTaskId/leadTimeDays never leave the server; portal
+    //    actor cannot call link/override/template actions ─────────────────
+
+    test("portal: undecided decision shows 'Decide by' with the correct date, and the payload never carries the raw link/override fields", async ({ browser }) => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const portalDecision = await prisma.decision.create({
+            data: { id: `${run}-portal-decision`, projectId: ids.project, name: "Portal Decide By Test", status: "Open" },
+        });
+        const overrideDate = new Date("2026-08-04T00:00:00.000Z");
+        await setDecisionDueDateOverride(portalDecision.id, overrideDate, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+
+        const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+        const page = await context.newPage();
+        const token = await signClientPortalToken(ids.client, clientEmail);
+        await page.goto(
+            `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/projects/${ids.project}/selections`)}`,
+        );
+
+        await expect(page.getByText("Portal Decide By Test")).toBeVisible();
+        // Scoped to THIS decision's card — other decisions on this shared
+        // project fixture (from earlier tests in this serial suite) also
+        // render a "Decide by" line, so an unscoped .first() would be
+        // order-dependent and flaky.
+        const card = page.locator(".hui-card", { hasText: "Portal Decide By Test" });
+        const decideBy = card.getByTestId("portal-decide-by");
+        await expect(decideBy).toContainText("Aug 4");
+
+        const portalMarkup = await page.content();
+        expect(portalMarkup).not.toContain('"dueDate"');
+        expect(portalMarkup).not.toContain('"scheduleTaskId"');
+        expect(portalMarkup).not.toContain('"leadTimeDays"');
+        expect(portalMarkup).toContain("effectiveDueDate");
+
+        await context.close();
+    });
+
+    test("a portal client cannot call template/link/override actions (direct authorization test, zero writes)", async () => {
+        const before = await prisma.decision.findMany({ where: { projectId: ids.project, deletedAt: null }, select: { id: true, scheduleTaskId: true, dueDate: true } });
+
+        // The portal actor is represented by `null` in every getActor seam
+        // below — assertDecisionActorAccess/canAccessProject/isAdminOrManager
+        // all require a real staff user object; a portal client never
+        // resolves to one, so every one of these calls must reject.
+        await expect(
+            createDecisionTemplate({ name: "Portal Should Not Create", items: [{ name: "X" }] }, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+        await expect(
+            applyDecisionTemplate(ids.project, templateId, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+        await expect(
+            linkDecisionToSchedule(before[0].id, ids.taskCabinets, 5, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+        await expect(
+            setDecisionDueDateOverride(before[0].id, new Date(), { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+
+        const after = await prisma.decision.findMany({ where: { projectId: ids.project, deletedAt: null }, select: { id: true, scheduleTaskId: true, dueDate: true } });
+        expect(after).toEqual(before);
     });
 });
