@@ -355,25 +355,29 @@ function CandidateCard({
                     </button>
                 </div>
             )}
-            <SelectionItemNote
-                itemId={item.id}
-                note={item.clientNote}
-                onSaved={onChanged}
-                className="mt-1"
-            />
-            <SelectionItemThread
-                itemId={item.id}
-                comments={item.comments}
-                unreadCount={item.unreadThreadCount}
-                onChanged={onChanged}
-                className="mt-1.5"
-            />
-            {isHttpUrl(item.vendorUrl) && (
-                <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1 mt-1.5">
-                    <ExternalLink className="w-3 h-3" />
-                    View link
-                </a>
-            )}
+            {/* One inline row for the small actions; a saved note or an active
+                thread takes its own full-width line so text stays readable. */}
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <SelectionItemNote
+                    itemId={item.id}
+                    note={item.clientNote}
+                    onSaved={onChanged}
+                    className={item.clientNote?.trim() ? "basis-full" : ""}
+                />
+                <SelectionItemThread
+                    itemId={item.id}
+                    comments={item.comments}
+                    unreadCount={item.unreadThreadCount}
+                    onChanged={onChanged}
+                    className={item.comments.length > 0 ? "basis-full" : ""}
+                />
+                {isHttpUrl(item.vendorUrl) && (
+                    <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1">
+                        <ExternalLink className="w-3 h-3" />
+                        View link
+                    </a>
+                )}
+            </div>
         </div>
     );
 }
