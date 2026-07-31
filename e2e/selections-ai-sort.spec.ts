@@ -22,6 +22,11 @@ const ids = {
     assignedItem: `${run}-assigned-item`,
     raceItem: `${run}-race-item`,
     portalItem: `${run}-portal-item`,
+    uiFaucetItem: `${run}-ui-faucet-item`,
+    uiFlooringItem: `${run}-ui-flooring-item`,
+    uiReviewItem: `${run}-ui-review-item`,
+    uiChipItem: `${run}-ui-chip-item`,
+    uiDismissItem: `${run}-ui-dismiss-item`,
 } as const;
 const clientEmail = `${run}@example.com`;
 
@@ -258,5 +263,130 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
         expect(html).not.toContain("suggestedAt");
 
         await context.close();
+    });
+
+    // ── UI: Sort with AI button, review modal, chips ────────────────────────
+    // ids.unsortedFlooring and ids.portalItem are still unsorted leftovers
+    // from earlier tests in this serial suite — soft-delete them so they
+    // don't show up as extra rows/cards in the UI assertions below (matches
+    // real behavior: a deleted item is excluded from every unsorted query).
+
+    test("Sort with AI + Apply moves matching items into the right decisions and clears the chip", async ({ page }) => {
+        await prisma.selectionProposal.updateMany({
+            where: { id: { in: [ids.unsortedFlooring, ids.portalItem] } },
+            data: { deletedAt: new Date() },
+        });
+        await prisma.selectionProposal.create({
+            data: { id: ids.uiFaucetItem, projectId: ids.project, name: "Primary Bath Fixtures Faucet", status: "Idea" },
+        });
+        await prisma.selectionProposal.create({
+            data: { id: ids.uiFlooringItem, projectId: ids.project, name: "Entry Flooring Plank", status: "Idea" },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        await expect(modal.getByTestId(`ai-sort-row-select-${ids.uiFaucetItem}`)).toHaveValue(ids.decisionFixtures);
+        await expect(modal.getByTestId(`ai-sort-row-select-${ids.uiFlooringItem}`)).toHaveValue(ids.decisionFlooring);
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiFaucetItem } });
+                return item.decisionId;
+            })
+            .toBe(ids.decisionFixtures);
+        const faucet = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiFaucetItem } });
+        expect(faucet.suggestedDecisionId).toBeNull();
+        const flooring = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiFlooringItem } });
+        expect(flooring.decisionId).toBe(ids.decisionFlooring);
+        expect(flooring.suggestedDecisionId).toBeNull();
+
+        // Revalidated UI shows them filed under their decisions, not Unsorted.
+        await page.reload();
+        await expect(page.getByTestId(`selection-item-${ids.uiFaucetItem}`)).toBeVisible();
+        await expect(page.getByTestId(`selection-item-${ids.uiFlooringItem}`)).toBeVisible();
+    });
+
+    test("review-before-apply: deselecting to Leave unsorted excludes that row from Apply", async ({ page }) => {
+        await prisma.selectionProposal.create({
+            data: { id: ids.uiReviewItem, projectId: ids.project, name: "Deck Fixtures Sconce", status: "Idea" },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        const select = modal.getByTestId(`ai-sort-row-select-${ids.uiReviewItem}`);
+        await expect(select).toHaveValue(ids.decisionFixtures);
+        await select.selectOption("");
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiReviewItem } });
+        expect(item.decisionId).toBeNull();
+    });
+
+    test("chip flow: Cancel keeps the persisted suggestion as a chip; ✓ applies, ✕ dismisses", async ({ page }) => {
+        await prisma.selectionProposal.create({
+            data: { id: ids.uiChipItem, projectId: ids.project, name: "Foyer Fixtures Mirror", status: "Idea" },
+        });
+        await prisma.selectionProposal.create({
+            data: { id: ids.uiDismissItem, projectId: ids.project, name: "Foyer Fixtures Lantern", status: "Idea" },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        // Cancel — no ASSIGNMENT writes; the suggestions the route already
+        // persisted remain as chips, which is the intended behavior.
+        await modal.getByTestId("ai-sort-cancel").click();
+        await expect(modal).not.toBeVisible();
+
+        const chipCard = page.getByTestId(`selection-item-${ids.uiChipItem}`);
+        await expect(chipCard.getByTestId(`selection-suggestion-chip-${ids.uiChipItem}`)).toContainText("AI: Fixtures");
+        const dismissCard = page.getByTestId(`selection-item-${ids.uiDismissItem}`);
+        await expect(dismissCard.getByTestId(`selection-suggestion-chip-${ids.uiDismissItem}`)).toContainText("AI: Fixtures");
+
+        // ✓ applies via the CAS action.
+        await chipCard.getByTestId(`selection-suggestion-apply-${ids.uiChipItem}`).click();
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiChipItem } });
+                return item.decisionId;
+            })
+            .toBe(ids.decisionFixtures);
+        const appliedItem = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiChipItem } });
+        expect(appliedItem.suggestedDecisionId).toBeNull();
+
+        // ✕ dismisses — suggestion cleared, item stays unsorted.
+        await dismissCard.getByTestId(`selection-suggestion-dismiss-${ids.uiDismissItem}`).click();
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiDismissItem } });
+                return item.suggestedDecisionId;
+            })
+            .toBeNull();
+        const dismissedItem = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.uiDismissItem } });
+        expect(dismissedItem.decisionId).toBeNull();
+
+        await page.reload();
+        await expect(page.getByTestId(`selection-item-${ids.uiDismissItem}`).getByTestId(`selection-suggestion-chip-${ids.uiDismissItem}`)).toHaveCount(0);
     });
 });
