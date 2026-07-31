@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { submitSelectionProposal, createDecision } from "@/lib/actions";
+import { SELECTION_ITEM_NOTE_MAX_LENGTH } from "@/lib/selection-item-notes";
 import { isHttpUrl } from "@/lib/url-safety";
 import { ImageOff, Check } from "lucide-react";
 
@@ -225,14 +226,19 @@ export default function PortalClipClient({
                     </div>
 
                     <div>
-                        <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
+                        <label
+                            htmlFor="portal-clip-note"
+                            className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider"
+                        >
                             Note to your team <span className="normal-case font-normal">(optional)</span>
                         </label>
                         <textarea
+                            id="portal-clip-note"
                             value={note}
                             onChange={(e) => setNote(e.target.value)}
                             className="hui-input w-full mt-1 text-sm"
                             rows={3}
+                            maxLength={SELECTION_ITEM_NOTE_MAX_LENGTH}
                             placeholder="Where it'd go, why you like it..."
                             disabled={submitting}
                         />

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { deleteExpense, deleteExpenses, getExpenses, tagExpensesToChangeOrder } from "@/lib/time-expense-actions";
 
@@ -12,6 +12,9 @@ interface Expense {
     date: string | Date | null;
     status: string;
     receiptUrl: string | null;
+    qbPurchaseId?: string | null;
+    qbSyncToken?: string | null;
+    qbSyncedAt?: string | Date | null;
     costCode: { id: string; name: string; code: string } | null;
     costType: { id: string; name: string } | null;
     item: { id: string; name: string } | null;
@@ -47,6 +50,8 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
     const [statusFilter, setStatusFilter] = useState<"all" | "Pending" | "Reviewed">("all");
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [bulkChangeOrderId, setBulkChangeOrderId] = useState("");
+    const [uploadingId, setUploadingId] = useState<string | null>(null);
+    const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
     const refreshExpenses = useCallback(async () => {
         try {
@@ -59,13 +64,15 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
         let total = 0;
         let pending = 0;
         let reviewed = 0;
+        let qbImported = 0;
         for (const e of expenses) {
             const amt = num(e.amount);
             total += amt;
             if (e.status === "Pending") pending += amt;
             else reviewed += amt;
+            if (e.qbPurchaseId) qbImported += amt;
         }
-        return { total, pending, reviewed, count: expenses.length };
+        return { total, pending, reviewed, qbImported, count: expenses.length };
     }, [expenses]);
 
     const filtered = useMemo(() => {
@@ -86,6 +93,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
     }, [expenses, filter, statusFilter]);
 
     function toggleSelect(id: string) {
+        if (expenses.some(expense => expense.id === id && expense.qbPurchaseId)) return;
         setSelectedIds(prev => {
             const next = new Set(prev);
             if (next.has(id)) next.delete(id);
@@ -95,8 +103,11 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
     }
 
     function toggleAll() {
-        if (selectedIds.size === filtered.length) setSelectedIds(new Set());
-        else setSelectedIds(new Set(filtered.map(e => e.id)));
+        const selectableIds = filtered
+            .filter(expense => !expense.qbPurchaseId)
+            .map(expense => expense.id);
+        if (selectableIds.every(id => selectedIds.has(id))) setSelectedIds(new Set());
+        else setSelectedIds(new Set(selectableIds));
     }
 
     async function handleBulkDelete() {
@@ -121,6 +132,23 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
             await refreshExpenses();
         } catch (err: any) {
             toast.error(err.message || "Failed to delete");
+        }
+    }
+
+    async function handleUploadReceipt(id: string, file: File) {
+        setUploadingId(id);
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const res = await fetch(`/api/expenses/${id}/receipt`, { method: "POST", body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to upload receipt");
+            setExpenses(prev => prev.map(e => e.id === id ? { ...e, receiptUrl: data.receiptUrl } : e));
+            toast.success("Receipt uploaded");
+        } catch (err: any) {
+            toast.error(err.message || "Failed to upload receipt");
+        } finally {
+            setUploadingId(null);
         }
     }
 
@@ -165,9 +193,9 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                     <div className="text-xl font-bold text-emerald-700">{fmtMoney(summary.reviewed)}</div>
                 </div>
                 <div className="bg-gradient-to-br from-purple-50 to-purple-100/50 border border-purple-200 rounded-xl p-4">
-                    <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">QB Synced</div>
-                    <div className="text-xl font-bold text-purple-700">$0.00</div>
-                    <div className="text-xs text-slate-500">QuickBooks sync</div>
+                    <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">QBO Imports</div>
+                    <div className="text-xl font-bold text-purple-700">{fmtMoney(summary.qbImported)}</div>
+                    <div className="text-xs text-slate-500">Finalized in QuickBooks</div>
                 </div>
             </div>
 
@@ -245,7 +273,12 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                             <thead>
                                 <tr className="bg-slate-50 border-b border-slate-200">
                                     <th className="px-4 py-3 text-left w-10">
-                                        <input type="checkbox" checked={selectedIds.size === filtered.length && filtered.length > 0} onChange={toggleAll} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                        <input
+                                            type="checkbox"
+                                            checked={filtered.some(expense => !expense.qbPurchaseId) && filtered.filter(expense => !expense.qbPurchaseId).every(expense => selectedIds.has(expense.id))}
+                                            onChange={toggleAll}
+                                            className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary"
+                                        />
                                     </th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Date</th>
                                     <th className="px-4 py-3 text-left font-semibold text-slate-600 uppercase text-xs tracking-wider">Vendor</th>
@@ -256,6 +289,7 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider">Amount</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">Status</th>
                                     <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">QB</th>
+                                    <th className="px-4 py-3 text-center font-semibold text-slate-600 uppercase text-xs tracking-wider">Receipt</th>
                                     <th className="px-4 py-3 text-right font-semibold text-slate-600 uppercase text-xs tracking-wider w-20"></th>
                                 </tr>
                             </thead>
@@ -263,9 +297,23 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                 {filtered.map(expense => (
                                     <tr key={expense.id} className="hover:bg-slate-50 transition">
                                         <td className="px-4 py-3">
-                                            <input type="checkbox" checked={selectedIds.has(expense.id)} onChange={() => toggleSelect(expense.id)} className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary" />
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedIds.has(expense.id)}
+                                                onChange={() => toggleSelect(expense.id)}
+                                                disabled={Boolean(expense.qbPurchaseId)}
+                                                title={expense.qbPurchaseId ? "Finalized in QuickBooks; managed in QBO" : "Select expense"}
+                                                className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary disabled:opacity-40"
+                                            />
                                         </td>
-                                        <td className="px-4 py-3 text-slate-600 tabular-nums">{expense.date ? new Date(expense.date).toLocaleDateString() : "—"}</td>
+                                        <td className="px-4 py-3 text-slate-600 tabular-nums">
+                                            {expense.date
+                                                ? new Date(expense.date).toLocaleDateString(
+                                                    undefined,
+                                                    expense.qbPurchaseId ? { timeZone: "UTC" } : undefined,
+                                                )
+                                                : "—"}
+                                        </td>
                                         <td className="px-4 py-3 font-medium text-hui-textMain">{expense.vendor || "—"}</td>
                                         <td className="px-4 py-3 text-slate-600 max-w-[200px] truncate">{expense.description || "—"}</td>
                                         <td className="px-4 py-3 text-slate-600">{expense.costCode ? `${expense.costCode.code}` : "—"}</td>
@@ -282,15 +330,63 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                             </span>
                                         </td>
                                         <td className="px-4 py-3 text-center">
-                                            <input
-                                                type="checkbox"
-                                                disabled
-                                                title="QuickBooks sync — coming soon"
-                                                className="rounded border-slate-300 text-hui-primary focus:ring-hui-primary"
-                                            />
+                                            {expense.qbPurchaseId ? (
+                                                <span
+                                                    title={`QBO transaction ${expense.qbPurchaseId}${expense.qbSyncedAt ? `; imported ${new Date(expense.qbSyncedAt).toLocaleString()}` : ""}`}
+                                                    className="inline-flex items-center rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700"
+                                                >
+                                                    Finalized in QuickBooks
+                                                </span>
+                                            ) : (
+                                                <span className="text-slate-300">—</span>
+                                            )}
+                                        </td>
+                                        <td className="px-4 py-3">
+                                            <div className="flex items-center justify-center gap-2">
+                                                {expense.receiptUrl && (
+                                                    <a
+                                                        href={expense.receiptUrl}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="text-blue-500 hover:text-blue-700 transition"
+                                                        title="View receipt"
+                                                    >
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" />
+                                                        </svg>
+                                                    </a>
+                                                )}
+                                                <input
+                                                    type="file"
+                                                    accept="image/*,application/pdf"
+                                                    className="hidden"
+                                                    ref={el => { fileInputRefs.current[expense.id] = el; }}
+                                                    onChange={e => {
+                                                        const file = e.target.files?.[0];
+                                                        if (file) handleUploadReceipt(expense.id, file);
+                                                        e.target.value = "";
+                                                    }}
+                                                />
+                                                <button
+                                                    onClick={() => fileInputRefs.current[expense.id]?.click()}
+                                                    disabled={uploadingId === expense.id}
+                                                    className="text-slate-400 hover:text-hui-primary transition disabled:opacity-50"
+                                                    title={expense.receiptUrl ? "Replace receipt" : "Upload receipt"}
+                                                >
+                                                    {uploadingId === expense.id ? (
+                                                        <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-6.219-8.56" />
+                                                        </svg>
+                                                    ) : (
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                                                            <path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13" />
+                                                        </svg>
+                                                    )}
+                                                </button>
+                                            </div>
                                         </td>
                                         <td className="px-4 py-3 text-right">
-                                            {(currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
+                                            {!expense.qbPurchaseId && (currentUser.role === "ADMIN" || currentUser.role === "MANAGER") && (
                                                 <button onClick={() => handleDelete(expense.id)} className="text-slate-400 hover:text-red-500 transition" title="Delete">
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
                                                         <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />

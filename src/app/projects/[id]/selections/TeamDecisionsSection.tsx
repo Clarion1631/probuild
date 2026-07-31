@@ -15,10 +15,15 @@ import {
     deleteDecision,
     flagDecision,
     importBoardPicksAsDecisions,
+    applySuggestedDecision,
+    dismissSelectionSuggestion,
 } from "@/lib/actions";
 import { isHttpUrl } from "@/lib/url-safety";
+import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
+import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/components/selections/SelectionItemThread";
 import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
+import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal";
 import {
     ImageOff,
     ExternalLink,
@@ -31,6 +36,9 @@ import {
     Flag,
     Download,
     ClipboardList,
+    Sparkles,
+    Check,
+    X,
 } from "lucide-react";
 
 interface Candidate {
@@ -45,6 +53,12 @@ interface Candidate {
     decisionId: string | null;
     price: number | string | null;
     createdAt: string;
+    comments: SelectionItemThreadCommentView[];
+    unreadThreadCount: number;
+    // AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md) —
+    // resolved to a chip only when it still matches a live decision (see
+    // resolveSuggestion below); staff-only, never present on portal reads.
+    suggestedDecisionId: string | null;
 }
 
 interface DecisionData {
@@ -99,7 +113,13 @@ function statusChip(status: string): { label: string; className: string } {
     }
 }
 
-function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
+function ApprovedItemsTable({
+    decisions,
+    onChanged,
+}: {
+    decisions: DecisionData[];
+    onChanged: () => void;
+}) {
     const approved = decisions
         .filter((d) => d.status === "Decided" && d.chosenItemId)
         .map((d) => ({ decision: d, item: d.candidates.find((c) => c.id === d.chosenItemId) }))
@@ -123,18 +143,38 @@ function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
                             <tr className="border-b border-hui-border bg-slate-50">
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Decision</th>
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Chosen item</th>
+                                <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Notes</th>
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Vendor</th>
                                 <th className="text-right px-4 py-2.5 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">List price</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {approved.map(({ decision, item }) => (
-                                <tr key={decision.id} className="hover:bg-slate-50 transition">
+                                <tr
+                                    key={decision.id}
+                                    data-testid={`approved-item-${item.id}`}
+                                    className="hover:bg-slate-50 transition"
+                                >
                                     <td className="px-4 py-2.5 font-medium text-hui-textMain">
                                         {decision.name}
                                         {decision.area && <span className="text-hui-textMuted font-normal"> · {decision.area}</span>}
                                     </td>
                                     <td className="px-4 py-2.5 text-hui-textMain">{item.name}</td>
+                                    <td className="px-4 py-2.5 min-w-[220px]">
+                                        <SelectionItemNote
+                                            itemId={item.id}
+                                            note={item.clientNote}
+                                            onSaved={onChanged}
+                                        />
+                                        <SelectionItemThread
+                                            itemId={item.id}
+                                            instanceId={`approved-${item.id}`}
+                                            comments={item.comments}
+                                            unreadCount={item.unreadThreadCount}
+                                            onChanged={onChanged}
+                                            className="mt-1.5"
+                                        />
+                                    </td>
                                     <td className="px-4 py-2.5">
                                         {isHttpUrl(item.vendorUrl) ? (
                                             <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1">
@@ -158,10 +198,57 @@ function ApprovedItemsTable({ decisions }: { decisions: DecisionData[] }) {
     );
 }
 
-function CandidateCard({ item, isChosen }: { item: Candidate; isChosen: boolean }) {
+function CandidateCard({
+    item,
+    isChosen,
+    onChanged,
+    suggestion,
+}: {
+    item: Candidate;
+    isChosen: boolean;
+    onChanged: () => void;
+    // Only ever passed for Unsorted cards — decisions inside a DecisionCard
+    // never show a chip (manually filed items are never touched).
+    suggestion?: { decisionId: string; decisionName: string } | null;
+}) {
     const price = formatPrice(item.price);
+    const [suggestionBusy, setSuggestionBusy] = useState<"apply" | "dismiss" | null>(null);
+
+    async function handleApplySuggestion() {
+        if (!suggestion) return;
+        setSuggestionBusy("apply");
+        try {
+            const result = await applySuggestedDecision(item.id, suggestion.decisionId);
+            if (result.applied) {
+                toast.success(`Sorted into ${suggestion.decisionName}`);
+            } else {
+                toast.info("That item changed since the suggestion was made — refresh to see its current state.");
+            }
+            onChanged();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't apply that suggestion.");
+        } finally {
+            setSuggestionBusy(null);
+        }
+    }
+
+    async function handleDismissSuggestion() {
+        setSuggestionBusy("dismiss");
+        try {
+            await dismissSelectionSuggestion(item.id);
+            onChanged();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't dismiss that suggestion.");
+        } finally {
+            setSuggestionBusy(null);
+        }
+    }
+
     return (
-        <div className={`rounded-lg border p-3 ${isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"}`}>
+        <div
+            data-testid={`selection-item-${item.id}`}
+            className={`rounded-lg border p-3 ${isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"}`}
+        >
             <div className="w-full h-28 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden">
                 {isHttpUrl(item.imageUrl) ? (
                     <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" />
@@ -183,7 +270,50 @@ function CandidateCard({ item, isChosen }: { item: Candidate; isChosen: boolean 
                     Vendor list price: <span className="font-semibold text-hui-textMain">{price}</span>
                 </p>
             )}
-            {item.clientNote && <p className="text-xs text-hui-textMuted mt-1 line-clamp-2">Client note: &quot;{item.clientNote}&quot;</p>}
+            {suggestion && (
+                <div
+                    data-testid={`selection-suggestion-chip-${item.id}`}
+                    className="mt-1.5 inline-flex items-center gap-1.5 text-xs bg-hui-primary/10 text-hui-primary rounded-full pl-2 pr-1 py-0.5"
+                >
+                    <Sparkles className="w-3 h-3 shrink-0" />
+                    <span className="truncate max-w-[140px]">AI: {suggestion.decisionName}</span>
+                    <button
+                        type="button"
+                        data-testid={`selection-suggestion-apply-${item.id}`}
+                        onClick={handleApplySuggestion}
+                        disabled={suggestionBusy !== null}
+                        title={`Sort into ${suggestion.decisionName}`}
+                        aria-label={`Apply AI suggestion: sort into ${suggestion.decisionName}`}
+                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                    >
+                        <Check className="w-3 h-3" />
+                    </button>
+                    <button
+                        type="button"
+                        data-testid={`selection-suggestion-dismiss-${item.id}`}
+                        onClick={handleDismissSuggestion}
+                        disabled={suggestionBusy !== null}
+                        title="Dismiss suggestion"
+                        aria-label="Dismiss AI suggestion"
+                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                    >
+                        <X className="w-3 h-3" />
+                    </button>
+                </div>
+            )}
+            <SelectionItemNote
+                itemId={item.id}
+                note={item.clientNote}
+                onSaved={onChanged}
+                className="mt-1"
+            />
+            <SelectionItemThread
+                itemId={item.id}
+                comments={item.comments}
+                unreadCount={item.unreadThreadCount}
+                onChanged={onChanged}
+                className="mt-1.5"
+            />
             {isHttpUrl(item.vendorUrl) && (
                 <a href={item.vendorUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-1 mt-1.5">
                     <ExternalLink className="w-3 h-3" />
@@ -333,7 +463,7 @@ function DecisionCard({
                             <h3 className="text-lg font-bold text-hui-textMain">{decision.name}</h3>
                             {decision.area && <span className="text-xs text-hui-textMuted">· {decision.area}</span>}
                             <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${chip.className}`}>{chip.label}</span>
-                            <button onClick={() => setRenaming(true)} title="Rename" aria-label="Rename decision" className="text-slate-400 hover:text-hui-textMain transition">
+                            <button onClick={() => setRenaming(true)} title="Rename" aria-label="Edit decision title" className="text-slate-400 hover:text-hui-textMain transition">
                                 <Pencil className="w-3.5 h-3.5" />
                             </button>
                         </div>
@@ -371,7 +501,7 @@ function DecisionCard({
             ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     {active.map((item) => (
-                        <CandidateCard key={item.id} item={item} isChosen={decision.chosenItemId === item.id} />
+                        <CandidateCard key={item.id} item={item} isChosen={decision.chosenItemId === item.id} onChanged={onChanged} />
                     ))}
                 </div>
             )}
@@ -485,6 +615,16 @@ export default function TeamDecisionsSection({
     const [unsorted, setUnsorted] = useState<Candidate[]>(initialUnsorted);
     const [addDecisionOpen, setAddDecisionOpen] = useState(false);
     const [importing, setImporting] = useState(false);
+    const [sorting, setSorting] = useState(false);
+    const [aiSortRows, setAiSortRows] = useState<AiSortSuggestionRow[]>([]);
+    // The live decisions list for the review modal's selects comes straight
+    // from the ai-sort response, NOT the page's own `decisions` state — the
+    // route already re-queried live decisions in the same request that
+    // produced the suggestions, so the modal never has to join fresh
+    // suggestions against this component's possibly-stale snapshot.
+    const [aiSortDecisions, setAiSortDecisions] = useState<{ id: string; name: string }[]>([]);
+    const [aiSortFailedCount, setAiSortFailedCount] = useState(0);
+    const [aiSortModalOpen, setAiSortModalOpen] = useState(false);
 
     // initialDecisions is only the INITIAL value for useState — resync when
     // the server component re-fetches after router.refresh() (same fix
@@ -501,8 +641,61 @@ export default function TeamDecisionsSection({
     // client side.
     const activeUnsorted = unsorted.filter((c) => c.status !== ARCHIVED);
 
+    // Live decisions only — a chip resolves to a decision id/name from THIS
+    // list, so a stale/deleted suggestedDecisionId (a decision renamed or
+    // deleted since the suggestion was computed) naturally renders no chip
+    // rather than needing a separate staleness check.
+    const liveDecisionsById = new Map(decisions.map((d) => [d.id, d.name]));
+    function resolveSuggestion(item: Candidate): { decisionId: string; decisionName: string } | null {
+        if (!item.suggestedDecisionId) return null;
+        const decisionName = liveDecisionsById.get(item.suggestedDecisionId);
+        return decisionName ? { decisionId: item.suggestedDecisionId, decisionName } : null;
+    }
+
     function refresh() {
         router.refresh();
+    }
+
+    async function handleSortWithAi() {
+        setSorting(true);
+        try {
+            const res = await fetch("/api/selections/ai-sort", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(body.error || "Couldn't get AI suggestions.");
+            }
+
+            // The route response already carries everything the modal
+            // renders (item name/imageUrl, live decisions) — rendered
+            // as-is, never joined against this component's own state.
+            const rows: AiSortSuggestionRow[] = Array.isArray(body.suggestions) ? body.suggestions : [];
+            const responseDecisions: { id: string; name: string }[] = Array.isArray(body.decisions)
+                ? body.decisions
+                : [];
+            const failedCount = Array.isArray(body.failedItemIds) ? body.failedItemIds.length : 0;
+
+            if (rows.length === 0) {
+                toast.info("No unsorted items to sort.");
+                return;
+            }
+
+            setAiSortRows(rows);
+            setAiSortDecisions(responseDecisions);
+            setAiSortFailedCount(failedCount);
+            setAiSortModalOpen(true);
+            // The route already persisted every successful suggestion —
+            // refresh now so the chips render immediately even if the modal
+            // is cancelled.
+            refresh();
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't get AI suggestions.");
+        } finally {
+            setSorting(false);
+        }
     }
 
     async function handleMoveDecision(decisionId: string, direction: "up" | "down") {
@@ -566,20 +759,36 @@ export default function TeamDecisionsSection({
                 </div>
             </div>
 
-            <ApprovedItemsTable decisions={decisions} />
+            <ApprovedItemsTable decisions={decisions} onChanged={refresh} />
 
             {/* Anything the client clipped but hasn't filed yet. Sits above the
                 decisions because it's the newest input and the only part that
                 may need a nudge — every clipper capture lands here first. */}
             {activeUnsorted.length > 0 && (
                 <div className="hui-card p-5 mb-5">
-                    <h3 className="text-base font-semibold text-hui-textMain">Unsorted</h3>
-                    <p className="text-xs text-hui-textMuted mt-0.5 mb-3">
-                        Clipped by the client, not yet in a decision. They sort these themselves — this is just so you can see what&apos;s coming.
-                    </p>
+                    <div className="flex items-start justify-between gap-3 flex-wrap">
+                        <div>
+                            <h3 className="text-base font-semibold text-hui-textMain">Unsorted</h3>
+                            <p className="text-xs text-hui-textMuted mt-0.5 mb-3">
+                                Clipped by the client, not yet in a decision. They sort these themselves — this is just so you can see what&apos;s coming.
+                            </p>
+                        </div>
+                        <button
+                            data-testid="sort-with-ai-button"
+                            onClick={handleSortWithAi}
+                            // Also disabled while the review modal is open —
+                            // a second run mid-review would silently replace
+                            // the rows the staffer is currently looking at.
+                            disabled={sorting || aiSortModalOpen}
+                            className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
+                        >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            {sorting ? "Sorting…" : "Sort with AI"}
+                        </button>
+                    </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                         {activeUnsorted.map((item) => (
-                            <CandidateCard key={item.id} item={item} isChosen={false} />
+                            <CandidateCard key={item.id} item={item} isChosen={false} onChanged={refresh} suggestion={resolveSuggestion(item)} />
                         ))}
                     </div>
                 </div>
@@ -613,6 +822,15 @@ export default function TeamDecisionsSection({
             />
 
             <AddDecisionModal projectId={projectId} open={addDecisionOpen} onClose={() => setAddDecisionOpen(false)} onCreated={refresh} />
+
+            <AiSortReviewModal
+                open={aiSortModalOpen}
+                rows={aiSortRows}
+                decisions={aiSortDecisions}
+                failedCount={aiSortFailedCount}
+                onClose={() => setAiSortModalOpen(false)}
+                onApplied={refresh}
+            />
         </div>
     );
 }

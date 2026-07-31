@@ -56,6 +56,9 @@ export type SaveProjectFileInput = {
     // null = inherit from the folder (default "team"), matching /api/files.
     visibility?: string | null;
     uploadedById?: string | null;
+    // Provenance for the portal "From you" indicator — defaults to false
+    // (team upload). Pass true when the uploading actor is a portal client.
+    uploadedByClient?: boolean;
     activity?: {
         actorName: string;
         action: string;
@@ -104,6 +107,7 @@ export async function saveProjectFile(input: SaveProjectFileInput): Promise<Save
                 ...(input.leadId && { leadId: input.leadId }),
                 ...(input.folderId && { folderId: input.folderId }),
                 uploadedById: input.uploadedById ?? null,
+                uploadedByClient: input.uploadedByClient ?? false,
             },
             select: { id: true, name: true, size: true, url: true },
         });

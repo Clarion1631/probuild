@@ -4,7 +4,7 @@
  * Docs: https://developer.intuit.com/app/developer/qbo/docs/api/accounting
  */
 
-const QB_API_BASE = process.env.QB_SANDBOX === "true"
+export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
     : "https://quickbooks.api.intuit.com/v3/company";
 
@@ -74,12 +74,17 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
 }
 
 /** Make an authenticated call to the QB API, auto-refreshing if needed */
-async function qbFetch(
+export async function qbFetch(
     path: string,
     tokens: QBTokens,
     opts: RequestInit = {}
 ): Promise<Response> {
-    const url = `${QB_API_BASE}/${tokens.realmId}${path}?minorversion=73`;
+    // Callers that already put their own query string on `path` (e.g.
+    // "/purchase?requestid=...") get "&minorversion=73" appended instead of a
+    // second "?" — every existing call site passes a bare path, so this is
+    // backward compatible.
+    const separator = path.includes("?") ? "&" : "?";
+    const url = `${QB_API_BASE}/${tokens.realmId}${path}${separator}minorversion=73`;
     return fetch(url, {
         ...opts,
         headers: {
@@ -92,7 +97,7 @@ async function qbFetch(
 }
 
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
-async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
+export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
     const res = await fetch(url, {
         headers: {
@@ -110,8 +115,42 @@ async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
     return key ? response[key] : [];
 }
 
-function escapeQBString(s: string): string {
-    return s.replace(/'/g, "\\'");
+export function escapeQBString(s: string): string {
+    // Backslash MUST be escaped before the apostrophe escape, or an input
+    // ending in a literal backslash (e.g. "Smith\\") would have its escaped
+    // apostrophe's own backslash re-escaped, breaking out of the quoted string.
+    return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+export interface QBAttachable {
+    Id?: string;
+    FileName?: string;
+    ContentType?: string;
+    Size?: number;
+    TempDownloadUri?: string;
+    AttachableRef?: Array<{ EntityRef?: { value?: string; type?: string } }>;
+}
+
+/** List file attachments linked to a QBO Purchase (receipt images/PDFs). */
+export async function getQBPurchaseAttachables(
+    tokens: QBTokens,
+    purchaseId: string,
+): Promise<QBAttachable[]> {
+    // QBO transaction ids are numeric; refuse anything else rather than escape it.
+    if (!/^\d+$/.test(purchaseId)) return [];
+    const rows = await qbQuery<QBAttachable>(
+        tokens,
+        `SELECT * FROM attachable WHERE AttachableRef.EntityRef.value = '${purchaseId}'`,
+    );
+    // Entity ids are only unique per entity type, so the value-only query can
+    // surface attachments from other transaction types — keep Purchase links.
+    return rows.filter(row =>
+        row.AttachableRef?.some(
+            ref =>
+                ref.EntityRef?.value === purchaseId &&
+                /^purchase$/i.test(ref.EntityRef?.type ?? ""),
+        ),
+    );
 }
 
 /** Find a QBO customer by display name, creating it if missing. Returns the QBO customer Id. */
@@ -485,7 +524,7 @@ export async function appendQBInvoiceCustomerMemo(
 /** Posted money-out transactions (expenses/checks/card charges) from the books. */
 export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: number) {
     const since = new Date(Date.now() - sinceDaysAgo * 86_400_000).toISOString().split("T")[0];
-    const rows = await qbQuery<any>(tokens, `SELECT * FROM Purchase WHERE TxnDate >= '${since}' ORDERBY TxnDate DESC MAXRESULTS 500`);
+    const rows = await getQBPurchasesSince(tokens, new Date(`${since}T00:00:00.000Z`));
     return rows.map(p => ({
         qbId: String(p.Id),
         date: p.TxnDate ?? null,
@@ -496,6 +535,104 @@ export async function getRecentQBPurchases(tokens: QBTokens, sinceDaysAgo: numbe
         account: p.AccountRef?.name ?? null,
         memo: p.PrivateNote ?? null,
     }));
+}
+
+/**
+ * Read all posted QBO Purchase rows on or after a transaction date.
+ * Pagination matters for the initial historical backfill; a single QBO query
+ * page would silently stop after its MAXRESULTS boundary.
+ */
+export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?: Date): Promise<any[]> {
+    if (!Number.isFinite(since.getTime())) {
+        throw new Error("QBO purchase query requires a valid since date");
+    }
+    if (until && !Number.isFinite(until.getTime())) {
+        throw new Error("QBO purchase query requires a valid until date");
+    }
+
+    const sinceDate = since.toISOString().slice(0, 10);
+    // Inclusive upper bound so callers can chunk a long backfill into
+    // date windows that each finish within the serverless duration limit.
+    const untilClause = until ? ` AND TxnDate <= '${until.toISOString().slice(0, 10)}'` : "";
+    const pageSize = 1000;
+    const purchases: any[] = [];
+
+    for (let startPosition = 1; ; startPosition += pageSize) {
+        const page = await qbQuery<any>(
+            tokens,
+            `SELECT * FROM Purchase WHERE TxnDate >= '${sinceDate}'${untilClause} ORDERBY TxnDate ASC STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+        );
+        purchases.push(...page);
+        if (page.length < pageSize) break;
+    }
+
+    return purchases;
+}
+
+/**
+ * Read Purchase rows changed since a timestamp using QBO Change Data Capture.
+ * Unlike a TxnDate query, CDC catches newly entered backdated purchases,
+ * corrections, voids, refunds, and deletion tombstones. QBO caps CDC lookback
+ * at 30 days and returns at most 1,000 entities, so truncated responses fail
+ * visibly instead of silently leaving local job costs stale.
+ */
+export async function getQBPurchaseChangesSince(
+    tokens: QBTokens,
+    since: Date,
+): Promise<any[]> {
+    if (!Number.isFinite(since.getTime())) {
+        throw new Error("QBO Purchase CDC requires a valid since date");
+    }
+
+    const params = new URLSearchParams({
+        entities: "Purchase",
+        changedSince: since.toISOString(),
+        minorversion: "73",
+    });
+    const response = await fetch(
+        `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
+        {
+            headers: {
+                Authorization: `Bearer ${tokens.accessToken}`,
+                Accept: "application/json",
+            },
+        },
+    );
+    if (!response.ok) {
+        throw new Error(`QBO Purchase CDC failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const cdcResponses = Array.isArray(payload?.CDCResponse)
+        ? payload.CDCResponse
+        : [];
+    const queryResponses = cdcResponses.flatMap((entry: any) =>
+        Array.isArray(entry?.QueryResponse) ? entry.QueryResponse : [],
+    );
+    const purchases: any[] = [];
+    for (const queryResponse of queryResponses) {
+        const page = Array.isArray(queryResponse?.Purchase)
+            ? queryResponse.Purchase
+            : [];
+        const totalCount = Number(queryResponse?.totalCount ?? page.length);
+        if (
+            page.length >= 1000 ||
+            (Number.isFinite(totalCount) && totalCount > page.length)
+        ) {
+            throw new Error("QBO Purchase CDC response was truncated");
+        }
+        purchases.push(...page);
+    }
+
+    // Keep the last representation if QBO includes the same id more than once.
+    const byId = new Map<string, any>();
+    const withoutId: any[] = [];
+    for (const purchase of purchases) {
+        const id = purchase?.Id === undefined ? "" : String(purchase.Id);
+        if (id) byId.set(id, purchase);
+        else withoutId.push(purchase);
+    }
+    return [...byId.values(), ...withoutId];
 }
 
 /** Posted customer payments (money in) from the books. */

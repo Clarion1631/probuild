@@ -6,22 +6,46 @@ export function normalizeWords(s: string): string[] {
     return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
 }
 
+export function scoreProjectNameMatch(label: string, projectName: string): number {
+    const labelWords = normalizeWords(label);
+    if (labelWords.length === 0) return 0;
+
+    const projectWords = normalizeWords(projectName);
+    const shared = labelWords.filter(word => projectWords.includes(word)).length;
+    // First word (usually the client surname) must match to count at all.
+    const firstMatches = projectWords.includes(labelWords[0]);
+    return firstMatches ? shared + 1 : shared >= 2 ? shared : 0;
+}
+
+/**
+ * Return every project tied for the strongest name match. Consumers that
+ * mutate financial records must treat more than one result as ambiguous.
+ */
+export function findBestProjectNameMatches<T extends { id: string; name: string }>(
+    label: string,
+    projects: T[],
+): T[] {
+    let bestScore = 0;
+    let matches: T[] = [];
+
+    for (const project of projects) {
+        const score = scoreProjectNameMatch(label, project.name);
+        if (score > bestScore) {
+            bestScore = score;
+            matches = [project];
+        } else if (score > 0 && score === bestScore) {
+            matches.push(project);
+        }
+    }
+
+    return matches;
+}
+
 export function matchProjectByName<T extends { id: string; name: string }>(
     label: string,
     projects: T[]
 ): T | null {
-    const labelWords = normalizeWords(label);
-    if (labelWords.length === 0) return null;
-    let best: { p: T; score: number } | null = null;
-    for (const p of projects) {
-        const projWords = normalizeWords(p.name);
-        const shared = labelWords.filter(w => projWords.includes(w)).length;
-        // First word (usually the client surname) must match to count at all.
-        const firstMatches = projWords.includes(labelWords[0]);
-        const score = firstMatches ? shared + 1 : shared >= 2 ? shared : 0;
-        if (score > 0 && (!best || score > best.score)) best = { p, score };
-    }
-    return best?.p ?? null;
+    return findBestProjectNameMatches(label, projects)[0] ?? null;
 }
 
 // Match a receipt category ("03 Plumbing", "10 Paint") to a ProBuild cost code

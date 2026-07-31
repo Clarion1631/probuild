@@ -11,6 +11,7 @@ interface EntitySidebarProps {
     entity: { type: "lead" | "project"; id: string; name: string; clientName?: string };
     linkedEntity?: { type: "lead" | "project"; id: string; name: string } | null;
     unreadMessageCount?: number;
+    unreadSelectionThreadCount?: number;
     onConvertToProject?: () => void;
 }
 
@@ -18,7 +19,7 @@ type NavItem = { label: string; href: string; permission?: string };
 type NavSection = { id: string; title: string; items: NavItem[] };
 
 export default function EntitySidebar({
-    entity, linkedEntity, unreadMessageCount = 0, onConvertToProject,
+    entity, linkedEntity, unreadMessageCount = 0, unreadSelectionThreadCount = 0, onConvertToProject,
 }: EntitySidebarProps) {
     const pathname = usePathname();
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
@@ -247,7 +248,12 @@ export default function EntitySidebar({
                                     <ul className="space-y-1">
                                         {visibleItems.map((item) => {
                                             const isActive = pathname === item.href || (pathname?.startsWith(item.href + "/") && item.href !== `/leads/${id}` && item.href !== `/projects/${id}`);
-                                            const showBadge = item.label === "Client Messages" && unreadMessageCount > 0;
+                                            const badgeCount = item.label === "Client Messages"
+                                                ? unreadMessageCount
+                                                : item.label === "Selection Boards"
+                                                    ? unreadSelectionThreadCount
+                                                    : 0;
+                                            const showBadge = badgeCount > 0;
                                             return (
                                                 <li key={item.label}>
                                                     <Link
@@ -260,8 +266,11 @@ export default function EntitySidebar({
                                                     >
                                                         <span>{item.label}</span>
                                                         {showBadge && (
-                                                            <span className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold text-white bg-red-500 rounded-full">
-                                                                {unreadMessageCount > 99 ? "99+" : unreadMessageCount}
+                                                            <span
+                                                                data-testid={`nav-badge-${item.label.toLowerCase().replace(/\s+/g, "-")}`}
+                                                                className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold text-white bg-red-500 rounded-full"
+                                                            >
+                                                                {badgeCount > 99 ? "99+" : badgeCount}
                                                             </span>
                                                         )}
                                                     </Link>

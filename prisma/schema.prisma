@@ -519,6 +519,11 @@ model Expense {
   date        DateTime?
   description String?
   receiptUrl  String?
+  // Stable identity for finalized money-out imported from QuickBooks Online.
+  // Nullable so existing/manual and receipt-intake expenses remain unchanged.
+  qbPurchaseId String?   @unique(map: "Expense_qbPurchaseId_key")
+  qbSyncToken  String?
+  qbSyncedAt   DateTime?
   changeOrderId String?
   changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
   isBillable    Boolean      @default(false)
@@ -1734,10 +1739,47 @@ model SelectionProposal {
   // data" still holds: the row survives and the team can restore it for 30
   // days (getRecentlyDeletedItems / restoreItem). Filtered out of every read.
   deletedAt    DateTime?
+  comments     SelectionItemComment[]
+  // AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+  // NOT an FK on purpose — suggestions are advisory, may go stale (decision
+  // deleted/renamed), and stale values are filtered at read time rather than
+  // enforced by the database. Cleared when the item is assigned (staff apply
+  // or manual assignItemToDecision) or dismissed.
+  suggestedDecisionId String?
+  suggestedAt         DateTime?
 
   @@index([projectId, status])
   @@index([decisionId])
   @@index([projectId, deletedAt])
+}
+
+// Per-item discussion thread, additive alongside the single clientNote status
+// annotation (docs/superpowers/plans/2026-07-30-selection-item-threads.md).
+// Coarse read-tracking (any-viewer, like ClientMessage.readAt) — right-sized
+// for a small team. Cascades with the proposal on hard delete; while the
+// proposal is soft-deleted the thread is neither readable nor writable (same
+// visibility rule as the item).
+model SelectionItemComment {
+  id             String            @id @default(cuid())
+  proposalId     String
+  proposal       SelectionProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  authorType     String            // "TEAM" | "CLIENT"
+  authorUserId   String?           // User.id when authorType TEAM
+  authorClientId String?           // Client.id when authorType CLIENT
+  authorName     String
+  body           String            // server-enforced max 4000 chars, trimmed, non-empty (or an attachment)
+  attachments    String?           // JSON [{id, name, url}] — same shape as ClientMessage
+  readByTeamAt   DateTime?         // null on CLIENT posts until any staff opens the thread
+  readByClientAt DateTime?         // null on TEAM posts until the client opens the thread
+  createdAt      DateTime          @default(now())
+
+  @@index([proposalId, createdAt])
+  // Supports the unread nav-badge counts (getUnreadSelectionThreadCountForStaff
+  // / ForPortal in selection-item-thread-dependencies.ts), which filter on
+  // authorType + the viewer-side read timestamp before joining to the
+  // proposal's projectId.
+  @@index([authorType, readByTeamAt])
+  @@index([authorType, readByClientAt])
 }
 
 // Client Selections Playground — Phase 1 (docs/specs/client-selections-playground.md).

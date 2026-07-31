@@ -25,6 +25,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             estimatedHours: true,
             projectId: true,
             project: { select: { id: true, name: true, color: true, location: true } },
+            // Linked estimate line item + its cost code — lets the mobile geofence
+            // "clock in here?" nudge preselect the matching phase for one-tap clock-in.
+            estimateItemId: true,
+            estimateItem: { select: { costCode: { select: { code: true, name: true } } } },
             comments: {
                 orderBy: { createdAt: "desc" },
                 take: 50,
@@ -60,6 +64,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             projectName: task.project?.name ?? "",
             projectColor: task.project?.color ?? null,
             projectLocation: task.project?.location ?? null,
+            estimateItemId: task.estimateItemId ?? null,
+            costCode: task.estimateItem?.costCode ? { code: task.estimateItem.costCode.code, name: task.estimateItem.costCode.name } : null,
             punchItems: task.punchItems,
             comments: task.comments.map(c => ({
                 id: c.id,

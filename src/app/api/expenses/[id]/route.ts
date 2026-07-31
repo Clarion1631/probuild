@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
+import {
+    QboManagedExpenseError,
+    assertExpenseMutableOutsideQbo,
+} from "@/lib/qbo-expense-guard";
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -11,10 +15,18 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
         const id = (await params).id;
         if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
-        await prisma.expense.delete({ where: { id } });
+        const expense = await prisma.expense.findUnique({
+            where: { id },
+            select: { qbPurchaseId: true },
+        });
+        assertExpenseMutableOutsideQbo(expense);
+        await prisma.expense.deleteMany({ where: { id, qbPurchaseId: null } });
 
         return NextResponse.json({ success: true });
     } catch (error) {
+        if (error instanceof QboManagedExpenseError) {
+            return NextResponse.json({ error: error.message }, { status: 409 });
+        }
         console.error("Error deleting expense:", error);
         return NextResponse.json({ error: "Failed to delete expense" }, { status: 500 });
     }
@@ -28,6 +40,11 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         const id = (await params).id;
         if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
+        const expense = await prisma.expense.findUnique({
+            where: { id },
+            select: { qbPurchaseId: true },
+        });
+        assertExpenseMutableOutsideQbo(expense);
         const body = await req.json();
 
         if (body.itemId) {
@@ -50,6 +67,9 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
         return NextResponse.json(updatedExpense);
     } catch (error) {
+        if (error instanceof QboManagedExpenseError) {
+            return NextResponse.json({ error: error.message }, { status: 409 });
+        }
         console.error("Error updating expense:", error);
         return NextResponse.json({ error: "Failed to update expense" }, { status: 500 });
     }

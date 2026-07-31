@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { submitSelectionProposal } from "@/lib/actions";
+import { SELECTION_ITEM_NOTE_MAX_LENGTH } from "@/lib/selection-item-notes";
 
 const COULD_NOT_READ_PAGE_MESSAGE =
     "We couldn't read that page automatically. Just add the name (and a photo link if you have one) and we'll take it from there.";
@@ -155,8 +156,9 @@ export default function AddItemModal({
                     </div>
 
                     <div>
-                        <label className="block text-sm font-medium text-hui-textMain mb-1">Item name</label>
+                        <label htmlFor="portal-add-item-name" className="block text-sm font-medium text-hui-textMain mb-1">Item name</label>
                         <input
+                            id="portal-add-item-name"
                             type="text"
                             className="hui-input"
                             placeholder="e.g. Brushed brass cabinet pulls"
@@ -181,12 +183,17 @@ export default function AddItemModal({
                     </div>
 
                     <div>
-                        <label className="block text-sm font-medium text-hui-textMain mb-1">
+                        <label
+                            htmlFor="portal-add-item-note"
+                            className="block text-sm font-medium text-hui-textMain mb-1"
+                        >
                             Note to your project team <span className="text-hui-textMuted font-normal">(optional)</span>
                         </label>
                         <textarea
+                            id="portal-add-item-note"
                             className="hui-input"
                             rows={3}
+                            maxLength={SELECTION_ITEM_NOTE_MAX_LENGTH}
                             placeholder="Why you like it, where it'd go, anything else..."
                             value={clientNote}
                             onChange={(e) => setClientNote(e.target.value)}

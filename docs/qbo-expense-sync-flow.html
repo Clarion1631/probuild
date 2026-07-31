@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GTR Expense Pipeline — How It Works</title>
+<style>
+  :root {
+    --ink: #1a202c; --muted: #64748b; --line: #e2e8f0;
+    --green: #16a34a; --green-bg: #f0fdf4;
+    --blue: #2563eb; --blue-bg: #eff6ff;
+    --amber: #d97706; --amber-bg: #fffbeb;
+    --purple: #7c3aed; --purple-bg: #f5f3ff;
+    --red: #dc2626; --red-bg: #fef2f2;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: #f8fafc; padding: 2rem 1rem 4rem; line-height: 1.5; }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  .sub { color: var(--muted); margin-bottom: 2rem; }
+  h2 { font-size: 1.05rem; margin: 2.2rem 0 .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .stage { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: 0; position: relative; }
+  .stage .tag { display: inline-block; font-size: .7rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: .15rem .5rem; border-radius: 99px; margin-bottom: .4rem; }
+  .stage h3 { font-size: 1rem; margin-bottom: .3rem; }
+  .stage p, .stage li { font-size: .88rem; color: #334155; }
+  .stage ul { padding-left: 1.2rem; margin-top: .3rem; }
+  .arrow { text-align: center; color: var(--muted); font-size: 1.3rem; padding: .35rem 0; }
+  .g  { border-left: 4px solid var(--green); }  .g .tag { background: var(--green-bg); color: var(--green); }
+  .b  { border-left: 4px solid var(--blue); }   .b .tag { background: var(--blue-bg); color: var(--blue); }
+  .a  { border-left: 4px solid var(--amber); }  .a .tag { background: var(--amber-bg); color: var(--amber); }
+  .p  { border-left: 4px solid var(--purple); } .p .tag { background: var(--purple-bg); color: var(--purple); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin-top: .6rem; }
+  .cell { border: 1px dashed var(--line); border-radius: 8px; padding: .7rem .8rem; background: #fafbfc; }
+  .cell b { font-size: .85rem; display: block; margin-bottom: .2rem; }
+  .cell p { font-size: .8rem; }
+  code { background: #f1f5f9; border: 1px solid var(--line); border-radius: 4px; padding: .05rem .35rem; font-size: .8rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: #f8fafc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .check { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; }
+  .check li { margin-bottom: .55rem; font-size: .9rem; }
+  .check ol { padding-left: 1.3rem; }
+  .pill { font-weight: 700; }
+  .pill.on { color: var(--green); } .pill.off { color: var(--red); }
+  @media (max-width: 640px) { .split { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GTR Expense Pipeline</h1>
+  <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, and where the money data lives. Goal: answer "are we profitable, is cash flow good" daily.</p>
+
+  <div class="stage g">
+    <span class="tag">1 · Purchase</span>
+    <h3>Money leaves the bank</h3>
+    <p>Nearly all purchases hit the <b>Washington Trust debit cards</b> (CJ …8516, Richard …6098), plus checks, Venmo and Cash App payments to helpers.</p>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage g">
+    <span class="tag">2 · Receipt intake (every 10 min, Google Apps Script)</span>
+    <h3>Receipts land in Google Drive</h3>
+    <div class="split">
+      <div class="cell"><b>Email intake</b><p>Receipt emails to rlord@ (Lowe's, Home Depot, Amazon…) are pulled automatically and saved into the "New Receipts &amp; Checks" Drive folder.</p></div>
+      <div class="cell"><b>Manual drop</b><p>Anyone can drop a photo/PDF straight into the intake folder. <i>Coming: field crew photo via the ProBuild mobile app.</i></p></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage g">
+    <span class="tag">3 · AI processing (every 10 min, Gemini)</span>
+    <h3>Receipt is read, named, deduped, sent to QuickBooks</h3>
+    <ul>
+      <li>Gemini extracts vendor, date, invoice #, amount, and the project hint.</li>
+      <li>File renamed <code>Project_Date_Vendor_Invoice_$Amount</code> and archived by month in Drive.</li>
+      <li>Duplicates quarantined; unreadable items parked in <i>_Needs Review</i> with an alert.</li>
+      <li>Receipt emailed to the QuickBooks receipts inbox with everything pre-filled.</li>
+    </ul>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage b">
+    <span class="tag">4 · QuickBooks — source of record</span>
+    <h3>Marge books it · Vanessa matches it</h3>
+    <p><b>Marge</b> reviews each receipt in QBO and assigns the <b>customer/job on the expense lines</b> (this assignment is what drives everything downstream). <b>Vanessa</b> matches transactions against the bank feed. QuickBooks owns the books — ProBuild never edits money that lives here.</p>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage a">
+    <span class="tag">5 · QBO → ProBuild sync (cron: every 4 hours at :30)</span>
+    <h3>Finalized expenses flow into ProBuild job costs</h3>
+    <ul>
+      <li><b>Job match:</b> the QBO customer maps to exactly one <i>In&nbsp;Progress</i> ProBuild project — by id first, then name. It never guesses; ambiguity = visible skip.</li>
+      <li><b>Overhead triage:</b> purchases with <i>no customer</i> import into the <b>Shop</b> project tagged <code>[Overhead]</code>. Assign the real customer in QBO later and the expense <i>auto-moves</i> to that job on the next sync. Owner draws (equity/distributions) are excluded entirely.</li>
+      <li><b>Corrections flow through:</b> voids, deletions, and refunds in QBO zero out the ProBuild copy automatically.</li>
+      <li><b>Receipts come along:</b> the QBO attachment is copied into ProBuild's own storage — viewable in ProBuild with no QuickBooks login. Missing one? Upload it yourself with the paperclip button.</li>
+      <li><b>Idempotent:</b> keyed by QBO transaction id — rerunning anything can never double-import.</li>
+    </ul>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage p">
+    <span class="tag">6 · ProBuild — job costing &amp; daily visibility</span>
+    <h3>Where you look</h3>
+    <div class="split">
+      <div class="cell"><b>Per project</b><p>Project → Time &amp; Expenses → Expenses tab, and Financial Overview (cash flow, margin). Imported rows say "Finalized in QuickBooks" and are read-only.</p></div>
+      <div class="cell"><b>Company-wide</b><p>Manager → Bookkeeper Review Queue (audit trail of every import). <i>Coming next: Company Financials rollup under Reports — all jobs + overhead, profitability and cash flow in one screen.</i></p></div>
+    </div>
+  </div>
+
+  <h2>The cron, precisely</h2>
+  <table>
+    <tr><th>What</th><th>Value</th></tr>
+    <tr><td>Schedule</td><td><code>30 */4 * * *</code> — 12:30, 4:30, 8:30 AM/PM (UTC), every day</td></tr>
+    <tr><td>What it does</td><td>Incremental sync using QBO change tracking (7-day rolling lookback) — catches new purchases, backdated entries, edits, voids, deletions</td></tr>
+    <tr><td>Kill switch</td><td>Vercel env <code>QBO_EXPENSE_SYNC_CRON_ENABLED</code> — currently <span class="pill off">false (off)</span> until you sign off; flipping to <code>true</code> + redeploy turns it on</td></tr>
+    <tr><td>Manual backfill</td><td><code>node scripts/run-qbo-backfill.mjs [since] [until]</code> — month-chunked, runs twice to prove idempotency</td></tr>
+    <tr><td>Overhead bucket</td><td>Env <code>QBO_EXPENSE_OVERHEAD_PROJECT_ID</code> → the "Shop" project. If misconfigured, the sync skips safely instead of touching anything.</td></tr>
+  </table>
+
+  <h2>Your test drive</h2>
+  <div class="check">
+    <ol>
+      <li><b>Backfill May–July:</b> run the backfill command (Claude gives it to you) and watch imported/skipped counts per month.</li>
+      <li><b>Shop overhead:</b> open the Shop project → Time &amp; Expenses → Expenses. You should see <code>[Overhead]</code> rows (utilities, software, fuel…). No haircuts — owner draws are excluded.</li>
+      <li><b>Receipts:</b> open Mesplay Kitchen → Expenses. Rows with a QBO attachment show a receipt link — click one, it opens with no QuickBooks login. Try the paperclip to upload one yourself.</li>
+      <li><b>Self-healing move:</b> in QBO, assign a customer (say Mesplay Kitchen) to one Shop overhead purchase, then rerun the backfill — the expense should move from Shop to Mesplay automatically.</li>
+      <li><b>Audit trail:</b> Manager → Bookkeeper Review Queue — every import listed read-only with its QBO transaction id.</li>
+      <li><b>Sign off:</b> tell Claude "enable the cron" — from then on it's hands-free every 4 hours.</li>
+    </ol>
+  </div>
+
+  <h2>What's next on the roadmap</h2>
+  <table>
+    <tr><th>Piece</th><th>What it adds</th></tr>
+    <tr><td>Company Financials rollup</td><td>One screen under Reports: profitability + cash flow across every job and overhead</td></tr>
+    <tr><td>Receipt bot → QBO API</td><td>Bot creates the expense in QBO directly — job assigned at line level, receipt attached, ready for bank match. Marge only reviews.</td></tr>
+    <tr><td>Mobile app field capture</td><td>Crew photographs receipts + clocks time on the job; both feed the same pipeline</td></tr>
+  </table>
+</div>
+</body>
+</html>

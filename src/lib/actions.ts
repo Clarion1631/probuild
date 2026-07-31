@@ -28,6 +28,10 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import {
+    applySuggestedDecision as aiSortApplySuggestedDecision,
+    dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
+} from "./selection-ai-sort-apply-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
@@ -37,6 +41,7 @@ import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { autoAssignPhasesForEstimate } from "./auto-assign-phases";
 import { publishDispatch } from "./dispatch-publication";
 import type { DispatchIntent } from "./dispatch-intent";
 import type { PublishDispatchResult } from "./dispatch-publication";
@@ -69,6 +74,14 @@ import {
 } from "./schedule-task-core";
 import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
+import { normalizeSelectionItemNote } from "./selection-item-notes";
+import { persistSelectionItemNote } from "./selection-item-note-persistence";
+import {
+    markSelectionItemThreadRead as markSelectionItemThreadReadCore,
+    parseThreadAttachments,
+    unreadThreadCommentCount,
+} from "./selection-item-thread-core";
+import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
 
@@ -2388,6 +2401,23 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         console.error("[approveEstimate] post-approval automation failed:", e);
     }
 
+    // Backstop: an approved estimate is about to be worked by crew, whose
+    // clock-in is blocked on cost-coded line items. saveEstimate already
+    // auto-codes on every save, but cover the approval path too in case items
+    // were added some other way. Scheduled post-response via after() so this
+    // Anthropic call never blocks the signature/approval flow. after() throws
+    // synchronously outside a request scope (direct invocation/scripts) — fall
+    // back to a caught floating promise so the approval itself never fails here.
+    const autoAssignAfterApprove = () =>
+        autoAssignPhasesForEstimate(estimateId).catch((e) =>
+            console.error("[approveEstimate] auto-assign phases failed:", e instanceof Error ? e.message : e)
+        );
+    try {
+        after(autoAssignAfterApprove);
+    } catch {
+        void autoAssignAfterApprove();
+    }
+
     await logActivity({
         projectId: estimate?.projectId,
         leadId: estimate?.leadId,
@@ -3162,6 +3192,24 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         revalidatePath(`/leads/${contextId}`);
         revalidatePath(`/leads/${contextId}/estimates/${estimateId}`);
     }
+
+    // Auto-code any newly added line items so crew clock-in (which requires
+    // cost-coded items) isn't blocked on someone remembering to click
+    // "Auto-Assign Phases". Scheduled post-response via after() (not a bare
+    // floating promise, which serverless can kill before it finishes) —
+    // fail-soft, errors are logged inside the helper, not thrown here. after()
+    // throws synchronously outside a request scope (direct invocation/scripts)
+    // — fall back to a caught floating promise so the save itself never fails.
+    const autoAssignAfterSave = () =>
+        autoAssignPhasesForEstimate(estimateId).catch((e) =>
+            console.error("[saveEstimate] auto-assign phases failed:", e instanceof Error ? e.message : e)
+        );
+    try {
+        after(autoAssignAfterSave);
+    } catch {
+        void autoAssignAfterSave();
+    }
+
     return result;
 }
 
@@ -10256,6 +10304,7 @@ export async function submitSelectionProposal(projectId: string, data: {
     const manualName = data.name?.trim();
     const url = data.url?.trim();
     if (!manualName && !url) throw new Error("A name or a product link is required");
+    const clientNote = normalizeSelectionItemNote(data.clientNote ?? "");
 
     let validDecisionId: string | null = null;
     if (data.decisionId) {
@@ -10296,7 +10345,7 @@ export async function submitSelectionProposal(projectId: string, data: {
             imageUrl: safeUrlOrNull(data.imageUrl) || safeUrlOrNull(parsed?.imageUrl),
             price: clampedListPrice ?? parsed?.price ?? null,
             vendorUrl: safeUrlOrNull(url) || safeUrlOrNull(parsed?.vendorUrl),
-            clientNote: data.clientNote?.trim() || null,
+            clientNote,
             status: "Idea",
             decisionId: validDecisionId,
         },
@@ -10340,8 +10389,11 @@ export async function submitSelectionProposal(projectId: string, data: {
     revalidatePath(`/projects/${projectId}/selections`);
 
     // Price is PM-side info until approval — never return it to the client.
+    // AI-suggestion fields are staff-only too (the portal never shows
+    // suggestions) — always null on a freshly created row, but stripped
+    // explicitly here so this return never depends on that being true.
     const { price, ...proposalWithoutPrice } = proposal;
-    return proposalWithoutPrice;
+    return stripSuggestionFields(proposalWithoutPrice);
 }
 
 export async function getSelectionProposalsForPortal(projectId: string) {
@@ -10354,8 +10406,9 @@ export async function getSelectionProposalsForPortal(projectId: string) {
     // Approved/Chosen" (docs/specs/client-selections-playground.md, "Decisions
     // locked with Justin": GTR controls whether a number appears). Stricter
     // than the old behavior here, which returned price once a proposal was
-    // Approved.
-    return proposals.map((p) => ({ ...p, price: null }));
+    // Approved. AI-suggestion fields are staff-only for the same reason
+    // (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+    return proposals.map((p) => stripSuggestionFields({ ...p, price: null }));
 }
 
 export async function getSelectionProposals(projectId: string) {
@@ -10595,17 +10648,17 @@ export async function decideSelectionProposal(proposalId: string, input: {
  * callers fall through to assertPortalProjectOwnership, the same gate every
  * other client-facing selections action in this file uses.
  */
-async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; actorName: string }> {
+export async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: boolean; clientId: string | null; userId: string | null; actorName: string }> {
     const staffUser = await getCurrentUserWithPermissions();
     if (staffUser) {
         if (!canAccessProject(staffUser, projectId)) throw new Error("Forbidden");
-        return { isStaff: true, clientId: null, actorName: staffUser.name || staffUser.email };
+        return { isStaff: true, clientId: null, userId: staffUser.id, actorName: staffUser.name || staffUser.email };
     }
     if (await canUseDevAuthFallback()) {
         const devSession = await getSessionOrDev();
         const devRole = (devSession?.user as { role?: string } | undefined)?.role;
         if (devRole) {
-            return { isStaff: true, clientId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
+            return { isStaff: true, clientId: null, userId: null, actorName: (devSession?.user as { name?: string } | undefined)?.name || "Team" };
         }
     }
     const { clientId } = await assertPortalProjectOwnership(projectId);
@@ -10614,7 +10667,7 @@ async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: 
         const client = await prisma.client.findUnique({ where: { id: clientId }, select: { name: true } });
         if (client?.name) actorName = client.name;
     }
-    return { isStaff: false, clientId, actorName };
+    return { isStaff: false, clientId, userId: null, actorName };
 }
 
 /** Strip price from a SelectionProposal for any client-facing read — no
@@ -10622,6 +10675,17 @@ async function assertDecisionActorAccess(projectId: string): Promise<{ isStaff: 
  * "Decisions locked with Justin": GTR controls whether a number appears). */
 function stripProposalPrice<T extends { price?: unknown }>(item: T): Omit<T, "price"> {
     const { price, ...rest } = item;
+    return rest;
+}
+
+/** Strip AI Auto-Sort suggestion fields from any client-facing read — no
+ * exceptions (docs/superpowers/plans/2026-07-30-selection-ai-sort.md: "the
+ * portal never shows suggestions"). Applied to every portal-facing
+ * SelectionProposal read, alongside stripProposalPrice above. */
+function stripSuggestionFields<T extends { suggestedDecisionId?: unknown; suggestedAt?: unknown }>(
+    item: T,
+): Omit<T, "suggestedDecisionId" | "suggestedAt"> {
+    const { suggestedDecisionId, suggestedAt, ...rest } = item;
     return rest;
 }
 
@@ -10652,18 +10716,66 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => stripProposalPrice(normalizeProposal(c))) })),
-        unsorted: unsorted.map((p) => stripProposalPrice(normalizeProposal(p))),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)) })),
+        unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
     };
 }
+
+// Attaches parsed comments + the viewer-side unread count to a candidate for
+// the thread UI (SelectionItemThread). Shared shape between the staff read
+// (below) and the portal read (getProjectDecisionsForPortal). Only the
+// fields the UI type actually needs are sent to the browser — internal ids
+// (authorUserId/authorClientId) and the opposite side's read timestamps
+// never leave the server; unreadThreadCount is derived from them here
+// instead of shipping them raw.
+function withThreadSummary<T extends { comments: {
+    id: string; authorType: string;
+    authorName: string; body: string; attachments: string | null; readByTeamAt: Date | null;
+    readByClientAt: Date | null; createdAt: Date;
+}[] }>(candidate: T, isStaff: boolean) {
+    const { comments, ...rest } = candidate;
+    return {
+        ...rest,
+        comments: comments.map((c) => ({
+            id: c.id,
+            authorType: c.authorType,
+            authorName: c.authorName,
+            body: c.body,
+            attachments: parseThreadAttachments(c.attachments),
+            createdAt: c.createdAt,
+        })),
+        unreadThreadCount: unreadThreadCommentCount(comments, isStaff),
+    };
+}
+
+// authorUserId/authorClientId are deliberately NOT selected — nothing after
+// this fetch needs them (unreadThreadCommentCount only reads
+// authorType/readByTeamAt/readByClientAt), and withThreadSummary's job is to
+// keep internal ids out of the portal/staff payload in the first place.
+const CANDIDATE_COMMENTS_INCLUDE = {
+    comments: {
+        orderBy: { createdAt: "asc" as const },
+        select: {
+            id: true,
+            authorType: true,
+            authorName: true,
+            body: true,
+            attachments: true,
+            readByTeamAt: true,
+            readByClientAt: true,
+            createdAt: true,
+        },
+    },
+};
 
 export async function getProjectDecisions(projectId: string) {
     const user = await assertActiveStaff();
@@ -10675,16 +10787,17 @@ export async function getProjectDecisions(projectId: string) {
         prisma.decision.findMany({
             where: { projectId, deletedAt: null },
             orderBy: { sortOrder: "asc" },
-            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" } } },
+            include: { candidates: { where: { deletedAt: null }, orderBy: { createdAt: "asc" }, include: CANDIDATE_COMMENTS_INCLUDE } },
         }),
         prisma.selectionProposal.findMany({
             where: { projectId, decisionId: null, deletedAt: null },
+            include: CANDIDATE_COMMENTS_INCLUDE,
             orderBy: { createdAt: "desc" },
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map(normalizeProposal) })),
-        unsorted: unsorted.map(normalizeProposal),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
+        unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
 }
 
@@ -10727,6 +10840,70 @@ export async function renameDecision(decisionId: string, name: string) {
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
     return updated;
+}
+
+export async function updateSelectionItemNote(
+    itemId: string,
+    note: string,
+): Promise<{ success: true; note: string | null }> {
+    return persistSelectionItemNote(itemId, note, {
+        findItem: (id) =>
+            prisma.selectionProposal.findUnique({
+                where: { id },
+                select: { id: true, projectId: true, deletedAt: true },
+            }),
+        assertAccess: assertDecisionActorAccess,
+        updateNote: async (id, normalizedNote) => {
+            // CAS on deletedAt: the findItem check above is non-atomic with
+            // this write, so a concurrent soft-delete must make the update
+            // match zero rows rather than land a note on a deleted item.
+            const updated = await prisma.selectionProposal.updateMany({
+                where: { id, deletedAt: null },
+                data: { clientNote: normalizedNote },
+            });
+            if (updated.count === 0) {
+                throw new Error("Item not found");
+            }
+        },
+        revalidate: (projectId) => {
+            revalidatePath(`/projects/${projectId}/selections`);
+            revalidatePath(`/portal/projects/${projectId}/selections`);
+        },
+    });
+}
+
+/** Marks only the comment ids the viewer actually rendered as read for their
+ * side. Called from the UI when a thread is expanded. */
+export async function markSelectionItemThreadRead(itemId: string, seenCommentIds: string[]): Promise<void> {
+    return markSelectionItemThreadReadCore(itemId, seenCommentIds, {
+        findItem: findThreadItem,
+        assertAccess: assertDecisionActorAccess,
+        markRead: async (proposalId, seenIds, isStaff) => {
+            // Mirrors the decision-soft-delete guard in createComment
+            // (selection-item-thread-dependencies.ts): findThreadItem's
+            // check up front and this write are not atomic with each other,
+            // so a decision soft-deleted in that window must still make this
+            // match zero rows rather than mark a since-invisible thread read.
+            const visibleProposal = { OR: [{ decisionId: null }, { decision: { deletedAt: null } }] };
+            if (isStaff) {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByTeamAt: null, proposal: visibleProposal },
+                    data: { readByTeamAt: new Date() },
+                });
+            } else {
+                await prisma.selectionItemComment.updateMany({
+                    where: { proposalId, id: { in: seenIds }, readByClientAt: null, proposal: visibleProposal },
+                    data: { readByClientAt: new Date() },
+                });
+            }
+        },
+        revalidate: (projectId) => {
+            revalidatePath(`/projects/${projectId}/selections`);
+            revalidatePath(`/portal/projects/${projectId}/selections`);
+            revalidatePath(`/projects/${projectId}`, "layout");
+            revalidatePath(`/portal/projects/${projectId}`);
+        },
+    });
 }
 
 export async function reorderDecisions(projectId: string, orderedIds: string[]) {
@@ -10829,7 +11006,10 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
                     { status: { in: ["Chosen", "Approved"] }, decisionId },
                 ],
             },
-            data: { decisionId },
+            // An assigned (or manually re-filed) item carries no stale AI
+            // chip — clear the suggestion in the same write
+            // (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+            data: { decisionId, suggestedDecisionId: null, suggestedAt: null },
         });
         if (claim.count === 0) {
             throw new Error("Un-choose this item before moving it to a different decision.");
@@ -10839,6 +11019,20 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
     revalidatePath(`/projects/${item.projectId}/selections`);
     revalidatePath(`/portal/projects/${item.projectId}/selections`);
     return { success: true };
+}
+
+// ── AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md) ──
+// Thin "use server" wrappers — the CAS logic lives in
+// selection-ai-sort-apply-core.ts (a plain module, no "server-only"
+// transitively) so it's importable directly by tests, the same split
+// selection-item-thread-core.ts/selection-item-note-persistence-core.ts use.
+
+export async function applySuggestedDecision(itemId: string, decisionId: string): Promise<{ applied: boolean }> {
+    return aiSortApplySuggestedDecision(itemId, decisionId);
+}
+
+export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
+    return aiSortDismissSelectionSuggestion(itemId);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
@@ -11308,6 +11502,7 @@ export async function addTeamCandidate(decisionId: string | null, data: {
     imageUrl?: string;
     price?: number;
     vendorUrl?: string;
+    clientNote?: string;
     projectId?: string;
 }) {
     const user = await assertActiveStaff();
@@ -11337,6 +11532,7 @@ export async function addTeamCandidate(decisionId: string | null, data: {
             imageUrl: safeUrlOrNull(data.imageUrl),
             price: data.price ?? null,
             vendorUrl: safeUrlOrNull(data.vendorUrl),
+            clientNote: normalizeSelectionItemNote(data.clientNote ?? ""),
             status: "Idea",
         },
     });

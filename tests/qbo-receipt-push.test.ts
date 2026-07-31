@@ -1,0 +1,513 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createHash } from "node:crypto";
+import {
+    createQBReceiptPurchase,
+    ensureQBVendor,
+    QboVendorDuplicateError,
+    QboPurchaseFaultError,
+    type CreateQBReceiptPurchaseInput,
+    type QboReceiptProjectCandidate,
+    type QboReceiptPushDependencies,
+    type ReceiptAttachmentStatus,
+} from "../src/lib/qbo-receipt-push";
+import {
+    createQboReceiptCreateHandlers,
+    type QboReceiptCreateHandlerDependencies,
+} from "../src/app/api/integrations/qbo-receipts/create/route";
+
+const TOKENS = {
+    accessToken: "test-access",
+    refreshToken: "test-refresh",
+    realmId: "test-realm",
+};
+
+const BANK_ACCOUNT_ID = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || "154";
+const EXPENSE_ACCOUNT_ID = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || "98";
+
+const PROJECT: QboReceiptProjectCandidate = { id: "project-1", name: "Mueller Remodel" };
+
+function baseInput(overrides: Partial<CreateQBReceiptPurchaseInput> = {}): CreateQBReceiptPurchaseInput {
+    return {
+        projectName: "Mueller Remodel",
+        vendor: "Home Depot",
+        date: "2026-07-15",
+        invoice: "INV-100",
+        totalAmount: 150,
+        fileId: "1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890",
+        fileName: "receipt.jpg",
+        groups: [{ category: "03 Plumbing", amount: 150, lines: [{ desc: "PVC pipe" }] }],
+        ...overrides,
+    };
+}
+
+/** The account-identity check runs against whatever id was queried — return the shape it expects for either. */
+function defaultAccountRow(query: string): Array<{ Id: string; Name: string; AccountType: string }> {
+    if (query.includes(`'${BANK_ACCOUNT_ID}'`)) {
+        return [{ Id: BANK_ACCOUNT_ID, Name: "Washington Trust Bank", AccountType: "Bank" }];
+    }
+    if (query.includes(`'${EXPENSE_ACCOUNT_ID}'`)) {
+        return [{ Id: EXPENSE_ACCOUNT_ID, Name: "COGS Supplies & materials", AccountType: "Cost of Goods Sold" }];
+    }
+    return [];
+}
+
+interface DepsOverrides {
+    existingRows?: Array<{ Id: string; PrivateNote?: string }>;
+    createdId?: string;
+    customerId?: string;
+    vendorId?: string;
+    vendorImpl?: QboReceiptPushDependencies["ensureVendorFn"];
+    projects?: QboReceiptProjectCandidate[];
+    uploadAttachment?: QboReceiptPushDependencies["uploadAttachment"];
+    accountRows?: (query: string) => Array<Record<string, unknown>>;
+}
+
+function createDeps(overrides: DepsOverrides = {}) {
+    const calls = {
+        queries: [] as string[],
+        creates: [] as Array<{ payload: Record<string, unknown>; requestId: string }>,
+        vendorCalls: [] as string[],
+        customerCalls: [] as string[],
+    };
+    const deps: Partial<QboReceiptPushDependencies> = {
+        qbQueryFn: async (_tokens: unknown, query: string) => {
+            calls.queries.push(query);
+            if (/FROM Account/i.test(query)) {
+                return (overrides.accountRows?.(query) ?? defaultAccountRow(query)) as never[];
+            }
+            return (overrides.existingRows ?? []) as never[];
+        },
+        qbCreateFn: async (_tokens, payload, requestId) => {
+            calls.creates.push({ payload, requestId });
+            return { id: overrides.createdId ?? "purchase-1" };
+        },
+        ensureVendorFn:
+            overrides.vendorImpl ??
+            (async (_tokens, name: string) => {
+                calls.vendorCalls.push(name);
+                return overrides.vendorId ?? "vendor-1";
+            }),
+        ensureCustomerFn: async (_tokens, client) => {
+            calls.customerCalls.push(client.name);
+            return overrides.customerId ?? "cust-1";
+        },
+        listProjects: async () => overrides.projects ?? [PROJECT],
+        uploadAttachment:
+            overrides.uploadAttachment ??
+            (async () => "attached" as ReceiptAttachmentStatus),
+    };
+    return { deps, calls };
+}
+
+// ─── Idempotency ────────────────────────────────────────────────────────────
+
+test("createQBReceiptPurchase short-circuits when the DocNumber and marker both match", async () => {
+    const input = baseInput();
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps, calls } = createDeps({ existingRows: [{ Id: "purchase-99", PrivateNote: `note ${marker}` }] });
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.deepEqual(result, {
+        ok: true,
+        qbPurchaseId: "purchase-99",
+        docNumber: input.fileId.slice(0, 21),
+        alreadyExists: true,
+    });
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.customerCalls.length, 0);
+});
+
+test("createQBReceiptPurchase returns docnumber-conflict when the DocNumber matches but the full-fileId marker doesn't", async () => {
+    const input = baseInput();
+    const { deps, calls } = createDeps({ existingRows: [{ Id: "purchase-99", PrivateNote: "an unrelated purchase" }] });
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.deepEqual(result, { ok: false, reason: "docnumber-conflict", docNumber: input.fileId.slice(0, 21) });
+    assert.equal(calls.creates.length, 0);
+});
+
+test("createQBReceiptPurchase treats multiple DocNumber matches as a conflict", async () => {
+    const input = baseInput();
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps, calls } = createDeps({
+        existingRows: [
+            { Id: "purchase-1", PrivateNote: marker },
+            { Id: "purchase-2", PrivateNote: marker },
+        ],
+    });
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, "docnumber-conflict");
+    assert.equal(calls.creates.length, 0);
+});
+
+// ─── Exact project match ────────────────────────────────────────────────────
+
+test("createQBReceiptPurchase requires an EXACT project name match — a near-miss is not matched", async () => {
+    const { deps, calls } = createDeps({ projects: [{ id: "p1", name: "Smith Bathroom" }] });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({ projectName: "Smith Kitchen" }), deps);
+
+    assert.deepEqual(result, { ok: false, reason: "project-not-matched", projectName: "Smith Kitchen" });
+    assert.equal(calls.creates.length, 0);
+});
+
+test("createQBReceiptPurchase matches on normalized whitespace/case only", async () => {
+    const { deps } = createDeps({ projects: [{ id: "p1", name: "Mueller Remodel" }] });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({ projectName: "  mueller   remodel  " }), deps);
+    assert.equal(result.ok, true);
+});
+
+test("createQBReceiptPurchase refuses an ambiguous exact match across two identically-named projects", async () => {
+    const { deps } = createDeps({
+        projects: [{ id: "p1", name: "Shop" }, { id: "p2", name: "Shop" }],
+    });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({ projectName: "Shop" }), deps);
+    assert.deepEqual(result, { ok: false, reason: "project-not-matched", projectName: "Shop" });
+});
+
+// ─── Required fields ────────────────────────────────────────────────────────
+
+test("createQBReceiptPurchase treats a missing/empty/Unknown vendor as terminal", async () => {
+    for (const vendor of [undefined, "", "   ", "Unknown", "unknown"]) {
+        const { deps, calls } = createDeps();
+        const result = await createQBReceiptPurchase(TOKENS, baseInput({ vendor }), deps);
+        assert.deepEqual(result, { ok: false, reason: "missing-vendor" });
+        assert.equal(calls.creates.length, 0);
+        assert.equal(calls.vendorCalls.length, 0);
+    }
+});
+
+test("createQBReceiptPurchase requires a present, calendar-valid date with no fallback", async () => {
+    for (const date of [undefined, "", "07/15/2026", "2026-02-30", "not-a-date"]) {
+        const { deps, calls } = createDeps();
+        const result = await createQBReceiptPurchase(TOKENS, baseInput({ date }), deps);
+        assert.deepEqual(result, { ok: false, reason: "invalid-date" });
+        assert.equal(calls.creates.length, 0);
+    }
+});
+
+// ─── Money validation ───────────────────────────────────────────────────────
+
+test("createQBReceiptPurchase rejects a negative or non-finite included group amount", async () => {
+    const { deps: deps1, calls: calls1 } = createDeps();
+    const result1 = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ groups: [{ category: "03 Plumbing", amount: -50 }], totalAmount: -50 }),
+        deps1,
+    );
+    assert.deepEqual(result1, { ok: false, reason: "invalid-group-amount" });
+    assert.equal(calls1.creates.length, 0);
+
+    const { deps: deps2, calls: calls2 } = createDeps();
+    const result2 = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ groups: [{ category: "03 Plumbing", amount: Number.NaN }] }),
+        deps2,
+    );
+    assert.deepEqual(result2, { ok: false, reason: "invalid-group-amount" });
+    assert.equal(calls2.creates.length, 0);
+});
+
+test("createQBReceiptPurchase requires a finite, positive totalAmount", async () => {
+    const { deps, calls } = createDeps();
+    const result = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ totalAmount: undefined as unknown as number }),
+        deps,
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, "amount-mismatch");
+    assert.equal(calls.creates.length, 0);
+});
+
+test("createQBReceiptPurchase rejects a group sum that drifts from totalAmount by more than 2 cents", async () => {
+    const { deps, calls } = createDeps();
+    const result = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ totalAmount: 200, groups: [{ category: "03 Plumbing", amount: 150 }] }),
+        deps,
+    );
+
+    assert.equal(result.ok, false);
+    if (!result.ok && result.reason === "amount-mismatch") {
+        assert.equal(result.groupsSum, 150);
+        assert.equal(result.totalAmount, 200);
+    } else {
+        assert.fail("expected amount-mismatch");
+    }
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.customerCalls.length, 0);
+});
+
+// ─── Happy path / payload shape ─────────────────────────────────────────────
+
+test("createQBReceiptPurchase builds the payload with a requestid derived from the full fileId and line-level CustomerRef, skipping zero-amount groups", async () => {
+    const { deps, calls } = createDeps();
+    const input = baseInput({
+        groups: [
+            { category: "03 Plumbing", amount: 100, lines: [{ desc: "PVC pipe" }, { desc: "Fittings" }] },
+            { category: "05 Electrical", amount: 0 },
+            { category: "10 Paint", amount: 50 },
+        ],
+        totalAmount: 150,
+    });
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok, true);
+    if (result.ok && !result.alreadyExists) {
+        assert.equal(result.qbPurchaseId, "purchase-1");
+        assert.equal(result.docNumber, input.fileId.slice(0, 21));
+        assert.equal(result.attachment, "skipped"); // no fileBase64 supplied
+    } else {
+        assert.fail("expected a fresh create");
+    }
+
+    assert.equal(calls.creates.length, 1);
+    const { payload, requestId } = calls.creates[0];
+    const expectedRequestId = createHash("sha256").update(input.fileId).digest("hex").slice(0, 50);
+    assert.equal(requestId, expectedRequestId);
+
+    assert.equal(payload.DocNumber, input.fileId.slice(0, 21));
+    const lines = payload.Line as Array<{ AccountBasedExpenseLineDetail: { CustomerRef: { value: string } } }>;
+    assert.equal(lines.length, 2); // the $0 Electrical group is skipped
+    for (const line of lines) {
+        assert.equal(line.AccountBasedExpenseLineDetail.CustomerRef.value, "cust-1");
+    }
+    assert.match(payload.PrivateNote as string, /\[gtr-file:1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890\]/);
+    assert.equal((payload.EntityRef as { value: string }).value, "vendor-1");
+    assert.equal(calls.vendorCalls[0], "Home Depot");
+    assert.equal(calls.customerCalls[0], "Mueller Remodel"); // customer resolved by PROJECT name, not client
+});
+
+test("createQBReceiptPurchase attaches a small image receipt", async () => {
+    const uploads: Array<{ purchaseId: string }> = [];
+    const { deps } = createDeps({
+        uploadAttachment: async (_tokens, purchaseId) => {
+            uploads.push({ purchaseId });
+            return "attached";
+        },
+    });
+    const result = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ fileBase64: Buffer.from("hello receipt").toString("base64"), fileContentType: "image/jpeg" }),
+        deps,
+    );
+    assert.equal(result.ok, true);
+    if (result.ok && !result.alreadyExists) {
+        assert.equal(result.attachment, "attached");
+    } else {
+        assert.fail("expected a fresh create");
+    }
+    assert.equal(uploads.length, 1);
+});
+
+test("createQBReceiptPurchase treats an attachment failure as non-fatal", async () => {
+    const { deps } = createDeps({
+        uploadAttachment: async () => {
+            throw new Error("boom");
+        },
+    });
+    const result = await createQBReceiptPurchase(
+        TOKENS,
+        baseInput({ fileBase64: Buffer.from("hello receipt").toString("base64"), fileContentType: "image/jpeg" }),
+        deps,
+    );
+    assert.equal(result.ok, true);
+    if (result.ok && !result.alreadyExists) {
+        assert.match(result.attachment, /^failed:/);
+    } else {
+        assert.fail("expected a fresh create");
+    }
+});
+
+// ─── Vendor 6240 duplicate-name recovery ───────────────────────────────────
+
+test("createQBReceiptPurchase maps a QboVendorDuplicateError to a terminal duplicate-name result", async () => {
+    const { deps, calls } = createDeps({
+        vendorImpl: async () => {
+            throw new QboVendorDuplicateError("Home Depot");
+        },
+    });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput(), deps);
+    assert.deepEqual(result, { ok: false, reason: "duplicate-name" });
+    assert.equal(calls.creates.length, 0);
+});
+
+test("ensureQBVendor recovers from a 6240 duplicate-name fault by re-querying once", async () => {
+    const originalFetch = globalThis.fetch;
+    let queryCount = 0;
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/query?query=")) {
+            queryCount++;
+            if (queryCount <= 2) {
+                // exact DisplayName lookup, then the LIKE-prefix lookup: both miss.
+                return new Response(JSON.stringify({ QueryResponse: {} }), { status: 200 });
+            }
+            // re-query after the 6240 fault — this time it's found.
+            return new Response(JSON.stringify({ QueryResponse: { Vendor: [{ Id: "vendor-42" }] } }), { status: 200 });
+        }
+        if (u.includes("/vendor?") && init?.method === "POST") {
+            return new Response('{"Fault":{"Error":[{"code":"6240","Message":"Duplicate Name Exists Error"}]}}', { status: 400 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as typeof fetch;
+
+    try {
+        const id = await ensureQBVendor(TOKENS, "Home Depot");
+        assert.equal(id, "vendor-42");
+        assert.equal(queryCount, 3);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("ensureQBVendor throws a terminal duplicate-name error when the re-query also misses", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/query?query=")) {
+            return new Response(JSON.stringify({ QueryResponse: {} }), { status: 200 }); // always miss
+        }
+        if (u.includes("/vendor?") && init?.method === "POST") {
+            return new Response('{"Fault":{"Error":[{"code":"6240"}]}}', { status: 400 });
+        }
+        throw new Error(`Unexpected fetch in test: ${u}`);
+    }) as typeof fetch;
+
+    try {
+        await assert.rejects(() => ensureQBVendor(TOKENS, "Ghost Vendor"), QboVendorDuplicateError);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ─── Route: kill switch / auth / failure mapping ───────────────────────────
+
+function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependencies> & { enabled?: boolean; secret?: string } = {}) {
+    return createQboReceiptCreateHandlers({
+        getIngestSecret: overrides.getIngestSecret ?? (() => overrides.secret ?? "ingest-secret"),
+        isPushEnabled: overrides.isPushEnabled ?? (() => overrides.enabled ?? true),
+        getFreshTokens: overrides.getFreshTokens ?? (async () => TOKENS),
+        createPurchase:
+            overrides.createPurchase ??
+            (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true })),
+    });
+}
+
+function validBody() {
+    return JSON.stringify({
+        fileId: "file-1",
+        projectName: "Mueller Remodel",
+        groups: [{ category: "03 Plumbing", amount: 100 }],
+    });
+}
+
+test("route POST returns 200 ok:false when the kill switch is off (valid key)", async () => {
+    const { POST } = createRouteHandlers({ enabled: false });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: "{}",
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "push-disabled" });
+});
+
+test("route POST rejects a missing/invalid ingest key with 401 BEFORE the kill switch", async () => {
+    // Auth outranks the kill switch: a bad key must 401 even while disabled,
+    // so a misconfigured sender is alertable instead of seeing push-disabled.
+    const { POST } = createRouteHandlers({ enabled: false });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: "{}",
+        headers: { "content-type": "application/json" },
+    }));
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { ok: false, reason: "unauthorized" });
+});
+
+test("createQBReceiptPurchase rejects a sub-cent total that would produce a lineless Purchase", async () => {
+    const { deps, calls } = createDeps();
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        totalAmount: 0.001,
+        groups: [{ category: "03 Plumbing", amount: 0.001 }],
+    }), deps);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, "amount-mismatch");
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.customerCalls.length, 0);
+});
+
+test("route POST returns 200 ok:false for invalid JSON", async () => {
+    const { POST } = createRouteHandlers();
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: "not json",
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "invalid-json" });
+});
+
+test("route POST returns 200 ok:false for missing required fields", async () => {
+    const { POST } = createRouteHandlers();
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({}),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "missing-fields" });
+});
+
+test("route POST maps a QBO 400 business fault to 200 ok:false with the fault code as detail", async () => {
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QboPurchaseFaultError(400, "boom", "6190");
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "qbo-fault", detail: "6190" });
+});
+
+test("route POST maps a transient/network error to 500", async () => {
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new Error("fetch failed");
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), { ok: false, reason: "push-failed" });
+});
+
+test("route POST returns 503 when QuickBooks isn't connected (unchanged transient-adjacent case)", async () => {
+    const { QBNotConnectedError } = await import("../src/lib/quickbooks-payments");
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => {
+            throw new QBNotConnectedError();
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, reason: "quickbooks-not-connected" });
+});
