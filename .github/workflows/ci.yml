@@ -99,8 +99,22 @@ jobs:
       NEXT_PUBLIC_APP_URL: http://localhost:3000
       NEXT_PUBLIC_SUPABASE_URL: https://ghzdbzdnwjxazvmcefbh.supabase.co
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      # SUPABASE_URL stays (it's non-secret TRUST config — the SSRF hostname
+      # allowlist in secure-storage.ts and the attachment gate in
+      # client-messages both key off its presence) but the service key is
+      # deliberately gone: storage is hermetic here, like the DB.
+      # E2E_STORAGE_MOCK routes getSupabase() to an in-memory stub
+      # (src/lib/supabase-storage-mock.ts), so e2e never talks to the live
+      # bucket and can't write objects into it. (The prod service key this
+      # job used to get went stale when the key was rotated 2026-07-23, which
+      # broke every storage-dependent spec with "signature verification
+      # failed".)
       SUPABASE_URL: https://ghzdbzdnwjxazvmcefbh.supabase.co
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      E2E_STORAGE_MOCK: "1"
+      # Routes the selection AI features (ai-sort, decision-schedule-link) to
+      # their deterministic mocks. Without it the specs hit the real Anthropic
+      # API on every PR and the forced-failure test marker is inert prose.
+      SELECTION_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}

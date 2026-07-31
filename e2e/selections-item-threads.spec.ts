@@ -4,6 +4,7 @@ import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import { canAccessProject } from "../src/lib/permissions";
 import { postSelectionItemComment } from "../src/lib/selection-item-thread-core";
 import { createComment, getUnreadSelectionThreadCountForStaff } from "../src/lib/selection-item-thread-dependencies";
+import { isE2eStorageMockEnabled } from "../src/lib/supabase";
 
 const prisma = new PrismaClient();
 const run = `selection-threads-${process.pid}-${Date.now()}`;
@@ -312,17 +313,22 @@ test.describe.serial("selection item discussion threads", () => {
   });
 
   // Attachment round-trip. A real multipart upload through saveProjectFile()
-  // needs real Supabase Storage credentials (SUPABASE_URL +
-  // SUPABASE_SERVICE_KEY) — present in CI's Playwright job, but this sandbox
-  // has neither, and per docs/TESTING.md must never be pointed at
-  // production's. The test below runs for real wherever those creds exist
-  // (CI, or a manually configured environment) and is skipped otherwise;
-  // meanwhile denied/invalid-extension posts and the canonical-shape DB
-  // write are provable without Storage at all (both below, always run).
-  const hasRealStorage = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_KEY;
+  // needs working Supabase Storage — either the hermetic in-memory stub
+  // (isE2eStorageMockEnabled(), which is what CI's Playwright job turns on —
+  // see src/lib/supabase-storage-mock.ts) or real credentials (SUPABASE_URL
+  // + SUPABASE_SERVICE_KEY) in a manually configured environment. Per
+  // docs/TESTING.md, never production's. The gate imports the runtime's own
+  // predicate rather than re-deriving it so skip conditions can't drift from
+  // what getSupabase() actually does. The test below is skipped when neither
+  // is available; meanwhile denied/invalid-extension posts and the
+  // canonical-shape DB write are provable without Storage at all (both
+  // below, always run).
+  const hasWorkingStorage =
+    isE2eStorageMockEnabled() ||
+    (!!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_KEY);
 
   test("client posts a real file through the route: shared ProjectFile, provenance, canonical shape, chip renders", async ({ browser }) => {
-    test.skip(!hasRealStorage, "requires real Supabase Storage credentials (SUPABASE_URL + SUPABASE_SERVICE_KEY) — see CI's Playwright job");
+    test.skip(!hasWorkingStorage, "requires working Supabase Storage (E2E_STORAGE_MOCK=1 or SUPABASE_URL + SUPABASE_SERVICE_KEY) — see CI's Playwright job");
 
     const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
     const page = await context.newPage();
@@ -367,10 +373,11 @@ test.describe.serial("selection item discussion threads", () => {
       await card.getByTestId("selection-thread-toggle").click();
       await expect(card.getByTestId(`selection-thread-attachment-${fileId}`)).toContainText("swatch.png");
     } finally {
-      // This test is the only one in the suite that touches real Supabase
-      // Storage (CI's Playwright job has real credentials) — clean up
-      // exactly what it created, by exact id, so nothing accumulates in the
-      // live bucket across runs.
+      // This test is the only one in the suite that writes to Storage (the
+      // in-memory stub in CI, a real bucket where real credentials are
+      // configured) — clean up exactly what it created, by exact id, so
+      // nothing accumulates in a live bucket across runs. Against the stub
+      // the remove is a harmless no-op.
       if (fileId) {
         const file = await prisma.projectFile.findUnique({ where: { id: fileId }, select: { url: true } });
         await prisma.projectFile.delete({ where: { id: fileId } }).catch(() => {});
