@@ -24,9 +24,12 @@ const persistenceCore = readFileSync(
   join(process.cwd(), "src/lib/selection-item-note-persistence-core.ts"),
   "utf8",
 );
+// actions.ts must import the -core module, NOT the server-only wrapper:
+// verify-crew-overlays.ts imports actions.ts as a module under tsx, where the
+// wrapper's "server-only" (a Next build-time alias) cannot resolve.
 assert.match(
   actions,
-  /import \{ persistSelectionItemNote \} from "\.\/selection-item-note-persistence";/,
+  /import \{ persistSelectionItemNote \} from "\.\/selection-item-note-persistence-core";/,
 );
 assert.match(persistence, /import "server-only";/);
 assert.match(
