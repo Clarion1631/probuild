@@ -50,6 +50,11 @@ import {
     setDecisionDueDateOverride as setDecisionDueDateOverrideCore,
 } from "./decision-link-actions-core";
 import { computeEffectiveDueDate, computeLinkState, type DecisionLinkState } from "./decision-due-date";
+import {
+    setDecisionOrderInfo as setDecisionOrderInfoCore,
+    type DecisionOrderInput,
+} from "./decision-order-actions-core";
+import { assessDeliveryRisk, type DeliveryRisk } from "./selection-order-risk";
 import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
@@ -10834,6 +10839,65 @@ function stripDueDateFields<T extends { dueDate?: unknown; scheduleTaskId?: unkn
     return rest;
 }
 
+// ── Order tracking + delivery risk (Phase 4 —
+// docs/superpowers/plans/2026-07-31-selection-order-tracking.md) ──────────
+
+/** STAFF-ONLY enrichment — computed delivery risk, reusing the SAME batched
+ * schedule-task lookup as the due-date derivation above (no new N+1). Only
+ * passes `linkedTaskStartAt` when the schedule link is genuinely live
+ * (linkState === "linked") — a dangling/absent link falls back to
+ * effectiveDueDate inside assessDeliveryRisk itself, per the plan's spec. */
+function attachOrderRisk<T extends {
+    status: string;
+    expectedArrivalAt: Date | null;
+    scheduleTaskId: string | null;
+    effectiveDueDate: Date | null;
+    linkState: DecisionLinkState;
+}>(decision: T, taskStartDateById: Map<string, Date>): T & { risk: DeliveryRisk } {
+    const linkedTaskStartAt =
+        decision.linkState === "linked" && decision.scheduleTaskId
+            ? taskStartDateById.get(decision.scheduleTaskId) ?? null
+            : null;
+    return {
+        ...decision,
+        risk: assessDeliveryRisk({
+            status: decision.status,
+            expectedArrivalAt: decision.expectedArrivalAt,
+            linkedTaskStartAt,
+            effectiveDueDate: decision.effectiveDueDate,
+        }),
+    };
+}
+
+/** Portal-only derived status — {status, expectedArrivalAt} ONLY when the
+ * decision is Ordered/Received; null otherwise (nothing to show). This is
+ * the ONLY order-tracking shape the portal ever receives — no risk, no
+ * orderedBy, no raw orderedAt/expectedArrivalAt (those are removed by
+ * stripOrderFields below, applied AFTER this attach so the derivation still
+ * has the raw expectedArrivalAt to read). */
+type OrderStatusForPortal = { status: string; expectedArrivalAt: Date | null } | null;
+
+function attachOrderStatusForPortal<T extends { status: string; expectedArrivalAt: Date | null }>(
+    decision: T,
+): T & { orderStatusForPortal: OrderStatusForPortal } {
+    const orderStatusForPortal: OrderStatusForPortal =
+        decision.status === "Ordered" || decision.status === "Received"
+            ? { status: decision.status, expectedArrivalAt: decision.expectedArrivalAt }
+            : null;
+    return { ...decision, orderStatusForPortal };
+}
+
+/** Strip the raw order-tracking fields from any client-facing read — the
+ * portal only ever sees the derived orderStatusForPortal, never who ordered
+ * it or the raw timestamps directly (extends stripDueDateFields's pattern —
+ * the negative payload assertion covers all three raw field names). */
+function stripOrderFields<T extends { orderedAt?: unknown; orderedBy?: unknown; expectedArrivalAt?: unknown }>(
+    item: T,
+): Omit<T, "orderedAt" | "orderedBy" | "expectedArrivalAt"> {
+    const { orderedAt, orderedBy, expectedArrivalAt, ...rest } = item;
+    return rest;
+}
+
 /** Deploy-window hazard: the old build stays live while
  * apply-selections-playground.mjs's remap runs, so it can still insert new
  * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
@@ -10874,7 +10938,7 @@ export async function getProjectDecisionsForPortal(projectId: string) {
     const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
         decisions: decisions.map((d) => ({
-            ...stripDueDateFields(attachEffectiveDueDate(d, taskStartDateById)),
+            ...stripOrderFields(stripDueDateFields(attachOrderStatusForPortal(attachEffectiveDueDate(d, taskStartDateById)))),
             candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)),
         })),
         unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
@@ -10951,7 +11015,7 @@ export async function getProjectDecisions(projectId: string) {
     const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
         decisions: decisions.map((d) => ({
-            ...attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById),
+            ...attachOrderRisk(attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById), taskStartDateById),
             candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)),
         })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
@@ -11271,6 +11335,10 @@ export async function linkDecisionToSchedule(
 
 export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
     return setDecisionDueDateOverrideCore(decisionId, dueDate);
+}
+
+export async function setDecisionOrderInfo(decisionId: string, input: DecisionOrderInput) {
+    return setDecisionOrderInfoCore(decisionId, input);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────

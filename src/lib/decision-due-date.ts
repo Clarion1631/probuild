@@ -74,8 +74,13 @@ const DUE_SOON_WINDOW_DAYS = 7;
  * to tomorrow, which would make a decision due "today" render as overdue
  * hours early. Re-anchoring the company-local day key to UTC midnight
  * keeps the diff in daysBetweenUtc apples-to-apples with effectiveDueDate.
+ *
+ * Exported (Phase 4 — Selection Order Tracking,
+ * docs/superpowers/plans/2026-07-31-selection-order-tracking.md): reused by
+ * decision-order-actions-core.ts for the same company-day "today" contract
+ * on the order-date validation, rather than duplicating this math.
  */
-function companyTodayAsUtcMidnight(now: Date): Date {
+export function companyTodayAsUtcMidnight(now: Date): Date {
     return new Date(`${toCompanyDayKey(now)}T00:00:00.000Z`);
 }
 
