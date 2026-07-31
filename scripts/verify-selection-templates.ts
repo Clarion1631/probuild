@@ -2,9 +2,7 @@
 // (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
 // Mirrors scripts/verify-selection-ai-sort.ts's structure: static regex
 // assertions against source files, plus dynamic behavior checks against the
-// real (pure/plain-module) exports. Grows across the feature's commits —
-// this version covers Task 1 (template CRUD + apply); schedule-linking and
-// due-date derivation checks land with Task 2.
+// real (pure/plain-module) exports.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,15 +16,29 @@ import {
     LEAD_TIME_MIN,
     LEAD_TIME_MAX,
 } from "../src/lib/decision-template-core";
+import { computeEffectiveDueDate, dueDateUrgency } from "../src/lib/decision-due-date";
+import {
+    suggestScheduleLinksForDecisions,
+    DecisionLinkUnavailableError,
+    type DecisionLinkDecisionInput,
+    type DecisionLinkTaskInput,
+} from "../src/lib/decision-schedule-link-core";
 
 const root = join(__dirname, "..");
 const read = (rel: string) => readFileSync(join(root, rel), "utf8");
 
 const schema = read("prisma/schema.prisma");
 const applyScript = read("scripts/apply-selection-templates.mjs");
+const templateCore = read("src/lib/decision-template-core.ts");
 const templateCrudCore = read("src/lib/decision-template-crud-core.ts");
 const templateApplyCore = read("src/lib/decision-template-apply-core.ts");
+const linkCore = read("src/lib/decision-schedule-link-core.ts");
+const linkDeps = read("src/lib/decision-schedule-link-dependencies.ts");
+const linkActionsCore = read("src/lib/decision-link-actions-core.ts");
+const aiSortCore = read("src/lib/selection-ai-sort-core.ts");
 const permissions = read("src/lib/permissions.ts");
+const actions = read("src/lib/actions.ts");
+const proxy = read("src/proxy.ts");
 
 // ── Schema / migration ──────────────────────────────────────────────────────
 
@@ -52,6 +64,8 @@ assert.match(templateCrudCore, /isAdminOrManager/, "template CRUD must gate on i
 assert.match(templateCrudCore, /requireAdminOrManager/, "template CRUD must have an admin/manager requirement helper");
 assert.match(templateApplyCore, /canAccessProject/, "applyDecisionTemplate must gate on canAccessProject");
 assert.ok(!/isAdminOrManager/.test(templateApplyCore), "applyDecisionTemplate must NOT be gated by isAdminOrManager (any staff, not admin-only)");
+assert.match(linkActionsCore, /canAccessProject/, "linkDecisionToSchedule must gate on canAccessProject");
+assert.match(linkActionsCore, /isAdminOrManager/, "setDecisionDueDateOverride must gate on isAdminOrManager");
 
 // ── Per-item templateKey + validation caps ──────────────────────────────────
 
@@ -89,4 +103,155 @@ function verifyValidationCaps(): void {
 }
 verifyValidationCaps();
 
-console.log("decision templates (Task 1) contract verified");
+// ── effectiveDueDate compute-on-read + override semantics ──────────────────
+
+function verifyOverrideAlwaysWinsEvenWhenDangling(): void {
+    const override = new Date("2026-05-01T00:00:00.000Z");
+    const effective = computeEffectiveDueDate(
+        { dueDate: override, scheduleTaskId: "dangling-task", leadTimeDays: 5 },
+        new Map(), // task not present — dangling
+    );
+    assert.equal(effective?.toISOString(), override.toISOString(), "manual override must win even when the linked task is dangling");
+}
+
+function verifyDerivationSubtractsLeadTimeInUtc(): void {
+    const startDate = new Date("2026-09-01T00:00:00.000Z");
+    const effective = computeEffectiveDueDate(
+        { dueDate: null, scheduleTaskId: "task-1", leadTimeDays: 14 },
+        new Map([["task-1", startDate]]),
+    );
+    assert.equal(effective?.toISOString().slice(0, 10), "2026-08-18");
+}
+
+function verifyNoLinkOrDanglingYieldsNullNeverError(): void {
+    assert.equal(computeEffectiveDueDate({ dueDate: null, scheduleTaskId: null, leadTimeDays: null }, new Map()), null);
+    assert.equal(computeEffectiveDueDate({ dueDate: null, scheduleTaskId: "gone", leadTimeDays: 5 }, new Map()), null);
+}
+
+function verifyUrgencyThresholds(): void {
+    const now = new Date("2026-01-15T00:00:00.000Z");
+    assert.equal(dueDateUrgency(null, now), null);
+    const overdue = dueDateUrgency(new Date("2026-01-10T00:00:00.000Z"), now);
+    assert.ok(overdue && /overdue/.test(overdue.label) && /red/.test(overdue.className));
+    const dueSoon = dueDateUrgency(new Date("2026-01-20T00:00:00.000Z"), now);
+    assert.ok(dueSoon && /amber/.test(dueSoon.className));
+    const farOut = dueDateUrgency(new Date("2026-03-01T00:00:00.000Z"), now);
+    assert.equal(farOut, null, "more than 7 days out must show no urgency chip");
+}
+
+verifyOverrideAlwaysWinsEvenWhenDangling();
+verifyDerivationSubtractsLeadTimeInUtc();
+verifyNoLinkOrDanglingYieldsNullNeverError();
+verifyUrgencyThresholds();
+
+// ── Schedule-link AI seam: escapeFenceClosers reuse, mock guard reuse,
+//    strict cardinality on decisionId, unknown scheduleTaskId dropped ──────
+
+assert.match(aiSortCore, /export function escapeFenceClosers/, "escapeFenceClosers must be exported from selection-ai-sort-core for reuse");
+assert.match(linkCore, /import\s*\{\s*escapeFenceClosers\s*\}\s*from\s*"\.\/selection-ai-sort-core"/, "decision-schedule-link-core must REUSE escapeFenceClosers, not duplicate it");
+assert.ok(!/function escapeFenceClosers/.test(linkCore), "decision-schedule-link-core must not redefine escapeFenceClosers");
+assert.match(linkDeps, /isSelectionAiMockEnabled/, "decision-schedule-link-dependencies must reuse the AI Auto-Sort mock guard, not duplicate it");
+assert.match(proxy, /selections\\?\/\(\?:item-comments\|ai-sort\|link-schedule\)/, "proxy bypass regex must include link-schedule");
+assert.match(proxy, /api\/selections\/link-schedule/, "proxy matcher must exclude api/selections/link-schedule");
+
+const linkDecisions: DecisionLinkDecisionInput[] = [
+    { id: "d1", name: "Cabinets", area: null },
+    { id: "d2", name: "Countertops", area: null },
+];
+const linkTasks: DecisionLinkTaskInput[] = [
+    { id: "t1", name: "Cabinet Install", startDate: "2026-09-01T00:00:00.000Z", endDate: "2026-09-05T00:00:00.000Z", parentId: null, type: "task" },
+];
+
+async function verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(): Promise<void> {
+    let calls = 0;
+    await assert.rejects(
+        suggestScheduleLinksForDecisions(
+            { decisions: linkDecisions, tasks: linkTasks },
+            {
+                complete: async () => {
+                    calls++;
+                    return JSON.stringify({
+                        suggestions: [
+                            { decisionId: "d1", scheduleTaskId: "t1", leadTimeDays: 5, confidence: "high", reason: "x" },
+                            { decisionId: "d1", scheduleTaskId: null, leadTimeDays: 0, confidence: "low", reason: "dup" },
+                        ],
+                    });
+                },
+            },
+        ),
+        DecisionLinkUnavailableError,
+    );
+    assert.equal(calls, 2, "must retry exactly once on a duplicate decisionId before failing the batch");
+}
+
+async function verifyUnknownScheduleTaskIdIsDroppedNotBatchInvalidating(): Promise<void> {
+    const { suggestions, failedDecisionIds } = await suggestScheduleLinksForDecisions(
+        { decisions: linkDecisions, tasks: linkTasks },
+        {
+            complete: async () =>
+                JSON.stringify({
+                    suggestions: [
+                        { decisionId: "d1", scheduleTaskId: "not-a-real-task", leadTimeDays: 900, confidence: "high", reason: "x" },
+                        { decisionId: "d2", scheduleTaskId: "t1", leadTimeDays: 5, confidence: "medium", reason: "y" },
+                    ],
+                }),
+        },
+    );
+    assert.equal(failedDecisionIds.length, 0, "an unknown scheduleTaskId must not invalidate the batch");
+    const d1 = suggestions.find((s) => s.decisionId === "d1");
+    assert.equal(d1?.scheduleTaskId, null, "an unrecognized scheduleTaskId must be dropped to null");
+    assert.equal(d1?.leadTimeDays, 0, "leadTimeDays must reset to 0 when scheduleTaskId is dropped to null");
+    const d2 = suggestions.find((s) => s.decisionId === "d2");
+    assert.equal(d2?.scheduleTaskId, "t1");
+}
+
+async function verifyLeadTimeDaysIsClampedNotRejected(): Promise<void> {
+    const { suggestions } = await suggestScheduleLinksForDecisions(
+        { decisions: [linkDecisions[0]], tasks: linkTasks },
+        {
+            complete: async () =>
+                JSON.stringify({
+                    suggestions: [{ decisionId: "d1", scheduleTaskId: "t1", leadTimeDays: 9999, confidence: "high", reason: "x" }],
+                }),
+        },
+    );
+    assert.equal(suggestions[0].leadTimeDays, 365, "leadTimeDays must clamp to 365, not reject the suggestion");
+}
+
+async function verifyEmptyDecisionsShortCircuits(): Promise<void> {
+    const result = await suggestScheduleLinksForDecisions(
+        { decisions: [], tasks: linkTasks },
+        { complete: async () => { throw new Error("must not be called"); } },
+    );
+    assert.deepEqual(result, { suggestions: [], failedDecisionIds: [] });
+}
+
+// ── linkDecisionToSchedule CAS contract: never touches dueDate ─────────────
+
+assert.match(linkActionsCore, /data:\s*\{\s*scheduleTaskId,\s*leadTimeDays\s*\}/, "linkDecisionToSchedule must write ONLY scheduleTaskId/leadTimeDays — never dueDate");
+assert.match(linkActionsCore, /data:\s*\{\s*dueDate\s*\}/, "setDecisionDueDateOverride must write ONLY dueDate");
+
+// ── Portal payload stripping: negative assertion covers all three raw
+//    field names (dueDate, scheduleTaskId, leadTimeDays) ────────────────────
+
+assert.match(actions, /function stripDueDateFields</, "actions.ts must define stripDueDateFields");
+const portalDecisionsIdx = actions.indexOf("export async function getProjectDecisionsForPortal(");
+const portalDecisionsSlice = actions.slice(portalDecisionsIdx, portalDecisionsIdx + 1500);
+assert.match(portalDecisionsSlice, /stripDueDateFields\(/, "getProjectDecisionsForPortal must strip raw due-date/link fields");
+const stripDueDateFieldsIdx = actions.indexOf("function stripDueDateFields<");
+const stripDueDateFieldsSlice = actions.slice(stripDueDateFieldsIdx, stripDueDateFieldsIdx + 400);
+assert.match(stripDueDateFieldsSlice, /dueDate/);
+assert.match(stripDueDateFieldsSlice, /scheduleTaskId/);
+assert.match(stripDueDateFieldsSlice, /leadTimeDays/);
+
+Promise.all([
+    verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(),
+    verifyUnknownScheduleTaskIdIsDroppedNotBatchInvalidating(),
+    verifyLeadTimeDaysIsClampedNotRejected(),
+    verifyEmptyDecisionsShortCircuits(),
+])
+    .then(() => console.log("selection templates + schedule-driven due dates contract verified"))
+    .catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+    });

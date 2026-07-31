@@ -43,6 +43,11 @@ import {
     listActiveDecisionTemplatesForApply as listActiveDecisionTemplatesForApplyCore,
     applyDecisionTemplate as applyDecisionTemplateCore,
 } from "./decision-template-apply-core";
+import {
+    linkDecisionToSchedule as linkDecisionToScheduleCore,
+    setDecisionDueDateOverride as setDecisionDueDateOverrideCore,
+} from "./decision-link-actions-core";
+import { computeEffectiveDueDate } from "./decision-due-date";
 import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
@@ -10697,6 +10702,51 @@ function stripSuggestionFields<T extends { suggestedDecisionId?: unknown; sugges
     return rest;
 }
 
+// ── Schedule-driven due dates (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) ──
+
+type DecisionDueDateFields = { dueDate: Date | null; scheduleTaskId: string | null; leadTimeDays: number | null };
+
+/** ONE batched query per page load — never a per-decision lookup (plan's
+ * explicit requirement). Only the linked task's startDate is needed for
+ * derivation. */
+async function loadScheduleTaskStartDates(
+    projectId: string,
+    decisions: DecisionDueDateFields[],
+): Promise<Map<string, Date>> {
+    const linkedIds = [...new Set(decisions.map((d) => d.scheduleTaskId).filter((id): id is string => !!id))];
+    if (linkedIds.length === 0) return new Map();
+    const tasks = await prisma.scheduleTask.findMany({
+        where: { projectId, id: { in: linkedIds } },
+        select: { id: true, startDate: true },
+    });
+    return new Map(tasks.map((t) => [t.id, t.startDate]));
+}
+
+/** Attaches computed `effectiveDueDate` to every decision, using the batched
+ * task lookup above. Raw dueDate/scheduleTaskId/leadTimeDays are left in
+ * place here — the STAFF read keeps them (the edit popover needs them);
+ * stripDueDateFields (below) removes them for the portal read. */
+function attachEffectiveDueDate<T extends DecisionDueDateFields>(
+    decision: T,
+    taskStartDateById: Map<string, Date>,
+): T & { effectiveDueDate: Date | null } {
+    return { ...decision, effectiveDueDate: computeEffectiveDueDate(decision, taskStartDateById) };
+}
+
+/** Strip the raw due-date/link fields from any client-facing read — the
+ * portal only ever sees the computed `effectiveDueDate`, never whether it
+ * came from a manual override or a schedule derivation (extends
+ * stripSuggestionFields's pattern: the negative payload assertion covers all
+ * three raw field names, so the portal can never infer whether a date was
+ * manually set). */
+function stripDueDateFields<T extends { dueDate?: unknown; scheduleTaskId?: unknown; leadTimeDays?: unknown }>(
+    item: T,
+): Omit<T, "dueDate" | "scheduleTaskId" | "leadTimeDays"> {
+    const { dueDate, scheduleTaskId, leadTimeDays, ...rest } = item;
+    return rest;
+}
+
 /** Deploy-window hazard: the old build stays live while
  * apply-selections-playground.mjs's remap runs, so it can still insert new
  * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
@@ -10732,8 +10782,14 @@ export async function getProjectDecisionsForPortal(projectId: string) {
             orderBy: { createdAt: "desc" },
         }),
     ]);
+    // ONE batched schedule-task lookup for the whole page — never a
+    // per-decision query (see loadScheduleTaskStartDates).
+    const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)) })),
+        decisions: decisions.map((d) => ({
+            ...stripDueDateFields(attachEffectiveDueDate(d, taskStartDateById)),
+            candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)),
+        })),
         unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
     };
 }
@@ -10803,8 +10859,14 @@ export async function getProjectDecisions(projectId: string) {
             orderBy: { createdAt: "desc" },
         }),
     ]);
+    // ONE batched schedule-task lookup for the whole page — never a
+    // per-decision query (see loadScheduleTaskStartDates).
+    const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
+        decisions: decisions.map((d) => ({
+            ...attachEffectiveDueDate(d, taskStartDateById),
+            candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)),
+        })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
 }
@@ -11071,6 +11133,18 @@ export async function listActiveDecisionTemplatesForApply() {
 
 export async function applyDecisionTemplate(projectId: string, templateId: string) {
     return applyDecisionTemplateCore(projectId, templateId);
+}
+
+export async function linkDecisionToSchedule(
+    decisionId: string,
+    scheduleTaskId: string | null,
+    leadTimeDays: number | null,
+) {
+    return linkDecisionToScheduleCore(decisionId, scheduleTaskId, leadTimeDays);
+}
+
+export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
+    return setDecisionDueDateOverrideCore(decisionId, dueDate);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────

@@ -96,7 +96,10 @@ function vendorHost(url: string | null): string | null {
 // "<" and "/" characters can only ever originate from string VALUES (the
 // object keys here are fixed ASCII identifiers), never from JSON
 // structural syntax itself.
-function escapeFenceClosers(json: string): string {
+// Exported for reuse by decision-schedule-link-core.ts (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) — same
+// untrusted-JSON-in-a-prompt hazard, same fix, no need to duplicate it.
+export function escapeFenceClosers(json: string): string {
     return json.replace(/<\//g, "<\\/");
 }
 

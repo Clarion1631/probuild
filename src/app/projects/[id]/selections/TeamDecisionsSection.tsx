@@ -24,6 +24,7 @@ import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/comp
 import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal";
+import LinkScheduleReviewModal, { type LinkScheduleSuggestionRow } from "./LinkScheduleReviewModal";
 import {
     ImageOff,
     ExternalLink,
@@ -39,6 +40,7 @@ import {
     Sparkles,
     Check,
     X,
+    Calendar,
 } from "lucide-react";
 
 interface Candidate {
@@ -626,6 +628,12 @@ export default function TeamDecisionsSection({
     const [aiSortFailedCount, setAiSortFailedCount] = useState(0);
     const [aiSortModalOpen, setAiSortModalOpen] = useState(false);
 
+    const [linking, setLinking] = useState(false);
+    const [linkScheduleRows, setLinkScheduleRows] = useState<LinkScheduleSuggestionRow[]>([]);
+    const [linkScheduleTasks, setLinkScheduleTasks] = useState<{ id: string; name: string; startDate: string }[]>([]);
+    const [linkScheduleFailedCount, setLinkScheduleFailedCount] = useState(0);
+    const [linkScheduleModalOpen, setLinkScheduleModalOpen] = useState(false);
+
     // initialDecisions is only the INITIAL value for useState — resync when
     // the server component re-fetches after router.refresh() (same fix
     // ClientSuggestions needed — see its comment for the bug this avoids).
@@ -698,6 +706,39 @@ export default function TeamDecisionsSection({
         }
     }
 
+    async function handleLinkToSchedule() {
+        setLinking(true);
+        try {
+            const res = await fetch("/api/selections/link-schedule", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ projectId }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(body.error || "Couldn't get schedule-link suggestions.");
+            }
+
+            const rows: LinkScheduleSuggestionRow[] = Array.isArray(body.suggestions) ? body.suggestions : [];
+            const tasks: { id: string; name: string; startDate: string }[] = Array.isArray(body.tasks) ? body.tasks : [];
+            const failedCount = Array.isArray(body.failedDecisionIds) ? body.failedDecisionIds.length : 0;
+
+            if (rows.length === 0) {
+                toast.info("No undecided decisions to link.");
+                return;
+            }
+
+            setLinkScheduleRows(rows);
+            setLinkScheduleTasks(tasks);
+            setLinkScheduleFailedCount(failedCount);
+            setLinkScheduleModalOpen(true);
+        } catch (e: any) {
+            toast.error(e.message || "Couldn't get schedule-link suggestions.");
+        } finally {
+            setLinking(false);
+        }
+    }
+
     async function handleMoveDecision(decisionId: string, direction: "up" | "down") {
         const index = decisions.findIndex((d) => d.id === decisionId);
         if (index === -1) return;
@@ -751,6 +792,19 @@ export default function TeamDecisionsSection({
                     >
                         <Download className="w-4 h-4" />
                         {importing ? "Importing…" : "Import picks from selection boards"}
+                    </button>
+                    <button
+                        data-testid="link-to-schedule-button"
+                        onClick={handleLinkToSchedule}
+                        // Also disabled while the review modal is open — a
+                        // second run mid-review would silently replace the
+                        // rows being looked at (same reasoning as Sort with
+                        // AI's disabled condition).
+                        disabled={linking || linkScheduleModalOpen}
+                        className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                        <Calendar className="w-4 h-4" />
+                        {linking ? "Linking…" : "Link to schedule"}
                     </button>
                     <button onClick={() => setAddDecisionOpen(true)} className="hui-btn hui-btn-green text-sm flex items-center gap-1.5">
                         <Plus className="w-4 h-4" />
@@ -829,6 +883,15 @@ export default function TeamDecisionsSection({
                 decisions={aiSortDecisions}
                 failedCount={aiSortFailedCount}
                 onClose={() => setAiSortModalOpen(false)}
+                onApplied={refresh}
+            />
+
+            <LinkScheduleReviewModal
+                open={linkScheduleModalOpen}
+                rows={linkScheduleRows}
+                tasks={linkScheduleTasks}
+                failedCount={linkScheduleFailedCount}
+                onClose={() => setLinkScheduleModalOpen(false)}
                 onApplied={refresh}
             />
         </div>

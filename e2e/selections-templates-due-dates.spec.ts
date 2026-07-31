@@ -10,6 +10,11 @@ import {
     listDecisionTemplates,
 } from "../src/lib/decision-template-crud-core";
 import { applyDecisionTemplate } from "../src/lib/decision-template-apply-core";
+import {
+    linkDecisionToSchedule,
+    setDecisionDueDateOverride,
+} from "../src/lib/decision-link-actions-core";
+import { computeEffectiveDueDate } from "../src/lib/decision-due-date";
 
 const prisma = new PrismaClient();
 const run = `selection-templates-${process.pid}-${Date.now()}`;
@@ -21,6 +26,7 @@ const ids = {
     manager: `${run}-manager`,
     fieldCrewNoAccess: `${run}-field-crew-no-access`,
     fieldCrewWithAccess: `${run}-field-crew-with-access`,
+    taskCabinets: `${run}-task-cabinets`,
 } as const;
 
 let templateId = "";
@@ -60,10 +66,20 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
                 assignedProjects: { connect: [{ id: ids.project }] },
             },
         });
+        await prisma.scheduleTask.create({
+            data: {
+                id: ids.taskCabinets,
+                projectId: ids.project,
+                name: "Cabinet Install",
+                startDate: new Date("2026-09-01T00:00:00.000Z"),
+                endDate: new Date("2026-09-05T00:00:00.000Z"),
+            },
+        });
     });
 
     test.afterAll(async () => {
         await prisma.decision.deleteMany({ where: { projectId: { in: [ids.project, ids.otherProject] } } });
+        await prisma.scheduleTask.deleteMany({ where: { projectId: ids.project } });
         await prisma.project.deleteMany({ where: { id: { in: [ids.project, ids.otherProject] } } });
         await prisma.client.deleteMany({ where: { id: ids.client } });
         await prisma.user.deleteMany({ where: { id: { in: [ids.admin, ids.manager, ids.fieldCrewNoAccess, ids.fieldCrewWithAccess] } } });
@@ -208,8 +224,173 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
         ).rejects.toThrow("Forbidden");
     });
 
-    // Cases 3-7 (schedule linking, manual override, dangling links, portal
-    // display, cross-project tamper on linking) land in the next commit —
-    // "feat(selections): schedule-linked due dates" — alongside the linking
-    // core/route/actions themselves.
+    // ── Case 3: link to schedule (mocked AI covered in the review-modal E2E
+    // below); here we exercise the underlying link action + derivation math
+    // directly, since these are what the modal's Apply calls per row. ──────
+
+    test("linking a decision to a schedule task derives effectiveDueDate = startDate - leadTimeDays (UTC calendar math)", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Cabinets" } });
+
+        await linkDecisionToSchedule(decision.id, ids.taskCabinets, 14, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+
+        const updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(updated.scheduleTaskId).toBe(ids.taskCabinets);
+        expect(updated.leadTimeDays).toBe(14);
+        expect(updated.dueDate).toBeNull(); // linking never touches the override column
+
+        const task = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: ids.taskCabinets } });
+        const effective = computeEffectiveDueDate(updated, new Map([[ids.taskCabinets, task.startDate]]));
+        expect(effective?.toISOString().slice(0, 10)).toBe("2026-08-18"); // Sept 1 - 14 days
+
+        // Shift the schedule task's startDate directly — derivation is live,
+        // no stale storage: the SAME computeEffectiveDueDate call now
+        // reflects the new date with zero writes to Decision.
+        const shifted = new Date("2026-10-01T00:00:00.000Z");
+        await prisma.scheduleTask.update({ where: { id: ids.taskCabinets }, data: { startDate: shifted } });
+        const effectiveAfterShift = computeEffectiveDueDate(updated, new Map([[ids.taskCabinets, shifted]]));
+        expect(effectiveAfterShift?.toISOString().slice(0, 10)).toBe("2026-09-17"); // Oct 1 - 14 days
+    });
+
+    test("linking rejects a non-integer/out-of-range leadTimeDays, and a scheduleTaskId from another project (cross-project tamper check)", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Countertops" } });
+
+        await expect(
+            linkDecisionToSchedule(decision.id, ids.taskCabinets, 400, { getActor: async () => admin, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow();
+        await expect(
+            linkDecisionToSchedule(decision.id, ids.taskCabinets, null, { getActor: async () => admin, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow();
+
+        const otherTask = await prisma.scheduleTask.create({
+            data: {
+                id: `${run}-other-task`,
+                projectId: ids.otherProject,
+                name: "Other Project Task",
+                startDate: new Date(),
+                endDate: new Date(),
+            },
+        });
+        await expect(
+            linkDecisionToSchedule(decision.id, otherTask.id, 5, { getActor: async () => admin, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow();
+
+        const unchanged = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(unchanged.scheduleTaskId).toBeNull();
+    });
+
+    test("unlinking requires scheduleTaskId: null with leadTimeDays: null together", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Cabinets" } });
+
+        await expect(
+            linkDecisionToSchedule(decision.id, null, 5, { getActor: async () => admin, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow();
+
+        await linkDecisionToSchedule(decision.id, null, null, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        const updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(updated.scheduleTaskId).toBeNull();
+        expect(updated.leadTimeDays).toBeNull();
+    });
+
+    // ── Case 4: manual override always wins, survives dangling links ───────
+
+    test("ADMIN/MANAGER can set a manual override; it wins over derivation and survives a deleted linked task", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const manager = await prisma.user.findUniqueOrThrow({ where: { id: ids.manager } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Backsplash" } });
+
+        const overrideDate = new Date("2026-12-25T00:00:00.000Z");
+        await setDecisionDueDateOverride(decision.id, overrideDate, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        let updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(updated.dueDate?.toISOString()).toBe(overrideDate.toISOString());
+
+        // A subsequent link/shift does NOT move the override.
+        const task = await prisma.scheduleTask.create({
+            data: { id: `${run}-backsplash-task`, projectId: ids.project, name: "Backsplash Install", startDate: new Date("2026-06-01"), endDate: new Date("2026-06-05") },
+        });
+        await linkDecisionToSchedule(decision.id, task.id, 3, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        let effective = computeEffectiveDueDate(updated, new Map([[task.id, task.startDate]]));
+        expect(effective?.toISOString()).toBe(overrideDate.toISOString());
+
+        // Deleting the linked task entirely does not affect the overridden
+        // date either — override survives dangling links.
+        await prisma.scheduleTask.delete({ where: { id: task.id } });
+        updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        effective = computeEffectiveDueDate(updated, new Map()); // dangling — no row in the batched lookup
+        expect(effective?.toISOString()).toBe(overrideDate.toISOString());
+
+        // MANAGER can also set/clear it.
+        await setDecisionDueDateOverride(decision.id, null, { getActor: async () => manager, revalidate: NOOP_REVALIDATE });
+        updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(updated.dueDate).toBeNull();
+        // Cleared override returns to derived — but the task is gone
+        // (dangling scheduleTaskId), so effectiveDueDate is null, "not
+        // linked", never an error.
+        effective = computeEffectiveDueDate(updated, new Map());
+        expect(effective).toBeNull();
+    });
+
+    test("FIELD_CREW cannot set a due-date override (direct action-level test)", async () => {
+        const fieldCrew = await prisma.user.findUniqueOrThrow({ where: { id: ids.fieldCrewWithAccess } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Backsplash" } });
+        await expect(
+            setDecisionDueDateOverride(decision.id, new Date(), { getActor: async () => fieldCrew, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+    });
+
+    // ── Case 5: dangling link (task row deleted) shows "not linked" ────────
+
+    test("a dangling scheduleTaskId (linked task deleted) yields null effectiveDueDate — no error", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project, name: "Countertops" } });
+        const task = await prisma.scheduleTask.create({
+            data: { id: `${run}-countertop-task`, projectId: ids.project, name: "Countertop Install", startDate: new Date("2026-09-10"), endDate: new Date("2026-09-12") },
+        });
+        await linkDecisionToSchedule(decision.id, task.id, 5, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+
+        await prisma.scheduleTask.delete({ where: { id: task.id } });
+        const updated = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        // Batched lookup would come back empty for this project now — the
+        // dangling id maps to nothing.
+        const effective = computeEffectiveDueDate(updated, new Map());
+        expect(effective).toBeNull();
+    });
+
+    // ── UI: the "Link to schedule" review modal end to end (mocked AI) ─────
+
+    test("review modal: Link to schedule shows a mocked suggestion; Apply links the decision", async ({ page }) => {
+        const uiDecision = await prisma.decision.create({
+            data: { id: `${run}-ui-decision`, projectId: ids.project, name: "ZzzUiFlooring", status: "Open" },
+        });
+        const uiTask = await prisma.scheduleTask.create({
+            data: {
+                id: `${run}-ui-task`,
+                projectId: ids.project,
+                name: "ZzzUiFlooring Install",
+                startDate: new Date("2026-11-01T00:00:00.000Z"),
+                endDate: new Date("2026-11-05T00:00:00.000Z"),
+            },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/link-schedule") && res.ok()),
+            page.getByTestId("link-to-schedule-button").click(),
+        ]);
+
+        const modal = page.getByTestId("link-schedule-modal");
+        await expect(modal).toBeVisible();
+        const select = modal.getByTestId(`link-schedule-row-select-${uiDecision.id}`);
+        await expect(select).toHaveValue(uiTask.id); // mock keyword-matched "Flooring" → the flooring task
+
+        await modal.getByTestId("link-schedule-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        const linked = await prisma.decision.findUniqueOrThrow({ where: { id: uiDecision.id } });
+        expect(linked.scheduleTaskId).toBe(uiTask.id);
+        expect(linked.leadTimeDays).not.toBeNull();
+    });
 });
