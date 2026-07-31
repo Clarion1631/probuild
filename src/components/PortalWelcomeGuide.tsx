@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 /**
- * Dismissible "How your portal works" card for the client portal overview tab.
- * Items are driven by the project's portal visibility flags so the guide never
- * advertises a section the client can't see. Dismissal is remembered per
- * browser (localStorage); a small "How this portal works" link brings it back.
+ * "How your portal works" guide for the client portal overview tab — a slim
+ * row near the top, collapsed by default; clients expand it when they want
+ * the walkthrough. Items are driven by the project's portal visibility flags
+ * so the guide never advertises a section the client can't see.
  */
 export default function PortalWelcomeGuide({
     projectId,
@@ -24,40 +24,8 @@ export default function PortalWelcomeGuide({
         files: boolean;
     };
 }) {
-    const storageKey = `pb-portal-guide-dismissed:${projectId}`;
-    // null until we've read localStorage — render nothing to avoid a hydration flash
-    const [dismissed, setDismissed] = useState<boolean | null>(null);
-
-    useEffect(() => {
-        try {
-            setDismissed(localStorage.getItem(storageKey) === "1");
-        } catch {
-            setDismissed(false);
-        }
-    }, [storageKey]);
-
-    const setAndStore = (value: boolean) => {
-        setDismissed(value);
-        try {
-            if (value) localStorage.setItem(storageKey, "1");
-            else localStorage.removeItem(storageKey);
-        } catch { /* storage unavailable — card just won't persist its state */ }
-    };
-
-    if (dismissed === null) return null;
-
-    if (dismissed) {
-        return (
-            <div className="text-center">
-                <button
-                    onClick={() => setAndStore(false)}
-                    className="text-xs text-hui-textMuted hover:text-hui-textMain underline underline-offset-2 transition"
-                >
-                    How this portal works
-                </button>
-            </div>
-        );
-    }
+    const [open, setOpen] = useState(false);
+    const contentId = `portal-guide-${projectId}`;
 
     const items: Array<{ icon: React.ReactNode; title: string; text: string }> = [];
 
@@ -105,38 +73,52 @@ export default function PortalWelcomeGuide({
     }
 
     return (
-        <div className="hui-card p-5 md:p-6 border-emerald-200 bg-gradient-to-br from-emerald-50/60 to-white">
-            <div className="flex items-start justify-between gap-3 mb-4">
-                <div>
-                    <h2 className="text-base font-bold text-hui-textMain">How your portal works</h2>
-                    <p className="text-sm text-hui-textMuted mt-0.5">
-                        {companyName} keeps everything about your project in one place. Here's what you can do:
+        <div className="hui-card border-emerald-200 bg-gradient-to-br from-emerald-50/60 to-white">
+            <button
+                onClick={() => setOpen((value) => !value)}
+                aria-expanded={open}
+                aria-controls={contentId}
+                className="w-full flex items-center gap-3 p-4 text-left"
+            >
+                <span className="shrink-0 w-8 h-8 rounded-md bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                    <svg className="w-4.5 h-4.5" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                </span>
+                <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-bold text-hui-textMain">How your portal works</span>
+                    <span className="block text-xs text-hui-textMuted">A quick walkthrough of what you can do here.</span>
+                </span>
+                <svg
+                    className={`shrink-0 w-4 h-4 text-hui-textMuted transition-transform ${open ? "rotate-180" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+            </button>
+            {open && (
+                <div id={contentId} className="px-4 pb-5 md:px-5">
+                    <p className="text-sm text-hui-textMuted mb-4">
+                        {companyName} keeps everything about your project in one place. Here&apos;s what you can do:
+                    </p>
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {items.map(item => (
+                            <div key={item.title} className="flex gap-3 bg-white rounded-lg border border-slate-200 p-3.5">
+                                <div className="shrink-0 w-8 h-8 rounded-md bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                                    <svg className="w-4.5 h-4.5" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">{item.icon}</svg>
+                                </div>
+                                <div className="min-w-0">
+                                    <p className="text-sm font-semibold text-hui-textMain">{item.title}</p>
+                                    <p className="text-xs text-hui-textMuted mt-0.5 leading-relaxed">{item.text}</p>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                    <p className="text-xs text-hui-textMuted mt-4">
+                        Your email link signs you in automatically, so there is no password to remember. Bookmark this page, and if you ever need a fresh link just ask us.
                     </p>
                 </div>
-                <button
-                    onClick={() => setAndStore(true)}
-                    aria-label="Dismiss guide"
-                    className="shrink-0 text-hui-textMuted hover:text-hui-textMain transition p-1"
-                >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                </button>
-            </div>
-            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {items.map(item => (
-                    <div key={item.title} className="flex gap-3 bg-white rounded-lg border border-slate-200 p-3.5">
-                        <div className="shrink-0 w-8 h-8 rounded-md bg-emerald-100 text-emerald-700 flex items-center justify-center">
-                            <svg className="w-4.5 h-4.5" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">{item.icon}</svg>
-                        </div>
-                        <div className="min-w-0">
-                            <p className="text-sm font-semibold text-hui-textMain">{item.title}</p>
-                            <p className="text-xs text-hui-textMuted mt-0.5 leading-relaxed">{item.text}</p>
-                        </div>
-                    </div>
-                ))}
-            </div>
-            <p className="text-xs text-hui-textMuted mt-4">
-                Your email link signs you in automatically, so there is no password to remember. Bookmark this page, and if you ever need a fresh link just ask us.
-            </p>
+            )}
         </div>
     );
 }
