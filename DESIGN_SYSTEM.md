@@ -49,6 +49,10 @@ Every new page must follow these patterns. No exceptions. This file is the sourc
 .hui-btn-primary  /* dark slate primary — use for main page actions */
 .hui-btn-secondary /* white bordered — use for secondary actions */
 .hui-btn-green    /* brand green — use for positive actions (save, approve, create) */
+.hui-btn-accent   /* filled indigo — AI-assisted / bulk actions (Sort with AI, Link to
+                     schedule, Apply template). A distinct category from hui-btn-green:
+                     never use both on the same header, or the true primary action
+                     (Add/Save) loses its visual priority. */
 .hui-input        /* text input, select, textarea base */
 .hui-card         /* white card with border and shadow */
 ```

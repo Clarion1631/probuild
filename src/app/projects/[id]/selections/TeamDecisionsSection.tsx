@@ -334,7 +334,9 @@ function CandidateCard({
                         disabled={suggestionBusy !== null}
                         title={`Sort into ${suggestion.decisionName}`}
                         aria-label={`Apply AI suggestion: sort into ${suggestion.decisionName}`}
-                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                        // Affirmative action — filled green, not just a subtle
+                        // hover tint, so it reads as "apply" at a glance.
+                        className="w-5 h-5 rounded-full flex items-center justify-center bg-hui-primary text-white hover:bg-hui-primaryHover disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary focus-visible:ring-offset-1"
                     >
                         <Check className="w-3 h-3" />
                     </button>
@@ -345,7 +347,9 @@ function CandidateCard({
                         disabled={suggestionBusy !== null}
                         title="Dismiss suggestion"
                         aria-label="Dismiss AI suggestion"
-                        className="w-4 h-4 rounded-full flex items-center justify-center hover:bg-hui-primary/20 disabled:opacity-50"
+                        // Dismiss stays subtle (unfilled) but with a clearly
+                        // visible hover/focus state, distinct from apply.
+                        className="w-5 h-5 rounded-full flex items-center justify-center text-hui-textMuted hover:bg-red-50 hover:text-red-600 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-1"
                     >
                         <X className="w-3 h-3" />
                     </button>
@@ -874,7 +878,7 @@ export default function TeamDecisionsSection({
                                 // the rows being looked at (same reasoning as
                                 // Sort with AI's disabled condition).
                                 disabled={linking || linkScheduleModalOpen}
-                                className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5 disabled:opacity-50"
+                                className="hui-btn hui-btn-accent text-sm flex items-center gap-1.5 disabled:opacity-50"
                             >
                                 <Calendar className="w-4 h-4" />
                                 {linking ? "Linking…" : "Link to schedule"}
@@ -919,7 +923,9 @@ export default function TeamDecisionsSection({
                                     // silently replace the rows the staffer is
                                     // currently looking at.
                                     disabled={sorting || aiSortModalOpen}
-                                    className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
+                                    // text-sm + py-2 (not the old text-xs/py-1.5)
+                                    // to clear the ~36px minimum hit-target height.
+                                    className="hui-btn hui-btn-accent text-sm py-2 px-3 flex items-center gap-1.5 disabled:opacity-50"
                                 >
                                     <Sparkles className="w-3.5 h-3.5" />
                                     {sorting ? "Sorting…" : "Sort with AI"}

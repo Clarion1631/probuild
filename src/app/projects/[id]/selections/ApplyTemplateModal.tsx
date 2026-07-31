@@ -75,7 +75,7 @@ export default function ApplyTemplateModal({
             <Dialog.Trigger asChild>
                 <button
                     data-testid="apply-template-button"
-                    className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5"
+                    className="hui-btn hui-btn-accent text-sm flex items-center gap-1.5"
                 >
                     <LayoutTemplate className="w-4 h-4" />
                     Apply template
