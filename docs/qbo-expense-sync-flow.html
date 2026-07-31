@@ -6,137 +6,200 @@
 <title>GTR Expense Pipeline — How It Works</title>
 <style>
   :root {
-    --ink: #1a202c; --muted: #64748b; --line: #e2e8f0;
-    --green: #16a34a; --green-bg: #f0fdf4;
-    --blue: #2563eb; --blue-bg: #eff6ff;
-    --amber: #d97706; --amber-bg: #fffbeb;
-    --purple: #7c3aed; --purple-bg: #f5f3ff;
-    --red: #dc2626; --red-bg: #fef2f2;
+    --ink: #22252b; --muted: #6b7280; --line: #e4e2dd;
+    --paper: #fbfaf7; --card: #ffffff; --cell: #f7f6f2;
+    --green: #177245; --green-bg: #eef7f0;
+    --blue: #1d5fbf; --blue-bg: #edf3fc;
+    --amber: #b05e10; --amber-bg: #fdf6ec;
+    --purple: #6d4fc4; --purple-bg: #f3f0fb;
+    --red: #bb3434; --red-bg: #fdf0f0;
+    --code-bg: #f1efe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e8e6e1; --muted: #9aa0a8; --line: #3a3d44;
+      --paper: #1b1d21; --card: #24262c; --cell: #2b2d34;
+      --green: #5fc48d; --green-bg: #223528;
+      --blue: #7aa9ec; --blue-bg: #23304a;
+      --amber: #e2a35e; --amber-bg: #3a2f1f;
+      --purple: #ab97e8; --purple-bg: #2f2a44;
+      --red: #e08585; --red-bg: #402626;
+      --code-bg: #2f3138;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink: #e8e6e1; --muted: #9aa0a8; --line: #3a3d44;
+    --paper: #1b1d21; --card: #24262c; --cell: #2b2d34;
+    --green: #5fc48d; --green-bg: #223528;
+    --blue: #7aa9ec; --blue-bg: #23304a;
+    --amber: #e2a35e; --amber-bg: #3a2f1f;
+    --purple: #ab97e8; --purple-bg: #2f2a44;
+    --red: #e08585; --red-bg: #402626;
+    --code-bg: #2f3138;
+  }
+  :root[data-theme="light"] {
+    --ink: #22252b; --muted: #6b7280; --line: #e4e2dd;
+    --paper: #fbfaf7; --card: #ffffff; --cell: #f7f6f2;
+    --green: #177245; --green-bg: #eef7f0;
+    --blue: #1d5fbf; --blue-bg: #edf3fc;
+    --amber: #b05e10; --amber-bg: #fdf6ec;
+    --purple: #6d4fc4; --purple-bg: #f3f0fb;
+    --red: #bb3434; --red-bg: #fdf0f0;
+    --code-bg: #f1efe9;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: #f8fafc; padding: 2rem 1rem 4rem; line-height: 1.5; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--paper); padding: 2rem 1rem 4rem; line-height: 1.55; }
   .wrap { max-width: 880px; margin: 0 auto; }
-  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
-  .sub { color: var(--muted); margin-bottom: 2rem; }
-  h2 { font-size: 1.05rem; margin: 2.2rem 0 .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
-  .stage { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: 0; position: relative; }
+  h1 { font-size: 1.65rem; margin-bottom: .25rem; text-wrap: balance; }
+  .sub { color: var(--muted); margin-bottom: .5rem; max-width: 62ch; }
+  .stamp { font-size: .78rem; color: var(--muted); margin-bottom: 2rem; }
+  .stamp b { color: var(--green); }
+  h2 { font-size: .95rem; margin: 2.4rem 0 .8rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  .stage { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; position: relative; }
   .stage .tag { display: inline-block; font-size: .7rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: .15rem .5rem; border-radius: 99px; margin-bottom: .4rem; }
   .stage h3 { font-size: 1rem; margin-bottom: .3rem; }
-  .stage p, .stage li { font-size: .88rem; color: #334155; }
+  .stage p, .stage li { font-size: .88rem; }
   .stage ul { padding-left: 1.2rem; margin-top: .3rem; }
-  .arrow { text-align: center; color: var(--muted); font-size: 1.3rem; padding: .35rem 0; }
+  .stage li { margin-bottom: .15rem; }
+  .arrow { text-align: center; color: var(--muted); font-size: 1.2rem; padding: .35rem 0; }
   .g  { border-left: 4px solid var(--green); }  .g .tag { background: var(--green-bg); color: var(--green); }
   .b  { border-left: 4px solid var(--blue); }   .b .tag { background: var(--blue-bg); color: var(--blue); }
   .a  { border-left: 4px solid var(--amber); }  .a .tag { background: var(--amber-bg); color: var(--amber); }
   .p  { border-left: 4px solid var(--purple); } .p .tag { background: var(--purple-bg); color: var(--purple); }
   .split { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin-top: .6rem; }
-  .cell { border: 1px dashed var(--line); border-radius: 8px; padding: .7rem .8rem; background: #fafbfc; }
+  .cell { border: 1px dashed var(--line); border-radius: 8px; padding: .7rem .8rem; background: var(--cell); }
   .cell b { font-size: .85rem; display: block; margin-bottom: .2rem; }
   .cell p { font-size: .8rem; }
-  code { background: #f1f5f9; border: 1px solid var(--line); border-radius: 4px; padding: .05rem .35rem; font-size: .8rem; }
-  table { width: 100%; border-collapse: collapse; font-size: .85rem; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: .05rem .35rem; font-size: .8rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { background: #f8fafc; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  .check { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.2rem; }
-  .check li { margin-bottom: .55rem; font-size: .9rem; }
-  .check ol { padding-left: 1.3rem; }
+  tr:last-child td { border-bottom: none; }
+  th { background: var(--cell); font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .tablewrap { overflow-x: auto; }
+  .callout { border: 1px solid var(--line); border-left: 4px solid var(--amber); background: var(--card); border-radius: 12px; padding: 1rem 1.2rem; margin-top: .8rem; }
+  .callout h3 { font-size: .95rem; margin-bottom: .3rem; }
+  .callout p, .callout li { font-size: .88rem; }
+  .callout ul { padding-left: 1.2rem; margin-top: .3rem; }
   .pill { font-weight: 700; }
-  .pill.on { color: var(--green); } .pill.off { color: var(--red); }
+  .pill.on { color: var(--green); }
   @media (max-width: 640px) { .split { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>GTR Expense Pipeline</h1>
-  <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, and where the money data lives. Goal: answer "are we profitable, is cash flow good" daily.</p>
+  <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, where the money data lives, and what runs by itself. Goal: answer "are we profitable, is cash flow good" daily.</p>
+  <p class="stamp">Updated July 31, 2026 · Every stage below is <b>live and verified end-to-end</b> (test receipt → QuickBooks purchase → ProBuild job cost, receipt attached the whole way).</p>
 
   <div class="stage g">
     <span class="tag">1 · Purchase</span>
     <h3>Money leaves the bank</h3>
-    <p>Nearly all purchases hit the <b>Washington Trust debit cards</b> (CJ …8516, Richard …6098), plus checks, Venmo and Cash App payments to helpers.</p>
+    <p>Nearly all purchases hit the <b>Washington Trust debit cards</b> (CJ …8516, Richard …6098), plus checks, Venmo and Cash App payments to helpers. Keep the receipt — paper, email, or photo.</p>
   </div>
   <div class="arrow">▼</div>
 
   <div class="stage g">
-    <span class="tag">2 · Receipt intake (every 10 min, Google Apps Script)</span>
-    <h3>Receipts land in Google Drive</h3>
+    <span class="tag">2 · Receipts land in Google Drive</span>
+    <h3>One folder per job — named exactly like the ProBuild project</h3>
     <div class="split">
-      <div class="cell"><b>Email intake</b><p>Receipt emails to rlord@ (Lowe's, Home Depot, Amazon…) are pulled automatically and saved into the "New Receipts &amp; Checks" Drive folder.</p></div>
-      <div class="cell"><b>Manual drop</b><p>Anyone can drop a photo/PDF straight into the intake folder. <i>Coming: field crew photo via the ProBuild mobile app.</i></p></div>
+      <div class="cell"><b>Email intake (automatic)</b><p>Receipt emails to rlord@ (Lowe's, Home Depot, Amazon…) are pulled every few minutes and filed into "New Receipts &amp; Checks". Body-only e-receipts are saved as PDF — never as a text file.</p></div>
+      <div class="cell"><b>Manual drop</b><p>Anyone can drop a photo or PDF into the job's folder. Overhead with no job goes in <b>Shop</b>. <i>Coming: snap it in the ProBuild mobile app from the truck.</i></p></div>
     </div>
+    <ul>
+      <li><b>Folders make themselves:</b> when a project goes In&nbsp;Progress in ProBuild, its intake folder appears in Drive automatically (checked daily). Never hand-name a folder — if one doesn't match a project, Justin gets a drift alert and receipts in it fall back to the slow path.</li>
+      <li>Folders starting with <code>_</code> are archives — the bot ignores them.</li>
+    </ul>
   </div>
   <div class="arrow">▼</div>
 
   <div class="stage g">
-    <span class="tag">3 · AI processing (every 10 min, Gemini)</span>
-    <h3>Receipt is read, named, deduped, sent to QuickBooks</h3>
+    <span class="tag">3 · AI reads the receipt (every 10 min, Gemini)</span>
+    <h3>Named, deduped, and understood — including the tax line</h3>
     <ul>
-      <li>Gemini extracts vendor, date, invoice #, amount, and the project hint.</li>
-      <li>File renamed <code>Project_Date_Vendor_Invoice_$Amount</code> and archived by month in Drive.</li>
-      <li>Duplicates quarantined; unreadable items parked in <i>_Needs Review</i> with an alert.</li>
-      <li>Receipt emailed to the QuickBooks receipts inbox with everything pre-filled.</li>
+      <li>Extracts vendor, date, invoice #, the <b>final total</b> (after discounts and coupons — the number that matches the bank charge), and the <b>sales tax</b> shown on the receipt.</li>
+      <li>File renamed <code>Project_Date_Vendor_Invoice_$Amount</code> and archived by month in Drive — <b>the raw original is always kept</b> as the permanent backup.</li>
+      <li>Duplicates quarantined; unreadable items parked in <i>_Needs Review</i> with an email alert. Nothing is ever silently lost.</li>
     </ul>
   </div>
   <div class="arrow">▼</div>
 
   <div class="stage b">
-    <span class="tag">4 · QuickBooks — source of record</span>
-    <h3>Marge books it · Vanessa matches it</h3>
-    <p><b>Marge</b> reviews each receipt in QBO and assigns the <b>customer/job on the expense lines</b> (this assignment is what drives everything downstream). <b>Vanessa</b> matches transactions against the bank feed. QuickBooks owns the books — ProBuild never edits money that lives here.</p>
+    <span class="tag">4 · The purchase is created in QuickBooks (API)</span>
+    <h3>Booked, job-coded, tax split, receipt attached — ready to match</h3>
+    <ul>
+      <li>ProBuild creates the finalized QBO purchase: paid from <b>Washington Trust Bank</b>, vendor auto-created, expense line coded to the <b>customer/job</b>, receipt PDF attached.</li>
+      <li><b>Sales tax gets its own line</b> to the "Reimbursable Sales Tax Paid" account (see the reseller-permit box below). The lines always rebuild the receipt total to the penny.</li>
+      <li>Duplicate-proof: keyed to the Drive file, so retries can never book the same receipt twice.</li>
+      <li><b>Fallback:</b> Shop/overhead receipts, oversized files, or anything the system can't confidently code goes to the QBO receipts inbox by email instead — Marge books those by hand, same as the old days.</li>
+    </ul>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="stage b">
+    <span class="tag">5 · QuickBooks — source of record</span>
+    <h3>Marge reviews · Vanessa matches</h3>
+    <p><b>Marge</b> reviews each auto-created purchase (right job? right vendor?) instead of typing it from scratch. <b>Vanessa</b> matches the bank feed — the purchase amount equals the card charge, so matches line up on their own. QuickBooks owns the books; ProBuild never edits money that lives here.</p>
   </div>
   <div class="arrow">▼</div>
 
   <div class="stage a">
-    <span class="tag">5 · QBO → ProBuild sync (cron: every 4 hours at :30)</span>
+    <span class="tag">6 · QBO → ProBuild sync (every 4 hours, automatic)</span>
     <h3>Finalized expenses flow into ProBuild job costs</h3>
     <ul>
-      <li><b>Job match:</b> the QBO customer maps to exactly one <i>In&nbsp;Progress</i> ProBuild project — by id first, then name. It never guesses; ambiguity = visible skip.</li>
-      <li><b>Overhead triage:</b> purchases with <i>no customer</i> import into the <b>Shop</b> project tagged <code>[Overhead]</code>. Assign the real customer in QBO later and the expense <i>auto-moves</i> to that job on the next sync. Owner draws (equity/distributions) are excluded entirely.</li>
+      <li><b>Job match:</b> the QBO customer maps to exactly one <i>In&nbsp;Progress</i> ProBuild project. It never guesses — ambiguity is a visible skip, not a wrong booking.</li>
+      <li><b>Overhead triage:</b> purchases with no customer import into <b>Shop</b> tagged <code>[Overhead]</code>. Assign the real customer in QBO later and the expense moves itself on the next sync. Owner draws are excluded.</li>
       <li><b>Corrections flow through:</b> voids, deletions, and refunds in QBO zero out the ProBuild copy automatically.</li>
-      <li><b>Receipts come along:</b> the QBO attachment is copied into ProBuild's own storage — viewable in ProBuild with no QuickBooks login. Missing one? Upload it yourself with the paperclip button.</li>
-      <li><b>Idempotent:</b> keyed by QBO transaction id — rerunning anything can never double-import.</li>
+      <li><b>Receipts come along:</b> the attachment is copied into ProBuild's own storage — viewable in ProBuild with <b>no QuickBooks login</b>. Missing one? Upload it with the paperclip button.</li>
     </ul>
   </div>
   <div class="arrow">▼</div>
 
   <div class="stage p">
-    <span class="tag">6 · ProBuild — job costing &amp; daily visibility</span>
-    <h3>Where you look</h3>
+    <span class="tag">7 · ProBuild — where you look</span>
+    <h3>Job costing and company-wide visibility</h3>
     <div class="split">
-      <div class="cell"><b>Per project</b><p>Project → Time &amp; Expenses → Expenses tab, and Financial Overview (cash flow, margin). Imported rows say "Finalized in QuickBooks" and are read-only.</p></div>
-      <div class="cell"><b>Company-wide</b><p>Manager → Bookkeeper Review Queue (audit trail of every import). <i>Coming next: Company Financials rollup under Reports — all jobs + overhead, profitability and cash flow in one screen.</i></p></div>
+      <div class="cell"><b>Per project</b><p>Project → Time &amp; Expenses → Expenses tab, and the Financial Overview (cash flow, margin). Imported rows say "Finalized in QuickBooks" and are read-only.</p></div>
+      <div class="cell"><b>Company-wide</b><p><b>Reports → Company Financials:</b> profitability and cash flow across every job plus overhead, with charts and date/month filters. Manager → Bookkeeper Review Queue is the audit trail of every import.</p></div>
     </div>
   </div>
 
-  <h2>The cron, precisely</h2>
-  <table>
-    <tr><th>What</th><th>Value</th></tr>
-    <tr><td>Schedule</td><td><code>30 */4 * * *</code> — 12:30, 4:30, 8:30 AM/PM (UTC), every day</td></tr>
-    <tr><td>What it does</td><td>Incremental sync using QBO change tracking (7-day rolling lookback) — catches new purchases, backdated entries, edits, voids, deletions</td></tr>
-    <tr><td>Kill switch</td><td>Vercel env <code>QBO_EXPENSE_SYNC_CRON_ENABLED</code> — currently <span class="pill off">false (off)</span> until you sign off; flipping to <code>true</code> + redeploy turns it on</td></tr>
-    <tr><td>Manual backfill</td><td><code>node scripts/run-qbo-backfill.mjs [since] [until]</code> — month-chunked, runs twice to prove idempotency</td></tr>
-    <tr><td>Overhead bucket</td><td>Env <code>QBO_EXPENSE_OVERHEAD_PROJECT_ID</code> → the "Shop" project. If misconfigured, the sync skips safely instead of touching anything.</td></tr>
-  </table>
+  <div class="callout">
+    <h3>Why sales tax is split out — the reseller permit</h3>
+    <p>GTR holds a reseller's permit. When a vendor doesn't have our certificate on file, we pay sales tax we can later reclaim from the state. Every receipt now books as two lines — the pre-tax cost to the job, and the tax to <b>"Reimbursable Sales Tax Paid"</b>. Filing time is one report on that account: the total is the claim. If a receipt's tax line can't be read, the purchase books as a single line like before — a bad tax read never blocks a booking.</p>
+  </div>
 
-  <h2>Your test drive</h2>
-  <div class="check">
-    <ol>
-      <li><b>Backfill May–July:</b> run the backfill command (Claude gives it to you) and watch imported/skipped counts per month.</li>
-      <li><b>Shop overhead:</b> open the Shop project → Time &amp; Expenses → Expenses. You should see <code>[Overhead]</code> rows (utilities, software, fuel…). No haircuts — owner draws are excluded.</li>
-      <li><b>Receipts:</b> open Mesplay Kitchen → Expenses. Rows with a QBO attachment show a receipt link — click one, it opens with no QuickBooks login. Try the paperclip to upload one yourself.</li>
-      <li><b>Self-healing move:</b> in QBO, assign a customer (say Mesplay Kitchen) to one Shop overhead purchase, then rerun the backfill — the expense should move from Shop to Mesplay automatically.</li>
-      <li><b>Audit trail:</b> Manager → Bookkeeper Review Queue — every import listed read-only with its QBO transaction id.</li>
-      <li><b>Sign off:</b> tell Claude "enable the cron" — from then on it's hands-free every 4 hours.</li>
-    </ol>
+  <h2>What runs by itself</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Job</th><th>How often</th><th>What it does</th></tr>
+    <tr><td>Receipt email pull</td><td>Every few minutes</td><td>Saves receipt emails from rlord@ into the intake folders (PDF, never .txt)</td></tr>
+    <tr><td>Receipt scan + QBO booking</td><td>Every 10 minutes</td><td>Reads new receipts with AI, archives the original, creates the QuickBooks purchase (or emails the fallback)</td></tr>
+    <tr><td>Folder reconciler</td><td>Daily</td><td>Creates intake folders for new In-Progress projects; emails Justin when a folder matches no project</td></tr>
+    <tr><td>QBO → ProBuild sync</td><td>Every 4 hours <span class="pill on">on</span></td><td>Imports finalized purchases into job costs, copies receipts over, applies voids/edits/moves</td></tr>
+  </table>
+  </div>
+
+  <h2>Who does what now</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Person</th><th>Their part</th></tr>
+    <tr><td>Field crew / anyone</td><td>Get the receipt into the job's Drive folder (email receipts go by themselves)</td></tr>
+    <tr><td>Marge</td><td>Review auto-created purchases in QBO; hand-book the email-fallback ones; watch _Needs Review alerts</td></tr>
+    <tr><td>Vanessa</td><td>Match the bank feed; run the sales-tax account report at state-filing time</td></tr>
+    <tr><td>Richard / CJ / Justin</td><td>Read the numbers: project Financial Overview and Reports → Company Financials</td></tr>
+    <tr><td>The system</td><td>Everything between the receipt and the report</td></tr>
+  </table>
   </div>
 
   <h2>What's next on the roadmap</h2>
+  <div class="tablewrap">
   <table>
     <tr><th>Piece</th><th>What it adds</th></tr>
-    <tr><td>Company Financials rollup</td><td>One screen under Reports: profitability + cash flow across every job and overhead</td></tr>
-    <tr><td>Receipt bot → QBO API</td><td>Bot creates the expense in QBO directly — job assigned at line level, receipt attached, ready for bank match. Marge only reviews.</td></tr>
-    <tr><td>Mobile app field capture</td><td>Crew photographs receipts + clocks time on the job; both feed the same pipeline</td></tr>
+    <tr><td>Mobile field capture</td><td>Crew photographs the paper receipt in the ProBuild app, on the job site — it enters this same pipeline with the job pre-selected</td></tr>
+    <tr><td>Line-item category splitting</td><td>AI splits big receipts (lumber vs. plumbing vs. electrical) into coded lines, not just one</td></tr>
+    <tr><td>Vendor name cleanup</td><td>One canonical vendor list so "Lowes" and "Lowe's Home Improvement" stop creating near-duplicates in QBO</td></tr>
   </table>
+  </div>
 </div>
 </body>
 </html>
