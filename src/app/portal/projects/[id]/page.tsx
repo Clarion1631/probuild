@@ -8,6 +8,7 @@ import { getPortalVisibility } from "@/lib/actions";
 import { getUnreadSelectionThreadCountForPortal } from "@/lib/selection-item-thread-dependencies";
 import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
+import PortalWelcomeGuide from "@/components/PortalWelcomeGuide";
 import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
@@ -308,6 +309,20 @@ export default async function PortalProjectDetail(props: {
                                 </ul>
                             </div>
                         )}
+
+                        {/* Dismissible how-it-works guide (items follow visibility flags) */}
+                        <PortalWelcomeGuide
+                            projectId={projectId}
+                            companyName={settings?.companyName || "Your contractor"}
+                            features={{
+                                schedule: visibility.showSchedule,
+                                updates: visibility.showDailyLogs,
+                                estimates: visibility.showEstimates,
+                                invoices: visibility.showInvoices,
+                                selections: visibility.showSelections,
+                                files: visibility.showFiles,
+                            }}
+                        />
 
                         {/* Empty overview fallback — based on what would actually render */}
                         {pendingPayments.length === 0
