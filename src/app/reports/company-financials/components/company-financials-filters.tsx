@@ -35,14 +35,26 @@ export default function CompanyFinancialsFilters({ presetValue, selectedProjectI
         updateParams((sp) => sp.set("range", preset));
     }
 
+    // "projectId" absent => default (all). A single "none" value is an explicit
+    // empty selection (distinct from "absent") — see parseCompanyFinancialsChartFilters.
+    function currentSelection(sp: URLSearchParams): Set<string> {
+        if (!sp.has("projectId")) return new Set(allProjects.map((p) => p.id));
+        const explicit = sp.getAll("projectId");
+        if (explicit.length === 1 && explicit[0] === "none") return new Set();
+        return new Set(explicit);
+    }
+
     function toggleProject(id: string, checked: boolean) {
         updateParams((sp) => {
-            const explicit = sp.getAll("projectId");
-            const current = new Set(explicit.length > 0 ? explicit : allProjects.map((p) => p.id));
+            const current = currentSelection(sp);
             if (checked) current.add(id);
             else current.delete(id);
             sp.delete("projectId");
-            for (const pid of current) sp.append("projectId", pid);
+            if (current.size === 0) {
+                sp.set("projectId", "none"); // keep the empty selection explicit — don't fall back to "all"
+            } else {
+                for (const pid of current) sp.append("projectId", pid);
+            }
         });
     }
 

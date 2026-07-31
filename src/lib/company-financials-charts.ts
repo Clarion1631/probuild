@@ -1,11 +1,18 @@
 import { prisma } from "@/lib/prisma";
 import { getParam, getAllParams, type SearchParamMap } from "@/lib/report-utils";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 
 // "Shop" is the sanctioned overhead bucket — same env var as the company
 // financials rollup page and the QBO expense sync, so all three can never
 // point at different projects.
 const OVERHEAD_PROJECT_ID =
     process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || "cmpd6xca1009x1iizdf4suln3";
+
+// Same parent-status gating as computeProjectFinancials (src/lib/project-financials.ts,
+// includeUnissued: false) — Draft invoices/retainers are not receivables and must
+// never show up as "collected" or as outstanding AR.
+const INVOICE_PARENT_STATUSES = ["Issued", "Paid", "Overdue", "Partially Paid", "Sent"];
+const RETAINER_STATUSES = ["Sent", "Paid", "Partially Paid"];
 
 // ---------------------------------------------------------------------------
 // Filters
@@ -23,18 +30,24 @@ export const DATE_RANGE_PRESETS: { value: DateRangePreset; label: string }[] = [
 
 export interface CompanyFinancialsChartFilters {
     preset: DateRangePreset;
-    from: Date | null; // inclusive lower bound; null = no lower bound ("all")
-    to: Date; // exclusive upper bound — first of the month after the current month
+    from: Date | null; // inclusive lower bound (UTC month boundary); null = no lower bound ("all")
+    to: Date; // exclusive upper bound (UTC) — first of the month after the current UTC month
     projectIds: string[]; // selected job project ids (never includes the overhead project)
     includeOverhead: boolean;
 }
 
 /**
- * `allProjectIds` is the full set of selectable (In Progress, non-overhead) jobs.
- * It is also the default selection: no `projectId` params in the URL means "all".
- * If a user unchecks every project the filter bar simply stops writing any
- * `projectId` params (see company-financials-filters.tsx), which round-trips
- * back to this same "all" default rather than an empty dashboard.
+ * `allProjectIds` is the full set of selectable (In Progress, non-overhead) jobs —
+ * also the default selection.
+ *
+ * projectId param semantics:
+ * - Param entirely absent from the URL => default to all project ids.
+ * - Param present with a single "none" sentinel => explicit empty selection
+ *   (the filter bar writes this when the user deselects the last project —
+ *   see company-financials-filters.tsx).
+ * - Param present with real ids => that set, deduped and filtered to valid ids
+ *   (an id list that's empty after filtering — e.g. all stale/invalid — is
+ *   also treated as an explicit empty selection, not "all").
  */
 export function parseCompanyFinancialsChartFilters(
     params: SearchParamMap,
@@ -46,20 +59,31 @@ export function parseCompanyFinancialsChartFilters(
             ? rawPreset
             : "6mo"; // default per spec
 
+    // UTC-consistent month boundaries — never server-local time.
     const now = new Date();
-    const to = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
     let from: Date | null;
     switch (preset) {
-        case "3mo": from = new Date(now.getFullYear(), now.getMonth() - 2, 1); break;
-        case "6mo": from = new Date(now.getFullYear(), now.getMonth() - 5, 1); break;
-        case "12mo": from = new Date(now.getFullYear(), now.getMonth() - 11, 1); break;
-        case "ytd": from = new Date(now.getFullYear(), 0, 1); break;
+        case "3mo": from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 2, 1)); break;
+        case "6mo": from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1)); break;
+        case "12mo": from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1)); break;
+        case "ytd": from = new Date(Date.UTC(now.getUTCFullYear(), 0, 1)); break;
         case "all": from = null; break;
     }
 
-    const validIds = new Set(allProjectIds);
-    const rawIds = getAllParams(params, "projectId").filter((id) => validIds.has(id));
-    const projectIds = rawIds.length > 0 ? rawIds : allProjectIds;
+    const isAbsent = params["projectId"] === undefined;
+    let projectIds: string[];
+    if (isAbsent) {
+        projectIds = allProjectIds;
+    } else {
+        const raw = getAllParams(params, "projectId");
+        if (raw.length === 1 && raw[0] === "none") {
+            projectIds = [];
+        } else {
+            const validIds = new Set(allProjectIds);
+            projectIds = Array.from(new Set(raw.filter((id) => validIds.has(id))));
+        }
+    }
 
     const includeOverhead = getParam(params, "overhead") !== "0"; // default on
 
@@ -67,26 +91,27 @@ export function parseCompanyFinancialsChartFilters(
 }
 
 // ---------------------------------------------------------------------------
-// Date bucketing helpers
+// UTC month bucketing helpers
 // ---------------------------------------------------------------------------
 
 function monthStart(d: Date): Date {
-    return new Date(d.getFullYear(), d.getMonth(), 1);
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
 }
 function addMonths(d: Date, n: number): Date {
-    return new Date(d.getFullYear(), d.getMonth() + n, 1);
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, 1));
 }
 function monthKey(d: Date): string {
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 function monthLabel(d: Date): string {
-    return d.toLocaleString("en-US", { month: "short" });
+    return d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
 }
 function monthFullLabel(d: Date): string {
-    return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+    return d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" });
 }
 
-// Safety cap (10 years) so a bad/ancient date can't blow up the "All" range loop.
+// Safety cap (10 years) so a bad/ancient date can't blow up the "All" range —
+// clamped to the most RECENT N months (never silently drops recent data).
 const MAX_MONTH_BUCKETS = 120;
 
 function buildMonthBuckets(from: Date | null, to: Date, fallbackDates: Date[]): Date[] {
@@ -96,13 +121,33 @@ function buildMonthBuckets(from: Date | null, to: Date, fallbackDates: Date[]): 
         start = monthStart(fallbackDates.reduce((min, d) => (d < min ? d : min)));
     }
     const end = monthStart(to);
+    const earliestAllowed = addMonths(end, -MAX_MONTH_BUCKETS);
+    if (start < earliestAllowed) start = earliestAllowed;
+
     const buckets: Date[] = [];
     let cur = start;
-    while (cur < end && buckets.length < MAX_MONTH_BUCKETS) {
+    while (cur < end) {
         buckets.push(cur);
         cur = addMonths(cur, 1);
     }
     return buckets;
+}
+
+// ---------------------------------------------------------------------------
+// Company-timezone day math (AR aging only — dates are stored at company-local
+// noon; elapsed-86400s math can shift a row across a bucket boundary around
+// DST transitions, so bucket by normalized company-calendar-day difference).
+// ---------------------------------------------------------------------------
+
+function companyDayNumber(date: Date, timeZone: string): number {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+    return Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day)) / 86400000;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +163,7 @@ export interface MonthMeta {
 export interface CashFlowMonthPoint extends MonthMeta {
     collected: number;
     jobCosts: number; // expenses + labor
-    overhead: number;
+    overhead: number; // Shop expenses + Shop labor
     net: number;
 }
 
@@ -154,24 +199,49 @@ export interface CompanyFinancialsChartData {
 const TOP_PROJECT_COLORS = ["#2563eb", "#d97706", "#0d9488", "#9333ea", "#db2777"];
 const OTHER_COLOR = "#78716c";
 
-const AR_BUCKET_ORDER = ["Not yet due", "1-30", "31-60", "61-90", "90+", "No due date"] as const;
+const AR_BUCKET_ORDER = ["Not yet due", "1-30", "31-60", "61-90", "91+", "No due date"] as const;
 const AR_BUCKET_COLORS: Record<(typeof AR_BUCKET_ORDER)[number], string> = {
     "Not yet due": "#fcd34d",
     "1-30": "#fbbf24",
     "31-60": "#f59e0b",
     "61-90": "#d97706",
-    "90+": "#92400e",
+    "91+": "#92400e",
     "No due date": "#a8a29e",
 };
 
-function ageBucket(dueDate: Date | null, today: Date): (typeof AR_BUCKET_ORDER)[number] {
+function ageBucket(dueDate: Date | null, todayDayNumber: number, timeZone: string): (typeof AR_BUCKET_ORDER)[number] {
     if (!dueDate) return "No due date";
-    const diffDays = Math.floor((today.getTime() - dueDate.getTime()) / 86400000);
+    const diffDays = todayDayNumber - companyDayNumber(dueDate, timeZone);
     if (diffDays <= 0) return "Not yet due";
     if (diffDays <= 30) return "1-30";
     if (diffDays <= 60) return "31-60";
     if (diffDays <= 90) return "61-90";
-    return "90+";
+    return "91+";
+}
+
+// A date-range predicate approximating `effectiveDate = a ?? b` at the SQL
+// level (COALESCE-equivalent via OR branches), so history outside the selected
+// range is never fetched. Omitted entirely for the "All" preset (from = null).
+function coalescedDateRange2(from: Date | null, to: Date, a: string, b: string) {
+    if (!from) return {};
+    return {
+        OR: [
+            { [a]: { gte: from, lt: to } },
+            { [a]: null, [b]: { gte: from, lt: to } },
+        ],
+    };
+}
+
+// Same idea for a 3-column coalesce (`a ?? b ?? c`).
+function coalescedDateRange3(from: Date | null, to: Date, a: string, b: string, c: string) {
+    if (!from) return {};
+    return {
+        OR: [
+            { [a]: { gte: from, lt: to } },
+            { [a]: null, [b]: { gte: from, lt: to } },
+            { [a]: null, [b]: null, [c]: { gte: from, lt: to } },
+        ],
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +254,7 @@ export async function getCompanyFinancialsChartData(
 ): Promise<CompanyFinancialsChartData> {
     const { from, to, projectIds, includeOverhead } = filters;
     const inRange = (d: Date) => (!from || d >= from) && d < to;
+    const allJobIds = jobProjects.map((p) => p.id);
 
     const [
         paidSchedules,
@@ -191,53 +262,97 @@ export async function getCompanyFinancialsChartData(
         jobExpenses,
         timeEntries,
         overheadExpenses,
+        overheadTimeEntries,
         unpaidSchedules,
         openRetainers,
-        allTimeExpensesForRanking,
+        expenseTotalsByEstimate,
+        timeZone,
     ] = await Promise.all([
+        // Collected: paid schedules whose PARENT invoice isn't Draft (item 2),
+        // bucketed by the schedule's own paymentDate ?? paidAt ?? createdAt —
+        // never dueDate (a plan, not a collection) and never invoice.createdAt.
         prisma.paymentSchedule.findMany({
-            where: { status: "Paid", invoice: { projectId: { in: projectIds } } },
-            select: { amount: true, paymentDate: true, dueDate: true, invoice: { select: { createdAt: true } } },
+            where: {
+                status: "Paid",
+                invoice: { projectId: { in: projectIds }, status: { in: INVOICE_PARENT_STATUSES } },
+                ...coalescedDateRange3(from, to, "paymentDate", "paidAt", "createdAt"),
+            },
+            select: { amount: true, paymentDate: true, paidAt: true, createdAt: true },
         }),
         prisma.retainer.findMany({
-            where: { projectId: { in: projectIds }, amountPaid: { gt: 0 } },
+            where: {
+                projectId: { in: projectIds },
+                status: { in: RETAINER_STATUSES },
+                amountPaid: { gt: 0 },
+                ...(from ? { createdAt: { gte: from, lt: to } } : {}),
+            },
             select: { amountPaid: true, createdAt: true },
         }),
         prisma.expense.findMany({
-            where: { estimate: { projectId: { in: projectIds } } },
+            where: {
+                estimate: { projectId: { in: projectIds } },
+                ...coalescedDateRange2(from, to, "date", "createdAt"),
+            },
             select: { amount: true, date: true, createdAt: true, estimate: { select: { projectId: true } } },
         }),
         prisma.timeEntry.findMany({
-            where: { projectId: { in: projectIds } },
+            where: {
+                projectId: { in: projectIds },
+                ...(from ? { startTime: { gte: from, lt: to } } : {}),
+            },
             select: { laborCost: true, burdenCost: true, startTime: true },
         }),
         includeOverhead
             ? prisma.expense.findMany({
-                  where: { estimate: { projectId: OVERHEAD_PROJECT_ID } },
+                  where: {
+                      estimate: { projectId: OVERHEAD_PROJECT_ID },
+                      ...coalescedDateRange2(from, to, "date", "createdAt"),
+                  },
                   select: { amount: true, date: true, createdAt: true },
               })
             : Promise.resolve([] as { amount: unknown; date: Date | null; createdAt: Date }[]),
+        // Overhead must match the page's own definition: Shop expenses + Shop labor.
+        includeOverhead
+            ? prisma.timeEntry.findMany({
+                  where: {
+                      projectId: OVERHEAD_PROJECT_ID,
+                      ...(from ? { startTime: { gte: from, lt: to } } : {}),
+                  },
+                  select: { laborCost: true, burdenCost: true, startTime: true },
+              })
+            : Promise.resolve([] as { laborCost: unknown; burdenCost: unknown; startTime: Date }[]),
+        // AR aging (snapshot, no date-range filter) — same parent-status gate as "collected".
         prisma.paymentSchedule.findMany({
-            where: { status: { notIn: ["Paid", "Canceled"] }, invoice: { projectId: { in: projectIds } } },
+            where: {
+                status: { notIn: ["Paid", "Canceled"] },
+                invoice: { projectId: { in: projectIds }, status: { in: INVOICE_PARENT_STATUSES } },
+            },
             select: { amount: true, dueDate: true },
         }),
         prisma.retainer.findMany({
-            where: { projectId: { in: projectIds }, balanceDue: { gt: 0 } },
+            where: { projectId: { in: projectIds }, status: { in: RETAINER_STATUSES }, balanceDue: { gt: 0 } },
             select: { balanceDue: true, dueDate: true },
         }),
-        prisma.expense.findMany({
-            where: { estimate: { projectId: { in: jobProjects.map((p) => p.id) } } },
-            select: { amount: true, estimate: { select: { projectId: true } } },
+        // All-time top-5 ranking universe: aggregate in SQL (groupBy + sum) rather
+        // than materializing every expense row. Expense has no direct projectId
+        // column, so group by estimateId and resolve project ids via a small
+        // estimate lookup below.
+        prisma.expense.groupBy({
+            by: ["estimateId"],
+            where: { estimate: { projectId: { in: allJobIds } } },
+            _sum: { amount: true },
         }),
+        resolveCompanyTimeZone(),
     ]);
 
     // ---- Fallback dates for "All" range bucket-building ----
     const allDates: Date[] = [];
-    for (const p of paidSchedules) allDates.push(p.paymentDate ?? p.dueDate ?? p.invoice.createdAt);
+    for (const p of paidSchedules) allDates.push(p.paymentDate ?? p.paidAt ?? p.createdAt);
     for (const r of paidRetainers) allDates.push(r.createdAt);
     for (const e of jobExpenses) allDates.push(e.date ?? e.createdAt);
     for (const t of timeEntries) allDates.push(t.startTime);
     for (const e of overheadExpenses) allDates.push(e.date ?? e.createdAt);
+    for (const t of overheadTimeEntries) allDates.push(t.startTime);
 
     const buckets = buildMonthBuckets(from, to, allDates);
     const bucketKeys = buckets.map(monthKey);
@@ -247,10 +362,10 @@ export async function getCompanyFinancialsChartData(
     const collected = new Array(buckets.length).fill(0);
     const jobExpenseByMonth = new Array(buckets.length).fill(0);
     const laborByMonth = new Array(buckets.length).fill(0);
-    const overheadByMonth = new Array(buckets.length).fill(0);
+    const overheadByMonth = new Array(buckets.length).fill(0); // Shop expenses + Shop labor
 
     for (const p of paidSchedules) {
-        const d = p.paymentDate ?? p.dueDate ?? p.invoice.createdAt;
+        const d = p.paymentDate ?? p.paidAt ?? p.createdAt;
         if (!inRange(d)) continue;
         const idx = bucketIndex.get(monthKey(d));
         if (idx !== undefined) collected[idx] += Number(p.amount);
@@ -283,6 +398,12 @@ export async function getCompanyFinancialsChartData(
         const idx = bucketIndex.get(monthKey(d));
         if (idx !== undefined) overheadByMonth[idx] += Number(e.amount);
     }
+    for (const t of overheadTimeEntries) {
+        const d = t.startTime;
+        if (!inRange(d)) continue;
+        const idx = bucketIndex.get(monthKey(d));
+        if (idx !== undefined) overheadByMonth[idx] += (Number(t.laborCost) || 0) + (Number(t.burdenCost) || 0);
+    }
 
     const cashFlow: CashFlowMonthPoint[] = buckets.map((d, i) => {
         const jobCosts = jobExpenseByMonth[i] + laborByMonth[i];
@@ -302,14 +423,22 @@ export async function getCompanyFinancialsChartData(
     // Ranking universe is ALL selectable jobs (jobProjects), all-time, ignoring
     // the current date-range/project filters — this is what keeps a project's
     // color stable no matter how the filters change.
+    const rankedEstimateIds = expenseTotalsByEstimate.map((g) => g.estimateId);
+    const estimateProjects = rankedEstimateIds.length
+        ? await prisma.estimate.findMany({
+              where: { id: { in: rankedEstimateIds } },
+              select: { id: true, projectId: true },
+          })
+        : [];
+    const projectByEstimate = new Map(estimateProjects.map((e) => [e.id, e.projectId]));
     const allTimeTotals = new Map<string, number>();
-    for (const e of allTimeExpensesForRanking) {
-        const pid = e.estimate.projectId;
+    for (const g of expenseTotalsByEstimate) {
+        const pid = projectByEstimate.get(g.estimateId);
         if (!pid) continue; // Estimate.projectId is nullable on this schema
-        allTimeTotals.set(pid, (allTimeTotals.get(pid) ?? 0) + Number(e.amount));
+        allTimeTotals.set(pid, (allTimeTotals.get(pid) ?? 0) + Number(g._sum.amount ?? 0));
     }
     const topProjectIds = [...allTimeTotals.entries()]
-        .sort((a, b) => b[1] - a[1])
+        .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) // tie-break by id: stable across reloads
         .slice(0, 5)
         .map(([id]) => id);
     const nameById = new Map(jobProjects.map((p) => [p.id, p.name]));
@@ -345,14 +474,16 @@ export async function getCompanyFinancialsChartData(
     // ---- Chart C: AR aging — as-of-today snapshot, not date-range filtered ----
     // (Like the stat tiles/jobs table, "what's outstanding right now" is a
     // position statement, not a trend — only the project filter applies.)
-    const today = new Date();
+    // Bucketed by normalized company-calendar-day difference: dates are stored
+    // at company-local noon, so elapsed-86400s math can misfire across DST.
+    const todayDayNumber = companyDayNumber(new Date(), timeZone);
     const arTotals: Partial<Record<(typeof AR_BUCKET_ORDER)[number], number>> = {};
     for (const s of unpaidSchedules) {
-        const bucket = ageBucket(s.dueDate, today);
+        const bucket = ageBucket(s.dueDate, todayDayNumber, timeZone);
         arTotals[bucket] = (arTotals[bucket] ?? 0) + Number(s.amount);
     }
     for (const r of openRetainers) {
-        const bucket = ageBucket(r.dueDate, today);
+        const bucket = ageBucket(r.dueDate, todayDayNumber, timeZone);
         arTotals[bucket] = (arTotals[bucket] ?? 0) + Number(r.balanceDue);
     }
     const arAging: ArAgingBucket[] = AR_BUCKET_ORDER.map((bucket) => ({
