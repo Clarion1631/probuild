@@ -27,7 +27,7 @@ class PaymentSectionErrorBoundary extends React.Component<{ children: React.Reac
     render() {
         if (this.state.hasError) {
             return (
-                <div className="px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
+                <div className="px-5 sm:px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
                     Something went wrong loading the payment section. Please refresh the page or contact us to complete your payment.
                 </div>
             );
@@ -411,8 +411,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     />
 
                     {/* Bill To */}
-                    <div className="px-10 pt-6 pb-0">
-                        <div className="grid grid-cols-3 gap-8">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 pt-6 pb-0">
+                        <div className="grid grid-cols-1 gap-6 sm:grid-cols-3 sm:gap-8">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Prepared For</p>
                                 <p className="text-sm font-semibold text-slate-800">{initialEstimate.clientName || "Client"}</p>
@@ -434,7 +434,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Signed Badge */}
                     {isApproved && (signatureBlockOverride?.approvedBy || initialEstimate.approvedBy) && (
-                        <div className="mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
+                        <div className="mx-5 sm:mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
@@ -480,11 +480,11 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     {/* Line Items — editor-matched layout */}
                     <div className="bg-white">
                         {/* Column headers */}
-                        <div className="flex text-[11px] font-bold text-slate-400 border-b border-slate-200 px-10 py-3.5 uppercase tracking-wider">
-                            <div className="flex-1">Item Description</div>
-                            <div className="w-20 text-right">Qty</div>
-                            <div className="w-32 text-right">Unit Price</div>
-                            <div className="w-32 text-right">Amount</div>
+                        <div className="flex text-[11px] font-bold text-slate-400 border-b border-slate-200 px-5 sm:px-10 py-3.5 uppercase tracking-wider">
+                            <div className="flex-1"><span className="hidden sm:inline">Item Description</span></div>
+                            <div className="w-12 sm:w-20 text-right">Qty</div>
+                            <div className="w-20 sm:w-32 text-right">Unit Price</div>
+                            <div className="w-24 sm:w-32 text-right">Amount</div>
                         </div>
 
                         <div className="divide-y divide-slate-100/80">
@@ -496,22 +496,22 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                     return (
                                         <React.Fragment key={item.id}>
                                             {/* Category header */}
-                                            <div data-pdf-row="true" className="flex items-center px-10 py-3.5 bg-slate-50">
+                                            <div data-pdf-row="true" className="flex items-center px-5 sm:px-10 py-3.5 bg-slate-50">
                                                 <div className="flex-1 font-bold text-sm text-slate-800">{item.name}</div>
-                                                <div className="w-20"></div>
-                                                <div className="w-32"></div>
-                                                <div className="w-32 text-right font-bold text-sm text-slate-800">{formatCurrency(itemTotal)}</div>
+                                                <div className="hidden sm:block w-20"></div>
+                                                <div className="hidden sm:block w-32"></div>
+                                                <div className="w-auto sm:w-32 text-right font-bold text-sm text-slate-800">{formatCurrency(itemTotal)}</div>
                                             </div>
                                             {/* Sub-items */}
                                             {item.subItems.map((sub: any) => (
-                                                <div data-pdf-row="true" key={sub.id} className="flex items-start bg-white px-10 py-3">
-                                                    <div className="flex-1 pl-6">
+                                                <div data-pdf-row="true" key={sub.id} className="flex flex-wrap justify-end gap-y-1 sm:flex-nowrap items-start bg-white px-5 sm:px-10 py-3">
+                                                    <div className="w-full pl-3 sm:w-auto sm:flex-1 sm:pl-6">
                                                         <div className="text-sm font-medium text-slate-700">{sub.name}</div>
                                                         {sub.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{sub.description}</div>}
                                                     </div>
-                                                    <div className="w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
-                                                    <div className="w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
-                                                    <div className="w-32 text-right text-sm font-semibold text-slate-700">{formatCurrency(Number(sub.total))}</div>
+                                                    <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{sub.quantity}</div>
+                                                    <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(sub.unitCost)}</div>
+                                                    <div className="w-24 sm:w-32 text-right text-sm font-semibold text-slate-700">{formatCurrency(Number(sub.total))}</div>
                                                 </div>
                                             ))}
                                         </React.Fragment>
@@ -520,14 +520,14 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                                 // Standalone item
                                 return (
-                                    <div data-pdf-row="true" key={item.id} className="flex items-start px-10 py-3 bg-white">
-                                        <div className="flex-1">
+                                    <div data-pdf-row="true" key={item.id} className="flex flex-wrap justify-end gap-y-1 sm:flex-nowrap items-start px-5 sm:px-10 py-3 bg-white">
+                                        <div className="w-full sm:w-auto sm:flex-1">
                                             <div className="text-sm font-medium text-slate-800">{item.name}</div>
                                             {item.description && <div className="text-xs text-slate-400 mt-1 leading-relaxed max-w-[85%]">{item.description}</div>}
                                         </div>
-                                        <div className="w-20 text-right text-sm text-slate-500">{item.quantity}</div>
-                                        <div className="w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
-                                        <div className="w-32 text-right text-sm font-semibold text-slate-800">{formatCurrency(itemTotal)}</div>
+                                        <div className="w-12 sm:w-20 text-right text-sm text-slate-500">{item.quantity}</div>
+                                        <div className="w-20 sm:w-32 text-right text-sm text-slate-500">{formatCurrency(item.unitCost)}</div>
+                                        <div className="w-24 sm:w-32 text-right text-sm font-semibold text-slate-800">{formatCurrency(itemTotal)}</div>
                                     </div>
                                 );
                             })}
@@ -535,8 +535,8 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     </div>
 
                     {/* Totals */}
-                    <div data-pdf-row="true" className="px-10 py-8 border-t border-slate-100 flex justify-end">
-                        <div className="w-72 space-y-2 text-sm">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 py-8 border-t border-slate-100 flex justify-end">
+                        <div className="w-full sm:w-72 space-y-2 text-sm">
                             <div className="flex justify-between text-slate-500 font-medium">
                                 <span>Subtotal</span>
                                 <span className="text-slate-800">{formatCurrency(subtotal)}</span>
@@ -577,7 +577,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     {/* Payment Schedule — hide auto-created "Payment in Full" rows from milestone list */}
                     {schedules.filter((s: any) => s.name !== "Payment in Full").length > 0 && (
                         <PaymentSectionErrorBoundary>
-                        <div className="px-10 pb-8">
+                        <div className="px-5 sm:px-10 pb-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment Schedule</h2>
                             <div className="border border-slate-200 rounded-md overflow-hidden">
                                 {schedules.filter((s: any) => s.name !== "Payment in Full").map((p: any) => {
@@ -631,7 +631,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
 
                     {/* Signature / Approval Area — hidden in capture mode */}
                     {!isApproved && !isCapture && (
-                        <div data-pdf-row="true" className="px-10 pb-10 print:hidden">
+                        <div data-pdf-row="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
                                     <h3 className="text-lg font-bold text-slate-800 mb-2">Ready to Approve?</h3>
@@ -700,7 +700,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                     )}
 
                     {/* Footer */}
-                    <div data-pdf-row="true" className="bg-slate-50/60 border-t border-slate-100 px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50/60 border-t border-slate-100 px-5 sm:px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This estimate was prepared by {companyName}.{companyLicense && ` Lic# ${companyLicense}.`} {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>
@@ -710,7 +710,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                 {/* Attachments — interactive download links, shown only in the live portal (not in the captured PDF) */}
                 {!isCapture && files.length > 0 && (
                     <div className="bg-white rounded-lg shadow-sm mt-6 print:hidden">
-                        <div className="px-10 py-5 border-b border-slate-100">
+                        <div className="px-5 sm:px-10 py-5 border-b border-slate-100">
                             <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Attachments</h2>
                         </div>
                         <ul className="divide-y divide-slate-100">
@@ -720,7 +720,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                         href={f.url}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="flex items-center gap-3 px-10 py-3 hover:bg-slate-50 transition group"
+                                        className="flex items-center gap-3 px-5 sm:px-10 py-3 hover:bg-slate-50 transition group"
                                     >
                                         <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
                                         <span className="flex-1 text-sm font-medium text-slate-700 group-hover:text-indigo-600 truncate">{f.name}</span>
@@ -783,7 +783,7 @@ function TermsAndConditions({ html }: { html: string }) {
     const contentClassName = "border-l-2 border-slate-300 pl-6 py-1 prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:text-sm prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2";
 
     return (
-        <div className="px-10 pb-10 border-t border-slate-200 pt-8">
+        <div className="px-5 sm:px-10 pb-10 border-t border-slate-200 pt-8">
             {/* Section heading — always rendered once */}
             <div data-pdf-row="true" className="flex items-center gap-2 mb-4">
                 <svg className="w-4 h-4 text-slate-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -838,7 +838,7 @@ function PortalRichSection({ title, html, variant }: { title: string; html: stri
     const contentClassName = "prose prose-sm max-w-none text-slate-600 prose-headings:text-slate-800 prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2 prose-strong:text-slate-700 prose-p:leading-relaxed prose-p:text-[13px] prose-p:my-1.5 prose-li:text-[13px] prose-li:my-0.5 prose-ol:pl-4 prose-ul:pl-4 prose-ol:my-2 prose-ul:my-2";
 
     return (
-        <div className="px-10 pt-8 pb-8 border-t border-slate-100">
+        <div className="px-5 sm:px-10 pt-8 pb-8 border-t border-slate-100">
             <div data-pdf-row="true" className="mb-4">
                 {variant === "overview" ? (
                     <h2 className="text-xl font-bold text-slate-800 tracking-tight">{title}</h2>

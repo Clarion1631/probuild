@@ -712,13 +712,13 @@ export default function PortalContractClient({
                             )}
 
                             {/* Contract Title */}
-                            <div data-pdf-row="true" className="px-10 pt-8 pb-2">
+                            <div data-pdf-row="true" className="px-5 sm:px-10 pt-8 pb-2">
                                 <h2 className="text-xl font-bold text-slate-800 text-center">{initialContract.title}</h2>
                                 <div className="w-16 h-0.5 bg-slate-300 mx-auto mt-3"></div>
                             </div>
 
                             {/* Contract Body (Injected) */}
-                            <div className="px-10 py-8">
+                            <div className="px-5 sm:px-10 py-8">
                                 {/* We add a style tag to apply CSS to the dynamically generated buttons so Tailwind works smoothly on them */}
                                 <style dangerouslySetInnerHTML={{__html: `
                                     .doc-block-btn {
@@ -830,7 +830,7 @@ export default function PortalContractClient({
 
                     {/* Final Submission Block */}
                     {!isSigned && !initialContract.originalPdfPath && (
-                        <div data-pdf-skip="true" className="px-10 pb-10 print:hidden">
+                        <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 {awaitingContractor && (
                                     <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl mb-4 flex items-center gap-3">
@@ -867,7 +867,7 @@ export default function PortalContractClient({
                     )}
 
                     {/* Footer */}
-                    <div data-pdf-row="true" className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This document was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`}
                         </p>

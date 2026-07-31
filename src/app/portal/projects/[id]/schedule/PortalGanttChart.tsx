@@ -259,10 +259,10 @@ export default function PortalGanttChart({
 
             <div className="flex flex-1 overflow-hidden">
                 {/* Task List */}
-                <div className="w-72 shrink-0 bg-white border-r border-slate-200 flex flex-col z-10 shadow-[2px_0_8px_rgba(0,0,0,0.03)]">
+                <div className={`${subcontractorId ? "w-56" : "w-40"} sm:w-72 shrink-0 bg-white border-r border-slate-200 flex flex-col z-10 shadow-[2px_0_8px_rgba(0,0,0,0.03)]`}>
                     <div className="flex items-center px-4 bg-slate-50 border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider" style={{ height: headerHeight }}>
                         <div className="flex-1">Task Name</div>
-                        <div className="w-24 text-center">Status</div>
+                        <div className={`${subcontractorId ? "w-20" : "hidden"} sm:block sm:w-24 text-center`}>Status</div>
                     </div>
                     <div className="flex-1 overflow-y-auto">
                         {tasks.map(task => (
@@ -290,7 +290,7 @@ export default function PortalGanttChart({
                                         </div>
                                     )}
                                 </div>
-                                <div className="w-24 shrink-0 flex justify-end">
+                                <div className={`${subcontractorId ? "w-20 flex" : "hidden"} sm:flex sm:w-24 shrink-0 justify-end`}>
                                     {subcontractorId ? (
                                         <select
                                             value={task.status}

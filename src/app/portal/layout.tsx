@@ -2,10 +2,13 @@ import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { resolveSessionClientId } from "@/lib/portal-auth";
+import { getPublicCompanySettings } from "@/lib/actions";
 import PortalUserMenu from "@/components/PortalUserMenu";
 
 export default async function PortalLayout({ children }: { children: React.ReactNode }) {
     const session = await getServerSession(authOptions);
+    const settings = await getPublicCompanySettings().catch(() => null);
+    const companyName = settings?.companyName || "Golden Touch Remodeling";
     const isStaff = ["ADMIN", "MANAGER"].includes((session?.user as any)?.role);
 
     let displayName: string | null = null;
@@ -30,7 +33,15 @@ export default async function PortalLayout({ children }: { children: React.React
     return (
         <div className="min-h-screen bg-hui-background flex flex-col">
             <header className="bg-white border-b border-hui-border px-4 md:px-8 py-4 flex items-center justify-between shadow-sm">
-                <div className="font-bold text-xl text-hui-textMain tracking-tight">ProBuild</div>
+                <div className="flex items-center gap-2.5 min-w-0">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                        src={settings?.logoUrl || "/logo.png"}
+                        alt={companyName}
+                        className="h-9 w-9 rounded-lg object-contain shrink-0"
+                    />
+                    <span className="font-bold text-lg sm:text-xl text-hui-textMain tracking-tight truncate">{companyName}</span>
+                </div>
                 {isAuthed && <PortalUserMenu displayName={displayName} isStaff={isStaff} />}
             </header>
             <main className="flex-1 w-full max-w-5xl mx-auto p-4 md:p-8">

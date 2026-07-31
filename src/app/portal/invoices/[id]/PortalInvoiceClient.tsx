@@ -21,7 +21,7 @@ class PaymentSectionErrorBoundary extends React.Component<{ children: React.Reac
     render() {
         if (this.state.hasError) {
             return (
-                <div className="px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
+                <div className="px-5 sm:px-10 py-6 border-t border-slate-200 bg-amber-50 text-sm text-amber-900">
                     Something went wrong loading the payment section. Please refresh the page or contact us to complete your payment.
                 </div>
             );
@@ -174,8 +174,8 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     />
 
                     {/* Bill To */}
-                    <div className="px-10 pt-6 pb-0">
-                        <div className="grid grid-cols-2 gap-8">
+                    <div className="px-5 sm:px-10 pt-6 pb-0">
+                        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 sm:gap-8">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Bill To</p>
                                 <p className="text-sm font-semibold text-slate-800">{initialInvoice.clientName}</p>
@@ -190,7 +190,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                     {/* Focused payment request — the amount the client is being asked to pay right now */}
                     {hasFocus && (
-                        <div className="px-10 py-8 bg-emerald-50 border-b border-emerald-200">
+                        <div className="px-5 sm:px-10 py-8 bg-emerald-50 border-b border-emerald-200">
                             <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider mb-1">Payment Requested</p>
                             <p className="text-sm text-emerald-900 mb-3">{focusedPayments.map((p: any) => p.name).join(" · ")}</p>
                             <div className="flex items-center justify-between flex-wrap gap-4">
@@ -213,17 +213,17 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         payment request shows just the requested amount above; the full
                         balance stays out of the client's view until it's asked for. */}
                     {!hasFocus && (
-                    <div className="px-10 py-8 bg-slate-50 border-b border-slate-200">
-                        <div className="flex justify-between items-center">
+                    <div className="px-5 sm:px-10 py-8 bg-slate-50 border-b border-slate-200">
+                        <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-center">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Total Amount</p>
                                 <p className="text-2xl font-bold text-slate-800">{formatCurrency(initialInvoice.totalAmount)}</p>
                             </div>
-                            <div className="text-center">
+                            <div className="sm:text-center">
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Paid</p>
                                 <p className="text-2xl font-bold text-green-600">{formatCurrency(totalPaid)}</p>
                             </div>
-                            <div className="text-right">
+                            <div className="sm:text-right">
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Due Now</p>
                                 <p className={`text-2xl font-bold ${requestedDueNow > 0 ? 'text-red-600' : 'text-green-600'}`}>
                                     {formatCurrency(requestedDueNow)}
@@ -238,7 +238,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                     {/* Notes */}
                     {initialInvoice.notes && (
-                        <div className="px-10 py-6 border-b border-slate-200">
+                        <div className="px-5 sm:px-10 py-6 border-b border-slate-200">
                             <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Notes</p>
                             <p className="text-sm text-slate-600 whitespace-pre-wrap">{initialInvoice.notes}</p>
                         </div>
@@ -247,7 +247,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     {/* Payment Schedule */}
                     {initialInvoice.payments && initialInvoice.payments.length > 0 && (
                         <PaymentSectionErrorBoundary>
-                        <div className="px-10 py-8">
+                        <div className="px-5 sm:px-10 py-8">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-4">Payment Schedule</h2>
                             <div className="space-y-3">
                                 {initialInvoice.payments.map((payment: any) => {
@@ -260,7 +260,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                     return (
                                         <div
                                             key={payment.id}
-                                            className={`flex items-center justify-between px-5 py-4 rounded-lg border ${
+                                            className={`flex flex-wrap items-center justify-between gap-y-3 px-4 sm:px-5 py-4 rounded-lg border ${
                                                 isPaidItem
                                                     ? 'bg-green-50 border-green-200'
                                                     : isFocused
@@ -302,7 +302,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                     </a>
                                                 )}
                                             </div>
-                                            <div className="flex items-center gap-4">
+                                            <div className="flex items-center gap-4 ml-auto">
                                                 <span className="font-semibold text-slate-800 text-lg">
                                                     {formatCurrency(payment.amount)}
                                                 </span>
@@ -339,7 +339,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50 border-t border-slate-200 px-10 py-4 text-center">
+                    <div className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`} {companyLicense && `License # ${companyLicense}.`}
                         </p>
