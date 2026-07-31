@@ -92,6 +92,19 @@ export function validateTemplateItems(items: TemplateItemInput[]): CleanTemplate
     if (items.length > MAX_ITEMS) {
         throw new DecisionTemplateValidationError(`A template can have at most ${MAX_ITEMS} items`);
     }
+    // Duplicate ids in an update payload (Codex review round 2, NEW 3) would
+    // make updateDecisionTemplate's "update in place by id" loop write the
+    // same row twice with two different item's data (whichever iterates
+    // last wins) and silently lose the other — reject up front instead.
+    const seenIds = new Set<string>();
+    for (const item of items) {
+        const id = typeof item?.id === "string" ? item.id : undefined;
+        if (!id) continue;
+        if (seenIds.has(id)) {
+            throw new DecisionTemplateValidationError("Two items reference the same existing row — refresh and try again.");
+        }
+        seenIds.add(id);
+    }
     return items.map((item, index) => {
         const label = `Item ${index + 1}`;
         const name = (item?.name ?? "").trim();
@@ -115,4 +128,17 @@ export function validateTemplateItems(items: TemplateItemInput[]): CleanTemplate
  * applyDecisionTemplate. */
 export function buildTemplateKey(templateId: string, itemId: string): string {
     return `decision-template:${templateId}:${itemId}`;
+}
+
+/** Shared dedupe-comparison normalization (Codex review round 2, N1) — used
+ * on BOTH sides of every "is this the same category" comparison in this
+ * feature (currently applyDecisionTemplate's name-based skip check).
+ * NFKD (not NFKC) decomposes precomposed characters into base + combining
+ * marks, which are then stripped — this additionally handles cases NFKC
+ * alone does not, e.g. the Turkish dotted/dotless İ/ı pair and any
+ * accent/diacritic entered with a combining mark instead of a precomposed
+ * character, not just differing Unicode compositions of the same visual
+ * glyph. */
+export function normalizeForDedupe(name: string): string {
+    return name.trim().normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
 }

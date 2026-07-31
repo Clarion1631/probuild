@@ -10,6 +10,7 @@ import {
     createDecisionTemplate,
     listDecisionTemplates,
     archiveDecisionTemplate,
+    unarchiveDecisionTemplate,
 } from "../src/lib/decision-template-crud-core";
 import { applyDecisionTemplate } from "../src/lib/decision-template-apply-core";
 import {
@@ -406,6 +407,58 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
         expect(linked.leadTimeDays).not.toBeNull();
     });
 
+    test("R9: leaving a row unlinked with no failures still closes, but with an accurate 'N linked, M left unlinked' toast (not a plain success count)", async ({ page }) => {
+        const linkedDecision = await prisma.decision.create({
+            data: { id: `${run}-r9-linked-decision`, projectId: ids.project, name: "ZzzR9Flooring", status: "Open" },
+        });
+        const linkedTask = await prisma.scheduleTask.create({
+            data: {
+                id: `${run}-r9-task`,
+                projectId: ids.project,
+                name: "ZzzR9Flooring Install",
+                startDate: new Date("2026-11-01T00:00:00.000Z"),
+                endDate: new Date("2026-11-05T00:00:00.000Z"),
+            },
+        });
+        const unlinkedDecision = await prisma.decision.create({
+            data: { id: `${run}-r9-unlinked-decision`, projectId: ids.project, name: "ZzzR9NoMatch", status: "Open" },
+        });
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/link-schedule") && res.ok()),
+            page.getByTestId("link-to-schedule-button").click(),
+        ]);
+
+        const modal = page.getByTestId("link-schedule-modal");
+        await expect(modal).toBeVisible();
+        // Deliberately deselect the second row to "Leave unlinked" — the mock
+        // has no task to match "ZzzR9NoMatch" against anyway, but be explicit
+        // regardless of what the mock guessed. (This shared project fixture
+        // has accumulated other undecided decisions with no keyword match
+        // from earlier tests in this serial suite, which the mock ALSO
+        // leaves unlinked by default — so "left unlinked" here is never
+        // exactly 1; the toast/DB assertions below don't depend on the
+        // exact count.)
+        await modal.getByTestId(`link-schedule-row-select-${unlinkedDecision.id}`).selectOption("");
+
+        await modal.getByTestId("link-schedule-apply").click();
+
+        // Nothing FAILED — every row either linked successfully or was left
+        // unlinked by choice — so the modal still auto-closes (Codex review
+        // round 2, R9 corrects round 1's assumption that "some left
+        // unlinked" should keep it open; only a real failure does that).
+        // The fix is the TOAST TEXT: an accurate "N linked, M left
+        // unlinked" instead of a plain "N linked" that hides the skips.
+        await expect(page.getByText(/\d+ linked, \d+ left unlinked/)).toBeVisible();
+        await expect(modal).not.toBeVisible();
+
+        const linked = await prisma.decision.findUniqueOrThrow({ where: { id: linkedDecision.id } });
+        expect(linked.scheduleTaskId).toBe(linkedTask.id);
+        const unlinked = await prisma.decision.findUniqueOrThrow({ where: { id: unlinkedDecision.id } });
+        expect(unlinked.scheduleTaskId).toBeNull();
+    });
+
     // ── Case 6: portal shows "Decide by" with the correct date; raw
     //    dueDate/scheduleTaskId/leadTimeDays never leave the server; portal
     //    actor cannot call link/override/template actions ─────────────────
@@ -484,6 +537,29 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
 
         const decision = await prisma.decision.findFirst({ where: { projectId: ids.project, name: "Should Not Be Created" } });
         expect(decision).toBeNull();
+    });
+
+    test("R8: unarchiving restores a template to the active list and the apply picker; applying it then succeeds", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const manager = await prisma.user.findUniqueOrThrow({ where: { id: ids.manager } });
+
+        // archivedTemplateId was archived by the previous test.
+        const activeBefore = await listDecisionTemplates({ getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        expect(activeBefore.find((t) => t.id === archivedTemplateId)?.archivedAt).not.toBeNull();
+
+        await unarchiveDecisionTemplate(archivedTemplateId, { getActor: async () => manager, revalidate: NOOP_REVALIDATE });
+
+        const activeAfter = await listDecisionTemplates({ getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        const restored = activeAfter.find((t) => t.id === archivedTemplateId);
+        expect(restored?.archivedAt).toBeNull();
+
+        // Now applies successfully — proves it's genuinely back in the
+        // apply-eligible set, not just flagged in listDecisionTemplates.
+        const result = await applyDecisionTemplate(ids.project, archivedTemplateId, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        expect(result.created).toBe(1);
+
+        const decision = await prisma.decision.findFirst({ where: { projectId: ids.project, name: "Should Not Be Created" } });
+        expect(decision).not.toBeNull();
     });
 
     test("issue 11: auth runs BEFORE the decision lookup — an unauthenticated caller gets the same Forbidden for a real or a nonexistent decisionId (no existence oracle)", async () => {

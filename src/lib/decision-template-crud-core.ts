@@ -155,7 +155,10 @@ export async function updateDecisionTemplate(
 /** Archive, never hard-delete — projects that already applied this template
  * keep working; archived templates just drop out of listDecisionTemplates'
  * active set and the apply picker. Idempotent — archiving an already-archived
- * template is a no-op re-write, not an error. */
+ * template is a no-op re-write, not an error. Reversible via
+ * unarchiveDecisionTemplate below (Codex review round 2, R8) — the "no
+ * undo" framing this shipped with originally was wrong; archive is just a
+ * visibility toggle. */
 export async function archiveDecisionTemplate(templateId: string, deps: TemplateCrudDependencies = {}) {
     await requireAdminOrManager(deps);
     const existing = await prisma.decisionTemplate.findUnique({
@@ -167,6 +170,26 @@ export async function archiveDecisionTemplate(templateId: string, deps: Template
     const template = await prisma.decisionTemplate.update({
         where: { id: templateId },
         data: { archivedAt: existing.archivedAt ?? new Date() },
+    });
+
+    (deps.revalidate ?? defaultRevalidate)();
+    return template;
+}
+
+/** Clears archivedAt, restoring the template to listDecisionTemplates' active
+ * set and the apply picker (Codex review round 2, R8). Idempotent —
+ * unarchiving an already-active template is a no-op re-write. */
+export async function unarchiveDecisionTemplate(templateId: string, deps: TemplateCrudDependencies = {}) {
+    await requireAdminOrManager(deps);
+    const existing = await prisma.decisionTemplate.findUnique({
+        where: { id: templateId },
+        select: { id: true },
+    });
+    if (!existing) throw new DecisionTemplateNotFoundError();
+
+    const template = await prisma.decisionTemplate.update({
+        where: { id: templateId },
+        data: { archivedAt: null },
     });
 
     (deps.revalidate ?? defaultRevalidate)();

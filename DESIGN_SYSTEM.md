@@ -49,10 +49,14 @@ Every new page must follow these patterns. No exceptions. This file is the sourc
 .hui-btn-primary  /* dark slate primary — use for main page actions */
 .hui-btn-secondary /* white bordered — use for secondary actions */
 .hui-btn-green    /* brand green — use for positive actions (save, approve, create) */
-.hui-btn-accent   /* filled indigo — AI-assisted / bulk actions (Sort with AI, Link to
-                     schedule, Apply template). A distinct category from hui-btn-green:
-                     never use both on the same header, or the true primary action
-                     (Add/Save) loses its visual priority. */
+.hui-btn-accent   /* filled indigo — secondary bulk/AI actions (Sort with AI, Link to
+                     schedule, Apply template). MAY share a header with the one
+                     hui-btn-green primary action (e.g. the selections header:
+                     Link to schedule + Apply template are accent, Add a decision
+                     is the one green primary) — accent and green are different
+                     tiers, not competing primaries. The rule is per-COLOR, not
+                     per-header: exactly one hui-btn-green per page (the true
+                     primary action), and never two greens side by side. */
 .hui-input        /* text input, select, textarea base */
 .hui-card         /* white card with border and shadow */
 ```
@@ -335,6 +339,7 @@ function StatusBadge({ status }: { status: string }) {
 3. **Tabs use the TabButton pattern** — border-bottom style, hui-primary active color, count badges
 4. **Tables live inside hui-card** — `divide-y divide-slate-100` for rows, `bg-slate-50` for header
 5. **Save buttons are always `hui-btn-green`** — not `hui-btn-primary` (that's for navigation actions)
+5a. **Exactly one `hui-btn-green` per page/header** — the one true primary action. `hui-btn-accent` (secondary bulk/AI actions) may sit right next to it in the same header; never two greens side by side.
 6. **Loading states** — buttons show "Saving..." / "Loading..." text when disabled
 7. **Empty states** — every list must have one. Use EmptyState component with icon, title, description, and CTA
 8. **No raw colors** — always use hui-* tokens or the status color table above

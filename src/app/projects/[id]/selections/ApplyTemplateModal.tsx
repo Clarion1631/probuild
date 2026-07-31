@@ -42,6 +42,14 @@ export default function ApplyTemplateModal({
         setOpen(next);
         if (!next) return;
 
+        // Reset on EVERY open, not just the first (Codex review round 2,
+        // NEW 1) — without this, reopening after a successful apply left the
+        // previous session's `templates`/`selectedId` in state during the
+        // new fetch's loading window, so Confirm was clickable against a
+        // stale list (e.g. re-applying a template that was archived or
+        // edited in between) until the fresh data happened to land.
+        setTemplates([]);
+        setSelectedId("");
         setLoading(true);
         setLoadError(null);
         listActiveDecisionTemplatesForApply()
@@ -139,7 +147,13 @@ export default function ApplyTemplateModal({
                         <button
                             data-testid="apply-template-confirm"
                             onClick={handleApply}
-                            disabled={applying || !selectedId || templates.length === 0}
+                            // Explicitly gated on loading/loadError (Codex
+                            // review round 2, NEW 1), not just derived from
+                            // templates.length — defends against Confirm
+                            // ever being clickable mid-fetch or after a
+                            // failed load, independent of what `templates`
+                            // happens to hold at that moment.
+                            disabled={applying || loading || !!loadError || !selectedId || templates.length === 0}
                             className="hui-btn hui-btn-green disabled:opacity-50"
                         >
                             {applying ? "Applying…" : "Apply"}

@@ -8,8 +8,9 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import * as Dialog from "@radix-ui/react-dialog";
-import { createDecisionTemplate, updateDecisionTemplate, archiveDecisionTemplate } from "@/lib/actions";
-import { Plus, Pencil, Archive, Trash2, ArrowUp, ArrowDown } from "lucide-react";
+import * as AlertDialog from "@radix-ui/react-alert-dialog";
+import { createDecisionTemplate, updateDecisionTemplate, archiveDecisionTemplate, unarchiveDecisionTemplate } from "@/lib/actions";
+import { Plus, Pencil, Archive, ArchiveRestore, Trash2, ArrowUp, ArrowDown } from "lucide-react";
 
 export type TemplateItemDraft = {
     key: string; // client-only stable key for React lists, not persisted
@@ -293,9 +294,13 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
     const [editorOpen, setEditorOpen] = useState(false);
     const [editing, setEditing] = useState<TemplateView | null>(null);
     const [archiving, setArchiving] = useState<string | null>(null);
-    // Archive has no undo (Codex review round 1, issue 8) — confirm first,
-    // same plain-overlay house pattern as DecisionCard's delete confirm on
-    // the staff selections page.
+    const [unarchiving, setUnarchiving] = useState<string | null>(null);
+    // Archiving still gets a confirm step (it hides the template from the
+    // apply picker immediately) — but it's reversible via Unarchive below
+    // (Codex review round 2, R8), so the copy no longer claims there's no
+    // undo. Radix AlertDialog (Codex review round 2, NEW 2) — role="alertdialog",
+    // aria-modal, focus trap/restore, Escape — the same house pattern as
+    // every other confirm/review dialog in this feature.
     const [confirmArchive, setConfirmArchive] = useState<TemplateView | null>(null);
 
     function refresh() {
@@ -316,9 +321,22 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
         }
     }
 
+    async function handleUnarchive(template: TemplateView) {
+        setUnarchiving(template.id);
+        try {
+            await unarchiveDecisionTemplate(template.id);
+            toast.success("Template unarchived.");
+            refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Couldn't unarchive that template.");
+        } finally {
+            setUnarchiving(null);
+        }
+    }
+
     // initialTemplates is only the INITIAL value — resync after
     // router.refresh() re-fetches server data.
-    if (initialTemplates !== templates && editorOpen === false && archiving === null) {
+    if (initialTemplates !== templates && editorOpen === false && archiving === null && unarchiving === null) {
         // Cheap resync without an effect: only when nothing is mid-flight.
         setTemplates(initialTemplates);
     }
@@ -378,7 +396,17 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
                                             >
                                                 <Pencil className="w-4 h-4" />
                                             </button>
-                                            {!t.archivedAt && (
+                                            {t.archivedAt ? (
+                                                <button
+                                                    data-testid={`unarchive-template-${t.id}`}
+                                                    onClick={() => handleUnarchive(t)}
+                                                    disabled={unarchiving === t.id}
+                                                    title="Unarchive"
+                                                    className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:text-hui-primary hover:bg-hui-primary/10 transition disabled:opacity-50"
+                                                >
+                                                    <ArchiveRestore className="w-4 h-4" />
+                                                </button>
+                                            ) : (
                                                 <button
                                                     data-testid={`archive-template-${t.id}`}
                                                     onClick={() => setConfirmArchive(t)}
@@ -405,36 +433,47 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
                 onSaved={refresh}
             />
 
-            {confirmArchive && (
-                <div
-                    className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4"
-                    onClick={() => archiving === null && setConfirmArchive(null)}
-                >
-                    <div
+            <AlertDialog.Root
+                open={!!confirmArchive}
+                onOpenChange={(next) => { if (!next && archiving === null) setConfirmArchive(null); }}
+            >
+                <AlertDialog.Portal>
+                    <AlertDialog.Overlay className="fixed inset-0 bg-slate-900/50 z-50" />
+                    <AlertDialog.Content
                         data-testid="confirm-archive-template-modal"
-                        className="bg-white rounded-xl shadow-xl w-full max-w-sm border border-hui-border"
-                        onClick={(e) => e.stopPropagation()}
+                        className="fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2 bg-white rounded-xl shadow-xl w-full max-w-sm border border-hui-border focus:outline-none"
                     >
                         <div className="p-6">
-                            <h3 className="text-base font-bold text-hui-textMain mb-2">Archive &quot;{confirmArchive.name}&quot;?</h3>
-                            <p className="text-sm text-hui-textMuted">
-                                Projects that already applied it keep working — this just hides it from new applications. There&apos;s no undo from here; you&apos;d need to create a new template with the same items.
-                            </p>
+                            <AlertDialog.Title className="text-base font-bold text-hui-textMain mb-2">
+                                Archive &quot;{confirmArchive?.name}&quot;?
+                            </AlertDialog.Title>
+                            <AlertDialog.Description className="text-sm text-hui-textMuted">
+                                Projects that already applied it keep working — this just hides it from new applications and the apply picker. You can unarchive it again anytime from this list.
+                            </AlertDialog.Description>
                         </div>
                         <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50 rounded-b-xl">
-                            <button onClick={() => setConfirmArchive(null)} disabled={archiving !== null} className="hui-btn hui-btn-secondary">Cancel</button>
+                            <AlertDialog.Cancel asChild>
+                                <button disabled={archiving !== null} className="hui-btn hui-btn-secondary">Cancel</button>
+                            </AlertDialog.Cancel>
+                            {/* Plain button, not AlertDialog.Action — Action
+                                auto-closes on click, but this is an async
+                                write that must keep the dialog open on
+                                failure (so the error toast is visible and
+                                the user can retry) and only close on
+                                success (handleArchive calls
+                                setConfirmArchive(null) itself). */}
                             <button
                                 data-testid="confirm-archive-template-button"
-                                onClick={() => handleArchive(confirmArchive)}
+                                onClick={() => confirmArchive && handleArchive(confirmArchive)}
                                 disabled={archiving !== null}
                                 className="hui-btn hui-btn-primary disabled:opacity-50"
                             >
-                                {archiving === confirmArchive.id ? "Archiving…" : "Archive"}
+                                {confirmArchive && archiving === confirmArchive.id ? "Archiving…" : "Archive"}
                             </button>
                         </div>
-                    </div>
-                </div>
-            )}
+                    </AlertDialog.Content>
+                </AlertDialog.Portal>
+            </AlertDialog.Root>
         </div>
     );
 }

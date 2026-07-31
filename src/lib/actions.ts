@@ -36,6 +36,7 @@ import {
     createDecisionTemplate as createDecisionTemplateCore,
     updateDecisionTemplate as updateDecisionTemplateCore,
     archiveDecisionTemplate as archiveDecisionTemplateCore,
+    unarchiveDecisionTemplate as unarchiveDecisionTemplateCore,
     listDecisionTemplates as listDecisionTemplatesCore,
 } from "./decision-template-crud-core";
 import type { DecisionTemplateInput } from "./decision-template-crud-core";
@@ -11153,6 +11154,10 @@ export async function updateDecisionTemplate(templateId: string, input: Decision
 
 export async function archiveDecisionTemplate(templateId: string) {
     return archiveDecisionTemplateCore(templateId);
+}
+
+export async function unarchiveDecisionTemplate(templateId: string) {
+    return unarchiveDecisionTemplateCore(templateId);
 }
 
 export async function listDecisionTemplates() {

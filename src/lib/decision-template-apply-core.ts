@@ -11,7 +11,7 @@
 import { prisma } from "./prisma";
 import { getCurrentUserWithPermissions, canAccessProject } from "./permissions";
 import { revalidatePath } from "next/cache";
-import { buildTemplateKey, DecisionTemplateNotFoundError } from "./decision-template-core";
+import { buildTemplateKey, DecisionTemplateNotFoundError, normalizeForDedupe } from "./decision-template-core";
 
 export type ApplyActor = {
     role: string;
@@ -54,24 +54,15 @@ export async function listActiveDecisionTemplatesForApply(deps: Pick<ApplyDepend
 
 export type ApplyDecisionTemplateResult = { created: number; skipped: string[] };
 
-// Same normalization on both sides of the dedupe comparison as the CRUD/
-// portal-facing name checks elsewhere in this feature (Codex review round 1,
-// nit a) — NFKC first so visually-identical names that differ only in
-// Unicode composition (e.g. a precomposed vs. combining-mark accent) are
-// still recognized as the same category, not just case differences.
-function normalizeForDedupe(name: string): string {
-    return name.trim().normalize("NFKC").toLowerCase();
-}
-
 /**
  * Creates one Decision per template item, in item order, appended after the
  * project's existing sortOrder (createDecision precedent). Each Decision
  * gets a PER-ITEM templateKey ("decision-template:<templateId>:<itemId>") —
  * Decision has @@unique([projectId, templateKey]), so a shared per-template
  * key would make every item after the first fail. Items whose name matches
- * an existing LIVE decision on the project (NFKC + case-insensitively) are
- * skipped and reported, never duplicated — re-applying the same template is
- * always safe.
+ * an existing LIVE decision on the project (normalizeForDedupe — Codex
+ * review round 2, N1) are skipped and reported, never duplicated —
+ * re-applying the same template is always safe.
  *
  * The whole thing runs inside ONE interactive transaction, opened with a
  * project-scoped Postgres advisory lock (Codex review round 1, issues 3+4):

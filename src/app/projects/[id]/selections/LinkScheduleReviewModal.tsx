@@ -119,10 +119,14 @@ export default function LinkScheduleReviewModal({
         setApplying(true);
         const outcomes: Record<string, RowOutcome> = {};
         let appliedCount = 0;
+        let leftUnlinkedCount = 0;
 
         for (const row of rows) {
             const taskId = taskSelections[row.decisionId] || null;
-            if (!taskId) continue; // left unlinked — no write attempted; annotated below if the modal stays open
+            if (!taskId) {
+                leftUnlinkedCount += 1;
+                continue; // left unlinked — no write attempted; annotated below whenever outcomes are shown
+            }
             const leadTimeDays = Number(leadTimeDrafts[row.decisionId]);
             try {
                 await linkDecisionToSchedule(row.decisionId, taskId, Number.isFinite(leadTimeDays) ? leadTimeDays : 0);
@@ -134,7 +138,10 @@ export default function LinkScheduleReviewModal({
         }
 
         const attempted = Object.keys(outcomes).length;
-        if (attempted === 0) {
+        if (attempted === 0 && leftUnlinkedCount === rows.length) {
+            // NOTHING was selected at all — every row left unlinked from
+            // the start. Distinct from "some rows deliberately left
+            // unlinked, others applied" below.
             setApplying(false);
             toast.info("Nothing selected — nothing linked.");
             onApplied();
@@ -143,10 +150,16 @@ export default function LinkScheduleReviewModal({
         }
 
         const attemptedHasIssues = Object.values(outcomes).some((o) => o.status !== "applied");
-        if (attemptedHasIssues) {
-            // Modal stays open — every row left unlinked also gets an
-            // explicit "skipped" annotation so nothing on screen looks
-            // unaddressed (Codex review round 1, issue 9).
+        const hasLeftUnlinked = leftUnlinkedCount > 0;
+
+        // Every row left unlinked gets a "Skipped" annotation whenever
+        // per-row outcomes are shown at all (Codex review round 2, R9) —
+        // previously a left-unlinked row only got annotated when some OTHER
+        // row also FAILED; a real failure is the only case the modal stays
+        // open for (see below), but the annotation itself is unconditional
+        // once outcomes exist, so a subsequent render never shows a bare
+        // select next to already-resolved rows.
+        if (attemptedHasIssues || hasLeftUnlinked) {
             for (const row of rows) {
                 if (!(row.decisionId in outcomes) && !taskSelections[row.decisionId]) {
                     outcomes[row.decisionId] = { status: "skipped", message: "Left unlinked" };
@@ -157,12 +170,26 @@ export default function LinkScheduleReviewModal({
         setApplying(false);
         setRowOutcomes(outcomes);
         onApplied();
-        if (!attemptedHasIssues) {
-            toast.success(`${appliedCount} linked`);
+
+        if (attemptedHasIssues) {
+            // A real failure — stay open so the failed/skipped annotations
+            // are visible; staff closes explicitly via the Close button.
+            toast.info(`${appliedCount} linked, ${attempted - appliedCount} need another look`);
+            return;
+        }
+        if (hasLeftUnlinked) {
+            // Nothing failed, but not everything was linked either — an
+            // accurate count instead of a plain "N linked" that would hide
+            // the rows left unlinked on purpose (Codex review round 1
+            // shipped this as a bare success count; round 2 R9 corrects
+            // it). Still closes — nothing here needs staff's attention, it
+            // was their own deliberate choice to leave those rows unlinked.
+            toast.info(`${appliedCount} linked, ${leftUnlinkedCount} left unlinked`);
             onClose();
             return;
         }
-        toast.info(`${appliedCount} linked, ${attempted - appliedCount} need another look`);
+        toast.success(`${appliedCount} linked`);
+        onClose();
     }
 
     return (

@@ -10,6 +10,7 @@ import {
     validateTemplateItems,
     validateTemplateName,
     buildTemplateKey,
+    normalizeForDedupe,
     DecisionTemplateValidationError,
     MAX_ITEMS,
     ITEM_NAME_MAX,
@@ -42,6 +43,8 @@ const proxy = read("src/proxy.ts");
 const teamDecisionsSection = read("src/app/projects/[id]/selections/TeamDecisionsSection.tsx");
 const portalDecisionsSection = read("src/app/portal/projects/[id]/selections/PortalDecisionsSection.tsx");
 const dueDateEditPopover = read("src/app/projects/[id]/selections/DecisionDueDateEditPopover.tsx");
+const templatesManager = read("src/app/templates/selections/DecisionTemplatesManager.tsx");
+const applyTemplateModal = read("src/app/projects/[id]/selections/ApplyTemplateModal.tsx");
 
 // ── Schema / migration ──────────────────────────────────────────────────────
 
@@ -301,6 +304,74 @@ assert.ok(
 assert.match(dueDateEditPopover, /isAdminOrManager/, "the edit popover must gate the manual override input on isAdminOrManager");
 const popoverOverrideIdx = dueDateEditPopover.indexOf("Manual override");
 assert.ok(popoverOverrideIdx > -1, "popover must label the override section");
+
+// ── Codex review round 2 follow-ups ─────────────────────────────────────────
+
+// R8: archive is reversible.
+assert.match(templateCrudCore, /export async function unarchiveDecisionTemplate/, "must export unarchiveDecisionTemplate");
+const unarchiveIdx = templateCrudCore.indexOf("export async function unarchiveDecisionTemplate");
+const unarchiveSlice = templateCrudCore.slice(unarchiveIdx, unarchiveIdx + 500);
+assert.match(unarchiveSlice, /requireAdminOrManager/, "unarchiveDecisionTemplate must be ADMIN/MANAGER-gated, same as the rest of template CRUD");
+assert.match(unarchiveSlice, /archivedAt:\s*null/, "unarchiveDecisionTemplate must clear archivedAt");
+assert.match(actions, /export async function unarchiveDecisionTemplate/, "actions.ts must export a thin unarchiveDecisionTemplate wrapper");
+assert.match(templatesManager, /unarchive-template-/, "the manager UI must render an Unarchive control on archived rows");
+assert.ok(
+    !/no undo/i.test(templatesManager),
+    "the archive-confirm copy must no longer claim there's no undo, now that unarchive exists",
+);
+
+// N1: shared NFKD + combining-mark-strip dedupe normalization (Turkish İ/ı,
+// combining-mark accents — NFKC alone does not fold these).
+function verifyDedupeNormalizationHandlesNfkdAndCombiningMarks(): void {
+    // Turkish dotted capital I (U+0130) -- NFKD decomposes it to "I" plus a
+    // combining dot above (U+0307), which is then stripped, folding to "i".
+    const turkishDottedI = "İstanbul";
+    assert.equal(normalizeForDedupe(turkishDottedI), normalizeForDedupe("istanbul"), "Turkish capital dotted I must fold to the same key as plain i");
+
+    // "cafe with an accent" entered as a combining-mark sequence (plain "e"
+    // U+0065 plus a combining acute accent U+0301) vs. the precomposed
+    // character (U+00E9) -- built explicitly via escape sequences so the two
+    // source strings are GUARANTEED to differ at the code-unit level (typing
+    // both by hand in an editor tends to silently normalize to the same
+    // form, which would make this assertion pass trivially regardless of
+    // whether the fix works).
+    const combining = "Cabinets caf" + "e" + "́";
+    const precomposed = "Cabinets caf" + "é";
+    assert.notEqual(combining, precomposed, "the two source strings must actually differ at the code-unit level for this test to mean anything");
+    assert.equal(normalizeForDedupe(combining), normalizeForDedupe(precomposed), "a combining-mark accent must fold the same as its precomposed equivalent");
+
+    assert.equal(normalizeForDedupe("  Cabinets  "), "cabinets", "must still trim and lowercase plain ASCII");
+}
+verifyDedupeNormalizationHandlesNfkdAndCombiningMarks();
+assert.match(templateApplyCore, /normalizeForDedupe/, "applyDecisionTemplate must use the shared normalizeForDedupe helper, not a local reimplementation");
+assert.ok(!/function normalizeForDedupe/.test(templateApplyCore), "normalizeForDedupe must live in decision-template-core.ts, not be redefined in apply-core");
+
+// NEW 3: duplicate item ids in an update payload are rejected.
+function verifyDuplicateItemIdInUpdatePayloadIsRejected(): void {
+    assert.throws(
+        () => validateTemplateItems([
+            { id: "item-1", name: "Cabinets" },
+            { id: "item-1", name: "Countertops" },
+        ]),
+        DecisionTemplateValidationError,
+        "two items referencing the same existing row id must be rejected",
+    );
+    // Items with NO id (genuinely new rows) never collide with each other.
+    const items = validateTemplateItems([{ name: "Cabinets" }, { name: "Countertops" }]);
+    assert.equal(items.length, 2);
+}
+verifyDuplicateItemIdInUpdatePayloadIsRejected();
+
+// NEW 1: ApplyTemplateModal resets stale state on every open and gates
+// Confirm on loading/loadError, not just derived from `templates`.
+assert.match(applyTemplateModal, /setTemplates\(\[\]\)/, "ApplyTemplateModal must clear templates on every open, not just the first");
+assert.match(applyTemplateModal, /setSelectedId\(""\)/, "ApplyTemplateModal must clear selectedId on every open");
+assert.match(applyTemplateModal, /disabled=\{applying \|\| loading \|\| !!loadError/, "Confirm must be explicitly disabled while loading or when loadError is set");
+
+// NEW 2: archive confirmation is a real AlertDialog (role="alertdialog",
+// focus trap/restore, Escape) — not a hand-rolled div overlay.
+assert.match(templatesManager, /from "@radix-ui\/react-alert-dialog"/, "archive confirmation must be built on Radix AlertDialog");
+assert.ok(!/onClick=\{\(\) => archiving === null && setConfirmArchive\(null\)\}/.test(templatesManager), "the old hand-rolled overlay click-to-dismiss must be gone");
 
 Promise.all([
     verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(),
