@@ -51,6 +51,42 @@ const statements = [
                 ON DELETE CASCADE ON UPDATE CASCADE;
         END IF;
     END $$`,
+    // ── Reconciliation with the pre-existing prod tables ─────────────────
+    // Prod already carried dormant DecisionTemplate/DecisionTemplateItem
+    // tables (seeded ADU/Bathroom/Kitchen templates from earlier planning
+    // work) with a different shape: sortOrder/stageHint plus costCodeId and
+    // createdAt/updatedAt, and no archivedAt/order/scheduleHint. The CREATE
+    // TABLE IF NOT EXISTS above no-ops there, so add our columns additively,
+    // backfill from the legacy ones, and give the legacy NOT NULL columns
+    // defaults so inserts from the new Prisma client (which doesn't know
+    // them) succeed. No data is modified beyond the null/zero backfills.
+    `ALTER TABLE "DecisionTemplate" ADD COLUMN IF NOT EXISTS "archivedAt" TIMESTAMP(3)`,
+    `ALTER TABLE "DecisionTemplateItem" ADD COLUMN IF NOT EXISTS "order" INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE "DecisionTemplateItem" ADD COLUMN IF NOT EXISTS "scheduleHint" TEXT`,
+    `DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'DecisionTemplateItem' AND column_name = 'sortOrder'
+        ) THEN
+            UPDATE "DecisionTemplateItem" SET "order" = "sortOrder"
+            WHERE "order" = 0 AND "sortOrder" <> 0;
+            ALTER TABLE "DecisionTemplateItem" ALTER COLUMN "sortOrder" SET DEFAULT 0;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'DecisionTemplateItem' AND column_name = 'stageHint'
+        ) THEN
+            UPDATE "DecisionTemplateItem" SET "scheduleHint" = "stageHint"
+            WHERE "scheduleHint" IS NULL AND "stageHint" IS NOT NULL;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'DecisionTemplateItem' AND column_name = 'createdAt'
+        ) THEN
+            ALTER TABLE "DecisionTemplateItem" ALTER COLUMN "createdAt" SET DEFAULT CURRENT_TIMESTAMP;
+            ALTER TABLE "DecisionTemplateItem" ALTER COLUMN "updatedAt" SET DEFAULT CURRENT_TIMESTAMP;
+        END IF;
+    END $$`,
     `CREATE INDEX IF NOT EXISTS "DecisionTemplateItem_templateId_order_idx" ON "DecisionTemplateItem" ("templateId", "order")`,
 
     // ── Decision — schedule-driven due dates ─────────────────────────────
