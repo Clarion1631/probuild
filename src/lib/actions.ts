@@ -75,7 +75,10 @@ import {
 import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
-import { persistSelectionItemNote } from "./selection-item-note-persistence";
+// Import the -core module, not the "server-only" wrapper: actions.ts is in the
+// verify suites' import graph (verify-crew-overlays.ts), and tsx cannot resolve
+// server-only outside a Next build. Same split selection-ai-sort-apply-core uses.
+import { persistSelectionItemNote } from "./selection-item-note-persistence-core";
 import {
     markSelectionItemThreadRead as markSelectionItemThreadReadCore,
     parseThreadAttachments,
