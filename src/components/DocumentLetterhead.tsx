@@ -46,7 +46,7 @@ export default function DocumentLetterhead({ config, rightContent }: DocumentLet
           className="w-full h-auto block max-h-[200px] object-contain object-left"
         />
         {rightContent && (
-          <div className="px-10 pb-6 flex justify-between items-start">
+          <div className="px-5 sm:px-10 pb-6 flex justify-between items-start">
             <div />
             {rightContent}
           </div>
@@ -66,14 +66,14 @@ export default function DocumentLetterhead({ config, rightContent }: DocumentLet
   const isCenter = config.logoPosition === "center";
 
   return (
-    <div className="px-10 pt-10 pb-8 border-b border-slate-200 print:px-6">
+    <div className="px-5 sm:px-10 pt-10 pb-8 border-b border-slate-200 print:px-6">
       {config.showDivider && (
         <div
-          className="h-1 -mt-10 -mx-10 mb-8 print:-mx-6"
+          className="h-1 -mt-10 -mx-5 sm:-mx-10 mb-8 print:-mx-6"
           style={{ backgroundColor: config.accentColor }}
         />
       )}
-      <div className={`flex ${isCenter ? "flex-col items-center text-center" : "justify-between items-start"}`}>
+      <div className={`flex ${isCenter ? "flex-col items-center text-center" : "flex-col gap-6 sm:flex-row sm:justify-between items-start"}`}>
         <div className={isCenter ? "flex flex-col items-center" : ""}>
           {logo}
           <CompanyInfoLines config={config} />
