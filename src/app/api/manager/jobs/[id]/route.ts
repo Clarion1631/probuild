@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canonicalProjectStatus } from "@/lib/project-status";
+import { geocodeJobSiteAddress } from "@/lib/geocode";
 
 const SELECT = {
     id: true,
@@ -64,21 +65,43 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.status = canonical;
     }
     if (body.location === null || typeof body.location === "string") data.location = body.location;
-    if (body.locationLat === null) {
-        data.locationLat = null;
-    } else if (typeof body.locationLat === "number") {
-        if (!Number.isFinite(body.locationLat) || body.locationLat < -90 || body.locationLat > 90) {
-            return NextResponse.json({ error: "locationLat out of range" }, { status: 400 });
+    // Coords must be a valid numeric pair, provided together — same rule as POST's
+    // parseGeoFields (../route.ts). Only touch data.locationLat/Lng when the client
+    // actually sent one of the two fields; a lone or invalid-type coordinate must 400
+    // instead of silently mixing a new value with the stale one already in the DB.
+    if (body.locationLat !== undefined || body.locationLng !== undefined) {
+        let locationLat: number | null = null;
+        if (body.locationLat !== undefined && body.locationLat !== null) {
+            if (
+                typeof body.locationLat !== "number" ||
+                !Number.isFinite(body.locationLat) ||
+                body.locationLat < -90 ||
+                body.locationLat > 90
+            ) {
+                return NextResponse.json({ error: "locationLat out of range" }, { status: 400 });
+            }
+            locationLat = body.locationLat;
         }
-        data.locationLat = body.locationLat;
-    }
-    if (body.locationLng === null) {
-        data.locationLng = null;
-    } else if (typeof body.locationLng === "number") {
-        if (!Number.isFinite(body.locationLng) || body.locationLng < -180 || body.locationLng > 180) {
-            return NextResponse.json({ error: "locationLng out of range" }, { status: 400 });
+        let locationLng: number | null = null;
+        if (body.locationLng !== undefined && body.locationLng !== null) {
+            if (
+                typeof body.locationLng !== "number" ||
+                !Number.isFinite(body.locationLng) ||
+                body.locationLng < -180 ||
+                body.locationLng > 180
+            ) {
+                return NextResponse.json({ error: "locationLng out of range" }, { status: 400 });
+            }
+            locationLng = body.locationLng;
         }
-        data.locationLng = body.locationLng;
+        if ((locationLat === null) !== (locationLng === null)) {
+            return NextResponse.json(
+                { error: "locationLat and locationLng must be provided together" },
+                { status: 400 }
+            );
+        }
+        data.locationLat = locationLat;
+        data.locationLng = locationLng;
     }
     if (body.geofenceRadiusMeters !== undefined) {
         if (
@@ -90,6 +113,20 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             return NextResponse.json({ error: "geofenceRadiusMeters must be 1–100000" }, { status: 400 });
         }
         data.geofenceRadiusMeters = Math.floor(body.geofenceRadiusMeters);
+    }
+
+    // Mobile web can't geocode client-side (expo-location's geocodeAsync returns []
+    // on web), so a typed address override would otherwise silently lose its geofence.
+    // Geocode server-side when the client changed the location but didn't send coords.
+    if (
+        typeof body.location === "string" &&
+        body.location.trim() &&
+        (body.locationLat === undefined || body.locationLat === null) &&
+        (body.locationLng === undefined || body.locationLng === null)
+    ) {
+        const geocoded = await geocodeJobSiteAddress(body.location);
+        data.locationLat = geocoded?.lat ?? null;
+        data.locationLng = geocoded?.lng ?? null;
     }
 
     if (Object.keys(data).length === 0) {

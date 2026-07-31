@@ -117,6 +117,13 @@ export interface QboReceiptGroup {
     category: string;
     amount: number;
     lines?: QboReceiptLine[];
+    /**
+     * Sales-tax line: posts to the reimbursable-sales-tax account instead of
+     * the default expense account. GTR holds a reseller's permit, so tax paid
+     * to vendors without the certificate on file is recoverable via a state
+     * filing — it must be visible as its own account, not buried in COGS.
+     */
+    tax?: boolean;
 }
 
 export interface CreateQBReceiptPurchaseInput {
@@ -172,6 +179,7 @@ export interface QboReceiptPushDependencies {
 
 const BANK_ACCOUNT_ID_DEFAULT = "154"; // Washington Trust Bank
 const EXPENSE_ACCOUNT_ID_DEFAULT = "98"; // COGS Supplies & materials
+const TAX_ACCOUNT_ID_DEFAULT = "1150040032"; // COGS "Reimbursable Sales Tax Paid"
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 function receiptRequestId(fileId: string): string {
@@ -326,6 +334,19 @@ async function defaultUploadAttachment(
  * realm, ...) — this must throw and never let a Purchase post against the
  * wrong account.
  */
+/**
+ * Deterministic account misconfiguration (wrong id/type/name, or two roles
+ * pointing at the same account). The route maps this to 200 ok:false so the
+ * bot falls back to the email path — a generic throw would 500 and put EVERY
+ * document into an infinite retry loop against a config that can't succeed.
+ */
+export class QboAccountConfigError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "QboAccountConfigError";
+    }
+}
+
 // Keyed by realm + account ids so a reconnect to a different QBO company (or
 // an env change) re-verifies, and rejected entries are evicted so one
 // transient query failure can't poison a warm process forever.
@@ -336,12 +357,22 @@ async function verifyReceiptAccounts(
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
     bankAccountId: string,
     expenseAccountId: string,
+    taxAccountId: string,
 ): Promise<void> {
-    const cacheKey = `${tokens.realmId}|${bankAccountId}|${expenseAccountId}`;
+    const cacheKey = `${tokens.realmId}|${bankAccountId}|${expenseAccountId}|${taxAccountId}`;
     let verifiedAccountsPromise = verifiedAccountsCache.get(cacheKey);
     if (!verifiedAccountsPromise) {
         verifiedAccountsPromise = (async () => {
-            const [bankRows, expenseRows] = await Promise.all([
+            // Role separation: the whole point of the tax account is a clean
+            // filing report, so it must not collapse onto another role's
+            // account (e.g. QBO_RECEIPT_TAX_ACCOUNT_ID pasted as "98").
+            if (taxAccountId === expenseAccountId || taxAccountId === bankAccountId) {
+                throw new QboAccountConfigError(
+                    `QBO receipt push is misconfigured: tax account ${taxAccountId} must be distinct ` +
+                    `from the expense (${expenseAccountId}) and bank (${bankAccountId}) accounts.`,
+                );
+            }
+            const [bankRows, expenseRows, taxRows] = await Promise.all([
                 qbQueryFn<{ Id: string; Name?: string; AccountType?: string }>(
                     tokens,
                     `SELECT Id, Name, AccountType FROM Account WHERE Id = '${escapeQBString(bankAccountId)}'`,
@@ -350,16 +381,26 @@ async function verifyReceiptAccounts(
                     tokens,
                     `SELECT Id, Name, AccountType FROM Account WHERE Id = '${escapeQBString(expenseAccountId)}'`,
                 ),
+                qbQueryFn<{ Id: string; Name?: string; AccountType?: string }>(
+                    tokens,
+                    `SELECT Id, Name, AccountType FROM Account WHERE Id = '${escapeQBString(taxAccountId)}'`,
+                ),
             ]);
             const bank = bankRows[0];
             const expense = expenseRows[0];
+            const tax = taxRows[0];
             const bankOk = !!bank && bank.AccountType === "Bank" && /Washington Trust/i.test(bank.Name ?? "");
             const expenseOk = !!expense && expense.AccountType === "Cost of Goods Sold";
-            if (!bankOk || !expenseOk) {
-                throw new Error(
+            // The default is COGS "Reimbursable Sales Tax Paid", but an
+            // Expense-type override (e.g. "Sales Tax Paid", TaxesPaid) is also
+            // legitimate for a tax bucket.
+            const taxOk = !!tax && (tax.AccountType === "Cost of Goods Sold" || tax.AccountType === "Expense");
+            if (!bankOk || !expenseOk || !taxOk) {
+                throw new QboAccountConfigError(
                     `QBO receipt push is misconfigured: bank account ${bankAccountId} is ` +
                     `${bank?.AccountType ?? "missing"}/"${bank?.Name ?? "missing"}" (need Bank/"Washington Trust"); ` +
-                    `expense account ${expenseAccountId} is ${expense?.AccountType ?? "missing"} (need Cost of Goods Sold).`,
+                    `expense account ${expenseAccountId} is ${expense?.AccountType ?? "missing"} (need Cost of Goods Sold); ` +
+                    `tax account ${taxAccountId} is ${tax?.AccountType ?? "missing"} (need Cost of Goods Sold or Expense).`,
                 );
             }
         })();
@@ -475,6 +516,7 @@ export async function createQBReceiptPurchase(
 
     const bankAccountId = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || BANK_ACCOUNT_ID_DEFAULT;
     const expenseAccountId = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || EXPENSE_ACCOUNT_ID_DEFAULT;
+    const taxAccountId = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || TAX_ACCOUNT_ID_DEFAULT;
 
     const refSuffix = input.invoice
         ? ` · Invoice ${input.invoice}`
@@ -495,7 +537,9 @@ export async function createQBReceiptPurchase(
             DetailType: "AccountBasedExpenseLineDetail",
             Description: description,
             AccountBasedExpenseLineDetail: {
-                AccountRef: { value: expenseAccountId },
+                // Tax lines post to the reimbursable-sales-tax account but stay
+                // job-coded: the tax IS a job cost until the state refunds it.
+                AccountRef: { value: g.tax ? taxAccountId : expenseAccountId },
                 CustomerRef: { value: customerId },
                 BillableStatus: "NotBillable",
                 TaxCodeRef: { value: "NON" },
@@ -515,7 +559,7 @@ export async function createQBReceiptPurchase(
 
     // Once per process, before the first create — never write against a
     // misconfigured account.
-    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId);
+    await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId);
 
     const requestId = receiptRequestId(input.fileId);
     const created = await qbCreateFn(tokens, payload, requestId);

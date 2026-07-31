@@ -75,7 +75,10 @@ import {
 import { ensureStandardFolders } from "./project-folders";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
-import { persistSelectionItemNote } from "./selection-item-note-persistence";
+// Import the -core module, not the "server-only" wrapper: actions.ts is in the
+// verify suites' import graph (verify-crew-overlays.ts), and tsx cannot resolve
+// server-only outside a Next build. Same split selection-ai-sort-apply-core uses.
+import { persistSelectionItemNote } from "./selection-item-note-persistence-core";
 import {
     markSelectionItemThreadRead as markSelectionItemThreadReadCore,
     parseThreadAttachments,
@@ -6163,7 +6166,11 @@ export async function sendContractToClient(
     if (contract.projectId) revalidatePath(`/projects/${contract.projectId}`);
     if (contract.leadId) revalidatePath(`/leads/${contract.leadId}`);
 
-    return { success: true, sentTo: client.email, clientName: client.name };
+    // Status re-read at return time, not from the transition above — the client can sign
+    // while the email/activity awaits run, and callers use this to lock their editors.
+    // "Sent" fallback only for the impossible row-deleted-mid-send case.
+    const finalRow = await prisma.contract.findUnique({ where: { id: contractId }, select: { status: true } });
+    return { success: true, sentTo: client.email, clientName: client.name, status: finalRow?.status ?? "Sent" };
 }
 
 // Prefill for the "Send contract" dialog: the primary recipient + the default CC set

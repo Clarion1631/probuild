@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import {
     createContractFromTemplate, createContractBlank, sendContractToClient,
@@ -88,6 +88,9 @@ export default function EntityContractsClient({
     const [editTitle, setEditTitle] = useState("");
     const [editBody, setEditBody] = useState("");
     const [saving, setSaving] = useState(false);
+    // Synchronous mutex for saves — the `saving` state updates async, so two rapid
+    // clicks (Save then Send) could both pass a state check before the re-render.
+    const savingRef = useRef(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [isUploadingPdf, setIsUploadingPdf] = useState(false);
 
@@ -107,9 +110,22 @@ export default function EntityContractsClient({
     const [signingAsCompany, setSigningAsCompany] = useState(false);
     const [editRequiresCountersign, setEditRequiresCountersign] = useState(false);
 
+    // Mirror of the editor's local fields, readable synchronously after an await —
+    // state captured in a closure goes stale across the save that handleSend performs,
+    // and stale reads are exactly the bug (unsaved countersign toggle silently dropped).
+    // Mirrored in a layout effect (never during render): handlers only read it after
+    // awaits, well past commit, so the committed values are always what they see.
+    const editStateRef = useRef({ title: "", body: "", requiresCountersign: false });
+    useLayoutEffect(() => {
+        editStateRef.current = { title: editTitle, body: editBody, requiresCountersign: editRequiresCountersign };
+    }, [editTitle, editBody, editRequiresCountersign]);
+
     // ─── SEND DIALOG (editable CC) ───
     const [sendDialog, setSendDialog] = useState<{ contractId: string; toEmail: string; cc: string } | null>(null);
     const [sendingDialog, setSendingDialog] = useState(false);
+    // Synchronous mutex for the actual dispatch — `sendingDialog` state updates async,
+    // so a double-click on Confirm could fire sendContractToClient twice.
+    const sendingRef = useRef(false);
 
     // ─── PREVIEW MODE ───
     const [isPreview, setIsPreview] = useState(false);
@@ -297,13 +313,20 @@ export default function EntityContractsClient({
         setEditRequiresCountersign(!!contract.requiresCountersign);
     };
 
-    const handleSaveEdit = async () => {
-        if (!editingContract) return;
+    // Persists the editor's local title/body/countersign state. Returns the updated
+    // contract, or null when the save failed or was skipped (a toast is shown on failure).
+    // Reads the field values through editStateRef so edits made right up to the call —
+    // including during a preceding await — are what gets saved.
+    const saveEdits = async (): Promise<any | null> => {
+        if (!editingContract) return null;
+        if (savingRef.current) return null;
+        savingRef.current = true;
         setSaving(true);
         try {
-            const updatePayload: any = { title: editTitle, requiresCountersign: editRequiresCountersign };
+            const { title, body, requiresCountersign } = editStateRef.current;
+            const updatePayload: any = { title, requiresCountersign };
             if (!editingContract.originalPdfPath) {
-                updatePayload.body = editBody;
+                updatePayload.body = body;
             }
             const updated = await updateContract(editingContract.id, updatePayload);
             if (editingContract.contractorSignedAt && !updated?.contractorSignedAt) {
@@ -313,8 +336,24 @@ export default function EntityContractsClient({
             }
             setEditingContract(updated);
             router.refresh();
-        } catch (e: any) { toast.error(e.message || "Failed to update contract"); }
-        finally { setSaving(false); }
+            return updated;
+        } catch (e: any) {
+            toast.error(e.message || "Failed to update contract");
+            return null;
+        }
+        finally { savingRef.current = false; setSaving(false); }
+    };
+
+    const handleSaveEdit = async () => { await saveEdits(); };
+
+    // True when the editor holds changes that exist only in local state — sending reads
+    // the DB, so these must be persisted before a send or they'd be silently dropped.
+    // Reads through editStateRef so the check stays accurate after an await.
+    const hasUnsavedEdits = (contract: any) => {
+        const s = editStateRef.current;
+        return s.title !== contract.title ||
+            s.requiresCountersign !== !!contract.requiresCountersign ||
+            (!contract.originalPdfPath && s.body !== (contract.body || ""));
     };
 
     async function handleDraftContract() {
@@ -340,9 +379,32 @@ export default function EntityContractsClient({
         body.includes("{{CONTRACTOR_SIGNATURE_BLOCK}}") || body.includes('data-merge-field="CONTRACTOR_SIGNATURE_BLOCK"');
 
     const handleSend = async (contractId: string) => {
-        const contract = (editingContract?.id === contractId ? editingContract : null)
+        let contract = (editingContract?.id === contractId ? editingContract : null)
             ?? initialContracts.find((c: any) => c.id === contractId);
-        if (contract && contractHasContractorBlock(contract.body || "") && !contract.contractorSignedBy) {
+        // The countersign toggle (and title/body) live in local editor state until saved,
+        // but sending reads the DB — so persist unsaved edits first, otherwise the contract
+        // goes out with the stale requiresCountersign/title/body values.
+        if (editingContract?.id === contractId) {
+            if (savingRef.current) {
+                toast.info("Still saving your changes — try again in a moment.");
+                return;
+            }
+            // Two passes: edits typed while the first save was in flight get a second
+            // save. If the fields are STILL dirty after that, something is actively
+            // changing them — refuse to send rather than send state the user didn't see.
+            for (let pass = 0; pass < 2 && contract && hasUnsavedEdits(contract); pass++) {
+                const updated = await saveEdits();
+                if (!updated) return; // save failed — don't send stale state
+                contract = updated;
+            }
+            if (contract && hasUnsavedEdits(contract)) {
+                toast.error("Couldn't capture your latest changes — save them, then send.");
+                return;
+            }
+        }
+        // Gate on contractorSignedAt (not SignedBy) — it's the field the server-side
+        // send gate checks, so the two can never disagree on a legacy row.
+        if (contract && contractHasContractorBlock(contract.body || "") && !contract.contractorSignedAt) {
             setPendingSendContractId(contractId);
             setShowContractorSignPrompt(true);
             return;
@@ -361,22 +423,55 @@ export default function EntityContractsClient({
 
     const confirmSend = async () => {
         if (!sendDialog) return;
+        if (sendingRef.current) return;
+        sendingRef.current = true;
         const { contractId, cc } = sendDialog;
         const ccArray = cc.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
         setSendingDialog(true);
         try {
+            // Authoritative last flush: the editor stays editable while this dialog is
+            // open (it doesn't trap focus), so edits made after handleSend's flush —
+            // or while recipient defaults were loading — must be persisted or refused
+            // HERE, immediately before dispatch. Same rules as handleSend.
+            let contract = editingContract?.id === contractId ? editingContract : null;
+            if (contract) {
+                if (savingRef.current) {
+                    toast.info("Still saving your changes — try again in a moment.");
+                    return;
+                }
+                for (let pass = 0; pass < 2 && hasUnsavedEdits(contract); pass++) {
+                    const updated = await saveEdits();
+                    if (!updated) return; // save failed — don't send stale state
+                    contract = updated;
+                }
+                if (hasUnsavedEdits(contract)) {
+                    toast.error("Couldn't capture your latest changes — save them, then send.");
+                    return;
+                }
+                // The flush may have cleared the contractor pre-signature (text changed) —
+                // route back to the sign-as-contractor prompt instead of a doomed send.
+                if (contractHasContractorBlock(contract.body || "") && !contract.contractorSignedAt) {
+                    setSendDialog(null);
+                    setPendingSendContractId(contractId);
+                    setShowContractorSignPrompt(true);
+                    return;
+                }
+            }
             const result = await sendContractToClient(contractId, ccArray);
             toast.success(
                 `Contract sent to ${result.clientName || entity.clientName} at ${result.sentTo}`,
                 { description: entity.name }
             );
             if (editingContract && editingContract.id === contractId) {
-                setEditingContract({ ...editingContract, status: "Sent" });
+                // The server preserves Signed/Finalized when a resend races a client
+                // signature — mirror whatever status the row actually holds, so the
+                // editor locks itself instead of reopening a signed contract as "Sent".
+                setEditingContract({ ...editingContract, status: (result as any).status || "Sent" });
             }
             setSendDialog(null);
             router.refresh();
         } catch (e: any) { toast.error(e.message || "Failed to send"); }
-        finally { setSendingDialog(false); }
+        finally { sendingRef.current = false; setSendingDialog(false); }
     };
 
     const handleCompanyCountersign = async (dataUrl: string, name: string) => {
@@ -671,7 +766,7 @@ export default function EntityContractsClient({
                             </a>
                         )}
                         {!isReadOnly && (editingContract.status === "Draft" || editingContract.status === "Sent") && (
-                            <button onClick={() => handleSend(editingContract.id)} className="px-4 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition shadow-sm">
+                            <button onClick={() => handleSend(editingContract.id)} disabled={saving} className="px-4 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition shadow-sm disabled:opacity-50">
                                 {editingContract.status === "Sent" ? "Resend" : "Send"}
                             </button>
                         )}

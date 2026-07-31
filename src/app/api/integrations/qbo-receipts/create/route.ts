@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import {
     createQBReceiptPurchase,
+    QboAccountConfigError,
     QboPurchaseFaultError,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
@@ -33,7 +34,7 @@ export const maxDuration = 60;
  */
 
 interface ReceiptPushLine { sku?: unknown; desc?: unknown; price?: unknown }
-interface ReceiptPushGroup { category?: unknown; amount?: unknown; lines?: unknown }
+interface ReceiptPushGroup { category?: unknown; amount?: unknown; lines?: unknown; tax?: unknown }
 interface ReceiptPushBody {
     fileId?: unknown;
     projectName?: unknown;
@@ -55,6 +56,9 @@ function normalizeGroups(raw: unknown): CreateQBReceiptPurchaseInput["groups"] {
     return raw.map((g: ReceiptPushGroup) => ({
         category: typeof g?.category === "string" ? g.category : "General",
         amount: Number(g?.amount),
+        // Strict === true: only an explicit boolean routes money to the tax
+        // account — truthy strings ("false", "0") must never move a line.
+        tax: g?.tax === true,
         lines: Array.isArray(g?.lines)
             ? (g.lines as ReceiptPushLine[]).map(l => ({
                 sku: typeof l?.sku === "string" ? l.sku : undefined,
@@ -144,6 +148,15 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 const result = await dependencies.createPurchase(tokens, input);
                 return NextResponse.json(result);
             } catch (error) {
+                if (error instanceof QboAccountConfigError) {
+                    // Deterministic misconfiguration (missing/wrong-type/
+                    // colliding account ids) — the SAME failure would repeat on
+                    // every retry, so it must be terminal (bot books via the
+                    // email path) rather than a 500 retry loop that strands
+                    // every receipt until someone notices.
+                    console.error("QBO receipt push account misconfiguration", error.message);
+                    return NextResponse.json({ ok: false, reason: "account-misconfigured" });
+                }
                 if (error instanceof QboPurchaseFaultError) {
                     // A QBO business-rule rejection (400/403) is terminal, not
                     // transient — 200/ok:false with the fault code, never a retry loop.
