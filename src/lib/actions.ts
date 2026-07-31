@@ -8523,13 +8523,54 @@ export async function emailPortalLinkToClient(projectId: string) {
     const { buildClientPortalUrl } = await import("./client-portal-auth");
     const portalUrl = await buildClientPortalUrl(project.client.id, project.client.email, `/portal/projects/${projectId}`);
 
-    // Send email using our enhanced library fn
+    const companySettings = await getCachedCompanySettings();
+    const companyName = companySettings?.companyName || "Your Contractor";
+    const companyPhone = companySettings?.phone || "";
+
+    // Welcome / how-to email. The same action powers resends, so the wording
+    // has to read fine on a second delivery too — not first-visit-only.
     const { sendNotification } = await import('@/lib/email');
     const portalCc = buildCc(project.client.email, (project.client as any).additionalEmail);
+    const welcomeItems = [
+        ["Follow your project", "See the schedule, progress updates, and photos as work happens."],
+        ["Review and approve", "Estimates and change orders come to you for review and online signature."],
+        ["Pay securely online", "When a payment is requested, you can pay by card or bank transfer with one click. Only requested amounts are ever due."],
+        ["Everything in one place", "Plans, documents, selections, and photos, available any time."],
+    ].map(([title, text]) => `
+        <tr>
+            <td style="padding: 6px 0; vertical-align: top; width: 22px;"><span style="color: #059669; font-weight: 700;">&#10003;</span></td>
+            <td style="padding: 6px 0; color: #444; font-size: 14px; line-height: 1.5;"><strong style="color: #111;">${title}.</strong> ${text}</td>
+        </tr>`).join("");
     const result = await sendNotification(
         project.client.email,
-        `Your Dashboard for ${project.name} is Ready`,
-        `<p>Hi ${project.client.name},</p><p>We have updated the portal for your project: <strong>${project.name}</strong>.</p><p><a href="${portalUrl}" style="display:inline-block;padding:10px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:5px;">Access Your Client Dashboard</a></p><p>From here you can view estimates, invoices, updates, and more.</p><br/>Thanks,<br/>Golden Touch Remodeling`,
+        `Welcome to your ${project.name} project portal`,
+        `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+            <div style="text-align: center; margin-bottom: 32px;">
+                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
+            </div>
+            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                <h2 style="font-size: 20px; margin: 0 0 8px;">Your project portal is ready</h2>
+                <p style="color: #666; margin: 0 0 20px;">Hi ${project.client.name || "there"},</p>
+                <p style="color: #666; line-height: 1.6; margin: 0 0 16px;">
+                    ${companyName} has set up a private online portal for <strong>${project.name}</strong>. It's your one place to stay on top of the project:
+                </p>
+                <table style="width: 100%; border-collapse: collapse; margin: 0 0 8px;">${welcomeItems}</table>
+                <div style="text-align: center; margin: 28px 0;">
+                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                        Open Your Portal
+                    </a>
+                </div>
+                <p style="color: #999; font-size: 13px; text-align: center; margin: 0 0 8px;">
+                    The link signs you in automatically, so there is no password to remember. Bookmark it for easy access.
+                </p>
+                <p style="color: #999; font-size: 13px; text-align: center; margin: 0;">
+                    If the link ever stops working, just reply to this email and we will send a fresh one.
+                </p>
+            </div>
+            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                ${companyName}${companyPhone ? ` &bull; ${companyPhone}` : ""}
+            </p>
+        </div>`,
         undefined,
         { cc: portalCc, copyToInternal: true }
     );
