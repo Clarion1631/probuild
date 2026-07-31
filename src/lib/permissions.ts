@@ -16,6 +16,13 @@ export type PermissionKey =
 
 const ADMIN_ROLES = ["ADMIN", "MANAGER"];
 
+/** ADMIN_ROLES above is module-private — this is the exported check for
+ * callers outside permissions.ts (e.g. decision-template-crud-core.ts's
+ * "GTR admin" CRUD/override gate) instead of duplicating the role list. */
+export function isAdminOrManager(user: { role: string }): boolean {
+    return ADMIN_ROLES.includes(user.role);
+}
+
 /** Typed marker for the "Unauthorized" errors thrown by the portal access
  * assertions in actions.ts, so callers can detect an auth failure with
  * `instanceof` instead of the fragile `e.message === "Unauthorized"` string

@@ -32,6 +32,18 @@ import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
 } from "./selection-ai-sort-apply-core";
+import {
+    createDecisionTemplate as createDecisionTemplateCore,
+    updateDecisionTemplate as updateDecisionTemplateCore,
+    archiveDecisionTemplate as archiveDecisionTemplateCore,
+    listDecisionTemplates as listDecisionTemplatesCore,
+} from "./decision-template-crud-core";
+import type { DecisionTemplateInput } from "./decision-template-crud-core";
+import {
+    listActiveDecisionTemplatesForApply as listActiveDecisionTemplatesForApplyCore,
+    applyDecisionTemplate as applyDecisionTemplateCore,
+} from "./decision-template-apply-core";
+import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
@@ -11029,6 +11041,36 @@ export async function applySuggestedDecision(itemId: string, decisionId: string)
 
 export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
     return aiSortDismissSelectionSuggestion(itemId);
+}
+
+// ── Decision Templates + Schedule-Driven Due Dates (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) ──
+// Thin "use server" wrappers — the CRUD/apply/link logic lives in plain
+// (non-"use server") modules so it's importable directly by tests, the same
+// split selection-ai-sort-apply-core.ts/selection-item-thread-core.ts use.
+
+export async function createDecisionTemplate(input: DecisionTemplateInput) {
+    return createDecisionTemplateCore(input);
+}
+
+export async function updateDecisionTemplate(templateId: string, input: DecisionTemplateInput) {
+    return updateDecisionTemplateCore(templateId, input);
+}
+
+export async function archiveDecisionTemplate(templateId: string) {
+    return archiveDecisionTemplateCore(templateId);
+}
+
+export async function listDecisionTemplates() {
+    return listDecisionTemplatesCore();
+}
+
+export async function listActiveDecisionTemplatesForApply() {
+    return listActiveDecisionTemplatesForApplyCore();
+}
+
+export async function applyDecisionTemplate(projectId: string, templateId: string) {
+    return applyDecisionTemplateCore(projectId, templateId);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
