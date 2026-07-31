@@ -31,6 +31,14 @@ export const LEAD_TIME_MIN = 0;
 export const LEAD_TIME_MAX = 365;
 
 export type TemplateItemInput = {
+    // Present when this item is an edit of an EXISTING DecisionTemplateItem
+    // row (the UI passes ids through for rows it loaded); absent/undefined
+    // for a genuinely new row. updateDecisionTemplate uses this to update
+    // matched rows in place instead of delete-all-recreate, which would
+    // otherwise churn every item's id and break per-item templateKey
+    // provenance on projects that already applied the template (Codex
+    // review round 1, issue 2).
+    id?: string;
     name: string;
     area?: string | null;
     defaultLeadTimeDays?: number | null;
@@ -38,6 +46,7 @@ export type TemplateItemInput = {
 };
 
 export type CleanTemplateItem = {
+    id?: string;
     name: string;
     area: string | null;
     defaultLeadTimeDays: number | null;
@@ -96,7 +105,8 @@ export function validateTemplateItems(items: TemplateItemInput[]): CleanTemplate
             throw new DecisionTemplateValidationError(`${label}: schedule hint must be ${SCHEDULE_HINT_MAX} characters or fewer`);
         }
         const defaultLeadTimeDays = validateLeadTimeDays(item.defaultLeadTimeDays, label);
-        return { name, area, defaultLeadTimeDays, scheduleHint: scheduleHintRaw, order: index };
+        const id = typeof item.id === "string" && item.id ? item.id : undefined;
+        return { id, name, area, defaultLeadTimeDays, scheduleHint: scheduleHintRaw, order: index };
     });
 }
 

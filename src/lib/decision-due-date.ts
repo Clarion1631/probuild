@@ -16,6 +16,7 @@
 // importable directly by tests and by client components that render the
 // urgency badge without a server round trip.
 import { utcMidnight, daysBetweenUtc, dueDateLabel, subtractDaysUtc } from "./date-utils";
+import { toCompanyDayKey } from "./company-day";
 
 export type EffectiveDueDateInput = {
     dueDate: Date | string | null;
@@ -40,11 +41,43 @@ export function computeEffectiveDueDate(
     return subtractDaysUtc(new Date(startDate), decision.leadTimeDays);
 }
 
+/** Staff-only display state (Codex review round 1, issue 7) — the portal
+ * never receives this (it only ever sees effectiveDueDate). "linked": a live
+ * scheduleTaskId points at a real task. "dangling": scheduleTaskId is set
+ * but its task no longer exists (deleted) — the badge/popover need to say
+ * "not linked (task removed)" rather than silently showing nothing, which
+ * would look identical to never having linked at all. "none": never linked. */
+export type DecisionLinkState = "linked" | "dangling" | "none";
+
+export function computeLinkState(
+    decision: { scheduleTaskId: string | null },
+    taskStartDateById: Map<string, Date | string>,
+): DecisionLinkState {
+    if (!decision.scheduleTaskId) return "none";
+    return taskStartDateById.has(decision.scheduleTaskId) ? "linked" : "dangling";
+}
+
 export type DueDateUrgency = { label: string; className: string };
 
 const OVERDUE_STYLE = "bg-red-100 text-red-700";
 const DUE_SOON_STYLE = "bg-amber-100 text-amber-700";
 const DUE_SOON_WINDOW_DAYS = 7;
+
+/**
+ * "Today" for urgency purposes is the COMPANY-local calendar day (Codex
+ * review round 1, issue 6), not the UTC calendar day of the instant `now`.
+ * effectiveDueDate itself stays a UTC-midnight-anchored calendar date (the
+ * derivation math in computeEffectiveDueDate above is unchanged) — it's
+ * meant to be read as a plain date ("Aug 18"), not converted per-viewer. But
+ * comparing that plain date against a bare UTC `new Date()` is wrong for
+ * this company: at 4pm Pacific the UTC calendar day can already have rolled
+ * to tomorrow, which would make a decision due "today" render as overdue
+ * hours early. Re-anchoring the company-local day key to UTC midnight
+ * keeps the diff in daysBetweenUtc apples-to-apples with effectiveDueDate.
+ */
+function companyTodayAsUtcMidnight(now: Date): Date {
+    return new Date(`${toCompanyDayKey(now)}T00:00:00.000Z`);
+}
 
 /**
  * Urgency chip shown next to "Decide by <date>" — amber when due within
@@ -54,7 +87,8 @@ const DUE_SOON_WINDOW_DAYS = 7;
  */
 export function dueDateUrgency(effectiveDueDate: Date | null, now: Date = new Date()): DueDateUrgency | null {
     if (!effectiveDueDate) return null;
-    const daysUntil = daysBetweenUtc(now, effectiveDueDate);
+    const today = companyTodayAsUtcMidnight(now);
+    const daysUntil = daysBetweenUtc(today, effectiveDueDate);
     if (daysUntil < 0) return { label: dueDateLabel(daysUntil), className: OVERDUE_STYLE };
     if (daysUntil <= DUE_SOON_WINDOW_DAYS) return { label: dueDateLabel(daysUntil), className: DUE_SOON_STYLE };
     return null;

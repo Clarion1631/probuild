@@ -27,6 +27,7 @@ export default function DecisionDueDateEditPopover({
     scheduleTaskId,
     leadTimeDays,
     dueDate,
+    linkState,
     tasks,
     isAdminOrManager,
     onSaved,
@@ -36,12 +37,18 @@ export default function DecisionDueDateEditPopover({
     scheduleTaskId: string | null;
     leadTimeDays: number | null;
     dueDate: string | null; // raw manual override, ISO or null
+    linkState: "linked" | "dangling" | "none";
     tasks: ProjectScheduleTaskOption[];
     isAdminOrManager: boolean;
     onSaved: () => void;
 }) {
     const [open, setOpen] = useState(false);
-    const [taskId, setTaskId] = useState(scheduleTaskId ?? LEAVE_UNLINKED);
+    // A dangling scheduleTaskId isn't one of `tasks`'s options — seeding the
+    // select to that dead id would silently desync the visible "Not linked"
+    // selection from the real state, so "Save link" with no changes made
+    // would resend the stale (deleted) task id (Codex review round 1, issue
+    // 7). Seed to "not linked" instead; the notice below explains why.
+    const [taskId, setTaskId] = useState(linkState === "linked" ? (scheduleTaskId ?? LEAVE_UNLINKED) : LEAVE_UNLINKED);
     const [leadTimeDraft, setLeadTimeDraft] = useState(leadTimeDays !== null ? String(leadTimeDays) : "0");
     const [overrideDraft, setOverrideDraft] = useState(toDateInputValue(dueDate));
     const [savingLink, setSavingLink] = useState(false);
@@ -50,7 +57,7 @@ export default function DecisionDueDateEditPopover({
     function handleOpenChange(next: boolean) {
         if (next) {
             // Re-seed from current props each time the popover opens.
-            setTaskId(scheduleTaskId ?? LEAVE_UNLINKED);
+            setTaskId(linkState === "linked" ? (scheduleTaskId ?? LEAVE_UNLINKED) : LEAVE_UNLINKED);
             setLeadTimeDraft(leadTimeDays !== null ? String(leadTimeDays) : "0");
             setOverrideDraft(toDateInputValue(dueDate));
         }
@@ -113,6 +120,11 @@ export default function DecisionDueDateEditPopover({
                     <div className="p-5 space-y-4">
                         <div>
                             <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Schedule link</label>
+                            {linkState === "dangling" && (
+                                <p data-testid={`due-date-dangling-notice-${decisionId}`} className="text-xs text-amber-700 mt-1">
+                                    Not linked (task removed) — the schedule task this was linked to no longer exists.
+                                </p>
+                            )}
                             <div className="flex items-center gap-2 mt-1">
                                 <select
                                     data-testid={`due-date-task-select-${decisionId}`}

@@ -25,6 +25,7 @@ import AddCandidateModal from "./AddCandidateModal";
 import RecentlyDeletedDecisions from "./RecentlyDeletedDecisions";
 import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal";
 import LinkScheduleReviewModal, { type LinkScheduleSuggestionRow } from "./LinkScheduleReviewModal";
+import ApplyTemplateModal from "./ApplyTemplateModal";
 import DecisionDueDateEditPopover, { type ProjectScheduleTaskOption } from "./DecisionDueDateEditPopover";
 import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import {
@@ -81,6 +82,10 @@ interface DecisionData {
     leadTimeDays: number | null;
     dueDate: string | null;
     effectiveDueDate: string | null;
+    // Staff-only display state (Codex review round 1, issue 7) — never sent
+    // to the portal.
+    isManual: boolean;
+    linkState: "linked" | "dangling" | "none";
 }
 
 interface DeletedDecision {
@@ -125,8 +130,20 @@ function statusChip(status: string): { label: string; className: string } {
 
 // Undecided-only urgency badge (Open/Flagged) — Decided/Ordered/Received
 // show nothing regardless of effectiveDueDate (Phase 3 —
-// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
-function DecideByBadge({ status, effectiveDueDate }: { status: string; effectiveDueDate: string | null }) {
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md). A
+// small "manual" marker appears when the date came from the ADMIN/MANAGER
+// override rather than schedule derivation (Codex review round 1, issue 7)
+// — otherwise a manually-set date is visually indistinguishable from a
+// derived one.
+function DecideByBadge({
+    status,
+    effectiveDueDate,
+    isManual,
+}: {
+    status: string;
+    effectiveDueDate: string | null;
+    isManual: boolean;
+}) {
     if (status !== "Open" && status !== "Flagged") return null;
     if (!effectiveDueDate) return null;
     const date = new Date(effectiveDueDate);
@@ -134,6 +151,11 @@ function DecideByBadge({ status, effectiveDueDate }: { status: string; effective
     return (
         <span data-testid="decide-by-badge" className="inline-flex items-center gap-1 text-xs">
             <span className="text-hui-textMuted">Decide by {formatDueDateShort(date)}</span>
+            {isManual && (
+                <span data-testid="decide-by-manual-marker" title="Manually set — always wins over the schedule link" className="px-1.5 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700">
+                    manual
+                </span>
+            )}
             {urgency && (
                 <span className={`px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
             )}
@@ -498,13 +520,14 @@ function DecisionCard({
                             <button onClick={() => setRenaming(true)} title="Rename" aria-label="Edit decision title" className="text-slate-400 hover:text-hui-textMain transition">
                                 <Pencil className="w-3.5 h-3.5" />
                             </button>
-                            <DecideByBadge status={decision.status} effectiveDueDate={decision.effectiveDueDate} />
+                            <DecideByBadge status={decision.status} effectiveDueDate={decision.effectiveDueDate} isManual={decision.isManual} />
                             <DecisionDueDateEditPopover
                                 decisionId={decision.id}
                                 decisionName={decision.name}
                                 scheduleTaskId={decision.scheduleTaskId}
                                 leadTimeDays={decision.leadTimeDays}
                                 dueDate={decision.dueDate}
+                                linkState={decision.linkState}
                                 tasks={scheduleTasks}
                                 isAdminOrManager={isAdminOrManager}
                                 onSaved={onChanged}
@@ -838,19 +861,30 @@ export default function TeamDecisionsSection({
                         <Download className="w-4 h-4" />
                         {importing ? "Importing…" : "Import picks from selection boards"}
                     </button>
-                    <button
-                        data-testid="link-to-schedule-button"
-                        onClick={handleLinkToSchedule}
-                        // Also disabled while the review modal is open — a
-                        // second run mid-review would silently replace the
-                        // rows being looked at (same reasoning as Sort with
-                        // AI's disabled condition).
-                        disabled={linking || linkScheduleModalOpen}
-                        className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5 disabled:opacity-50"
-                    >
-                        <Calendar className="w-4 h-4" />
-                        {linking ? "Linking…" : "Link to schedule"}
-                    </button>
+                    <LinkScheduleReviewModal
+                        open={linkScheduleModalOpen}
+                        rows={linkScheduleRows}
+                        tasks={linkScheduleTasks}
+                        failedCount={linkScheduleFailedCount}
+                        trigger={
+                            <button
+                                data-testid="link-to-schedule-button"
+                                // Also disabled while the review modal is open —
+                                // a second run mid-review would silently replace
+                                // the rows being looked at (same reasoning as
+                                // Sort with AI's disabled condition).
+                                disabled={linking || linkScheduleModalOpen}
+                                className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5 disabled:opacity-50"
+                            >
+                                <Calendar className="w-4 h-4" />
+                                {linking ? "Linking…" : "Link to schedule"}
+                            </button>
+                        }
+                        onTriggerClick={handleLinkToSchedule}
+                        onClose={() => setLinkScheduleModalOpen(false)}
+                        onApplied={refresh}
+                    />
+                    <ApplyTemplateModal projectId={projectId} onApplied={refresh} />
                     <button onClick={() => setAddDecisionOpen(true)} className="hui-btn hui-btn-green text-sm flex items-center gap-1.5">
                         <Plus className="w-4 h-4" />
                         Add a decision
@@ -872,18 +906,29 @@ export default function TeamDecisionsSection({
                                 Clipped by the client, not yet in a decision. They sort these themselves — this is just so you can see what&apos;s coming.
                             </p>
                         </div>
-                        <button
-                            data-testid="sort-with-ai-button"
-                            onClick={handleSortWithAi}
-                            // Also disabled while the review modal is open —
-                            // a second run mid-review would silently replace
-                            // the rows the staffer is currently looking at.
-                            disabled={sorting || aiSortModalOpen}
-                            className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
-                        >
-                            <Sparkles className="w-3.5 h-3.5" />
-                            {sorting ? "Sorting…" : "Sort with AI"}
-                        </button>
+                        <AiSortReviewModal
+                            open={aiSortModalOpen}
+                            rows={aiSortRows}
+                            decisions={aiSortDecisions}
+                            failedCount={aiSortFailedCount}
+                            trigger={
+                                <button
+                                    data-testid="sort-with-ai-button"
+                                    // Also disabled while the review modal is
+                                    // open — a second run mid-review would
+                                    // silently replace the rows the staffer is
+                                    // currently looking at.
+                                    disabled={sorting || aiSortModalOpen}
+                                    className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 flex items-center gap-1.5 disabled:opacity-50"
+                                >
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    {sorting ? "Sorting…" : "Sort with AI"}
+                                </button>
+                            }
+                            onTriggerClick={handleSortWithAi}
+                            onClose={() => setAiSortModalOpen(false)}
+                            onApplied={refresh}
+                        />
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                         {activeUnsorted.map((item) => (
@@ -923,24 +968,6 @@ export default function TeamDecisionsSection({
             />
 
             <AddDecisionModal projectId={projectId} open={addDecisionOpen} onClose={() => setAddDecisionOpen(false)} onCreated={refresh} />
-
-            <AiSortReviewModal
-                open={aiSortModalOpen}
-                rows={aiSortRows}
-                decisions={aiSortDecisions}
-                failedCount={aiSortFailedCount}
-                onClose={() => setAiSortModalOpen(false)}
-                onApplied={refresh}
-            />
-
-            <LinkScheduleReviewModal
-                open={linkScheduleModalOpen}
-                rows={linkScheduleRows}
-                tasks={linkScheduleTasks}
-                failedCount={linkScheduleFailedCount}
-                onClose={() => setLinkScheduleModalOpen(false)}
-                onApplied={refresh}
-            />
         </div>
     );
 }

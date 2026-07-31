@@ -13,7 +13,7 @@
 // aria-labelledby/aria-describedby (via Dialog.Title/Dialog.Description) for
 // free, instead of hand-rolling any of it on a plain div.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
 import { applySuggestedDecision } from "@/lib/actions";
@@ -60,6 +60,8 @@ export default function AiSortReviewModal({
     rows,
     decisions,
     failedCount,
+    trigger,
+    onTriggerClick,
     onClose,
     onApplied,
 }: {
@@ -70,6 +72,16 @@ export default function AiSortReviewModal({
     // never a silent "no match") — surfaced as a banner so staff know some
     // items still need a rerun, not that nothing was wrong.
     failedCount: number;
+    // Codex review round 1 (on the sibling schedule-templates feature) also
+    // flagged this modal's trigger for the same gap: the "Sort with AI"
+    // button was a plain <button> next to an independently-opened
+    // Dialog.Root, missing the Trigger's ARIA wiring and close-focus
+    // restoration. Rendered as Dialog.Trigger (asChild) here instead — `open`
+    // stays fully parent-controlled (the fetch that populates `rows` must
+    // finish before the modal makes sense to show), so onTriggerClick runs
+    // the existing fetch-then-decide logic instead of Radix auto-opening.
+    trigger: ReactNode;
+    onTriggerClick: () => void;
     onClose: () => void;
     onApplied: () => void;
 }) {
@@ -95,6 +107,14 @@ export default function AiSortReviewModal({
     function handleClose() {
         if (applying) return;
         onClose();
+    }
+
+    function handleOpenChange(next: boolean) {
+        if (next) {
+            onTriggerClick();
+            return;
+        }
+        handleClose();
     }
 
     async function handleApply() {
@@ -152,7 +172,8 @@ export default function AiSortReviewModal({
     }
 
     return (
-        <Dialog.Root open={open} onOpenChange={(next) => { if (!next) handleClose(); }}>
+        <Dialog.Root open={open} onOpenChange={handleOpenChange}>
+            <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
             <Dialog.Portal>
                 <Dialog.Overlay className="fixed inset-0 bg-black/40 z-50" />
                 <Dialog.Content

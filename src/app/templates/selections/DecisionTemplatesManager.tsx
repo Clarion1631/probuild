@@ -9,10 +9,17 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import * as Dialog from "@radix-ui/react-dialog";
 import { createDecisionTemplate, updateDecisionTemplate, archiveDecisionTemplate } from "@/lib/actions";
-import { Plus, Pencil, Archive, Trash2 } from "lucide-react";
+import { Plus, Pencil, Archive, Trash2, ArrowUp, ArrowDown } from "lucide-react";
 
 export type TemplateItemDraft = {
     key: string; // client-only stable key for React lists, not persisted
+    // True for a row loaded from an existing DecisionTemplateItem (key ===
+    // that item's real id) — false for a row added via "Add item" in this
+    // session (key is a throwaway crypto.randomUUID()). Distinguishes them
+    // on save so updateDecisionTemplate can update matched rows in place
+    // instead of delete-all-recreate (Codex review round 1, issue 2) — a
+    // brand-new row must never be sent with an `id`.
+    isExisting: boolean;
     name: string;
     area: string;
     defaultLeadTimeDays: string; // kept as string while editing, parsed on save
@@ -35,7 +42,20 @@ export type TemplateView = {
 };
 
 function emptyItem(): TemplateItemDraft {
-    return { key: crypto.randomUUID(), name: "", area: "", defaultLeadTimeDays: "", scheduleHint: "" };
+    return { key: crypto.randomUUID(), isExisting: false, name: "", area: "", defaultLeadTimeDays: "", scheduleHint: "" };
+}
+
+function draftsFromTemplate(template: TemplateView | null): TemplateItemDraft[] {
+    return template && template.items.length > 0
+        ? template.items.map((i) => ({
+              key: i.id,
+              isExisting: true,
+              name: i.name,
+              area: i.area ?? "",
+              defaultLeadTimeDays: i.defaultLeadTimeDays !== null ? String(i.defaultLeadTimeDays) : "",
+              scheduleHint: i.scheduleHint ?? "",
+          }))
+        : [emptyItem()];
 }
 
 function TemplateEditorModal({
@@ -51,36 +71,24 @@ function TemplateEditorModal({
 }) {
     const [name, setName] = useState(template?.name ?? "");
     const [description, setDescription] = useState(template?.description ?? "");
-    const [items, setItems] = useState<TemplateItemDraft[]>(
-        template && template.items.length > 0
-            ? template.items.map((i) => ({
-                  key: i.id,
-                  name: i.name,
-                  area: i.area ?? "",
-                  defaultLeadTimeDays: i.defaultLeadTimeDays !== null ? String(i.defaultLeadTimeDays) : "",
-                  scheduleHint: i.scheduleHint ?? "",
-              }))
-            : [emptyItem()],
-    );
+    const [items, setItems] = useState<TemplateItemDraft[]>(draftsFromTemplate(template));
     const [saving, setSaving] = useState(false);
-    // Re-seed whenever a different template opens (React's "adjusting state
-    // when a prop changes" pattern, avoiding an extra render/useEffect).
+    // Re-seed whenever the modal OPENS (Codex review round 1, nit c — the
+    // previous version only reseeded when the `template` prop reference
+    // changed, so closing without saving and reopening the SAME template
+    // left the abandoned draft in place instead of the persisted values) OR
+    // a different template opens while already open. React's "adjusting
+    // state when a prop changes" pattern, avoiding an extra render/useEffect.
     const [seededFor, setSeededFor] = useState(template);
-    if (template !== seededFor) {
+    const [seededOpen, setSeededOpen] = useState(open);
+    if (open && (!seededOpen || template !== seededFor)) {
         setSeededFor(template);
         setName(template?.name ?? "");
         setDescription(template?.description ?? "");
-        setItems(
-            template && template.items.length > 0
-                ? template.items.map((i) => ({
-                      key: i.id,
-                      name: i.name,
-                      area: i.area ?? "",
-                      defaultLeadTimeDays: i.defaultLeadTimeDays !== null ? String(i.defaultLeadTimeDays) : "",
-                      scheduleHint: i.scheduleHint ?? "",
-                  }))
-                : [emptyItem()],
-        );
+        setItems(draftsFromTemplate(template));
+    }
+    if (open !== seededOpen) {
+        setSeededOpen(open);
     }
 
     function updateItem(key: string, patch: Partial<TemplateItemDraft>) {
@@ -92,6 +100,17 @@ function TemplateEditorModal({
     function removeItem(key: string) {
         setItems((prev) => (prev.length > 1 ? prev.filter((it) => it.key !== key) : prev));
     }
+    function moveItem(key: string, direction: "up" | "down") {
+        setItems((prev) => {
+            const index = prev.findIndex((it) => it.key === key);
+            if (index === -1) return prev;
+            const targetIndex = direction === "up" ? index - 1 : index + 1;
+            if (targetIndex < 0 || targetIndex >= prev.length) return prev;
+            const next = [...prev];
+            [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
+            return next;
+        });
+    }
 
     async function handleSave() {
         const trimmedName = name.trim();
@@ -102,6 +121,12 @@ function TemplateEditorModal({
         const cleanItems = items
             .filter((it) => it.name.trim())
             .map((it) => ({
+                // Only an EXISTING row's real id is forwarded — a row added
+                // in this session (isExisting: false) must never carry one,
+                // so updateDecisionTemplate creates it fresh rather than
+                // trying to update a nonexistent row (Codex review round 1,
+                // issue 2).
+                id: it.isExisting ? it.key : undefined,
                 name: it.name.trim(),
                 area: it.area.trim() || undefined,
                 scheduleHint: it.scheduleHint.trim() || undefined,
@@ -183,7 +208,7 @@ function TemplateEditorModal({
                                     <div key={item.key} data-testid={`template-item-row-${i}`} className="grid grid-cols-12 gap-2 items-center border border-slate-200 rounded-lg p-2">
                                         <input
                                             data-testid={`template-item-name-${i}`}
-                                            className="hui-input text-sm col-span-4"
+                                            className="hui-input text-sm col-span-3"
                                             value={item.name}
                                             onChange={(e) => updateItem(item.key, { name: e.target.value })}
                                             placeholder="Name (e.g. Cabinets)"
@@ -214,6 +239,28 @@ function TemplateEditorModal({
                                             placeholder="Schedule hint"
                                             disabled={saving}
                                         />
+                                        <div className="col-span-1 flex justify-center gap-0.5">
+                                            <button
+                                                data-testid={`template-item-move-up-${i}`}
+                                                onClick={() => moveItem(item.key, "up")}
+                                                disabled={saving || i === 0}
+                                                title="Move up"
+                                                aria-label="Move item up"
+                                                className="text-slate-400 hover:text-hui-textMain disabled:opacity-30"
+                                            >
+                                                <ArrowUp className="w-3.5 h-3.5" />
+                                            </button>
+                                            <button
+                                                data-testid={`template-item-move-down-${i}`}
+                                                onClick={() => moveItem(item.key, "down")}
+                                                disabled={saving || i === items.length - 1}
+                                                title="Move down"
+                                                aria-label="Move item down"
+                                                className="text-slate-400 hover:text-hui-textMain disabled:opacity-30"
+                                            >
+                                                <ArrowDown className="w-3.5 h-3.5" />
+                                            </button>
+                                        </div>
                                         <button
                                             onClick={() => removeItem(item.key)}
                                             disabled={saving || items.length === 1}
@@ -246,6 +293,10 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
     const [editorOpen, setEditorOpen] = useState(false);
     const [editing, setEditing] = useState<TemplateView | null>(null);
     const [archiving, setArchiving] = useState<string | null>(null);
+    // Archive has no undo (Codex review round 1, issue 8) — confirm first,
+    // same plain-overlay house pattern as DecisionCard's delete confirm on
+    // the staff selections page.
+    const [confirmArchive, setConfirmArchive] = useState<TemplateView | null>(null);
 
     function refresh() {
         router.refresh();
@@ -256,6 +307,7 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
         try {
             await archiveDecisionTemplate(template.id);
             toast.success("Template archived.");
+            setConfirmArchive(null);
             refresh();
         } catch (e: any) {
             toast.error(e?.message || "Couldn't archive that template.");
@@ -329,7 +381,7 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
                                             {!t.archivedAt && (
                                                 <button
                                                     data-testid={`archive-template-${t.id}`}
-                                                    onClick={() => handleArchive(t)}
+                                                    onClick={() => setConfirmArchive(t)}
                                                     disabled={archiving === t.id}
                                                     title="Archive"
                                                     className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"
@@ -352,6 +404,37 @@ export default function DecisionTemplatesManager({ initialTemplates }: { initial
                 onClose={() => setEditorOpen(false)}
                 onSaved={refresh}
             />
+
+            {confirmArchive && (
+                <div
+                    className="fixed inset-0 bg-slate-900/50 flex items-center justify-center z-50 p-4"
+                    onClick={() => archiving === null && setConfirmArchive(null)}
+                >
+                    <div
+                        data-testid="confirm-archive-template-modal"
+                        className="bg-white rounded-xl shadow-xl w-full max-w-sm border border-hui-border"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="p-6">
+                            <h3 className="text-base font-bold text-hui-textMain mb-2">Archive &quot;{confirmArchive.name}&quot;?</h3>
+                            <p className="text-sm text-hui-textMuted">
+                                Projects that already applied it keep working — this just hides it from new applications. There&apos;s no undo from here; you&apos;d need to create a new template with the same items.
+                            </p>
+                        </div>
+                        <div className="px-6 py-4 border-t border-hui-border flex justify-end gap-3 bg-slate-50 rounded-b-xl">
+                            <button onClick={() => setConfirmArchive(null)} disabled={archiving !== null} className="hui-btn hui-btn-secondary">Cancel</button>
+                            <button
+                                data-testid="confirm-archive-template-button"
+                                onClick={() => handleArchive(confirmArchive)}
+                                disabled={archiving !== null}
+                                className="hui-btn hui-btn-primary disabled:opacity-50"
+                            >
+                                {archiving === confirmArchive.id ? "Archiving…" : "Archive"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

@@ -47,7 +47,7 @@ import {
     linkDecisionToSchedule as linkDecisionToScheduleCore,
     setDecisionDueDateOverride as setDecisionDueDateOverrideCore,
 } from "./decision-link-actions-core";
-import { computeEffectiveDueDate } from "./decision-due-date";
+import { computeEffectiveDueDate, computeLinkState, type DecisionLinkState } from "./decision-due-date";
 import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
@@ -10734,6 +10734,24 @@ function attachEffectiveDueDate<T extends DecisionDueDateFields>(
     return { ...decision, effectiveDueDate: computeEffectiveDueDate(decision, taskStartDateById) };
 }
 
+/** STAFF-ONLY enrichment (Codex review round 1, issue 7) — adds `isManual`
+ * (a dueDate override is set) and `linkState` ("linked"/"dangling"/"none")
+ * so the staff badge can show a "manual" marker and the edit popover can
+ * distinguish "never linked" from "was linked, task got deleted" instead of
+ * both silently rendering as nothing. NEVER applied to the portal read —
+ * that stays effectiveDueDate-only (getProjectDecisionsForPortal does not
+ * call this). */
+function attachStaffDueDateMeta<T extends DecisionDueDateFields>(
+    decision: T,
+    taskStartDateById: Map<string, Date>,
+): T & { isManual: boolean; linkState: DecisionLinkState } {
+    return {
+        ...decision,
+        isManual: !!decision.dueDate,
+        linkState: computeLinkState(decision, taskStartDateById),
+    };
+}
+
 /** Strip the raw due-date/link fields from any client-facing read — the
  * portal only ever sees the computed `effectiveDueDate`, never whether it
  * came from a manual override or a schedule derivation (extends
@@ -10864,7 +10882,7 @@ export async function getProjectDecisions(projectId: string) {
     const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
         decisions: decisions.map((d) => ({
-            ...attachEffectiveDueDate(d, taskStartDateById),
+            ...attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById),
             candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)),
         })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),

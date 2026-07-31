@@ -9,6 +9,7 @@ import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import {
     createDecisionTemplate,
     listDecisionTemplates,
+    archiveDecisionTemplate,
 } from "../src/lib/decision-template-crud-core";
 import { applyDecisionTemplate } from "../src/lib/decision-template-apply-core";
 import {
@@ -32,6 +33,8 @@ const ids = {
 
 let templateId = "";
 let template2Id = "";
+let uiApplyTemplateId = "";
+let archivedTemplateId = "";
 // Direct core-module calls run in a bare Node process, not a live Next.js
 // request — the real (default) revalidate would throw ("static generation
 // store missing"), same as applySuggestedDecision's testDeps in
@@ -88,7 +91,11 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
         await prisma.project.deleteMany({ where: { id: { in: [ids.project, ids.otherProject] } } });
         await prisma.client.deleteMany({ where: { id: ids.client } });
         await prisma.user.deleteMany({ where: { id: { in: [ids.admin, ids.manager, ids.fieldCrewNoAccess, ids.fieldCrewWithAccess] } } });
-        if (templateId) await prisma.decisionTemplate.deleteMany({ where: { id: { in: [templateId, template2Id] } } });
+        if (templateId) {
+            await prisma.decisionTemplate.deleteMany({
+                where: { id: { in: [templateId, template2Id, uiApplyTemplateId, archivedTemplateId].filter(Boolean) } },
+            });
+        }
         await prisma.$disconnect();
     });
 
@@ -458,5 +465,87 @@ test.describe.serial("Decision templates + schedule-driven due dates", () => {
 
         const after = await prisma.decision.findMany({ where: { projectId: ids.project, deletedAt: null }, select: { id: true, scheduleTaskId: true, dueDate: true } });
         expect(after).toEqual(before);
+    });
+
+    // ── Codex review round 1 follow-ups ─────────────────────────────────────
+
+    test("issue 1: applying an ARCHIVED template is rejected, not silently applied", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const template = await createDecisionTemplate(
+            { name: `${run} Archived Template`, items: [{ name: "Should Not Be Created" }] },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+        archivedTemplateId = template.id;
+        await archiveDecisionTemplate(template.id, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+
+        await expect(
+            applyDecisionTemplate(ids.project, template.id, { getActor: async () => admin, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Template not found");
+
+        const decision = await prisma.decision.findFirst({ where: { projectId: ids.project, name: "Should Not Be Created" } });
+        expect(decision).toBeNull();
+    });
+
+    test("issue 11: auth runs BEFORE the decision lookup — an unauthenticated caller gets the same Forbidden for a real or a nonexistent decisionId (no existence oracle)", async () => {
+        const realDecision = await prisma.decision.findFirstOrThrow({ where: { projectId: ids.project } });
+
+        await expect(
+            linkDecisionToSchedule(realDecision.id, null, null, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+        await expect(
+            linkDecisionToSchedule("this-decision-id-does-not-exist", null, null, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden"); // NOT "Decision not found" — the lookup never runs without a real actor
+
+        await expect(
+            setDecisionDueDateOverride(realDecision.id, null, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+        await expect(
+            setDecisionDueDateOverride("this-decision-id-does-not-exist", null, { getActor: async () => null, revalidate: NOOP_REVALIDATE }),
+        ).rejects.toThrow("Forbidden");
+    });
+
+    // ── BLOCKER: applyDecisionTemplate had no UI call site at all — this is
+    // the missing "Apply template" flow end to end. ─────────────────────────
+
+    test("UI: 'Apply template' button opens a picker, applying creates decisions and shows a result toast", async ({ page }) => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const template = await createDecisionTemplate(
+            {
+                name: `${run} UI Apply Template`,
+                items: [{ name: "UI Apply Item A" }, { name: "UI Apply Item B" }],
+            },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+        uiApplyTemplateId = template.id;
+
+        await page.goto(`/projects/${ids.project}/selections`);
+        await page.getByTestId("apply-template-button").click();
+
+        const modal = page.getByTestId("apply-template-modal");
+        await expect(modal).toBeVisible();
+        const option = modal.getByTestId(`apply-template-option-${template.id}`);
+        await expect(option).toBeVisible();
+        await expect(modal.getByTestId(`apply-template-items-${template.id}`)).toContainText("UI Apply Item A");
+        await expect(modal.getByTestId(`apply-template-items-${template.id}`)).toContainText("UI Apply Item B");
+        await option.click();
+
+        await modal.getByTestId("apply-template-confirm").click();
+        await expect(page.getByText("2 created")).toBeVisible();
+        await expect(modal).not.toBeVisible();
+
+        const decisionA = await prisma.decision.findFirst({ where: { projectId: ids.project, name: "UI Apply Item A", deletedAt: null } });
+        const decisionB = await prisma.decision.findFirst({ where: { projectId: ids.project, name: "UI Apply Item B", deletedAt: null } });
+        expect(decisionA).not.toBeNull();
+        expect(decisionB).not.toBeNull();
+        expect(decisionA?.templateKey).toContain(template.id);
+
+        // Re-applying the SAME template through the UI reports the skip —
+        // proves the picker's toast reflects real created/skipped counts,
+        // not a hardcoded string.
+        await page.getByTestId("apply-template-button").click();
+        await expect(modal).toBeVisible();
+        await modal.getByTestId(`apply-template-option-${template.id}`).click();
+        await modal.getByTestId("apply-template-confirm").click();
+        await expect(page.getByText("0 created, 2 skipped (already exist)")).toBeVisible();
     });
 });

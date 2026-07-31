@@ -7,7 +7,7 @@
 // linkDecisionToSchedule independently (sequential, not Promise.all) so a
 // skipped/failed row never blocks the rest.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
 import { linkDecisionToSchedule } from "@/lib/actions";
@@ -18,6 +18,12 @@ export type LinkScheduleSuggestionRow = {
     decisionName: string;
     scheduleTaskId: string | null;
     leadTimeDays: number;
+    // The decision's ALREADY-CONFIGURED lead time (template default or a
+    // prior manual link), if any — takes priority over the AI's guess when
+    // seeding the lead-time input (Codex review round 1, issue 5: a
+    // deliberately configured value must never be silently clobbered by an
+    // AI suggestion).
+    existingLeadTimeDays: number | null;
     confidence: "high" | "medium" | "low";
     reason: string;
 };
@@ -56,6 +62,8 @@ export default function LinkScheduleReviewModal({
     rows,
     tasks,
     failedCount,
+    trigger,
+    onTriggerClick,
     onClose,
     onApplied,
 }: {
@@ -63,6 +71,16 @@ export default function LinkScheduleReviewModal({
     rows: LinkScheduleSuggestionRow[];
     tasks: { id: string; name: string; startDate: string }[];
     failedCount: number;
+    // Codex review round 1, issue 10: the header button is rendered AS the
+    // Dialog.Trigger (asChild) rather than a separate plain <button> next to
+    // an independently-opened Dialog.Root — this gives the trigger the ARIA
+    // wiring (aria-haspopup/aria-controls/aria-expanded) and focus
+    // restoration on close for free. `open` stays fully parent-controlled
+    // (the fetch that populates `rows` must complete before the modal makes
+    // sense to show) — onTriggerClick is invoked on click instead of Radix
+    // auto-opening, so the parent can fetch first and decide.
+    trigger: ReactNode;
+    onTriggerClick: () => void;
     onClose: () => void;
     onApplied: () => void;
 }) {
@@ -74,7 +92,9 @@ export default function LinkScheduleReviewModal({
     if (rows !== seededRows) {
         setSeededRows(rows);
         setTaskSelections(Object.fromEntries(rows.map((r) => [r.decisionId, r.scheduleTaskId ?? LEAVE_UNLINKED])));
-        setLeadTimeDrafts(Object.fromEntries(rows.map((r) => [r.decisionId, String(r.leadTimeDays)])));
+        // Configured default wins over the AI's guess (Codex review round 1,
+        // issue 5).
+        setLeadTimeDrafts(Object.fromEntries(rows.map((r) => [r.decisionId, String(r.existingLeadTimeDays ?? r.leadTimeDays)])));
         setRowOutcomes({});
     }
 
@@ -87,6 +107,14 @@ export default function LinkScheduleReviewModal({
         onClose();
     }
 
+    function handleOpenChange(next: boolean) {
+        if (next) {
+            onTriggerClick();
+            return;
+        }
+        handleClose();
+    }
+
     async function handleApply() {
         setApplying(true);
         const outcomes: Record<string, RowOutcome> = {};
@@ -94,7 +122,7 @@ export default function LinkScheduleReviewModal({
 
         for (const row of rows) {
             const taskId = taskSelections[row.decisionId] || null;
-            if (!taskId) continue; // left unlinked — no attempt, no write, no outcome
+            if (!taskId) continue; // left unlinked — no write attempted; annotated below if the modal stays open
             const leadTimeDays = Number(leadTimeDrafts[row.decisionId]);
             try {
                 await linkDecisionToSchedule(row.decisionId, taskId, Number.isFinite(leadTimeDays) ? leadTimeDays : 0);
@@ -105,11 +133,9 @@ export default function LinkScheduleReviewModal({
             }
         }
 
-        setApplying(false);
-        setRowOutcomes(outcomes);
-
         const attempted = Object.keys(outcomes).length;
         if (attempted === 0) {
+            setApplying(false);
             toast.info("Nothing selected — nothing linked.");
             onApplied();
             onClose();
@@ -117,6 +143,19 @@ export default function LinkScheduleReviewModal({
         }
 
         const attemptedHasIssues = Object.values(outcomes).some((o) => o.status !== "applied");
+        if (attemptedHasIssues) {
+            // Modal stays open — every row left unlinked also gets an
+            // explicit "skipped" annotation so nothing on screen looks
+            // unaddressed (Codex review round 1, issue 9).
+            for (const row of rows) {
+                if (!(row.decisionId in outcomes) && !taskSelections[row.decisionId]) {
+                    outcomes[row.decisionId] = { status: "skipped", message: "Left unlinked" };
+                }
+            }
+        }
+
+        setApplying(false);
+        setRowOutcomes(outcomes);
         onApplied();
         if (!attemptedHasIssues) {
             toast.success(`${appliedCount} linked`);
@@ -127,7 +166,8 @@ export default function LinkScheduleReviewModal({
     }
 
     return (
-        <Dialog.Root open={open} onOpenChange={(next) => { if (!next) handleClose(); }}>
+        <Dialog.Root open={open} onOpenChange={handleOpenChange}>
+            <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
             <Dialog.Portal>
                 <Dialog.Overlay className="fixed inset-0 bg-black/40 z-50" />
                 <Dialog.Content

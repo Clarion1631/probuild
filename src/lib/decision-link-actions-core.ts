@@ -45,14 +45,21 @@ export async function linkDecisionToSchedule(
     leadTimeDays: number | null,
     deps: LinkActionDependencies = {},
 ): Promise<{ success: true }> {
+    // Auth before lookup (Codex review round 1, issue 11): resolve the actor
+    // FIRST — an entirely unauthenticated/no-session caller is rejected
+    // before the decision table is ever queried, so it can never learn
+    // whether a decisionId exists. The project-scoped canAccessProject check
+    // still needs the decision's projectId, so it runs after the lookup —
+    // but only once we already know a real actor made the call.
+    const actor = await (deps.getActor ?? defaultGetActor)();
+    if (!actor) throw new Error("Forbidden");
+
     const decision = await prisma.decision.findFirst({
         where: { id: decisionId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!decision) throw new Error("Decision not found");
-
-    const actor = await (deps.getActor ?? defaultGetActor)();
-    if (!actor || !canAccessProject(actor, decision.projectId)) throw new Error("Forbidden");
+    if (!canAccessProject(actor, decision.projectId)) throw new Error("Forbidden");
 
     if (scheduleTaskId === null) {
         if (leadTimeDays !== null) {
@@ -90,14 +97,17 @@ export async function setDecisionDueDateOverride(
     dueDate: Date | null,
     deps: LinkActionDependencies = {},
 ): Promise<{ success: true }> {
+    // Auth before lookup (Codex review round 1, issue 11) — isAdminOrManager
+    // doesn't even need the decision's projectId, so this check runs
+    // entirely before any decision lookup.
+    const actor = await (deps.getActor ?? defaultGetActor)();
+    if (!actor || !isAdminOrManager(actor)) throw new Error("Forbidden");
+
     const decision = await prisma.decision.findFirst({
         where: { id: decisionId, deletedAt: null },
         select: { id: true, projectId: true },
     });
     if (!decision) throw new Error("Decision not found");
-
-    const actor = await (deps.getActor ?? defaultGetActor)();
-    if (!actor || !isAdminOrManager(actor)) throw new Error("Forbidden");
 
     const updated = await prisma.decision.updateMany({
         where: { id: decisionId, deletedAt: null },

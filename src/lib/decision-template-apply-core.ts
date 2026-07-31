@@ -54,15 +54,37 @@ export async function listActiveDecisionTemplatesForApply(deps: Pick<ApplyDepend
 
 export type ApplyDecisionTemplateResult = { created: number; skipped: string[] };
 
+// Same normalization on both sides of the dedupe comparison as the CRUD/
+// portal-facing name checks elsewhere in this feature (Codex review round 1,
+// nit a) — NFKC first so visually-identical names that differ only in
+// Unicode composition (e.g. a precomposed vs. combining-mark accent) are
+// still recognized as the same category, not just case differences.
+function normalizeForDedupe(name: string): string {
+    return name.trim().normalize("NFKC").toLowerCase();
+}
+
 /**
  * Creates one Decision per template item, in item order, appended after the
  * project's existing sortOrder (createDecision precedent). Each Decision
  * gets a PER-ITEM templateKey ("decision-template:<templateId>:<itemId>") —
  * Decision has @@unique([projectId, templateKey]), so a shared per-template
  * key would make every item after the first fail. Items whose name matches
- * an existing LIVE decision on the project case-insensitively are skipped
- * and reported, never duplicated — re-applying the same template is always
- * safe.
+ * an existing LIVE decision on the project (NFKC + case-insensitively) are
+ * skipped and reported, never duplicated — re-applying the same template is
+ * always safe.
+ *
+ * The whole thing runs inside ONE interactive transaction, opened with a
+ * project-scoped Postgres advisory lock (Codex review round 1, issues 3+4):
+ * without it, two concurrent applies (or an apply racing a manual
+ * createDecision) could both read the same "existing names"/"max sortOrder"
+ * snapshot and then both write, producing duplicate-looking decisions with
+ * colliding sortOrder — and a mid-loop failure would leave a partial apply
+ * committed with no way to tell which items actually landed. The advisory
+ * lock serializes concurrent applies on the SAME project (other projects are
+ * unaffected — hashtext(projectId) scopes the lock key); the transaction
+ * makes the whole apply atomic, so any failure rolls back to nothing rather
+ * than a partially-applied template. pg_advisory_xact_lock auto-releases at
+ * transaction end (commit or rollback) — no manual unlock needed.
  */
 export async function applyDecisionTemplate(
     projectId: string,
@@ -71,33 +93,59 @@ export async function applyDecisionTemplate(
 ): Promise<ApplyDecisionTemplateResult> {
     await requireProjectStaff(projectId, deps);
 
-    const template = await prisma.decisionTemplate.findUnique({
-        where: { id: templateId },
+    // Archived templates are hidden from the apply picker but are NOT
+    // otherwise deleted — reject applying one directly too (Codex review
+    // round 1, issue 1), e.g. a stale picker tab or a replayed request.
+    const template = await prisma.decisionTemplate.findFirst({
+        where: { id: templateId, archivedAt: null },
         include: { items: { orderBy: { order: "asc" } } },
     });
     if (!template) throw new DecisionTemplateNotFoundError();
 
-    const existingDecisions = await prisma.decision.findMany({
-        where: { projectId, deletedAt: null },
-        select: { name: true },
-    });
-    const existingNamesLower = new Set(existingDecisions.map((d) => d.name.trim().toLowerCase()));
+    return prisma.$transaction(async (tx) => {
+        // $executeRaw, not $queryRaw — pg_advisory_xact_lock returns void,
+        // which $queryRaw's result-set deserialization can't handle
+        // ("Failed to deserialize column of type 'void'"); $executeRaw
+        // doesn't try to parse a result set at all.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${projectId}))`;
 
-    const maxOrder = await prisma.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
-    let nextSortOrder = (maxOrder._max.sortOrder ?? -1) + 1;
+        const existingDecisions = await tx.decision.findMany({
+            where: { projectId, deletedAt: null },
+            select: { name: true },
+        });
+        const existingNamesNormalized = new Set(existingDecisions.map((d) => normalizeForDedupe(d.name)));
 
-    const skipped: string[] = [];
-    let created = 0;
-    for (const item of template.items) {
-        const nameLower = item.name.trim().toLowerCase();
-        if (existingNamesLower.has(nameLower)) {
-            skipped.push(item.name);
-            continue;
-        }
+        const maxOrder = await tx.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+        let nextSortOrder = (maxOrder._max.sortOrder ?? -1) + 1;
 
-        const templateKey = buildTemplateKey(template.id, item.id);
-        try {
-            await prisma.decision.create({
+        const skipped: string[] = [];
+        let created = 0;
+        for (const item of template.items) {
+            const nameNormalized = normalizeForDedupe(item.name);
+            if (existingNamesNormalized.has(nameNormalized)) {
+                skipped.push(item.name);
+                continue;
+            }
+
+            const templateKey = buildTemplateKey(template.id, item.id);
+            const existingByKey = await tx.decision.findFirst({
+                where: { projectId, templateKey },
+                select: { id: true },
+            });
+            if (existingByKey) {
+                // templateKey is permanent even across a soft-deleted
+                // Decision (deletedAt doesn't participate in the
+                // @@unique([projectId, templateKey]) constraint), so a
+                // template item whose prior Decision was soft-deleted (and
+                // therefore excluded from existingNamesNormalized above)
+                // would otherwise collide on that unique constraint. Treat
+                // that the same as a name-match skip — re-applying never
+                // duplicates, and never crashes either.
+                skipped.push(item.name);
+                continue;
+            }
+
+            await tx.decision.create({
                 data: {
                     projectId,
                     name: item.name,
@@ -107,30 +155,17 @@ export async function applyDecisionTemplate(
                     sortOrder: nextSortOrder,
                 },
             });
-        } catch (err) {
-            // Defensive: templateKey is permanent even across a soft-deleted
-            // Decision (deletedAt doesn't participate in the
-            // @@unique([projectId, templateKey]) constraint), so a template
-            // item whose prior Decision was soft-deleted (and therefore
-            // excluded from existingNamesLower above) would otherwise throw
-            // a raw P2002 here. Treat that the same as a name-match skip —
-            // re-applying never duplicates, and never crashes either.
-            if (isUniqueConstraintError(err)) {
-                skipped.push(item.name);
-                continue;
-            }
-            throw err;
+
+            existingNamesNormalized.add(nameNormalized); // guard within-batch duplicate item names too
+            nextSortOrder += 1;
+            created += 1;
         }
 
-        existingNamesLower.add(nameLower); // guard within-batch duplicate item names too
-        nextSortOrder += 1;
-        created += 1;
-    }
-
-    (deps.revalidate ?? defaultRevalidate)(projectId);
-    return { created, skipped };
-}
-
-function isUniqueConstraintError(err: unknown): boolean {
-    return !!err && typeof err === "object" && "code" in err && (err as { code?: string }).code === "P2002";
+        return { created, skipped };
+    }).then((result) => {
+        // Counts are only returned after commit — revalidate now that the
+        // whole apply is durable.
+        (deps.revalidate ?? defaultRevalidate)(projectId);
+        return result;
+    });
 }

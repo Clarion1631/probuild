@@ -67,6 +67,12 @@ assert.match(templateCrudCore, /isAdminOrManager/, "template CRUD must gate on i
 assert.match(templateCrudCore, /requireAdminOrManager/, "template CRUD must have an admin/manager requirement helper");
 assert.match(templateApplyCore, /canAccessProject/, "applyDecisionTemplate must gate on canAccessProject");
 assert.ok(!/isAdminOrManager/.test(templateApplyCore), "applyDecisionTemplate must NOT be gated by isAdminOrManager (any staff, not admin-only)");
+
+// ── Apply races + non-atomicity (Codex review round 1, issues 1, 3, 4) ─────
+assert.match(templateApplyCore, /archivedAt:\s*null/, "applyDecisionTemplate must reject archived templates");
+assert.match(templateApplyCore, /\$transaction/, "applyDecisionTemplate must run inside one interactive transaction");
+assert.match(templateApplyCore, /pg_advisory_xact_lock/, "applyDecisionTemplate must take a project-scoped advisory lock inside the transaction");
+assert.match(templateApplyCore, /\$executeRaw/, "the advisory lock must be taken with $executeRaw (pg_advisory_xact_lock returns void, which $queryRaw cannot deserialize)");
 assert.match(linkActionsCore, /canAccessProject/, "linkDecisionToSchedule must gate on canAccessProject");
 assert.match(linkActionsCore, /isAdminOrManager/, "setDecisionDueDateOverride must gate on isAdminOrManager");
 
@@ -187,6 +193,34 @@ async function verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(): 
     assert.equal(calls, 2, "must retry exactly once on a duplicate decisionId before failing the batch");
 }
 
+async function verifyExtraUnknownDecisionIdInvalidatesBatchEvenWhenAllValidIdsArePresent(): Promise<void> {
+    // Codex review round 1, nit b: BOTH real decisions present, PLUS one
+    // bogus extra decisionId — cardinality (length) alone would match
+    // (2 valid + the bogus one dropped = 2 == batch.length) if the bogus id
+    // were silently dropped instead of invalidating the batch. Must still
+    // fail, not silently pass with the 2 real suggestions.
+    let calls = 0;
+    await assert.rejects(
+        suggestScheduleLinksForDecisions(
+            { decisions: linkDecisions, tasks: linkTasks },
+            {
+                complete: async () => {
+                    calls++;
+                    return JSON.stringify({
+                        suggestions: [
+                            { decisionId: "d1", scheduleTaskId: "t1", leadTimeDays: 5, confidence: "high", reason: "x" },
+                            { decisionId: "d2", scheduleTaskId: null, leadTimeDays: 0, confidence: "low", reason: "y" },
+                            { decisionId: "not-a-real-decision", scheduleTaskId: null, leadTimeDays: 0, confidence: "low", reason: "bogus" },
+                        ],
+                    });
+                },
+            },
+        ),
+        DecisionLinkUnavailableError,
+    );
+    assert.equal(calls, 2, "must retry exactly once on an unrecognized decisionId before failing the batch");
+}
+
 async function verifyUnknownScheduleTaskIdIsDroppedNotBatchInvalidating(): Promise<void> {
     const { suggestions, failedDecisionIds } = await suggestScheduleLinksForDecisions(
         { decisions: linkDecisions, tasks: linkTasks },
@@ -270,6 +304,7 @@ assert.ok(popoverOverrideIdx > -1, "popover must label the override section");
 
 Promise.all([
     verifyDuplicateDecisionIdInvalidatesBatchRetriesOnceThenFails(),
+    verifyExtraUnknownDecisionIdInvalidatesBatchEvenWhenAllValidIdsArePresent(),
     verifyUnknownScheduleTaskIdIsDroppedNotBatchInvalidating(),
     verifyLeadTimeDaysIsClampedNotRejected(),
     verifyEmptyDecisionsShortCircuits(),

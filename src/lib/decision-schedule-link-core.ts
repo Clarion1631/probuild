@@ -141,10 +141,14 @@ function cleanBatchSuggestions(
         if (!entry || typeof entry !== "object") continue;
         const e = entry as Record<string, unknown>;
         const decisionId = String(e.decisionId ?? "");
-        // A decisionId the model invented (not part of this batch) is
-        // dropped — if it displaced a real decision, the length check in
-        // classifyBatchWithRetry catches that as a missing decision.
-        if (!decisionId || !validDecisionIds.has(decisionId)) continue;
+        // A decisionId the model invented (not part of this batch)
+        // invalidates the whole batch (Codex review round 1, nit b) — NOT
+        // silently dropped. Dropping-then-relying-on-the-length-check would
+        // miss the case where the model returns every real decision PLUS
+        // one bogus extra: the length check alone can't tell "one real
+        // decision is missing" apart from "one extra bogus id was
+        // dropped, cardinality still matches" without this explicit check.
+        if (!decisionId || !validDecisionIds.has(decisionId)) return { ok: false };
         if (seen.has(decisionId)) return { ok: false };
         seen.add(decisionId);
 

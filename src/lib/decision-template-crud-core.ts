@@ -57,7 +57,12 @@ export async function createDecisionTemplate(input: DecisionTemplateInput, deps:
     await requireAdminOrManager(deps);
     const name = validateTemplateName(input.name);
     const description = validateTemplateDescription(input.description);
-    const items = validateTemplateItems(input.items);
+    // A brand-new template's items are never "existing rows" — any id a
+    // caller passed for one (stale UI state, tampered payload) is meaningless
+    // here and must not be forwarded to Prisma's create (which would
+    // otherwise happily set an arbitrary custom id instead of the normal
+    // cuid()).
+    const items = validateTemplateItems(input.items).map(({ id: _id, ...item }) => item);
 
     const template = await prisma.decisionTemplate.create({
         data: { name, description, items: { create: items } },
@@ -68,29 +73,77 @@ export async function createDecisionTemplate(input: DecisionTemplateInput, deps:
     return template;
 }
 
-/** Full items replace — items are few; wholesale replace keeps ordering
- * simple. Existing DecisionTemplateItem rows are deleted and recreated in a
- * transaction; this never touches Decisions already applied from this
- * template (their templateKey/name/leadTimeDays are copies, not live
- * references). */
+/** Items are updated IN PLACE by id, not delete-all-recreate (Codex review
+ * round 1, issue 2): a payload item carrying an `id` (an existing row the UI
+ * loaded) is updated; an item with no `id` is a genuinely new row and is
+ * created; any existing row whose id is no longer present in the payload
+ * (removed in the editor) is deleted. Delete-all-recreate would regenerate
+ * every retained item's id on every save, which breaks per-item templateKey
+ * provenance two ways: (1) renaming an item and reapplying the template
+ * would then create a SECOND decision for it (the old templateKey's
+ * decision no longer matches any current item, so the name-based dedupe is
+ * the only thing standing between it and a duplicate), and (2) a
+ * previously soft-deleted templated decision would "resurrect" under the
+ * new id's templateKey instead of staying gone. Preserving ids keeps
+ * applyDecisionTemplate's per-item provenance stable across edits. */
 export async function updateDecisionTemplate(
     templateId: string,
     input: DecisionTemplateInput,
     deps: TemplateCrudDependencies = {},
 ) {
     await requireAdminOrManager(deps);
-    const existing = await prisma.decisionTemplate.findUnique({ where: { id: templateId }, select: { id: true } });
-    if (!existing) throw new DecisionTemplateNotFoundError();
+    const existing = await prisma.decisionTemplateItem.findMany({
+        where: { templateId },
+        select: { id: true },
+    });
+    if (existing.length === 0) {
+        const template = await prisma.decisionTemplate.findUnique({ where: { id: templateId }, select: { id: true } });
+        if (!template) throw new DecisionTemplateNotFoundError();
+    }
+    const existingIds = new Set(existing.map((i) => i.id));
 
     const name = validateTemplateName(input.name);
     const description = validateTemplateDescription(input.description);
     const items = validateTemplateItems(input.items);
 
+    // A payload id that doesn't belong to THIS template (stale/tampered) is
+    // treated as a new row — never lets a caller repoint an id from another
+    // template's item.
+    const retainedIds = new Set(items.map((i) => i.id).filter((id): id is string => !!id && existingIds.has(id)));
+    const idsToDelete = [...existingIds].filter((id) => !retainedIds.has(id));
+
     const template = await prisma.$transaction(async (tx) => {
-        await tx.decisionTemplateItem.deleteMany({ where: { templateId } });
+        if (idsToDelete.length > 0) {
+            await tx.decisionTemplateItem.deleteMany({ where: { templateId, id: { in: idsToDelete } } });
+        }
+        for (const item of items) {
+            if (item.id && retainedIds.has(item.id)) {
+                await tx.decisionTemplateItem.update({
+                    where: { id: item.id },
+                    data: {
+                        name: item.name,
+                        area: item.area,
+                        defaultLeadTimeDays: item.defaultLeadTimeDays,
+                        scheduleHint: item.scheduleHint,
+                        order: item.order,
+                    },
+                });
+            } else {
+                await tx.decisionTemplateItem.create({
+                    data: {
+                        templateId,
+                        name: item.name,
+                        area: item.area,
+                        defaultLeadTimeDays: item.defaultLeadTimeDays,
+                        scheduleHint: item.scheduleHint,
+                        order: item.order,
+                    },
+                });
+            }
+        }
         return tx.decisionTemplate.update({
             where: { id: templateId },
-            data: { name, description, items: { create: items } },
+            data: { name, description },
             include: { items: { orderBy: { order: "asc" } } },
         });
     });
