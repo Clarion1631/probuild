@@ -870,17 +870,29 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
     return Buffer.from(pdfBytes);
 }
 
-export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
+export async function generateInvoicePdf(
+    invoiceId: string,
+    // When set, the PDF mirrors the client's milestone-scoped view: the listed
+    // milestones are marked "Requested" and the headline figure is the requested
+    // total, not the full invoice balance.
+    opts?: { requestedMilestoneIds?: string[] },
+): Promise<Buffer> {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
         include: {
-            payments: { orderBy: { name: 'asc' } },
+            // Schedule order (same as the portal and invoice editor), not alphabetical.
+            // id tiebreaker: same-transaction inserts can share createdAt, and cuids
+            // are monotonic within a batch, so this pins insertion order.
+            payments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
             project: { include: { client: true } },
             client: true,
         },
     });
 
     if (!invoice) throw new Error('Invoice not found');
+
+    const requestedIds = new Set(opts?.requestedMilestoneIds ?? []);
+    const requestedPayments = invoice.payments.filter(p => requestedIds.has(p.id) && p.status !== 'Paid' && p.status !== 'Canceled');
 
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
 
@@ -962,9 +974,11 @@ export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
 
         page.drawText(displayName, { x: invCols.name, y, size: 10, font: helvetica, color: colors.textMain });
 
-        const statusStr = payment.status || 'Pending';
-        const statusW = helvetica.widthOfTextAtSize(statusStr, 10);
-        page.drawText(statusStr, { x: invCols.status - statusW, y, size: 10, font: helvetica, color: payment.status === 'Paid' ? colors.primary : colors.textMuted });
+        const isRequested = requestedIds.has(payment.id) && payment.status !== 'Paid' && payment.status !== 'Canceled';
+        const statusStr = isRequested ? 'Requested' : (payment.status || 'Pending');
+        const statusFont = isRequested ? helveticaBold : helvetica;
+        const statusW = statusFont.widthOfTextAtSize(statusStr, 10);
+        page.drawText(statusStr, { x: invCols.status - statusW, y, size: 10, font: statusFont, color: payment.status === 'Paid' || isRequested ? colors.primary : colors.textMuted });
 
         const dueDateStr = payment.dueDate ? new Date(payment.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
         const dueDateW = helvetica.widthOfTextAtSize(dueDateStr, 10);
@@ -993,8 +1007,13 @@ export async function generateInvoicePdf(invoiceId: string): Promise<Buffer> {
     page.drawText(totalStr, { x: invCols.amount - totalW, y, size: 10, font: helvetica, color: colors.textMain });
     y -= 22;
 
-    page.drawText('Balance Due', { x: invLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
-    const balStr = formatCurrency(balanceDue);
+    // Milestone-scoped view: the headline is what was requested of the client,
+    // not the whole outstanding balance.
+    const requestedTotal = requestedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const headlineLabel = requestedPayments.length > 0 ? 'Amount Requested' : 'Balance Due';
+    const headlineAmt = requestedPayments.length > 0 ? requestedTotal : balanceDue;
+    page.drawText(headlineLabel, { x: invLabelX, y, size: 14, font: helveticaBold, color: colors.primary });
+    const balStr = formatCurrency(headlineAmt);
     const balW = helveticaBold.widthOfTextAtSize(balStr, 14);
     page.drawText(balStr, { x: invCols.amount - balW, y, size: 14, font: helveticaBold, color: colors.primary });
 

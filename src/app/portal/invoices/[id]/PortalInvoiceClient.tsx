@@ -30,12 +30,21 @@ class PaymentSectionErrorBoundary extends React.Component<{ children: React.Reac
     }
 }
 
+// Single parser for the ?milestone= focus param — the same list (including the
+// cap, which markInvoiceViewed also enforces server-side) drives both the
+// focused rendering and the viewed notification, so they can never diverge.
+function parseFocusIds(param: string | null | undefined): string[] {
+    return (param || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 40);
+}
+
 export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess, focusMilestoneParam }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean, focusMilestoneParam?: string | null }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
-        markInvoiceViewed(initialInvoice.id).catch(console.error);
-    }, [initialInvoice.id]);
+        // Pass the focused milestone ids so the internal "Invoice Viewed"
+        // notification reflects the payment request the client actually saw.
+        markInvoiceViewed(initialInvoice.id, parseFocusIds(focusMilestoneParam)).catch(console.error);
+    }, [initialInvoice.id, focusMilestoneParam]);
 
     // Telemetry: log Pay-button DOM state on mount so we can confirm visibility on iPhone customers
     useEffect(() => {
@@ -81,12 +90,13 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
     // Milestone focus mode: the payment-request email links here with
     // ?milestone=<ids> so the client sees a clear "amount due now" for exactly
-    // the requested payment(s), with the full-invoice figures demoted to a
-    // secondary reference line. Paid/unknown ids fall out; if nothing valid
-    // remains the page renders as the normal full invoice.
-    const focusIds = (focusMilestoneParam || "").split(",").map(s => s.trim()).filter(Boolean);
+    // the requested payment(s), with the full-invoice figures hidden. Paid/
+    // Canceled/unknown ids fall out (same predicate as markInvoiceViewed and
+    // the PDF); if nothing valid remains the page renders as the normal full
+    // invoice.
+    const focusIds = parseFocusIds(focusMilestoneParam);
     const focusedPayments = focusIds.length > 0
-        ? (initialInvoice.payments || []).filter((p: any) => focusIds.includes(p.id) && p.status !== "Paid")
+        ? (initialInvoice.payments || []).filter((p: any) => focusIds.includes(p.id) && p.status !== "Paid" && p.status !== "Canceled")
         : [];
     const hasFocus = focusedPayments.length > 0;
     const focusTotal = focusedPayments.reduce((sum: number, p: any) => sum + Number(p.amount), 0);
@@ -188,15 +198,10 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         </div>
                     )}
 
-                    {/* Amount Summary — full-width when there's no focus; a compact
-                        reference line when a specific payment is being requested */}
-                    {hasFocus ? (
-                        <div className="px-10 py-4 bg-slate-50 border-b border-slate-200">
-                            <p className="text-xs text-slate-500 text-center">
-                                Full invoice {initialInvoice.code}: total {formatCurrency(initialInvoice.totalAmount)} · paid to date {formatCurrency(totalPaid)} · remaining balance {formatCurrency(initialInvoice.balanceDue)}
-                            </p>
-                        </div>
-                    ) : (
+                    {/* Amount Summary — only when there's no milestone focus. A focused
+                        payment request shows just the requested amount above; the full
+                        balance stays out of the client's view until it's asked for. */}
+                    {!hasFocus && (
                     <div className="px-10 py-8 bg-slate-50 border-b border-slate-200">
                         <div className="flex justify-between items-center">
                             <div>
@@ -234,7 +239,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                 {initialInvoice.payments.map((payment: any) => {
                                     const isPaidItem = payment.status === "Paid";
                                     const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && !isPaidItem;
-                                    const isFocused = !isPaidItem && focusIds.includes(payment.id);
+                                    const isFocused = !isPaidItem && payment.status !== "Canceled" && focusIds.includes(payment.id);
 
                                     return (
                                         <div

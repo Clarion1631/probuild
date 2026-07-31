@@ -76,7 +76,7 @@ export default async function PortalProjectDetail(props: {
                 where: { status: { not: 'Draft' } },
                 orderBy: { issueDate: 'desc' },
                 include: {
-                    payments: { orderBy: { createdAt: 'asc' } }
+                    payments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }
                 }
             },
             changeOrders: {

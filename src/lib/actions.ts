@@ -2747,7 +2747,7 @@ export async function getInvoiceForPortal(id: string) {
                 include: {
                     project: { include: { client: true } },
                     client: true,
-                    payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: { createdAt: "asc" } },
+                    payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
                 },
             });
             if (!invoice) return null;
@@ -2769,7 +2769,7 @@ export async function getInvoiceForPortal(id: string) {
             include: {
                 project: { include: { client: true } },
                 client: true,
-                payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: { createdAt: "asc" } },
+                payments: { include: { coBilling: { select: { id: true, changeOrderId: true, label: true } } }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
             },
         });
         if (!invoice) return null;
@@ -2785,9 +2785,15 @@ export async function getInvoiceForPortal(id: string) {
     }
 }
 
-export async function markInvoiceViewed(invoiceId: string) {
+export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?: string[]) {
     const sessionClientId = await assertInvoicePortalAccess();
     if (!sessionClientId) return;
+
+    // Client-supplied (from the portal's ?milestone= param) — validated against
+    // the invoice's own payments below before it influences anything.
+    const claimedFocusIds = Array.isArray(focusedMilestoneIds)
+        ? focusedMilestoneIds.filter((id): id is string => typeof id === "string" && id.length <= 50).slice(0, 40)
+        : [];
 
     const claim = await prisma.invoice.updateMany({
         where: {
@@ -2808,11 +2814,17 @@ export async function markInvoiceViewed(invoiceId: string) {
             viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
+            payments: { select: { id: true, name: true, amount: true, status: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
         },
     });
     if (invoice) {
         const clientName = invoice.client?.name || invoice.project?.client?.name || "A client";
         const projectName = invoice.project?.name || "";
+        // The milestones the client was actually looking at (focused portal view).
+        const focusedPayments = invoice.payments.filter(
+            p => claimedFocusIds.includes(p.id) && p.status !== "Paid" && p.status !== "Canceled"
+        );
+        const focusedTotal = focusedPayments.reduce((sum, p) => sum + Number(p.amount), 0);
         try {
             const settings = await getCachedCompanySettings();
             if (settings.notificationEmail && isNotificationEnabled(settings, "invoiceViewed")) {
@@ -2822,7 +2834,9 @@ export async function markInvoiceViewed(invoiceId: string) {
                 let attachments: { filename: string; content: Buffer }[] | undefined = undefined;
                 try {
                     const { generateInvoicePdf } = await import("./pdf");
-                    const pdfBuffer = await generateInvoicePdf(invoiceId);
+                    const pdfBuffer = await generateInvoicePdf(invoiceId, {
+                        requestedMilestoneIds: focusedPayments.map(p => p.id),
+                    });
                     if (pdfBuffer) {
                         attachments = [{ filename: `Invoice_${invoice.code}.pdf`, content: pdfBuffer }];
                     }
@@ -2830,6 +2844,9 @@ export async function markInvoiceViewed(invoiceId: string) {
                     console.error("[markInvoiceViewed] PDF generation failed; sending without attachment:", e);
                 }
 
+                const focusedLine = focusedPayments.length > 0
+                    ? `<p style="margin: 0 0 4px; color: #333;">They were viewing the payment request for <strong>${focusedPayments.map(p => p.name).join(" · ")}</strong> (${formatCurrency(focusedTotal)}).</p>`
+                    : "";
                 await sendNotification(
                     settings.notificationEmail,
                     `👁️ Invoice Viewed — ${invoice.code}`,
@@ -2837,13 +2854,14 @@ export async function markInvoiceViewed(invoiceId: string) {
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
                             <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            ${focusedLine}
                             <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
                             <div style="text-align: center; margin: 16px 0;">
                                 <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
                                     View Invoice
                                 </a>
                             </div>
-                            ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of this invoice is attached.</p>` : ""}
+                            ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of the invoice as the client saw it is attached.</p>` : ""}
                         </div>
                     </div>`,
                     attachments
