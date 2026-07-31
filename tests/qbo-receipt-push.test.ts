@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
     createQBReceiptPurchase,
     ensureQBVendor,
+    QboAccountConfigError,
     QboVendorDuplicateError,
     QboPurchaseFaultError,
     type CreateQBReceiptPurchaseInput,
@@ -24,6 +25,7 @@ const TOKENS = {
 
 const BANK_ACCOUNT_ID = process.env.QBO_RECEIPT_BANK_ACCOUNT_ID || "154";
 const EXPENSE_ACCOUNT_ID = process.env.QBO_RECEIPT_EXPENSE_ACCOUNT_ID || "98";
+const TAX_ACCOUNT_ID = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID || "1150040032";
 
 const PROJECT: QboReceiptProjectCandidate = { id: "project-1", name: "Mueller Remodel" };
 
@@ -48,6 +50,9 @@ function defaultAccountRow(query: string): Array<{ Id: string; Name: string; Acc
     }
     if (query.includes(`'${EXPENSE_ACCOUNT_ID}'`)) {
         return [{ Id: EXPENSE_ACCOUNT_ID, Name: "COGS Supplies & materials", AccountType: "Cost of Goods Sold" }];
+    }
+    if (query.includes(`'${TAX_ACCOUNT_ID}'`)) {
+        return [{ Id: TAX_ACCOUNT_ID, Name: "Reimbursable Sales Tax Paid", AccountType: "Cost of Goods Sold" }];
     }
     return [];
 }
@@ -283,6 +288,64 @@ test("createQBReceiptPurchase builds the payload with a requestid derived from t
     assert.equal(calls.customerCalls[0], "Mueller Remodel"); // customer resolved by PROJECT name, not client
 });
 
+test("createQBReceiptPurchase posts tax-flagged groups to the tax account and everything else to the expense account, all job-coded", async () => {
+    const { deps, calls } = createDeps();
+    const input = baseInput({
+        groups: [
+            { category: "Receipt (pre-tax)", amount: 138.6 },
+            { category: "Sales tax", amount: 11.4, tax: true },
+        ],
+        totalAmount: 150,
+    });
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.creates.length, 1);
+    const lines = calls.creates[0].payload.Line as Array<{
+        Amount: number;
+        AccountBasedExpenseLineDetail: { AccountRef: { value: string }; CustomerRef: { value: string } };
+    }>;
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].Amount, 138.6);
+    assert.equal(lines[0].AccountBasedExpenseLineDetail.AccountRef.value, EXPENSE_ACCOUNT_ID);
+    assert.equal(lines[1].Amount, 11.4);
+    assert.equal(lines[1].AccountBasedExpenseLineDetail.AccountRef.value, TAX_ACCOUNT_ID);
+    // Tax stays job-coded — it IS a job cost until the state refunds it.
+    for (const line of lines) {
+        assert.equal(line.AccountBasedExpenseLineDetail.CustomerRef.value, "cust-1");
+    }
+});
+
+test("createQBReceiptPurchase throws the TYPED config error when the tax account is missing (fresh realm, no cache)", async () => {
+    const { deps } = createDeps({
+        accountRows: (query: string) =>
+            query.includes(`'${TAX_ACCOUNT_ID}'`) ? [] : defaultAccountRow(query),
+    });
+    // Distinct realm so the module-level verified-accounts cache (seeded by
+    // earlier tests under "test-realm") cannot mask the misconfiguration.
+    const freshRealmTokens = { ...TOKENS, realmId: "tax-misconfig-realm" };
+    await assert.rejects(
+        createQBReceiptPurchase(freshRealmTokens, baseInput({ groups: [{ category: "Sales tax", amount: 150, tax: true }] }), deps),
+        (error: unknown) => error instanceof QboAccountConfigError && /tax account .* is missing/.test((error as Error).message),
+    );
+});
+
+test("createQBReceiptPurchase rejects a tax account that collides with the expense account (typed config error)", async () => {
+    const { deps } = createDeps();
+    const prevTax = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID;
+    process.env.QBO_RECEIPT_TAX_ACCOUNT_ID = EXPENSE_ACCOUNT_ID; // the copy/paste mistake
+    try {
+        const freshRealmTokens = { ...TOKENS, realmId: "tax-collision-realm" };
+        await assert.rejects(
+            createQBReceiptPurchase(freshRealmTokens, baseInput(), deps),
+            (error: unknown) => error instanceof QboAccountConfigError && /must be distinct/.test((error as Error).message),
+        );
+    } finally {
+        if (prevTax === undefined) delete process.env.QBO_RECEIPT_TAX_ACCOUNT_ID;
+        else process.env.QBO_RECEIPT_TAX_ACCOUNT_ID = prevTax;
+    }
+});
+
 test("createQBReceiptPurchase attaches a small image receipt", async () => {
     const uploads: Array<{ purchaseId: string }> = [];
     const { deps } = createDeps({
@@ -407,6 +470,34 @@ function validBody() {
     });
 }
 
+test("route POST forwards tax:true only as an explicit boolean — string \"true\" must not move money to the tax account", async () => {
+    const inputs: CreateQBReceiptPurchaseInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async (_tokens, input) => {
+            inputs.push(input);
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true };
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({
+            fileId: "file-1",
+            projectName: "Mueller Remodel",
+            groups: [
+                { category: "Receipt (pre-tax)", amount: 90 },
+                { category: "Sales tax", amount: 10, tax: true },
+                { category: "Sneaky", amount: 0, tax: "true" },
+            ],
+        }),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0].groups[0].tax, false);
+    assert.equal(inputs[0].groups[1].tax, true);
+    assert.equal(inputs[0].groups[2].tax, false); // string "true" is NOT a tax flag
+});
+
 test("route POST returns 200 ok:false when the kill switch is off (valid key)", async () => {
     const { POST } = createRouteHandlers({ enabled: false });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
@@ -479,6 +570,21 @@ test("route POST maps a QBO 400 business fault to 200 ok:false with the fault co
     }));
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: false, reason: "qbo-fault", detail: "6190" });
+});
+
+test("route POST maps an account misconfiguration to 200 ok:false (terminal — bot must fall back to email, never retry-loop)", async () => {
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QboAccountConfigError("tax account 98 must be distinct");
+        },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: false, reason: "account-misconfigured" });
 });
 
 test("route POST maps a transient/network error to 500", async () => {

@@ -101,6 +101,31 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     setState(file, state);
   }
 
+  // SALES TAX SPLIT: GTR holds a reseller's permit, so sales tax paid to
+  // vendors without the certificate on file is recoverable via a state filing.
+  // When the extraction read a tax line, split it out as its own group —
+  // ProBuild posts tax-flagged lines to the "Reimbursable Sales Tax Paid"
+  // account so the filing total is a one-click account report. All math in
+  // integer cents; the two lines reconstruct totalAmount EXACTLY. Tax only
+  // applies to receipts (never handwritten checks), and an unreadable/absent
+  // tax ("" -> 0) or a nonsense value (tax >= total) falls back to the
+  // single-line shape — a bad tax read must never block the booking.
+  const totalCents = Math.round(Number(totalAmount) * 100);
+  const taxCents = isCheck ? 0 : Math.round(Number(cleanMoney(aiData.tax_amount)) * 100);
+  let groups;
+  if (taxCents > 0 && taxCents < totalCents) {
+    groups = [
+      { category: "Receipt (pre-tax)", amount: (totalCents - taxCents) / 100, lines: [] },
+      { category: "Sales tax", amount: taxCents / 100, tax: true, lines: [] }
+    ];
+  } else {
+    groups = [{
+      category: isCheck ? ("Check #" + (checkNum || "?")) : "Receipt",
+      amount: totalCents / 100,
+      lines: []
+    }];
+  }
+
   const payload = {
     projectName: ctx.projectName,
     docType: isCheck ? "check" : "receipt",
@@ -112,12 +137,7 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     totalAmount: Number(totalAmount),
     fileId: file.getId(),
     fileName: blob.getName() || file.getName(),
-    // Single line for the whole receipt — reconciles with totalAmount exactly.
-    groups: [{
-      category: isCheck ? ("Check #" + (checkNum || "?")) : "Receipt",
-      amount: Number(Number(totalAmount).toFixed(2)),
-      lines: []
-    }]
+    groups: groups
   };
   // Guarded again here so an API-committed retry of an oversize file sends a
   // slim payload (Purchase without inline file) instead of 413-looping.
