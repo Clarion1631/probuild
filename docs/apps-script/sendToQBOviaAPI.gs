@@ -84,9 +84,12 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     return emailPath("no-ingest-key");
   }
 
-  // Files too large to ride the API request keep their attachment by going
-  // through the email path instead of creating an attachment-less Purchase.
-  const blob = file.getBlob();
+  // Use the QBO-READY blob the caller already built (qboAttachment_): for a
+  // text/plain source (Lowe's email receipts) that's the PDF CONVERSION, never
+  // the raw .txt — QuickBooks must never receive a text file. Files too large
+  // to ride the API request keep their attachment by going through the email
+  // path instead of creating an attachment-less Purchase.
+  const blob = attachment || file.getBlob();
   const blobBytes = blob.getBytes();
   if (!apiCommitted && blobBytes.length > MAX_QBO_PUSH_ATTACHMENT_BYTES) return emailPath("file-too-large");
 
@@ -108,7 +111,7 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     memo: memo || "",
     totalAmount: Number(totalAmount),
     fileId: file.getId(),
-    fileName: file.getName(),
+    fileName: blob.getName() || file.getName(),
     // Single line for the whole receipt — reconciles with totalAmount exactly.
     groups: [{
       category: isCheck ? ("Check #" + (checkNum || "?")) : "Receipt",
