@@ -23,7 +23,7 @@ export default async function PortalDashboard() {
                 client: { select: { name: true } },
                 invoices: {
                     where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                    select: { id: true, balanceDue: true }
+                    select: { id: true, payments: { select: { amount: true, status: true, qbInvoiceSentAt: true } } }
                 }
             }
         });
@@ -69,7 +69,7 @@ export default async function PortalDashboard() {
                     include: {
                         invoices: {
                             where: { status: { in: ['Issued', 'Overdue', 'Partially Paid'] } },
-                            select: { id: true, balanceDue: true }
+                            select: { id: true, payments: { select: { amount: true, status: true, qbInvoiceSentAt: true } } }
                         }
                     }
                 }
@@ -135,7 +135,13 @@ export default async function PortalDashboard() {
             ) : projects.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {projects.map(p => {
-                        const activeInvoices = (p.invoices || []).reduce((sum: number, inv: any) => sum + Number(inv.balanceDue), 0);
+                        // "Payment Due" badge only when a REQUESTED milestone is outstanding
+                        // (qbInvoiceSentAt stamps the payment-request email) — never for the
+                        // remaining contract balance.
+                        const activeInvoices = (p.invoices || []).reduce((sum: number, inv: any) =>
+                            sum + (inv.payments || [])
+                                .filter((pm: any) => pm.status === 'Pending' && pm.qbInvoiceSentAt)
+                                .reduce((s: number, pm: any) => s + Number(pm.amount), 0), 0);
 
                         return (
                             <Link href={`/portal/projects/${p.id}`} key={p.id} className="hui-card group overflow-hidden hover:shadow-md transition flex flex-col">

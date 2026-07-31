@@ -30,12 +30,21 @@ class PaymentSectionErrorBoundary extends React.Component<{ children: React.Reac
     }
 }
 
+// Single parser for the ?milestone= focus param — the same list (including the
+// cap, which markInvoiceViewed also enforces server-side) drives both the
+// focused rendering and the viewed notification, so they can never diverge.
+function parseFocusIds(param: string | null | undefined): string[] {
+    return (param || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 40);
+}
+
 export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess, focusMilestoneParam }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean, focusMilestoneParam?: string | null }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
 
     useEffect(() => {
-        markInvoiceViewed(initialInvoice.id).catch(console.error);
-    }, [initialInvoice.id]);
+        // Pass the focused milestone ids so the internal "Invoice Viewed"
+        // notification reflects the payment request the client actually saw.
+        markInvoiceViewed(initialInvoice.id, parseFocusIds(focusMilestoneParam)).catch(console.error);
+    }, [initialInvoice.id, focusMilestoneParam]);
 
     // Telemetry: log Pay-button DOM state on mount so we can confirm visibility on iPhone customers
     useEffect(() => {
@@ -81,15 +90,23 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
     // Milestone focus mode: the payment-request email links here with
     // ?milestone=<ids> so the client sees a clear "amount due now" for exactly
-    // the requested payment(s), with the full-invoice figures demoted to a
-    // secondary reference line. Paid/unknown ids fall out; if nothing valid
-    // remains the page renders as the normal full invoice.
-    const focusIds = (focusMilestoneParam || "").split(",").map(s => s.trim()).filter(Boolean);
+    // the requested payment(s), with the full-invoice figures hidden. Only
+    // Pending ids stay focused (same predicate as markInvoiceViewed and the
+    // PDF) — Paid, Canceled, and in-flight Processing payments are not an ask.
+    // If nothing valid remains the page renders as the normal full invoice.
+    const focusIds = parseFocusIds(focusMilestoneParam);
     const focusedPayments = focusIds.length > 0
-        ? (initialInvoice.payments || []).filter((p: any) => focusIds.includes(p.id) && p.status !== "Paid")
+        ? (initialInvoice.payments || []).filter((p: any) => focusIds.includes(p.id) && p.status === "Pending")
         : [];
     const hasFocus = focusedPayments.length > 0;
     const focusTotal = focusedPayments.reduce((sum: number, p: any) => sum + Number(p.amount), 0);
+
+    // "Due now" = requested (payment-request email sent) and still pending.
+    // The rest of the schedule is context, not an ask — the client should never
+    // see the whole contract balance presented as due.
+    const requestedDueNow = (initialInvoice.payments || [])
+        .filter((p: any) => p.status === "Pending" && p.qbInvoiceSentAt)
+        .reduce((sum: number, p: any) => sum + Number(p.amount), 0);
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -142,9 +159,13 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                                             Paid
                                         </span>
-                                    ) : (
+                                    ) : (requestedDueNow > 0 || hasFocus) ? (
                                         <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
                                             Payment Due
+                                        </span>
+                                    ) : (
+                                        <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-slate-50 text-slate-500 border border-slate-200 uppercase tracking-wider">
+                                            No Payment Due
                                         </span>
                                     )}
                                 </div>
@@ -188,15 +209,10 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         </div>
                     )}
 
-                    {/* Amount Summary — full-width when there's no focus; a compact
-                        reference line when a specific payment is being requested */}
-                    {hasFocus ? (
-                        <div className="px-10 py-4 bg-slate-50 border-b border-slate-200">
-                            <p className="text-xs text-slate-500 text-center">
-                                Full invoice {initialInvoice.code}: total {formatCurrency(initialInvoice.totalAmount)} · paid to date {formatCurrency(totalPaid)} · remaining balance {formatCurrency(initialInvoice.balanceDue)}
-                            </p>
-                        </div>
-                    ) : (
+                    {/* Amount Summary — only when there's no milestone focus. A focused
+                        payment request shows just the requested amount above; the full
+                        balance stays out of the client's view until it's asked for. */}
+                    {!hasFocus && (
                     <div className="px-10 py-8 bg-slate-50 border-b border-slate-200">
                         <div className="flex justify-between items-center">
                             <div>
@@ -208,9 +224,12 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                 <p className="text-2xl font-bold text-green-600">{formatCurrency(totalPaid)}</p>
                             </div>
                             <div className="text-right">
-                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Balance Due</p>
-                                <p className={`text-2xl font-bold ${Number(initialInvoice.balanceDue) > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                                    {formatCurrency(initialInvoice.balanceDue)}
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Due Now</p>
+                                <p className={`text-2xl font-bold ${requestedDueNow > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                                    {formatCurrency(requestedDueNow)}
+                                </p>
+                                <p className="text-xs text-slate-400 mt-0.5">
+                                    Remaining balance {formatCurrency(initialInvoice.balanceDue)}
                                 </p>
                             </div>
                         </div>
@@ -233,8 +252,10 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                             <div className="space-y-3">
                                 {initialInvoice.payments.map((payment: any) => {
                                     const isPaidItem = payment.status === "Paid";
-                                    const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && !isPaidItem;
-                                    const isFocused = !isPaidItem && focusIds.includes(payment.id);
+                                    // Overdue only means something once the payment was actually
+                                    // requested — an unrequested scheduled milestone can't be late.
+                                    const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && payment.status === "Pending" && payment.qbInvoiceSentAt;
+                                    const isFocused = payment.status === "Pending" && focusIds.includes(payment.id);
 
                                     return (
                                         <div
@@ -285,16 +306,24 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                 <span className="font-semibold text-slate-800 text-lg">
                                                     {formatCurrency(payment.amount)}
                                                 </span>
-                                                {!isPaidItem && (
-                                                    <PortalPayButton 
-                                                        invoiceId={initialInvoice.id} 
-                                                        paymentScheduleId={payment.id} 
+                                                {/* Pay only what's been requested AND still pending:
+                                                    qbInvoiceSentAt is stamped when the payment-request email
+                                                    goes out; Processing/Canceled rows must never re-offer
+                                                    checkout. Unrequested rows are schedule context, not an ask. */}
+                                                {!isPaidItem && (payment.status === "Pending" && payment.qbInvoiceSentAt ? (
+                                                    <PortalPayButton
+                                                        invoiceId={initialInvoice.id}
+                                                        paymentScheduleId={payment.id}
                                                         amount={payment.amount}
                                                         label="Pay Now"
                                                         settings={companySettings}
                                                         qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
                                                     />
-                                                )}
+                                                ) : (
+                                                    payment.status === "Pending" && (
+                                                        <span className="text-xs text-slate-400 whitespace-nowrap">Not yet due</span>
+                                                    )
+                                                ))}
                                                 {isPaidItem && (
                                                     <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center">
                                                         <svg className="w-4 h-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>

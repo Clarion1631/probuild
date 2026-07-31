@@ -76,7 +76,7 @@ export default async function PortalProjectDetail(props: {
                 where: { status: { not: 'Draft' } },
                 orderBy: { issueDate: 'desc' },
                 include: {
-                    payments: { orderBy: { createdAt: 'asc' } }
+                    payments: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }
                 }
             },
             changeOrders: {
@@ -134,11 +134,15 @@ export default async function PortalProjectDetail(props: {
     const changeOrderCount = (project.changeOrders || []).length;
 
     // All overview-derived data must respect the same visibility flag as the section it surfaces.
+    // "Due" in the portal means REQUESTED and unpaid — qbInvoiceSentAt is stamped
+    // when a milestone payment request is emailed. Unrequested milestones are part
+    // of the schedule, not an ask; they must never roll up into a due amount.
+    const isRequested = (p: any) => p.status === 'Pending' && p.qbInvoiceSentAt;
     const pendingPayments: { invoiceId: string; payment: any }[] = [];
     if (visibility.showInvoices) {
         for (const inv of project.invoices) {
             for (const p of (inv.payments || [])) {
-                if (p.status === 'Pending') pendingPayments.push({ invoiceId: inv.id, payment: p });
+                if (isRequested(p)) pendingPayments.push({ invoiceId: inv.id, payment: p });
             }
         }
     }
@@ -252,8 +256,8 @@ export default async function PortalProjectDetail(props: {
                                         <p className="text-2xl md:text-3xl font-bold text-green-900">{formatCurrency(totalDue)}</p>
                                         <p className="text-sm text-green-700 mt-1">
                                             {pendingPayments.length === 1
-                                                ? `Due ${pendingPayments[0].payment.dueDate ? new Date(pendingPayments[0].payment.dueDate).toLocaleDateString() : 'soon'}`
-                                                : `${pendingPayments.length} payments awaiting your approval`
+                                                ? `${pendingPayments[0].payment.name} · due ${pendingPayments[0].payment.dueDate ? new Date(pendingPayments[0].payment.dueDate).toLocaleDateString() : 'upon receipt'}`
+                                                : `${pendingPayments.length} requested payments`
                                             }
                                         </p>
                                     </div>
@@ -373,7 +377,13 @@ export default async function PortalProjectDetail(props: {
 
                 {activeTab === "invoices" && (
                     <div className="space-y-3">
-                        {project.invoices.map(inv => (
+                        {project.invoices.map(inv => {
+                            // Only requested-and-unpaid milestones are "due now"; the rest
+                            // of the schedule is informational until a request goes out.
+                            const dueNow = (inv.payments || [])
+                                .filter((p: any) => isRequested(p))
+                                .reduce((sum: number, p: any) => sum + Number(p.amount), 0);
+                            return (
                             <div key={inv.id} className="hui-card p-4">
                                 <div className="flex justify-between items-start mb-2 gap-2">
                                     <h3 className="font-semibold text-hui-textMain">Invoice #{inv.code}</h3>
@@ -385,7 +395,9 @@ export default async function PortalProjectDetail(props: {
                                 </div>
                                 <div className="flex justify-between text-sm mb-4">
                                     <span className="text-hui-textMuted">Amount: {formatCurrency(inv.totalAmount)}</span>
-                                    <span className="font-medium text-hui-textMain">Due: {formatCurrency(inv.balanceDue)}</span>
+                                    <span className="font-medium text-hui-textMain">
+                                        {dueNow > 0 ? `Due now: ${formatCurrency(dueNow)}` : 'Nothing due right now'}
+                                    </span>
                                 </div>
 
                                 {inv.payments && inv.payments.length > 0 && (
@@ -412,7 +424,7 @@ export default async function PortalProjectDetail(props: {
                                                     )}
                                                 </div>
                                                 <div className="flex flex-col sm:items-end w-full sm:w-auto mt-2 sm:mt-0">
-                                                    {payment.status === 'Pending' ? (
+                                                    {isRequested(payment) ? (
                                                         <PortalPayButton
                                                             invoiceId={inv.id}
                                                             paymentScheduleId={payment.id}
@@ -422,7 +434,12 @@ export default async function PortalProjectDetail(props: {
                                                             qbPayLink={payment.qbInvoiceLink || null}
                                                         />
                                                     ) : (
-                                                        <span className="text-sm font-medium text-hui-textMain">{formatCurrency(payment.amount)}</span>
+                                                        <div className="flex flex-col sm:items-end">
+                                                            <span className="text-sm font-medium text-hui-textMain">{formatCurrency(payment.amount)}</span>
+                                                            {payment.status === 'Pending' && (
+                                                                <span className="text-xs text-hui-textMuted mt-0.5">Not yet due</span>
+                                                            )}
+                                                        </div>
                                                     )}
                                                 </div>
                                             </div>
@@ -430,7 +447,8 @@ export default async function PortalProjectDetail(props: {
                                     </div>
                                 )}
                             </div>
-                        ))}
+                            );
+                        })}
                     </div>
                 )}
 

@@ -80,7 +80,9 @@ export async function claimQBInvoiceUnlink(
         data: {
             qbInvoiceId: null,
             qbInvoiceLink: null,
-            qbInvoiceSentAt: null,
+            // qbInvoiceSentAt deliberately survives the unlink: it records that a
+            // payment request was emailed (the portal's "due" marker), which stays
+            // true even when the QBO invoice behind it is voided and re-staged.
             qbSyncedAt: null,
             qbSyncError: null,
         },

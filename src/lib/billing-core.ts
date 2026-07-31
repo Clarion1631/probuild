@@ -459,7 +459,7 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
 
     const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
     const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
-    await sendNotification(
+    const emailResult = await sendNotification(
         recipientEmail,
         `${companyName} sent you an invoice — ${invoice.code}`,
         `<!DOCTYPE html>
@@ -496,6 +496,29 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
         undefined,
         { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc, copyToInternal: true }
     );
+
+    // Requested-marker stamp, gated on the email actually going out — a failed
+    // send must never leave the portal claiming a payment is due.
+    if (!emailResult?.success) {
+        return { success: false as const, error: "The invoice email could not be sent — please try again.", sentTo: undefined };
+    }
+
+    // A whole-invoice email asks the client for everything unpaid, so every
+    // Pending milestone becomes "requested". qbInvoiceSentAt doubles as the
+    // rail-neutral request marker: the portal only shows Pay buttons and due
+    // amounts for requested milestones. (Covers resendInvoiceCore too — it
+    // delegates here after refreshing QBO links.) Delivered-but-not-recorded
+    // must not read as a send failure — the email DID go out, and reporting
+    // failure here would invite a duplicate send — so the stamp is fail-soft
+    // and loud, same pattern as the milestone path.
+    try {
+        await prisma.paymentSchedule.updateMany({
+            where: { invoiceId, status: "Pending" },
+            data: { qbInvoiceSentAt: new Date() },
+        });
+    } catch (stampErr) {
+        console.error(`[sendInvoiceToClientCore] Email sent but the request stamp failed for invoice ${invoice.code} — portal will show nothing due until a resend:`, stampErr);
+    }
 
     // Log to activity feed (project-scoped only)
     if (invoice.projectId) {
