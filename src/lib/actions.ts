@@ -37,6 +37,7 @@ import { appendContractCountersignaturePage } from "./pdf";
 import { defaultTaxForNewEstimate } from "./wa-tax";
 import { geocodeJobSiteAddress } from "./geocode";
 import { assertColumnExists, parseOfficeTaskDateOnly } from "./office-task-utils";
+import { autoAssignPhasesForEstimate } from "./auto-assign-phases";
 import { publishDispatch } from "./dispatch-publication";
 import type { DispatchIntent } from "./dispatch-intent";
 import type { PublishDispatchResult } from "./dispatch-publication";
@@ -2396,6 +2397,23 @@ export async function approveEstimate(estimateId: string, signatureName: string,
         console.error("[approveEstimate] post-approval automation failed:", e);
     }
 
+    // Backstop: an approved estimate is about to be worked by crew, whose
+    // clock-in is blocked on cost-coded line items. saveEstimate already
+    // auto-codes on every save, but cover the approval path too in case items
+    // were added some other way. Scheduled post-response via after() so this
+    // Anthropic call never blocks the signature/approval flow. after() throws
+    // synchronously outside a request scope (direct invocation/scripts) — fall
+    // back to a caught floating promise so the approval itself never fails here.
+    const autoAssignAfterApprove = () =>
+        autoAssignPhasesForEstimate(estimateId).catch((e) =>
+            console.error("[approveEstimate] auto-assign phases failed:", e instanceof Error ? e.message : e)
+        );
+    try {
+        after(autoAssignAfterApprove);
+    } catch {
+        void autoAssignAfterApprove();
+    }
+
     await logActivity({
         projectId: estimate?.projectId,
         leadId: estimate?.leadId,
@@ -3170,6 +3188,24 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         revalidatePath(`/leads/${contextId}`);
         revalidatePath(`/leads/${contextId}/estimates/${estimateId}`);
     }
+
+    // Auto-code any newly added line items so crew clock-in (which requires
+    // cost-coded items) isn't blocked on someone remembering to click
+    // "Auto-Assign Phases". Scheduled post-response via after() (not a bare
+    // floating promise, which serverless can kill before it finishes) —
+    // fail-soft, errors are logged inside the helper, not thrown here. after()
+    // throws synchronously outside a request scope (direct invocation/scripts)
+    // — fall back to a caught floating promise so the save itself never fails.
+    const autoAssignAfterSave = () =>
+        autoAssignPhasesForEstimate(estimateId).catch((e) =>
+            console.error("[saveEstimate] auto-assign phases failed:", e instanceof Error ? e.message : e)
+        );
+    try {
+        after(autoAssignAfterSave);
+    } catch {
+        void autoAssignAfterSave();
+    }
+
     return result;
 }
 
