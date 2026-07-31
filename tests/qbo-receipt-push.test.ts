@@ -407,19 +407,21 @@ function validBody() {
     });
 }
 
-test("route POST returns 200 ok:false when the kill switch is off", async () => {
+test("route POST returns 200 ok:false when the kill switch is off (valid key)", async () => {
     const { POST } = createRouteHandlers({ enabled: false });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
         method: "POST",
         body: "{}",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
     }));
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: false, reason: "push-disabled" });
 });
 
-test("route POST rejects a missing/invalid ingest key with 401 even when the kill switch is on", async () => {
-    const { POST } = createRouteHandlers();
+test("route POST rejects a missing/invalid ingest key with 401 BEFORE the kill switch", async () => {
+    // Auth outranks the kill switch: a bad key must 401 even while disabled,
+    // so a misconfigured sender is alertable instead of seeing push-disabled.
+    const { POST } = createRouteHandlers({ enabled: false });
     const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
         method: "POST",
         body: "{}",
@@ -427,6 +429,19 @@ test("route POST rejects a missing/invalid ingest key with 401 even when the kil
     }));
     assert.equal(response.status, 401);
     assert.deepEqual(await response.json(), { ok: false, reason: "unauthorized" });
+});
+
+test("createQBReceiptPurchase rejects a sub-cent total that would produce a lineless Purchase", async () => {
+    const { deps, calls } = createDeps();
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        totalAmount: 0.001,
+        groups: [{ category: "03 Plumbing", amount: 0.001 }],
+    }), deps);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, "amount-mismatch");
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.customerCalls.length, 0);
 });
 
 test("route POST returns 200 ok:false for invalid JSON", async () => {

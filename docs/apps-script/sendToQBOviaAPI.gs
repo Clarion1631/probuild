@@ -68,11 +68,13 @@ const MAX_QBO_PUSH_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, categoryGroups, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment, state) {
   if (state.qboApi) return; // already handled on a previous pass
 
-  // Shop/overhead expenses have no ProBuild project to code the line to —
-  // this is the one skip that ISN'T a fallback-to-email case, because the
-  // legacy sendToQBO email path handles shop docs exactly the same way today.
+  // Shop/overhead expenses have no ProBuild project to code the line to, so
+  // they stay on the legacy email path — called HERE, not skipped, because
+  // once this function replaces the step-5 sendToQBO call nothing else would
+  // email them and the doc would be marked handled without ever being booked.
   if (ctx.isShop) {
-    state.qboApi = "skipped-shop";
+    sendToQBO(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment);
+    state.qboApi = "email-shop";
     setState(file, state);
     return;
   }

@@ -93,16 +93,16 @@ export interface QboReceiptCreateHandlerDependencies {
 export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHandlerDependencies) {
     return {
         async POST(request: Request) {
-            // Opt-in kill switch, checked before anything else. Deterministic —
-            // 200/ok:false, not a 503: this is expected steady-state until the
+            // Auth first so a bad key is always a 401 (alertable misconfig),
+            // then the opt-in kill switch. push-disabled is deterministic —
+            // 200/ok:false, not a 503: it is expected steady-state until the
             // feature is turned on, and the Apps Script must not retry it forever.
-            if (!dependencies.isPushEnabled()) {
-                return NextResponse.json({ ok: false, reason: "push-disabled" });
-            }
-
             const secret = dependencies.getIngestSecret();
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
                 return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
+            }
+            if (!dependencies.isPushEnabled()) {
+                return NextResponse.json({ ok: false, reason: "push-disabled" });
             }
 
             let body: ReceiptPushBody;

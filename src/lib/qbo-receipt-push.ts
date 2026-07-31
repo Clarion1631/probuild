@@ -87,9 +87,23 @@ export async function ensureQBVendor(tokens: QBTokens, name: string): Promise<st
             if (requery.length > 0) return requery[0].Id;
             throw new QboVendorDuplicateError(trimmed);
         }
+        // Other business-rule rejections (invalid name, closed books, scope)
+        // are deterministic — surface as a fault so the route maps them to a
+        // terminal ok:false instead of a forever-retried 500.
+        if (res.status === 400 || res.status === 403) {
+            const faultCode = err.match(/"code"\s*:\s*"(\d+)"/)?.[1];
+            throw new QboPurchaseFaultError(res.status, `QB vendor create failed: ${err}`, faultCode);
+        }
         throw new Error(`QB vendor create failed: ${err}`);
     }
-    const data = await res.json();
+    const data = await res.json().catch(() => null);
+    if (!data?.Vendor?.Id) {
+        const faultCode = data?.Fault?.Error?.[0]?.code;
+        if (data?.Fault) {
+            throw new QboPurchaseFaultError(res.status, `QB vendor create returned a Fault: ${JSON.stringify(data.Fault).slice(0, 500)}`, faultCode);
+        }
+        throw new Error("QB vendor create returned no Vendor body");
+    }
     return data.Vendor.Id;
 }
 
@@ -187,8 +201,19 @@ function isValidCalendarDate(value: unknown): value is string {
     return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
-function isAttachableContentType(contentType: string): boolean {
-    return /^image\//i.test(contentType) || contentType.toLowerCase() === "application/pdf";
+/**
+ * Strict allowlist on the MIME essence — the value is inserted into a
+ * multipart header line, so anything beyond a bare known token is rejected
+ * (no parameters, no CR/LF smuggling like "image/jpeg\r\nX-Test: x").
+ */
+const ATTACHABLE_CONTENT_TYPES = new Set([
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "image/heic", "image/heif", "application/pdf",
+]);
+
+function normalizeAttachableContentType(contentType: string): string | null {
+    const essence = contentType.split(";")[0].trim().toLowerCase();
+    return ATTACHABLE_CONTENT_TYPES.has(essence) ? essence : null;
 }
 
 /** Decode-reencode compare — catches truncated/corrupted base64 before it's sent anywhere. */
@@ -222,7 +247,15 @@ async function defaultQbCreatePurchase(
         }
         throw new Error(`QB purchase create failed: ${text}`);
     }
-    const data = await res.json();
+    const data = await res.json().catch(() => null);
+    // Intuit documents that a 200 response can still carry a Fault body.
+    if (!data?.Purchase?.Id) {
+        const faultCode = data?.Fault?.Error?.[0]?.code;
+        if (data?.Fault) {
+            throw new QboPurchaseFaultError(res.status, `QB purchase create returned a Fault: ${JSON.stringify(data.Fault).slice(0, 500)}`, faultCode);
+        }
+        throw new Error("QB purchase create returned no Purchase body");
+    }
     return { id: data.Purchase.Id };
 }
 
@@ -293,7 +326,10 @@ async function defaultUploadAttachment(
  * realm, ...) — this must throw and never let a Purchase post against the
  * wrong account.
  */
-let verifiedAccountsPromise: Promise<void> | null = null;
+// Keyed by realm + account ids so a reconnect to a different QBO company (or
+// an env change) re-verifies, and rejected entries are evicted so one
+// transient query failure can't poison a warm process forever.
+const verifiedAccountsCache = new Map<string, Promise<void>>();
 
 async function verifyReceiptAccounts(
     tokens: QBTokens,
@@ -301,6 +337,8 @@ async function verifyReceiptAccounts(
     bankAccountId: string,
     expenseAccountId: string,
 ): Promise<void> {
+    const cacheKey = `${tokens.realmId}|${bankAccountId}|${expenseAccountId}`;
+    let verifiedAccountsPromise = verifiedAccountsCache.get(cacheKey);
     if (!verifiedAccountsPromise) {
         verifiedAccountsPromise = (async () => {
             const [bankRows, expenseRows] = await Promise.all([
@@ -325,6 +363,8 @@ async function verifyReceiptAccounts(
                 );
             }
         })();
+        verifiedAccountsCache.set(cacheKey, verifiedAccountsPromise);
+        verifiedAccountsPromise.catch(() => verifiedAccountsCache.delete(cacheKey));
     }
     return verifiedAccountsPromise;
 }
@@ -386,16 +426,24 @@ export async function createQBReceiptPurchase(
     }
 
     // Money validation — integer cents throughout to avoid float drift.
+    // EVERY group must be finite and non-negative (the bot legitimately sends
+    // zero-amount fee/tax groups, which are skipped as no-op lines; anything
+    // negative or non-numeric anywhere rejects the whole document).
     const roundedGroups = input.groups.map(g => ({ ...g, cents: Math.round(Number(g.amount) * 100) }));
-    const includedGroups = roundedGroups.filter(g => g.cents !== 0);
-    if (includedGroups.some(g => !Number.isFinite(g.cents) || g.cents <= 0)) {
+    if (roundedGroups.some(g => !Number.isFinite(g.cents) || g.cents < 0)) {
         return { ok: false, reason: "invalid-group-amount" };
     }
+    const includedGroups = roundedGroups.filter(g => g.cents > 0);
     const groupsSumCents = includedGroups.reduce((sum, g) => sum + g.cents, 0);
     if (!Number.isFinite(input.totalAmount) || input.totalAmount <= 0) {
         return { ok: false, reason: "amount-mismatch", groupsSum: groupsSumCents / 100, totalAmount: input.totalAmount };
     }
     const totalCents = Math.round(input.totalAmount * 100);
+    // A sub-cent total (rounds to 0) or an empty line set must never produce a
+    // Purchase — QBO would accept a lineless/zero document.
+    if (totalCents <= 0 || includedGroups.length === 0) {
+        return { ok: false, reason: "amount-mismatch", groupsSum: groupsSumCents / 100, totalAmount: input.totalAmount };
+    }
     if (Math.abs(groupsSumCents - totalCents) > 2) {
         return { ok: false, reason: "amount-mismatch", groupsSum: groupsSumCents / 100, totalAmount: input.totalAmount };
     }
@@ -403,7 +451,17 @@ export async function createQBReceiptPurchase(
     // Customer resolved PER PROJECT (QBO customers are named after jobs — this
     // round-trips with the expense sync's project-name matching). A Client can
     // own several projects, so Client.qbCustomerId is never used here.
-    const customerId = await ensureCustomerFn(tokens, { name: project.name });
+    let customerId: string;
+    try {
+        customerId = await ensureCustomerFn(tokens, { name: project.name });
+    } catch (error) {
+        // ensureQBCustomer's ambiguous-duplicate rejection is deterministic —
+        // terminal fallback, not a retry loop.
+        if (error instanceof Error && /resolve the duplicate in QuickBooks/.test(error.message)) {
+            return { ok: false, reason: "duplicate-name" };
+        }
+        throw error;
+    }
 
     let vendorId: string;
     try {
@@ -423,7 +481,11 @@ export async function createQBReceiptPurchase(
         : input.checkNumber
             ? ` · Check #${input.checkNumber}`
             : "";
-    const privateNote = `${input.projectName} - ${vendorName} ($${input.totalAmount})${refSuffix} ${marker}`.slice(0, 4000);
+    // Truncate the descriptive prefix, never the marker — a lost-response retry
+    // depends on finding the FULL [gtr-file:...] marker to prove idempotency.
+    const notePrefix = `${input.projectName} - ${vendorName} ($${input.totalAmount})${refSuffix}`
+        .slice(0, 4000 - marker.length - 1);
+    const privateNote = `${notePrefix} ${marker}`;
 
     const lines = includedGroups.map(g => {
         const lineDescs = (g.lines || []).slice(0, 4).map(l => l.desc).filter(Boolean).join("; ");
@@ -460,9 +522,9 @@ export async function createQBReceiptPurchase(
 
     let attachment: ReceiptAttachmentStatus = "skipped";
     if (input.fileBase64) {
-        const contentType = input.fileContentType || "";
+        const contentType = normalizeAttachableContentType(input.fileContentType || "");
         if (
-            isAttachableContentType(contentType) &&
+            contentType &&
             isValidBase64(input.fileBase64) &&
             Buffer.byteLength(input.fileBase64, "base64") <= MAX_ATTACHMENT_BYTES
         ) {
