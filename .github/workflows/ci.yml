@@ -116,6 +116,13 @@ jobs:
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
       SENTRY_ORG: golden-touch-remodeling
       PLAYWRIGHT_TEST_SECRET: ${{ secrets.PLAYWRIGHT_TEST_SECRET }}
+      # e2e/selections-ai-sort.spec.ts requires the deterministic AI mock
+      # (selection-ai-sort-mock.ts). Without this flag the route calls the real
+      # Anthropic API: the spec's forced-invalid-batch marker is inert prose to
+      # a real model, so the batch-isolation assertions fail — and every CI run
+      # burns real API tokens. Safe by construction: the mock gate also
+      # requires !process.env.VERCEL, so real deploys ignore this flag.
+      SELECTION_AI_MOCK: "1"
       CI: true
 
     steps:
