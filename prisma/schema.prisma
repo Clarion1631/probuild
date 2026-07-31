@@ -1740,6 +1740,13 @@ model SelectionProposal {
   // days (getRecentlyDeletedItems / restoreItem). Filtered out of every read.
   deletedAt    DateTime?
   comments     SelectionItemComment[]
+  // AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+  // NOT an FK on purpose — suggestions are advisory, may go stale (decision
+  // deleted/renamed), and stale values are filtered at read time rather than
+  // enforced by the database. Cleared when the item is assigned (staff apply
+  // or manual assignItemToDecision) or dismissed.
+  suggestedDecisionId String?
+  suggestedAt         DateTime?
 
   @@index([projectId, status])
   @@index([decisionId])
