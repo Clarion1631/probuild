@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
+import { utcMidnight, daysBetweenUtc, dueDateLabel } from "@/lib/date-utils";
 
 // Same writer as actions.ts's logActivity, but reached via a lazy dynamic import so this
 // module (imported by the cron route) never pulls in actions.ts's "use server"
@@ -48,20 +49,9 @@ export type PaymentReminderResult = {
 // "due in N days" / the reminder window are calendar-day concepts, not 24h-tick
 // concepts — comparing raw millisecond deltas would put a milestone due at 11pm
 // today a day off from one due at 1am today depending on what time the cron runs.
-// Everything below normalizes to UTC midnight before diffing.
-function utcMidnight(d: Date): Date {
-    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-function daysBetweenUtc(from: Date, to: Date): number {
-    return Math.round((utcMidnight(to).getTime() - utcMidnight(from).getTime()) / DAY_MS);
-}
-function dueDateLabel(daysUntil: number): string {
-    if (daysUntil > 1) return `due in ${daysUntil} days`;
-    if (daysUntil === 1) return "due tomorrow";
-    if (daysUntil === 0) return "due today";
-    const daysOverdue = Math.abs(daysUntil);
-    return `${daysOverdue} day${daysOverdue === 1 ? "" : "s"} overdue`;
-}
+// utcMidnight/daysBetweenUtc/dueDateLabel now live in date-utils.ts (extracted
+// so decision-due-date.ts can reuse the identical math — see
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
 
 function reminderEmailHtml(opts: {
     clientName: string;

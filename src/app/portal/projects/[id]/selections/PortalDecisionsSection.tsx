@@ -27,6 +27,7 @@ import { buildClipperBookmarklet } from "@/lib/clipper-bookmarklet";
 import ClipperDragLink from "@/components/ClipperDragLink";
 import { SelectionItemNote } from "@/components/selections/SelectionItemNote";
 import { SelectionItemThread, type SelectionItemThreadCommentView } from "@/components/selections/SelectionItemThread";
+import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import AddItemModal from "./AddItemModal";
 import {
     ImageOff,
@@ -73,6 +74,27 @@ interface DecisionData {
     sortOrder: number;
     pmNote: string | null;
     candidates: Candidate[];
+    // Schedule-driven due dates (Phase 3) — computed value only; the portal
+    // never receives the raw dueDate/scheduleTaskId/leadTimeDays fields
+    // (stripped server-side, see stripDueDateFields in actions.ts).
+    effectiveDueDate: string | null;
+}
+
+// Read-only "Decide by" line — undecided decisions only (Open/Flagged);
+// Decided/Ordered/Received show nothing regardless of effectiveDueDate.
+function DecideByLine({ status, effectiveDueDate }: { status: string; effectiveDueDate: string | null }) {
+    if (status !== "Open" && status !== "Flagged") return null;
+    if (!effectiveDueDate) return null;
+    const date = new Date(effectiveDueDate);
+    const urgency = dueDateUrgency(date);
+    return (
+        <p data-testid="portal-decide-by" className="text-xs mt-1">
+            <span className="text-hui-textMuted">Decide by {formatDueDateShort(date)}</span>
+            {urgency && (
+                <span className={`ml-1.5 px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
+            )}
+        </p>
+    );
 }
 
 const ARCHIVED = "Archived";
@@ -287,7 +309,7 @@ function CandidateCard({
     return (
         <div
             data-testid={`selection-item-${item.id}`}
-            className={`relative rounded-lg border p-3 group ${
+            className={`relative rounded-lg border p-3 group flex flex-col h-full ${
                 isChosen ? "border-hui-primary ring-1 ring-hui-primary bg-hui-primary/5" : "border-slate-200"
             }`}
         >
@@ -315,33 +337,36 @@ function CandidateCard({
                 )}
             </div>
 
-            <SelectionItemNote
-                itemId={item.id}
-                note={item.clientNote}
-                onSaved={onChanged}
-                className="mt-1"
-            />
-            <SelectionItemThread
-                itemId={item.id}
-                comments={item.comments}
-                unreadCount={item.unreadThreadCount}
-                onChanged={onChanged}
-                className="mt-1.5"
-            />
+            {/* One inline row for the small actions; a saved note or an active
+                thread takes its own full-width line so text stays readable. */}
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <SelectionItemNote
+                    itemId={item.id}
+                    note={item.clientNote}
+                    onSaved={onChanged}
+                    className={item.clientNote?.trim() ? "basis-full" : ""}
+                />
+                <SelectionItemThread
+                    itemId={item.id}
+                    comments={item.comments}
+                    unreadCount={item.unreadThreadCount}
+                    onChanged={onChanged}
+                    className={item.comments.length > 0 ? "basis-full" : ""}
+                />
+                {isHttpUrl(item.vendorUrl) && (
+                    <a
+                        href={item.vendorUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                    >
+                        <ExternalLink className="w-3 h-3" />
+                        View link
+                    </a>
+                )}
+            </div>
 
-            {isHttpUrl(item.vendorUrl) && (
-                <a
-                    href={item.vendorUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-blue-600 hover:underline flex items-center gap-1 mt-1.5"
-                >
-                    <ExternalLink className="w-3 h-3" />
-                    View link
-                </a>
-            )}
-
-            <div className="mt-2.5">
+            <div className="mt-auto pt-2.5">
                 {decision ? (
                     isChosen ? (
                         !decisionLocked && (
@@ -579,6 +604,7 @@ function DecisionCard({
                             </button>
                         </div>
                     )}
+                    <DecideByLine status={decision.status} effectiveDueDate={decision.effectiveDueDate} />
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                     <button

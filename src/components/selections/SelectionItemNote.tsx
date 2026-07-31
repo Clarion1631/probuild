@@ -118,38 +118,42 @@ export function SelectionItemNote({
 
     return (
         <div className={className}>
-            <p
-                ref={previewRef}
-                data-testid="selection-note-preview"
-                className={`whitespace-pre-wrap break-words text-xs text-hui-textMuted ${
-                    // Notes are usually short — show them in full without a
-                    // click. Only genuinely long notes get clamped behind
-                    // Show more.
-                    expanded || displayedNote.length <= 240 ? "" : "line-clamp-2"
-                }`}
-            >
-                {displayedNote}
-            </p>
-            <div className="mt-1 flex items-center gap-3">
-                {hasOverflow && (
+            {/* Tinted block so the note reads as a note at a glance instead of
+                blending in with the item description. */}
+            <div className="rounded-md bg-amber-50 border border-amber-100 px-2 py-1.5">
+                <p
+                    ref={previewRef}
+                    data-testid="selection-note-preview"
+                    className={`whitespace-pre-wrap break-words text-xs text-slate-700 ${
+                        // Notes are usually short — show them in full without a
+                        // click. Only genuinely long notes get clamped behind
+                        // Show more.
+                        expanded || displayedNote.length <= 240 ? "" : "line-clamp-2"
+                    }`}
+                >
+                    {displayedNote}
+                </p>
+                <div className="mt-0.5 flex items-center gap-3">
+                    {hasOverflow && (
+                        <button
+                            type="button"
+                            data-testid="selection-note-toggle"
+                            aria-expanded={expanded}
+                            className="text-[11px] font-medium text-blue-600 hover:underline"
+                            onClick={() => setExpanded((value) => !value)}
+                        >
+                            {expanded ? "Show less" : "Show more"}
+                        </button>
+                    )}
                     <button
                         type="button"
-                        data-testid="selection-note-toggle"
-                        aria-expanded={expanded}
-                        className="text-xs font-medium text-blue-600 hover:underline"
-                        onClick={() => setExpanded((value) => !value)}
+                        data-testid="selection-note-edit"
+                        className="text-[11px] font-medium text-blue-600 hover:underline"
+                        onClick={startEditing}
                     >
-                        {expanded ? "Show less" : "Show more"}
+                        Edit note
                     </button>
-                )}
-                <button
-                    type="button"
-                    data-testid="selection-note-edit"
-                    className="text-xs font-medium text-blue-600 hover:underline"
-                    onClick={startEditing}
-                >
-                    Edit note
-                </button>
+                </div>
             </div>
         </div>
     );

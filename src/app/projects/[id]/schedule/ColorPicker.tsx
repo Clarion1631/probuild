@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useState, type RefObject } from "react";
 import { FloatingLayer } from "@/components/FloatingLayer";
+import ColorWheel from "./ColorWheel";
 import { PRESET_COLORS } from "./schedule-utils";
 
 const RECENT_KEY = "probuild:scheduleRecentColors";
@@ -44,7 +45,6 @@ export type ColorPickerProps = {
 
 export default function ColorPicker({ selected, onPick, onClose, anchorRef, align = "left" }: ColorPickerProps) {
     const [recent, setRecent] = useState<string[]>([]);
-    const colorInputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => { setRecent(getRecentColors()); }, []);
 
@@ -57,10 +57,6 @@ export default function ColorPicker({ selected, onPick, onClose, anchorRef, alig
         onPick(normalized);
         pushRecentColor(normalized);
         setRecent(getRecentColors());
-    }
-
-    function handleCustomInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-        handlePick(e.target.value);
     }
 
     return (
@@ -108,23 +104,7 @@ export default function ColorPicker({ selected, onPick, onClose, anchorRef, alig
                 </>
             )}
             <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mt-2.5 mb-1.5">Custom</div>
-            <button
-                type="button"
-                onClick={() => colorInputRef.current?.click()}
-                className="w-full flex items-center gap-2 px-2 py-1.5 text-[11px] text-slate-600 hover:bg-slate-50 rounded border border-dashed border-slate-300 transition"
-            >
-                <span className="w-5 h-5 rounded-full border border-slate-300 flex items-center justify-center text-slate-400 text-sm leading-none">+</span>
-                <span>Pick a color…</span>
-            </button>
-            <input
-                ref={colorInputRef}
-                type="color"
-                value={selected.startsWith("#") ? selected : "#4c9a2a"}
-                onChange={handleCustomInputChange}
-                className="sr-only"
-                aria-label="Custom color"
-                tabIndex={-1}
-            />
+            <ColorWheel value={selected.startsWith("#") ? selected : "#4c9a2a"} onCommit={handlePick} />
             <button
                 type="button"
                 onClick={onClose}

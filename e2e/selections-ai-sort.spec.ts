@@ -42,8 +42,37 @@ const ids = {
     soloPoisonProject: `${run}-solo-poison-project`,
     soloPoisonItem: `${run}-solo-poison-item`,
     adversarialItem: `${run}-adversarial-item`,
+    // New-categories follow-up
+    // (docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md)
+    // — dedicated projects so the shared knownCategories vocabulary and the
+    // dedupe-reuse scenario don't interact with each other or the rest of
+    // this serial suite's decisions/items.
+    newCatTemplate: `${run}-newcat-template`,
+    newCatTemplateItem: `${run}-newcat-template-item`,
+    newCatProject: `${run}-newcat-project`,
+    newCatItemA: `${run}-newcat-item-a`,
+    newCatItemB: `${run}-newcat-item-b`,
+    newCatReuseProject: `${run}-newcat-reuse-project`,
+    newCatExistingDecision: `${run}-newcat-existing-decision`,
+    newCatReuseItem: `${run}-newcat-reuse-item`,
+    matchPriorityItem: `${run}-match-priority-item`,
 } as const;
 const clientEmail = `${run}@example.com`;
+// Codex review nit (ii): run-unique, not a bare literal — a fixed
+// "Backsplash" would sit in the SAME global knownCategories vocabulary
+// (distinct across every active template, capped at 150, alphabetical) as
+// every other worker running this suite in parallel/locally; a shared
+// literal risks colliding with, or being pushed out of, the cap/ordering.
+const newCatVocabName = `Backsplash-${run}`;
+// A diacritic variant of the SAME word (Codex review issue 4a's mock fix
+// makes the mock match an existing decision against the item's FULL
+// name+description+clientNote, not just name — so a plain-case pre-existing
+// decision whose name is textually containable in the item's own text now
+// resolves via the ordinary decision-match path, not the new-category path.
+// This variant is normalizeForDedupe-equal (NFKD-strips the accent) but
+// textually distinct, so the reuse test below still exercises
+// createDecisionForSuggestion's dedupe rather than the primary match.
+const newCatVocabNameAccented = newCatVocabName.replace(/a/, "á");
 
 test.describe.serial("AI auto-sort for unsorted selection items", () => {
     test.beforeAll(async () => {
@@ -137,12 +166,88 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
                 status: "Idea",
             },
         });
+
+        // New-categories follow-up fixtures. An ACTIVE DecisionTemplate item
+        // named newCatVocabName is the knownCategories vocabulary the route
+        // loads (distinct names across every active template, global — not
+        // project-scoped), so the mock can deterministically propose it for
+        // an item that matches no offered decision.
+        await prisma.decisionTemplate.create({
+            data: {
+                id: ids.newCatTemplate,
+                name: `${run} New Category Template`,
+                items: { create: [{ id: ids.newCatTemplateItem, name: newCatVocabName, order: 0 }] },
+            },
+        });
+        await prisma.project.create({
+            data: { id: ids.newCatProject, name: "AI Sort New Category Project", clientId: ids.client, status: "In Progress" },
+        });
+        // Two items whose names both contain newCatVocabName but match
+        // neither "Fixtures" nor "Flooring" — the mock proposes it as
+        // newCategoryName for both, from the knownCategories vocabulary
+        // above.
+        await prisma.selectionProposal.create({
+            data: { id: ids.newCatItemA, projectId: ids.newCatProject, name: `Zellige ${newCatVocabName} Tile`, status: "Idea" },
+        });
+        await prisma.selectionProposal.create({
+            data: { id: ids.newCatItemB, projectId: ids.newCatProject, name: `Subway ${newCatVocabName} Sample`, status: "Idea" },
+        });
+
+        // A SEPARATE project with a pre-existing LIVE decision named a
+        // DIACRITIC variant of newCatVocabName — an item here proposes the
+        // plain (unaccented) vocabulary name via its clientNote, never its
+        // name, so it can't textually match the accented existing decision
+        // through the mock's name+description+clientNote matching (issue 4a
+        // — see the mock's unified haystack); createDecisionForSuggestion
+        // must resolve it by reusing the existing decision
+        // (normalizeForDedupe strips the accent), never creating a
+        // duplicate.
+        await prisma.project.create({
+            data: { id: ids.newCatReuseProject, name: "AI Sort New Category Reuse Project", clientId: ids.client, status: "In Progress" },
+        });
+        await prisma.decision.create({
+            data: { id: ids.newCatExistingDecision, projectId: ids.newCatReuseProject, name: newCatVocabNameAccented },
+        });
+        await prisma.selectionProposal.create({
+            data: {
+                id: ids.newCatReuseItem,
+                projectId: ids.newCatReuseProject,
+                name: "Elegant Tile Sample",
+                clientNote: `For the ${newCatVocabName} accent wall`,
+                status: "Idea",
+            },
+        });
+
+        // Match-priority fixture (Codex review issue 4a): an item whose
+        // text matches BOTH an existing offered decision ("Fixtures") AND
+        // the knownCategories vocabulary — the existing decision must win;
+        // a new category must never be invented when a real match exists.
+        await prisma.selectionProposal.create({
+            data: {
+                id: ids.matchPriorityItem,
+                projectId: ids.project,
+                name: `Fixtures ${newCatVocabName} Trim Kit`,
+                status: "Idea",
+            },
+        });
     });
 
     test.afterAll(async () => {
         await prisma.project.deleteMany({
-            where: { id: { in: [ids.project, ids.otherProject, ids.batchProject, ids.soloPoisonProject] } },
+            where: {
+                id: {
+                    in: [
+                        ids.project,
+                        ids.otherProject,
+                        ids.batchProject,
+                        ids.soloPoisonProject,
+                        ids.newCatProject,
+                        ids.newCatReuseProject,
+                    ],
+                },
+            },
         });
+        await prisma.decisionTemplate.deleteMany({ where: { id: ids.newCatTemplate } });
         await prisma.client.deleteMany({ where: { id: ids.client } });
         await prisma.user.deleteMany({ where: { id: ids.restrictedStaff } });
         await prisma.$disconnect();
@@ -222,6 +327,21 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
 
         const storedAssigned = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.assignedItem } });
         expect(storedAssigned.suggestedDecisionId).toBeNull();
+
+        // Match priority (Codex review issue 4a): an item whose text matches
+        // BOTH an existing offered decision ("Fixtures") AND the
+        // knownCategories vocabulary must file into the existing decision —
+        // never invent a new category when a real match exists.
+        const matchPrioritySuggestion = byItemId.get(ids.matchPriorityItem) as {
+            decisionId: string | null;
+            newCategoryName: string | null;
+        };
+        expect(matchPrioritySuggestion).toBeTruthy();
+        expect(matchPrioritySuggestion.decisionId).toBe(ids.decisionFixtures);
+        expect(matchPrioritySuggestion.newCategoryName).toBeNull();
+
+        const storedMatchPriority = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.matchPriorityItem } });
+        expect(storedMatchPriority.suggestedDecisionId).toBe(ids.decisionFixtures);
     });
 
     test("a batch that fails strict cardinality is isolated — other batches still persist; partial success returned as 200", async ({ page }) => {
@@ -546,5 +666,83 @@ test.describe.serial("AI auto-sort for unsorted selection items", () => {
 
         const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.a11yItem } });
         expect(item.decisionId).toBeNull();
+    });
+
+    // ── New categories: AI suggests a category for items that fit no
+    // offered decision (docs/superpowers/plans/2026-07-31-selection-ai-sort-new-categories.md) ──
+
+    test("new-category suggestion: two items sharing the proposed category create exactly one decision, both filed", async ({ page }) => {
+        await page.goto(`/projects/${ids.newCatProject}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+
+        // Neither item matches an offered decision — both get the
+        // "Create <newCatVocabName>" option, pre-selected.
+        const selectA = modal.getByTestId(`ai-sort-row-select-${ids.newCatItemA}`);
+        const selectB = modal.getByTestId(`ai-sort-row-select-${ids.newCatItemB}`);
+        await expect(selectA.locator("option:checked")).toHaveText(`Create "${newCatVocabName}"`);
+        await expect(selectB.locator("option:checked")).toHaveText(`Create "${newCatVocabName}"`);
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        // Toast mentions the new category was created.
+        await expect(page.locator("[data-sonner-toast]").last()).toContainText(/new categor/i);
+
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemA } });
+                return item.decisionId;
+            })
+            .not.toBeNull();
+
+        const itemA = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemA } });
+        const itemB = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatItemB } });
+        expect(itemA.decisionId).not.toBeNull();
+        // Both items resolved the SAME "Create" choice to the SAME decision
+        // — exactly one Decision must exist for it, never one per row.
+        expect(itemB.decisionId).toBe(itemA.decisionId);
+
+        const vocabDecisions = await prisma.decision.findMany({
+            where: { projectId: ids.newCatProject, name: newCatVocabName, deletedAt: null },
+        });
+        expect(vocabDecisions.length).toBe(1);
+        expect(vocabDecisions[0].id).toBe(itemA.decisionId);
+    });
+
+    test("Apply reuses an existing live decision with a different (accented) form, never duplicating it", async ({ page }) => {
+        await page.goto(`/projects/${ids.newCatReuseProject}/selections`);
+        await Promise.all([
+            page.waitForResponse((res) => res.url().includes("/api/selections/ai-sort") && res.ok()),
+            page.getByTestId("sort-with-ai-button").click(),
+        ]);
+
+        const modal = page.getByTestId("ai-sort-modal");
+        await expect(modal).toBeVisible();
+        const select = modal.getByTestId(`ai-sort-row-select-${ids.newCatReuseItem}`);
+        await expect(select.locator("option:checked")).toHaveText(`Create "${newCatVocabName}"`);
+
+        await modal.getByTestId("ai-sort-apply").click();
+        await expect(modal).not.toBeVisible();
+
+        await expect
+            .poll(async () => {
+                const item = await prisma.selectionProposal.findUniqueOrThrow({ where: { id: ids.newCatReuseItem } });
+                return item.decisionId;
+            })
+            .toBe(ids.newCatExistingDecision);
+
+        // Reused the pre-existing accented decision (normalizeForDedupe
+        // strips the accent) — no second decision was created for it.
+        const allVocabDecisions = await prisma.decision.findMany({
+            where: { projectId: ids.newCatReuseProject, deletedAt: null, name: { in: [newCatVocabName, newCatVocabNameAccented] } },
+        });
+        expect(allVocabDecisions.length).toBe(1);
+        expect(allVocabDecisions[0].id).toBe(ids.newCatExistingDecision);
     });
 });

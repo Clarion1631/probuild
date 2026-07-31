@@ -85,7 +85,7 @@ Legacy `"Pending"`/`"Approved"`/`"Declined"` remain readable so in-flight rows n
 
 ## Phase 2 — Templates + schedule-driven due dates (the domino layer)
 
-**Decision templates — team-authored, team-applied** (fills the existing `/templates/selections` placeholder). Authoring and applying are ADMIN/MANAGER only; no portal route may create, edit, or apply a template.
+**Decision templates — team-authored, team-applied** (fills the existing `/templates/selections` placeholder). Template CRUD (create/edit/archive) is ADMIN/MANAGER only; applying a template to a project is available to any staff member with project access (the same bar as creating a decision directly) — no portal route may create, edit, or apply a template. Decided (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md, task 4).
 ```
 model DecisionTemplate      { id, name ("Bathroom Remodel"), description, items[] }
 model DecisionTemplateItem  { id, templateId, name ("Shower Valve"), area, defaultLeadTimeDays, costCodeId?, stageHint?, sortOrder }

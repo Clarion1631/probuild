@@ -31,7 +31,26 @@ import { normalizeE164 } from "./phone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
+    createDecisionForSuggestion as aiSortCreateDecisionForSuggestion,
 } from "./selection-ai-sort-apply-core";
+import {
+    createDecisionTemplate as createDecisionTemplateCore,
+    updateDecisionTemplate as updateDecisionTemplateCore,
+    archiveDecisionTemplate as archiveDecisionTemplateCore,
+    unarchiveDecisionTemplate as unarchiveDecisionTemplateCore,
+    listDecisionTemplates as listDecisionTemplatesCore,
+} from "./decision-template-crud-core";
+import type { DecisionTemplateInput } from "./decision-template-crud-core";
+import {
+    listActiveDecisionTemplatesForApply as listActiveDecisionTemplatesForApplyCore,
+    applyDecisionTemplate as applyDecisionTemplateCore,
+} from "./decision-template-apply-core";
+import {
+    linkDecisionToSchedule as linkDecisionToScheduleCore,
+    setDecisionDueDateOverride as setDecisionDueDateOverrideCore,
+} from "./decision-link-actions-core";
+import { computeEffectiveDueDate, computeLinkState, type DecisionLinkState } from "./decision-due-date";
+import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
@@ -10711,6 +10730,69 @@ function stripSuggestionFields<T extends { suggestedDecisionId?: unknown; sugges
     return rest;
 }
 
+// ── Schedule-driven due dates (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) ──
+
+type DecisionDueDateFields = { dueDate: Date | null; scheduleTaskId: string | null; leadTimeDays: number | null };
+
+/** ONE batched query per page load — never a per-decision lookup (plan's
+ * explicit requirement). Only the linked task's startDate is needed for
+ * derivation. */
+async function loadScheduleTaskStartDates(
+    projectId: string,
+    decisions: DecisionDueDateFields[],
+): Promise<Map<string, Date>> {
+    const linkedIds = [...new Set(decisions.map((d) => d.scheduleTaskId).filter((id): id is string => !!id))];
+    if (linkedIds.length === 0) return new Map();
+    const tasks = await prisma.scheduleTask.findMany({
+        where: { projectId, id: { in: linkedIds } },
+        select: { id: true, startDate: true },
+    });
+    return new Map(tasks.map((t) => [t.id, t.startDate]));
+}
+
+/** Attaches computed `effectiveDueDate` to every decision, using the batched
+ * task lookup above. Raw dueDate/scheduleTaskId/leadTimeDays are left in
+ * place here — the STAFF read keeps them (the edit popover needs them);
+ * stripDueDateFields (below) removes them for the portal read. */
+function attachEffectiveDueDate<T extends DecisionDueDateFields>(
+    decision: T,
+    taskStartDateById: Map<string, Date>,
+): T & { effectiveDueDate: Date | null } {
+    return { ...decision, effectiveDueDate: computeEffectiveDueDate(decision, taskStartDateById) };
+}
+
+/** STAFF-ONLY enrichment (Codex review round 1, issue 7) — adds `isManual`
+ * (a dueDate override is set) and `linkState` ("linked"/"dangling"/"none")
+ * so the staff badge can show a "manual" marker and the edit popover can
+ * distinguish "never linked" from "was linked, task got deleted" instead of
+ * both silently rendering as nothing. NEVER applied to the portal read —
+ * that stays effectiveDueDate-only (getProjectDecisionsForPortal does not
+ * call this). */
+function attachStaffDueDateMeta<T extends DecisionDueDateFields>(
+    decision: T,
+    taskStartDateById: Map<string, Date>,
+): T & { isManual: boolean; linkState: DecisionLinkState } {
+    return {
+        ...decision,
+        isManual: !!decision.dueDate,
+        linkState: computeLinkState(decision, taskStartDateById),
+    };
+}
+
+/** Strip the raw due-date/link fields from any client-facing read — the
+ * portal only ever sees the computed `effectiveDueDate`, never whether it
+ * came from a manual override or a schedule derivation (extends
+ * stripSuggestionFields's pattern: the negative payload assertion covers all
+ * three raw field names, so the portal can never infer whether a date was
+ * manually set). */
+function stripDueDateFields<T extends { dueDate?: unknown; scheduleTaskId?: unknown; leadTimeDays?: unknown }>(
+    item: T,
+): Omit<T, "dueDate" | "scheduleTaskId" | "leadTimeDays"> {
+    const { dueDate, scheduleTaskId, leadTimeDays, ...rest } = item;
+    return rest;
+}
+
 /** Deploy-window hazard: the old build stays live while
  * apply-selections-playground.mjs's remap runs, so it can still insert new
  * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
@@ -10746,8 +10828,14 @@ export async function getProjectDecisionsForPortal(projectId: string) {
             orderBy: { createdAt: "desc" },
         }),
     ]);
+    // ONE batched schedule-task lookup for the whole page — never a
+    // per-decision query (see loadScheduleTaskStartDates).
+    const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)) })),
+        decisions: decisions.map((d) => ({
+            ...stripDueDateFields(attachEffectiveDueDate(d, taskStartDateById)),
+            candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)),
+        })),
         unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
     };
 }
@@ -10817,10 +10905,30 @@ export async function getProjectDecisions(projectId: string) {
             orderBy: { createdAt: "desc" },
         }),
     ]);
+    // ONE batched schedule-task lookup for the whole page — never a
+    // per-decision query (see loadScheduleTaskStartDates).
+    const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)) })),
+        decisions: decisions.map((d) => ({
+            ...attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById),
+            candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)),
+        })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
     };
+}
+
+/** Project schedule tasks for the per-decision edit popover's manual link
+ * select (Phase 3 — docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+ * Staff-only, ordered by startDate — the same shape the link-schedule
+ * review modal already renders selects from. */
+export async function listProjectScheduleTasksForLinking(projectId: string) {
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return prisma.scheduleTask.findMany({
+        where: { projectId },
+        orderBy: { startDate: "asc" },
+        select: { id: true, name: true, startDate: true },
+    });
 }
 
 // ── Structure — shared by client + team (see assertDecisionActorAccess) ────
@@ -10830,15 +10938,29 @@ export async function createDecision(projectId: string, data: { name: string; ar
     const name = data.name?.trim();
     if (!name) throw new Error("Name is required");
 
-    const maxOrder = await prisma.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
-    const decision = await prisma.decision.create({
-        data: {
-            projectId,
-            name: name.slice(0, 200),
-            area: data.area?.trim() || null,
-            createdByClient: !actor.isStaff,
-            sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
-        },
+    // Codex review (selection-ai-sort new-categories follow-up), issue 1:
+    // createDecisionForSuggestion (selection-ai-sort-apply-core.ts) takes the
+    // project's advisory lock before reading max sortOrder + creating, but
+    // this manual path didn't — a manual create racing an AI-sort "Create
+    // <name>" resolution (or another manual create) could read the same
+    // max-sortOrder snapshot and both write, producing colliding sortOrder.
+    // Same lock, same transaction shape as applyDecisionTemplate/
+    // createDecisionForSuggestion. Behavior is otherwise UNCHANGED — manual
+    // duplicate names are still allowed (no dedupe check added here); this
+    // only closes the ordering race window.
+    const decision = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${projectId}))`;
+
+        const maxOrder = await tx.decision.aggregate({ where: { projectId }, _max: { sortOrder: true } });
+        return tx.decision.create({
+            data: {
+                projectId,
+                name: name.slice(0, 200),
+                area: data.area?.trim() || null,
+                createdByClient: !actor.isStaff,
+                sortOrder: (maxOrder._max.sortOrder ?? -1) + 1,
+            },
+        });
     });
 
     revalidatePath(`/projects/${projectId}/selections`);
@@ -11055,6 +11177,59 @@ export async function applySuggestedDecision(itemId: string, decisionId: string)
 
 export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
     return aiSortDismissSelectionSuggestion(itemId);
+}
+
+export async function createDecisionForSuggestion(
+    projectId: string,
+    name: string,
+): Promise<{ decisionId: string; existed: boolean }> {
+    return aiSortCreateDecisionForSuggestion(projectId, name);
+}
+
+// ── Decision Templates + Schedule-Driven Due Dates (Phase 3 —
+// docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md) ──
+// Thin "use server" wrappers — the CRUD/apply/link logic lives in plain
+// (non-"use server") modules so it's importable directly by tests, the same
+// split selection-ai-sort-apply-core.ts/selection-item-thread-core.ts use.
+
+export async function createDecisionTemplate(input: DecisionTemplateInput) {
+    return createDecisionTemplateCore(input);
+}
+
+export async function updateDecisionTemplate(templateId: string, input: DecisionTemplateInput) {
+    return updateDecisionTemplateCore(templateId, input);
+}
+
+export async function archiveDecisionTemplate(templateId: string) {
+    return archiveDecisionTemplateCore(templateId);
+}
+
+export async function unarchiveDecisionTemplate(templateId: string) {
+    return unarchiveDecisionTemplateCore(templateId);
+}
+
+export async function listDecisionTemplates() {
+    return listDecisionTemplatesCore();
+}
+
+export async function listActiveDecisionTemplatesForApply() {
+    return listActiveDecisionTemplatesForApplyCore();
+}
+
+export async function applyDecisionTemplate(projectId: string, templateId: string) {
+    return applyDecisionTemplateCore(projectId, templateId);
+}
+
+export async function linkDecisionToSchedule(
+    decisionId: string,
+    scheduleTaskId: string | null,
+    leadTimeDays: number | null,
+) {
+    return linkDecisionToScheduleCore(decisionId, scheduleTaskId, leadTimeDays);
+}
+
+export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
+    return setDecisionDueDateOverrideCore(decisionId, dueDate);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
