@@ -28,6 +28,10 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import {
+    applySuggestedDecision as aiSortApplySuggestedDecision,
+    dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
+} from "./selection-ai-sort-apply-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
@@ -10381,8 +10385,11 @@ export async function submitSelectionProposal(projectId: string, data: {
     revalidatePath(`/projects/${projectId}/selections`);
 
     // Price is PM-side info until approval — never return it to the client.
+    // AI-suggestion fields are staff-only too (the portal never shows
+    // suggestions) — always null on a freshly created row, but stripped
+    // explicitly here so this return never depends on that being true.
     const { price, ...proposalWithoutPrice } = proposal;
-    return proposalWithoutPrice;
+    return stripSuggestionFields(proposalWithoutPrice);
 }
 
 export async function getSelectionProposalsForPortal(projectId: string) {
@@ -10395,8 +10402,9 @@ export async function getSelectionProposalsForPortal(projectId: string) {
     // Approved/Chosen" (docs/specs/client-selections-playground.md, "Decisions
     // locked with Justin": GTR controls whether a number appears). Stricter
     // than the old behavior here, which returned price once a proposal was
-    // Approved.
-    return proposals.map((p) => ({ ...p, price: null }));
+    // Approved. AI-suggestion fields are staff-only for the same reason
+    // (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+    return proposals.map((p) => stripSuggestionFields({ ...p, price: null }));
 }
 
 export async function getSelectionProposals(projectId: string) {
@@ -10666,6 +10674,17 @@ function stripProposalPrice<T extends { price?: unknown }>(item: T): Omit<T, "pr
     return rest;
 }
 
+/** Strip AI Auto-Sort suggestion fields from any client-facing read — no
+ * exceptions (docs/superpowers/plans/2026-07-30-selection-ai-sort.md: "the
+ * portal never shows suggestions"). Applied to every portal-facing
+ * SelectionProposal read, alongside stripProposalPrice above. */
+function stripSuggestionFields<T extends { suggestedDecisionId?: unknown; suggestedAt?: unknown }>(
+    item: T,
+): Omit<T, "suggestedDecisionId" | "suggestedAt"> {
+    const { suggestedDecisionId, suggestedAt, ...rest } = item;
+    return rest;
+}
+
 /** Deploy-window hazard: the old build stays live while
  * apply-selections-playground.mjs's remap runs, so it can still insert new
  * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
@@ -10702,8 +10721,8 @@ export async function getProjectDecisionsForPortal(projectId: string) {
         }),
     ]);
     return {
-        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripProposalPrice(normalizeProposal(c)), false)) })),
-        unsorted: unsorted.map((p) => withThreadSummary(stripProposalPrice(normalizeProposal(p)), false)),
+        decisions: decisions.map((d) => ({ ...d, candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)) })),
+        unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
     };
 }
 
@@ -10983,7 +11002,10 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
                     { status: { in: ["Chosen", "Approved"] }, decisionId },
                 ],
             },
-            data: { decisionId },
+            // An assigned (or manually re-filed) item carries no stale AI
+            // chip — clear the suggestion in the same write
+            // (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
+            data: { decisionId, suggestedDecisionId: null, suggestedAt: null },
         });
         if (claim.count === 0) {
             throw new Error("Un-choose this item before moving it to a different decision.");
@@ -10993,6 +11015,20 @@ export async function assignItemToDecision(itemId: string, decisionId: string | 
     revalidatePath(`/projects/${item.projectId}/selections`);
     revalidatePath(`/portal/projects/${item.projectId}/selections`);
     return { success: true };
+}
+
+// ── AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md) ──
+// Thin "use server" wrappers — the CAS logic lives in
+// selection-ai-sort-apply-core.ts (a plain module, no "server-only"
+// transitively) so it's importable directly by tests, the same split
+// selection-item-thread-core.ts/selection-item-note-persistence-core.ts use.
+
+export async function applySuggestedDecision(itemId: string, decisionId: string): Promise<{ applied: boolean }> {
+    return aiSortApplySuggestedDecision(itemId, decisionId);
+}
+
+export async function dismissSelectionSuggestion(itemId: string): Promise<{ success: true }> {
+    return aiSortDismissSelectionSuggestion(itemId);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
