@@ -15,7 +15,7 @@
 | "Zero txt to QuickBooks" guarantee (PDF conversion on every path) | ✅ live | `57828ba3` |
 | Intake-folder reconciler (auto-creates folders from ProBuild projects, drift email) | ✅ live (daily, end of scan) | `039d9f73` |
 | GET `/api/integrations/qbo-receipts/projects` (canonical project list, ingest-key auth) | ✅ live | `039d9f73` |
-| Automation Command Center **v2** at `/automation` (journeys, graph, sync runs, Run-sync-now; Field+Time Clock removed from nav) | ✅ live | `0479d316` |
+| Automation Command Center **v3** (validation station) at `/automation` (journeys, graph, sync runs, Run-sync-now; Field+Time Clock removed from nav) | ✅ live | `0479d316` |
 | GAS stage beacons (read/parked/dedupe/email-book → ProBuild, after terminal moves, circuit breaker) | ✅ pushed via clasp | GAS only |
 | QBO→ProBuild expense sync cron (4h, `30 */4 * * *` UTC) | ✅ on | earlier session |
 | Process doc (HTML/PDF/artifact) | ✅ current | `bf862546` |
@@ -24,9 +24,9 @@
 
 ---
 
-## 2. What is BUILT but NOT yet committed/deployed (v3 "validation station")
+## 2. v3 "validation station" — NOW DEPLOYED (commit 4c2d547b, 2026-08-01)
 
-All local in the repo working tree, build ✅, 68/68 unit tests ✅, **awaiting one Codex review that was still running when this handoff was written** (codex-reviewer agent, background; findings not yet received).
+Committed 4c2d547b, deployed to production 2026-08-01. Codex code review COMPLETE: 1 blocker (sync-now lacked server-side pause enforcement) + 9 issues + 3 nits — ALL fixed except the manager-cohort finding (defended: ADMIN+MANAGER is the app-wide privileged set). Also fixed: transactional toggle audit, original-created verify evidence, all-lines project check, paused pushes audited as fallbacks, CreateTime backfill window, backfilled-flag bug, attachment evidence rendered, stale-verify clearing, switch a11y.
 
 Backend (written by orchestrator):
 - `src/lib/automation-settings.ts` — pause switches, **fail-CLOSED** reads (pause-only invariant: effective = env master AND NOT paused; UI can never enable books-writing)
@@ -39,7 +39,7 @@ Backend (written by orchestrator):
 
 UI (executor-built, v3): `src/app/automation/` — validation panel (receipt image/PDF, Extracted vs Booked-at-booking-time vs In-ProBuild vs live-QBO columns with verdict icons), exception-first row verdicts (incl. stale >5h unsynced), "Imported history" chip for backfilled, `pipeline-controls.tsx` toggles (resume = inline confirm), sync-now disabled while paused, QBO deep link `https://qbo.intuit.com/app/expense?txnId=<id>` (best-effort) + Copy-ID fallback.
 
-**To finish v3:** receive Codex findings → fix real ones (round limit already used: this IS the review round; self-verify fixes) → `npm run build` + both test suites → commit to main → `vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd <repo>` → no GAS changes needed this round.
+**Nothing left to finish — v3 is live.** Section 7 item 2 is obsolete.
 
 ---
 

@@ -72,6 +72,7 @@ const STAGE_LABEL: Record<string, string> = {
     "email-book": "Booked via email",
     push: "Pushed to QuickBooks",
     synced: "Synced to ProBuild job costs",
+    "ai-review": "AI review",
 };
 
 function humanizeStage(stage: string): string {
@@ -97,7 +98,7 @@ function StepIcon({ status }: { status: string }) {
             </span>
         );
     }
-    if (status === "error") {
+    if (status === "error" || status === "mismatch") {
         return (
             <span className="w-5 h-5 rounded-full bg-red-100 text-red-700 flex items-center justify-center text-xs shrink-0">
                 ✗
@@ -255,6 +256,77 @@ interface VerifyFailure {
 
 type VerifyResponse = VerifySuccess | VerifyFailure;
 
+// ── AI review ────────────────────────────────────────────────────────────
+
+interface AiReviewRead {
+    vendor: string | null;
+    total: number | null;
+    tax: number | null;
+    date: string | null;
+    legible: boolean;
+    notes: string | null;
+}
+
+interface AiReviewVerdict {
+    field: "total" | "tax" | "vendor";
+    state: "agree" | "flag" | "unknown";
+    note?: string;
+}
+
+interface AiReviewModelResult {
+    model: string;
+    read: AiReviewRead;
+    verdicts: AiReviewVerdict[];
+}
+
+interface AiReviewSuccess {
+    ok: true;
+    reviewedAt: string;
+    anyFlag: boolean;
+    models: AiReviewModelResult[];
+}
+
+interface AiReviewFailure {
+    ok: false;
+    reason: string;
+}
+
+type AiReviewResponse = AiReviewSuccess | AiReviewFailure;
+
+/** Raw model read, shown in muted text under the per-field chips. */
+function aiReadLine(read: AiReviewRead): string {
+    const vendor = read.vendor ?? "—";
+    const total = read.total != null ? formatCurrency(read.total) : "—";
+    const tax = read.tax != null ? formatCurrency(read.tax) : "—";
+    const date = read.date ?? "—";
+    return `read: ${vendor} · ${total} · tax ${tax} · ${date}`;
+}
+
+function AiFieldChip({ field, verdict }: { field: AiReviewVerdict["field"]; verdict: AiReviewVerdict | undefined }) {
+    const label = field.charAt(0).toUpperCase() + field.slice(1);
+    const state = verdict?.state ?? "unknown";
+    if (state === "flag") {
+        return (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700">
+                {label} <span className="font-bold">!</span>
+                {verdict?.note ? ` ${verdict.note}` : ""}
+            </span>
+        );
+    }
+    if (state === "agree") {
+        return (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-700">
+                {label} <span className="font-bold">✓</span>
+            </span>
+        );
+    }
+    return (
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500" title={verdict?.note}>
+            {label} <span className="font-bold">?</span>
+        </span>
+    );
+}
+
 function money(cents: number | null | undefined): string {
     return cents != null ? formatCurrency(cents / 100) : "—";
 }
@@ -355,6 +427,8 @@ function ReceiptPreview({ journey }: { journey: SerializedJourney }) {
 function ValidationPanel({ journey }: { journey: SerializedJourney }) {
     const [verifying, setVerifying] = useState(false);
     const [result, setResult] = useState<VerifySuccess | null>(null);
+    const [aiReviewing, setAiReviewing] = useState(false);
+    const [aiResult, setAiResult] = useState<AiReviewSuccess | null>(null);
 
     async function handleVerify() {
         setVerifying(true);
@@ -376,6 +450,33 @@ function ValidationPanel({ journey }: { journey: SerializedJourney }) {
             toast.error("Couldn't verify: network error");
         } finally {
             setVerifying(false);
+        }
+    }
+
+    async function handleAiReview() {
+        setAiReviewing(true);
+        setAiResult(null);
+        try {
+            const res = await fetch("/api/automation/ai-review", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ docNumber: journey.docNumber }),
+            });
+            const data: AiReviewResponse | null = await res.json().catch(() => null);
+            if (res.ok && data && data.ok) {
+                setAiResult(data);
+            } else {
+                const reason = data && !data.ok ? data.reason : undefined;
+                if (reason === "no-stored-copy") {
+                    toast.error("Receipt copy not stored yet — AI review is available after the next sync.");
+                } else {
+                    toast.error(reason || `HTTP ${res.status}`);
+                }
+            }
+        } catch {
+            toast.error("Couldn't run AI review: network error");
+        } finally {
+            setAiReviewing(false);
         }
     }
 
@@ -490,24 +591,52 @@ function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                 )}
 
                 <div className="flex items-center gap-3 mt-3 flex-wrap">
-                    <button
-                        type="button"
-                        onClick={handleVerify}
-                        disabled={verifying}
-                        className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 flex items-center gap-2 disabled:opacity-50"
-                    >
-                        {verifying ? (
-                            <>
-                                <svg className="animate-spin w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                                </svg>
-                                Verifying…
-                            </>
-                        ) : (
-                            "Verify in QuickBooks"
-                        )}
-                    </button>
+                    {journey.qbPurchaseId ? (
+                        <button
+                            type="button"
+                            onClick={handleVerify}
+                            disabled={verifying}
+                            className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 flex items-center gap-2 disabled:opacity-50"
+                        >
+                            {verifying ? (
+                                <>
+                                    <svg className="animate-spin w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                    </svg>
+                                    Verifying…
+                                </>
+                            ) : (
+                                "Verify in QuickBooks"
+                            )}
+                        </button>
+                    ) : journey.finalState === "booked-email" ? (
+                        <p className="text-xs text-hui-textMuted">
+                            Booked by hand via the email path — nothing to auto-verify. Check it in QuickBooks directly.
+                        </p>
+                    ) : null}
+
+                    {journey.synced?.receiptUrl && (
+                        <button
+                            type="button"
+                            onClick={handleAiReview}
+                            disabled={aiReviewing}
+                            className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 flex items-center gap-2 disabled:opacity-50"
+                        >
+                            {aiReviewing ? (
+                                <>
+                                    <svg className="animate-spin w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                    </svg>
+                                    Reviewing…
+                                </>
+                            ) : (
+                                "AI review"
+                            )}
+                        </button>
+                    )}
+
                     {result && (
                         <span
                             className="text-xs text-hui-textMuted"
@@ -517,6 +646,32 @@ function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                         </span>
                     )}
                 </div>
+
+                {aiResult && (
+                    <div className="mt-3 space-y-2">
+                        <p className={`text-xs font-medium ${aiResult.anyFlag ? "text-red-700" : "text-teal-700"}`}>
+                            {aiResult.anyFlag
+                                ? "⚠ A model disagrees with what was booked — check the flagged fields"
+                                : `${aiResult.models.length === 1 ? "Model agrees" : "Both models agree"} with what was booked ✓`}
+                        </p>
+                        {aiResult.models.map((m) => (
+                            <div key={m.model} className="border border-hui-border rounded-lg p-2.5">
+                                <p className="text-xs font-semibold text-hui-textMain mb-1">{m.model}</p>
+                                {m.read.legible === false ? (
+                                    <p className="text-xs text-hui-textMuted italic">Model couldn't read this receipt confidently</p>
+                                ) : (
+                                    <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                                        {(["total", "tax", "vendor"] as const).map((field) => (
+                                            <AiFieldChip key={field} field={field} verdict={m.verdicts.find((v) => v.field === field)} />
+                                        ))}
+                                    </div>
+                                )}
+                                <p className="text-xs text-hui-textMuted">{aiReadLine(m.read)}</p>
+                                {m.read.notes != null && <p className="text-xs text-hui-textMuted italic mt-0.5">{m.read.notes}</p>}
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
         </div>
     );
