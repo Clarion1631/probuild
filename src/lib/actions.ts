@@ -86,6 +86,7 @@ import {
 } from "./portal-tracker";
 import {
     createScheduleTaskInTransaction,
+    SCHEDULE_TASK_STATUSES,
     setTaskLeadInTransaction,
     updateScheduleTaskInTransaction,
     type CreateScheduleTaskInput,
@@ -7868,7 +7869,8 @@ Rules:
     // Set dedupe keeps the (predecessorId, dependentId) unique constraint safe.
     const aiTasks = parsed.map((raw, i) => {
         const t = (raw ?? {}) as { name?: unknown; durationDays?: unknown; estimatedHours?: unknown; dependsOn?: unknown };
-        const name = typeof t.name === "string" ? t.name.trim().slice(0, 200) : "";
+        // Strip NUL bytes — they pass string checks but PostgreSQL rejects them.
+        const name = typeof t.name === "string" ? t.name.replace(/\u0000/g, "").trim().slice(0, 200) : "";
         if (!name) throw new Error("Invalid AI response");
         const durationDays = typeof t.durationDays === "number" && Number.isFinite(t.durationDays) && t.durationDays >= 1
             ? Math.min(Math.round(t.durationDays), 90)
@@ -12514,6 +12516,27 @@ export async function getLeadScheduleTasks(leadId: string) {
     });
 }
 
+// Runtime validation for lead task fields — the TS signature is not enforced on
+// a forged Server Action call, so every accepted value gets checked here.
+function leadTaskName(value: unknown): string {
+    const name = typeof value === "string" ? value.replace(/\u0000/g, "").trim().slice(0, 200) : "";
+    if (!name) throw new Error("Task name is required");
+    return name;
+}
+
+function leadTaskDate(value: unknown, label: string): Date {
+    const date = value instanceof Date ? value : (typeof value === "string" ? new Date(value) : null);
+    if (!date || isNaN(date.getTime())) throw new Error(`Invalid ${label}`);
+    return date;
+}
+
+function leadTaskStatus(value: unknown): string {
+    if (!(SCHEDULE_TASK_STATUSES as readonly string[]).includes(value as string)) {
+        throw new Error(`Invalid schedule task status "${value}"`);
+    }
+    return value as string;
+}
+
 export async function createLeadScheduleTask(leadId: string, data: {
     name: string;
     startDate: Date;
@@ -12521,13 +12544,12 @@ export async function createLeadScheduleTask(leadId: string, data: {
 }) {
     "use server";
     await assertLeadScheduleAccess(leadId);
+    const name = leadTaskName(data.name);
+    const startDate = leadTaskDate(data.startDate, "start date");
+    const endDate = leadTaskDate(data.endDate, "end date");
+    if (endDate < startDate) throw new Error("Task end date cannot be before its start date");
     const task = await prisma.scheduleTask.create({
-        data: {
-            leadId,
-            name: data.name,
-            startDate: data.startDate,
-            endDate: data.endDate,
-        },
+        data: { leadId, name, startDate, endDate },
     });
     revalidatePath(`/leads/${leadId}/schedule`);
     return task;
@@ -12546,10 +12568,10 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
     // stop at runtime. The leadId in the where keeps the ownership check and the
     // write atomic (no re-parent race between check and update).
     const update: { name?: string; status?: string; startDate?: Date; endDate?: Date } = {};
-    if (data.name !== undefined) update.name = data.name;
-    if (data.status !== undefined) update.status = data.status;
-    if (data.startDate !== undefined) update.startDate = data.startDate;
-    if (data.endDate !== undefined) update.endDate = data.endDate;
+    if (data.name !== undefined) update.name = leadTaskName(data.name);
+    if (data.status !== undefined) update.status = leadTaskStatus(data.status);
+    if (data.startDate !== undefined) update.startDate = leadTaskDate(data.startDate, "start date");
+    if (data.endDate !== undefined) update.endDate = leadTaskDate(data.endDate, "end date");
     let task;
     try {
         task = await prisma.scheduleTask.update({
