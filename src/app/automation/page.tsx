@@ -239,9 +239,14 @@ export default async function AutomationPage() {
                     <p className="text-sm text-hui-textMuted mt-1">
                         Receipts in, books done — the pipeline watching itself.
                     </p>
-                    <a href="/automation/guide" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
-                        How this pipeline works ↗
-                    </a>
+                    <div className="flex gap-3">
+                        <a href="/automation/guide" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
+                            How this pipeline works ↗
+                        </a>
+                        <a href="/automation/bank" className="text-xs font-medium text-hui-primary hover:underline">
+                            Bank register →
+                        </a>
+                    </div>
                 </div>
                 {isAdmin && (
                     <SyncNowButton
