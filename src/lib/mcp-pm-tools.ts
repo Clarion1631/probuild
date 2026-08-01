@@ -9,6 +9,7 @@ import type { McpActorContext } from "./mcp-actor";
 import { prisma } from "./prisma";
 import { ensureStandardFolders } from "./project-folders";
 import { appendPunchItemsInTransaction } from "./punch-items";
+import { lockTaskAssignmentParent } from "./schedule-core";
 
 type PmDb = Pick<
     Prisma.TransactionClient,
@@ -652,6 +653,11 @@ export async function addPunchItemsWithConfirmation(
             select: { id: true, name: true, projectId: true },
         });
         if (!task) throw new Error("Task not found");
+        // Lock Project → ScheduleTask in the canonical order when the task has a
+        // project (lead tasks don't): writeActivity's Project FK would otherwise
+        // take Project after the task lock, inverting against schedule mutations
+        // that lock Project first (deadlock risk).
+        if (task.projectId) await lockTaskAssignmentParent(tx, task.id, task.projectId);
         const created = await appendPunchItemsInTransaction(tx, input.taskId, items, actor.actorUserId);
         await writeActivity(tx, actor, {
             projectId: task.projectId,
