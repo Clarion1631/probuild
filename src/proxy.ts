@@ -34,7 +34,10 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // api/selections/link-schedule is the same shape (staff-only, self-
 // authorizing, must return a clean 403) for the schedule-linking AI
 // suggestion route (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+// api/chat/events is the Google Chat app's event endpoint — Google POSTs with
+// its own signed bearer token, which the route verifies (fail-closed on
+// GOOGLE_CHAT_APP_AUDIENCE). A login redirect here would break the app.
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|chat\/events|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
 
 export function isPublicProxyBypass(pathname: string) {
@@ -123,6 +126,7 @@ export const config = {
          * - api/portal (Public backend handlers for documents)
          * - api/integrations (Machine-to-machine ingest — own shared-secret auth)
          * - api/mcp (ChatGPT MCP connector — own shared-secret auth)
+         * - api/chat/events (Google Chat app events — own Google-signed JWT auth)
          * - api/health (Exact public web-process deployment/liveness probe)
          * - api/version (Deployment-id probe for the stale-tab refresh banner)
          * - api/selections/item-comments (self-authorizes staff + portal internally)
@@ -139,6 +143,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/chat/events|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

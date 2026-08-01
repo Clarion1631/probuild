@@ -289,8 +289,19 @@ export async function updateScheduleTaskInTransaction(
         updateData.name = name;
     }
     if (data.color !== undefined) updateData.color = data.color;
-    if (data.progress !== undefined) updateData.progress = data.progress;
+    if (data.progress !== undefined) {
+        if (!Number.isInteger(data.progress) || data.progress < 0 || data.progress > 100) {
+            throw new Error("Progress must be an integer between 0 and 100");
+        }
+        updateData.progress = data.progress;
+    }
     if (data.status !== undefined) updateData.status = data.status;
+    if (data.progress !== undefined || data.status !== undefined) {
+        // Provenance for the field-progress cron: a human write is durable and the
+        // AI must never overwrite it, so any TEAM-actor change stamps "human".
+        // SYSTEM actors (MCP connector, field-progress cron) stamp "ai".
+        updateData.progressSource = actor.type === "SYSTEM" ? "ai" : "human";
+    }
     if (data.assignee !== undefined) updateData.assignee = data.assignee;
     if (data.order !== undefined) updateData.order = data.order;
     if (data.estimatedHours !== undefined) {

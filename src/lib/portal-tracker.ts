@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { prisma } from "@/lib/prisma";
+import { toCompanyDayKey } from "@/lib/company-day";
 import {
     CLIENT_STAGES,
     CLIENT_STAGE_LABELS,
@@ -100,9 +101,17 @@ export type PortalNextTask = {
     startDate: string;
 };
 
+export type PortalClientNextSteps = {
+    text: string;
+    /** Company-local day key ("YYYY-MM-DD") of the AI write, for the freshness label. */
+    updatedDayKey: string;
+};
+
 export type PortalProjectTrackerPayload = ProjectTracker & {
     projectColor: string;
     whatsNext: PortalNextTask[];
+    /** AI-written, customer-safe narrative from recent field reports; null when absent or stale. */
+    clientNextSteps: PortalClientNextSteps | null;
     whoIsComing: PortalDayVisitors[];
 };
 
@@ -624,11 +633,24 @@ export async function getPortalProjectTrackerCore(
     const [project, tasks] = await Promise.all([
         prisma.project.findUnique({
             where: { id: projectId },
-            select: { color: true, portalStageOverride: true },
+            select: { color: true, portalStageOverride: true, clientNextSteps: true, clientNextStepsAt: true },
         }),
         getPortalScheduleTasksCore(projectId),
     ]);
     if (!project) throw new Error("Project not found");
+
+    // A week-old "what's next" narrative is worse than none — the schedule list
+    // below stays accurate on its own, so stale blurbs drop out rather than lie.
+    const NEXT_STEPS_MAX_AGE_MS = 7 * 24 * 3600_000;
+    const clientNextSteps = project.clientNextSteps && project.clientNextStepsAt
+        && now.getTime() - project.clientNextStepsAt.getTime() <= NEXT_STEPS_MAX_AGE_MS
+        ? {
+            text: project.clientNextSteps,
+            // Company-local day, not the UTC prefix: a 7pm PDT write must not
+            // read as tomorrow.
+            updatedDayKey: toCompanyDayKey(project.clientNextStepsAt) ?? dateKey(project.clientNextStepsAt),
+        }
+        : null;
 
     const tracker = buildProjectTracker(tasks, project.portalStageOverride);
     const whatsNext = chronologicalTasks(tasks)
@@ -647,6 +669,7 @@ export async function getPortalProjectTrackerCore(
         projectColor: sanitizeProjectColor(project.color),
         ...tracker,
         whatsNext,
+        clientNextSteps,
         whoIsComing: buildPortalWhoIsComing(tasks, now),
     };
 }

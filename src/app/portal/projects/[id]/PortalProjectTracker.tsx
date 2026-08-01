@@ -329,6 +329,15 @@ export default function PortalProjectTracker({
                         </Link>
                     </div>
 
+                    {data.clientNextSteps && (
+                        <div className="border-b border-slate-100 bg-slate-50/60 px-4 py-4 sm:px-5">
+                            <p className="text-sm leading-6 text-slate-700">{data.clientNextSteps.text}</p>
+                            <p className="mt-1.5 text-[0.65rem] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                                From the field · {formatTaskDate(data.clientNextSteps.updatedDayKey)}
+                            </p>
+                        </div>
+                    )}
+
                     {data.whatsNext.length > 0 ? (
                         <ol className="divide-y divide-slate-100">
                             {data.whatsNext.map((task, index) => (

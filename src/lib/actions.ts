@@ -7320,7 +7320,9 @@ export async function updateTaskStatusAsSub(taskId: string, subcontractorId: str
     if (!assignment) throw new Error("Not assigned to this task");
     const task = await prisma.scheduleTask.update({
         where: { id: taskId },
-        data: { status },
+        // A sub marking their own task is field truth — stamp it human so the
+        // field-progress cron treats it as durable (see schedule-task-core).
+        data: { status, progressSource: "human" },
     });
     revalidatePath(`/projects`);
     return task;
