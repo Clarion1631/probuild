@@ -5,6 +5,7 @@ import { PrismaClient } from "@prisma/client";
 // not resolvable outside a Next.js build context (see
 // e2e/selections-templates-due-dates.spec.ts's identical comment).
 import { setDecisionOrderInfo } from "../src/lib/decision-order-actions-core";
+import { signClientPortalToken } from "../src/lib/client-portal-auth";
 
 const prisma = new PrismaClient();
 const run = `selection-order-tracking-${process.pid}-${Date.now()}`;
@@ -342,5 +343,70 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
 
         await page.goto(`/projects/${ids.project}/selections`);
         await expect(page.getByTestId(`approved-item-${candidate.id}`)).toBeVisible();
+    });
+
+    // ── Case 4: portal shows the derived status, never the raw fields or
+    //    risk; a portal actor cannot call setDecisionOrderInfo ─────────────
+
+    test("portal: shows 'Ordered · arriving ~<date>' then 'Received'; the payload never carries the raw order fields or risk", async ({ browser }) => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await makeDecision("case4-portal", "Decided");
+        await setDecisionOrderInfo(
+            decision.id,
+            { kind: "ordered", orderedAt: new Date("2026-08-01T00:00:00.000Z"), orderedBy: "TEAM", expectedArrivalAt: new Date("2026-08-12T00:00:00.000Z") },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+
+        const context = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+        const page = await context.newPage();
+        const token = await signClientPortalToken(ids.client, clientEmail);
+        await page.goto(
+            `/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/projects/${ids.project}/selections`)}`,
+        );
+
+        // "case4-portal" also appears as an <option> in the client's "Move
+        // to" decision picker on other cards, so a bare getByText would hit
+        // Playwright's strict-mode ambiguity — scope to the heading role.
+        await expect(page.getByRole("heading", { name: "case4-portal" })).toBeVisible();
+        // Scoped to THIS decision's card via its exact heading (a plain
+        // hasText match also hits the "case4-portal" <option> inside other
+        // cards' "Move to" pickers) — other decisions on this shared
+        // project fixture also render order-status lines, so an unscoped
+        // locator would be order-dependent and flaky.
+        const card = page.locator(".hui-card").filter({ has: page.getByRole("heading", { name: "case4-portal", exact: true }) });
+        const orderStatus = card.getByTestId("portal-order-status");
+        await expect(orderStatus).toBeVisible();
+        await expect(orderStatus).toContainText("Ordered");
+        await expect(orderStatus).toContainText("Aug 12");
+
+        const portalMarkup = await page.content();
+        expect(portalMarkup).not.toContain('"orderedAt"');
+        expect(portalMarkup).not.toContain('"orderedBy"');
+        expect(portalMarkup).not.toContain('"expectedArrivalAt"');
+        expect(portalMarkup).not.toContain('"risk"');
+        expect(portalMarkup).toContain("orderStatusForPortal");
+
+        // Mark received server-side, reload — the portal line updates too.
+        await setDecisionOrderInfo(decision.id, { kind: "received" }, { getActor: async () => admin, revalidate: NOOP_REVALIDATE });
+        await page.reload();
+        await expect(card.getByTestId("portal-order-status")).toContainText("Received");
+
+        await context.close();
+    });
+
+    test("a portal client cannot call setDecisionOrderInfo (direct authorization test, zero writes)", async () => {
+        const decision = await makeDecision("case4-denied", "Decided");
+
+        await expect(
+            setDecisionOrderInfo(
+                decision.id,
+                { kind: "ordered", orderedAt: new Date(), orderedBy: "TEAM", expectedArrivalAt: null },
+                { getActor: async () => null, revalidate: NOOP_REVALIDATE },
+            ),
+        ).rejects.toThrow("Forbidden");
+
+        const unchanged = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(unchanged.status).toBe("Decided");
+        expect(unchanged.orderedAt).toBeNull();
     });
 });
