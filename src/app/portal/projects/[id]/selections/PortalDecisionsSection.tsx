@@ -78,6 +78,11 @@ interface DecisionData {
     // never receives the raw dueDate/scheduleTaskId/leadTimeDays fields
     // (stripped server-side, see stripDueDateFields in actions.ts).
     effectiveDueDate: string | null;
+    // Order tracking (Phase 4) — ONLY this derived shape; the portal never
+    // receives orderedAt/orderedBy/expectedArrivalAt/risk (stripped
+    // server-side, see stripOrderFields/attachOrderStatusForPortal in
+    // actions.ts). Null unless the decision is Ordered or Received.
+    orderStatusForPortal: { status: string; expectedArrivalAt: string | null } | null;
 }
 
 // Read-only "Decide by" line — undecided decisions only (Open/Flagged);
@@ -93,6 +98,30 @@ function DecideByLine({ status, effectiveDueDate }: { status: string; effectiveD
             {urgency && (
                 <span className={`ml-1.5 px-1.5 py-0.5 rounded-full font-medium ${urgency.className}`}>{urgency.label}</span>
             )}
+        </p>
+    );
+}
+
+// Read-only "Ordered · arriving ~<date>" / "Received" line (Phase 4) —
+// derived from orderStatusForPortal ONLY. No who ordered, no risk, no raw
+// order date — the portal never receives those.
+function OrderStatusForPortalLine({
+    orderStatusForPortal,
+}: {
+    orderStatusForPortal: { status: string; expectedArrivalAt: string | null } | null;
+}) {
+    if (!orderStatusForPortal) return null;
+    if (orderStatusForPortal.status === "Received") {
+        return (
+            <p data-testid="portal-order-status" className="text-xs mt-1 text-hui-textMuted">
+                Received
+            </p>
+        );
+    }
+    const etaLabel = orderStatusForPortal.expectedArrivalAt ? formatDueDateShort(new Date(orderStatusForPortal.expectedArrivalAt)) : null;
+    return (
+        <p data-testid="portal-order-status" className="text-xs mt-1 text-hui-textMuted">
+            Ordered{etaLabel ? ` · arriving ~${etaLabel}` : ""}
         </p>
     );
 }
@@ -605,6 +634,7 @@ function DecisionCard({
                         </div>
                     )}
                     <DecideByLine status={decision.status} effectiveDueDate={decision.effectiveDueDate} />
+                    <OrderStatusForPortalLine orderStatusForPortal={decision.orderStatusForPortal} />
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                     <button

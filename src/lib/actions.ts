@@ -50,6 +50,11 @@ import {
     setDecisionDueDateOverride as setDecisionDueDateOverrideCore,
 } from "./decision-link-actions-core";
 import { computeEffectiveDueDate, computeLinkState, type DecisionLinkState } from "./decision-due-date";
+import {
+    setDecisionOrderInfo as setDecisionOrderInfoCore,
+    type DecisionOrderInput,
+} from "./decision-order-actions-core";
+import { assessDeliveryRisk, type DeliveryRisk } from "./selection-order-risk";
 import type { TemplateItemInput } from "./decision-template-core";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { headers } from "next/headers";
@@ -10882,6 +10887,65 @@ function stripDueDateFields<T extends { dueDate?: unknown; scheduleTaskId?: unkn
     return rest;
 }
 
+// ── Order tracking + delivery risk (Phase 4 —
+// docs/superpowers/plans/2026-07-31-selection-order-tracking.md) ──────────
+
+/** STAFF-ONLY enrichment — computed delivery risk, reusing the SAME batched
+ * schedule-task lookup as the due-date derivation above (no new N+1). Only
+ * passes `linkedTaskStartAt` when the schedule link is genuinely live
+ * (linkState === "linked") — a dangling/absent link falls back to
+ * effectiveDueDate inside assessDeliveryRisk itself, per the plan's spec. */
+function attachOrderRisk<T extends {
+    status: string;
+    expectedArrivalAt: Date | null;
+    scheduleTaskId: string | null;
+    effectiveDueDate: Date | null;
+    linkState: DecisionLinkState;
+}>(decision: T, taskStartDateById: Map<string, Date>): T & { risk: DeliveryRisk } {
+    const linkedTaskStartAt =
+        decision.linkState === "linked" && decision.scheduleTaskId
+            ? taskStartDateById.get(decision.scheduleTaskId) ?? null
+            : null;
+    return {
+        ...decision,
+        risk: assessDeliveryRisk({
+            status: decision.status,
+            expectedArrivalAt: decision.expectedArrivalAt,
+            linkedTaskStartAt,
+            effectiveDueDate: decision.effectiveDueDate,
+        }),
+    };
+}
+
+/** Portal-only derived status — {status, expectedArrivalAt} ONLY when the
+ * decision is Ordered/Received; null otherwise (nothing to show). This is
+ * the ONLY order-tracking shape the portal ever receives — no risk, no
+ * orderedBy, no raw orderedAt/expectedArrivalAt (those are removed by
+ * stripOrderFields below, applied AFTER this attach so the derivation still
+ * has the raw expectedArrivalAt to read). */
+type OrderStatusForPortal = { status: string; expectedArrivalAt: Date | null } | null;
+
+function attachOrderStatusForPortal<T extends { status: string; expectedArrivalAt: Date | null }>(
+    decision: T,
+): T & { orderStatusForPortal: OrderStatusForPortal } {
+    const orderStatusForPortal: OrderStatusForPortal =
+        decision.status === "Ordered" || decision.status === "Received"
+            ? { status: decision.status, expectedArrivalAt: decision.expectedArrivalAt }
+            : null;
+    return { ...decision, orderStatusForPortal };
+}
+
+/** Strip the raw order-tracking fields from any client-facing read — the
+ * portal only ever sees the derived orderStatusForPortal, never who ordered
+ * it or the raw timestamps directly (extends stripDueDateFields's pattern —
+ * the negative payload assertion covers all three raw field names). */
+function stripOrderFields<T extends { orderedAt?: unknown; orderedBy?: unknown; expectedArrivalAt?: unknown }>(
+    item: T,
+): Omit<T, "orderedAt" | "orderedBy" | "expectedArrivalAt"> {
+    const { orderedAt, orderedBy, expectedArrivalAt, ...rest } = item;
+    return rest;
+}
+
 /** Deploy-window hazard: the old build stays live while
  * apply-selections-playground.mjs's remap runs, so it can still insert new
  * 'Pending'/'Approved'/'Declined' SelectionProposal rows after the remap
@@ -10922,7 +10986,7 @@ export async function getProjectDecisionsForPortal(projectId: string) {
     const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
         decisions: decisions.map((d) => ({
-            ...stripDueDateFields(attachEffectiveDueDate(d, taskStartDateById)),
+            ...stripOrderFields(stripDueDateFields(attachOrderStatusForPortal(attachEffectiveDueDate(d, taskStartDateById)))),
             candidates: d.candidates.map((c) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(c))), false)),
         })),
         unsorted: unsorted.map((p) => withThreadSummary(stripSuggestionFields(stripProposalPrice(normalizeProposal(p))), false)),
@@ -10999,7 +11063,7 @@ export async function getProjectDecisions(projectId: string) {
     const taskStartDateById = await loadScheduleTaskStartDates(projectId, decisions);
     return {
         decisions: decisions.map((d) => ({
-            ...attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById),
+            ...attachOrderRisk(attachStaffDueDateMeta(attachEffectiveDueDate(d, taskStartDateById), taskStartDateById), taskStartDateById),
             candidates: d.candidates.map((c) => withThreadSummary(normalizeProposal(c), true)),
         })),
         unsorted: unsorted.map((c) => withThreadSummary(normalizeProposal(c), true)),
@@ -11165,12 +11229,6 @@ export async function deleteDecision(decisionId: string) {
     if (!decision || decision.deletedAt) return { success: false };
     await assertDecisionActorAccess(decision.projectId);
 
-    // Ordered/Received are terminal — that's the company's purchasing
-    // record (Phase 3), not something either side deletes.
-    if (decision.status === "Ordered" || decision.status === "Received") {
-        throw new Error("This decision has already been ordered — it can't be deleted.");
-    }
-
     // Soft delete only. "They can approve and unapprove themselves, delete
     // stuff, it's their playground" (Justin, explicit) — clients can delete
     // ANY decision on their own project, no createdByClient or status
@@ -11186,16 +11244,40 @@ export async function deleteDecision(decisionId: string) {
     // deleted decision has no live approved record, and this keeps the
     // chooseItem/unchooseItem invariant (Decided+chosenItemId only ever
     // points at an item actually marked Chosen) true even while deleted.
-    await prisma.$transaction(async (tx) => {
+    //
+    // Ordered/Received are terminal — that's the company's purchasing
+    // record (Phase 4), not something either side deletes. Codex review
+    // round 1 BLOCKER: the guard used to be a plain read-then-check BEFORE
+    // this transaction, so a concurrent setDecisionOrderInfo("ordered")
+    // landing between the read above and this write would sail through
+    // undetected — the decision gets soft-deleted AND its status silently
+    // reset to Open, stranding orderedAt/orderedBy/expectedArrivalAt on a
+    // now-"Open" row with no CAS ever having rejected the delete. The guard
+    // now lives INSIDE the transaction as a CAS (status NOT IN
+    // [Ordered,Received], re-evaluated atomically at write time) — a
+    // concurrent order landing first makes this updateMany match zero rows,
+    // which is treated as "can't delete an ordered decision", same as if
+    // the pre-transaction read had already seen it. The reset also nulls
+    // the three order fields explicitly as defense-in-depth, even though
+    // the CAS should make it structurally impossible for a deleted row to
+    // carry them.
+    const deleted = await prisma.$transaction(async (tx) => {
+        const claim = await tx.decision.updateMany({
+            where: { id: decisionId, deletedAt: null, status: { notIn: ["Ordered", "Received"] } },
+            data: { deletedAt: new Date(), chosenItemId: null, status: "Open", decidedAt: null, orderedAt: null, orderedBy: null, expectedArrivalAt: null },
+        });
+        if (claim.count === 0) return false;
+
         await tx.selectionProposal.updateMany({
             where: { decisionId, status: "Chosen" },
             data: { status: "Idea" },
         });
-        await tx.decision.update({
-            where: { id: decisionId },
-            data: { deletedAt: new Date(), chosenItemId: null, status: "Open", decidedAt: null },
-        });
+        return true;
     });
+
+    if (!deleted) {
+        throw new Error("This decision has already been ordered — it can't be deleted.");
+    }
 
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
@@ -11319,6 +11401,10 @@ export async function linkDecisionToSchedule(
 
 export async function setDecisionDueDateOverride(decisionId: string, dueDate: Date | null) {
     return setDecisionDueDateOverrideCore(decisionId, dueDate);
+}
+
+export async function setDecisionOrderInfo(decisionId: string, input: DecisionOrderInput) {
+    return setDecisionOrderInfoCore(decisionId, input);
 }
 
 // ── Client-only: choose / un-choose / archive ───────────────────────────────
@@ -11698,7 +11784,11 @@ export async function restoreDecision(decisionId: string) {
         return { success: true }; // already live — idempotent no-op
     }
 
-    await prisma.decision.update({ where: { id: decisionId }, data: { deletedAt: null } });
+    // Defense-in-depth (Codex review round 1, BLOCKER follow-up): deleteDecision's
+    // CAS fix means a soft-deleted row can never carry order fields today,
+    // but null them explicitly here too so a restore is provably clean
+    // regardless of how the row got deleted.
+    await prisma.decision.update({ where: { id: decisionId }, data: { deletedAt: null, orderedAt: null, orderedBy: null, expectedArrivalAt: null } });
 
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
