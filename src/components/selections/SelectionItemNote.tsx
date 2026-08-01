@@ -155,10 +155,11 @@ export function SelectionItemNote({
                     <button
                         type="button"
                         data-testid="selection-note-edit"
+                        aria-label="Edit note"
                         className="inline-flex items-center min-h-[32px] py-1 text-xs font-medium text-blue-600 hover:underline"
                         onClick={startEditing}
                     >
-                        Edit note
+                        Edit
                     </button>
                 </div>
             </div>
