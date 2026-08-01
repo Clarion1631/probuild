@@ -2141,6 +2141,32 @@ model Integration {
   updatedAt DateTime @updatedAt
 }
 
+// One row per automation happening: a receipt pushed to QuickBooks by the
+// bot (kind "receipt-push") or a QBO→ProBuild sync run (kind "qbo-sync").
+// Powers the Automation Command Center's activity feed, intake graph, and
+// audit history. Append-only; writes are fire-and-forget so a logging
+// failure can never fail the automation it describes.
+model AutomationEvent {
+  id          String   @id @default(cuid())
+  kind        String   // "receipt-push" | "qbo-sync" | "receipt-stage"
+  stage       String?  // receipt-stage beacons: "intake" | "read" | "dedupe" | "email-book" (push events imply stage "push")
+  status      String   // push: "created" | "already-exists" | "fallback" | "error" · sync: "ok" | "error" · stage: "ok" | "parked" | "quarantined" | "emailed"
+  reason      String?  // fallback/decline/park reason or error name
+  source      String?  // sync: "cron" | "manual" | "backfill" · push/stage: "apps-script"
+  vendor      String?
+  projectName String?
+  docNumber   String?
+  fileName    String?
+  amountCents Int?
+  taxCents    Int?
+  detail      String?  // JSON extras (sync counts, decline context)
+  createdAt   DateTime @default(now())
+
+  @@index([kind, createdAt])
+  @@index([createdAt])
+  @@index([docNumber, createdAt])
+}
+
 model StripeEvent {
   id          String    @id
   type        String

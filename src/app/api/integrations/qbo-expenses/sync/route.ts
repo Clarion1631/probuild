@@ -5,6 +5,7 @@ import {
     type QboExpenseSyncResult,
 } from "@/lib/qbo-expense-sync";
 import type { QBTokens } from "@/lib/quickbooks";
+import { logAutomationEvent } from "@/lib/automation-events";
 
 export const dynamic = "force-dynamic";
 // 300s: the first historical backfill reads every QBO Purchase page since the
@@ -25,6 +26,7 @@ export interface QboExpenseSyncHandlerDependencies {
         runtime: { tokens: QBTokens },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
+    logEvent?: (event: import("@/lib/automation-events").AutomationEventInput) => void | Promise<void>;
     incrementalLookbackDays: number;
 }
 
@@ -56,10 +58,35 @@ function incrementalSince(now: Date, lookbackDays: number): Date {
 export function createQboExpenseSyncHandlers(
     dependencies: QboExpenseSyncHandlerDependencies,
 ) {
-    async function run(mode: SyncMode, since: Date, until?: Date) {
+    async function run(mode: SyncMode, since: Date, until?: Date, source: string = "manual") {
+        const rawLog = dependencies.logEvent ?? logAutomationEvent;
+        // An injected logger that REJECTS must never divert the money path into
+        // its error branch — isolate it here, whatever the dependency does.
+        const logEvent = async (event: Parameters<typeof logAutomationEvent>[0]) => {
+            try { await rawLog(event); } catch (error) {
+                console.error("sync audit log failed", error instanceof Error ? error.name : "UnknownError");
+            }
+        };
         try {
             const tokens = await dependencies.getFreshTokens();
             const result = await dependencies.syncExpenses({ since, until, mode }, { tokens });
+            await logEvent({
+                kind: "qbo-sync",
+                status: "ok",
+                source,
+                detail: {
+                    mode,
+                    since: since.toISOString().slice(0, 10),
+                    ...(until ? { until: until.toISOString().slice(0, 10) } : {}),
+                    imported: result.imported,
+                    updated: result.updated,
+                    deactivated: result.removed,
+                    // Bounded summary: the full skipped array (id+reason each) can
+                    // blow past the detail budget and corrupt nothing but itself.
+                    skipped: result.skipped.length,
+                    skippedSample: result.skipped.slice(0, 10),
+                },
+            });
             return NextResponse.json({
                 ok: true,
                 mode,
@@ -69,6 +96,7 @@ export function createQboExpenseSyncHandlers(
             });
         } catch (error) {
             if (error instanceof QBNotConnectedError) {
+                await logEvent({ kind: "qbo-sync", status: "error", reason: "quickbooks-not-connected", source });
                 return NextResponse.json(
                     { ok: false, reason: "quickbooks-not-connected" },
                     { status: 503 },
@@ -78,6 +106,7 @@ export function createQboExpenseSyncHandlers(
                 "QBO expense sync failed",
                 error instanceof Error ? error.name : "UnknownError",
             );
+            await logEvent({ kind: "qbo-sync", status: "error", reason: error instanceof Error ? error.name : "UnknownError", source });
             return NextResponse.json(
                 { ok: false, reason: "sync-failed" },
                 { status: 500 },
@@ -133,7 +162,7 @@ export function createQboExpenseSyncHandlers(
                     }
                     until = parsedUntil;
                 }
-                return run("backfill", since, until);
+                return run("backfill", since, until, "backfill");
             }
             return NextResponse.json(
                 { ok: false, reason: "invalid-mode" },
@@ -162,7 +191,7 @@ export function createQboExpenseSyncHandlers(
                 dependencies.now(),
                 dependencies.incrementalLookbackDays,
             );
-            return run("incremental", since);
+            return run("incremental", since, undefined, "cron");
         },
     };
 }
