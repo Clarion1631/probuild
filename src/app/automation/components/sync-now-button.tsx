@@ -13,7 +13,7 @@ interface SyncResponse {
     deactivated?: number;
 }
 
-export default function SyncNowButton() {
+export default function SyncNowButton({ disabled, disabledTitle }: { disabled?: boolean; disabledTitle?: string }) {
     const [isRunning, setIsRunning] = useState(false);
     const router = useRouter();
 
@@ -44,7 +44,8 @@ export default function SyncNowButton() {
     return (
         <button
             onClick={handleClick}
-            disabled={isRunning}
+            disabled={isRunning || disabled}
+            title={disabled ? disabledTitle : undefined}
             className="hui-btn hui-btn-green disabled:opacity-50 flex items-center gap-2"
         >
             {isRunning ? (

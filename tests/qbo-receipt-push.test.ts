@@ -461,6 +461,8 @@ function createRouteHandlers(overrides: Partial<QboReceiptCreateHandlerDependenc
             (async () => ({ ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true })),
         // Stub the audit logger: unit tests must never touch the real Prisma client.
         logEvent: overrides.logEvent ?? (() => {}),
+        // Same for the pause switch — the real read fails CLOSED (paused) with no DB.
+        isPushPaused: overrides.isPushPaused ?? (async () => false),
     });
 }
 

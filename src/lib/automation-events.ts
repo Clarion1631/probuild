@@ -14,7 +14,7 @@ import { prisma } from "@/lib/prisma";
  */
 
 export interface AutomationEventInput {
-    kind: "receipt-push" | "qbo-sync" | "receipt-stage";
+    kind: "receipt-push" | "qbo-sync" | "receipt-stage" | "setting";
     stage?: string;
     status: string;
     reason?: string;
@@ -212,6 +212,22 @@ export interface ReceiptJourney {
     /** Set once the 4h sync landed it in ProBuild job costs. */
     syncedExpenseId: string | null;
     syncedProjectName: string | null;
+    /** True when this journey was reconstructed from QBO history rather than observed live. */
+    backfilled: boolean;
+    /** Full Drive fileId (from event detail) — powers the "Open in Drive" link. */
+    driveFileId: string | null;
+    /** QBO purchase id (from the push event detail) — powers the QBO deep link. */
+    qbPurchaseId: string | null;
+    /** Validation panel: what actually landed in ProBuild after the sync. */
+    synced: {
+        expenseId: string;
+        projectId: string | null;
+        projectName: string | null;
+        amountCents: number | null;
+        vendor: string | null;
+        receiptUrl: string | null;
+        syncedAt: Date;
+    } | null;
 }
 
 function journeyFinalState(steps: JourneyStep[]): { state: ReceiptJourney["finalState"]; reason: string | null } {
@@ -273,15 +289,27 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 firstSeen: e.createdAt, lastSeen: e.createdAt,
                 steps: [], finalState: "in-flight", finalReason: null,
                 syncedExpenseId: null, syncedProjectName: null,
+                driveFileId: null, qbPurchaseId: null, synced: null, backfilled: false,
             };
             byDoc.set(doc, j);
         }
         j.lastSeen = e.createdAt;
+        if (e.source === "backfill") j.backfilled = true;
         j.fileName = e.fileName ?? j.fileName;
         j.vendor = e.vendor ?? j.vendor;
         j.projectName = e.projectName ?? j.projectName;
         j.amountCents = e.amountCents ?? j.amountCents;
         j.taxCents = e.taxCents ?? j.taxCents;
+        // Full ids ride in detail JSON (docNumber is only a 21-char prefix).
+        if (e.detail) {
+            try {
+                const d = JSON.parse(e.detail) as { fileId?: unknown; qbPurchaseId?: unknown };
+                if (typeof d.fileId === "string" && d.fileId) j.driveFileId = d.fileId;
+                if (typeof d.qbPurchaseId === "string" && d.qbPurchaseId) j.qbPurchaseId = d.qbPurchaseId;
+            } catch {
+                // malformed detail is display-only data — ignore
+            }
+        }
         j.steps.push({
             at: e.createdAt,
             stage: e.stage ?? (e.kind === "receipt-push" ? "push" : "unknown"),
@@ -310,10 +338,13 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
             select: {
                 id: true,
                 description: true,
+                amount: true,
+                vendor: true,
+                receiptUrl: true,
                 qbSyncedAt: true,
                 createdAt: true,
                 // Expense hangs off the ESTIMATE, not the project directly.
-                estimate: { select: { project: { select: { name: true } } } },
+                estimate: { select: { project: { select: { id: true, name: true } } } },
             },
             take: 2000,
         });
@@ -322,11 +353,23 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
             if (!m) continue;
             const j = byDoc.get(m[1].slice(0, 21));
             if (j) {
+                const syncedAt = exp.qbSyncedAt ?? exp.createdAt;
                 j.syncedExpenseId = exp.id;
                 j.syncedProjectName = exp.estimate?.project?.name ?? null;
+                j.driveFileId = j.driveFileId ?? m[1];
+                j.synced = {
+                    expenseId: exp.id,
+                    projectId: exp.estimate?.project?.id ?? null,
+                    projectName: exp.estimate?.project?.name ?? null,
+                    // Prisma Decimal → cents; guard the conversion, this is display data.
+                    amountCents: exp.amount != null ? Math.round(Number(exp.amount) * 100) : null,
+                    vendor: exp.vendor ?? null,
+                    receiptUrl: exp.receiptUrl ?? null,
+                    syncedAt,
+                };
                 // The expense records when the sync actually landed it — never
                 // fabricate the step time from unrelated event timestamps.
-                j.steps.push({ at: exp.qbSyncedAt ?? exp.createdAt, stage: "synced", status: "ok", reason: null, detail: null });
+                j.steps.push({ at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null });
             }
         }
     }

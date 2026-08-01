@@ -50,6 +50,15 @@ const statements = [
   // role (which bypasses RLS); enabling RLS closes the anon-access gap the
   // same way apply-task-evidence-schema.mjs did for TaskPunchItem.
   `ALTER TABLE "AutomationEvent" ENABLE ROW LEVEL SECURITY`,
+  // Command Center pause switches (pause-only by design; env vars stay the
+  // opt-in masters for anything that writes the books).
+  `CREATE TABLE IF NOT EXISTS "AutomationSetting" (
+     "key"       TEXT NOT NULL,
+     "value"     TEXT NOT NULL,
+     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     CONSTRAINT "AutomationSetting_pkey" PRIMARY KEY ("key")
+   )`,
+  `ALTER TABLE "AutomationSetting" ENABLE ROW LEVEL SECURITY`,
 ];
 
 for (const sql of statements) {

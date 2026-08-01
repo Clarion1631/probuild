@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { logAutomationEvent, type AutomationEventInput } from "@/lib/automation-events";
+import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 import {
     createQBReceiptPurchase,
     QboAccountConfigError,
@@ -95,6 +96,8 @@ export interface QboReceiptCreateHandlerDependencies {
     createPurchase(tokens: QBTokens, input: CreateQBReceiptPurchaseInput): Promise<CreateQBReceiptPurchaseResult>;
     /** Fire-and-forget audit row for the Automation Command Center. Optional so tests need not stub it. */
     logEvent?: (event: AutomationEventInput) => void | Promise<void>;
+    /** Command Center pause switch (pause-only; env stays the opt-in master). Optional for tests. */
+    isPushPaused?: () => Promise<boolean>;
 }
 
 /** Command-center audit: one event per authenticated push attempt. */
@@ -163,6 +166,19 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
             };
             const input = buildInput(body, groups);
 
+            // Command Center pause: terminal ok:false so the bot books via the
+            // email path while paused — receipts keep flowing, just not
+            // hands-free. Checked AFTER validation so the paused attempt is
+            // AUDITED as a fallback (otherwise paused traffic would vanish
+            // from the intake graph and inflate the hands-free rate).
+            const isPushPausedFn = dependencies.isPushPaused ?? (() => isPaused(PAUSE_KEYS.receiptPush));
+            if (await isPushPausedFn()) {
+                const event = pushEventFromOutcome(input, { status: "fallback", reason: "push-paused" });
+                event.detail = { fileId: input.fileId };
+                await logEvent(event);
+                return NextResponse.json({ ok: false, reason: "push-paused" });
+            }
+
             let tokens: QBTokens;
             try {
                 tokens = await dependencies.getFreshTokens();
@@ -184,9 +200,20 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 // Apps Script treats ok:false as terminal, same convention as
                 // sendToProBuild.txt.
                 const result = await dependencies.createPurchase(tokens, input);
-                await logEvent(pushEventFromOutcome(input, result.ok
+                const event = pushEventFromOutcome(input, result.ok
                     ? { status: result.alreadyExists ? "already-exists" : "created" }
-                    : { status: "fallback", reason: result.reason }));
+                    : { status: "fallback", reason: result.reason });
+                // Full ids for the Command Center's validation panel: the Drive
+                // file link needs the WHOLE fileId (docNumber is a 21-char
+                // prefix) and the QBO deep link needs the purchase id.
+                event.detail = {
+                    fileId: input.fileId,
+                    ...(result.ok ? { qbPurchaseId: result.qbPurchaseId } : {}),
+                    // Attachment evidence AT BOOKING TIME (fresh creates only —
+                    // already-exists responses don't re-report it).
+                    ...(result.ok && !result.alreadyExists ? { attachment: result.attachment } : {}),
+                };
+                await logEvent(event);
                 return NextResponse.json(result);
             } catch (error) {
                 if (error instanceof QboAccountConfigError) {

@@ -2149,6 +2149,16 @@ model Integration {
   updatedAt DateTime @updatedAt
 }
 
+// Command Center pause switches. SAFETY INVARIANT: these can only PAUSE a
+// pipeline — effective-enabled is (env master switch) AND NOT (paused here),
+// so the UI can never turn books-writing ON. Keys: "receiptPushPaused",
+// "qboSyncPaused"; value "true" means paused.
+model AutomationSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
 // One row per automation happening: a receipt pushed to QuickBooks by the
 // bot (kind "receipt-push") or a QBO→ProBuild sync run (kind "qbo-sync").
 // Powers the Automation Command Center's activity feed, intake graph, and

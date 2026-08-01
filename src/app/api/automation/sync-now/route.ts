@@ -3,6 +3,7 @@ import { getCurrentUserWithPermissions, isAdminOrManager } from "@/lib/permissio
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { syncQboExpenses } from "@/lib/qbo-expense-sync";
 import { logAutomationEvent } from "@/lib/automation-events";
+import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -28,6 +29,11 @@ export async function POST() {
     }
     if (!isAdminOrManager(user)) {
         return NextResponse.json({ ok: false, reason: "forbidden" }, { status: 403 });
+    }
+    // Server-side pause enforcement — UI disablement is not an authority
+    // boundary (stale tabs, direct calls). Resuming first IS the override.
+    if (await isPaused(PAUSE_KEYS.qboSync)) {
+        return NextResponse.json({ ok: false, reason: "sync-paused" }, { status: 503 });
     }
 
     const since = new Date(Date.now() - lookbackDays() * 86_400_000);

@@ -6,6 +6,7 @@ import {
 } from "@/lib/qbo-expense-sync";
 import type { QBTokens } from "@/lib/quickbooks";
 import { logAutomationEvent } from "@/lib/automation-events";
+import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
 export const dynamic = "force-dynamic";
 // 300s: the first historical backfill reads every QBO Purchase page since the
@@ -26,6 +27,7 @@ export interface QboExpenseSyncHandlerDependencies {
         runtime: { tokens: QBTokens },
     ): Promise<QboExpenseSyncResult>;
     now(): Date;
+    isSyncPaused?: () => Promise<boolean>;
     logEvent?: (event: import("@/lib/automation-events").AutomationEventInput) => void | Promise<void>;
     incrementalLookbackDays: number;
 }
@@ -186,6 +188,12 @@ export function createQboExpenseSyncHandlers(
                     { ok: false, reason: "sync-disabled" },
                     { status: 503 },
                 );
+            }
+            // Command Center pause (cron only — the manual Run-sync-now button
+            // deliberately overrides a pause; pressing it IS the override).
+            const isSyncPausedFn = dependencies.isSyncPaused ?? (() => isPaused(PAUSE_KEYS.qboSync));
+            if (await isSyncPausedFn()) {
+                return NextResponse.json({ ok: false, reason: "sync-paused" }, { status: 503 });
             }
             const since = incrementalSince(
                 dependencies.now(),

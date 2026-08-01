@@ -32,9 +32,27 @@ export interface SerializedJourney {
     finalReason: string | null;
     syncedExpenseId: string | null;
     syncedProjectName: string | null;
+    /** True when reconstructed from QBO history rather than observed live. */
+    backfilled: boolean;
+    /** Full Drive fileId — powers the "Open in Drive" link. */
+    driveFileId: string | null;
+    /** QBO purchase id — powers the QBO deep link. */
+    qbPurchaseId: string | null;
+    /** What actually landed in ProBuild after the 4h sync. */
+    synced: {
+        expenseId: string;
+        projectId: string | null;
+        projectName: string | null;
+        amountCents: number | null;
+        vendor: string | null;
+        receiptUrl: string | null;
+        syncedAt: string;
+    } | null;
 }
 
 type FilterKey = "all" | "booked" | "needs-attention" | "in-flight";
+
+const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
 const FINAL_STATE_STYLE: Record<
     SerializedJourney["finalState"],
@@ -103,13 +121,43 @@ function StateChip({ state }: { state: SerializedJourney["finalState"] }) {
     );
 }
 
+/** True once a booked-api receipt has gone longer than the 4h sync cadence
+ * (plus a buffer) without landing in ProBuild — worth a human look. */
+function isStaleBookedApi(journey: SerializedJourney): boolean {
+    if (journey.finalState !== "booked-api" || journey.synced) return false;
+    return Date.now() - new Date(journey.lastSeen).getTime() >= FIVE_HOURS_MS;
+}
+
+/**
+ * Exception-first verdict: one owner-readable sentence per row. An audit
+ * event proves what happened at booking time — this line summarizes that,
+ * not a live QuickBooks re-check (that's what "Verify in QuickBooks" is for).
+ */
+function journeyVerdict(journey: SerializedJourney, suggestion: FixSuggestion | null): { text: string; attention: boolean } {
+    if (journey.finalState === "booked-api") {
+        if (journey.synced) return { text: "Booked and in job costs", attention: false };
+        if (isStaleBookedApi(journey)) {
+            return { text: "Booked but not yet in ProBuild — worth a look", attention: true };
+        }
+        return { text: "Booked — waiting for the next sync (runs every 4 hours)", attention: false };
+    }
+    if (journey.finalState === "booked-email") {
+        return { text: "Booked via email (not hands-free)", attention: false };
+    }
+    const attention = journey.finalState === "parked" || journey.finalState === "quarantined" || journey.finalState === "error";
+    return {
+        text: suggestion?.diagnosis ?? journey.finalReason ?? FINAL_STATE_STYLE[journey.finalState].label,
+        attention,
+    };
+}
+
 const FILTERS: { key: FilterKey; label: string; test: (j: SerializedJourney) => boolean }[] = [
     { key: "all", label: "All", test: () => true },
     { key: "booked", label: "Booked", test: (j) => j.finalState === "booked-api" || j.finalState === "booked-email" },
     {
         key: "needs-attention",
         label: "Needs attention",
-        test: (j) => j.finalState === "parked" || j.finalState === "quarantined" || j.finalState === "error",
+        test: (j) => j.finalState === "parked" || j.finalState === "quarantined" || j.finalState === "error" || isStaleBookedApi(j),
     },
     { key: "in-flight", label: "In flight", test: (j) => j.finalState === "in-flight" },
 ];
@@ -165,6 +213,345 @@ function SuggestionCard({ suggestion }: { suggestion: FixSuggestion }) {
     );
 }
 
+// ── Validation station ──────────────────────────────────────────────────────
+
+interface VerifyBookingEvidence {
+    amountCents: number | null;
+    taxCents: number | null;
+    vendor: string | null;
+    projectName: string | null;
+    bookedAt: string;
+    attachment: string | null;
+}
+
+interface VerifyLiveState {
+    amountCents: number | null;
+    taxCents: number | null;
+    vendor: string | null;
+    projectName: string | null;
+    txnDate: string | null;
+    markerIntact: boolean | null;
+}
+
+interface VerifyVerdict {
+    field: string;
+    state: "verified" | "needs-attention" | "unknown";
+    note?: string;
+}
+
+interface VerifySuccess {
+    ok: true;
+    verifiedAt: string;
+    deleted: boolean;
+    booking: VerifyBookingEvidence;
+    live: VerifyLiveState | null;
+    verdicts: VerifyVerdict[];
+}
+
+interface VerifyFailure {
+    ok: false;
+    reason: string;
+}
+
+type VerifyResponse = VerifySuccess | VerifyFailure;
+
+function money(cents: number | null | undefined): string {
+    return cents != null ? formatCurrency(cents / 100) : "—";
+}
+
+/** Renders the booking-time attachment evidence carried on `booking.attachment`
+ * ("attached" | "skipped" | "failed:<reason>"). Returns null for no evidence. */
+function attachmentLine(attachment: string | null): { text: string; className: string } | null {
+    if (attachment == null) return null;
+    if (attachment === "attached") {
+        return { text: "Attachment at booking: attached ✓", className: "text-teal-700" };
+    }
+    if (attachment === "skipped") {
+        return { text: "Attachment at booking: skipped", className: "text-hui-textMuted" };
+    }
+    if (attachment.startsWith("failed:")) {
+        return { text: `Attachment at booking: failed: ${attachment.slice("failed:".length)}`, className: "text-red-700" };
+    }
+    return { text: `Attachment at booking: ${attachment}`, className: "text-hui-textMuted" };
+}
+
+function VerdictIcon({ state, note }: { state: VerifyVerdict["state"]; note?: string }) {
+    if (state === "verified") {
+        return (
+            <span className="text-teal-700" title={note || "Verified against QuickBooks right now"}>
+                ✓
+            </span>
+        );
+    }
+    if (state === "needs-attention") {
+        return (
+            <span className="text-red-700 font-bold" title={note || "Needs attention"}>
+                !
+            </span>
+        );
+    }
+    return (
+        <span className="text-slate-400" title={note || "Not enough data to compare"}>
+            ?
+        </span>
+    );
+}
+
+function ReceiptPreview({ journey }: { journey: SerializedJourney }) {
+    const url = journey.synced?.receiptUrl ?? null;
+    const isPdf = url ? /\.pdf(\?|#|$)/i.test(url) : false;
+    const hasDrive = Boolean(journey.driveFileId);
+    const hasProject = Boolean(journey.synced?.projectId);
+
+    return (
+        <div className="space-y-2">
+            {url ? (
+                isPdf ? (
+                    <a
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center justify-center gap-2 border border-hui-border rounded-lg p-6 text-sm font-medium text-hui-textMain hover:bg-slate-50 transition"
+                    >
+                        Open receipt PDF
+                    </a>
+                ) : (
+                    <a
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block border border-hui-border rounded-lg overflow-hidden hover:opacity-90 transition"
+                    >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={url} alt={journey.fileName || "Receipt"} className="w-full h-auto object-contain max-h-80" />
+                    </a>
+                )
+            ) : !hasDrive ? (
+                <p className="text-xs text-hui-textMuted italic">No stored copy yet — appears after the next sync.</p>
+            ) : null}
+            {(hasDrive || hasProject) && (
+                <div className="flex items-center gap-3 flex-wrap">
+                    {hasDrive && (
+                        <a
+                            href={`https://drive.google.com/file/d/${journey.driveFileId}/view`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-medium text-hui-primary hover:underline"
+                        >
+                            Open in Drive
+                        </a>
+                    )}
+                    {hasProject && (
+                        <a href={`/projects/${journey.synced!.projectId}`} className="text-xs font-medium text-hui-primary hover:underline">
+                            Open project
+                        </a>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function ValidationPanel({ journey }: { journey: SerializedJourney }) {
+    const [verifying, setVerifying] = useState(false);
+    const [result, setResult] = useState<VerifySuccess | null>(null);
+
+    async function handleVerify() {
+        setVerifying(true);
+        setResult(null);
+        try {
+            const res = await fetch("/api/automation/verify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ docNumber: journey.docNumber }),
+            });
+            const data: VerifyResponse | null = await res.json().catch(() => null);
+            if (res.ok && data && data.ok) {
+                setResult(data);
+            } else {
+                const reason = data && !data.ok ? data.reason : undefined;
+                toast.error(`Couldn't verify: ${reason || `HTTP ${res.status}`}`);
+            }
+        } catch {
+            toast.error("Couldn't verify: network error");
+        } finally {
+            setVerifying(false);
+        }
+    }
+
+    const showLive = Boolean(result && !result.deleted && result.live);
+    const verdictFor = (field: string) => result?.verdicts.find((v) => v.field === field);
+    const markerVerdict = verdictFor("marker");
+
+    // "Booked (at booking time)" reflects the audit trail by default; once a
+    // Verify has run, it shows the booking evidence the verify call itself
+    // re-derived from that same audit event (see /api/automation/verify).
+    const bookingSource = result?.booking ?? null;
+    const bookedVendor = bookingSource ? bookingSource.vendor : journey.vendor;
+    const bookedAmount = bookingSource ? bookingSource.amountCents : journey.amountCents;
+    const bookedTax = bookingSource ? bookingSource.taxCents : journey.taxCents;
+    const bookedProject = bookingSource ? bookingSource.projectName : journey.projectName;
+
+    // Backfilled journeys were reconstructed from QBO history — there was no
+    // live OCR extraction step, so that column would be misleading.
+    const extractedVendor = journey.backfilled ? "Not recorded" : journey.vendor ?? "—";
+    const extractedAmount = journey.backfilled ? "Not recorded" : money(journey.amountCents);
+    const extractedTax = journey.backfilled ? "Not recorded" : money(journey.taxCents);
+    const extractedProject = journey.backfilled ? "Not recorded" : journey.projectName ?? "—";
+
+    const rows: { label: string; extracted: string; booked: string; inProBuild: string; liveText: string; liveVerdict?: VerifyVerdict }[] = [
+        {
+            label: "Vendor",
+            extracted: extractedVendor,
+            booked: bookedVendor ?? "—",
+            inProBuild: journey.synced?.vendor ?? "—",
+            liveText: showLive ? result!.live!.vendor ?? "—" : "—",
+            liveVerdict: verdictFor("vendor"),
+        },
+        {
+            label: "Amount",
+            extracted: extractedAmount,
+            booked: money(bookedAmount),
+            inProBuild: money(journey.synced?.amountCents ?? null),
+            liveText: showLive ? money(result!.live!.amountCents) : "—",
+            liveVerdict: verdictFor("amount"),
+        },
+        {
+            label: "Sales tax",
+            extracted: extractedTax,
+            booked: money(bookedTax),
+            inProBuild: "—",
+            liveText: showLive ? money(result!.live!.taxCents) : "—",
+            liveVerdict: verdictFor("tax"),
+        },
+        {
+            label: "Project",
+            extracted: extractedProject,
+            booked: bookedProject ?? "—",
+            inProBuild: journey.synced?.projectName ?? "—",
+            liveText: showLive ? result!.live!.projectName ?? "—" : "—",
+            liveVerdict: verdictFor("project"),
+        },
+    ];
+
+    return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <ReceiptPreview journey={journey} />
+
+            <div>
+                {result?.deleted && (
+                    <div className="mb-2 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                        This purchase no longer exists in QuickBooks
+                    </div>
+                )}
+
+                <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                        <thead>
+                            <tr className="border-b border-hui-border">
+                                <th className="text-left py-1.5 pr-2 font-semibold text-hui-textMuted uppercase tracking-wider">Field</th>
+                                <th className="text-left py-1.5 px-2 font-semibold text-hui-textMuted uppercase tracking-wider">Extracted</th>
+                                <th className="text-left py-1.5 px-2 font-semibold text-hui-textMuted uppercase tracking-wider">Booked (at booking time)</th>
+                                <th className="text-left py-1.5 px-2 font-semibold text-hui-textMuted uppercase tracking-wider">In ProBuild</th>
+                                {showLive && (
+                                    <th className="text-left py-1.5 pl-2 font-semibold text-hui-textMuted uppercase tracking-wider">In QuickBooks (live)</th>
+                                )}
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                            {rows.map((row) => (
+                                <tr key={row.label}>
+                                    <td className="py-1.5 pr-2 font-medium text-hui-textMain whitespace-nowrap">{row.label}</td>
+                                    <td className="py-1.5 px-2 text-hui-textMuted">{row.extracted}</td>
+                                    <td className="py-1.5 px-2 text-hui-textMuted">{row.booked}</td>
+                                    <td className="py-1.5 px-2 text-hui-textMuted">{row.inProBuild}</td>
+                                    {showLive && (
+                                        <td className="py-1.5 pl-2 text-hui-textMuted">
+                                            <span className="inline-flex items-center gap-1.5">
+                                                {row.liveVerdict && <VerdictIcon state={row.liveVerdict.state} note={row.liveVerdict.note} />}
+                                                {row.liveText}
+                                            </span>
+                                        </td>
+                                    )}
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+
+                {markerVerdict && markerVerdict.state === "needs-attention" && (
+                    <p className="text-xs text-red-700 mt-2">⚠ {markerVerdict.note}</p>
+                )}
+
+                {result && result.booking.attachment != null && (
+                    <p className={`text-xs mt-2 ${attachmentLine(result.booking.attachment)!.className}`}>
+                        {attachmentLine(result.booking.attachment)!.text}
+                    </p>
+                )}
+
+                <div className="flex items-center gap-3 mt-3 flex-wrap">
+                    <button
+                        type="button"
+                        onClick={handleVerify}
+                        disabled={verifying}
+                        className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 flex items-center gap-2 disabled:opacity-50"
+                    >
+                        {verifying ? (
+                            <>
+                                <svg className="animate-spin w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                                </svg>
+                                Verifying…
+                            </>
+                        ) : (
+                            "Verify in QuickBooks"
+                        )}
+                    </button>
+                    {result && (
+                        <span
+                            className="text-xs text-hui-textMuted"
+                            title={new Date(result.verifiedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                        >
+                            Verified {formatRelativeTime(new Date(result.verifiedAt))}
+                        </span>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function QbPurchaseLink({ qbPurchaseId }: { qbPurchaseId: string }) {
+    async function copyId() {
+        try {
+            await navigator.clipboard.writeText(qbPurchaseId);
+            toast.success("QuickBooks purchase ID copied");
+        } catch {
+            toast.error("Couldn't copy — select and copy manually");
+        }
+    }
+
+    return (
+        <div
+            className="flex items-center gap-2 text-xs text-hui-textMuted flex-wrap"
+            title="The QuickBooks link is best-effort — if it doesn't open the purchase, use the copied ID to search in QuickBooks instead."
+        >
+            <a
+                href={`https://qbo.intuit.com/app/expense?txnId=${qbPurchaseId}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-medium text-hui-primary hover:underline"
+            >
+                QuickBooks purchase #{qbPurchaseId}
+            </a>
+            <button type="button" onClick={copyId} className="hui-btn hui-btn-secondary text-xs px-2 py-0.5">
+                Copy ID
+            </button>
+        </div>
+    );
+}
+
 function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; suggestion: FixSuggestion | null }) {
     const [isOpen, setIsOpen] = useState(false);
 
@@ -176,6 +563,7 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
     ].filter(Boolean);
 
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
+    const verdict = journeyVerdict(journey, suggestion);
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -191,6 +579,14 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
                     {subParts.length > 0 && (
                         <p className="text-xs text-hui-textMuted truncate">{subParts.join(" · ")}</p>
                     )}
+                    <p className={`text-xs truncate mt-0.5 ${verdict.attention ? "text-red-700 font-medium" : "text-hui-textMuted"}`}>
+                        {verdict.text}
+                        {journey.backfilled && (
+                            <span className="ml-1.5 inline-block align-middle text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500">
+                                Imported history
+                            </span>
+                        )}
+                    </p>
                 </div>
                 <span
                     className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
@@ -202,6 +598,8 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
 
             {isOpen && (
                 <div className="px-4 pb-4 space-y-4">
+                    <ValidationPanel journey={journey} />
+
                     <div className="space-y-2 pl-1">
                         {journey.steps.map((step, i) => (
                             <div key={i} className="flex items-start gap-3">
@@ -236,6 +634,8 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
                     </div>
 
                     {suggestion && <SuggestionCard suggestion={suggestion} />}
+
+                    {journey.qbPurchaseId && <QbPurchaseLink qbPurchaseId={journey.qbPurchaseId} />}
                 </div>
             )}
         </div>

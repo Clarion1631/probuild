@@ -27,6 +27,10 @@ function createHandlers(options: { cronEnabled?: boolean; syncError?: Error } = 
         },
         now: () => new Date("2026-07-29T12:00:00.000Z"),
         incrementalLookbackDays: 7,
+        // Stub the audit logger and pause switch — with no DB the real pause
+        // read fails CLOSED (paused) and would 503 the cron test.
+        logEvent: () => {},
+        isSyncPaused: async () => false,
     });
     return { ...handlers, calls };
 }

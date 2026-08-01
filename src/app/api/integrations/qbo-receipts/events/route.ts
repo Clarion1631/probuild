@@ -89,6 +89,9 @@ export async function POST(request: Request) {
             fileName: str(item.fileName),
             amountCents: cents(item.amountCents),
             taxCents: cents(item.taxCents),
+            // docNumber is only a 21-char prefix; the validation panel's
+            // "Open in Drive" link needs the whole fileId.
+            detail: { fileId },
         });
         logged += 1;
     }

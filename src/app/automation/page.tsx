@@ -10,8 +10,10 @@ import {
     type ReceiptJourney,
 } from "@/lib/automation-events";
 import { suggestFix, type FixSuggestion } from "@/lib/automation-suggestions";
+import { pauseStates } from "@/lib/automation-settings";
 import IntakeChart from "./components/intake-chart";
 import SyncNowButton from "./components/sync-now-button";
+import PipelineControls from "./components/pipeline-controls";
 import JourneyList, { type SerializedJourney } from "./components/journey-list";
 import { formatRelativeTime } from "./components/format";
 
@@ -40,16 +42,6 @@ function ChartPanel({ title, subtitle, isEmpty, children }: { title: string; sub
                 children
             )}
         </div>
-    );
-}
-
-function SwitchChip({ on }: { on: boolean }) {
-    return (
-        <span
-            className={`text-xs font-semibold px-2 py-0.5 rounded-full ${on ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"}`}
-        >
-            {on ? "ON" : "OFF"}
-        </span>
     );
 }
 
@@ -128,6 +120,20 @@ function serializeJourney(j: ReceiptJourney): SerializedJourney {
         finalReason: j.finalReason,
         syncedExpenseId: j.syncedExpenseId,
         syncedProjectName: j.syncedProjectName,
+        backfilled: j.backfilled,
+        driveFileId: j.driveFileId,
+        qbPurchaseId: j.qbPurchaseId,
+        synced: j.synced
+            ? {
+                  expenseId: j.synced.expenseId,
+                  projectId: j.synced.projectId,
+                  projectName: j.synced.projectName,
+                  amountCents: j.synced.amountCents,
+                  vendor: j.synced.vendor,
+                  receiptUrl: j.synced.receiptUrl,
+                  syncedAt: j.synced.syncedAt.toISOString(),
+              }
+            : null,
     };
 }
 
@@ -141,11 +147,12 @@ export default async function AutomationPage() {
     const pushEnabled = process.env.QBO_RECEIPT_PUSH_ENABLED === "true";
     const syncCronEnabled = process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false";
 
-    const [summary, buckets, events, journeys] = await Promise.all([
+    const [summary, buckets, events, journeys, pauses] = await Promise.all([
         automationSummary(),
         receiptDailyBuckets(30),
         recentAutomationEvents(50),
         receiptJourneys(30, 100),
+        pauseStates(),
     ]);
 
     const chartEmpty = buckets.every((b) => b.created === 0 && b.fallback === 0 && b.error === 0);
@@ -180,7 +187,12 @@ export default async function AutomationPage() {
                         Receipts in, books done — the pipeline watching itself.
                     </p>
                 </div>
-                {isAdmin && <SyncNowButton />}
+                {isAdmin && (
+                    <SyncNowButton
+                        disabled={pauses.qboSyncPaused}
+                        disabledTitle="Sync is paused — resume it first"
+                    />
+                )}
             </div>
 
             {/* Stat tiles */}
@@ -213,20 +225,13 @@ export default async function AutomationPage() {
             <div className="hui-card p-5">
                 <h2 className="text-base font-semibold text-hui-textMain mb-4">Pipeline status</h2>
                 <div className="space-y-3">
-                    <div className="flex items-center justify-between py-2 border-b border-hui-border">
-                        <div>
-                            <p className="text-sm font-medium text-hui-textMain">Receipt → QuickBooks push</p>
-                            <p className="text-xs text-hui-textMuted">Receipts drop straight into QuickBooks as they're scanned.</p>
-                        </div>
-                        <SwitchChip on={pushEnabled} />
-                    </div>
-                    <div className="flex items-center justify-between py-2 border-b border-hui-border">
-                        <div>
-                            <p className="text-sm font-medium text-hui-textMain">QuickBooks → ProBuild sync (every 4h)</p>
-                            <p className="text-xs text-hui-textMuted">Pulls booked transactions back into ProBuild's job costing.</p>
-                        </div>
-                        <SwitchChip on={syncCronEnabled} />
-                    </div>
+                    <PipelineControls
+                        pushEnabled={pushEnabled}
+                        syncCronEnabled={syncCronEnabled}
+                        receiptPushPaused={pauses.receiptPushPaused}
+                        qboSyncPaused={pauses.qboSyncPaused}
+                        isAdmin={isAdmin}
+                    />
                     <div className="flex items-center justify-between py-2">
                         <div>
                             <p className="text-sm font-medium text-hui-textMain">Last sync</p>
