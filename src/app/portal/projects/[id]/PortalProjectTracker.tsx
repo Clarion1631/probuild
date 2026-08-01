@@ -43,7 +43,8 @@ function dayLabel(date: string): { weekday: string; date: string } {
 function hasVisitors(day: PortalDayVisitors): boolean {
     return day.crew.length > 0
         || day.subcontractors.length > 0
-        || day.appointments.length > 0;
+        || day.appointments.length > 0
+        || day.work.length > 0;
 }
 
 export default function PortalProjectTracker({
@@ -378,7 +379,7 @@ export default function PortalProjectTracker({
                             Next 7 days
                         </p>
                         <h3 id="coming-heading" className="mt-0.5 font-bold text-slate-950">
-                            Who&apos;s coming this week
+                            What&apos;s happening this week
                         </h3>
                     </div>
 
@@ -420,6 +421,19 @@ export default function PortalProjectTracker({
                                                     {company}
                                                 </span>
                                             ))}
+                                            {day.work.map(name => (
+                                                <span
+                                                    key={`work-${day.date}-${name}`}
+                                                    className="inline-flex min-h-8 items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700"
+                                                >
+                                                    <CalendarDays
+                                                        className="h-3.5 w-3.5"
+                                                        style={{ color: "var(--project-accent)" }}
+                                                        aria-hidden="true"
+                                                    />
+                                                    {name}
+                                                </span>
+                                            ))}
                                             {day.appointments.map(appointment => (
                                                 <span
                                                     key={`appointment-${day.date}-${appointment.name}-${appointment.scheduledTime}`}
@@ -441,7 +455,7 @@ export default function PortalProjectTracker({
                         </div>
                     ) : (
                         <div className="px-5 py-7 text-sm leading-6 text-slate-500">
-                            No crew visits or appointments are scheduled for the next seven days.
+                            Nothing is on the schedule for the next seven days.
                         </div>
                     )}
                 </motion.section>

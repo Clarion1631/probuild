@@ -54,6 +54,8 @@ export type PortalTrackerTask = {
     clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
+    /** Optional so older fixtures/serializers keep compiling; undefined = leaf. */
+    parentId?: string | null;
     assignments: PortalTrackerAssignment[];
     subAssignments: PortalTrackerSubAssignment[];
     dependencies?: PortalTrackerDependency[];
@@ -94,6 +96,12 @@ export type PortalDayVisitors = {
     crew: string[];
     subcontractors: string[];
     appointments: PortalAppointment[];
+    /**
+     * Scheduled work (client-scrubbed leaf task names) active that day. This
+     * company rarely assigns crew in ProBuild, so without it the weekly card
+     * reads "nobody is coming" while Richard's schedule is full.
+     */
+    work: string[];
 };
 
 export type PortalNextTask = {
@@ -484,6 +492,11 @@ export function buildPortalWhoIsComing(
     now = new Date(),
 ): PortalDayVisitors[] {
     const start = startOfUtcDay(now);
+    // Phase parents span every child's window; listing them as that day's
+    // "work" would show "Kitchen Remodel" all month. Leaves only.
+    const parentIds = new Set(
+        tasks.map(task => task.parentId).filter((id): id is string => !!id),
+    );
 
     return Array.from({ length: 7 }, (_, offset): PortalDayVisitors => {
         const day = addUtcDays(start, offset);
@@ -492,6 +505,7 @@ export function buildPortalWhoIsComing(
         const crew = new Map<string, string>();
         const subcontractors = new Map<string, string>();
         const appointments: PortalAppointment[] = [];
+        const work = new Map<string, string>();
 
         for (const task of tasks) {
             if (task.type === "appointment") {
@@ -516,6 +530,11 @@ export function buildPortalWhoIsComing(
             task.subAssignments.forEach(assignment =>
                 addDeduped(subcontractors, assignment.companyName),
             );
+            // The scheduled work itself, so the weekly card reflects Richard's
+            // schedule even when no crew is assigned in ProBuild.
+            if (task.type === "task" && !parentIds.has(task.id)) {
+                addDeduped(work, clientTaskName(task.name));
+            }
         }
 
         return {
@@ -526,6 +545,8 @@ export function buildPortalWhoIsComing(
                 (a.scheduledTime ?? "99:99").localeCompare(b.scheduledTime ?? "99:99")
                 || a.name.localeCompare(b.name),
             ),
+            // Schedule order, capped so a dense day can't swamp the card.
+            work: [...work.values()].slice(0, 4),
         };
     });
 }
@@ -571,6 +592,7 @@ export async function getPortalScheduleTasksCore(projectId: string): Promise<Por
             clientStage: true,
             scheduledTime: true,
             confirmationStatus: true,
+            parentId: true,
             dependencies: {
                 select: {
                     id: true,
@@ -613,6 +635,7 @@ export async function getPortalScheduleTasksCore(projectId: string): Promise<Por
         clientStage: task.clientStage,
         scheduledTime: task.scheduledTime,
         confirmationStatus: task.confirmationStatus,
+        parentId: task.parentId,
         dependencies: task.dependencies,
         assignments: task.assignments.map(assignment => ({
             id: assignment.id,
