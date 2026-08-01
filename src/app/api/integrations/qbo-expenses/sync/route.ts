@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import {
+    skippedAuditSummary,
     syncQboExpenses,
     type QboExpenseSyncResult,
 } from "@/lib/qbo-expense-sync";
@@ -83,10 +84,10 @@ export function createQboExpenseSyncHandlers(
                     imported: result.imported,
                     updated: result.updated,
                     deactivated: result.removed,
-                    // Bounded summary: the full skipped array (id+reason each) can
-                    // blow past the detail budget and corrupt nothing but itself.
-                    skipped: result.skipped.length,
-                    skippedSample: result.skipped.slice(0, 10),
+                    // Bounded summary + reason histogram so the dashboard can
+                    // say WHY instead of a bare scary count (shared shape with
+                    // the Command Center's sync-now route).
+                    ...skippedAuditSummary(result.skipped),
                 },
             });
             return NextResponse.json({

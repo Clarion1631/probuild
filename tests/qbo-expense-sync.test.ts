@@ -250,6 +250,211 @@ test("rejects a purchase that mixes job-assigned and unassigned expense lines", 
     });
 });
 
+test("tolerates an uncoded Reimbursable Sales Tax line when every other line is one job", () => {
+    // QBO's receipt-inbox categorize flow doesn't carry the customer onto the
+    // tax split line — that must not exclude the whole purchase from job costs.
+    const result = normalizeQboPurchase({
+        Id: "purchase-uncoded-tax",
+        SyncToken: "0",
+        TxnDate: "2026-07-20",
+        TotalAmt: 15.51,
+        Line: [
+            {
+                Amount: 14.24,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                    CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                },
+            },
+            {
+                Amount: 1.27,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "1150040032", name: "Reimbursable Sales Tax Paid" },
+                },
+            },
+        ],
+    });
+
+    assert.equal(result.kind, "purchase");
+    if (result.kind === "purchase") {
+        assert.equal(result.purchase.customerId, "213");
+        assert.equal(result.purchase.customerName, "Mesplay Kitchen");
+        assert.equal(result.purchase.total, 15.51);
+    }
+});
+
+test("a configured tax-account id mismatch keeps the mixed-allocation guard", () => {
+    // With QBO_RECEIPT_TAX_ACCOUNT_ID set, the id DECIDES — a lookalike name
+    // on a different account id must NOT get the tax exception.
+    const prev = process.env.QBO_RECEIPT_TAX_ACCOUNT_ID;
+    process.env.QBO_RECEIPT_TAX_ACCOUNT_ID = "1150040032";
+    try {
+        const result = normalizeQboPurchase({
+            Id: "purchase-tax-id-mismatch",
+            SyncToken: "0",
+            TxnDate: "2026-07-20",
+            TotalAmt: 15.51,
+            Line: [
+                {
+                    Amount: 14.24,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                        CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                    },
+                },
+                {
+                    Amount: 1.27,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: "999", name: "Reimbursable Sales Tax Paid" },
+                    },
+                },
+            ],
+        });
+        assert.equal(result.kind, "ineligible");
+        if (result.kind === "ineligible") assert.equal(result.reason, "mixed-customer-allocation");
+    } finally {
+        if (prev === undefined) delete process.env.QBO_RECEIPT_TAX_ACCOUNT_ID;
+        else process.env.QBO_RECEIPT_TAX_ACCOUNT_ID = prev;
+    }
+});
+
+test("an uncoded NON-tax line alongside an uncoded tax line still rejects", () => {
+    const result = normalizeQboPurchase({
+        Id: "purchase-tax-plus-uncoded",
+        SyncToken: "0",
+        TxnDate: "2026-07-20",
+        TotalAmt: 65.51,
+        Line: [
+            {
+                Amount: 14.24,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                    CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                },
+            },
+            {
+                Amount: 1.27,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { name: "Reimbursable Sales Tax Paid" },
+                },
+            },
+            {
+                Amount: 50,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "supplies" },
+                },
+            },
+        ],
+    });
+    assert.equal(result.kind, "ineligible");
+    if (result.kind === "ineligible") assert.equal(result.reason, "mixed-customer-allocation");
+});
+
+test("a tax line with a malformed amount stays conservative and rejects", () => {
+    const result = normalizeQboPurchase({
+        Id: "purchase-tax-bad-amount",
+        SyncToken: "0",
+        TxnDate: "2026-07-20",
+        TotalAmt: 15.51,
+        Line: [
+            {
+                Amount: 14.24,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                    CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                },
+            },
+            {
+                Amount: "not-a-number",
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { name: "Reimbursable Sales Tax Paid" },
+                },
+            },
+        ],
+    });
+    assert.equal(result.kind, "ineligible");
+    if (result.kind === "ineligible") assert.equal(result.reason, "mixed-customer-allocation");
+});
+
+test("a tax line whose amount is a coercible non-number stays conservative", () => {
+    // Number(true) === 1 and Number("1.27") === 1.27 — neither may earn the
+    // exception; only an actual positive number does.
+    for (const badAmount of [true, "1.27"]) {
+        const result = normalizeQboPurchase({
+            Id: "purchase-tax-coerced-amount",
+            SyncToken: "0",
+            TxnDate: "2026-07-20",
+            TotalAmt: 15.51,
+            Line: [
+                {
+                    Amount: 14.24,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                        CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                    },
+                },
+                {
+                    Amount: badAmount,
+                    AccountBasedExpenseLineDetail: {
+                        AccountRef: { name: "Reimbursable Sales Tax Paid" },
+                    },
+                },
+            ],
+        });
+        assert.equal(result.kind, "ineligible", `amount ${JSON.stringify(badAmount)}`);
+        if (result.kind === "ineligible") assert.equal(result.reason, "mixed-customer-allocation");
+    }
+});
+
+test("a lookalike tax-account NAME does not get the exception", () => {
+    const result = normalizeQboPurchase({
+        Id: "purchase-tax-lookalike",
+        SyncToken: "0",
+        TxnDate: "2026-07-20",
+        TotalAmt: 15.51,
+        Line: [
+            {
+                Amount: 14.24,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { value: "98", name: "Cost of goods sold:Supplies & materials - COGS" },
+                    CustomerRef: { value: "213", name: "Mesplay Kitchen" },
+                },
+            },
+            {
+                Amount: 1.27,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { name: "Non-Reimbursable Sales Tax Paid" },
+                },
+            },
+        ],
+    });
+    assert.equal(result.kind, "ineligible");
+    if (result.kind === "ineligible") assert.equal(result.reason, "mixed-customer-allocation");
+});
+
+test("an uncoded tax line with NO job-coded lines still has no customer", () => {
+    const result = normalizeQboPurchase({
+        Id: "purchase-tax-only",
+        SyncToken: "0",
+        TxnDate: "2026-07-20",
+        TotalAmt: 1.27,
+        Line: [
+            {
+                Amount: 1.27,
+                AccountBasedExpenseLineDetail: {
+                    AccountRef: { name: "Reimbursable Sales Tax Paid" },
+                },
+            },
+        ],
+    });
+
+    assert.equal(result.kind, "purchase");
+    if (result.kind === "purchase") {
+        assert.equal(result.purchase.customerId, null);
+        assert.equal(result.purchase.customerName, null);
+    }
+});
+
 test("matches a QBO customer label to exactly one in-progress job and its latest estimate", () => {
     const result = findActiveProjectForQboPurchase(PURCHASE, [
         {

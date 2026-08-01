@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, isAdminOrManager } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
-import { syncQboExpenses } from "@/lib/qbo-expense-sync";
+import { skippedAuditSummary, syncQboExpenses } from "@/lib/qbo-expense-sync";
 import { logAutomationEvent } from "@/lib/automation-events";
 import { isPaused, PAUSE_KEYS } from "@/lib/automation-settings";
 
@@ -59,7 +59,7 @@ export async function POST() {
             kind: "qbo-sync",
             status: "ok",
             source,
-            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), ...counts, by: user.name || user.email || undefined, skippedSample: result.skipped.slice(0, 10) },
+            detail: { mode: "incremental", since: since.toISOString().slice(0, 10), imported: result.imported, updated: result.updated, deactivated: result.removed, by: user.name || user.email || undefined, ...skippedAuditSummary(result.skipped) },
         });
         return NextResponse.json({ ok: true, ...counts });
     } catch (error) {

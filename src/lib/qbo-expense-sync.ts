@@ -110,6 +110,29 @@ function customerReferenceKey(reference: QboReference): string | null {
     return id ? `id:${id}` : `name:${name!.toLowerCase()}`;
 }
 
+/**
+ * Hand-entered purchases (QBO receipt inbox → Marge) job-code the expense
+ * lines but leave the "Reimbursable Sales Tax Paid" split line uncoded — QBO's
+ * categorize flow doesn't carry the customer onto the tax line. That line
+ * belongs to the same job as the rest of the purchase, so it must not trip the
+ * mixed-customer-allocation check (our own API-pushed purchases job-code the
+ * tax line explicitly; this only matters for manual entries). Matched by the
+ * configured account id first, name as a fallback — same name-based precedent
+ * as the equity-draw check in normalizeQboPurchase.
+ */
+function isReimbursableTaxLine(line: QboPurchaseLine): boolean {
+    const accountRef = line.AccountBasedExpenseLineDetail?.AccountRef;
+    if (!accountRef) return false;
+    const configuredId = optionalString(process.env.QBO_RECEIPT_TAX_ACCOUNT_ID);
+    const id = optionalString(accountRef.value);
+    // When both ids are known, the id DECIDES — a mismatch must never fall
+    // through to name matching (Codex: "Non-Reimbursable Sales Tax" etc.
+    // would otherwise suppress the mixed-allocation guard).
+    if (configuredId && id) return id === configuredId;
+    const name = optionalString(accountRef.name);
+    return !!name && name.toLowerCase() === "reimbursable sales tax paid";
+}
+
 function collectCustomerReferences(purchase: RawQboPurchase): {
     references: QboReference[];
     hasAssignedExpenseLine: boolean;
@@ -137,8 +160,16 @@ function collectCustomerReferences(purchase: RawQboPurchase): {
                 hasAssignedExpenseLine = true;
             } else {
                 const amount = Number(line.Amount);
-                // Missing amounts are treated conservatively as monetary lines.
-                if (!Number.isFinite(amount) || amount > 0) {
+                // Missing amounts are treated conservatively as monetary
+                // lines. The tax-line exception demands an ACTUAL positive
+                // number — coercions (true→1, "1"→1) stay conservative, so a
+                // malformed tax line can never earn the exception.
+                const taxException =
+                    typeof line.Amount === "number" &&
+                    Number.isFinite(line.Amount) &&
+                    line.Amount > 0 &&
+                    isReimbursableTaxLine(line);
+                if ((!Number.isFinite(amount) || amount > 0) && !taxException) {
                     hasUnassignedExpenseLine = true;
                 }
             }
@@ -662,6 +693,27 @@ export interface QboExpenseSyncResult {
     updated: number;
     removed: number;
     skipped: Array<{ qbPurchaseId: string; reason: string }>;
+}
+
+/**
+ * Bounded skip summary for audit-event detail — shared by the cron/manual
+ * sync route and the Command Center's sync-now route so both log the same
+ * shape. The full skipped array can blow past the detail budget; the sample
+ * is capped and the histogram is bounded by the small closed set of reasons.
+ */
+export function skippedAuditSummary(skipped: QboExpenseSyncResult["skipped"]): {
+    skipped: number;
+    skippedSample: QboExpenseSyncResult["skipped"];
+    skippedByReason: Record<string, number>;
+} {
+    return {
+        skipped: skipped.length,
+        skippedSample: skipped.slice(0, 10),
+        skippedByReason: skipped.reduce<Record<string, number>>((acc, s) => {
+            acc[s.reason] = (acc[s.reason] ?? 0) + 1;
+            return acc;
+        }, {}),
+    };
 }
 
 async function listInProgressProjects(): Promise<QboExpenseProjectCandidate[]> {
