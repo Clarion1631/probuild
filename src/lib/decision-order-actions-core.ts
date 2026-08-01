@@ -62,15 +62,28 @@ export type OrderedByValue = "TEAM" | "CLIENT";
  * them (see the Decision model comment in schema.prisma, and the
  * deleteDecision defense-in-depth reset).
  *
- * `expectedOrderedAt` (Codex review round 1, issue 3) — the orderedAt value
- * the CLIENT last saw and is editing from (null for a fresh "Decided" ->
- * "Ordered" transition, since a Decided row's orderedAt is always null).
- * Included in the CAS where-clause below so a stale popover (open while
- * someone else cleared or re-ordered the same decision) can't silently
- * overwrite state it never actually saw.
+ * `expectedOrderedAt`/`expectedOrderedBy`/`expectedExpectedArrivalAt` (Codex
+ * review round 1, issue 3; round 2, R3 residual) — the THREE order fields
+ * the CLIENT last saw and is editing from (all null for a fresh "Decided"
+ * -> "Ordered" transition, since a Decided row's order fields are always
+ * null). All three are included in the CAS where-clause below, not just
+ * orderedAt — comparing orderedAt alone let two forms seeded from the SAME
+ * order date last-write-win on orderedBy/expectedArrivalAt (e.g. two staff
+ * editing the same Ordered row concurrently, one changing who ordered it,
+ * the other changing the ETA, both seeded from the same orderedAt). A
+ * stale popover (any of the three fields changed since it was seeded) now
+ * fails the CAS instead of silently overwriting what it never actually saw.
  */
 export type DecisionOrderInput =
-    | { kind: "ordered"; orderedAt: Date; orderedBy: OrderedByValue; expectedArrivalAt: Date | null; expectedOrderedAt: Date | null }
+    | {
+          kind: "ordered";
+          orderedAt: Date;
+          orderedBy: OrderedByValue;
+          expectedArrivalAt: Date | null;
+          expectedOrderedAt: Date | null;
+          expectedOrderedBy: OrderedByValue | null;
+          expectedExpectedArrivalAt: Date | null;
+      }
     | { kind: "received" }
     | { kind: "clear" };
 
@@ -144,6 +157,8 @@ export async function setDecisionOrderInfo(
             const orderedAt = utcMidnight(input.orderedAt);
             const expectedArrivalAt = input.expectedArrivalAt ? utcMidnight(input.expectedArrivalAt) : null;
             const expectedOrderedAt = input.expectedOrderedAt ? utcMidnight(input.expectedOrderedAt) : null;
+            const expectedOrderedBy = input.expectedOrderedBy ?? null;
+            const expectedExpectedArrivalAt = input.expectedExpectedArrivalAt ? utcMidnight(input.expectedExpectedArrivalAt) : null;
 
             // Company-local "today" (decision-due-date.ts's
             // companyTodayAsUtcMidnight): a raw UTC `new Date()` has already
@@ -172,14 +187,23 @@ export async function setDecisionOrderInfo(
             }
 
             // CAS: status must be Decided (or already Ordered, for edits),
-            // AND the row's current orderedAt must match what the client's
-            // form was seeded from (field-level CAS, issue 3) — catches a
-            // stale popover racing a concurrent clear/re-order that a
-            // status-only CAS would miss (e.g. someone clears then
-            // re-orders with a different date between this form's open and
-            // its Save).
+            // AND ALL THREE of the row's current order fields must match
+            // what the client's form was seeded from (field-level CAS,
+            // issue 3; round 2 R3 — orderedAt alone wasn't enough, see the
+            // DecisionOrderInput comment above). Prisma's equality where
+            // clause is null-safe: `orderedBy: null` matches IS NULL, same
+            // as the Date fields. Catches a stale popover racing a
+            // concurrent clear/re-order/edit that a status-only (or
+            // orderedAt-only) CAS would miss.
             const updated = await write({
-                where: { id: decisionId, deletedAt: null, status: { in: ["Decided", "Ordered"] }, orderedAt: expectedOrderedAt },
+                where: {
+                    id: decisionId,
+                    deletedAt: null,
+                    status: { in: ["Decided", "Ordered"] },
+                    orderedAt: expectedOrderedAt,
+                    orderedBy: expectedOrderedBy,
+                    expectedArrivalAt: expectedExpectedArrivalAt,
+                },
                 data: { status: "Ordered", orderedAt, orderedBy: input.orderedBy, expectedArrivalAt },
             });
             if (updated.count === 0) {

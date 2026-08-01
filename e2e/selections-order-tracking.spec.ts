@@ -105,7 +105,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const firstEta = daysFromToday(-15);
         const first = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: firstEta, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: firstEta, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(first.ok).toBe(true);
@@ -117,12 +117,21 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         expect(updated.expectedArrivalAt?.toISOString()).toBe(firstEta.toISOString());
 
         // Edit ETA — CAS also admits Ordered -> Ordered (re-marking to
-        // edit), with expectedOrderedAt now matching the row's current
-        // orderedAt (field-level CAS, issue 3).
+        // edit), with all three expected* fields matching the row's
+        // current orderedAt/orderedBy/expectedArrivalAt (field-level CAS,
+        // issue 3; round 2 R3 — all three, not just orderedAt).
         const revisedEta = daysFromToday(-10);
         const editResult = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "CLIENT", expectedArrivalAt: revisedEta, expectedOrderedAt: orderedAt },
+            {
+                kind: "ordered",
+                orderedAt,
+                orderedBy: "CLIENT",
+                expectedArrivalAt: revisedEta,
+                expectedOrderedAt: orderedAt,
+                expectedOrderedBy: "TEAM",
+                expectedExpectedArrivalAt: firstEta,
+            },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(editResult.ok).toBe(true);
@@ -156,7 +165,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
 
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(false);
@@ -177,7 +186,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
 
         const first = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(first.ok).toBe(true);
@@ -186,7 +195,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         // its form before the write above landed) — its CAS must fail.
         const stale = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(1), orderedBy: "CLIENT", expectedArrivalAt: null, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt: daysFromToday(1), orderedBy: "CLIENT", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(stale.ok).toBe(false);
@@ -195,6 +204,73 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const unchanged = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
         expect(unchanged.orderedBy).toBe("TEAM"); // the stale write did NOT win
         expect(unchanged.orderedAt?.toISOString()).toBe(orderedAt.toISOString());
+    });
+
+    // ── Codex review round 2, R3 residual: the CAS predicate compared ONLY
+    //    orderedAt, so two forms seeded from the SAME order date still
+    //    last-write-won on orderedBy/expectedArrivalAt. Extended to compare
+    //    all three seeded fields — this reproduces the exact gap: a stale
+    //    editor whose orderedAt still matches (unchanged) but whose
+    //    orderedBy/expectedArrivalAt have gone stale (someone else already
+    //    edited them) must now be rejected too. ─────────────────────────────
+
+    test("field-level CAS (R3 residual): a same-orderedAt edit is rejected when orderedBy/expectedArrivalAt have gone stale, not just when orderedAt itself changed", async () => {
+        const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
+        const decision = await makeDecision("r3-same-date-stale-cas", "Decided");
+        const orderedAt = daysFromToday(0);
+        const firstEta = daysFromToday(10);
+        const secondEta = daysFromToday(15);
+
+        // Initial order — TEAM, ETA firstEta.
+        const first = await setDecisionOrderInfo(
+            decision.id,
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: firstEta, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+        expect(first.ok).toBe(true);
+
+        // Editor A: seeded from the state above (orderedAt unchanged,
+        // orderedBy TEAM, ETA firstEta) — changes who ordered it AND the
+        // ETA. Succeeds.
+        const editorA = await setDecisionOrderInfo(
+            decision.id,
+            {
+                kind: "ordered",
+                orderedAt, // same order date — unchanged
+                orderedBy: "CLIENT",
+                expectedArrivalAt: secondEta,
+                expectedOrderedAt: orderedAt,
+                expectedOrderedBy: "TEAM",
+                expectedExpectedArrivalAt: firstEta,
+            },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+        expect(editorA.ok).toBe(true);
+
+        // Editor B: seeded from the SAME pre-edit-A snapshot as editor A
+        // (orderedAt unchanged, but still believes orderedBy is TEAM and
+        // ETA is firstEta — both now stale after editor A's write). The
+        // orderedAt-only CAS from round 1 would have WRONGLY ALLOWED this
+        // (orderedAt still matches) — the 3-field CAS must reject it.
+        const editorB = await setDecisionOrderInfo(
+            decision.id,
+            {
+                kind: "ordered",
+                orderedAt, // still matches — this is the residual gap
+                orderedBy: "TEAM",
+                expectedArrivalAt: daysFromToday(20),
+                expectedOrderedAt: orderedAt,
+                expectedOrderedBy: "TEAM", // STALE — actual is now CLIENT
+                expectedExpectedArrivalAt: firstEta, // STALE — actual is now secondEta
+            },
+            { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
+        );
+        expect(editorB.ok).toBe(false);
+        if (!editorB.ok) expect(editorB.code).toBe("CAS_CONFLICT");
+
+        const unchanged = await prisma.decision.findUniqueOrThrow({ where: { id: decision.id } });
+        expect(unchanged.orderedBy).toBe("CLIENT"); // editor A's write stands — editor B did NOT win
+        expect(unchanged.expectedArrivalAt?.toISOString()).toBe(secondEta.toISOString());
     });
 
     // ── Case 5: validation — ETA before order date; far-future date ────────
@@ -207,7 +283,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const etaBeforeOrder = daysFromToday(-5);
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: etaBeforeOrder, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: etaBeforeOrder, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(false);
@@ -225,7 +301,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const farFutureEta = daysFromToday(365 * 10); // ~10 years out — always beyond the +5y bound
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: farFutureEta, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: farFutureEta, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(false);
@@ -237,9 +313,21 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
 
     // ── BLOCKER regression: deleteDecision's TOCTOU fix — a decision
     //    already marked Ordered cannot be deleted, and nothing is stranded.
-    //    "Concurrent-ish": the order lands (direct core call) BEFORE the
-    //    delete is attempted through the live UI/server action, exercising
-    //    the real CAS guard exactly as a race would hit it. ────────────────
+    //
+    //    Codex review round 2, B1 (test honesty): this test does NOT — and
+    //    reasonably cannot, in Playwright — reproduce the actual race
+    //    interleaving (a setDecisionOrderInfo write landing on another
+    //    connection between deleteDecision's pre-fix read and its write).
+    //    What it validates is the in-transaction CAS guard's BEHAVIOR: an
+    //    already-Ordered row is rejected when a delete is attempted against
+    //    it, exercised through the real UI/server action end to end. The
+    //    race itself is closed STRUCTURALLY, not by this test — the guard
+    //    is now a single atomic `status NOT IN [Ordered, Received]`
+    //    updateMany evaluated at write time inside the transaction, so
+    //    there is no read-then-check window left for a concurrent write to
+    //    land in, regardless of ordering. This test's job is only to prove
+    //    that guard actually rejects an Ordered row (and leaves it
+    //    untouched) — not to simulate two connections racing each other. ──
 
     test("BLOCKER regression: a decision marked Ordered cannot be deleted — the CAS rejects it and the row is left untouched", async ({ page }) => {
         const admin = await prisma.user.findUniqueOrThrow({ where: { id: ids.admin } });
@@ -247,7 +335,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const orderedAt = daysFromToday(-5);
         const ordered = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt, orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(ordered.ok).toBe(true);
@@ -352,7 +440,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const decision = await makeDecision(name, "Decided");
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(true);
@@ -410,7 +498,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         await prisma.decision.update({ where: { id: decision.id }, data: { dueDate } });
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: daysFromToday(63), expectedOrderedAt: null }, // dueDate + 3
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: daysFromToday(63), expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null }, // dueDate + 3
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(true);
@@ -444,7 +532,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const decision = await makeDecision("case3-shift", "Decided");
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: daysFromToday(62), expectedOrderedAt: null }, // SHIFT_TASK_START + 2
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: daysFromToday(62), expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null }, // SHIFT_TASK_START + 2
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(true);
@@ -477,7 +565,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         await prisma.decision.update({ where: { id: decision.id }, data: { chosenItemId: candidate.id } });
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(true);
@@ -495,7 +583,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         const etaDate = daysFromToday(12);
         const result = await setDecisionOrderInfo(
             decision.id,
-            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: etaDate, expectedOrderedAt: null },
+            { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: etaDate, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
             { getActor: async () => admin, revalidate: NOOP_REVALIDATE },
         );
         expect(result.ok).toBe(true);
@@ -544,7 +632,7 @@ test.describe.serial("Selection order tracking + delivery risk", () => {
         await expect(
             setDecisionOrderInfo(
                 decision.id,
-                { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null },
+                { kind: "ordered", orderedAt: daysFromToday(0), orderedBy: "TEAM", expectedArrivalAt: null, expectedOrderedAt: null, expectedOrderedBy: null, expectedExpectedArrivalAt: null },
                 { getActor: async () => null, revalidate: NOOP_REVALIDATE },
             ),
         ).rejects.toThrow("Forbidden");

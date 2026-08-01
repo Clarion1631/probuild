@@ -62,13 +62,16 @@ assert.ok(!/prisma\.decision\./.test(setDecisionOrderInfoBody), "setDecisionOrde
 // ── CAS transition matrix: Decided/Ordered -> Ordered, Ordered -> Received,
 //    Ordered/Received -> clear -> Decided. Each must be a single CAS write
 //    keyed on both id AND the allowed source status/statuses. The "ordered"
-//    branch ALSO carries a field-level CAS on orderedAt (Codex review
-//    round 1, issue 3) so a stale form can't clobber a concurrent change. ──
+//    branch ALSO carries a field-level CAS on ALL THREE order fields
+//    (Codex review round 1, issue 3; round 2, R3 residual — orderedAt alone
+//    let two forms seeded from the SAME order date last-write-win on
+//    orderedBy/expectedArrivalAt) so a stale form can't clobber a
+//    concurrent change to any of the three. ─────────────────────────────────
 
 assert.match(
     orderActionsCore,
-    /where:\s*\{\s*id:\s*decisionId,\s*deletedAt:\s*null,\s*status:\s*\{\s*in:\s*\["Decided",\s*"Ordered"\]\s*\},\s*orderedAt:\s*expectedOrderedAt\s*\}/,
-    "marking ordered must CAS from status in [Decided, Ordered] AND match the client's expectedOrderedAt (field-level CAS)",
+    /where:\s*\{\s*id:\s*decisionId,\s*deletedAt:\s*null,\s*status:\s*\{\s*in:\s*\["Decided",\s*"Ordered"\]\s*\},\s*orderedAt:\s*expectedOrderedAt,\s*orderedBy:\s*expectedOrderedBy,\s*expectedArrivalAt:\s*expectedExpectedArrivalAt,?\s*\}/,
+    "marking ordered must CAS from status in [Decided, Ordered] AND match ALL THREE client-seeded fields (expectedOrderedAt, expectedOrderedBy, expectedExpectedArrivalAt) — the full field-level CAS",
 );
 assert.match(
     orderActionsCore,
@@ -116,6 +119,8 @@ assert.match(orderActionsCore, /throw new Error\("Decision not found"\);/, "a no
 assert.match(orderActionsCore, /const orderedAt = utcMidnight\(input\.orderedAt\);/, "orderedAt must be normalized to UTC midnight server-side");
 assert.match(orderActionsCore, /const expectedArrivalAt = input\.expectedArrivalAt \? utcMidnight\(input\.expectedArrivalAt\) : null;/, "expectedArrivalAt must be normalized to UTC midnight server-side");
 assert.match(orderActionsCore, /const expectedOrderedAt = input\.expectedOrderedAt \? utcMidnight\(input\.expectedOrderedAt\) : null;/, "expectedOrderedAt must be normalized to UTC midnight server-side too (it's compared against the stored, normalized orderedAt)");
+assert.match(orderActionsCore, /const expectedOrderedBy = input\.expectedOrderedBy \?\? null;/, "expectedOrderedBy must be resolved server-side (round 2, R3 residual)");
+assert.match(orderActionsCore, /const expectedExpectedArrivalAt = input\.expectedExpectedArrivalAt \? utcMidnight\(input\.expectedExpectedArrivalAt\) : null;/, "expectedExpectedArrivalAt must be normalized to UTC midnight server-side too (round 2, R3 residual)");
 assert.match(orderActionsCore, /expectedArrivalAt\.getTime\(\) < orderedAt\.getTime\(\)/, "expectedArrivalAt must be validated >= orderedAt using the NORMALIZED local values, not the raw input");
 
 // ── +5y sanity bound must be an exact company-today + 5 years, not a
@@ -401,6 +406,8 @@ assert.match(orderPopover, /htmlFor=\{orderEtaInputId\}/, "the ETA label must be
 assert.match(orderPopover, /id=\{orderEtaInputId\}/, "the ETA input must carry the matching id");
 
 assert.match(orderPopover, /expectedOrderedAt:/, "the popover must send expectedOrderedAt (field-level CAS) on every \"ordered\" call");
+assert.match(orderPopover, /expectedOrderedBy:/, "the popover must send expectedOrderedBy too (round 2, R3 residual — full 3-field CAS)");
+assert.match(orderPopover, /expectedExpectedArrivalAt:/, "the popover must send expectedExpectedArrivalAt too (round 2, R3 residual — full 3-field CAS)");
 assert.match(orderPopover, /if \(!result\.ok\) \{/, "the popover must branch on the typed result, not rely solely on a catch block, for expected failures");
 
 console.log("selection order tracking + delivery risk contract verified");

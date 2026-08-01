@@ -95,16 +95,20 @@ export default function DecisionOrderPopover({
         }
         setPending("save");
         try {
-            // Field-level CAS (Codex review round 1, issue 3): send the
-            // orderedAt this form was seeded from (null for a fresh
-            // Decided -> Ordered transition) so the server can detect a
-            // concurrent change to the same row between open and Save.
+            // Field-level CAS (Codex review round 1, issue 3; round 2, R3
+            // residual): send ALL THREE order fields this form was seeded
+            // from (all null for a fresh Decided -> Ordered transition) so
+            // the server can detect ANY concurrent change to the row
+            // between open and Save — comparing orderedAt alone missed a
+            // same-date edit that only changed who ordered it or the ETA.
             const result = await setDecisionOrderInfo(decisionId, {
                 kind: "ordered",
                 orderedAt: dateOnlyToUtcMidnight(orderDateDraft),
                 orderedBy: orderedByDraft,
                 expectedArrivalAt: etaDraft ? dateOnlyToUtcMidnight(etaDraft) : null,
                 expectedOrderedAt: orderedAt ? dateOnlyToUtcMidnight(toDateInputValue(orderedAt)) : null,
+                expectedOrderedBy: (orderedBy as OrderedByValue) || null,
+                expectedExpectedArrivalAt: expectedArrivalAt ? dateOnlyToUtcMidnight(toDateInputValue(expectedArrivalAt)) : null,
             });
             if (!result.ok) {
                 // Typed result (Codex review round 1, issue 1) — production
