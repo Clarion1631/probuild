@@ -2936,7 +2936,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
                     `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${escapeHtml(clientName)}</strong> opened invoice <strong>${escapeHtml(invoice.code)}</strong>${projectName ? ` for ${escapeHtml(projectName)}` : ""}.</p>
                             ${focusedLine}
                             <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
                             ${ctaBlock}
