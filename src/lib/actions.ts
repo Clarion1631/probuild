@@ -19,6 +19,7 @@ import { isHttpUrl } from "./url-safety";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { appendPunchItemsInTransaction } from "./punch-items";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
@@ -7637,13 +7638,11 @@ export async function markFieldUpdatesSeen() {
 // ========== PUNCH LIST ==========
 
 export async function addTaskPunchItem(taskId: string, name: string) {
-    const maxOrder = await prisma.taskPunchItem.aggregate({
-        where: { taskId },
-        _max: { order: true },
-    });
-    return prisma.taskPunchItem.create({
-        data: { taskId, name, order: (maxOrder._max.order ?? -1) + 1 },
-    });
+    await assertScheduleTaskAccess(taskId);
+    const [item] = await withTxRetry(() => prisma.$transaction(
+        tx => appendPunchItemsInTransaction(tx, taskId, [name]),
+    ));
+    return item;
 }
 
 export async function togglePunchItem(id: string) {
@@ -7668,10 +7667,19 @@ export async function togglePunchItem(id: string) {
 }
 
 export async function deletePunchItem(id: string) {
-    return prisma.taskPunchItem.delete({ where: { id } });
+    const current = await prisma.taskPunchItem.findUnique({
+        where: { id },
+        select: { taskId: true },
+    });
+    if (!current) return null;
+    await assertScheduleTaskAccess(current.taskId);
+    // deleteMany so a concurrent delete of the same item is a no-op, not a P2025 throw
+    await prisma.taskPunchItem.deleteMany({ where: { id } });
+    return { id };
 }
 
 export async function getTaskPunchItems(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     return prisma.taskPunchItem.findMany({
         where: { taskId },
         orderBy: { order: "asc" },
@@ -7791,23 +7799,10 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
 
     // One transaction so a mid-loop failure cannot leave a partial punch list,
     // and the task lock serializes `order` with concurrent punch-item writers.
-    const created = await withTxRetry(() => prisma.$transaction(async tx => {
-        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
-        const maxOrder = await tx.taskPunchItem.aggregate({
-            where: { taskId },
-            _max: { order: true },
-        });
-        let order = (maxOrder._max.order ?? -1) + 1;
-
-        const createdItems = [];
-        for (const name of items) {
-            const item = await tx.taskPunchItem.create({
-                data: { taskId, name, order: order++ },
-            });
-            createdItems.push(item);
-        }
-        return createdItems;
-    }, { maxWait: 10000, timeout: 30000 }));
+    const created = await withTxRetry(() => prisma.$transaction(
+        tx => appendPunchItemsInTransaction(tx, taskId, items),
+        { maxWait: 10000, timeout: 30000 },
+    ));
     return created;
 }
 

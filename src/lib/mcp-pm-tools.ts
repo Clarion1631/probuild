@@ -8,6 +8,8 @@ import {
 import type { McpActorContext } from "./mcp-actor";
 import { prisma } from "./prisma";
 import { ensureStandardFolders } from "./project-folders";
+import { appendPunchItemsInTransaction } from "./punch-items";
+import { lockTaskAssignmentParent } from "./schedule-core";
 
 type PmDb = Pick<
     Prisma.TransactionClient,
@@ -651,23 +653,12 @@ export async function addPunchItemsWithConfirmation(
             select: { id: true, name: true, projectId: true },
         });
         if (!task) throw new Error("Task not found");
-        const maxOrder = await tx.taskPunchItem.aggregate({
-            where: { taskId: input.taskId },
-            _max: { order: true },
-        });
-        let order = (maxOrder._max.order ?? -1) + 1;
-        const created = [];
-        for (const name of items) {
-            created.push(await tx.taskPunchItem.create({
-                data: {
-                    taskId: input.taskId,
-                    name,
-                    order: order++,
-                    createdById: actor.actorUserId,
-                },
-                select: { id: true, name: true, order: true },
-            }));
-        }
+        // Lock Project → ScheduleTask in the canonical order when the task has a
+        // project (lead tasks don't): writeActivity's Project FK would otherwise
+        // take Project after the task lock, inverting against schedule mutations
+        // that lock Project first (deadlock risk).
+        if (task.projectId) await lockTaskAssignmentParent(tx, task.id, task.projectId);
+        const created = await appendPunchItemsInTransaction(tx, input.taskId, items, actor.actorUserId);
         await writeActivity(tx, actor, {
             projectId: task.projectId,
             action: "added_punch_items",
@@ -678,7 +669,7 @@ export async function addPunchItemsWithConfirmation(
         });
         return {
             taskId: task.id,
-            created,
+            created: created.map(item => ({ id: item.id, name: item.name, order: item.order })),
         };
     });
 }
