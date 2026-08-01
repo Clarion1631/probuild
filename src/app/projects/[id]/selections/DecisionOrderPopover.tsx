@@ -19,12 +19,34 @@ function toDateInputValue(iso: string | null): string {
 
 // UTC-midnight anchored calendar date — the same convention
 // DecisionDueDateEditPopover uses for the manual due-date override, so a
-// date-only input round-trips through storage without shifting a day.
+// date-only input round-trips through storage without shifting a day. The
+// server re-normalizes to UTC midnight itself too (Codex review round 1,
+// issue 7) — this client-side normalization is a courtesy, not the only
+// guard.
 function dateOnlyToUtcMidnight(value: string): Date {
     return new Date(`${value}T00:00:00.000Z`);
 }
 
 type OrderedByValue = "TEAM" | "CLIENT";
+
+function formatOrderHistoryLine(orderedAt: string | null, orderedBy: string | null, expectedArrivalAt: string | null): string {
+    // Codex review round 1, issue 4: nullable orderedBy on legacy/edge-case
+    // rows must never be invented as "GTR team" — only render a segment when
+    // its underlying field is actually present.
+    const parts: string[] = ["Ordered"];
+    if (orderedAt) {
+        const dateLabel = toDateInputValue(orderedAt);
+        parts[0] = `Ordered ${dateLabel}`;
+    }
+    if (orderedBy) {
+        const whoLabel = orderedBy === "CLIENT" ? "Client" : "GTR team";
+        parts[0] = `${parts[0]} by ${whoLabel}`;
+    }
+    if (expectedArrivalAt) {
+        return `${parts[0]} · arrives ~${toDateInputValue(expectedArrivalAt)}`;
+    }
+    return parts[0];
+}
 
 export default function DecisionOrderPopover({
     decisionId,
@@ -51,8 +73,10 @@ export default function DecisionOrderPopover({
     const [orderDateDraft, setOrderDateDraft] = useState(toDateInputValue(orderedAt) || toCompanyDayKey(new Date()));
     const [orderedByDraft, setOrderedByDraft] = useState<OrderedByValue>((orderedBy as OrderedByValue) || "TEAM");
     const [etaDraft, setEtaDraft] = useState(toDateInputValue(expectedArrivalAt));
-    const [saving, setSaving] = useState(false);
-    const [busyAction, setBusyAction] = useState<"receive" | "clear" | null>(null);
+    // Single pending flag (Codex review round 1, issue 3) — Save and
+    // Clear/undo must be disabled TOGETHER while either is in flight, so a
+    // double-click can't fire a Save racing a Clear against the same row.
+    const [pending, setPending] = useState<"save" | "receive" | "clear" | null>(null);
 
     function handleOpenChange(next: boolean) {
         if (next) {
@@ -69,49 +93,70 @@ export default function DecisionOrderPopover({
             toast.error("Order date is required.");
             return;
         }
-        setSaving(true);
+        setPending("save");
         try {
-            await setDecisionOrderInfo(decisionId, {
+            // Field-level CAS (Codex review round 1, issue 3): send the
+            // orderedAt this form was seeded from (null for a fresh
+            // Decided -> Ordered transition) so the server can detect a
+            // concurrent change to the same row between open and Save.
+            const result = await setDecisionOrderInfo(decisionId, {
                 kind: "ordered",
                 orderedAt: dateOnlyToUtcMidnight(orderDateDraft),
                 orderedBy: orderedByDraft,
                 expectedArrivalAt: etaDraft ? dateOnlyToUtcMidnight(etaDraft) : null,
+                expectedOrderedAt: orderedAt ? dateOnlyToUtcMidnight(toDateInputValue(orderedAt)) : null,
             });
+            if (!result.ok) {
+                // Typed result (Codex review round 1, issue 1) — production
+                // redacts thrown Server Action error messages, so expected
+                // validation/CAS failures come back as data instead of a
+                // throw, and the real message reaches this toast in prod too.
+                toast.error(result.message);
+                return;
+            }
             toast.success(status === "Decided" ? "Marked ordered." : "Order info updated.");
             setOpen(false);
             onSaved();
         } catch (e: any) {
             toast.error(e?.message || "Couldn't save order info.");
         } finally {
-            setSaving(false);
+            setPending(null);
         }
     }
 
     async function handleReceive() {
-        setBusyAction("receive");
+        setPending("receive");
         try {
-            await setDecisionOrderInfo(decisionId, { kind: "received" });
+            const result = await setDecisionOrderInfo(decisionId, { kind: "received" });
+            if (!result.ok) {
+                toast.error(result.message);
+                return;
+            }
             toast.success("Marked received.");
             setOpen(false);
             onSaved();
         } catch (e: any) {
             toast.error(e?.message || "Couldn't mark received.");
         } finally {
-            setBusyAction(null);
+            setPending(null);
         }
     }
 
     async function handleClear() {
-        setBusyAction("clear");
+        setPending("clear");
         try {
-            await setDecisionOrderInfo(decisionId, { kind: "clear" });
+            const result = await setDecisionOrderInfo(decisionId, { kind: "clear" });
+            if (!result.ok) {
+                toast.error(result.message);
+                return;
+            }
             toast.success("Order info cleared.");
             setOpen(false);
             onSaved();
         } catch (e: any) {
             toast.error(e?.message || "Couldn't clear order info.");
         } finally {
-            setBusyAction(null);
+            setPending(null);
         }
     }
 
@@ -139,6 +184,14 @@ export default function DecisionOrderPopover({
             </button>
         );
 
+    // Codex review round 1, issue 2: a Received row showed editable fields
+    // + a Save that always sent kind "ordered" (the server rightly rejected
+    // it, but the UI dangled a live-looking form that could never succeed).
+    // Received is read-only history + ONLY the Clear/undo affordance.
+    const isReceived = status === "Received";
+    const orderDateInputId = `order-date-input-${decisionId}`;
+    const orderEtaInputId = `order-eta-input-${decisionId}`;
+
     return (
         <Dialog.Root open={open} onOpenChange={handleOpenChange}>
             <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
@@ -153,63 +206,77 @@ export default function DecisionOrderPopover({
                     </div>
 
                     <div className="p-5 space-y-4">
-                        <div>
-                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Order date</label>
-                            <input
-                                type="date"
-                                data-testid={`order-date-input-${decisionId}`}
-                                className="hui-input text-sm py-1 w-full mt-1"
-                                value={orderDateDraft}
-                                onChange={(e) => setOrderDateDraft(e.target.value)}
-                                disabled={saving}
-                            />
-                        </div>
-                        <div>
-                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Ordered by</label>
-                            <div className="flex items-center gap-4 mt-1">
-                                <label className="flex items-center gap-1.5 text-sm text-hui-textMain">
+                        {isReceived ? (
+                            <p data-testid={`order-history-${decisionId}`} className="text-sm text-hui-textMain">
+                                {formatOrderHistoryLine(orderedAt, orderedBy, expectedArrivalAt)} · Received
+                            </p>
+                        ) : (
+                            <>
+                                <div>
+                                    <label htmlFor={orderDateInputId} className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
+                                        Order date
+                                    </label>
                                     <input
-                                        type="radio"
-                                        name={`ordered-by-${decisionId}`}
-                                        data-testid={`order-by-team-${decisionId}`}
-                                        checked={orderedByDraft === "TEAM"}
-                                        onChange={() => setOrderedByDraft("TEAM")}
-                                        disabled={saving}
+                                        type="date"
+                                        id={orderDateInputId}
+                                        data-testid={orderDateInputId}
+                                        className="hui-input text-sm py-1 w-full mt-1"
+                                        value={orderDateDraft}
+                                        onChange={(e) => setOrderDateDraft(e.target.value)}
+                                        disabled={pending !== null}
                                     />
-                                    GTR team
-                                </label>
-                                <label className="flex items-center gap-1.5 text-sm text-hui-textMain">
+                                </div>
+                                <div>
+                                    <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Ordered by</label>
+                                    <div className="flex items-center gap-4 mt-1">
+                                        <label className="flex items-center gap-1.5 text-sm text-hui-textMain">
+                                            <input
+                                                type="radio"
+                                                name={`ordered-by-${decisionId}`}
+                                                data-testid={`order-by-team-${decisionId}`}
+                                                checked={orderedByDraft === "TEAM"}
+                                                onChange={() => setOrderedByDraft("TEAM")}
+                                                disabled={pending !== null}
+                                            />
+                                            GTR team
+                                        </label>
+                                        <label className="flex items-center gap-1.5 text-sm text-hui-textMain">
+                                            <input
+                                                type="radio"
+                                                name={`ordered-by-${decisionId}`}
+                                                data-testid={`order-by-client-${decisionId}`}
+                                                checked={orderedByDraft === "CLIENT"}
+                                                onChange={() => setOrderedByDraft("CLIENT")}
+                                                disabled={pending !== null}
+                                            />
+                                            Client
+                                        </label>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label htmlFor={orderEtaInputId} className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
+                                        Expected arrival (optional)
+                                    </label>
                                     <input
-                                        type="radio"
-                                        name={`ordered-by-${decisionId}`}
-                                        data-testid={`order-by-client-${decisionId}`}
-                                        checked={orderedByDraft === "CLIENT"}
-                                        onChange={() => setOrderedByDraft("CLIENT")}
-                                        disabled={saving}
+                                        type="date"
+                                        id={orderEtaInputId}
+                                        data-testid={orderEtaInputId}
+                                        className="hui-input text-sm py-1 w-full mt-1"
+                                        value={etaDraft}
+                                        onChange={(e) => setEtaDraft(e.target.value)}
+                                        disabled={pending !== null}
                                     />
-                                    Client
-                                </label>
-                            </div>
-                        </div>
-                        <div>
-                            <label className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Expected arrival (optional)</label>
-                            <input
-                                type="date"
-                                data-testid={`order-eta-input-${decisionId}`}
-                                className="hui-input text-sm py-1 w-full mt-1"
-                                value={etaDraft}
-                                onChange={(e) => setEtaDraft(e.target.value)}
-                                disabled={saving}
-                            />
-                        </div>
-                        <button
-                            data-testid={`order-save-${decisionId}`}
-                            onClick={handleSave}
-                            disabled={saving}
-                            className="hui-btn hui-btn-green text-xs py-1.5 px-3 disabled:opacity-50"
-                        >
-                            {saving ? "Saving…" : "Save"}
-                        </button>
+                                </div>
+                                <button
+                                    data-testid={`order-save-${decisionId}`}
+                                    onClick={handleSave}
+                                    disabled={pending !== null}
+                                    className="hui-btn hui-btn-green text-xs py-1.5 px-3 disabled:opacity-50"
+                                >
+                                    {pending === "save" ? "Saving…" : "Save"}
+                                </button>
+                            </>
+                        )}
 
                         {(status === "Ordered" || status === "Received") && (
                             <div className="pt-3 border-t border-hui-border flex items-center gap-2">
@@ -217,19 +284,19 @@ export default function DecisionOrderPopover({
                                     <button
                                         data-testid={`mark-received-${decisionId}`}
                                         onClick={handleReceive}
-                                        disabled={busyAction !== null}
+                                        disabled={pending !== null}
                                         className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 disabled:opacity-50"
                                     >
-                                        {busyAction === "receive" ? "Saving…" : "Mark received"}
+                                        {pending === "receive" ? "Saving…" : "Mark received"}
                                     </button>
                                 )}
                                 <button
                                     data-testid={`order-clear-${decisionId}`}
                                     onClick={handleClear}
-                                    disabled={busyAction !== null}
+                                    disabled={pending !== null}
                                     className="hui-btn hui-btn-secondary text-xs py-1.5 px-3 disabled:opacity-50"
                                 >
-                                    {busyAction === "clear" ? "Clearing…" : "Undo / clear"}
+                                    {pending === "clear" ? "Clearing…" : "Undo / clear"}
                                 </button>
                             </div>
                         )}

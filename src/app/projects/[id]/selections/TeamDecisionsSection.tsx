@@ -29,6 +29,7 @@ import ApplyTemplateModal from "./ApplyTemplateModal";
 import DecisionDueDateEditPopover, { type ProjectScheduleTaskOption } from "./DecisionDueDateEditPopover";
 import DecisionOrderPopover from "./DecisionOrderPopover";
 import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
+import { formatDeliveryRiskWording } from "@/lib/selection-order-risk";
 import {
     ImageOff,
     ExternalLink,
@@ -179,48 +180,48 @@ const APPROVED_STATUSES = ["Decided", "Ordered", "Received"];
 
 // Read-only "Ordered <date> by <who> · arrives ~<eta>" / "Received" history
 // line (Phase 4) — Ordered/Received only, gates itself so callers don't need
-// a status check.
+// a status check. Codex review round 1, issue 4: orderedBy is nullable
+// (legacy/edge-case rows) — NEVER invent attribution. Each segment (who,
+// order date) only renders when its underlying field is actually present;
+// with both absent this degrades gracefully to a bare "Ordered"/"Received".
 function OrderStatusLine({ decision }: { decision: DecisionData }) {
     if (decision.status !== "Ordered" && decision.status !== "Received") return null;
     const orderedDateLabel = decision.orderedAt ? formatDueDateShort(new Date(decision.orderedAt)) : null;
-    const whoLabel = decision.orderedBy === "CLIENT" ? "Client" : "GTR team";
+    const whoLabel = decision.orderedBy === "CLIENT" ? "Client" : decision.orderedBy === "TEAM" ? "GTR team" : null;
     const etaLabel = decision.expectedArrivalAt ? formatDueDateShort(new Date(decision.expectedArrivalAt)) : null;
 
+    let orderedSegment = "Ordered";
+    if (orderedDateLabel) orderedSegment += ` ${orderedDateLabel}`;
+    if (whoLabel) orderedSegment += ` by ${whoLabel}`;
+
     if (decision.status === "Received") {
+        const hasOrderedInfo = !!orderedDateLabel || !!whoLabel;
         return (
             <span data-testid={`order-status-line-${decision.id}`} className="text-xs text-hui-textMuted">
-                {orderedDateLabel ? `Ordered ${orderedDateLabel} by ${whoLabel} · ` : ""}Received
+                {hasOrderedInfo ? `${orderedSegment} · ` : ""}Received
             </span>
         );
     }
 
     return (
         <span data-testid={`order-status-line-${decision.id}`} className="text-xs text-hui-textMuted">
-            Ordered {orderedDateLabel} by {whoLabel}
+            {orderedSegment}
             {etaLabel ? ` · arrives ~${etaLabel}` : ""}
         </span>
     );
 }
 
-function riskWording(risk: DecisionData["risk"]): string {
-    const refLabel = risk.referenceDate ? formatDueDateShort(new Date(risk.referenceDate)) : "the linked date";
-    if (risk.level === "late") {
-        const days = risk.daysLate ?? 0;
-        return `arrives ${days} day${days === 1 ? "" : "s"} after ${refLabel}`;
-    }
-    const days = Math.abs(risk.daysLate ?? 0);
-    return `arrives ${days} day${days === 1 ? "" : "s"} before ${refLabel}`;
-}
-
 // Delivery-risk badge (Phase 4) — red "late" / amber "tight", derived from
 // assessDeliveryRisk via the staff loader's attached `risk`. Null level
-// renders nothing.
+// renders nothing. Wording built by the shared formatDeliveryRiskWording
+// (selection-order-risk.ts) — Codex review round 1, issue 5's zero-day
+// special case lives there once, not duplicated per call site.
 function RiskBadge({ decisionId, risk }: { decisionId: string; risk: DecisionData["risk"] }) {
     if (!risk.level) return null;
     const className = risk.level === "late" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700";
     return (
         <span data-testid={`risk-badge-${decisionId}`} className={`px-1.5 py-0.5 rounded-full font-medium text-xs ${className}`}>
-            {riskWording(risk)}
+            {formatDeliveryRiskWording(risk)}
         </span>
     );
 }
@@ -250,7 +251,7 @@ function RiskBanner({ decisions }: { decisions: DecisionData[] }) {
                                 href={`#decision-${decision.id}`}
                                 className={`hover:underline ${decision.risk.level === "late" ? "text-red-700" : "text-amber-700"}`}
                             >
-                                {decision.name} — {riskWording(decision.risk)}
+                                {decision.name} — {formatDeliveryRiskWording(decision.risk)}
                             </a>
                         </li>
                     ))}

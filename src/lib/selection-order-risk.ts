@@ -4,6 +4,7 @@
 // no server-only imports — importable directly by the staff loader (server),
 // the E2E specs, and the verifier, same convention as decision-due-date.ts.
 import { daysBetweenUtc } from "./date-utils";
+import { formatDueDateShort } from "./decision-due-date";
 
 export type DeliveryRiskLevel = "late" | "tight" | null;
 
@@ -59,4 +60,26 @@ export function assessDeliveryRisk(input: {
     if (diff >= 0) return { level: "late", referenceDate: reference, daysLate: diff };
     if (diff >= -TIGHT_BUFFER_DAYS) return { level: "tight", referenceDate: reference, daysLate: diff };
     return NO_RISK;
+}
+
+/**
+ * Shared wording builder (Codex review round 1, issue 5) — lives here
+ * instead of being duplicated in the badge/banner UI so it's unit-tested
+ * once, in the verifier. `arrives 0 day(s) after <date>` read as nonsense on
+ * the boundary case (arrival lands exactly ON the reference day) — that's
+ * "arrives the day <ref> starts", not a "0 days after" count.
+ */
+export function formatDeliveryRiskWording(risk: {
+    level: DeliveryRiskLevel;
+    referenceDate: Date | string | null;
+    daysLate: number | null;
+}): string {
+    if (!risk.level || !risk.referenceDate || risk.daysLate === null) return "";
+    const refLabel = formatDueDateShort(new Date(risk.referenceDate));
+    if (risk.level === "late") {
+        if (risk.daysLate === 0) return `arrives the day ${refLabel} starts`;
+        return `arrives ${risk.daysLate} day${risk.daysLate === 1 ? "" : "s"} after ${refLabel}`;
+    }
+    const daysBefore = Math.abs(risk.daysLate);
+    return `arrives ${daysBefore} day${daysBefore === 1 ? "" : "s"} before ${refLabel}`;
 }

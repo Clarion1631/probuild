@@ -11181,12 +11181,6 @@ export async function deleteDecision(decisionId: string) {
     if (!decision || decision.deletedAt) return { success: false };
     await assertDecisionActorAccess(decision.projectId);
 
-    // Ordered/Received are terminal — that's the company's purchasing
-    // record (Phase 3), not something either side deletes.
-    if (decision.status === "Ordered" || decision.status === "Received") {
-        throw new Error("This decision has already been ordered — it can't be deleted.");
-    }
-
     // Soft delete only. "They can approve and unapprove themselves, delete
     // stuff, it's their playground" (Justin, explicit) — clients can delete
     // ANY decision on their own project, no createdByClient or status
@@ -11202,16 +11196,40 @@ export async function deleteDecision(decisionId: string) {
     // deleted decision has no live approved record, and this keeps the
     // chooseItem/unchooseItem invariant (Decided+chosenItemId only ever
     // points at an item actually marked Chosen) true even while deleted.
-    await prisma.$transaction(async (tx) => {
+    //
+    // Ordered/Received are terminal — that's the company's purchasing
+    // record (Phase 4), not something either side deletes. Codex review
+    // round 1 BLOCKER: the guard used to be a plain read-then-check BEFORE
+    // this transaction, so a concurrent setDecisionOrderInfo("ordered")
+    // landing between the read above and this write would sail through
+    // undetected — the decision gets soft-deleted AND its status silently
+    // reset to Open, stranding orderedAt/orderedBy/expectedArrivalAt on a
+    // now-"Open" row with no CAS ever having rejected the delete. The guard
+    // now lives INSIDE the transaction as a CAS (status NOT IN
+    // [Ordered,Received], re-evaluated atomically at write time) — a
+    // concurrent order landing first makes this updateMany match zero rows,
+    // which is treated as "can't delete an ordered decision", same as if
+    // the pre-transaction read had already seen it. The reset also nulls
+    // the three order fields explicitly as defense-in-depth, even though
+    // the CAS should make it structurally impossible for a deleted row to
+    // carry them.
+    const deleted = await prisma.$transaction(async (tx) => {
+        const claim = await tx.decision.updateMany({
+            where: { id: decisionId, deletedAt: null, status: { notIn: ["Ordered", "Received"] } },
+            data: { deletedAt: new Date(), chosenItemId: null, status: "Open", decidedAt: null, orderedAt: null, orderedBy: null, expectedArrivalAt: null },
+        });
+        if (claim.count === 0) return false;
+
         await tx.selectionProposal.updateMany({
             where: { decisionId, status: "Chosen" },
             data: { status: "Idea" },
         });
-        await tx.decision.update({
-            where: { id: decisionId },
-            data: { deletedAt: new Date(), chosenItemId: null, status: "Open", decidedAt: null },
-        });
+        return true;
     });
+
+    if (!deleted) {
+        throw new Error("This decision has already been ordered — it can't be deleted.");
+    }
 
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
@@ -11718,7 +11736,11 @@ export async function restoreDecision(decisionId: string) {
         return { success: true }; // already live — idempotent no-op
     }
 
-    await prisma.decision.update({ where: { id: decisionId }, data: { deletedAt: null } });
+    // Defense-in-depth (Codex review round 1, BLOCKER follow-up): deleteDecision's
+    // CAS fix means a soft-deleted row can never carry order fields today,
+    // but null them explicitly here too so a restore is provably clean
+    // regardless of how the row got deleted.
+    await prisma.decision.update({ where: { id: decisionId }, data: { deletedAt: null, orderedAt: null, orderedBy: null, expectedArrivalAt: null } });
 
     revalidatePath(`/projects/${decision.projectId}/selections`);
     revalidatePath(`/portal/projects/${decision.projectId}/selections`);
