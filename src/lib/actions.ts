@@ -7733,6 +7733,7 @@ export async function unassignSubFromTask(taskId: string, subcontractorId: strin
 // ========== AI PUNCHLIST ==========
 
 export async function aiGeneratePunchlist(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
 
@@ -7772,19 +7773,25 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
-    const maxOrder = await prisma.taskPunchItem.aggregate({
-        where: { taskId },
-        _max: { order: true },
-    });
-    let order = (maxOrder._max.order ?? -1) + 1;
-
-    const created = [];
-    for (const name of items) {
-        const item = await prisma.taskPunchItem.create({
-            data: { taskId, name, order: order++ },
+    // One transaction so a mid-loop failure cannot leave a partial punch list,
+    // and the task lock serializes `order` with concurrent punch-item writers.
+    const created = await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+        const maxOrder = await tx.taskPunchItem.aggregate({
+            where: { taskId },
+            _max: { order: true },
         });
-        created.push(item);
-    }
+        let order = (maxOrder._max.order ?? -1) + 1;
+
+        const createdItems = [];
+        for (const name of items) {
+            const item = await tx.taskPunchItem.create({
+                data: { taskId, name, order: order++ },
+            });
+            createdItems.push(item);
+        }
+        return createdItems;
+    }, { maxWait: 10000, timeout: 30000 }));
     return created;
 }
 
