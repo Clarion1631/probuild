@@ -43,6 +43,19 @@ UI (executor-built, v3): `src/app/automation/` — validation panel (receipt ima
 
 ---
 
+## 2b. Tiered AI review — DEPLOYED (commits 4237c6e9 + hotfix 83b1e7c9, 2026-08-01)
+
+`POST /api/automation/ai-review` ({docNumber}) + "AI review" button in the validation panel (shows once the ProBuild receipt copy exists, i.e. after sync). Read-only; result logged as journey stage `ai-review`.
+
+- **Tier 1:** Gemini Flash (`gemini-3.0-flash-preview`, same in-repo model as room-designer-review) independently re-reads the stored receipt and compares vendor/total/tax against booked values in cents.
+- **Tier 2 ("big guns"):** Claude Opus 5 (`claude-opus-5`, max_tokens 8000) runs ONLY when tier 1 flags, can't read, or fails — arbitrates with booked values + tier 1's read in the prompt, returns `trueTotal/trueTax/bookedIsCorrect/explanation`.
+- **Ruling is computed in code, fail-closed:** `outcome = agree | mismatch | inconclusive` from cent comparisons (tier 2's `trueTotal` decides when present; model booleans advisory only). A required-but-failed escalation is **inconclusive, never clean**. UI: teal agree / red mismatch / amber "check manually" + amber `?` stage icon.
+- Codex review round on the endpoint (5 blockers) all fixed in `83b1e7c9`: fail-closed JSON parsing (explicit `legible` boolean + usable total required), tax null-vs-zero verdict rule, SSRF sink check (receiptUrl must be our `SUPABASE_URL/storage/v1/object/public/` prefix, `redirect:"error"`, 20s timeout, 7MB cap), per-instance in-flight lock + 10/min rate window (429s), split-tender + prompt-injection lines in both prompts, GIF dropped from accepted types.
+- The number framed everywhere is **expectedBankChargeCents** — the amount Vanessa's bank match must hit.
+- Same deploy also fixed a stale local Prisma client (another session's PR #269 added `Decision.expectedArrivalAt` etc.; `prisma generate` fixed a bogus type collapse at `src/app/portal/clip/page.tsx:90` — remember to regenerate after pulling schema changes).
+
+---
+
 ## 3. All the links
 
 - **Command Center (v2 live):** https://probuild.goldentouchremodeling.com/automation
