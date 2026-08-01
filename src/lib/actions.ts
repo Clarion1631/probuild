@@ -86,6 +86,7 @@ import {
 } from "./portal-tracker";
 import {
     createScheduleTaskInTransaction,
+    SCHEDULE_TASK_STATUSES,
     setTaskLeadInTransaction,
     updateScheduleTaskInTransaction,
     type CreateScheduleTaskInput,
@@ -4187,6 +4188,16 @@ async function assertScheduleTaskAccess(taskId: string) {
     return { user, projectId: task.projectId };
 }
 
+// Mirrors the /leads/[id] layout gate: a remotely invoked Server Action cannot
+// lean on the page layout that normally checks `leadAccess`.
+async function assertLeadScheduleAccess(leadId: string) {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+    const lead = await prisma.lead.findUnique({ where: { id: leadId }, select: { id: true } });
+    if (!lead) throw new Error("Lead not found");
+    return user;
+}
+
 async function assertStagingQueueAccess() {
     const user = await assertActiveStaff();
     if (!["ADMIN", "MANAGER", "FIELD_CREW"].includes(user.role) || !hasPermission(user, "schedules")) {
@@ -7733,6 +7744,7 @@ export async function unassignSubFromTask(taskId: string, subcontractorId: strin
 // ========== AI PUNCHLIST ==========
 
 export async function aiGeneratePunchlist(taskId: string) {
+    await assertScheduleTaskAccess(taskId);
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
 
@@ -7772,23 +7784,30 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
     const items: string[] = JSON.parse(rawText);
     if (!Array.isArray(items)) throw new Error("Invalid AI response");
 
-    const maxOrder = await prisma.taskPunchItem.aggregate({
-        where: { taskId },
-        _max: { order: true },
-    });
-    let order = (maxOrder._max.order ?? -1) + 1;
-
-    const created = [];
-    for (const name of items) {
-        const item = await prisma.taskPunchItem.create({
-            data: { taskId, name, order: order++ },
+    // One transaction so a mid-loop failure cannot leave a partial punch list,
+    // and the task lock serializes `order` with concurrent punch-item writers.
+    const created = await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${taskId} FOR UPDATE`;
+        const maxOrder = await tx.taskPunchItem.aggregate({
+            where: { taskId },
+            _max: { order: true },
         });
-        created.push(item);
-    }
+        let order = (maxOrder._max.order ?? -1) + 1;
+
+        const createdItems = [];
+        for (const name of items) {
+            const item = await tx.taskPunchItem.create({
+                data: { taskId, name, order: order++ },
+            });
+            createdItems.push(item);
+        }
+        return createdItems;
+    }, { maxWait: 10000, timeout: 30000 }));
     return created;
 }
 
 export async function aiGenerateSchedule(projectId: string, estimateId?: string) {
+    await assertScheduleProjectAccess(projectId);
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
 
@@ -7797,16 +7816,15 @@ export async function aiGenerateSchedule(projectId: string, estimateId?: string)
 
     let estimateContext = "";
     if (estimateId) {
-        const estimate = await prisma.estimate.findUnique({
-            where: { id: estimateId },
+        const estimate = await prisma.estimate.findFirst({
+            where: { id: estimateId, projectId },
             include: { items: { where: { parentId: null }, orderBy: { order: "asc" }, include: { subItems: true } } },
         });
-        if (estimate) {
-            estimateContext = `\n\nESTIMATE LINE ITEMS:\n${estimate.items.map(i => {
-                const laborHrs = i.subItems?.filter((s: any) => s.type === "Labor").reduce((a: number, s: any) => a + (s.quantity || 0), 0) || (i.type === "Labor" ? i.quantity : 0);
-                return `- ${i.name} (Type: ${i.type}, Labor Hours: ${laborHrs || "N/A"})`;
-            }).join("\n")}`;
-        }
+        if (!estimate) throw new Error("Estimate not found on this project");
+        estimateContext = `\n\nESTIMATE LINE ITEMS:\n${estimate.items.map(i => {
+            const laborHrs = i.subItems?.filter((s: any) => s.type === "Labor").reduce((a: number, s: any) => a + (s.quantity || 0), 0) || (i.type === "Labor" ? i.quantity : 0);
+            return `- ${i.name} (Type: ${i.type}, Labor Hours: ${laborHrs || "N/A"})`;
+        }).join("\n")}`;
     }
 
     const prompt = `You are an expert construction project manager. Generate a realistic schedule for this project.
@@ -7842,50 +7860,80 @@ Rules:
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    const aiTasks: { name: string; durationDays: number; estimatedHours: number; dependsOn: number[] }[] = JSON.parse(rawText);
-    if (!Array.isArray(aiTasks)) throw new Error("Invalid AI response");
+    const parsed: unknown = JSON.parse(rawText);
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 40) throw new Error("Invalid AI response");
 
-    const maxOrder = await prisma.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
-    let order = (maxOrder._max.order ?? -1) + 1;
+    // The model's output is untrusted input: bound every field before it reaches
+    // the database. Dependencies may only point backward (matches the prompt),
+    // which also rules out self-references, cycles, and forward references; the
+    // Set dedupe keeps the (predecessorId, dependentId) unique constraint safe.
+    const aiTasks = parsed.map((raw, i) => {
+        const t = (raw ?? {}) as { name?: unknown; durationDays?: unknown; estimatedHours?: unknown; dependsOn?: unknown };
+        // Strip NUL bytes — they pass string checks but PostgreSQL rejects them.
+        const name = typeof t.name === "string" ? t.name.replace(/\u0000/g, "").trim().slice(0, 200) : "";
+        if (!name) throw new Error("Invalid AI response");
+        const durationDays = typeof t.durationDays === "number" && Number.isFinite(t.durationDays) && t.durationDays >= 1
+            ? Math.min(Math.round(t.durationDays), 90)
+            : 5;
+        const estimatedHours = typeof t.estimatedHours === "number" && Number.isFinite(t.estimatedHours) && t.estimatedHours > 0
+            ? Math.min(t.estimatedHours, 10000)
+            : null;
+        const dependsOn = [...new Set(
+            (Array.isArray(t.dependsOn) ? t.dependsOn : []).filter((d): d is number => Number.isInteger(d) && d >= 0 && d < i)
+        )];
+        return { name, durationDays, estimatedHours, dependsOn };
+    });
 
     const COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
     const today = new Date();
-    const createdIds: string[] = [];
-    const created = [];
-    let dayOffset = 0;
 
-    for (let i = 0; i < aiTasks.length; i++) {
-        const t = aiTasks[i];
-        const startDate = new Date(today.getTime() + dayOffset * 86400000);
-        const endDate = new Date(today.getTime() + (dayOffset + (t.durationDays || 5)) * 86400000);
-        dayOffset += Math.ceil((t.durationDays || 5) * 0.7);
+    // All writes happen in one transaction so a mid-loop failure cannot leave a
+    // partial schedule behind, and the project lock serializes `order` with the
+    // other schedule writers (same pattern as clearAllTasks).
+    const created = await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const maxOrder = await tx.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
+        let order = (maxOrder._max.order ?? -1) + 1;
 
-        const task = await prisma.scheduleTask.create({
-            data: {
-                projectId,
-                name: t.name,
-                startDate,
-                endDate,
-                color: getDefaultColorForTaskName(t.name) || COLORS[i % COLORS.length],
-                order: order++,
-                status: "Not Started",
-                estimatedHours: t.estimatedHours || null,
-            },
-        });
-        createdIds.push(task.id);
-        created.push(task);
-    }
+        const createdIds: string[] = [];
+        const createdTasks = [];
+        let dayOffset = 0;
 
-    // Create dependencies
-    for (let i = 0; i < aiTasks.length; i++) {
-        for (const depIdx of (aiTasks[i].dependsOn || [])) {
-            if (depIdx >= 0 && depIdx < createdIds.length && depIdx !== i) {
-                await prisma.taskDependency.create({
-                    data: { predecessorId: createdIds[depIdx], dependentId: createdIds[i] },
-                });
+        for (let i = 0; i < aiTasks.length; i++) {
+            const t = aiTasks[i];
+            const startDate = new Date(today.getTime() + dayOffset * 86400000);
+            const endDate = new Date(today.getTime() + (dayOffset + (t.durationDays || 5)) * 86400000);
+            dayOffset += Math.ceil((t.durationDays || 5) * 0.7);
+
+            const task = await tx.scheduleTask.create({
+                data: {
+                    projectId,
+                    name: t.name,
+                    startDate,
+                    endDate,
+                    color: getDefaultColorForTaskName(t.name) || COLORS[i % COLORS.length],
+                    order: order++,
+                    status: "Not Started",
+                    estimatedHours: t.estimatedHours || null,
+                },
+            });
+            createdIds.push(task.id);
+            createdTasks.push(task);
+        }
+
+        // Create dependencies
+        for (let i = 0; i < aiTasks.length; i++) {
+            for (const depIdx of (aiTasks[i].dependsOn || [])) {
+                if (depIdx >= 0 && depIdx < createdIds.length && depIdx !== i) {
+                    await tx.taskDependency.create({
+                        data: { predecessorId: createdIds[depIdx], dependentId: createdIds[i] },
+                    });
+                }
             }
         }
-    }
+
+        return createdTasks;
+    }, { maxWait: 10000, timeout: 30000 }));
 
     revalidatePath(`/projects/${projectId}/schedule`);
     return created;
@@ -12461,10 +12509,32 @@ export async function deleteCatalogItem(id: string) {
 // ─── Lead Schedule ────────────────────────────────────────────────────────
 
 export async function getLeadScheduleTasks(leadId: string) {
+    await assertLeadScheduleAccess(leadId);
     return prisma.scheduleTask.findMany({
         where: { leadId },
         orderBy: { order: "asc" },
     });
+}
+
+// Runtime validation for lead task fields — the TS signature is not enforced on
+// a forged Server Action call, so every accepted value gets checked here.
+function leadTaskName(value: unknown): string {
+    const name = typeof value === "string" ? value.replace(/\u0000/g, "").trim().slice(0, 200) : "";
+    if (!name) throw new Error("Task name is required");
+    return name;
+}
+
+function leadTaskDate(value: unknown, label: string): Date {
+    const date = value instanceof Date ? value : (typeof value === "string" ? new Date(value) : null);
+    if (!date || isNaN(date.getTime())) throw new Error(`Invalid ${label}`);
+    return date;
+}
+
+function leadTaskStatus(value: unknown): string {
+    if (!(SCHEDULE_TASK_STATUSES as readonly string[]).includes(value as string)) {
+        throw new Error(`Invalid schedule task status "${value}"`);
+    }
+    return value as string;
 }
 
 export async function createLeadScheduleTask(leadId: string, data: {
@@ -12473,13 +12543,13 @@ export async function createLeadScheduleTask(leadId: string, data: {
     endDate: Date;
 }) {
     "use server";
+    await assertLeadScheduleAccess(leadId);
+    const name = leadTaskName(data.name);
+    const startDate = leadTaskDate(data.startDate, "start date");
+    const endDate = leadTaskDate(data.endDate, "end date");
+    if (endDate < startDate) throw new Error("Task end date cannot be before its start date");
     const task = await prisma.scheduleTask.create({
-        data: {
-            leadId,
-            name: data.name,
-            startDate: data.startDate,
-            endDate: data.endDate,
-        },
+        data: { leadId, name, startDate, endDate },
     });
     revalidatePath(`/leads/${leadId}/schedule`);
     return task;
@@ -12492,17 +12562,49 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
     endDate?: Date;
 }) {
     "use server";
-    const task = await prisma.scheduleTask.update({
-        where: { id: taskId },
-        data,
-    });
+    await assertLeadScheduleAccess(leadId);
+    // Whitelist fields explicitly — a forged Server Action call can carry extra
+    // properties (leadId, projectId, order, ...) that the TS signature doesn't
+    // stop at runtime. The leadId in the where keeps the ownership check and the
+    // write atomic (no re-parent race between check and update).
+    const update: { name?: string; status?: string; startDate?: Date; endDate?: Date } = {};
+    if (data.name !== undefined) update.name = leadTaskName(data.name);
+    if (data.status !== undefined) update.status = leadTaskStatus(data.status);
+    if (data.startDate !== undefined) update.startDate = leadTaskDate(data.startDate, "start date");
+    if (data.endDate !== undefined) update.endDate = leadTaskDate(data.endDate, "end date");
+    if (update.startDate || update.endDate) {
+        let start = update.startDate;
+        let end = update.endDate;
+        if (!start || !end) {
+            const persisted = await prisma.scheduleTask.findFirst({
+                where: { id: taskId, leadId },
+                select: { startDate: true, endDate: true },
+            });
+            if (!persisted) throw new Error("Task not found");
+            start = start ?? persisted.startDate;
+            end = end ?? persisted.endDate;
+        }
+        if (end < start) throw new Error("Task end date cannot be before its start date");
+    }
+    let task;
+    try {
+        task = await prisma.scheduleTask.update({
+            where: { id: taskId, leadId },
+            data: update,
+        });
+    } catch (e) {
+        if ((e as { code?: string })?.code === "P2025") throw new Error("Task not found");
+        throw e;
+    }
     revalidatePath(`/leads/${leadId}/schedule`);
     return task;
 }
 
 export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
     "use server";
-    await prisma.scheduleTask.delete({ where: { id: taskId } });
+    await assertLeadScheduleAccess(leadId);
+    const deleted = await prisma.scheduleTask.deleteMany({ where: { id: taskId, leadId } });
+    if (deleted.count === 0) throw new Error("Task not found");
     revalidatePath(`/leads/${leadId}/schedule`);
     return { success: true };
 }
