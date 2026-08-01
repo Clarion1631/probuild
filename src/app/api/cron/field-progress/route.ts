@@ -45,11 +45,14 @@ export async function GET(request: Request) {
     const TIME_BUDGET_MS = 240_000;
     const deadlineAt = startedAt + TIME_BUDGET_MS;
 
+    // The scheduled sweep covers projects with a mapped Chat space; an explicit
+    // ?projectId= run may target any open project (ingest degrades gracefully
+    // when no space or credential exists — the model still reads whatever
+    // daily logs are already there).
     const projects = await prisma.project.findMany({
         where: {
-            googleChatSpaceId: { not: null },
             status: { notIn: [...CLOSED_PROJECT_STATUSES] },
-            ...(onlyProjectId ? { id: onlyProjectId } : {}),
+            ...(onlyProjectId ? { id: onlyProjectId } : { googleChatSpaceId: { not: null } }),
         },
         select: { id: true, name: true },
         orderBy: { createdAt: "asc" },
