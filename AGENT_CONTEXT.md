@@ -70,7 +70,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 
 ## Existing API Routes (src/app/api/)
 
-`auth/[...nextauth]` · `ai-estimate` · `ai-schedule` · `clients` + `clients/[id]` + `clients/[id]/invite` · `cost-codes` · `cost-types` · `expenses` + `expenses/[id]` + `expenses/parse` · `files` + `files/folders` · `leads/[id]/notes/ai` · `leads/messages` + `leads/messages/suggest` · `me/permissions` · `messages/[id]/read` · `mobile/login` · `payments/create-session` · `pdf/[id]` · `projects` + `projects/[id]` + `projects/[id]/buckets` + `projects/[id]/cost-codes` + `projects/[id]/crew` · `seed` · `sub-portal/login` + `sub-portal/verify` · `subcontractors` + `subcontractors/[id]` · `takeoffs` + `takeoffs/[id]` + `takeoffs/ai-estimate` + `takeoffs/convert-to-estimate` + `takeoffs/register-file` + `takeoffs/upload` · `time-entries` · `users` + `users/[id]` · `webhook/stripe`
+`auth/[...nextauth]` · `ai-estimate` · `clients` + `clients/[id]` + `clients/[id]/invite` · `cost-codes` · `cost-types` · `expenses` + `expenses/[id]` + `expenses/parse` · `files` + `files/folders` · `leads/[id]/notes/ai` · `leads/messages` + `leads/messages/suggest` · `me/permissions` · `messages/[id]/read` · `mobile/login` · `payments/create-session` · `pdf/[id]` · `projects` + `projects/[id]` + `projects/[id]/buckets` + `projects/[id]/cost-codes` + `projects/[id]/crew` · `seed` · `sub-portal/login` + `sub-portal/verify` · `subcontractors` + `subcontractors/[id]` · `takeoffs` + `takeoffs/[id]` + `takeoffs/ai-estimate` + `takeoffs/convert-to-estimate` + `takeoffs/register-file` + `takeoffs/upload` · `time-entries` · `users` + `users/[id]` · `webhook/stripe`
 
 ---
 

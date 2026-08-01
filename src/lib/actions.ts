@@ -4187,6 +4187,16 @@ async function assertScheduleTaskAccess(taskId: string) {
     return { user, projectId: task.projectId };
 }
 
+// Mirrors the /leads/[id] layout gate: a remotely invoked Server Action cannot
+// lean on the page layout that normally checks `leadAccess`.
+async function assertLeadScheduleAccess(leadId: string) {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+    const lead = await prisma.lead.findUnique({ where: { id: leadId }, select: { id: true } });
+    if (!lead) throw new Error("Lead not found");
+    return user;
+}
+
 async function assertStagingQueueAccess() {
     const user = await assertActiveStaff();
     if (!["ADMIN", "MANAGER", "FIELD_CREW"].includes(user.role) || !hasPermission(user, "schedules")) {
@@ -7789,6 +7799,7 @@ Example: ["Check all outlets for proper voltage", "Verify GFCI protection in wet
 }
 
 export async function aiGenerateSchedule(projectId: string, estimateId?: string) {
+    await assertScheduleProjectAccess(projectId);
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
 
@@ -7797,8 +7808,8 @@ export async function aiGenerateSchedule(projectId: string, estimateId?: string)
 
     let estimateContext = "";
     if (estimateId) {
-        const estimate = await prisma.estimate.findUnique({
-            where: { id: estimateId },
+        const estimate = await prisma.estimate.findFirst({
+            where: { id: estimateId, projectId },
             include: { items: { where: { parentId: null }, orderBy: { order: "asc" }, include: { subItems: true } } },
         });
         if (estimate) {
@@ -7845,47 +7856,56 @@ Rules:
     const aiTasks: { name: string; durationDays: number; estimatedHours: number; dependsOn: number[] }[] = JSON.parse(rawText);
     if (!Array.isArray(aiTasks)) throw new Error("Invalid AI response");
 
-    const maxOrder = await prisma.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
-    let order = (maxOrder._max.order ?? -1) + 1;
-
     const COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
     const today = new Date();
-    const createdIds: string[] = [];
-    const created = [];
-    let dayOffset = 0;
 
-    for (let i = 0; i < aiTasks.length; i++) {
-        const t = aiTasks[i];
-        const startDate = new Date(today.getTime() + dayOffset * 86400000);
-        const endDate = new Date(today.getTime() + (dayOffset + (t.durationDays || 5)) * 86400000);
-        dayOffset += Math.ceil((t.durationDays || 5) * 0.7);
+    // All writes happen in one transaction so a mid-loop failure cannot leave a
+    // partial schedule behind, and the project lock serializes `order` with the
+    // other schedule writers (same pattern as clearAllTasks).
+    const created = await withTxRetry(() => prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        const maxOrder = await tx.scheduleTask.aggregate({ where: { projectId }, _max: { order: true } });
+        let order = (maxOrder._max.order ?? -1) + 1;
 
-        const task = await prisma.scheduleTask.create({
-            data: {
-                projectId,
-                name: t.name,
-                startDate,
-                endDate,
-                color: getDefaultColorForTaskName(t.name) || COLORS[i % COLORS.length],
-                order: order++,
-                status: "Not Started",
-                estimatedHours: t.estimatedHours || null,
-            },
-        });
-        createdIds.push(task.id);
-        created.push(task);
-    }
+        const createdIds: string[] = [];
+        const createdTasks = [];
+        let dayOffset = 0;
 
-    // Create dependencies
-    for (let i = 0; i < aiTasks.length; i++) {
-        for (const depIdx of (aiTasks[i].dependsOn || [])) {
-            if (depIdx >= 0 && depIdx < createdIds.length && depIdx !== i) {
-                await prisma.taskDependency.create({
-                    data: { predecessorId: createdIds[depIdx], dependentId: createdIds[i] },
-                });
+        for (let i = 0; i < aiTasks.length; i++) {
+            const t = aiTasks[i];
+            const startDate = new Date(today.getTime() + dayOffset * 86400000);
+            const endDate = new Date(today.getTime() + (dayOffset + (t.durationDays || 5)) * 86400000);
+            dayOffset += Math.ceil((t.durationDays || 5) * 0.7);
+
+            const task = await tx.scheduleTask.create({
+                data: {
+                    projectId,
+                    name: t.name,
+                    startDate,
+                    endDate,
+                    color: getDefaultColorForTaskName(t.name) || COLORS[i % COLORS.length],
+                    order: order++,
+                    status: "Not Started",
+                    estimatedHours: t.estimatedHours || null,
+                },
+            });
+            createdIds.push(task.id);
+            createdTasks.push(task);
+        }
+
+        // Create dependencies
+        for (let i = 0; i < aiTasks.length; i++) {
+            for (const depIdx of (aiTasks[i].dependsOn || [])) {
+                if (depIdx >= 0 && depIdx < createdIds.length && depIdx !== i) {
+                    await tx.taskDependency.create({
+                        data: { predecessorId: createdIds[depIdx], dependentId: createdIds[i] },
+                    });
+                }
             }
         }
-    }
+
+        return createdTasks;
+    }, { maxWait: 10000, timeout: 30000 }));
 
     revalidatePath(`/projects/${projectId}/schedule`);
     return created;
@@ -12461,6 +12481,7 @@ export async function deleteCatalogItem(id: string) {
 // ─── Lead Schedule ────────────────────────────────────────────────────────
 
 export async function getLeadScheduleTasks(leadId: string) {
+    await assertLeadScheduleAccess(leadId);
     return prisma.scheduleTask.findMany({
         where: { leadId },
         orderBy: { order: "asc" },
@@ -12473,6 +12494,7 @@ export async function createLeadScheduleTask(leadId: string, data: {
     endDate: Date;
 }) {
     "use server";
+    await assertLeadScheduleAccess(leadId);
     const task = await prisma.scheduleTask.create({
         data: {
             leadId,
@@ -12492,6 +12514,9 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
     endDate?: Date;
 }) {
     "use server";
+    await assertLeadScheduleAccess(leadId);
+    const existing = await prisma.scheduleTask.findFirst({ where: { id: taskId, leadId }, select: { id: true } });
+    if (!existing) throw new Error("Task not found");
     const task = await prisma.scheduleTask.update({
         where: { id: taskId },
         data,
@@ -12502,6 +12527,9 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
 
 export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
     "use server";
+    await assertLeadScheduleAccess(leadId);
+    const existing = await prisma.scheduleTask.findFirst({ where: { id: taskId, leadId }, select: { id: true } });
+    if (!existing) throw new Error("Task not found");
     await prisma.scheduleTask.delete({ where: { id: taskId } });
     revalidatePath(`/leads/${leadId}/schedule`);
     return { success: true };
