@@ -1811,6 +1811,14 @@ model Decision {
   // column. effectiveDueDate is computed on read (dueDate ?? derived from the
   // linked task minus leadTimeDays) — see decision-due-date.ts.
   dueDate         DateTime?
+  // Phase 4 — Selection Order Tracking + Delivery Risk
+  // (docs/superpowers/plans/2026-07-31-selection-order-tracking.md). All
+  // nullable, no FK, no backfill — `status` keeps driving the lifecycle.
+  // Canonical writer: setDecisionOrderInfo (decision-order-actions-core.ts) —
+  // no other path writes these three columns.
+  orderedAt         DateTime? // when the order was placed
+  orderedBy         String?   // "TEAM" | "CLIENT" — who purchased
+  expectedArrivalAt DateTime? // ETA used for schedule-risk comparison
   createdByClient Boolean             @default(false)
   decidedAt       DateTime?
   pmNote          String?             // client-visible note from the flag path

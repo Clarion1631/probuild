@@ -289,7 +289,10 @@ export async function updateScheduleTaskInTransaction(
         updateData.name = name;
     }
     if (data.color !== undefined) updateData.color = data.color;
-    if (data.progress !== undefined) updateData.progress = data.progress;
+    if (data.progress !== undefined) {
+        if (!Number.isFinite(data.progress)) throw new Error("Progress must be a number");
+        updateData.progress = Math.min(100, Math.max(0, Math.round(data.progress)));
+    }
     if (data.status !== undefined) updateData.status = data.status;
     if (data.assignee !== undefined) updateData.assignee = data.assignee;
     if (data.order !== undefined) updateData.order = data.order;
