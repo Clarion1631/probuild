@@ -105,6 +105,13 @@ function StepIcon({ status }: { status: string }) {
             </span>
         );
     }
+    if (status === "inconclusive") {
+        return (
+            <span className="w-5 h-5 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center text-xs shrink-0">
+                ?
+            </span>
+        );
+    }
     return (
         <span className="w-5 h-5 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center text-xs shrink-0">
             →
@@ -283,6 +290,8 @@ interface AiReviewSuccess {
     ok: true;
     reviewedAt: string;
     anyFlag: boolean;
+    /** Fail-closed ruling from the server; anyFlag alone can't express "couldn't tell". */
+    outcome?: "agree" | "mismatch" | "inconclusive";
     models: AiReviewModelResult[];
 }
 
@@ -649,10 +658,16 @@ function ValidationPanel({ journey }: { journey: SerializedJourney }) {
 
                 {aiResult && (
                     <div className="mt-3 space-y-2">
-                        <p className={`text-xs font-medium ${aiResult.anyFlag ? "text-red-700" : "text-teal-700"}`}>
-                            {aiResult.anyFlag
-                                ? "⚠ A model disagrees with what was booked — check the flagged fields"
-                                : `${aiResult.models.length === 1 ? "Model agrees" : "Both models agree"} with what was booked ✓`}
+                        <p className={`text-xs font-medium ${
+                            aiResult.outcome === "inconclusive"
+                                ? "text-amber-700"
+                                : aiResult.anyFlag ? "text-red-700" : "text-teal-700"
+                        }`}>
+                            {aiResult.outcome === "inconclusive"
+                                ? "⚠ Couldn't reach a confident verdict — check this one manually against the receipt image"
+                                : aiResult.anyFlag
+                                    ? "⚠ A model disagrees with what was booked — check the flagged fields"
+                                    : `${aiResult.models.length === 1 ? "Model agrees" : "Both models agree"} with what was booked ✓`}
                         </p>
                         {aiResult.models.map((m) => (
                             <div key={m.model} className="border border-hui-border rounded-lg p-2.5">
