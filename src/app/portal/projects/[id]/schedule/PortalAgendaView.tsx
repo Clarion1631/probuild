@@ -110,10 +110,8 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
     }
 
     function toggleExpanded(taskId: string) {
-        setExpandedId(prev => {
-            if (prev !== taskId) setCommentText("");
-            return prev === taskId ? null : taskId;
-        });
+        if (expandedId !== taskId) setCommentText("");
+        setExpandedId(prev => prev === taskId ? null : taskId);
     }
 
     async function handleAddComment(taskId: string) {
