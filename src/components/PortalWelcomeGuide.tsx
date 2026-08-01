@@ -74,30 +74,35 @@ export default function PortalWelcomeGuide({
 
     return (
         <div className="hui-card border-emerald-200 bg-gradient-to-br from-emerald-50/60 to-white">
-            <button
-                onClick={() => setOpen((value) => !value)}
-                aria-expanded={open}
-                aria-controls={contentId}
-                className="w-full flex items-center gap-3 p-4 text-left"
-            >
-                <span className="shrink-0 w-8 h-8 rounded-md bg-emerald-100 text-emerald-700 flex items-center justify-center">
-                    <svg className="w-4.5 h-4.5" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                </span>
-                <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-bold text-hui-textMain">How your portal works</span>
-                    <span className="block text-xs text-hui-textMuted">A quick walkthrough of what you can do here.</span>
-                </span>
-                <svg
-                    className={`shrink-0 w-4 h-4 text-hui-textMuted transition-transform ${open ? "rotate-180" : ""}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
+            {/* Heading wraps the disclosure button (WAI accordion pattern) so
+                "How your portal works" stays in screen-reader heading nav. */}
+            <h2>
+                <button
+                    onClick={() => setOpen((value) => !value)}
+                    aria-expanded={open}
+                    aria-controls={contentId}
+                    className="w-full flex items-center gap-3 p-4 text-left rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-inset"
                 >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                </svg>
-            </button>
+                    <span className="shrink-0 w-8 h-8 rounded-md bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                        <svg aria-hidden="true" className="w-4.5 h-4.5" width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    </span>
+                    <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-bold text-hui-textMain">How your portal works</span>
+                        <span className="block text-xs font-normal text-hui-textMuted">A quick walkthrough of what you can do here.</span>
+                    </span>
+                    <svg
+                        aria-hidden="true"
+                        className={`shrink-0 w-4 h-4 text-hui-textMuted transition-transform ${open ? "rotate-180" : ""}`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                    >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                </button>
+            </h2>
             {open && (
-                <div id={contentId} className="px-4 pb-5 md:px-5">
+                <div id={contentId} className="px-4 pb-5">
                     <p className="text-sm text-hui-textMuted mb-4">
                         {companyName} keeps everything about your project in one place. Here&apos;s what you can do:
                     </p>

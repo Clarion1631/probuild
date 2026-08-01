@@ -64,7 +64,10 @@ export function SelectionItemNote({
 
     if (editing) {
         return (
-            <div className={className}>
+            // basis-full: inside the card's flex-wrap action row the editor
+            // must take the whole row even when it was opened from the inline
+            // "Add note" link (no saved note → the parent passes no width).
+            <div className={`${className ?? ""} basis-full`.trim()}>
                 <textarea
                     aria-label="Selection item note"
                     className="hui-input w-full text-xs"
@@ -107,7 +110,7 @@ export function SelectionItemNote({
                 <button
                     type="button"
                     data-testid="selection-note-edit"
-                    className="text-xs font-medium text-blue-600 hover:underline"
+                    className="inline-flex items-center min-h-[32px] py-1 text-xs font-medium text-blue-600 hover:underline"
                     onClick={startEditing}
                 >
                     Add note
@@ -121,6 +124,10 @@ export function SelectionItemNote({
             {/* Tinted block so the note reads as a note at a glance instead of
                 blending in with the item description. */}
             <div className="rounded-md bg-amber-50 border border-amber-100 px-2 py-1.5">
+                {/* Non-color cue so the tint reads as "note", not a warning. */}
+                <span className="block text-[10px] font-semibold uppercase tracking-wider text-amber-700">
+                    Note
+                </span>
                 <p
                     ref={previewRef}
                     data-testid="selection-note-preview"
@@ -133,13 +140,13 @@ export function SelectionItemNote({
                 >
                     {displayedNote}
                 </p>
-                <div className="mt-0.5 flex items-center gap-3">
+                <div className="flex items-center gap-4">
                     {hasOverflow && (
                         <button
                             type="button"
                             data-testid="selection-note-toggle"
                             aria-expanded={expanded}
-                            className="text-[11px] font-medium text-blue-600 hover:underline"
+                            className="inline-flex items-center min-h-[32px] py-1 text-xs font-medium text-blue-600 hover:underline"
                             onClick={() => setExpanded((value) => !value)}
                         >
                             {expanded ? "Show less" : "Show more"}
@@ -148,7 +155,7 @@ export function SelectionItemNote({
                     <button
                         type="button"
                         data-testid="selection-note-edit"
-                        className="text-[11px] font-medium text-blue-600 hover:underline"
+                        className="inline-flex items-center min-h-[32px] py-1 text-xs font-medium text-blue-600 hover:underline"
                         onClick={startEditing}
                     >
                         Edit note

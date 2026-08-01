@@ -127,7 +127,10 @@ export function SelectionItemThread({
     }
 
     return (
-        <div className={className}>
+        // basis-full when expanded: inside the card's flex-wrap action row the
+        // open composer must take the whole row even when the thread was empty
+        // (no comments → the parent passes no width class).
+        <div className={`${className ?? ""} ${expanded ? "basis-full" : ""}`.trim()}>
             <button
                 type="button"
                 data-testid="selection-thread-toggle"
