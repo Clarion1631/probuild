@@ -108,6 +108,18 @@ model DecisionTemplateItem  { id, templateId, name ("Shower Valve"), area, defau
 
 `/purchasing` (team): every Decided decision across active projects — vendor link, clipped price, client note, due date. Mark **Ordered** (date, order ref, actual cost) → **Received**. Adds `orderedAt/receivedAt/orderRef/actualCost`. Status flows back to the client as a plain line ("Ordered Aug 2 · arriving Aug 12") with **no cost shown**.
 
+> **Superseded (2026-07-31) by Selection Order Tracking + Delivery Risk**
+> (`docs/superpowers/plans/2026-07-31-selection-order-tracking.md`). The
+> shipped mechanism is `Decision.status` ("Ordered"/"Received") plus three
+> new nullable fields — `orderedAt`, `orderedBy` ("TEAM" | "CLIENT"),
+> `expectedArrivalAt` — set per-decision from the project Selections page
+> (`setDecisionOrderInfo`), not a dedicated queue page. Portal shows "Ordered
+> · arriving ~<date>" / "Received", no cost, matching this section's intent.
+> Still **deferred** as future work: the standalone `/purchasing` page (a
+> cross-project queue view), `receivedAt` (a separate received-date column —
+> today "Received" is a status transition, not its own timestamp), `orderRef`,
+> and `actualCost`.
+
 ## Phase 4 — Internal allowances
 
 Allowance per decision or area, team-side only; decided-item total vs allowance with over/under. Feeds Richard's flag decision. Never rendered in any portal route.

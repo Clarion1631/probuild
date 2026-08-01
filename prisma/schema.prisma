@@ -1815,6 +1815,14 @@ model Decision {
   // column. effectiveDueDate is computed on read (dueDate ?? derived from the
   // linked task minus leadTimeDays) — see decision-due-date.ts.
   dueDate         DateTime?
+  // Phase 4 — Selection Order Tracking + Delivery Risk
+  // (docs/superpowers/plans/2026-07-31-selection-order-tracking.md). All
+  // nullable, no FK, no backfill — `status` keeps driving the lifecycle.
+  // Canonical writer: setDecisionOrderInfo (decision-order-actions-core.ts) —
+  // no other path writes these three columns.
+  orderedAt         DateTime? // when the order was placed
+  orderedBy         String?   // "TEAM" | "CLIENT" — who purchased
+  expectedArrivalAt DateTime? // ETA used for schedule-risk comparison
   createdByClient Boolean             @default(false)
   decidedAt       DateTime?
   pmNote          String?             // client-visible note from the flag path
@@ -2150,6 +2158,32 @@ model Integration {
   id        String   @id
   settings  String
   updatedAt DateTime @updatedAt
+}
+
+// One row per automation happening: a receipt pushed to QuickBooks by the
+// bot (kind "receipt-push") or a QBO→ProBuild sync run (kind "qbo-sync").
+// Powers the Automation Command Center's activity feed, intake graph, and
+// audit history. Append-only; writes are fire-and-forget so a logging
+// failure can never fail the automation it describes.
+model AutomationEvent {
+  id          String   @id @default(cuid())
+  kind        String   // "receipt-push" | "qbo-sync" | "receipt-stage"
+  stage       String?  // receipt-stage beacons: "intake" | "read" | "dedupe" | "email-book" (push events imply stage "push")
+  status      String   // push: "created" | "already-exists" | "fallback" | "error" · sync: "ok" | "error" · stage: "ok" | "parked" | "quarantined" | "emailed"
+  reason      String?  // fallback/decline/park reason or error name
+  source      String?  // sync: "cron" | "manual" | "backfill" · push/stage: "apps-script"
+  vendor      String?
+  projectName String?
+  docNumber   String?
+  fileName    String?
+  amountCents Int?
+  taxCents    Int?
+  detail      String?  // JSON extras (sync counts, decline context)
+  createdAt   DateTime @default(now())
+
+  @@index([kind, createdAt])
+  @@index([createdAt])
+  @@index([docNumber, createdAt])
 }
 
 model StripeEvent {

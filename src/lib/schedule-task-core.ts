@@ -290,10 +290,8 @@ export async function updateScheduleTaskInTransaction(
     }
     if (data.color !== undefined) updateData.color = data.color;
     if (data.progress !== undefined) {
-        if (!Number.isInteger(data.progress) || data.progress < 0 || data.progress > 100) {
-            throw new Error("Progress must be an integer between 0 and 100");
-        }
-        updateData.progress = data.progress;
+        if (!Number.isFinite(data.progress)) throw new Error("Progress must be a number");
+        updateData.progress = Math.min(100, Math.max(0, Math.round(data.progress)));
     }
     if (data.status !== undefined) updateData.status = data.status;
     if (data.progress !== undefined || data.status !== undefined) {
