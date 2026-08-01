@@ -7819,12 +7819,11 @@ export async function aiGenerateSchedule(projectId: string, estimateId?: string)
             where: { id: estimateId, projectId },
             include: { items: { where: { parentId: null }, orderBy: { order: "asc" }, include: { subItems: true } } },
         });
-        if (estimate) {
-            estimateContext = `\n\nESTIMATE LINE ITEMS:\n${estimate.items.map(i => {
-                const laborHrs = i.subItems?.filter((s: any) => s.type === "Labor").reduce((a: number, s: any) => a + (s.quantity || 0), 0) || (i.type === "Labor" ? i.quantity : 0);
-                return `- ${i.name} (Type: ${i.type}, Labor Hours: ${laborHrs || "N/A"})`;
-            }).join("\n")}`;
-        }
+        if (!estimate) throw new Error("Estimate not found on this project");
+        estimateContext = `\n\nESTIMATE LINE ITEMS:\n${estimate.items.map(i => {
+            const laborHrs = i.subItems?.filter((s: any) => s.type === "Labor").reduce((a: number, s: any) => a + (s.quantity || 0), 0) || (i.type === "Labor" ? i.quantity : 0);
+            return `- ${i.name} (Type: ${i.type}, Labor Hours: ${laborHrs || "N/A"})`;
+        }).join("\n")}`;
     }
 
     const prompt = `You are an expert construction project manager. Generate a realistic schedule for this project.
@@ -7860,8 +7859,28 @@ Rules:
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
 
-    const aiTasks: { name: string; durationDays: number; estimatedHours: number; dependsOn: number[] }[] = JSON.parse(rawText);
-    if (!Array.isArray(aiTasks)) throw new Error("Invalid AI response");
+    const parsed: unknown = JSON.parse(rawText);
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 40) throw new Error("Invalid AI response");
+
+    // The model's output is untrusted input: bound every field before it reaches
+    // the database. Dependencies may only point backward (matches the prompt),
+    // which also rules out self-references, cycles, and forward references; the
+    // Set dedupe keeps the (predecessorId, dependentId) unique constraint safe.
+    const aiTasks = parsed.map((raw, i) => {
+        const t = (raw ?? {}) as { name?: unknown; durationDays?: unknown; estimatedHours?: unknown; dependsOn?: unknown };
+        const name = typeof t.name === "string" ? t.name.trim().slice(0, 200) : "";
+        if (!name) throw new Error("Invalid AI response");
+        const durationDays = typeof t.durationDays === "number" && Number.isFinite(t.durationDays) && t.durationDays >= 1
+            ? Math.min(Math.round(t.durationDays), 90)
+            : 5;
+        const estimatedHours = typeof t.estimatedHours === "number" && Number.isFinite(t.estimatedHours) && t.estimatedHours > 0
+            ? Math.min(t.estimatedHours, 10000)
+            : null;
+        const dependsOn = [...new Set(
+            (Array.isArray(t.dependsOn) ? t.dependsOn : []).filter((d): d is number => Number.isInteger(d) && d >= 0 && d < i)
+        )];
+        return { name, durationDays, estimatedHours, dependsOn };
+    });
 
     const COLORS = ["#4c9a2a", "#3b82f6", "#8b5cf6", "#f59e0b", "#ef4444", "#ec4899", "#06b6d4", "#64748b"];
     const today = new Date();
@@ -12522,12 +12541,25 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
 }) {
     "use server";
     await assertLeadScheduleAccess(leadId);
-    const existing = await prisma.scheduleTask.findFirst({ where: { id: taskId, leadId }, select: { id: true } });
-    if (!existing) throw new Error("Task not found");
-    const task = await prisma.scheduleTask.update({
-        where: { id: taskId },
-        data,
-    });
+    // Whitelist fields explicitly — a forged Server Action call can carry extra
+    // properties (leadId, projectId, order, ...) that the TS signature doesn't
+    // stop at runtime. The leadId in the where keeps the ownership check and the
+    // write atomic (no re-parent race between check and update).
+    const update: { name?: string; status?: string; startDate?: Date; endDate?: Date } = {};
+    if (data.name !== undefined) update.name = data.name;
+    if (data.status !== undefined) update.status = data.status;
+    if (data.startDate !== undefined) update.startDate = data.startDate;
+    if (data.endDate !== undefined) update.endDate = data.endDate;
+    let task;
+    try {
+        task = await prisma.scheduleTask.update({
+            where: { id: taskId, leadId },
+            data: update,
+        });
+    } catch (e) {
+        if ((e as { code?: string })?.code === "P2025") throw new Error("Task not found");
+        throw e;
+    }
     revalidatePath(`/leads/${leadId}/schedule`);
     return task;
 }
@@ -12535,9 +12567,8 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
 export async function deleteLeadScheduleTask(taskId: string, leadId: string) {
     "use server";
     await assertLeadScheduleAccess(leadId);
-    const existing = await prisma.scheduleTask.findFirst({ where: { id: taskId, leadId }, select: { id: true } });
-    if (!existing) throw new Error("Task not found");
-    await prisma.scheduleTask.delete({ where: { id: taskId } });
+    const deleted = await prisma.scheduleTask.deleteMany({ where: { id: taskId, leadId } });
+    if (deleted.count === 0) throw new Error("Task not found");
     revalidatePath(`/leads/${leadId}/schedule`);
     return { success: true };
 }
