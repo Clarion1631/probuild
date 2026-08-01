@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import PortalGanttChart from "./PortalGanttChart";
 import PortalCalendarView from "./PortalCalendarView";
+import PortalAgendaView from "./PortalAgendaView";
 
 type Dependency = { id: string; predecessorId: string; dependentId: string };
 type Assignment = { id: string; userId: string; firstName: string };
@@ -25,7 +26,7 @@ export type PortalTask = {
     comments?: Comment[];
 };
 
-export type PortalViewMode = "calendar" | "gantt";
+export type PortalViewMode = "calendar" | "gantt" | "agenda";
 export type PortalCalendarSubMode = "month" | "week";
 
 const VIEW_KEY = "probuild:portal:schedule:viewMode";
@@ -48,7 +49,12 @@ export default function PortalScheduleView({ projectId, initialTasks, subcontrac
     useEffect(() => {
         try {
             const v = localStorage.getItem(VIEW_KEY);
-            if (v === "calendar" || v === "gantt") setViewMode(v);
+            if (v === "calendar" || v === "gantt" || v === "agenda") {
+                setViewMode(v);
+            } else if (window.matchMedia("(max-width: 639px)").matches) {
+                // No saved preference: phones get the agenda list, desktop keeps the calendar.
+                setViewMode("agenda");
+            }
             const s = localStorage.getItem(SUB_KEY);
             if (s === "month" || s === "week") setCalendarSubMode(s);
         } catch { /* ignore */ }
@@ -62,6 +68,18 @@ export default function PortalScheduleView({ projectId, initialTasks, subcontrac
     function changeSubMode(m: PortalCalendarSubMode) {
         setCalendarSubMode(m);
         if (hydrated) { try { localStorage.setItem(SUB_KEY, m); } catch { /* ignore */ } }
+    }
+
+    if (viewMode === "agenda") {
+        return (
+            <PortalAgendaView
+                tasks={tasks}
+                setTasks={setTasks}
+                subcontractorId={subcontractorId}
+                viewMode={viewMode}
+                onViewModeChange={changeViewMode}
+            />
+        );
     }
 
     if (viewMode === "calendar") {
