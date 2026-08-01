@@ -42,10 +42,8 @@ function weekLabel(monday: Date, currentMonday: Date) {
     const diffWeeks = Math.round((monday.getTime() - currentMonday.getTime()) / (7 * 24 * 3600 * 1000));
     if (diffWeeks === 0) return "This week";
     if (diffWeeks === 1) return "Next week";
-    const sunday = new Date(monday.getTime());
-    sunday.setUTCDate(sunday.getUTCDate() + 6);
     const year = monday.getUTCFullYear() === todayUTC().getUTCFullYear() ? "" : `, ${monday.getUTCFullYear()}`;
-    return `Week of ${fmtDay(monday)}${year} `.trimEnd() + (monday.getUTCMonth() === sunday.getUTCMonth() ? "" : "");
+    return `Week of ${fmtDay(monday)}${year}`;
 }
 
 interface Props {
@@ -83,12 +81,20 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
             .map(([ms, list]) => ({ monday: new Date(ms), tasks: list }));
     }, [tasks]);
 
-    // Land the reader on the current week (or the nearest future one) instead of the project's start.
+    // Anchor "Today" on the first group that is current/future OR still has a running task;
+    // when the whole schedule is in the past, land on the final week.
+    let anchorIdx = groups.findIndex(g =>
+        g.monday.getTime() >= currentMonday.getTime()
+        || g.tasks.some(t => parseUTCDate(t.endDate).getTime() >= today.getTime()));
+    if (anchorIdx === -1) anchorIdx = groups.length - 1;
+    const anchorTime = groups[anchorIdx]?.monday.getTime();
+
+    // Land the reader on the anchor week instead of the project's start.
     useEffect(() => {
         currentWeekRef.current?.scrollIntoView({ block: "start" });
-        // Re-run only when the group structure changes, not on status/comment updates.
+        // Re-run when the anchor week changes, not on status/comment updates.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [groups.length]);
+    }, [anchorTime]);
 
     async function handleStatusChange(taskId: string, status: string) {
         if (!subcontractorId) return;
@@ -103,8 +109,15 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
         }
     }
 
+    function toggleExpanded(taskId: string) {
+        setExpandedId(prev => {
+            if (prev !== taskId) setCommentText("");
+            return prev === taskId ? null : taskId;
+        });
+    }
+
     async function handleAddComment(taskId: string) {
-        if (!subcontractorId || !commentText.trim()) return;
+        if (!subcontractorId || !commentText.trim() || submittingComment) return;
         setSubmittingComment(true);
         try {
             const created = await addTaskCommentAsSub(taskId, subcontractorId, commentText.trim());
@@ -128,9 +141,6 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
 
     const completedCount = tasks.filter(t => t.status === "Complete").length;
     const progressPct = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
-
-    // Anchor "Today" on the first group that is not entirely in the past.
-    const anchorIdx = groups.findIndex(g => g.monday.getTime() >= currentMonday.getTime());
 
     return (
         <div className="flex flex-col h-full bg-white">
@@ -199,8 +209,13 @@ export default function PortalAgendaView({ tasks, setTasks, subcontractorId, vie
                                                 <div
                                                     role="button"
                                                     tabIndex={0}
-                                                    onClick={() => setExpandedId(expanded ? null : task.id)}
-                                                    onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedId(expanded ? null : task.id); } }}
+                                                    onClick={() => toggleExpanded(task.id)}
+                                                    onKeyDown={e => {
+                                                        // Only act on keys aimed at the row itself — the nested
+                                                        // status <select> must keep its native keyboard behavior.
+                                                        if (e.target !== e.currentTarget) return;
+                                                        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleExpanded(task.id); }
+                                                    }}
                                                     className="flex items-center gap-3 px-4 sm:px-6 py-3 cursor-pointer hover:bg-slate-50 transition"
                                                     style={{ borderLeft: `3px solid ${task.color}` }}
                                                 >

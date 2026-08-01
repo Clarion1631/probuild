@@ -41,7 +41,7 @@ function formatDate(d: Date) { return d.toISOString().split("T")[0]; }
 function getMonday(d: Date) { const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1); return new Date(d.setDate(diff)); }
 function isWeekend(d: Date) { const day = d.getDay(); return day === 0 || day === 6; }
 
-type PortalViewMode = "calendar" | "gantt" | "agenda";
+import type { PortalViewMode } from "./PortalScheduleView";
 
 export default function PortalGanttChart({
     initialTasks,
@@ -181,16 +181,14 @@ export default function PortalGanttChart({
                 {onViewModeChange && (
                     <div className="flex items-center justify-end px-6 py-3 border-b border-slate-200 shrink-0">
                         <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
-                            <button
-                                onClick={() => onViewModeChange("calendar")}
-                                aria-pressed={viewMode === "calendar"}
-                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "calendar" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                            >Calendar</button>
-                            <button
-                                onClick={() => onViewModeChange("gantt")}
-                                aria-pressed={viewMode === "gantt"}
-                                className={`px-3 py-1 text-xs font-medium rounded-md transition ${viewMode === "gantt" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                            >Gantt</button>
+                            {(["agenda", "calendar", "gantt"] as PortalViewMode[]).map(m => (
+                                <button
+                                    key={m}
+                                    onClick={() => onViewModeChange(m)}
+                                    aria-pressed={viewMode === m}
+                                    className={`px-3 py-1 text-xs font-medium rounded-md transition capitalize ${viewMode === m ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+                                >{m}</button>
+                            ))}
                         </div>
                     </div>
                 )}
