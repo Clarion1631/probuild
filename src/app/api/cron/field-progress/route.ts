@@ -37,6 +37,14 @@ export async function GET(request: Request) {
     const dryRun = url.searchParams.get("dryRun") === "1";
     const onlyProjectId = url.searchParams.get("projectId");
 
+    // Budget clock starts at request time (before any DB work). Every slow
+    // request downstream carries its own abort timeout, and the per-project
+    // deadline makes each run stop starting new slow work near the ceiling —
+    // so the 300s platform kill can't silently swallow the summary.
+    const startedAt = Date.now();
+    const TIME_BUDGET_MS = 240_000;
+    const deadlineAt = startedAt + TIME_BUDGET_MS;
+
     const projects = await prisma.project.findMany({
         where: {
             googleChatSpaceId: { not: null },
@@ -50,18 +58,13 @@ export async function GET(request: Request) {
     const runs = [];
     const failures: Array<{ projectId: string; error: string }> = [];
     const skippedForBudget: string[] = [];
-    // One stalled Chat/Anthropic request must not let the 300s platform kill
-    // silently swallow the remaining projects — stop starting new ones near
-    // the ceiling and REPORT what was skipped.
-    const startedAt = Date.now();
-    const TIME_BUDGET_MS = 240_000;
     for (const project of projects) {
-        if (Date.now() - startedAt > TIME_BUDGET_MS) {
+        if (Date.now() > deadlineAt) {
             skippedForBudget.push(project.id);
             continue;
         }
         try {
-            runs.push(await runFieldProgressForProject(project.id, { dryRun }));
+            runs.push(await runFieldProgressForProject(project.id, { dryRun, deadlineAt }));
         } catch (err) {
             failures.push({ projectId: project.id, error: err instanceof Error ? err.message : String(err) });
         }

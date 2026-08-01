@@ -1923,6 +1923,11 @@ model DailyLogPhoto {
   caption    String?
   sharedToPortal Boolean @default(false)
   createdAt  DateTime @default(now())
+
+  // Chat ingest computes a deterministic storage URL per (message, attachment
+  // index), so this pair is the retry/concurrency identity: a partial photo
+  // save can be resumed and two overlapping runs cannot double-insert.
+  @@unique([dailyLogId, url])
 }
 
 model Retainer {

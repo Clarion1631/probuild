@@ -55,6 +55,10 @@ async function defaultComplete(prompt: string): Promise<string> {
         model: "claude-sonnet-4-6",
         max_tokens: 2000,
         messages: [{ role: "user", content: prompt }],
+    }, {
+        // A hung model request must fail this project, not the whole cron run.
+        timeout: 90_000,
+        maxRetries: 1,
     });
     const block = response.content[0];
     return ("text" in block ? block.text : "").trim();
@@ -134,11 +138,12 @@ export function sanitizeNextSteps(value: string | null): string | null {
 
 export async function runFieldProgressForProject(
     projectId: string,
-    options: { dryRun?: boolean; complete?: FieldProgressCompletion; lookbackHours?: number } = {},
+    options: { dryRun?: boolean; complete?: FieldProgressCompletion; lookbackHours?: number; deadlineAt?: number } = {},
 ): Promise<FieldProgressRunResult> {
     const dryRun = !!options.dryRun || isFieldProgressForcedDryRun();
     const complete = options.complete ?? defaultComplete;
     const lookbackHours = options.lookbackHours ?? FIELD_PROGRESS_LOOKBACK_HOURS;
+    const deadlineAt = options.deadlineAt;
 
     const project = await prisma.project.findUnique({
         where: { id: projectId },
@@ -159,7 +164,7 @@ export async function runFieldProgressForProject(
         try {
             result.ingest = await ingestChatSpaceToDailyLogs(
                 { id: project.id, googleChatSpaceId: project.googleChatSpaceId },
-                { dryRun },
+                { dryRun, deadlineAt },
             );
         } catch (err) {
             result.errors.push(`ingest: ${err instanceof Error ? err.message : String(err)}`);
@@ -203,7 +208,12 @@ export async function runFieldProgressForProject(
     }
     const candidateById = new Map(candidates.map(task => [task.id, task]));
 
-    // 4. Model pass.
+    // 4. Model pass. Not worth starting with under 30s of budget left — the
+    //    project resumes cleanly on tomorrow's run.
+    if (deadlineAt && deadlineAt - Date.now() < 30_000) {
+        result.skippedReason = "time budget too low for the model pass";
+        return result;
+    }
     const raw = await complete(buildPrompt(
         project.name,
         logs.map(log => ({ date: log.date, workPerformed: log.workPerformed, photoCount: log._count.photos })),
@@ -271,6 +281,7 @@ export async function runFieldProgressForProject(
         const toStatus = "In Progress";
         let fromProgress = task.progress;
         let fromStatus = task.status;
+        let toProgress = update.progress;
         if (!dryRun) {
             try {
                 const outcome = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -278,9 +289,16 @@ export async function runFieldProgressForProject(
                     await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${update.taskId} FOR UPDATE`;
                     const fresh = await tx.scheduleTask.findUnique({
                         where: { id: update.taskId },
-                        select: { progress: true, status: true, progressSource: true, projectId: true },
+                        select: {
+                            progress: true, status: true, progressSource: true,
+                            projectId: true, type: true,
+                            _count: { select: { children: true } },
+                        },
                     });
                     if (!fresh || fresh.projectId !== projectId) return { rejected: "task moved or vanished" };
+                    if (fresh.type !== "task" || fresh._count.children > 0) {
+                        return { rejected: "no longer an eligible leaf work task" };
+                    }
                     if (fresh.progressSource === "human") return { rejected: "human-set progress is durable" };
                     if (fresh.status === "Complete" || fresh.status === "Blocked") {
                         return { rejected: `task is now ${fresh.status}` };
@@ -288,10 +306,12 @@ export async function runFieldProgressForProject(
                     if (update.progress <= fresh.progress && fresh.status === "In Progress") {
                         return { rejected: "would not advance the task" };
                     }
+                    // The single value that is written, audited, and reported.
+                    const writtenProgress = Math.min(99, Math.max(update.progress, fresh.progress));
                     await updateScheduleTaskInTransaction(
                         tx,
                         update.taskId,
-                        { status: toStatus, progress: Math.min(99, Math.max(update.progress, fresh.progress)) },
+                        { status: toStatus, progress: writtenProgress },
                         FIELD_PROGRESS_ACTOR,
                         projectId,
                     );
@@ -308,12 +328,12 @@ export async function runFieldProgressForProject(
                                 fromStatus: fresh.status,
                                 toStatus,
                                 fromProgress: fresh.progress,
-                                toProgress: update.progress,
+                                toProgress: writtenProgress,
                                 evidence: update.note,
                             }),
                         },
                     });
-                    return { fromProgress: fresh.progress, fromStatus: fresh.status };
+                    return { fromProgress: fresh.progress, fromStatus: fresh.status, writtenProgress };
                 });
                 if ("rejected" in outcome) {
                     result.rejected.push({ taskId: update.taskId, reason: outcome.rejected! });
@@ -321,6 +341,7 @@ export async function runFieldProgressForProject(
                 }
                 fromProgress = outcome.fromProgress!;
                 fromStatus = outcome.fromStatus!;
+                toProgress = outcome.writtenProgress!;
             } catch (err) {
                 result.errors.push(`apply ${update.taskId}: ${err instanceof Error ? err.message : String(err)}`);
                 continue;
@@ -330,7 +351,7 @@ export async function runFieldProgressForProject(
             taskId: update.taskId,
             taskName: task.name,
             fromProgress,
-            toProgress: update.progress,
+            toProgress,
             fromStatus,
             toStatus,
             note: update.note,

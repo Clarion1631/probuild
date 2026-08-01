@@ -198,6 +198,12 @@ async function main() {
         const savedLegacy = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: legacy.id } });
         assert.ok(savedLegacy.progress <= 99, `legacy task must clamp to ≤99, got ${savedLegacy.progress}`);
         assert.equal(legacyRun.applied.length + legacyRun.rejected.length, 1);
+        if (legacyRun.applied.length === 1) {
+            assert.equal(
+                legacyRun.applied[0].toProgress, savedLegacy.progress,
+                "reported toProgress must equal what the database holds",
+            );
+        }
 
         // Race: a human edit landing WHILE the model is thinking must win. The
         // fake completion mutates the task mid-run; the in-transaction recheck

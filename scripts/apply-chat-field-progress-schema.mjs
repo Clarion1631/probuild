@@ -47,6 +47,10 @@ const statements = [
   // every task the moment this ships.
   `ALTER TABLE "ScheduleTask"
      ADD COLUMN IF NOT EXISTS "progressSource" TEXT`,
+  // Photo identity for the chat ingest: retry-safe and concurrency-safe.
+  // Safe on existing data — the DailyLogPhoto table had zero rows at ship time.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "DailyLogPhoto_dailyLogId_url_key"
+     ON "DailyLogPhoto" ("dailyLogId", "url")`,
 ];
 
 try {

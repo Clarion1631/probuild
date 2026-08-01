@@ -95,6 +95,8 @@ async function getChatAccessToken(): Promise<string> {
             grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
             assertion,
         }),
+        // One hung Google request must not eat a whole cron run's budget.
+        signal: AbortSignal.timeout(20_000),
     });
     if (!response.ok) {
         throw new Error(`Chat SA token exchange failed: ${response.status} ${await response.text()}`);
@@ -124,6 +126,7 @@ async function listRecentSpaceMessages(spaceName: string, sinceIso: string): Pro
         if (pageToken) params.set("pageToken", pageToken);
         const response = await fetch(`${CHAT_API}/${spaceName}/messages?${params}`, {
             headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(30_000),
         });
         if (!response.ok) {
             throw new Error(`messages.list failed for ${spaceName}: ${response.status} ${await response.text()}`);
@@ -140,6 +143,7 @@ async function downloadAttachment(resourceName: string): Promise<Buffer | null> 
     const token = await getChatAccessToken();
     const response = await fetch(`${CHAT_API}/media/${resourceName}?alt=media`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(45_000),
     });
     if (!response.ok) return null;
     return Buffer.from(await response.arrayBuffer());
@@ -181,8 +185,10 @@ export async function ingestChatSpaceToDailyLogs(
     project: { id: string; googleChatSpaceId: string },
     // skipPhotos: the interactive "@mention sync" path must answer within
     // Google Chat's response deadline; photo downloads are the slow part and
-    // the nightly run backfills them (zero-photo logs retry below).
-    options: { dryRun?: boolean; lookbackHours?: number; skipPhotos?: boolean } = {},
+    // the nightly run backfills them (partial-photo logs retry below).
+    // deadlineAt: epoch ms after which no NEW slow work starts — what's
+    // missed resumes on the next run (everything here is upsert/resumable).
+    options: { dryRun?: boolean; lookbackHours?: number; skipPhotos?: boolean; deadlineAt?: number } = {},
 ): Promise<ChatIngestResult> {
     const result: ChatIngestResult = {
         spaceName: project.googleChatSpaceId,
@@ -194,6 +200,10 @@ export async function ingestChatSpaceToDailyLogs(
 
     let ingestUserId: string | null = null;
     for (const message of messages) {
+        if (options.deadlineAt && Date.now() > options.deadlineAt) {
+            result.errors.push("time budget reached; remaining messages resume next run");
+            break;
+        }
         if (!isIngestableMessage(message)) {
             result.skipped += 1;
             continue;
@@ -230,11 +240,12 @@ export async function ingestChatSpaceToDailyLogs(
                     });
                     result.updated += 1;
                 }
-                // Photo retry: a crash or failed upload on the run that created
-                // the log must not lose its attachments forever. Zero photos +
-                // attachments on the message ⇒ try again.
-                if (!options.skipPhotos && existing._count.photos === 0 && imageAttachments.length > 0) {
-                    result.photosSaved += await saveMessagePhotos(existing.id, project.id, message.name, imageAttachments, result.errors);
+                // Photo retry: a crash or failed upload must not lose
+                // attachments forever. Missing photos only — saveMessagePhotos
+                // skips per-attachment URLs that already landed, so a fully
+                // saved log costs one cheap query and no downloads.
+                if (!options.skipPhotos && existing._count.photos < imageAttachments.length) {
+                    result.photosSaved += await saveMessagePhotos(existing.id, project.id, message.name, imageAttachments, result.errors, options.deadlineAt);
                 }
                 continue;
             }
@@ -262,7 +273,7 @@ export async function ingestChatSpaceToDailyLogs(
             }
             result.created += 1;
             if (!options.skipPhotos) {
-                result.photosSaved += await saveMessagePhotos(created.id, project.id, message.name, imageAttachments, result.errors);
+                result.photosSaved += await saveMessagePhotos(created.id, project.id, message.name, imageAttachments, result.errors, options.deadlineAt);
             }
         } catch (err) {
             result.errors.push(`${message.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -277,6 +288,7 @@ async function saveMessagePhotos(
     messageName: string,
     attachments: ChatAttachment[],
     errors: string[],
+    deadlineAt?: number,
 ): Promise<number> {
     if (attachments.length === 0) return 0;
     const supabase = getSupabase();
@@ -284,19 +296,34 @@ async function saveMessagePhotos(
         errors.push(`${messageName}: storage not configured; photos skipped`);
         return 0;
     }
+    // The (dailyLogId, url) pair is the photo's identity, and the URL is
+    // deterministic per (message, index) — so a retry after a PARTIAL save
+    // skips what landed and fetches only what's missing, and two overlapping
+    // runs collapse on the unique constraint instead of double-inserting.
+    const existingUrls = new Set(
+        (await prisma.dailyLogPhoto.findMany({
+            where: { dailyLogId }, select: { url: true },
+        })).map(photo => photo.url),
+    );
     let saved = 0;
-    // Stable per-message path segment so a partially-failed run that retries
-    // can't collide with itself on Date.now().
     const messageKey = messageName.split("/").pop() ?? "msg";
     for (const [index, attachment] of attachments.entries()) {
+        if (deadlineAt && Date.now() > deadlineAt) {
+            errors.push(`${messageName}: photo ${index}+ deferred (time budget); next run resumes`);
+            break;
+        }
         try {
+            const safeName = (attachment.contentName ?? `photo-${index}.jpg`).replace(/[^a-zA-Z0-9._-]/g, "_");
+            const storagePath = `daily-logs/${projectId}/${messageKey}_${index}_${safeName}`;
+            const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
+            const url = urlData?.publicUrl || storagePath;
+            if (existingUrls.has(url)) continue;
+
             const bytes = await downloadAttachment(attachment.attachmentDataRef!.resourceName!);
             if (!bytes) {
                 errors.push(`${messageName}: attachment ${index} download failed`);
                 continue;
             }
-            const safeName = (attachment.contentName ?? `photo-${index}.jpg`).replace(/[^a-zA-Z0-9._-]/g, "_");
-            const storagePath = `daily-logs/${projectId}/${messageKey}_${index}_${safeName}`;
             const { error: uploadError } = await supabase.storage
                 .from(STORAGE_BUCKET)
                 .upload(storagePath, bytes, {
@@ -307,15 +334,15 @@ async function saveMessagePhotos(
                 errors.push(`${messageName}: upload failed: ${uploadError.message}`);
                 continue;
             }
-            const { data: urlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath);
-            await prisma.dailyLogPhoto.create({
-                data: {
-                    dailyLogId,
-                    url: urlData?.publicUrl || storagePath,
-                    caption: attachment.contentName ?? null,
-                },
-            });
-            saved += 1;
+            try {
+                await prisma.dailyLogPhoto.create({
+                    data: { dailyLogId, url, caption: attachment.contentName ?? null },
+                });
+                saved += 1;
+            } catch (err) {
+                // Concurrent run inserted the same photo first — dedupe, not error.
+                if ((err as { code?: string })?.code !== "P2002") throw err;
+            }
         } catch (err) {
             errors.push(`${messageName}: photo ${index}: ${err instanceof Error ? err.message : String(err)}`);
         }
