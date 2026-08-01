@@ -12572,6 +12572,20 @@ export async function updateLeadScheduleTask(taskId: string, leadId: string, dat
     if (data.status !== undefined) update.status = leadTaskStatus(data.status);
     if (data.startDate !== undefined) update.startDate = leadTaskDate(data.startDate, "start date");
     if (data.endDate !== undefined) update.endDate = leadTaskDate(data.endDate, "end date");
+    if (update.startDate || update.endDate) {
+        let start = update.startDate;
+        let end = update.endDate;
+        if (!start || !end) {
+            const persisted = await prisma.scheduleTask.findFirst({
+                where: { id: taskId, leadId },
+                select: { startDate: true, endDate: true },
+            });
+            if (!persisted) throw new Error("Task not found");
+            start = start ?? persisted.startDate;
+            end = end ?? persisted.endDate;
+        }
+        if (end < start) throw new Error("Task end date cannot be before its start date");
+    }
     let task;
     try {
         task = await prisma.scheduleTask.update({
