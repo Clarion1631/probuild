@@ -27,6 +27,7 @@ import AiSortReviewModal, { type AiSortSuggestionRow } from "./AiSortReviewModal
 import LinkScheduleReviewModal, { type LinkScheduleSuggestionRow } from "./LinkScheduleReviewModal";
 import ApplyTemplateModal from "./ApplyTemplateModal";
 import DecisionDueDateEditPopover, { type ProjectScheduleTaskOption } from "./DecisionDueDateEditPopover";
+import DecisionOrderPopover from "./DecisionOrderPopover";
 import { dueDateUrgency, formatDueDateShort } from "@/lib/decision-due-date";
 import {
     ImageOff,
@@ -86,6 +87,13 @@ interface DecisionData {
     // to the portal.
     isManual: boolean;
     linkState: "linked" | "dangling" | "none";
+    // Order tracking + delivery risk (Phase 4) — raw fields (staff read
+    // only; the portal read strips these to orderStatusForPortal) plus the
+    // computed risk.
+    orderedAt: string | null;
+    orderedBy: string | null;
+    expectedArrivalAt: string | null;
+    risk: { level: "late" | "tight" | null; referenceDate: string | null; daysLate: number | null };
 }
 
 interface DeletedDecision {
@@ -163,6 +171,95 @@ function DecideByBadge({
     );
 }
 
+// The shared record of truth stays visible through the rest of the order
+// lifecycle (Phase 4 cross-cutting correction) — marking a decision Ordered
+// (or Received) must NOT vanish it from Approved Items, only Decided did
+// before this widened.
+const APPROVED_STATUSES = ["Decided", "Ordered", "Received"];
+
+// Read-only "Ordered <date> by <who> · arrives ~<eta>" / "Received" history
+// line (Phase 4) — Ordered/Received only, gates itself so callers don't need
+// a status check.
+function OrderStatusLine({ decision }: { decision: DecisionData }) {
+    if (decision.status !== "Ordered" && decision.status !== "Received") return null;
+    const orderedDateLabel = decision.orderedAt ? formatDueDateShort(new Date(decision.orderedAt)) : null;
+    const whoLabel = decision.orderedBy === "CLIENT" ? "Client" : "GTR team";
+    const etaLabel = decision.expectedArrivalAt ? formatDueDateShort(new Date(decision.expectedArrivalAt)) : null;
+
+    if (decision.status === "Received") {
+        return (
+            <span data-testid={`order-status-line-${decision.id}`} className="text-xs text-hui-textMuted">
+                {orderedDateLabel ? `Ordered ${orderedDateLabel} by ${whoLabel} · ` : ""}Received
+            </span>
+        );
+    }
+
+    return (
+        <span data-testid={`order-status-line-${decision.id}`} className="text-xs text-hui-textMuted">
+            Ordered {orderedDateLabel} by {whoLabel}
+            {etaLabel ? ` · arrives ~${etaLabel}` : ""}
+        </span>
+    );
+}
+
+function riskWording(risk: DecisionData["risk"]): string {
+    const refLabel = risk.referenceDate ? formatDueDateShort(new Date(risk.referenceDate)) : "the linked date";
+    if (risk.level === "late") {
+        const days = risk.daysLate ?? 0;
+        return `arrives ${days} day${days === 1 ? "" : "s"} after ${refLabel}`;
+    }
+    const days = Math.abs(risk.daysLate ?? 0);
+    return `arrives ${days} day${days === 1 ? "" : "s"} before ${refLabel}`;
+}
+
+// Delivery-risk badge (Phase 4) — red "late" / amber "tight", derived from
+// assessDeliveryRisk via the staff loader's attached `risk`. Null level
+// renders nothing.
+function RiskBadge({ decisionId, risk }: { decisionId: string; risk: DecisionData["risk"] }) {
+    if (!risk.level) return null;
+    const className = risk.level === "late" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700";
+    return (
+        <span data-testid={`risk-badge-${decisionId}`} className={`px-1.5 py-0.5 rounded-full font-medium text-xs ${className}`}>
+            {riskWording(risk)}
+        </span>
+    );
+}
+
+// Banner above Approved Items, only rendered when at least one decision is
+// at risk — red items listed before amber, each an anchor jump-link to its
+// decision card.
+function RiskBanner({ decisions }: { decisions: DecisionData[] }) {
+    const risky = decisions.filter((d): d is DecisionData & { risk: { level: "late" | "tight"; referenceDate: string | null; daysLate: number } } => !!d.risk.level);
+    if (risky.length === 0) return null;
+
+    const sorted = [...risky].sort((a, b) => {
+        if (a.risk.level === b.risk.level) return 0;
+        return a.risk.level === "late" ? -1 : 1;
+    });
+
+    return (
+        <div data-testid="order-risk-banner" className="hui-card mb-6 border-amber-200 bg-amber-50">
+            <div className="px-5 py-4">
+                <h3 className="text-sm font-semibold text-amber-900">
+                    {sorted.length} item{sorted.length === 1 ? "" : "s"} may delay the schedule
+                </h3>
+                <ul className="mt-2 space-y-1">
+                    {sorted.map((decision) => (
+                        <li key={decision.id} data-testid={`order-risk-banner-item-${decision.id}`} className="text-sm">
+                            <a
+                                href={`#decision-${decision.id}`}
+                                className={`hover:underline ${decision.risk.level === "late" ? "text-red-700" : "text-amber-700"}`}
+                            >
+                                {decision.name} — {riskWording(decision.risk)}
+                            </a>
+                        </li>
+                    ))}
+                </ul>
+            </div>
+        </div>
+    );
+}
+
 function ApprovedItemsTable({
     decisions,
     onChanged,
@@ -171,7 +268,7 @@ function ApprovedItemsTable({
     onChanged: () => void;
 }) {
     const approved = decisions
-        .filter((d) => d.status === "Decided" && d.chosenItemId)
+        .filter((d) => APPROVED_STATUSES.includes(d.status) && d.chosenItemId)
         .map((d) => ({ decision: d, item: d.candidates.find((c) => c.id === d.chosenItemId) }))
         .filter((x): x is { decision: DecisionData; item: Candidate } => !!x.item);
 
@@ -503,7 +600,7 @@ function DecisionCard({
     }
 
     return (
-        <div className="hui-card p-5">
+        <div id={`decision-${decision.id}`} className="hui-card p-5">
             <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
                 <div className="flex-1 min-w-[200px]">
                     {renaming ? (
@@ -538,6 +635,17 @@ function DecisionCard({
                                 linkState={decision.linkState}
                                 tasks={scheduleTasks}
                                 isAdminOrManager={isAdminOrManager}
+                                onSaved={onChanged}
+                            />
+                            <OrderStatusLine decision={decision} />
+                            <RiskBadge decisionId={decision.id} risk={decision.risk} />
+                            <DecisionOrderPopover
+                                decisionId={decision.id}
+                                decisionName={decision.name}
+                                status={decision.status}
+                                orderedAt={decision.orderedAt}
+                                orderedBy={decision.orderedBy}
+                                expectedArrivalAt={decision.expectedArrivalAt}
                                 onSaved={onChanged}
                             />
                         </div>
@@ -900,6 +1008,7 @@ export default function TeamDecisionsSection({
                 </div>
             </div>
 
+            <RiskBanner decisions={decisions} />
             <ApprovedItemsTable decisions={decisions} onChanged={refresh} />
 
             {/* Anything the client clipped but hasn't filed yet. Sits above the
