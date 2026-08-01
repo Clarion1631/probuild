@@ -15,7 +15,9 @@ import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { toCompanyDayKey } from "./company-day";
 
 const CHAT_API = "https://chat.googleapis.com/v1";
-const CHAT_SCOPE = "https://www.googleapis.com/auth/chat.bot";
+// chat.bot covers media download; spaces.messages.list under app auth needs
+// chat.app.messages.readonly (granted once by a Workspace admin). Request both.
+const CHAT_SCOPE = "https://www.googleapis.com/auth/chat.bot https://www.googleapis.com/auth/chat.app.messages.readonly";
 /** How far back each ingest looks. Overlap is safe (upsert), gaps are not. */
 export const CHAT_INGEST_LOOKBACK_HOURS = 48;
 const MAX_PHOTOS_PER_MESSAGE = 10;
@@ -114,7 +116,10 @@ async function listRecentSpaceMessages(spaceName: string, sinceIso: string): Pro
         const params = new URLSearchParams({
             pageSize: "100",
             filter: `createTime > "${sinceIso}"`,
-            orderBy: "createTime ASC",
+            // Newest first, so if the cap ever bites it starves the OLDEST
+            // messages (already had their chance on earlier runs), never the
+            // newest.
+            orderBy: "createTime DESC",
         });
         if (pageToken) params.set("pageToken", pageToken);
         const response = await fetch(`${CHAT_API}/${spaceName}/messages?${params}`, {
@@ -127,7 +132,8 @@ async function listRecentSpaceMessages(spaceName: string, sinceIso: string): Pro
         messages.push(...(page.messages ?? []));
         pageToken = page.nextPageToken;
     } while (pageToken && messages.length < 500);
-    return messages;
+    // Process chronologically regardless of fetch order.
+    return messages.reverse();
 }
 
 async function downloadAttachment(resourceName: string): Promise<Buffer | null> {
@@ -173,7 +179,10 @@ function isIngestableMessage(message: ChatMessage): boolean {
  */
 export async function ingestChatSpaceToDailyLogs(
     project: { id: string; googleChatSpaceId: string },
-    options: { dryRun?: boolean; lookbackHours?: number } = {},
+    // skipPhotos: the interactive "@mention sync" path must answer within
+    // Google Chat's response deadline; photo downloads are the slow part and
+    // the nightly run backfills them (zero-photo logs retry below).
+    options: { dryRun?: boolean; lookbackHours?: number; skipPhotos?: boolean } = {},
 ): Promise<ChatIngestResult> {
     const result: ChatIngestResult = {
         spaceName: project.googleChatSpaceId,
@@ -210,7 +219,8 @@ export async function ingestChatSpaceToDailyLogs(
             const dayKey = toCompanyDayKey(message.createTime);
             const logDate = new Date(`${dayKey}T00:00:00.000Z`);
             const existing = await prisma.dailyLog.findUnique({
-                where: { chatMessageName: message.name }, select: { id: true, workPerformed: true },
+                where: { chatMessageName: message.name },
+                select: { id: true, workPerformed: true, _count: { select: { photos: true } } },
             });
             if (existing) {
                 if (existing.workPerformed !== text) {
@@ -220,21 +230,40 @@ export async function ingestChatSpaceToDailyLogs(
                     });
                     result.updated += 1;
                 }
+                // Photo retry: a crash or failed upload on the run that created
+                // the log must not lose its attachments forever. Zero photos +
+                // attachments on the message ⇒ try again.
+                if (!options.skipPhotos && existing._count.photos === 0 && imageAttachments.length > 0) {
+                    result.photosSaved += await saveMessagePhotos(existing.id, project.id, message.name, imageAttachments, result.errors);
+                }
                 continue;
             }
-            const created = await prisma.dailyLog.create({
-                data: {
-                    projectId: project.id,
-                    createdById: ingestUserId,
-                    date: logDate,
-                    workPerformed: text,
-                    source: "chat",
-                    chatMessageName: message.name,
-                },
-                select: { id: true },
-            });
+            let created: { id: string };
+            try {
+                created = await prisma.dailyLog.create({
+                    data: {
+                        projectId: project.id,
+                        createdById: ingestUserId,
+                        date: logDate,
+                        workPerformed: text,
+                        source: "chat",
+                        chatMessageName: message.name,
+                    },
+                    select: { id: true },
+                });
+            } catch (err) {
+                // A concurrent run won the unique-constraint race — that's a
+                // dedupe, not an error; the winner owns the photos.
+                if ((err as { code?: string })?.code === "P2002") {
+                    result.skipped += 1;
+                    continue;
+                }
+                throw err;
+            }
             result.created += 1;
-            result.photosSaved += await saveMessagePhotos(created.id, project.id, message.name, imageAttachments, result.errors);
+            if (!options.skipPhotos) {
+                result.photosSaved += await saveMessagePhotos(created.id, project.id, message.name, imageAttachments, result.errors);
+            }
         } catch (err) {
             result.errors.push(`${message.name}: ${err instanceof Error ? err.message : String(err)}`);
         }

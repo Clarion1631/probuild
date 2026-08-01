@@ -57,6 +57,11 @@ async function main() {
     assert.equal(sanitizeNextSteps("Tile work wraps up, then paint."), "Tile work wraps up, then paint.");
     assert.equal(sanitizeNextSteps("The change costs $1,200 extra."), null, "dollar amounts must drop the blurb");
     assert.equal(sanitizeNextSteps("About 1,200.00 dollars remain."), null);
+    assert.equal(sanitizeNextSteps("That runs USD 1,200 all in."), null);
+    assert.equal(sanitizeNextSteps("Add €500 for the upgrade."), null);
+    assert.equal(sanitizeNextSteps("Roughly five hundred dollars more."), null);
+    assert.equal(sanitizeNextSteps("Maybe 500 bucks."), null);
+    assert.equal(sanitizeNextSteps("Your balance due is ready."), null);
     const long = "a".repeat(1000);
     assert.ok((sanitizeNextSteps(long) ?? "").length <= 600, "blurb must be capped");
 
@@ -181,6 +186,40 @@ async function main() {
         assert.equal(run3.applied.length, 0, "AI must not overwrite a human edit");
         assert.equal(run3.rejected[0]?.reason, "human-set progress is durable");
 
+        // Legacy 100%-progress row (pre-clamp data) with null provenance: the
+        // AI write must come out at ≤99, never resurrect 100.
+        const legacy = await mkTask("Legacy hundred", { progress: 100, status: "Not Started" });
+        const legacyRun = await runFieldProgressForProject(project.id, {
+            complete: async () => JSON.stringify({
+                updates: [{ taskId: legacy.id, progress: 50, note: "still moving" }],
+                nextSteps: null,
+            }),
+        });
+        const savedLegacy = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: legacy.id } });
+        assert.ok(savedLegacy.progress <= 99, `legacy task must clamp to ≤99, got ${savedLegacy.progress}`);
+        assert.equal(legacyRun.applied.length + legacyRun.rejected.length, 1);
+
+        // Race: a human edit landing WHILE the model is thinking must win. The
+        // fake completion mutates the task mid-run; the in-transaction recheck
+        // must reject the stale suggestion.
+        const raced = await mkTask("Race target");
+        const raceRun = await runFieldProgressForProject(project.id, {
+            complete: async () => {
+                await prisma.scheduleTask.update({
+                    where: { id: raced.id },
+                    data: { progress: 80, status: "In Progress", progressSource: "human" },
+                });
+                return JSON.stringify({
+                    updates: [{ taskId: raced.id, progress: 30, note: "stale read" }],
+                    nextSteps: null,
+                });
+            },
+        });
+        assert.equal(raceRun.applied.length, 0, "a mid-run human edit must win the race");
+        const savedRaced = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: raced.id } });
+        assert.equal(savedRaced.progress, 80, "the human's progress must survive");
+        assert.equal(savedRaced.progressSource, "human");
+
         // Dry run: report but never write.
         const dryTask = await mkTask("Dry-run target");
         const dry = await runFieldProgressForProject(project.id, {
@@ -193,6 +232,8 @@ async function main() {
         assert.equal(dry.applied.length, 1, "dry run still reports what it would do");
         const savedDry = await prisma.scheduleTask.findUniqueOrThrow({ where: { id: dryTask.id } });
         assert.equal(savedDry.progress, 0, "dry run must not write task progress");
+        assert.equal(dry.nextStepsWritten, false, "dry run must not claim a write");
+        assert.equal(dry.nextStepsPreview, "Dry run only.", "dry run reports the blurb as a preview");
         const savedProject3 = await prisma.project.findUniqueOrThrow({ where: { id: project.id } });
         assert.ok(!savedProject3.clientNextSteps?.includes("Dry run"), "dry run must not write next steps");
 

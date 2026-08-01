@@ -37,6 +37,8 @@ export type FieldProgressRunResult = {
     /** Model suggestions rejected by a guard, with the reason. */
     rejected: Array<{ taskId: string; reason: string }>;
     nextStepsWritten: boolean;
+    /** Dry run only: the blurb that passed the gate and WOULD have been written. */
+    nextStepsPreview?: string;
     skippedReason?: string;
     errors: string[];
 };
@@ -60,7 +62,9 @@ async function defaultComplete(prompt: string): Promise<string> {
 
 /** Neutralize fence-closing sequences in untrusted text (same idea as change-order-detect). */
 function neutralizeFences(value: string): string {
-    return value.replace(/<\/?(daily_logs|schedule_tasks|project)>/gi, "[fence]");
+    // Loose form: whitespace or attributes inside the tag (`</daily_logs >`)
+    // must not slip past an exact-tag match.
+    return value.replace(/<\s*\/?\s*(daily_logs|schedule_tasks|project)\b[^>]*>/gi, "[fence]");
 }
 
 function buildPrompt(
@@ -122,7 +126,9 @@ export function sanitizeNextSteps(value: string | null): string | null {
     if (!value) return null;
     const text = value.replace(/\s+/g, " ").trim();
     if (!text) return null;
-    if (/[$]\s*\d|\b\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:dollars|USD)\b/i.test(text)) return null;
+    // Any currency symbol, currency code, or money word drops the blurb —
+    // "USD 1,200", "€500", "five hundred dollars", "500 bucks" all count.
+    if (/[$€£¥]|\b(?:USD|EUR|GBP|CAD|dollars?|bucks|cents?)\b|\bbalance\s+due\b|\bpayment\s+due\b/i.test(text)) return null;
     return text.length > MAX_NEXT_STEPS_CHARS ? `${text.slice(0, MAX_NEXT_STEPS_CHARS - 1)}…` : text;
 }
 
@@ -245,23 +251,47 @@ export async function runFieldProgressForProject(
         seenTaskIds.add(taskId);
         planned.push({
             taskId,
-            progress: Math.max(progress, task.progress || 1),
+            // Clamp LAST: max() against a legacy 100%-progress row must not
+            // resurrect a value the 99 ceiling exists to prevent.
+            progress: Math.min(99, Math.max(progress, task.progress || 1)),
             note: typeof update.note === "string" ? update.note.slice(0, 300) : "",
         });
     }
 
     // 6. Apply through the canonical core (stamps progressSource "ai" via the
     //    SYSTEM actor) plus an audit row carrying the evidence sentence.
+    //
+    //    The step-5 guards ran against a snapshot taken BEFORE the model call,
+    //    and a human can edit while the model thinks. So every guard that a
+    //    human edit could invalidate is re-checked inside the transaction,
+    //    under the same Project→Task row-lock order the schedule cores use —
+    //    the human always wins the race.
     for (const update of planned) {
         const task = candidateById.get(update.taskId)!;
         const toStatus = "In Progress";
+        let fromProgress = task.progress;
+        let fromStatus = task.status;
         if (!dryRun) {
             try {
-                await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+                const outcome = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+                    await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+                    await tx.$queryRaw`SELECT id FROM "ScheduleTask" WHERE id = ${update.taskId} FOR UPDATE`;
+                    const fresh = await tx.scheduleTask.findUnique({
+                        where: { id: update.taskId },
+                        select: { progress: true, status: true, progressSource: true, projectId: true },
+                    });
+                    if (!fresh || fresh.projectId !== projectId) return { rejected: "task moved or vanished" };
+                    if (fresh.progressSource === "human") return { rejected: "human-set progress is durable" };
+                    if (fresh.status === "Complete" || fresh.status === "Blocked") {
+                        return { rejected: `task is now ${fresh.status}` };
+                    }
+                    if (update.progress <= fresh.progress && fresh.status === "In Progress") {
+                        return { rejected: "would not advance the task" };
+                    }
                     await updateScheduleTaskInTransaction(
                         tx,
                         update.taskId,
-                        { status: toStatus, progress: update.progress },
+                        { status: toStatus, progress: Math.min(99, Math.max(update.progress, fresh.progress)) },
                         FIELD_PROGRESS_ACTOR,
                         projectId,
                     );
@@ -275,15 +305,22 @@ export async function runFieldProgressForProject(
                             entityId: update.taskId,
                             entityName: task.name,
                             metadata: JSON.stringify({
-                                fromStatus: task.status,
+                                fromStatus: fresh.status,
                                 toStatus,
-                                fromProgress: task.progress,
+                                fromProgress: fresh.progress,
                                 toProgress: update.progress,
                                 evidence: update.note,
                             }),
                         },
                     });
+                    return { fromProgress: fresh.progress, fromStatus: fresh.status };
                 });
+                if ("rejected" in outcome) {
+                    result.rejected.push({ taskId: update.taskId, reason: outcome.rejected! });
+                    continue;
+                }
+                fromProgress = outcome.fromProgress!;
+                fromStatus = outcome.fromStatus!;
             } catch (err) {
                 result.errors.push(`apply ${update.taskId}: ${err instanceof Error ? err.message : String(err)}`);
                 continue;
@@ -292,23 +329,32 @@ export async function runFieldProgressForProject(
         result.applied.push({
             taskId: update.taskId,
             taskName: task.name,
-            fromProgress: task.progress,
+            fromProgress,
             toProgress: update.progress,
-            fromStatus: task.status,
+            fromStatus,
             toStatus,
             note: update.note,
         });
     }
 
-    // 7. Customer-facing next steps — deterministic scrub, fail-closed.
+    // 7. Customer-facing next steps — deterministic scrub, fail-closed. A
+    //    failure here must not report the whole project as failed (the task
+    //    writes above are already committed).
     const nextSteps = sanitizeNextSteps(parsed.nextSteps);
     if (nextSteps && !dryRun) {
-        await prisma.project.update({
-            where: { id: projectId },
-            data: { clientNextSteps: nextSteps, clientNextStepsAt: new Date() },
-        });
+        try {
+            await prisma.project.update({
+                where: { id: projectId },
+                data: { clientNextSteps: nextSteps, clientNextStepsAt: new Date() },
+            });
+            result.nextStepsWritten = true;
+        } catch (err) {
+            result.errors.push(`next-steps write: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
-    result.nextStepsWritten = !!nextSteps;
+    // Dry run never writes, so it never claims to have written — the blurb
+    // that passed the gate is reported separately.
+    if (nextSteps && dryRun) result.nextStepsPreview = nextSteps;
 
     return result;
 }

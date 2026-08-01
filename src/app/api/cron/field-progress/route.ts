@@ -49,7 +49,17 @@ export async function GET(request: Request) {
 
     const runs = [];
     const failures: Array<{ projectId: string; error: string }> = [];
+    const skippedForBudget: string[] = [];
+    // One stalled Chat/Anthropic request must not let the 300s platform kill
+    // silently swallow the remaining projects — stop starting new ones near
+    // the ceiling and REPORT what was skipped.
+    const startedAt = Date.now();
+    const TIME_BUDGET_MS = 240_000;
     for (const project of projects) {
+        if (Date.now() - startedAt > TIME_BUDGET_MS) {
+            skippedForBudget.push(project.id);
+            continue;
+        }
         try {
             runs.push(await runFieldProgressForProject(project.id, { dryRun }));
         } catch (err) {
@@ -64,6 +74,7 @@ export async function GET(request: Request) {
         rejected: runs.reduce((sum, run) => sum + run.rejected.length, 0),
         logsIngested: runs.reduce((sum, run) => sum + (run.ingest?.created ?? 0), 0),
         nextStepsWritten: runs.filter(run => run.nextStepsWritten).length,
+        skippedForBudget,
         failures,
         runs,
     };

@@ -88,12 +88,15 @@ export async function POST(request: Request) {
             return NextResponse.json({ text: "Sync isn't configured yet (missing service-account credential). Posts will be picked up once it is." });
         }
         try {
+            // Chat expects a reply within its interaction deadline; photos are
+            // the slow part, so the interactive sync skips them — the nightly
+            // run backfills photos for zero-photo logs.
             const result = await ingestChatSpaceToDailyLogs(
                 { id: project.id, googleChatSpaceId: project.googleChatSpaceId! },
+                { skipPhotos: true, lookbackHours: 24 },
             );
-            const photoNote = result.photosSaved > 0 ? ` with ${result.photosSaved} photos` : "";
             return NextResponse.json({
-                text: `Synced: ${result.created} new daily log${result.created === 1 ? "" : "s"}${photoNote}, ${result.updated} updated.`,
+                text: `Synced: ${result.created} new daily log${result.created === 1 ? "" : "s"}, ${result.updated} updated. Photos come in on the nightly pass.`,
             });
         } catch (err) {
             console.error("[chat/events] sync failed", err);
