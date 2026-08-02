@@ -58,6 +58,8 @@ function trackerTask(
         clientStage: input.clientStage ?? null,
         scheduledTime: input.scheduledTime ?? null,
         confirmationStatus: input.confirmationStatus ?? null,
+        // Same forwarding rule as clientStage above: the work-list cases need it.
+        parentId: input.parentId ?? null,
         assignments: input.assignments ?? [],
         subAssignments: input.subAssignments ?? [],
     };
@@ -357,6 +359,28 @@ function runPureCases(): void {
     assert.equal(visitors[2].appointments[0].confirmationStatus, "confirmed");
     assert.equal(visitors[3].appointments[0].confirmationStatus, "pending confirmation");
     assert.ok(visitors.every(day => !day.crew.includes("Late")));
+    // Scheduled work shows even with no crew assigned — the common case here.
+    assert.deepEqual(visitors[0].work, ["Install blocking", "Continue blocking"]);
+    assert.deepEqual(visitors[2].work, [], "appointments are not scheduled work");
+
+    const unassignedWork = buildPortalWhoIsComing([
+        trackerTask({
+            id: "phase-parent",
+            name: "Framing phase",
+            startDate: date(0),
+            endDate: date(6),
+        }),
+        trackerTask({
+            id: "bare-task",
+            name: "02: Frame walls",
+            parentId: "phase-parent",
+            startDate: date(1),
+            endDate: date(2),
+        }),
+    ], BASE_DATE);
+    assert.deepEqual(unassignedWork[1].work, ["Frame walls"], "leaf work shows scrubbed, parent excluded");
+    assert.deepEqual(unassignedWork[0].work, [], "a phase parent is not that day's work");
+    assert.ok(unassignedWork[1].crew.length === 0 && unassignedWork[1].work.length > 0);
 
     const hashA = computeDailyLogSharedContentHash("Installed blocking", ["photo-b", "photo-a"]);
     const hashB = computeDailyLogSharedContentHash("Installed blocking", ["photo-a", "photo-b"]);
