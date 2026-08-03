@@ -51,6 +51,7 @@ interface ReceiptPushBody {
     groups?: unknown;
     fileBase64?: unknown;
     fileContentType?: unknown;
+    overheadCategory?: unknown;
 }
 
 function normalizeGroups(raw: unknown): CreateQBReceiptPurchaseInput["groups"] {
@@ -86,6 +87,7 @@ function buildInput(body: ReceiptPushBody, groups: CreateQBReceiptPurchaseInput[
         fileName: typeof body.fileName === "string" ? body.fileName : undefined,
         fileBase64: typeof body.fileBase64 === "string" ? body.fileBase64 : undefined,
         fileContentType: typeof body.fileContentType === "string" ? body.fileContentType : undefined,
+        overheadCategory: typeof body.overheadCategory === "string" ? body.overheadCategory : undefined,
     };
 }
 

@@ -140,6 +140,16 @@ export interface CreateQBReceiptPurchaseInput {
     groups: QboReceiptGroup[];
     fileBase64?: string;
     fileContentType?: string;
+    /**
+     * Shop/overhead docs: the QBO expense-account NAME to post the lines to
+     * (the Drive category folder mirrors the chart of accounts, e.g. "Vehicle
+     * expenses", "Meals"). When set, the lines post to that account instead of
+     * the default COGS expense account — resolved by EXACT name against
+     * Expense / Other Expense accounts, terminal ok:false when it can't be.
+     * Tax-split groups are refused with overheadCategory: the reseller-permit
+     * reclaim only applies to job materials, never overhead purchases.
+     */
+    overheadCategory?: string;
 }
 
 /** "attached" | "skipped" | "failed:<short reason>" — a failure never fails the Purchase create. */
@@ -154,7 +164,9 @@ export type CreateQBReceiptPurchaseResult =
     | { ok: false; reason: "amount-mismatch"; groupsSum: number; totalAmount: number }
     | { ok: false; reason: "missing-vendor" }
     | { ok: false; reason: "invalid-date" }
-    | { ok: false; reason: "duplicate-name" };
+    | { ok: false; reason: "duplicate-name" }
+    | { ok: false; reason: "overhead-account-not-matched"; category: string }
+    | { ok: false; reason: "overhead-tax-unsupported" };
 
 export interface QboReceiptProjectCandidate {
     id: string;
@@ -352,6 +364,34 @@ export class QboAccountConfigError extends Error {
 // transient query failure can't poison a warm process forever.
 const verifiedAccountsCache = new Map<string, Promise<void>>();
 
+/**
+ * Resolve a Shop/overhead category folder name to its QBO expense account by
+ * EXACT name match — never fuzzy, this picks where real money posts. Accepts
+ * Expense and Other Expense types (GTR's "Vehicle expenses" bucket is Other
+ * Expense). Returns null when no single active match exists — the caller maps
+ * that to a terminal ok:false so the bot books via the email path instead.
+ *
+ * DELIBERATELY UNCACHED. Accounts are mutable: renaming "Meals" in QBO must
+ * stop matching the name immediately, and any cache — even a short-TTL one —
+ * leaves a window where a receipt posts to an account that no longer carries
+ * the category's name. One extra query per overhead receipt (a handful a day)
+ * buys a guarantee that the id was verified against the CURRENT name.
+ */
+async function resolveOverheadAccountId(
+    tokens: QBTokens,
+    qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
+    category: string,
+): Promise<string | null> {
+    const rows = await qbQueryFn<{ Id: string; Name?: string; AccountType?: string; Active?: boolean }>(
+        tokens,
+        `SELECT Id, Name, AccountType, Active FROM Account WHERE Name = '${escapeQBString(category)}'`,
+    );
+    const matches = rows.filter(
+        r => r.Active !== false && (r.AccountType === "Expense" || r.AccountType === "Other Expense"),
+    );
+    return matches.length === 1 ? matches[0].Id : null;
+}
+
 async function verifyReceiptAccounts(
     tokens: QBTokens,
     qbQueryFn: QboReceiptPushDependencies["qbQueryFn"],
@@ -489,6 +529,23 @@ export async function createQBReceiptPurchase(
         return { ok: false, reason: "amount-mismatch", groupsSum: groupsSumCents / 100, totalAmount: input.totalAmount };
     }
 
+    // Overhead docs post to the category's own expense account. The tax split
+    // is refused outright: the reseller-permit reclaim covers job materials
+    // only, so overhead sales tax must stay inside the expense, and silently
+    // rerouting it would corrupt the state-filing report. Resolved BEFORE any
+    // customer/vendor ensure so an unmatched category never creates entities.
+    const overheadCategory = (input.overheadCategory ?? "").trim();
+    let overheadAccountId: string | null = null;
+    if (overheadCategory) {
+        if (roundedGroups.some(g => g.tax === true)) {
+            return { ok: false, reason: "overhead-tax-unsupported" };
+        }
+        overheadAccountId = await resolveOverheadAccountId(tokens, qbQueryFn, overheadCategory);
+        if (!overheadAccountId) {
+            return { ok: false, reason: "overhead-account-not-matched", category: overheadCategory };
+        }
+    }
+
     // Customer resolved PER PROJECT (QBO customers are named after jobs — this
     // round-trips with the expense sync's project-name matching). A Client can
     // own several projects, so Client.qbCustomerId is never used here.
@@ -539,7 +596,8 @@ export async function createQBReceiptPurchase(
             AccountBasedExpenseLineDetail: {
                 // Tax lines post to the reimbursable-sales-tax account but stay
                 // job-coded: the tax IS a job cost until the state refunds it.
-                AccountRef: { value: g.tax ? taxAccountId : expenseAccountId },
+                // Overhead docs (tax refused above) post to the category account.
+                AccountRef: { value: g.tax ? taxAccountId : (overheadAccountId ?? expenseAccountId) },
                 CustomerRef: { value: customerId },
                 BillableStatus: "NotBillable",
                 TaxCodeRef: { value: "NON" },

@@ -18,12 +18,16 @@
  * + DocNumber dedupe) — so a config change mid-retry can never double-book.
  *
  * Fallback contract (nothing can be lost):
- *  - GAS flag off / no key / file > 3MB -> email path (sticky)
+ *  - GAS flag off / no key / file > 3MB / ambiguous prior legacy email
+ *    (possibleDuplicate) / uncategorized Shop doc -> email path (sticky)
  *  - HTTP 401            -> ONE alert per file (quota-guarded), then throw (retry)
  *  - other non-200       -> throw (transient; retries next pass)
  *  - 200 { ok:false }    -> sticky email route, then the legacy sendToQBO(...)
  *  - 200 { ok:true }     -> state.qboApi = the QBO purchase id
- * Shop/overhead docs always take the legacy email path (no ProBuild project).
+ * Shop/overhead docs ride the API path when they carry a category folder
+ * (the folder name mirrors the QBO expense account — ProBuild resolves it via
+ * payload.overheadCategory); a root-of-Shop drop has no account to code to,
+ * so it stays on the email path for Marge to categorize.
  *
  * NOTE: the current Gemini extraction has no line-item/category splitting, so
  * the Purchase carries ONE line for the receipt total. When extraction gains
@@ -53,6 +57,12 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     sendToQBO(file, ctx, aiData, isCheck, totalAmount, dateStr, memo, checkNum, cleanInv, possibleDuplicate, attachment);
     state.qboApi = "email-fallback:" + reason;
     setState(file, state);
+    // Journey beacon: this receipt was booked via the EMAIL path and why.
+    reportStageBeacon_(file, "email-book", "emailed", reason, {
+      vendor: aiData.vendor || "",
+      projectName: ctx.projectName,
+      amountCents: Math.round(Number(totalAmount) * 100)
+    });
   }
 
   // A document already routed to email NEVER re-attempts the API.
@@ -65,8 +75,18 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
   const apiCommitted = state.qboRoute === "api";
 
   if (!apiCommitted) {
-    // Shop/overhead expenses have no ProBuild project to code the line to.
-    if (ctx.isShop) return emailPath("shop");
+    // An earlier LEGACY send may have reached the QBO inbox for this document
+    // (emailing=true, emailed=false — a crash mid-send). The email path
+    // re-sends WITH a duplicate warning Marge can see side by side; the API
+    // path would silently create a second, invisible booking. Ambiguous docs
+    // therefore never switch to the API.
+    if (possibleDuplicate) return emailPath("ambiguous-prior-email");
+
+    // Shop/overhead: the API path needs a category folder to pick the QBO
+    // expense account. A receipt dropped at the ROOT of Shop has no category
+    // (and a folder whose name reduces to nothing, e.g. all digits, has no
+    // usable one), so it books via email and Marge codes it in the inbox.
+    if (ctx.isShop && !displayCategory(ctx.category)) return emailPath("shop-uncategorized");
 
     // GAS-side rollout flag: while off, no HTTP call is made at all — the
     // legacy pipeline keeps zero dependency on ProBuild being reachable.
@@ -96,8 +116,13 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
   // Point of no return for routing: this document is an API document. The
   // POST is idempotent server-side (requestid + DocNumber from the Drive
   // fileId), so any number of retries can only ever yield one Purchase.
+  // The overhead category is persisted WITH the route: a retry must book to
+  // the account the original attempt selected, even if someone moves the file
+  // between folders before the retry lands (ctx.* reflects the CURRENT
+  // folder; state.* reflects the committed decision).
   if (!apiCommitted) {
     state.qboRoute = "api";
+    state.qboOverheadCategory = ctx.isShop ? displayCategory(ctx.category) : "";
     setState(file, state);
   }
 
@@ -110,8 +135,17 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
   // applies to receipts (never handwritten checks), and an unreadable/absent
   // tax ("" -> 0) or a nonsense value (tax >= total) falls back to the
   // single-line shape — a bad tax read must never block the booking.
+  // The COMMITTED overhead category (may be "" for project docs and for docs
+  // committed before this feature existed). Everything below keys off this
+  // persisted value, never ctx.*, so a file moved between folders mid-retry
+  // cannot change how its committed booking is coded.
+  const overheadCategory = state.qboOverheadCategory || "";
+
   const totalCents = Math.round(Number(totalAmount) * 100);
-  const taxCents = isCheck ? 0 : Math.round(Number(cleanMoney(aiData.tax_amount)) * 100);
+  // Overhead (Shop) docs NEVER split tax: the reseller-permit reclaim covers
+  // job materials only, so overhead sales tax stays inside the expense —
+  // ProBuild refuses a tax group on an overhead doc for the same reason.
+  const taxCents = (isCheck || overheadCategory) ? 0 : Math.round(Number(cleanMoney(aiData.tax_amount)) * 100);
   let groups;
   if (taxCents > 0 && taxCents < totalCents) {
     groups = [
@@ -120,7 +154,7 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
     ];
   } else {
     groups = [{
-      category: isCheck ? ("Check #" + (checkNum || "?")) : "Receipt",
+      category: isCheck ? ("Check #" + (checkNum || "?")) : (overheadCategory || "Receipt"),
       amount: totalCents / 100,
       lines: []
     }];
@@ -128,6 +162,10 @@ function sendReceiptToQuickBooksViaAPI(file, ctx, aiData, isCheck, totalAmount, 
 
   const payload = {
     projectName: ctx.projectName,
+    // Category folder name -> QBO expense account name ("15 Vehicle expenses"
+    // -> "Vehicle expenses"). ProBuild resolves it by exact name; an unmatched
+    // name comes back ok:false and the doc falls to the email path.
+    overheadCategory: overheadCategory || undefined,
     docType: isCheck ? "check" : "receipt",
     vendor: aiData.vendor || "Unknown",
     date: dateStr,

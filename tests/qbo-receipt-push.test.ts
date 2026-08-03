@@ -621,3 +621,150 @@ test("route POST returns 503 when QuickBooks isn't connected (unchanged transien
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { ok: false, reason: "quickbooks-not-connected" });
 });
+
+// ─── Overhead category (Shop docs) ──────────────────────────────────────────
+
+const SHOP_PROJECT: QboReceiptProjectCandidate = { id: "project-shop", name: "Shop" };
+
+/** Name-lookup rows for the overhead resolver + the id-lookup rows the account-identity check needs. */
+function overheadAccountRows(name: string, row: Record<string, unknown> | null) {
+    return (query: string) => {
+        if (query.includes("WHERE Name = ")) {
+            return query.includes(`'${name}'`) && row ? [row] : [];
+        }
+        return defaultAccountRow(query);
+    };
+}
+
+test("overheadCategory posts lines to the resolved category account, not the default expense account", async () => {
+    const { deps, calls } = createDeps({
+        projects: [SHOP_PROJECT],
+        accountRows: overheadAccountRows("Vehicle expenses", { Id: "88", Name: "Vehicle expenses", AccountType: "Other Expense", Active: true }),
+    });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        projectName: "Shop",
+        overheadCategory: "Vehicle expenses",
+        groups: [{ category: "Vehicle expenses", amount: 150 }],
+    }), deps);
+
+    assert.equal(result.ok, true);
+    const lines = calls.creates[0].payload.Line as Array<{ AccountBasedExpenseLineDetail: { AccountRef: { value: string }; CustomerRef: { value: string } } }>;
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].AccountBasedExpenseLineDetail.AccountRef.value, "88");
+    // Overhead stays customer-coded to the Shop project so the expense sync
+    // still lands it as ProBuild job cost.
+    assert.equal(lines[0].AccountBasedExpenseLineDetail.CustomerRef.value, "cust-1");
+});
+
+test("an unmatched overheadCategory is terminal ok:false and never ensures a customer or vendor", async () => {
+    const { deps, calls } = createDeps({ projects: [SHOP_PROJECT] });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        projectName: "Shop",
+        overheadCategory: "No Such Account",
+        groups: [{ category: "No Such Account", amount: 150 }],
+    }), deps);
+
+    assert.deepEqual(result, { ok: false, reason: "overhead-account-not-matched", category: "No Such Account" });
+    assert.equal(calls.customerCalls.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.creates.length, 0);
+});
+
+test("an overheadCategory that matches a non-expense account (e.g. a Bank) is refused", async () => {
+    const { deps, calls } = createDeps({
+        projects: [SHOP_PROJECT],
+        accountRows: overheadAccountRows("Sneaky Bank", { Id: "154", Name: "Sneaky Bank", AccountType: "Bank", Active: true }),
+    });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        projectName: "Shop",
+        overheadCategory: "Sneaky Bank",
+        groups: [{ category: "Sneaky Bank", amount: 150 }],
+    }), deps);
+
+    assert.deepEqual(result, { ok: false, reason: "overhead-account-not-matched", category: "Sneaky Bank" });
+    assert.equal(calls.creates.length, 0);
+});
+
+test("an overheadCategory that matches only an inactive account is refused", async () => {
+    const { deps, calls } = createDeps({
+        projects: [SHOP_PROJECT],
+        accountRows: overheadAccountRows("Dormant", { Id: "999", Name: "Dormant", AccountType: "Expense", Active: false }),
+    });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        projectName: "Shop",
+        overheadCategory: "Dormant",
+        groups: [{ category: "Dormant", amount: 150 }],
+    }), deps);
+
+    assert.deepEqual(result, { ok: false, reason: "overhead-account-not-matched", category: "Dormant" });
+    assert.equal(calls.creates.length, 0);
+});
+
+test("a tax-split group with overheadCategory is refused before any account lookup — overhead tax is not reclaimable", async () => {
+    const { deps, calls } = createDeps({ projects: [SHOP_PROJECT] });
+    const result = await createQBReceiptPurchase(TOKENS, baseInput({
+        projectName: "Shop",
+        overheadCategory: "Vehicle expenses",
+        totalAmount: 150,
+        groups: [
+            { category: "Receipt (pre-tax)", amount: 140 },
+            { category: "Sales tax", amount: 10, tax: true },
+        ],
+    }), deps);
+
+    assert.deepEqual(result, { ok: false, reason: "overhead-tax-unsupported" });
+    assert.equal(calls.queries.filter(q => q.includes("WHERE Name = ")).length, 0);
+    assert.equal(calls.customerCalls.length, 0);
+    assert.equal(calls.vendorCalls.length, 0);
+    assert.equal(calls.creates.length, 0);
+});
+
+test("the overhead account is re-resolved on EVERY push — a rename in QBO must stop matching the old name immediately", async () => {
+    const input = (fileId: string) => baseInput({
+        projectName: "Shop",
+        overheadCategory: "Meals",
+        fileId,
+        groups: [{ category: "Meals", amount: 150 }],
+    });
+
+    // First push: "Meals" exists and resolves.
+    const before = createDeps({
+        projects: [SHOP_PROJECT],
+        accountRows: overheadAccountRows("Meals", { Id: "56", Name: "Meals", AccountType: "Expense", Active: true }),
+    });
+    assert.equal((await createQBReceiptPurchase(TOKENS, input("meals-file-000000000000000001"), before.deps)).ok, true);
+    assert.equal(before.calls.queries.filter(q => q.includes("WHERE Name = ")).length, 1);
+
+    // Account 56 is then renamed in QBO, so nothing carries the name "Meals"
+    // any more. The next push must re-query and refuse — never reuse the id.
+    const after = createDeps({ projects: [SHOP_PROJECT], accountRows: overheadAccountRows("Meals", null) });
+    const result = await createQBReceiptPurchase(TOKENS, input("meals-file-000000000000000002"), after.deps);
+    assert.deepEqual(result, { ok: false, reason: "overhead-account-not-matched", category: "Meals" });
+    assert.equal(after.calls.queries.filter(q => q.includes("WHERE Name = ")).length, 1);
+    assert.equal(after.calls.creates.length, 0);
+});
+
+test("route POST forwards overheadCategory only as a string", async () => {
+    const inputs: CreateQBReceiptPurchaseInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async (_tokens, input) => {
+            inputs.push(input);
+            return { ok: true, qbPurchaseId: "p1", docNumber: "doc", alreadyExists: true };
+        },
+    });
+    for (const overheadCategory of ["Meals", 42]) {
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: JSON.stringify({
+                fileId: "file-1",
+                projectName: "Shop",
+                overheadCategory,
+                groups: [{ category: "Meals", amount: 100 }],
+            }),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 200);
+    }
+    assert.equal(inputs[0].overheadCategory, "Meals");
+    assert.equal(inputs[1].overheadCategory, undefined);
+});
