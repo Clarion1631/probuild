@@ -34,8 +34,17 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // api/selections/link-schedule is the same shape (staff-only, self-
 // authorizing, must return a clean 403) for the schedule-linking AI
 // suggestion route (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+// privacy / terms / account-deletion are static legal pages with no data access.
+// The app stores require them to be reachable by a logged-out reviewer, and Google
+// Play specifically requires a public account-deletion URL.
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
+
+// The legal pages are static server components that define no Server Actions.
+// Next's action IDs are global, so a bypassed path is a place an anonymous caller
+// could POST a `next-action` header for someone else's action; the portal routes
+// accept that tradeoff because they genuinely have anonymous actions, these don't.
+const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
 
 export function isPublicProxyBypass(pathname: string) {
     return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname) || CHANGE_ORDER_BILLING_PDF_PATTERN.test(pathname);
@@ -71,6 +80,11 @@ export default async function proxy(req: any, event: any) {
         if (!token?.email || (token as any).accountDisabled === true || !await isStaffAccountEnabled(token.email)) {
             return new NextResponse("Forbidden", { status: 403 });
         }
+    }
+
+    // Legal pages are readable by anyone but are not an action endpoint.
+    if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
+        return new NextResponse("Forbidden", { status: 403 });
     }
 
     if (typeof pathname === "string" && isPublicProxyBypass(pathname)) {
@@ -134,11 +148,13 @@ export const config = {
          * - portal (Client portal, if public/token-based)
          * - sub-portal (Subcontractor portal, magic-link auth)
          * - share (Public token-gated room design viewer)
+         * - privacy, terms, account-deletion, support (Public legal/support pages —
+         *   the app stores require a logged-out reviewer to be able to load them)
          * - _next/static (Static files)
          * - _next/image (Image optimization)
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|privacy|terms|account-deletion|support|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

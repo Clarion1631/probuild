@@ -7,6 +7,21 @@ import Header from "./Header";
 import { useSession, signOut } from "next-auth/react";
 import { useEffect } from "react";
 
+// Routes rendered bare, with no staff session required. /privacy, /terms and
+// /account-deletion are the public legal pages the app stores must be able to
+// load logged out — keep this in sync with PUBLIC_PROXY_BYPASS_PATTERN in proxy.ts.
+function isPublicPath(pathname: string | null) {
+    return pathname?.startsWith('/portal')
+        || pathname?.startsWith('/sub-portal')
+        || pathname?.startsWith('/share')
+        || pathname === '/login'
+        || pathname === '/clip'
+        || pathname === '/privacy'
+        || pathname === '/terms'
+        || pathname === '/account-deletion'
+        || pathname === '/support';
+}
+
 export default function AppLayout({ children, logoUrl }: { children: React.ReactNode, logoUrl?: string }) {
     const pathname = usePathname();
     const router = useRouter();
@@ -34,7 +49,7 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
     // getSessionOrDev() + redirect("/login"), same as every other team page.
     useEffect(() => {
         if (status === 'authenticated') {
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
+            const isPublicRoute = isPublicPath(pathname);
 
             // If an authenticated user suddenly has no role, they were likely deleted.
             // Force sign out to clear the stale session so they can try again.
@@ -48,14 +63,14 @@ export default function AppLayout({ children, logoUrl }: { children: React.React
             }
         }
         if (status === 'unauthenticated' && process.env.NODE_ENV !== 'development') { // Bypass only if NOT in development
-            const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
+            const isPublicRoute = isPublicPath(pathname);
             if (!isPublicRoute) {
                 router.replace('/login');
             }
         }
     }, [status, role, pathname, router, session]);
 
-    const isPublicRoute = pathname?.startsWith('/portal') || pathname?.startsWith('/sub-portal') || pathname?.startsWith('/share') || pathname === '/login' || pathname === '/clip';
+    const isPublicRoute = isPublicPath(pathname);
 
     if (status === 'authenticated' && !role && !isPublicRoute) {
         return <div className="min-h-screen bg-hui-background flex items-center justify-center text-slate-500">Signing out...</div>;
