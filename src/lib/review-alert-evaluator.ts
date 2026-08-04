@@ -10,7 +10,7 @@ import {
     type RegisterMergeReceiptEvent,
 } from "./register-merge";
 import { deriveReasonCodes, type ReasonCode } from "./review-alert-reasons";
-import { evaluateReviewIssue } from "./review-alert-lifecycle";
+import { evaluateReviewIssue, type ReviewIssueLifecycleClient } from "./review-alert-lifecycle";
 import { ensureRolloutBaseline, type EnsureRolloutBaselineResult, type ReviewTarget } from "./review-alert-rollout";
 
 /**
@@ -109,6 +109,17 @@ async function fetchClassifications(purchaseIds: string[]): Promise<RegisterMerg
     }));
 }
 
+export interface ReviewTargetsSnapshot {
+    targets: ReviewTarget[];
+    /** Propagated from `fetchBankRegister`'s own `stale` flag: true when QBO
+     * errored this call and a previously-cached register was served instead
+     * (qbo-bank-register.ts:147,188). A `stale` snapshot is NOT a trustworthy
+     * full picture of what currently exists in QBO — callers that need to
+     * know "is a target's absence from this list real" (reconcileMissingTargets's
+     * trust gate) must check this before acting on absence. */
+    stale: boolean;
+}
+
 /**
  * Every register row with a QBO transaction id, over a trailing window,
  * mapped to its CURRENT reason codes (possibly `[]`). `[]` is not filtered
@@ -130,7 +141,7 @@ async function fetchClassifications(purchaseIds: string[]): Promise<RegisterMerg
  * rows join to Expense/QboPurchaseClassification), but the target LIST built
  * here must not.
  */
-export async function computeReviewTargets(now: Date = new Date()): Promise<ReviewTarget[]> {
+async function computeReviewTargetsSnapshot(now: Date = new Date()): Promise<ReviewTargetsSnapshot> {
     const tokens = await getFreshQBTokens();
     const endDate = now.toISOString().slice(0, 10);
     const startDate = new Date(now.getTime() - WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
@@ -166,7 +177,17 @@ export async function computeReviewTargets(now: Date = new Date()): Promise<Revi
             },
         });
     }
-    return targets;
+    return { targets, stale: registerResult.stale };
+}
+
+/** Thin wrapper over `computeReviewTargetsSnapshot` that keeps the ORIGINAL
+ * `Promise<ReviewTarget[]>` signature — deliberately, so the rollout module's
+ * `EnsureRolloutBaselineOptions.computeReviewTargets` seam
+ * (review-alert-rollout.ts) and `recomputeCodesFor` below don't need to
+ * change shape. Only `runEvaluation`'s reconciliation step needs the `stale`
+ * flag, so it calls `computeReviewTargetsSnapshot` directly instead. */
+export async function computeReviewTargets(now: Date = new Date()): Promise<ReviewTarget[]> {
+    return (await computeReviewTargetsSnapshot(now)).targets;
 }
 
 /** Re-derives ONE target's current reason codes from a fresh full sweep —
@@ -179,17 +200,46 @@ async function recomputeCodesFor(targetKey: string, now: Date): Promise<ReasonCo
     return fresh.find(t => t.targetType === TARGET_TYPE && t.targetKey === targetKey)?.reasonCodes ?? [];
 }
 
-/** Prisma-shaped subset for listing open issue keys — separate from
- * `ReviewIssueLifecycleClient` (that one is about single-row transitions,
- * this is a plain list read for reconciliation, finding 8). */
+/** Prisma-shaped subset for listing/updating open issue keys — separate from
+ * `ReviewIssueLifecycleClient` (that one is about single-row lifecycle
+ * transitions guarded by `version`; this is a plain list read plus bulk
+ * `absentSince` bookkeeping writes for reconciliation, finding 8). */
 interface OpenIssueKeyLister {
     reviewIssue: {
         findMany(args: {
             where: { targetType: string; clearedAt: null };
-            select: { targetKey: true };
-        }): Promise<Array<{ targetKey: string }>>;
+            select: { targetKey: true; absentSince: true };
+        }): Promise<Array<{ targetKey: string; absentSince: Date | null }>>;
+        updateMany(args: {
+            where: Record<string, unknown>;
+            data: Record<string, unknown>;
+        }): Promise<{ count: number }>;
     };
 }
+
+/** How long a target must be continuously absent from a TRUSTWORTHY snapshot
+ * before its open ReviewIssue is actually cleared (arbiter ruling, replacing
+ * the immediate-clear design below). Must outlive: `fetchBankRegister`'s
+ * 120s per-instance register cache (qbo-bank-register.ts), its 30s QBO-
+ * failure cooldown, AND at least one full backstop interval with margin —
+ * vercel.json's `review-alerts-backstop` cron runs once per hour (minute 15
+ * of every hour), so 6h spans six independent sweeps, well over the
+ * required two. */
+export const ABSENCE_GRACE_MS = 6 * 3_600_000;
+
+/** Floor below which the coverage gate (below) does not apply. The gate's
+ * ratio (`present / openIssues.length`) is a circuit breaker meant to catch
+ * mass disappearance from a misconfigured or faulting register — but over a
+ * denominator of one or two, the ratio is noise, not signal: a single open
+ * issue whose target genuinely vanished from QBO scores 0/1 = 0%, permanently
+ * below the 50% threshold, so it can never age out and its ReviewIssue stays
+ * open forever. "Mass disappearance" isn't a meaningful concept at 1-4 open
+ * issues in the first place. Below this floor the coverage gate is skipped
+ * and normal absence tracking proceeds — the `stale` gate and the
+ * `ABSENCE_GRACE_MS` grace period are still in effect and remain the primary
+ * defense against transient gaps. Do not remove this as "arbitrary": without
+ * it, a genuinely-deleted lone target is stranded open forever. */
+const COVERAGE_GATE_MIN_OPEN_ISSUES = 5;
 
 /**
  * Finding 8 (part 2): a purchase deleted in QBO, retyped off this
@@ -198,30 +248,100 @@ interface OpenIssueKeyLister {
  * reconciliation, its ReviewIssue (if still open) would never receive the
  * `[]` "clear" evaluation and would stay open forever.
  *
- * Age-out policy: immediate, based on full-snapshot absence. Every call to
- * `computeReviewTargets` re-derives the ENTIRE trailing window from scratch
- * (no pagination, no delta) and `fetchBankRegister` fails CLOSED — throws —
- * on a QBO error rather than silently returning a partial row set (see its
- * own header). A *successful* sweep is therefore a trustworthy full
- * snapshot, so an open issue whose key is absent from it is cleared on the
- * very next sweep rather than requiring a grace period tracked across runs
- * (which would need a new "last seen" column — out of scope here; flagged in
- * the implementation report for arbitration).
+ * Age-out policy (arbiter ruling): NOT immediate. `fetchBankRegister` does
+ * NOT fail closed on a QBO error — it returns the last good cached result
+ * marked `stale: true` whenever a cache entry exists (qbo-bank-register.ts:
+ * 147, 188), and a structurally-valid but wrong/empty report (misconfigured
+ * bank account id, QBO fault) is indistinguishable from "everything got
+ * fixed" without an independent check. Clearing an issue immediately wipes
+ * `acknowledgedCodes`/`acknowledgedAt` (review-alert-lifecycle.ts's "clear"
+ * branch) and a later reopen mints a new `requestId`
+ * (`issueId:generation`, review-alert-outbox.ts), so a single bad or stale
+ * sweep would both destroy a bookkeeper's "I reviewed this" decision AND
+ * send her a duplicate card. Instead: track `absentSince` per issue, only
+ * treat a snapshot as trustworthy enough to act on absence when it passes
+ * BOTH a freshness gate (not `stale`) and a coverage gate (at least half of
+ * currently-open issue keys still appear in it — the circuit breaker for a
+ * wrong-account/empty-report misconfiguration), and only clear once a target
+ * has been continuously absent from trustworthy snapshots for
+ * `ABSENCE_GRACE_MS`.
+ *
+ * `client` lists/updates the bookkeeping columns (`targetKey`, `absentSince`)
+ * and `lifecycleClient` is threaded through to `evaluateReviewIssue` for the
+ * actual clear — both default to real Prisma but are separately injectable
+ * (same split as `EnsureRolloutBaselineOptions.client` /
+ * `.lifecycleClient` in review-alert-rollout.ts) so tests can back both with
+ * one in-memory fake without touching a database.
  */
-async function reconcileMissingTargets(
+export async function reconcileMissingTargets(
     presentKeys: ReadonlySet<string>,
+    stale: boolean,
     now: Date,
     client: OpenIssueKeyLister = prisma as unknown as OpenIssueKeyLister,
+    lifecycleClient?: ReviewIssueLifecycleClient,
 ): Promise<number> {
     const openIssues = await client.reviewIssue.findMany({
         where: { targetType: TARGET_TYPE, clearedAt: null },
-        select: { targetKey: true },
+        select: { targetKey: true, absentSince: true },
     });
-    let cleared = 0;
+    if (openIssues.length === 0) return 0;
+
+    const presentCount = openIssues.filter(issue => presentKeys.has(issue.targetKey)).length;
+    const coverageGateApplies = openIssues.length >= COVERAGE_GATE_MIN_OPEN_ISSUES;
+    const coverageOk = !coverageGateApplies || presentCount >= openIssues.length / 2;
+    if (stale || !coverageOk) {
+        console.warn(
+            `reconcileMissingTargets: trust gate tripped (stale=${stale}, present=${presentCount}/${openIssues.length} open issue keys) — skipping reconciliation this sweep`,
+        );
+        return 0;
+    }
+
+    const recoveredKeys: string[] = [];
+    const newlyAbsentKeys: string[] = [];
+    const readyToClearKeys: string[] = [];
     for (const issue of openIssues) {
-        if (presentKeys.has(issue.targetKey)) continue;
-        await evaluateReviewIssue(TARGET_TYPE, issue.targetKey, [], null, { now: () => now });
+        if (presentKeys.has(issue.targetKey)) {
+            if (issue.absentSince !== null) recoveredKeys.push(issue.targetKey);
+            continue;
+        }
+        if (issue.absentSince === null) {
+            newlyAbsentKeys.push(issue.targetKey);
+        } else if (now.getTime() - issue.absentSince.getTime() >= ABSENCE_GRACE_MS) {
+            readyToClearKeys.push(issue.targetKey);
+        }
+    }
+
+    if (recoveredKeys.length > 0) {
+        await client.reviewIssue.updateMany({
+            where: { targetType: TARGET_TYPE, targetKey: { in: recoveredKeys } },
+            data: { absentSince: null },
+        });
+    }
+    if (newlyAbsentKeys.length > 0) {
+        await client.reviewIssue.updateMany({
+            where: { targetType: TARGET_TYPE, targetKey: { in: newlyAbsentKeys } },
+            data: { absentSince: now },
+        });
+    }
+
+    let cleared = 0;
+    for (const targetKey of readyToClearKeys) {
+        // Finding 6's version-conflict hazard applies here too (item 4 of
+        // the arbiter ruling): without recomputeCodes, a retry after a
+        // version conflict would reapply the stale `[]` snapshot and stomp
+        // a concurrent fresh observation. Mirrors the main loop's pattern.
+        await evaluateReviewIssue(TARGET_TYPE, targetKey, [], null, {
+            now: () => now,
+            recomputeCodes: () => recomputeCodesFor(targetKey, now),
+            client: lifecycleClient,
+        });
         cleared++;
+    }
+    if (readyToClearKeys.length > 0) {
+        await client.reviewIssue.updateMany({
+            where: { targetType: TARGET_TYPE, targetKey: { in: readyToClearKeys } },
+            data: { absentSince: null },
+        });
     }
     return cleared;
 }
@@ -252,10 +372,16 @@ async function runEvaluation(now: Date = new Date()): Promise<EvaluateReviewAler
     }
 
     // Finding 5: when THIS call just finished the baseline sweep, its
-    // catch-up pass already computed a fresh target snapshot — reuse it
-    // instead of fetching a third time (baseline fetch + catch-up fetch +
-    // would-be normal-pass fetch).
-    const targets = baseline.ranBaseline && baseline.catchUpTargets ? baseline.catchUpTargets : await computeReviewTargets(now);
+    // catch-up pass already computed a fresh target snapshot — reuse it for
+    // the evaluation loop instead of fetching a third time (baseline fetch +
+    // catch-up fetch + would-be normal-pass fetch). Reconciliation still
+    // needs the register's `stale` flag, which the baseline path doesn't
+    // surface — `computeReviewTargetsSnapshot` is called below regardless,
+    // but it's a cache hit against `fetchBankRegister`'s 120s cache (same
+    // account+date-range key, computed moments ago), not a second live QBO
+    // call.
+    const snapshot = await computeReviewTargetsSnapshot(now);
+    const targets = baseline.ranBaseline && baseline.catchUpTargets ? baseline.catchUpTargets : snapshot.targets;
 
     for (const target of targets) {
         await evaluateReviewIssue(target.targetType, target.targetKey, target.reasonCodes, target.displayDetails, {
@@ -263,7 +389,7 @@ async function runEvaluation(now: Date = new Date()): Promise<EvaluateReviewAler
         });
     }
 
-    const reconciled = await reconcileMissingTargets(new Set(targets.map(t => t.targetKey)), now);
+    const reconciled = await reconcileMissingTargets(new Set(targets.map(t => t.targetKey)), snapshot.stale, now);
 
     return { ran: true, evaluated: targets.length, baseline, reconciled };
 }

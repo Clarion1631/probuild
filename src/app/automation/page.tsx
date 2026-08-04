@@ -19,6 +19,7 @@ import {
     receiptJourneys,
     type ReceiptJourney,
 } from "@/lib/automation-events";
+import { suggestFix, type FixSuggestion } from "@/lib/automation-suggestions";
 import { pauseStates } from "@/lib/automation-settings";
 import {
     fetchRegisterMergeInputs,
@@ -32,11 +33,14 @@ import SyncNowButton from "./components/sync-now-button";
 import CopyIdButton from "./components/copy-id-button";
 import { DocumentationPips } from "./components/register/documentation-pips";
 import { OrphanReceipts } from "./components/register/orphan-receipts";
+import { JourneySection } from "./components/register/journey-section";
+import type { SerializedJourney } from "./components/journey-list";
 import { PipelineHealth } from "./components/pipeline-health";
 import { ExpandableRow } from "./components/register/expandable-row";
 import { LinksCell } from "./components/register/links-cell";
 import { RowDrilldown } from "./components/register/row-drilldown";
 import { matchReceiptJourney, type ReceiptJourneyMatch } from "./components/register/match-receipt-journey";
+import { toSerializedJourney } from "./components/register/serialize-journey";
 
 export const dynamic = "force-dynamic";
 
@@ -225,6 +229,24 @@ export default async function AutomationPage(props: {
         </div>
     ) : (
         <OrphanReceipts orphans={actionableOrphans} projectNames={orphanProjectNameMap} />
+    );
+
+    // Receipt journey list (plan §3) — reuses the same receiptJourneyList
+    // fetched above for row drill-down, and the same toSerializedJourney used
+    // by row-drilldown.tsx, so driveFileId/qbPurchaseId/keyConfirmed carry
+    // through identically in both places.
+    const serializedJourneys: SerializedJourney[] = receiptJourneyList.map(toSerializedJourney);
+    const journeySuggestions: Record<string, FixSuggestion | null> = {};
+    for (const j of receiptJourneyList) {
+        const suggestion = suggestFix(j);
+        if (suggestion) journeySuggestions[j.docNumber] = suggestion;
+    }
+    const journeySection: ReactNode = mergeUnavailable ? (
+        <div className="hui-card p-5 text-sm text-hui-textMuted">
+            Receipt pipeline view unavailable right now — documentation data couldn&apos;t be loaded.
+        </div>
+    ) : (
+        <JourneySection journeys={serializedJourneys} suggestions={journeySuggestions} />
     );
 
     const displayRows: DisplayRow[] = mergedRows
@@ -495,6 +517,9 @@ export default async function AutomationPage(props: {
 
             {/* Orphan receipts */}
             {orphanSection}
+
+            {/* Receipt pipeline — journey list, Verify in QuickBooks + AI review (plan §3) */}
+            {journeySection}
 
             {/* Pipeline health — collapsible, plan §5 step 7 */}
             <PipelineHealth

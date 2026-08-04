@@ -160,7 +160,9 @@ acknowledged reason must not re-alert the remaining acknowledged subset; a genui
 
 ### Schema
 `ReviewIssue` (current state, `@@unique([targetType,targetKey])`, `version` for optimistic
-concurrency, `reasonCodes`, `reasonHash`, `acknowledgedCodes`, `firstObservedAt`, `clearedAt`) ·
+concurrency, `reasonCodes`, `reasonHash`, `acknowledgedCodes`, `firstObservedAt`, `clearedAt`,
+`absentSince` — when the target first went missing from a trustworthy snapshot; age-out
+bookkeeping only, deliberately does NOT bump `version`) ·
 `ReviewAlertEpisode` (immutable snapshot, `@@unique([issueId,generation])`, full retry state) ·
 `ReviewAlertBatch` (same complete retry model, FK + index from episodes) ·
 `QboPurchaseClassification` (keyed by `qbPurchaseId`: classification, reason, syncToken, timestamps)
@@ -186,6 +188,28 @@ Statuses gain `SUPERSEDED` and `CANCELLED`. `Mark reviewed` conditionally update
 **CLAIMED semantics (punch 2):** a claim already crossing the network cannot be cancelled — fencing
 only blocks its *database* completion. An old immutable episode may still post. Always enqueue the
 new generation regardless.
+
+#### Absence is not resolution
+
+A target missing from the register (deleted in QBO, retyped off this domain, aged out of the
+trailing window) does NOT map to step 1's clear branch on the next sweep it's absent from. It maps
+to the clear branch only once BOTH hold: the target has been continuously absent from a
+trustworthy snapshot for a grace window (`ABSENCE_GRACE_MS`, review-alert-evaluator.ts —
+long enough to outlive the register cache, the QBO-failure cooldown, and at least two independent
+backstop sweeps), AND the snapshot driving that clear itself passed a freshness check (not served
+`stale` after a QBO error) and a coverage check (at least half of currently-open issue keys still
+present — the circuit breaker for a misconfigured bank account id or an empty-but-structurally-valid
+report). The coverage check only applies once there are at least `COVERAGE_GATE_MIN_OPEN_ISSUES`
+(5) open issues — below that floor the ratio's denominator is too small to carry signal (a single
+open issue whose target genuinely vanished scores 0/1 = 0%, permanently below the 50% threshold,
+so it would never age out), and "mass disappearance" isn't a meaningful concept at 1-4 open issues
+anyway. Below the floor, absence tracking proceeds on the `stale` gate and the grace window alone.
+Rationale, so it isn't re-litigated: step 1's clear branch wipes `acknowledgedCodes` and
+`acknowledgedAt`, and a subsequent reopen (step 3) mints a new `requestId` (`issueId:generation`)
+that Chat's own dedupe can't catch — so a single transient or bad snapshot, acted on immediately,
+would both destroy a bookkeeper's "I reviewed this" decision and send her a duplicate card. The
+grace window and trust gates exist specifically to make that single-bad-sweep failure mode
+impossible; don't remove them to "simplify" the reconciliation path.
 
 ### Delivery — mirror the real drainer (punch 3)
 v3 wrote failures as `FAILED` + `nextAttemptAt` but only claimed `PENDING` — **failures were

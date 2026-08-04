@@ -2249,6 +2249,10 @@ model ReviewIssue {
   acknowledgedAt    DateTime?
   firstObservedAt   DateTime // reset whenever the issue re-opens after clearing — "when did the CURRENT failure start"
   clearedAt         DateTime?
+  // When this issue's target first went missing from a trustworthy snapshot.
+  // Not lifecycle state — bookkeeping for the age-out policy; deliberately
+  // does NOT bump version.
+  absentSince       DateTime?
   // Highest ReviewAlertEpisode.generation opened for this issue. Not called
   // out by name in the plan's schema bullet list, but the lifecycle ("open
   // generation+1") needs an authoritative counter to bump race-safely inside

@@ -78,6 +78,10 @@ const statements = [
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "acknowledgedAt" TIMESTAMP(3)`,
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "firstObservedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "clearedAt" TIMESTAMP(3)`,
+  // When this issue's target first went missing from a trustworthy snapshot —
+  // age-out bookkeeping for reconcileMissingTargets (review-alert-evaluator.ts),
+  // not lifecycle state. Deliberately does NOT bump version.
+  `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "absentSince" TIMESTAMP(3)`,
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "currentGeneration" INTEGER NOT NULL DEFAULT 1`,
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
   `ALTER TABLE "ReviewIssue" ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,

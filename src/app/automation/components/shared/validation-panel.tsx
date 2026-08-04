@@ -407,7 +407,7 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                             <div key={m.model} className="border border-hui-border rounded-lg p-2.5">
                                 <p className="text-xs font-semibold text-hui-textMain mb-1">{m.model}</p>
                                 {m.read.legible === false ? (
-                                    <p className="text-xs text-hui-textMuted italic">Model couldn't read this receipt confidently</p>
+                                    <p className="text-xs text-hui-textMuted italic">Model couldn&apos;t read this receipt confidently</p>
                                 ) : (
                                     <div className="flex items-center gap-1.5 flex-wrap mb-1">
                                         {(["total", "tax", "vendor"] as const).map((field) => (
