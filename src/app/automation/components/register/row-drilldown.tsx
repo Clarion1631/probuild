@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { decimalToCents, type MergedRegisterRow } from "@/lib/register-merge";
 import type { RawExpense } from "../../register-data";
-import { friendlyType } from "../format";
+import { amountSign, friendlyType } from "../format";
 import CopyIdButton from "../copy-id-button";
 import { StateChip } from "../shared/state-chip";
 import { StepTimeline } from "../shared/step-timeline";
@@ -51,7 +51,7 @@ function QuickBooksBlock({ row }: { row: MergedRegisterRow }) {
                 <Field label="Payee">{row.name ?? "—"}</Field>
                 <Field label="Amount">
                     <span className={`font-medium tabular-nums ${row.amountCents > 0 ? "text-teal-700" : "text-hui-textMain"}`}>
-                        {row.amountCents > 0 ? "+" : "-"}
+                        {amountSign(row.amountCents)}
                         {formatCurrency(Math.abs(row.amountCents) / 100)}
                     </span>
                 </Field>
@@ -147,10 +147,12 @@ function ReceiptTimelineBlock({
     row,
     journeyMatch,
     receiptUrl,
+    now,
 }: {
     row: MergedRegisterRow;
     journeyMatch: ReceiptJourneyMatch | null;
     receiptUrl: string | null;
+    now: number;
 }) {
     if (!row.edges) return null;
 
@@ -167,7 +169,7 @@ function ReceiptTimelineBlock({
 
     const journey = toSerializedJourney(journeyMatch.journey);
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
-    const stale = isStaleBookedApi(journey);
+    const stale = isStaleBookedApi(journey, now);
     const openReceiptHref =
         receiptUrl ?? journey.synced?.receiptUrl ?? (journey.driveFileId ? `https://drive.google.com/file/d/${journey.driveFileId}/view` : null);
 
@@ -233,16 +235,18 @@ export function RowDrilldown({
     row,
     expense,
     journeyMatch,
+    now,
 }: {
     row: MergedRegisterRow;
     expense: RawExpense | null;
     journeyMatch: ReceiptJourneyMatch | null;
+    now: number;
 }) {
     return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
             <QuickBooksBlock row={row} />
             <JobCostBlock row={row} expense={expense} />
-            <ReceiptTimelineBlock row={row} journeyMatch={journeyMatch} receiptUrl={row.receiptUrl} />
+            <ReceiptTimelineBlock row={row} journeyMatch={journeyMatch} receiptUrl={row.receiptUrl} now={now} />
             {row.edges && <ActionsBlock />}
         </div>
     );

@@ -60,6 +60,16 @@ export interface SerializedJourney {
     } | null;
 }
 
+/** Stable per-journey key — mirrors `journeyKey()` in `@/lib/automation-events`
+ * (the server-side equivalent operating on `Date` instead of the serialized
+ * ISO string here). Full driveFileId when confirmed; otherwise a composite
+ * of the bare docNumber prefix + firstSeen so two journeys sharing that
+ * prefix (a real collision) never collide onto the same key — used for both
+ * the React list key and the fix-suggestion lookup below. */
+function journeyKey(j: Pick<SerializedJourney, "driveFileId" | "docNumber" | "firstSeen">): string {
+    return j.driveFileId ?? `${j.docNumber}:${j.firstSeen}`;
+}
+
 function EmptyState() {
     return (
         <div className="flex flex-col items-center justify-center py-16 text-center">
@@ -81,10 +91,10 @@ function EmptyState() {
  * event proves what happened at booking time — this line summarizes that,
  * not a live QuickBooks re-check (that's what "Verify in QuickBooks" is for).
  */
-function journeyVerdict(journey: SerializedJourney, suggestion: FixSuggestion | null): { text: string; attention: boolean } {
+function journeyVerdict(journey: SerializedJourney, suggestion: FixSuggestion | null, nowMs: number): { text: string; attention: boolean } {
     if (journey.finalState === "booked-api") {
         if (journey.synced) return { text: "Booked and in job costs", attention: false };
-        if (isStaleBookedApi(journey)) {
+        if (isStaleBookedApi(journey, nowMs)) {
             return { text: "Booked but not yet in ProBuild — worth a look", attention: true };
         }
         return { text: "Booked — waiting for the next sync (runs every 4 hours)", attention: false };
@@ -129,7 +139,7 @@ function QbPurchaseLink({ qbPurchaseId }: { qbPurchaseId: string }) {
     );
 }
 
-function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; suggestion: FixSuggestion | null }) {
+function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; suggestion: FixSuggestion | null; now: number }) {
     const [isOpen, setIsOpen] = useState(false);
 
     const primaryLabel = journey.fileName || journey.vendor || journey.docNumber;
@@ -140,7 +150,7 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
     ].filter(Boolean);
 
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
-    const verdict = journeyVerdict(journey, suggestion);
+    const verdict = journeyVerdict(journey, suggestion, now);
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -175,7 +185,7 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
                 </div>
                 <span
                     className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
-                    title={new Date(journey.lastSeen).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                    title={new Date(journey.lastSeen).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Los_Angeles" })}
                 >
                     {formatRelativeTime(new Date(journey.lastSeen))}
                 </span>
@@ -199,17 +209,22 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
 export default function JourneyList({
     journeys,
     suggestions,
+    now,
 }: {
     journeys: SerializedJourney[];
     suggestions: Record<string, FixSuggestion | null>;
+    /** A single timestamp captured once on the server and threaded through
+     * both the SSR and hydration render passes — see `isStaleBookedApi`'s
+     * doc comment for why this can't be `Date.now()` called in here. */
+    now: number;
 }) {
     const [filter, setFilter] = useState<FilterKey>("all");
 
-    const filtered = journeys.filter((j) => FILTERS.find((f) => f.key === filter)!.test(j));
+    const filtered = journeys.filter((j) => FILTERS.find((f) => f.key === filter)!.test(j, now));
 
     return (
         <div className="space-y-3">
-            <ReceiptFilterBar journeys={journeys} filter={filter} onFilterChange={setFilter} />
+            <ReceiptFilterBar journeys={journeys} filter={filter} onFilterChange={setFilter} now={now} />
 
             {filtered.length === 0 ? (
                 <div className="hui-card">
@@ -220,14 +235,15 @@ export default function JourneyList({
                     {filtered.map((j) => (
                         // Never key on the bare docNumber alone — it's a 21-char Drive
                         // fileId prefix that two different receipts can share, which
-                        // would collide two unrelated rows onto one React key. Prefer
-                        // the full driveFileId; fall back to a composite that includes
-                        // firstSeen so an unconfirmed-prefix bucket still gets a stable,
-                        // distinguishing key.
+                        // would collide two unrelated rows onto one React key. Also
+                        // keys the fix-suggestion lookup (`journeyKey` above) for the
+                        // same reason — a truncated docNumber key would let two
+                        // journeys sharing that prefix overwrite each other's entry.
                         <JourneyRow
-                            key={j.driveFileId ?? `${j.docNumber}:${j.firstSeen}`}
+                            key={journeyKey(j)}
                             journey={j}
-                            suggestion={suggestions[j.docNumber] ?? null}
+                            suggestion={suggestions[journeyKey(j)] ?? null}
+                            now={now}
                         />
                     ))}
                 </div>

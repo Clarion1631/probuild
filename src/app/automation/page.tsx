@@ -16,8 +16,11 @@ import {
     automationSummary,
     receiptDailyBuckets,
     recentAutomationEvents,
-    receiptJourneys,
+    receiptJourneysAll,
+    journeyKey,
     type ReceiptJourney,
+    type AutomationSummary,
+    type AutomationDayBucket,
 } from "@/lib/automation-events";
 import { suggestFix, type FixSuggestion } from "@/lib/automation-suggestions";
 import { pauseStates } from "@/lib/automation-settings";
@@ -27,7 +30,8 @@ import {
     drilldownExpenseByPurchaseId,
     type RawExpense,
 } from "./register-data";
-import { formatRelativeTime, friendlyType } from "./components/format";
+import { applyRegisterFilters } from "./register-filters";
+import { amountSign, formatRelativeTime, friendlyType } from "./components/format";
 import { StatCard } from "./components/shared/stat-card";
 import SyncNowButton from "./components/sync-now-button";
 import CopyIdButton from "./components/copy-id-button";
@@ -122,6 +126,17 @@ export default async function AutomationPage(props: {
     const isAdmin = isAdminOrManager(user);
     const sp = await props.searchParams;
     const { range, type, reviewOnly, focus } = parseFilters(sp);
+    // Captured ONCE, server-side, and threaded through every component that
+    // needs "now" (stale-receipt detection) — calling Date.now() again
+    // inside a client component would read a different clock value on
+    // hydration than SSR did, risking a hydration mismatch right at a
+    // threshold boundary. This IS the fix for that: an async Server
+    // Component runs once per request (no client re-render to be impure
+    // against), so capturing a single stable timestamp here is exactly what
+    // prevents descendant client components from each calling Date.now()
+    // independently during SSR vs. hydration.
+    // eslint-disable-next-line react-hooks/purity
+    const nowMs = Date.now();
 
     function filterHref(overrides: { range?: string; type?: string; review?: string }) {
         const params = new URLSearchParams();
@@ -205,7 +220,13 @@ export default async function AutomationPage(props: {
         // Row drill-down inputs (plan §3/§5 step 9): same known dev-DB gap as
         // mergeInputs above (AutomationEvent.qbPurchaseId/driveFileId), so
         // fetched in the same try/catch — both degrade together.
-        receiptJourneyList = await receiptJourneys(rangeDays, 200);
+        //
+        // UNCAPPED on purpose: this same list also powers the row drill-down
+        // match below (`matchReceiptJourney`) — capping it here would let a
+        // genuinely-matching older journey fall past the cap and render "No
+        // audit record" even though it exists. Only the pipeline LIST DISPLAY
+        // (`pipelineJourneys` below) is capped.
+        receiptJourneyList = await receiptJourneysAll(rangeDays);
         expenseByPurchaseId = drilldownExpenseByPurchaseId(mergeInputs.rawExpenses);
 
         mergedRows = merged.rows;
@@ -231,22 +252,28 @@ export default async function AutomationPage(props: {
         <OrphanReceipts orphans={actionableOrphans} projectNames={orphanProjectNameMap} />
     );
 
-    // Receipt journey list (plan §3) — reuses the same receiptJourneyList
-    // fetched above for row drill-down, and the same toSerializedJourney used
-    // by row-drilldown.tsx, so driveFileId/qbPurchaseId/keyConfirmed carry
-    // through identically in both places.
-    const serializedJourneys: SerializedJourney[] = receiptJourneyList.map(toSerializedJourney);
+    // Receipt journey PIPELINE LIST (plan §3) — display-capped (only this
+    // slice renders as list rows); the full receiptJourneyList above stays
+    // uncapped for the row drill-down match. Reuses the same
+    // toSerializedJourney used by row-drilldown.tsx, so driveFileId/
+    // qbPurchaseId/keyConfirmed carry through identically in both places.
+    const pipelineJourneys = receiptJourneyList.slice(0, 200);
+    const serializedJourneys: SerializedJourney[] = pipelineJourneys.map(toSerializedJourney);
+    // Keyed by the full driveFileId (falling back to a docNumber+firstSeen
+    // composite) — NEVER the bare docNumber alone, which is a 21-char Drive
+    // fileId prefix two different receipts can share; keying by it would let
+    // one journey's suggestion silently overwrite another's.
     const journeySuggestions: Record<string, FixSuggestion | null> = {};
-    for (const j of receiptJourneyList) {
+    for (const j of pipelineJourneys) {
         const suggestion = suggestFix(j);
-        if (suggestion) journeySuggestions[j.docNumber] = suggestion;
+        if (suggestion) journeySuggestions[journeyKey(j)] = suggestion;
     }
     const journeySection: ReactNode = mergeUnavailable ? (
         <div className="hui-card p-5 text-sm text-hui-textMuted">
             Receipt pipeline view unavailable right now — documentation data couldn&apos;t be loaded.
         </div>
     ) : (
-        <JourneySection journeys={serializedJourneys} suggestions={journeySuggestions} />
+        <JourneySection journeys={serializedJourneys} suggestions={journeySuggestions} now={nowMs} />
     );
 
     const displayRows: DisplayRow[] = mergedRows
@@ -290,21 +317,46 @@ export default async function AutomationPage(props: {
     const moneyInCents = registerRows.filter((r) => r.amountCents > 0).reduce((sum, r) => sum + r.amountCents, 0);
     const moneyOutCents = registerRows.filter((r) => r.amountCents < 0).reduce((sum, r) => sum + Math.abs(r.amountCents), 0);
 
-    const filteredRows = displayRows.filter((row) => {
-        if (reviewOnly && !row.needsReview) return false;
-        if (type === "in") return row.amountCents > 0;
-        if (type === "out") return row.amountCents < 0;
-        return true;
-    });
+    const filteredRows = applyRegisterFilters(displayRows, { type, reviewOnly, mergeUnavailable });
+
+    // ?focus=<qbTxnId> (plan §3/§5 step 9 deep link) named a row that exists
+    // on this page but the current type/review filters hid it — say so
+    // rather than silently rendering as if that row never existed.
+    const focusHiddenByFilters =
+        focus !== null && displayRows.some((r) => r.qbTxnId === focus) && !filteredRows.some((r) => r.qbTxnId === focus);
 
     // Pipeline health inputs — independent of the register/merge above, so a
     // register or merge failure doesn't need to take this section down too.
-    const [summary, buckets, events, pauses] = await Promise.all([
-        automationSummary(),
-        receiptDailyBuckets(30),
-        recentAutomationEvents(50),
-        pauseStates(),
-    ]);
+    // Isolated behind its own try/catch (mirrors `mergeUnavailable` above):
+    // these ran inside the SAME Promise.all as the register/merge fetch
+    // before, so one ancillary failure here (e.g. `recentAutomationEvents`)
+    // rejected the whole page and hid the register the user actually came
+    // for.
+    let pipelineHealthUnavailable = false;
+    let summary: AutomationSummary = {
+        pushedThisMonth: 0,
+        fallbackThisMonth: 0,
+        amountCentsThisMonth: 0,
+        taxCentsThisMonth: 0,
+        lastSync: null,
+        handsFreeRate30d: null,
+    };
+    let buckets: AutomationDayBucket[] = [];
+    let events: Awaited<ReturnType<typeof recentAutomationEvents>> = [];
+    // Fail closed: an unknown pause state disables the manual sync button
+    // rather than presenting it as available.
+    let pauses = { receiptPushPaused: true, qboSyncPaused: true };
+    try {
+        [summary, buckets, events, pauses] = await Promise.all([
+            automationSummary(),
+            receiptDailyBuckets(30),
+            recentAutomationEvents(50),
+            pauseStates(),
+        ]);
+    } catch (error) {
+        console.error("pipeline health inputs failed", error instanceof Error ? error.message : "UnknownError");
+        pipelineHealthUnavailable = true;
+    }
     const minutesSaved = summary.pushedThisMonth * 4;
     const hoursSavedRaw = Math.round((minutesSaved / 60) * 2) / 2;
     const hoursSavedLabel = Number.isInteger(hoursSavedRaw) ? String(hoursSavedRaw) : hoursSavedRaw.toFixed(1);
@@ -398,6 +450,21 @@ export default async function AutomationPage(props: {
                     Needs review only
                 </FilterChip>
             </div>
+            {reviewOnly && mergeUnavailable && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 -mt-2">
+                    Review status is unavailable right now, so &quot;Needs review only&quot; isn&apos;t applied — showing every
+                    row instead of hiding all of them.
+                </p>
+            )}
+            {focusHiddenByFilters && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 -mt-2">
+                    The row you followed a link to is hidden by the current filters —{" "}
+                    <a href={filterHref({ type: "all", review: "0" })} className="underline">
+                        clear filters
+                    </a>{" "}
+                    to see it.
+                </p>
+            )}
 
             {/* Register table */}
             <div className="hui-card overflow-hidden">
@@ -444,7 +511,7 @@ export default async function AutomationPage(props: {
                                                     row.amountCents > 0 ? "text-teal-700" : "text-hui-textMain"
                                                 }`}
                                             >
-                                                {row.amountCents > 0 ? "+" : "-"}
+                                                {amountSign(row.amountCents)}
                                                 {formatCurrency(Math.abs(row.amountCents) / 100)}
                                             </td>
                                             <td className="px-4 py-3">{row.documentation}</td>
@@ -502,6 +569,7 @@ export default async function AutomationPage(props: {
                                                 row={row.drilldown.row}
                                                 expense={row.drilldown.expense}
                                                 journeyMatch={row.drilldown.journeyMatch}
+                                                now={nowMs}
                                             />
                                         </ExpandableRow>
                                     );
@@ -522,22 +590,28 @@ export default async function AutomationPage(props: {
             {journeySection}
 
             {/* Pipeline health — collapsible, plan §5 step 7 */}
-            <PipelineHealth
-                pushedThisMonth={summary.pushedThisMonth}
-                handsFreeRate30d={summary.handsFreeRate30d}
-                amountCentsThisMonth={summary.amountCentsThisMonth}
-                taxCentsThisMonth={summary.taxCentsThisMonth}
-                lastSync={summary.lastSync}
-                buckets={buckets}
-                hoursSavedLabel={hoursSavedLabel}
-                onARoll={onARoll}
-                pushEnabled={pushEnabled}
-                syncCronEnabled={syncCronEnabled}
-                receiptPushPaused={pauses.receiptPushPaused}
-                qboSyncPaused={pauses.qboSyncPaused}
-                isAdmin={isAdmin}
-                syncRuns={syncRuns}
-            />
+            {pipelineHealthUnavailable ? (
+                <div className="hui-card p-5 text-sm text-hui-textMuted">
+                    Pipeline health unavailable right now — the register above is still current.
+                </div>
+            ) : (
+                <PipelineHealth
+                    pushedThisMonth={summary.pushedThisMonth}
+                    handsFreeRate30d={summary.handsFreeRate30d}
+                    amountCentsThisMonth={summary.amountCentsThisMonth}
+                    taxCentsThisMonth={summary.taxCentsThisMonth}
+                    lastSync={summary.lastSync}
+                    buckets={buckets}
+                    hoursSavedLabel={hoursSavedLabel}
+                    onARoll={onARoll}
+                    pushEnabled={pushEnabled}
+                    syncCronEnabled={syncCronEnabled}
+                    receiptPushPaused={pauses.receiptPushPaused}
+                    qboSyncPaused={pauses.qboSyncPaused}
+                    isAdmin={isAdmin}
+                    syncRuns={syncRuns}
+                />
+            )}
         </div>
     );
 }

@@ -311,13 +311,29 @@ function journeyFinalState(steps: JourneyStep[]): { state: ReceiptJourney["final
     return { state: "in-flight", reason: last.reason };
 }
 
+/** Stable key for a journey, for anywhere a Map/Record needs exactly one
+ * entry per journey (React list keys, fix-suggestion lookups, …). Full
+ * driveFileId when confirmed; otherwise a composite of the bare docNumber
+ * prefix + firstSeen so two journeys sharing that prefix (a real collision)
+ * never collide onto the same key. Never key on the bare docNumber alone. */
+export function journeyKey(j: { driveFileId: string | null; docNumber: string; firstSeen: Date }): string {
+    return j.driveFileId ?? `${j.docNumber}:${j.firstSeen.toISOString()}`;
+}
+
 /**
  * Group stage beacons + push events into one timeline per receipt, newest
  * receipt first, and mark the ones the 4-hour sync already landed in
  * ProBuild (matched via the [gtr-file:...] marker the sync copies into the
  * expense description).
+ *
+ * Returns the COMPLETE list for the trailing `days` window — uncapped.
+ * Callers that need a display-size-limited list (the pipeline view) must cap
+ * it themselves (see `receiptJourneys` below); anything that keys/looks up a
+ * SPECIFIC journey (e.g. the register row drill-down) must use this
+ * uncapped list, or a genuinely-matching older journey can silently miss the
+ * cap and read as "no audit record".
  */
-export async function receiptJourneys(days: number, maxReceipts: number): Promise<ReceiptJourney[]> {
+export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]> {
     const since = new Date(Date.now() - days * 86_400_000);
     const events = await prisma.automationEvent.findMany({
         where: {
@@ -334,18 +350,24 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
 
     events.reverse(); // back to ascending for timeline assembly
 
-    // Grouping key is the FULL driveFileId, never the bare 21-char docNumber
-    // prefix alone — two different Drive fileIds can share a prefix
-    // (qbo-receipt-push.ts:477-481), and keying by prefix would silently
-    // merge two different receipts' timelines into one journey. An event
-    // with no derivable full id groups under a `prefix:`-tagged bucket
-    // (distinct from any real fileId string) and the resulting journey is
+    // Grouping key, in trust order: FULL driveFileId, then FULL qbPurchaseId,
+    // then the bare 21-char docNumber prefix as a last resort. Two different
+    // Drive fileIds can share a prefix (qbo-receipt-push.ts:477-481), so
+    // keying by prefix alone would silently merge two different receipts'
+    // timelines into one journey — but keying SOLELY by fileId also misses
+    // real matches: events that never recorded a fileId can still carry the
+    // same typed qbPurchaseId (near-zero collision risk, same trust tier
+    // `automation-key-resolver.ts` gives it), and without that tier those
+    // events would stay split into separate, incomplete journeys. An event
+    // with neither id groups under a `prefix:`-tagged bucket (distinct from
+    // any real fileId/qbPurchaseId string) and the resulting journey is
     // marked `keyConfirmed: false`.
     const byDoc = new Map<string, ReceiptJourney>();
     for (const e of events) {
         const doc = e.docNumber as string;
         const fileId = resolveEventFileId(e);
-        const key = fileId ?? `prefix:${doc}`;
+        const qbPurchaseId = resolveEventQbPurchaseId(e);
+        const key = fileId ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : `prefix:${doc}`);
         let j = byDoc.get(key);
         if (!j) {
             j = {
@@ -356,7 +378,7 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 steps: [], finalState: "in-flight", finalReason: null,
                 syncedExpenseId: null, syncedProjectName: null,
                 driveFileId: fileId, qbPurchaseId: null, synced: null, backfilled: false,
-                keyConfirmed: Boolean(fileId),
+                keyConfirmed: Boolean(fileId) || Boolean(qbPurchaseId),
             };
             byDoc.set(key, j);
         }
@@ -368,7 +390,6 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
         j.amountCents = e.amountCents ?? j.amountCents;
         j.taxCents = e.taxCents ?? j.taxCents;
         j.driveFileId = j.driveFileId ?? fileId;
-        const qbPurchaseId = resolveEventQbPurchaseId(e);
         if (qbPurchaseId) j.qbPurchaseId = qbPurchaseId;
         j.steps.push({
             at: e.createdAt,
@@ -403,6 +424,7 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 receiptUrl: true,
                 qbSyncedAt: true,
                 createdAt: true,
+                qbPurchaseId: true,
                 // Expense hangs off the ESTIMATE, not the project directly.
                 estimate: { select: { project: { select: { id: true, name: true } } } },
             },
@@ -412,11 +434,16 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
             const m = exp.description?.match(/\[gtr-file:([^\]]+)\]/);
             if (!m) continue;
             const fullId = m[1];
-            // Confirmed match: a journey already keyed on this exact fileId.
-            // Only when none exists do we fall back to the bare prefix
-            // bucket — which may belong to a DIFFERENT colliding fileId — so
-            // that fallback match is marked unconfirmed rather than sure.
+            // Confirmed match, in trust order: a journey already keyed on
+            // this exact fileId, then one keyed on this exact qbPurchaseId
+            // (same journeys.ts grouping tiers above). Only when NEITHER
+            // exists do we fall back to the bare prefix bucket — which may
+            // belong to a DIFFERENT colliding fileId — so that fallback
+            // match is marked unconfirmed rather than sure.
             let j = byDoc.get(fullId);
+            if (!j && exp.qbPurchaseId) {
+                j = byDoc.get(`qb:${exp.qbPurchaseId}`);
+            }
             if (!j) {
                 j = byDoc.get(`prefix:${fullId.slice(0, 21)}`);
                 if (j) j.keyConfirmed = false;
@@ -443,7 +470,18 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
         }
     }
 
-    return [...byDoc.values()]
-        .sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime())
-        .slice(0, Math.min(Math.max(maxReceipts, 1), 200));
+    return [...byDoc.values()].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime());
+}
+
+/**
+ * Display-capped wrapper around `receiptJourneysAll` for the pipeline list
+ * view, which genuinely only ever renders a bounded number of rows. Never
+ * use this for a lookup/match against one specific journey (e.g. the
+ * register row drill-down) — an older, genuinely-matching journey can sit
+ * just past the cap and read as "no audit record" even though it exists;
+ * use `receiptJourneysAll` for that instead.
+ */
+export async function receiptJourneys(days: number, maxReceipts: number): Promise<ReceiptJourney[]> {
+    const all = await receiptJourneysAll(days);
+    return all.slice(0, Math.min(Math.max(maxReceipts, 1), 200));
 }

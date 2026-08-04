@@ -70,8 +70,6 @@ function fetchRawReceiptEvents(sinceMs: number) {
 const DRILLDOWN_EXPENSE_SELECT = {
     qbPurchaseId: true,
     amount: true,
-    vendor: true,
-    date: true,
     receiptUrl: true,
     estimate: {
         select: {

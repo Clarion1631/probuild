@@ -320,11 +320,20 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                     <p className="text-xs text-red-700 mt-2">⚠ {markerVerdict.note}</p>
                 )}
 
-                {result && result.booking.attachment != null && (
-                    <p className={`text-xs mt-2 ${attachmentLine(result.booking.attachment)!.className}`}>
-                        {attachmentLine(result.booking.attachment)!.text}
-                    </p>
-                )}
+                {result && result.booking.attachment != null && (() => {
+                    const line = attachmentLine(result.booking.attachment)!;
+                    // A "attached ✓" against unconfirmed receipt evidence
+                    // isn't proof THIS receipt has its attachment — the
+                    // booking it describes may not even be the one shown
+                    // here. Downgrade to neutral, same rule as the field
+                    // checkmarks above.
+                    const downgraded = matchUnconfirmed && result.booking.attachment === "attached";
+                    return (
+                        <p className={`text-xs mt-2 ${downgraded ? "text-hui-textMuted" : line.className}`}>
+                            {downgraded ? "Attachment at booking: attached (match unconfirmed — see warning above)" : line.text}
+                        </p>
+                    );
+                })()}
 
                 <div className="flex items-center gap-3 mt-3 flex-wrap">
                     {journey.qbPurchaseId ? (
@@ -378,7 +387,10 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                             className="text-xs text-hui-textMuted"
                             title={new Date(result.verifiedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
                         >
-                            Verified {formatRelativeTime(new Date(result.verifiedAt))}
+                            {/* "Verified" implies confirmed identity — when the match
+                                itself is a guess, say what actually happened: we
+                                checked, not that we verified this receipt. */}
+                            {matchUnconfirmed ? "Checked" : "Verified"} {formatRelativeTime(new Date(result.verifiedAt))}
                         </span>
                     )}
                 </div>
@@ -411,7 +423,12 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                                 ) : (
                                     <div className="flex items-center gap-1.5 flex-wrap mb-1">
                                         {(["total", "tax", "vendor"] as const).map((field) => (
-                                            <AiFieldChip key={field} field={field} verdict={m.verdicts.find((v) => v.field === field)} />
+                                            <AiFieldChip
+                                                key={field}
+                                                field={field}
+                                                verdict={m.verdicts.find((v) => v.field === field)}
+                                                unconfirmed={matchUnconfirmed}
+                                            />
                                         ))}
                                     </div>
                                 )}

@@ -15,6 +15,15 @@ export function friendlyType(qbType: string, docNum: string | null): string {
     return qbType;
 }
 
+/** "+" for money in, "-" for money out, and nothing for exactly zero — a
+ * zero-value row is unclassifiable/non-spend, not money that "left" the
+ * account, so "-$0.00" would misrepresent it. */
+export function amountSign(amountCents: number): "+" | "-" | "" {
+    if (amountCents > 0) return "+";
+    if (amountCents < 0) return "-";
+    return "";
+}
+
 export function formatRelativeTime(date: Date): string {
     const diffMs = Date.now() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);

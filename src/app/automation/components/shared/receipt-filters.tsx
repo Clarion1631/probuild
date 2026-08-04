@@ -5,13 +5,13 @@ import { isStaleBookedApi } from "./stale-detection";
 
 export type FilterKey = "all" | "booked" | "needs-attention" | "in-flight";
 
-export const FILTERS: { key: FilterKey; label: string; test: (j: SerializedJourney) => boolean }[] = [
+export const FILTERS: { key: FilterKey; label: string; test: (j: SerializedJourney, now: number) => boolean }[] = [
     { key: "all", label: "All", test: () => true },
     { key: "booked", label: "Booked", test: (j) => j.finalState === "booked-api" || j.finalState === "booked-email" },
     {
         key: "needs-attention",
         label: "Needs attention",
-        test: (j) => j.finalState === "parked" || j.finalState === "quarantined" || j.finalState === "error" || isStaleBookedApi(j),
+        test: (j, now) => j.finalState === "parked" || j.finalState === "quarantined" || j.finalState === "error" || isStaleBookedApi(j, now),
     },
     { key: "in-flight", label: "In flight", test: (j) => j.finalState === "in-flight" },
 ];
@@ -22,15 +22,17 @@ export function ReceiptFilterBar({
     journeys,
     filter,
     onFilterChange,
+    now,
 }: {
     journeys: SerializedJourney[];
     filter: FilterKey;
     onFilterChange: (key: FilterKey) => void;
+    now: number;
 }) {
     return (
         <div className="flex flex-wrap gap-2">
             {FILTERS.map((f) => {
-                const count = journeys.filter(f.test).length;
+                const count = journeys.filter((j) => f.test(j, now)).length;
                 const active = filter === f.key;
                 return (
                     <button

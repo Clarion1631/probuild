@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { qbQuery, escapeQBString } from "@/lib/quickbooks";
-import { resolveEventFileId, resolveEventQbPurchaseId } from "@/lib/automation-events";
-import { readIdentifier, resolveReceiptPushEvent } from "@/lib/automation-key-resolver";
+import { resolveEventFileId } from "@/lib/automation-events";
+import { readIdentifier, resolveReceiptPushEvent, trustedQbPurchaseId } from "@/lib/automation-key-resolver";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -87,7 +87,14 @@ export async function POST(request: Request) {
     // receipt.
     const matchConfirmed = resolution.confirmed;
     const expectedFileId = resolution.fullFileId ?? resolveEventFileId(pushEvent);
-    const qbPurchaseId = qbPurchaseIdInput ?? resolveEventQbPurchaseId(pushEvent);
+    // Derived ONLY from the resolved event — NEVER the raw `qbPurchaseIdInput`
+    // above. A client can send a `driveFileId` that resolves event A and a
+    // conflicting `qbPurchaseId` naming event B; querying QBO with B's id
+    // would compare A's booking evidence against B's live purchase while the
+    // response calls it confirmed. `resolveReceiptPushEvent`'s own tiers
+    // already resolve exactly this value when the match came from the
+    // qbPurchaseId tier, so nothing is lost by ignoring the raw client input.
+    const qbPurchaseId = trustedQbPurchaseId(pushEvent);
     if (!qbPurchaseId) {
         return NextResponse.json({ ok: false, reason: "no-purchase-id-on-record" }, { status: 404 });
     }

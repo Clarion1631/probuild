@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { logAutomationEvent, resolveEventFileId } from "@/lib/automation-events";
-import { readIdentifier, resolveReceiptPushEvent } from "@/lib/automation-key-resolver";
+import { readIdentifier, resolveReceiptPushEvent, trustedQbPurchaseId } from "@/lib/automation-key-resolver";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -233,11 +233,19 @@ export async function POST(request: Request) {
     const dedupeKey = pushEvent.docNumber ?? fullFileId ?? qbPurchaseId ?? "unknown";
     const markerToken = fullFileId ? `[gtr-file:${fullFileId}]` : `[gtr-file:${pushEvent.docNumber ?? ""}`;
 
+    // Derived ONLY from the resolved event — never the raw client `qbPurchaseId`
+    // input above, which can name a different receipt than the one `pushEvent`
+    // actually resolved to. When `fullFileId` is unavailable, `markerToken`
+    // degenerates to the bare docNumber prefix (collision-prone by itself, see
+    // above), so this constraint is what keeps the Expense lookup from
+    // matching a DIFFERENT receipt that happens to share that prefix.
+    const resolvedQbPurchaseId = trustedQbPurchaseId(pushEvent);
+
     // The reviewable image is the ProBuild-stored copy (public Supabase URL,
     // fetchable server-side). It exists once the 4-hour sync has landed.
     const expense = await prisma.expense.findFirst({
         where: {
-            qbPurchaseId: { not: null },
+            qbPurchaseId: resolvedQbPurchaseId ?? { not: null },
             description: { contains: markerToken },
             receiptUrl: { not: null },
         },

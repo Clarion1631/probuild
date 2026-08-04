@@ -15,9 +15,11 @@ import JourneyList, { type SerializedJourney } from "../journey-list";
 export function JourneySection({
     journeys,
     suggestions,
+    now,
 }: {
     journeys: SerializedJourney[];
     suggestions: Record<string, FixSuggestion | null>;
+    now: number;
 }) {
     return (
         <details className="hui-card group" open>
@@ -33,7 +35,7 @@ export function JourneySection({
                     Every receipt the automation processed, including ones that never became a register row above.
                     Verify a receipt live against QuickBooks or run an AI review from here.
                 </p>
-                <JourneyList journeys={journeys} suggestions={suggestions} />
+                <JourneyList journeys={journeys} suggestions={suggestions} now={now} />
             </div>
         </details>
     );

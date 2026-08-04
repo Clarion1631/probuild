@@ -78,7 +78,7 @@ export function StepTimeline({
                     </div>
                     <span
                         className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
-                        title={new Date(step.at).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                        title={new Date(step.at).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Los_Angeles" })}
                     >
                         {formatRelativeTime(new Date(step.at))}
                     </span>

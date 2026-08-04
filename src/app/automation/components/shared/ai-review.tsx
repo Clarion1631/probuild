@@ -54,7 +54,20 @@ export function aiReadLine(read: AiReviewRead): string {
     return `read: ${vendor} · ${total} · tax ${tax} · ${date}`;
 }
 
-export function AiFieldChip({ field, verdict }: { field: AiReviewVerdict["field"]; verdict: AiReviewVerdict | undefined }) {
+export function AiFieldChip({
+    field,
+    verdict,
+    unconfirmed,
+}: {
+    field: AiReviewVerdict["field"];
+    verdict: AiReviewVerdict | undefined;
+    /** True when the receipt match itself is unconfirmed (possible prefix
+     * collision) — a green "agree" checkmark here would read as confirmation
+     * of the WRONG receipt's data, so it must downgrade to the same neutral
+     * "?" chip as an unknown verdict. Flags stay red either way: a
+     * disagreement is worth surfacing regardless of match confidence. */
+    unconfirmed?: boolean;
+}) {
     const label = field.charAt(0).toUpperCase() + field.slice(1);
     const state = verdict?.state ?? "unknown";
     if (state === "flag") {
@@ -65,7 +78,7 @@ export function AiFieldChip({ field, verdict }: { field: AiReviewVerdict["field"
             </span>
         );
     }
-    if (state === "agree") {
+    if (state === "agree" && !unconfirmed) {
         return (
             <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-700">
                 {label} <span className="font-bold">✓</span>
@@ -73,7 +86,10 @@ export function AiFieldChip({ field, verdict }: { field: AiReviewVerdict["field"
         );
     }
     return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500" title={verdict?.note}>
+        <span
+            className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500"
+            title={state === "agree" && unconfirmed ? "Match unconfirmed — see warning above" : verdict?.note}
+        >
             {label} <span className="font-bold">?</span>
         </span>
     );
