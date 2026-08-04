@@ -2177,12 +2177,203 @@ model AutomationEvent {
   fileName    String?
   amountCents Int?
   taxCents    Int?
+  // Typed provenance (Unified Money Register plan §1, "Promote evidence out
+  // of JSON"). Dual-written alongside `detail.fileId` / `detail.qbPurchaseId`
+  // by logAutomationEvent — join on these, never on the 21-char `docNumber`
+  // prefix, which two different Drive fileIds can share.
+  qbPurchaseId String?
+  driveFileId  String?
   detail      String?  // JSON extras (sync counts, decline context)
   createdAt   DateTime @default(now())
 
   @@index([kind, createdAt])
   @@index([createdAt])
   @@index([docNumber, createdAt])
+  @@index([qbPurchaseId])
+  @@index([driveFileId])
+}
+
+// Persisted at QBO expense-sync time (Unified Money Register plan §5 step 3,
+// docs/UNIFIED-REGISTER-PLAN.md). A QuickBooks Purchase's customer/account/
+// equity shape decides whether it's job-costable, overhead, or an owner
+// draw — and a bank-register GL row (qbo-bank-register.ts) carries none of
+// that shape, so it CANNOT be recomputed from the register alone. Captured
+// once at sync time and joined back in by qbPurchaseId. `classification` is
+// CHECK-constrained to the four values below (see
+// scripts/apply-qbo-purchase-classification.mjs) rather than left an
+// unvalidated string.
+model QboPurchaseClassification {
+  qbPurchaseId   String   @id
+  classification String // "job-cost" | "overhead" | "owner-draw" | "unknown"
+  reason         String? // why, e.g. "no customer on purchase", "no-active-project"
+  qbSyncToken    String? // lets a later sync tell whether the Purchase changed since classification
+  classifiedAt   DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([classification])
+}
+
+// ── Review alerts (Unified Money Register plan §4/§5 step 8) ────────────────
+// Google Chat notifications for register rows that land in "needs-review".
+// Three-model durable state machine, mirroring the PaymentNotification outbox
+// (src/lib/payment-outbox.ts) for the delivery half and adding a lifecycle
+// layer on top (src/lib/review-alert-lifecycle.ts) because — unlike a
+// milestone-paid event, which fires once — a review issue's reason set can
+// change, clear, and re-open many times, and delivery must track exactly one
+// "current" outstanding problem per target without re-alerting on every sync.
+//
+// Reason codes are STABLE ENUM-LIKE STRINGS (NO_RECEIPT, NO_JOB_COST, ...),
+// never free text — see src/lib/review-alert-reasons.ts for the closed set,
+// canonical-JSON encoding, and untruncated-SHA-256 hashing (plan punch 9: a
+// comma-joined string collides, and hashing display text churns a new
+// generation on every evaluation). `reasonCodes` / `reasonHash` are that
+// canonical encoding; `displayDetails` is a SEPARATE, NEVER-hashed JSON blob
+// for amounts/dates/vendor — display data changes constantly (a backdated
+// CDC catch-up can revise an amount) and must never itself trigger a new
+// alert generation.
+
+// Current state, one row per (targetType, targetKey) — e.g. targetType
+// "qbo-purchase", targetKey the QBO Purchase Id. `version` guards every write
+// with optimistic concurrency (see the lifecycle module): the ordered
+// decision tree runs in one short transaction keyed on `{id, version}`, and a
+// conflict retries the whole evaluation rather than blindly overwriting.
+model ReviewIssue {
+  id                String    @id @default(cuid())
+  targetType        String
+  targetKey         String
+  version           Int       @default(1)
+  reasonCodes       String // canonical JSON array of ReasonCode, sorted + deduped
+  reasonHash        String // untruncated SHA-256 hex of reasonCodes
+  displayDetails    String? // JSON: amounts/dates/vendor/project — NOT hashed, NOT what drives a new generation
+  acknowledgedCodes String    @default("[]") // canonical JSON array — acknowledgement is per-code (plan punch 9), not whole-set
+  acknowledgedAt    DateTime?
+  firstObservedAt   DateTime // reset whenever the issue re-opens after clearing — "when did the CURRENT failure start"
+  clearedAt         DateTime?
+  // Highest ReviewAlertEpisode.generation opened for this issue. Not called
+  // out by name in the plan's schema bullet list, but the lifecycle ("open
+  // generation+1") needs an authoritative counter to bump race-safely inside
+  // the same version-guarded transaction — deriving it via
+  // MAX(generation) FROM ReviewAlertEpisode on every evaluation would be an
+  // extra query and an extra race window for no benefit.
+  currentGeneration Int       @default(1)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  episodes ReviewAlertEpisode[]
+
+  @@unique([targetType, targetKey])
+  @@index([clearedAt])
+}
+
+// IMMUTABLE per-generation snapshot — one row per (issueId, generation), never
+// updated in place except for its OWN delivery-retry bookkeeping (status,
+// claimToken, attempts, ...). `reasonCodes` / `reasonHash` / `displayDetails`
+// here are a snapshot AS OF the generation open, independent of whatever the
+// parent ReviewIssue's current values later become — so a delayed send still
+// reports the numbers that were true when the alert was generated.
+//
+// Delivery state mirrors src/lib/payment-outbox.ts's PaymentNotification
+// model exactly (plan punch 3): status PENDING|CLAIMED|SENT|FAILED, plus
+// SUPERSEDED (a newer generation opened before this one sent — plan punch 1
+// step 6) and CANCELLED (the issue cleared before this one sent — step 1) and
+// SUPPRESSED (acknowledged-superset suppression, or a rollout-baseline
+// snapshot that must never actually send — plan §4 "Rollout").
+model ReviewAlertEpisode {
+  id      String @id @default(cuid())
+  issueId String
+  issue   ReviewIssue @relation(fields: [issueId], references: [id])
+  generation Int
+
+  reasonCodes    String
+  reasonHash     String
+  displayDetails String?
+
+  status String @default("PENDING") // PENDING | CLAIMED | SENT | FAILED | SUPERSEDED | CANCELLED | SUPPRESSED | BATCHED
+  // Fencing token: set on each claim, required by the completion update — a
+  // worker whose lease expired (row re-claimed by another drainer) writes a
+  // stale token, so its late completion no-ops instead of overwriting the new
+  // owner's result (same convention as PaymentNotification.claimToken).
+  claimToken    String?
+  claimedAt     DateTime?
+  attempts      Int       @default(0)
+  lastError     String?
+  // Retry-as-PENDING backoff gate, distinct from claimedAt's stale-claim
+  // reclaim window — see src/lib/review-alert-outbox.ts.
+  nextAttemptAt DateTime?
+  sentAt        DateTime?
+  chatMessageName String? // Google Chat message resource name, for the deterministic-requestId re-fetch path (step 10)
+
+  // Rate-ceiling overflow (plan §4 "Rate ceiling"): when more than 10 episodes
+  // are ready in one drain run, the overflow moves PENDING → BATCHED with a
+  // batchId, and the batch itself is drained through the SAME claim/fence/
+  // retry path as a single ReviewAlertBatch row. FK is ON DELETE RESTRICT
+  // (Codex finding 3 — SET NULL let a deleted batch orphan its still-BATCHED
+  // members with nothing left to drain them); apply-review-alerts-schema.mjs
+  // is the source of truth for the FK's actual delete rule, this attribute
+  // relation doesn't encode it.
+  batchId String?
+  batch   ReviewAlertBatch? @relation(fields: [batchId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([issueId, generation])
+  // Real indexes (finding 11) are two separate PARTIAL indexes — one on
+  // (nextAttemptAt, createdAt) WHERE status='PENDING', one on
+  // (claimedAt, createdAt) WHERE status='CLAIMED' — managed by
+  // apply-review-alerts-schema.mjs. A single composite (status,
+  // nextAttemptAt, claimedAt) index can't serve both branches of the
+  // drainer's due-retry / stale-claim OR query; Prisma's schema DSL has no
+  // partial-index syntax, so this line is documentation only, not what's
+  // actually applied.
+  @@index([status, nextAttemptAt, claimedAt])
+  @@index([batchId])
+}
+
+// Rate-ceiling overflow summary card. Same COMPLETE retry model as
+// ReviewAlertEpisode (plan §4 "Schema") — drained through the identical
+// claim/fence/retry code path, just building a multi-episode summary payload
+// instead of a single-issue card.
+model ReviewAlertBatch {
+  id     String @id @default(cuid())
+  status String @default("PENDING") // PENDING | CLAIMED | SENT | FAILED
+
+  claimToken      String?
+  claimedAt       DateTime?
+  attempts        Int       @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime?
+  sentAt          DateTime?
+  chatMessageName String?
+
+  createdAt DateTime @default(now())
+
+  episodes ReviewAlertEpisode[]
+
+  // Same partial-index split as ReviewAlertEpisode above (finding 11) —
+  // documentation only, see that model's comment.
+  @@index([status, nextAttemptAt, claimedAt])
+}
+
+// Durable lease row for the rollout baseline (plan §4 "Rollout"). NOT a long
+// transaction and NOT a session advisory lock — neither survives pgbouncer's
+// transaction-pooling mode (every statement can land on a different backend
+// connection). A single row, claimed the same conditional-updateMany way the
+// outbox claims work, records whether the one-time baseline sweep (existing
+// failures written as SUPPRESSED episodes so enabling alerts doesn't dump the
+// entire backlog into Chat) has completed.
+model RolloutGate {
+  key    String @id
+  status String @default("pending") // pending | in-progress | complete
+
+  claimToken  String?
+  claimedAt   DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status])
 }
 
 model StripeEvent {

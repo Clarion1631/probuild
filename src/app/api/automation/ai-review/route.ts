@@ -3,7 +3,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI } from "@google/genai";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
-import { logAutomationEvent } from "@/lib/automation-events";
+import { logAutomationEvent, resolveEventFileId } from "@/lib/automation-events";
+import { readIdentifier, resolveReceiptPushEvent } from "@/lib/automation-key-resolver";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -200,33 +201,44 @@ export async function POST(request: Request) {
     if (typeof parsed !== "object" || parsed === null) {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
     }
-    const docNumber = typeof (parsed as { docNumber?: unknown }).docNumber === "string"
-        ? ((parsed as { docNumber: string }).docNumber).trim()
-        : null;
-    if (!docNumber || docNumber.length > 30) {
+    const body = parsed as { docNumber?: unknown; driveFileId?: unknown; qbPurchaseId?: unknown };
+    const docNumber = readIdentifier(body.docNumber, 30);
+    const driveFileId = readIdentifier(body.driveFileId, 128);
+    const qbPurchaseId = readIdentifier(body.qbPurchaseId, 64);
+    if (!docNumber && !driveFileId && !qbPurchaseId) {
         return NextResponse.json({ ok: false, reason: "invalid-doc-number" }, { status: 400 });
     }
 
-    // Booked values (original created event — same evidence rule as verify).
-    const pushEvent =
-        (await prisma.automationEvent.findFirst({
-            where: { kind: "receipt-push", docNumber, status: "created" },
-            orderBy: { createdAt: "asc" },
-        })) ??
-        (await prisma.automationEvent.findFirst({
-            where: { kind: "receipt-push", docNumber, status: "already-exists" },
-            orderBy: { createdAt: "desc" },
-        }));
-    if (!pushEvent) {
+    // Resolve the push event via the FULL driveFileId/qbPurchaseId first
+    // (near-zero collision risk); the bare docNumber (fileId.slice(0,21) —
+    // qbo-receipt-push.ts:477-481) is a LEGACY FALLBACK only, since two
+    // different Drive fileIds can share that prefix. When the fallback path
+    // finds more than one distinct fileId sharing the prefix, it refuses to
+    // guess — reviewing the wrong receipt's evidence is worse than refusing.
+    const resolution = await resolveReceiptPushEvent({ docNumber, driveFileId, qbPurchaseId });
+    if (resolution.outcome === "ambiguous") {
+        return NextResponse.json(
+            { ok: false, reason: "ambiguous-match", candidateCount: resolution.candidateCount },
+            { status: 409 },
+        );
+    }
+    if (resolution.outcome === "not-found") {
         return NextResponse.json({ ok: false, reason: "no-booking-on-record" }, { status: 404 });
     }
+    const pushEvent = resolution.event;
+    // False when this match came from the bare-prefix legacy fallback — the
+    // caller must not present the review as tied to a confirmed receipt.
+    const fileIdConfirmed = resolution.confirmed;
+    const fullFileId = resolution.fullFileId ?? resolveEventFileId(pushEvent);
+    const dedupeKey = pushEvent.docNumber ?? fullFileId ?? qbPurchaseId ?? "unknown";
+    const markerToken = fullFileId ? `[gtr-file:${fullFileId}]` : `[gtr-file:${pushEvent.docNumber ?? ""}`;
 
     // The reviewable image is the ProBuild-stored copy (public Supabase URL,
     // fetchable server-side). It exists once the 4-hour sync has landed.
     const expense = await prisma.expense.findFirst({
         where: {
             qbPurchaseId: { not: null },
-            description: { contains: `[gtr-file:${docNumber}` },
+            description: { contains: markerToken },
             receiptUrl: { not: null },
         },
         select: { receiptUrl: true },
@@ -249,11 +261,11 @@ export async function POST(request: Request) {
     if (windowCount >= WINDOW_MAX) {
         return NextResponse.json({ ok: false, reason: "rate-limited" }, { status: 429, headers: { "Retry-After": "60" } });
     }
-    if (inFlightDocs.has(docNumber)) {
+    if (inFlightDocs.has(dedupeKey)) {
         return NextResponse.json({ ok: false, reason: "review-already-running" }, { status: 429, headers: { "Retry-After": "15" } });
     }
     windowCount += 1;
-    inFlightDocs.add(docNumber);
+    inFlightDocs.add(dedupeKey);
 
     try {
         const fileRes = await fetch(expense.receiptUrl, { redirect: "error", signal: AbortSignal.timeout(20_000) });
@@ -364,7 +376,13 @@ export async function POST(request: Request) {
                     ? (tier2Attempted && !tier2 ? "escalation failed — no confident verdict" : "document not confidently readable")
                     : (tier2 ? "escalated — arbitration confirmed the booking" : "first pass agrees with the booking"),
             source: `manual:${user.id}`,
-            docNumber,
+            docNumber: pushEvent.docNumber ?? undefined,
+            // Carry the FULL fileId when we actually resolved one, so this
+            // event dual-writes into the same typed driveFileId as the
+            // originating receipt-push event — otherwise receiptJourneys()
+            // would key this step under the bare prefix and split one
+            // receipt's timeline into two journeys.
+            ...(fullFileId ? { detail: { fileId: fullFileId } } : {}),
         });
 
         return NextResponse.json({
@@ -377,11 +395,15 @@ export async function POST(request: Request) {
             // What the bank feed will try to match — the whole point.
             expectedBankChargeCents: pushEvent.amountCents,
             models,
+            // False when the receipt evidence was matched via the bare
+            // docNumber prefix (no full driveFileId on record) — the caller
+            // must not present this review as tied to a confirmed receipt.
+            unconfirmedMatch: !fileIdConfirmed,
         });
     } catch (error) {
         console.error("ai-review failed", error instanceof Error ? error.name : "UnknownError");
         return NextResponse.json({ ok: false, reason: "review-failed" }, { status: 500 });
     } finally {
-        inFlightDocs.delete(docNumber);
+        inFlightDocs.delete(dedupeKey);
     }
 }

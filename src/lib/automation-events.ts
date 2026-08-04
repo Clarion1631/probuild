@@ -58,6 +58,18 @@ export async function logAutomationEvent(input: AutomationEventInput): Promise<v
         // and silently drop the whole audit row.
         return Math.abs(rounded) <= 2_147_483_647 ? rounded : undefined;
     };
+    // Dual-write (Unified Money Register plan §1): the same fileId /
+    // qbPurchaseId values already going into `detail` also land in typed
+    // columns, so future reads can join on a real id instead of parsing
+    // JSON-in-TEXT or the collision-prone 21-char docNumber prefix. `detail`
+    // keeps writing unchanged — this is additive, not a cutover.
+    const driveFileId =
+        typeof input.detail?.fileId === "string" && input.detail.fileId ? input.detail.fileId : undefined;
+    const qbPurchaseId =
+        typeof input.detail?.qbPurchaseId === "string" && input.detail.qbPurchaseId
+            ? input.detail.qbPurchaseId
+            : undefined;
+
     try {
         await prisma.automationEvent.create({
             data: {
@@ -72,6 +84,8 @@ export async function logAutomationEvent(input: AutomationEventInput): Promise<v
                 fileName: clip(input.fileName),
                 amountCents: safeCents(input.amountCents),
                 taxCents: safeCents(input.taxCents),
+                qbPurchaseId: clip(qbPurchaseId),
+                driveFileId: clip(driveFileId),
                 detail: serializeDetail(input.detail),
             },
         });
@@ -190,7 +204,9 @@ export interface JourneyStep {
 }
 
 export interface ReceiptJourney {
-    /** Correlation key: Drive fileId's 21-char prefix (= QBO DocNumber). */
+    /** Display id: Drive fileId's 21-char prefix (= QBO DocNumber). NOT the
+     * grouping key — two different Drive fileIds can share this prefix, see
+     * `keyConfirmed`. */
     docNumber: string;
     fileName: string | null;
     vendor: string | null;
@@ -214,10 +230,15 @@ export interface ReceiptJourney {
     syncedProjectName: string | null;
     /** True when this journey was reconstructed from QBO history rather than observed live. */
     backfilled: boolean;
-    /** Full Drive fileId (from event detail) — powers the "Open in Drive" link. */
+    /** Full Drive fileId (typed column, falling back to legacy event detail JSON) — powers the "Open in Drive" link. */
     driveFileId: string | null;
-    /** QBO purchase id (from the push event detail) — powers the QBO deep link. */
+    /** QBO purchase id (typed column, falling back to legacy event detail JSON) — powers the QBO deep link. */
     qbPurchaseId: string | null;
+    /** False when this journey was grouped by the bare 21-char docNumber
+     * prefix because no event on it carries a full driveFileId — a prefix
+     * collision with a DIFFERENT receipt is possible, so this journey (and
+     * any expense match found for it) must never be presented as confirmed. */
+    keyConfirmed: boolean;
     /** Validation panel: what actually landed in ProBuild after the sync. */
     synced: {
         expenseId: string;
@@ -228,6 +249,42 @@ export interface ReceiptJourney {
         receiptUrl: string | null;
         syncedAt: Date;
     } | null;
+}
+
+/**
+ * Resolve the FULL Drive fileId for an automation event: typed column first
+ * (dual-write / backfilled), legacy `detail` JSON as fallback. Returns null
+ * when neither is available — never derived from the docNumber prefix, which
+ * is exactly the ambiguous value this exists to avoid. Exported so callers
+ * that need the same resolution against a single known event (the ai-review
+ * and verify API routes, via `automation-key-resolver.ts`) don't duplicate
+ * this parsing.
+ */
+export function resolveEventFileId(e: { driveFileId: string | null; detail: string | null }): string | null {
+    if (e.driveFileId) return e.driveFileId;
+    if (e.detail) {
+        try {
+            const d = JSON.parse(e.detail) as { fileId?: unknown };
+            if (typeof d.fileId === "string" && d.fileId) return d.fileId;
+        } catch {
+            // malformed detail — no full id derivable from this event
+        }
+    }
+    return null;
+}
+
+/** Same idea as `resolveEventFileId`, for the QBO Purchase id. */
+export function resolveEventQbPurchaseId(e: { qbPurchaseId: string | null; detail: string | null }): string | null {
+    if (e.qbPurchaseId) return e.qbPurchaseId;
+    if (e.detail) {
+        try {
+            const d = JSON.parse(e.detail) as { qbPurchaseId?: unknown };
+            if (typeof d.qbPurchaseId === "string" && d.qbPurchaseId) return d.qbPurchaseId;
+        } catch {
+            // malformed detail — ignore
+        }
+    }
+    return null;
 }
 
 function journeyFinalState(steps: JourneyStep[]): { state: ReceiptJourney["finalState"]; reason: string | null } {
@@ -277,10 +334,19 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
 
     events.reverse(); // back to ascending for timeline assembly
 
+    // Grouping key is the FULL driveFileId, never the bare 21-char docNumber
+    // prefix alone — two different Drive fileIds can share a prefix
+    // (qbo-receipt-push.ts:477-481), and keying by prefix would silently
+    // merge two different receipts' timelines into one journey. An event
+    // with no derivable full id groups under a `prefix:`-tagged bucket
+    // (distinct from any real fileId string) and the resulting journey is
+    // marked `keyConfirmed: false`.
     const byDoc = new Map<string, ReceiptJourney>();
     for (const e of events) {
         const doc = e.docNumber as string;
-        let j = byDoc.get(doc);
+        const fileId = resolveEventFileId(e);
+        const key = fileId ?? `prefix:${doc}`;
+        let j = byDoc.get(key);
         if (!j) {
             j = {
                 docNumber: doc,
@@ -289,9 +355,10 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 firstSeen: e.createdAt, lastSeen: e.createdAt,
                 steps: [], finalState: "in-flight", finalReason: null,
                 syncedExpenseId: null, syncedProjectName: null,
-                driveFileId: null, qbPurchaseId: null, synced: null, backfilled: false,
+                driveFileId: fileId, qbPurchaseId: null, synced: null, backfilled: false,
+                keyConfirmed: Boolean(fileId),
             };
-            byDoc.set(doc, j);
+            byDoc.set(key, j);
         }
         j.lastSeen = e.createdAt;
         if (e.source === "backfill") j.backfilled = true;
@@ -300,16 +367,9 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
         j.projectName = e.projectName ?? j.projectName;
         j.amountCents = e.amountCents ?? j.amountCents;
         j.taxCents = e.taxCents ?? j.taxCents;
-        // Full ids ride in detail JSON (docNumber is only a 21-char prefix).
-        if (e.detail) {
-            try {
-                const d = JSON.parse(e.detail) as { fileId?: unknown; qbPurchaseId?: unknown };
-                if (typeof d.fileId === "string" && d.fileId) j.driveFileId = d.fileId;
-                if (typeof d.qbPurchaseId === "string" && d.qbPurchaseId) j.qbPurchaseId = d.qbPurchaseId;
-            } catch {
-                // malformed detail is display-only data — ignore
-            }
-        }
+        j.driveFileId = j.driveFileId ?? fileId;
+        const qbPurchaseId = resolveEventQbPurchaseId(e);
+        if (qbPurchaseId) j.qbPurchaseId = qbPurchaseId;
         j.steps.push({
             at: e.createdAt,
             stage: e.stage ?? (e.kind === "receipt-push" ? "push" : "unknown"),
@@ -351,12 +411,21 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
         for (const exp of expenses) {
             const m = exp.description?.match(/\[gtr-file:([^\]]+)\]/);
             if (!m) continue;
-            const j = byDoc.get(m[1].slice(0, 21));
+            const fullId = m[1];
+            // Confirmed match: a journey already keyed on this exact fileId.
+            // Only when none exists do we fall back to the bare prefix
+            // bucket — which may belong to a DIFFERENT colliding fileId — so
+            // that fallback match is marked unconfirmed rather than sure.
+            let j = byDoc.get(fullId);
+            if (!j) {
+                j = byDoc.get(`prefix:${fullId.slice(0, 21)}`);
+                if (j) j.keyConfirmed = false;
+            }
             if (j) {
                 const syncedAt = exp.qbSyncedAt ?? exp.createdAt;
                 j.syncedExpenseId = exp.id;
                 j.syncedProjectName = exp.estimate?.project?.name ?? null;
-                j.driveFileId = j.driveFileId ?? m[1];
+                j.driveFileId = j.driveFileId ?? fullId;
                 j.synced = {
                     expenseId: exp.id,
                     projectId: exp.estimate?.project?.id ?? null,

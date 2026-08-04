@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { qbQuery, escapeQBString } from "@/lib/quickbooks";
-import { prisma } from "@/lib/prisma";
+import { resolveEventFileId, resolveEventQbPurchaseId } from "@/lib/automation-events";
+import { readIdentifier, resolveReceiptPushEvent } from "@/lib/automation-key-resolver";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -51,9 +52,11 @@ export async function POST(request: Request) {
     if (typeof parsed !== "object" || parsed === null) {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
     }
-    const body = parsed as { docNumber?: unknown };
-    const docNumber = typeof body.docNumber === "string" && body.docNumber.trim() ? body.docNumber.trim() : null;
-    if (!docNumber || docNumber.length > 30) {
+    const body = parsed as { docNumber?: unknown; driveFileId?: unknown; qbPurchaseId?: unknown };
+    const docNumber = readIdentifier(body.docNumber, 30);
+    const driveFileId = readIdentifier(body.driveFileId, 128);
+    const qbPurchaseIdInput = readIdentifier(body.qbPurchaseId, 64);
+    if (!docNumber && !driveFileId && !qbPurchaseIdInput) {
         return NextResponse.json({ ok: false, reason: "invalid-doc-number" }, { status: 400 });
     }
 
@@ -62,27 +65,29 @@ export async function POST(request: Request) {
     // comparing live QBO against those would report false mismatches and a
     // wrong bookedAt. Fall back to already-exists only when the created
     // record was never captured (pre-logging history).
-    const pushEvent =
-        (await prisma.automationEvent.findFirst({
-            where: { kind: "receipt-push", docNumber, status: "created" },
-            orderBy: { createdAt: "asc" },
-        })) ??
-        (await prisma.automationEvent.findFirst({
-            where: { kind: "receipt-push", docNumber, status: "already-exists" },
-            orderBy: { createdAt: "desc" },
-        }));
-    if (!pushEvent) {
+    //
+    // Resolve via the FULL driveFileId/qbPurchaseId first (near-zero
+    // collision risk); the bare docNumber (fileId.slice(0,21) —
+    // qbo-receipt-push.ts:477-481) is a LEGACY FALLBACK only, since two
+    // different Drive fileIds can share that prefix. That fallback refuses
+    // to guess when the prefix genuinely matches more than one receipt.
+    const resolution = await resolveReceiptPushEvent({ docNumber, driveFileId, qbPurchaseId: qbPurchaseIdInput });
+    if (resolution.outcome === "ambiguous") {
+        return NextResponse.json(
+            { ok: false, reason: "ambiguous-match", candidateCount: resolution.candidateCount },
+            { status: 409 },
+        );
+    }
+    if (resolution.outcome === "not-found") {
         return NextResponse.json({ ok: false, reason: "no-booking-on-record" }, { status: 404 });
     }
-    let qbPurchaseId: string | null = null;
-    let expectedFileId: string | null = null;
-    try {
-        const d = JSON.parse(pushEvent.detail ?? "{}") as { qbPurchaseId?: unknown; fileId?: unknown };
-        if (typeof d.qbPurchaseId === "string") qbPurchaseId = d.qbPurchaseId;
-        if (typeof d.fileId === "string") expectedFileId = d.fileId;
-    } catch {
-        // detail is display data; verify can proceed without it
-    }
+    const pushEvent = resolution.event;
+    // False when this match came from the bare-prefix legacy fallback — the
+    // caller must not present the verify result as tied to a confirmed
+    // receipt.
+    const matchConfirmed = resolution.confirmed;
+    const expectedFileId = resolution.fullFileId ?? resolveEventFileId(pushEvent);
+    const qbPurchaseId = qbPurchaseIdInput ?? resolveEventQbPurchaseId(pushEvent);
     if (!qbPurchaseId) {
         return NextResponse.json({ ok: false, reason: "no-purchase-id-on-record" }, { status: 404 });
     }
@@ -100,6 +105,9 @@ export async function POST(request: Request) {
                 booking: bookingEvidence(pushEvent),
                 live: null,
                 verdicts: [{ field: "existence", state: "needs-attention", note: "Purchase no longer exists in QuickBooks (deleted or voided)." }],
+                // False when this booking evidence came from the bare-prefix
+                // legacy fallback — never present it as a confirmed match.
+                unconfirmedMatch: !matchConfirmed,
             });
         }
 
@@ -159,7 +167,17 @@ export async function POST(request: Request) {
             verdicts.push({ field: "marker", state: "needs-attention", note: "The idempotency marker was edited out of the memo — duplicate protection for this file is weakened." });
         }
 
-        return NextResponse.json({ ok: true, verifiedAt, deleted: false, booking: bookingEvidence(pushEvent), live, verdicts });
+        return NextResponse.json({
+            ok: true,
+            verifiedAt,
+            deleted: false,
+            booking: bookingEvidence(pushEvent),
+            live,
+            verdicts,
+            // False when this booking evidence came from the bare-prefix
+            // legacy fallback — never present it as a confirmed match.
+            unconfirmedMatch: !matchConfirmed,
+        });
     } catch (error) {
         if (error instanceof QBNotConnectedError) {
             return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });

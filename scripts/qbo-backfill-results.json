@@ -1,0 +1,944 @@
+{
+  "since": "2026-05-01",
+  "until": "2026-07-31",
+  "chunks": [
+    {
+      "since": "2026-05-01",
+      "until": "2026-05-31"
+    },
+    {
+      "since": "2026-06-01",
+      "until": "2026-06-30"
+    },
+    {
+      "since": "2026-07-01",
+      "until": "2026-07-31"
+    }
+  ],
+  "pass1": [
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-05-01",
+      "until": "2026-05-31",
+      "imported": 5,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "5920",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5897",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5962",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5963",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5875",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5964",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5983",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5880",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5874",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5848",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5851",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5853",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5855",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5854",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5857",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5856",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6223",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5969",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5858",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5971",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5970",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5906",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5981",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5927",
+          "reason": "no-active-project"
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-06-01",
+      "until": "2026-06-30",
+      "imported": 37,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "6063",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6091",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "6075",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "5986",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5976",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5972",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5828",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6034",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5835",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6010",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5975",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6228",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6177",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6043",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6005",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6167",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6164",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6156",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6155",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5978",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5977",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5950",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6157",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6153",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6152",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6046",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6018",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6158",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6045",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6044",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6042",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6041",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6159",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6038",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6031",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6234",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6227",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6161",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6160",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6132",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6100",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6126",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6124",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6121",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6119",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6112",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6097",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6242",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6239",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6229",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6214",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6194",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6125",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6120",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6109",
+          "reason": "no-active-project"
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-07-01",
+      "until": "2026-07-31",
+      "imported": 15,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "6266",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6273",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "6344",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6343",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6241",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6238",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6213",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6196",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6256",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6245",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6211",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6247",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6251",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6198",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6301",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6307",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6306",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6286",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6317",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6318",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6335",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6331",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6321",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6320",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6319",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6339",
+          "reason": "no-estimate"
+        },
+        {
+          "qbPurchaseId": "6333",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6334",
+          "reason": "no-estimate"
+        }
+      ]
+    }
+  ],
+  "pass2": [
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-05-01",
+      "until": "2026-05-31",
+      "imported": 0,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "5920",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5897",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5962",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5963",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5875",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5964",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5983",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5880",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5874",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5848",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5851",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5853",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5855",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5854",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5857",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5856",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6223",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5969",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5858",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5971",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5970",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5906",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5981",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5927",
+          "reason": "no-active-project"
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-06-01",
+      "until": "2026-06-30",
+      "imported": 0,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "6063",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6091",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "6075",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "5986",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5976",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5972",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5828",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6034",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5835",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6010",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5975",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6228",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6177",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6043",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6005",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6167",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6164",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6156",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6155",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5978",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "5977",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "5950",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6157",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6153",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6152",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6046",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6018",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6158",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6045",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6044",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6042",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6041",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6159",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6038",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6031",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6234",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6227",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6161",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6160",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6132",
+          "reason": "equity-draw"
+        },
+        {
+          "qbPurchaseId": "6100",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6126",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6124",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6121",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6119",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6112",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6097",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6242",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6239",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6229",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6214",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6194",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6125",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6120",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6109",
+          "reason": "no-active-project"
+        }
+      ]
+    },
+    {
+      "ok": true,
+      "mode": "backfill",
+      "since": "2026-07-01",
+      "until": "2026-07-31",
+      "imported": 0,
+      "updated": 0,
+      "removed": 0,
+      "skipped": [
+        {
+          "qbPurchaseId": "6266",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6273",
+          "reason": "multiple-customers"
+        },
+        {
+          "qbPurchaseId": "6344",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6343",
+          "reason": "mixed-customer-allocation"
+        },
+        {
+          "qbPurchaseId": "6241",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6238",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6213",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6196",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6256",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6245",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6211",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6247",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6251",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6198",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6301",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6307",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6306",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6286",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6317",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6318",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6335",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6331",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6321",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6320",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6319",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6339",
+          "reason": "no-estimate"
+        },
+        {
+          "qbPurchaseId": "6333",
+          "reason": "no-active-project"
+        },
+        {
+          "qbPurchaseId": "6334",
+          "reason": "no-estimate"
+        }
+      ]
+    }
+  ]
+}

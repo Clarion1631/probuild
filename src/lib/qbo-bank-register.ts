@@ -1,5 +1,6 @@
 import { qbFetch, type QBTokens } from "@/lib/quickbooks";
 import { prisma } from "@/lib/prisma";
+import { isPurchaseType, isMoneyInType } from "@/lib/register-types";
 
 /**
  * QuickBooks bank-account REGISTER for the Command Center's Bank page.
@@ -196,13 +197,6 @@ export async function fetchBankRegister(
 
 // ── Verdicts ────────────────────────────────────────────────────────────────
 
-/** GL type labels whose underlying entity is a QBO Purchase (deep-linkable
- * as /app/expense and joinable to ProBuild via Expense.qbPurchaseId). */
-const PURCHASE_TYPES = new Set(["Expense", "Check", "Cash Expense", "Cash Purchase", "Credit Card Expense"]);
-// Refund/Refund Receipt deliberately NOT here: a refund receipt pays money
-// OUT of the account — the sign check below decides, never the label alone.
-const MONEY_IN_TYPES = new Set(["Deposit", "Payment", "Sales Receipt"]);
-
 export type BankRowVerdict =
     | { kind: "linked"; projectId: string | null; projectName: string | null; amountMatches: boolean; expenseAmountCents: number; receiptUrl: string | null }
     | { kind: "review"; note: string }
@@ -231,7 +225,7 @@ export interface BankRegisterRowWithVerdict extends BankRegisterRow {
  */
 export async function attachVerdicts(rows: BankRegisterRow[]): Promise<BankRegisterRowWithVerdict[]> {
     const purchaseIds = rows
-        .filter(r => PURCHASE_TYPES.has(r.qbType) && r.qbTxnId)
+        .filter(r => isPurchaseType(r.qbType) && r.qbTxnId)
         .map(r => r.qbTxnId as string);
 
     const expenses = purchaseIds.length
@@ -248,7 +242,7 @@ export async function attachVerdicts(rows: BankRegisterRow[]): Promise<BankRegis
     const byPurchaseId = new Map(expenses.map(e => [e.qbPurchaseId, e]));
 
     return rows.map(row => {
-        const isPurchase = PURCHASE_TYPES.has(row.qbType);
+        const isPurchase = isPurchaseType(row.qbType);
         let verdict: BankRowVerdict;
         if (isPurchase && row.amountCents > 0) {
             // A POSITIVE purchase-type posting is a reversal/credit, not
@@ -279,7 +273,7 @@ export async function attachVerdicts(rows: BankRegisterRow[]): Promise<BankRegis
                     note: "No ProBuild link for this QuickBooks purchase — could be overhead, an owner draw, not job-coded, or simply not synced yet. Open it in QuickBooks to check.",
                 };
             }
-        } else if (MONEY_IN_TYPES.has(row.qbType) && row.amountCents > 0) {
+        } else if (isMoneyInType(row.qbType) && row.amountCents > 0) {
             verdict = { kind: "money-in" };
         } else if (row.qbType === "Transfer") {
             verdict = { kind: "transfer" };
