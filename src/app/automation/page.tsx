@@ -35,7 +35,7 @@ import { amountSign, formatRelativeTime, friendlyType } from "./components/forma
 import { StatCard } from "./components/shared/stat-card";
 import SyncNowButton from "./components/sync-now-button";
 import CopyIdButton from "./components/copy-id-button";
-import { DocumentationPips } from "./components/register/documentation-pips";
+import { DocumentationPips, DocumentationLegend } from "./components/register/documentation-pips";
 import { OrphanReceipts } from "./components/register/orphan-receipts";
 import { JourneySection } from "./components/register/journey-section";
 import type { SerializedJourney } from "./components/journey-list";
@@ -244,9 +244,16 @@ export default async function AutomationPage(props: {
     }
 
     const orphanCount = actionableOrphans.length;
+    // True when essentially every job-costable row hasn't been sorted into a
+    // job cost or overhead yet (e.g. classification data hasn't been
+    // populated at all). Repeating "Not categorized yet" on every one of
+    // ~141 rows is noise once it's page-wide — say it once in a banner above
+    // the table instead (DocumentationPips.suppressUnclassifiedNote hides
+    // the per-row repeat when this is true), same status, no logic change.
+    const mostRowsUncategorized = !mergeUnavailable && denominator > 0 && unknownClassification / denominator >= 0.9;
     const orphanSection: ReactNode = mergeUnavailable ? (
         <div className="hui-card p-5 text-sm text-hui-textMuted">
-            Orphan receipts unavailable right now — documentation data couldn&apos;t be loaded.
+            Can&apos;t show receipts that never reached the bank right now — that data couldn&apos;t be loaded.
         </div>
     ) : (
         <OrphanReceipts orphans={actionableOrphans} projectNames={orphanProjectNameMap} />
@@ -289,7 +296,7 @@ export default async function AutomationPage(props: {
             projectId: r.projectId,
             projectName: r.projectName,
             receiptUrl: r.receiptUrl,
-            documentation: <DocumentationPips row={r} />,
+            documentation: <DocumentationPips row={r} suppressUnclassifiedNote={mostRowsUncategorized} />,
             needsReview: r.status === "needs-review",
             drilldown: {
                 row: r,
@@ -411,28 +418,28 @@ export default async function AutomationPage(props: {
                 <StatCard label="Money out" value={formatCurrency(moneyOutCents / 100)} />
                 <StatCard
                     label="Documented"
-                    value={mergeUnavailable ? "—" : `${documented} of ${denominator} job-costable spend rows`}
+                    value={mergeUnavailable ? "—" : `${documented} of ${denominator} job purchases fully documented`}
                 />
                 <StatCard label="Needs review" value={mergeUnavailable ? "—" : String(needsReview)} />
-                <StatCard label="Orphan exceptions" value={mergeUnavailable ? "—" : String(orphanCount)} />
+                <StatCard label="Receipts stuck outside the bank" value={mergeUnavailable ? "—" : String(orphanCount)} />
             </div>
 
             {/* Secondary counts — nothing hides, plan §2 */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <StatCard
-                    label="Expected non-job spend"
+                    label="Overhead and owner draws"
                     value={mergeUnavailable ? "—" : String(expectedNonJobSpend)}
-                    sub="Overhead / owner draw — excluded from the denominator on purpose"
+                    sub="No job cost expected here on purpose"
                 />
                 <StatCard
-                    label="Receipt provenance unverified"
+                    label="Receipt not traced"
                     value={mergeUnavailable ? "—" : String(receiptProvenanceUnverified)}
-                    sub="Job cost + amount confirmed, no receipt-push audit record"
+                    sub="Job cost and amount match, but we can't find the receipt in the automation records"
                 />
                 <StatCard
-                    label="Unknown classification"
+                    label="Not categorized yet"
                     value={mergeUnavailable ? "—" : String(unknownClassification)}
-                    sub="Never auto-documented, never hidden"
+                    sub="We don't know if these are job costs or overhead"
                 />
             </div>
 
@@ -465,6 +472,16 @@ export default async function AutomationPage(props: {
                     to see it.
                 </p>
             )}
+
+            {mostRowsUncategorized && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    Most of these purchases haven&apos;t been sorted into a job cost or overhead yet, so most rows below
+                    will say &quot;Not categorized yet.&quot; That&apos;s expected until that gets set up — it doesn&apos;t
+                    mean anything is wrong with these entries.
+                </p>
+            )}
+
+            <DocumentationLegend />
 
             {/* Register table */}
             <div className="hui-card overflow-hidden">

@@ -189,7 +189,7 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
             } else {
                 const reason = data && !data.ok ? data.reason : undefined;
                 if (reason === "ambiguous-match") {
-                    toast.error("Can't tell which receipt this is — more than one shares the same id prefix. Check it manually in QuickBooks.");
+                    toast.error("Can't tell which receipt this is — more than one shares the same ID. Check it by hand in QuickBooks.");
                 } else {
                     toast.error(`Couldn't verify: ${reason || `HTTP ${res.status}`}`);
                 }
@@ -271,8 +271,8 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
             <div>
                 {matchUnconfirmed && (
                     <div className="mb-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                        Possible prefix collision — unconfirmed. Two different Drive files can share this
-                        identifier, so this may not be the receipt this row is showing.
+                        We&apos;re not certain this is the right receipt. Two different files can share this same ID, so
+                        this row may be showing a different receipt than the one we mean.
                     </div>
                 )}
 

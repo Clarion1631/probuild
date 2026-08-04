@@ -143,7 +143,7 @@ export function LastSyncSummary({ lastSync }: { lastSync: LastSync | null }) {
                         counts.skippedSample?.length
                             ? `QBO purchases: ${counts.skippedSample.map((s) => s.qbPurchaseId).join(", ")}`
                             : null,
-                        "Skipped means QuickBooks kept it but it didn't map to a ProBuild job — loans, overhead, and owner draws are supposed to be skipped.",
+                        "Skipped means QuickBooks kept it, but it wasn't matched to a ProBuild job — loans, overhead, and owner draws are supposed to be skipped.",
                     ].filter(Boolean).join(". ")}
                 >
                     Skipped: {formatSkippedBreakdown(counts.skippedByReason)}

@@ -134,7 +134,7 @@ export function useAiReview(ids: AiReviewIdentifiers) {
                 if (reason === "no-stored-copy") {
                     toast.error("Receipt copy not stored yet — AI review is available after the next sync.");
                 } else if (reason === "ambiguous-match") {
-                    toast.error("Can't tell which receipt this is — more than one shares the same id prefix. Check it manually in QuickBooks.");
+                    toast.error("Can't tell which receipt this is — more than one shares the same ID. Check it by hand in QuickBooks.");
                 } else {
                     toast.error(reason || `HTTP ${res.status}`);
                 }

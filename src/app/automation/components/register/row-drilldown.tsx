@@ -71,7 +71,7 @@ function QuickBooksBlock({ row }: { row: MergedRegisterRow }) {
                 {row.qbTxnId ? (
                     <CopyIdButton value={row.qbTxnId} label="QuickBooks ID" />
                 ) : (
-                    <span className="text-xs text-hui-textMuted italic">No QuickBooks transaction id on this row.</span>
+                    <span className="text-xs text-hui-textMuted italic">There&apos;s no QuickBooks transaction ID on this row.</span>
                 )}
             </div>
         </DrilldownSection>
@@ -84,7 +84,7 @@ function JobCostBlock({ row, expense }: { row: MergedRegisterRow; expense: RawEx
     if (row.edges.jobCost !== "pass" || !expense) {
         return (
             <DrilldownSection title="ProBuild job cost">
-                <p className="text-sm text-hui-textMuted">No matching ProBuild job-cost expense found.</p>
+                <p className="text-sm text-hui-textMuted">We couldn&apos;t find a matching expense in ProBuild for this purchase.</p>
             </DrilldownSection>
         );
     }
@@ -128,7 +128,7 @@ function JobCostBlock({ row, expense }: { row: MergedRegisterRow; expense: RawEx
                     {row.edges.amount === "pass" && <span className="text-teal-700">Matches QuickBooks exactly</span>}
                     {row.edges.amount === "indeterminate" && (
                         <span className="text-amber-700">
-                            Amount could not be parsed as an exact cent value — no delta shown.
+                            We couldn&apos;t read this amount as an exact dollar figure, so there&apos;s no difference shown.
                         </span>
                     )}
                     {row.edges.amount === "fail" && expenseCents !== null && (
@@ -158,10 +158,10 @@ function ReceiptTimelineBlock({
 
     if (!journeyMatch) {
         return (
-            <DrilldownSection title="Receipt provenance">
+            <DrilldownSection title="Receipt tracking">
                 <p className="text-sm text-hui-textMuted">
-                    No audit record for this receipt — that&apos;s not evidence it&apos;s missing, only that no
-                    receipt-push event has been matched to it.
+                    We don&apos;t have a record of this receipt in the automation yet. That doesn&apos;t mean it&apos;s
+                    missing — we just haven&apos;t matched one to this purchase.
                 </p>
             </DrilldownSection>
         );
@@ -174,11 +174,11 @@ function ReceiptTimelineBlock({
         receiptUrl ?? journey.synced?.receiptUrl ?? (journey.driveFileId ? `https://drive.google.com/file/d/${journey.driveFileId}/view` : null);
 
     return (
-        <DrilldownSection title="Receipt provenance">
+        <DrilldownSection title="Receipt tracking">
             {journeyMatch.unconfirmed && (
                 <div className="mb-3 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                    Possible prefix collision — unconfirmed. Two different Drive files can share this identifier, so
-                    this may not be the receipt behind this row.
+                    We&apos;re not certain this is the right receipt. Two different files can share this same ID, so
+                    this might be a different receipt than the one shown here.
                 </div>
             )}
             <div className="flex items-center gap-2 mb-3">

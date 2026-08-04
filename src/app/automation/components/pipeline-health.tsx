@@ -75,9 +75,9 @@ export function PipelineHealth({
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <StatCard label="Receipts booked this month" value={String(pushedThisMonth)} />
                     <StatCard
-                        label="Hands-free rate (30d)"
+                        label="Hands-free rate (last 30 days)"
                         value={handsFreeRate30d === null ? "—" : `${Math.round(handsFreeRate30d * 100)}%`}
-                        sub="Booked automatically vs. emailed as fallback"
+                        sub="Booked automatically, or emailed when that wasn't possible"
                     />
                     <StatCard label="Booked this month" value={formatCurrency(amountCentsThisMonth / 100)} />
                     <StatCard
@@ -89,7 +89,7 @@ export function PipelineHealth({
 
                 <ChartPanel
                     title="Receipts processed — last 30 days"
-                    subtitle="Booked automatically vs. email fallback vs. errors."
+                    subtitle="Booked automatically, emailed instead, or ran into an error."
                     isEmpty={chartEmpty}
                 >
                     <IntakeChart data={buckets} />

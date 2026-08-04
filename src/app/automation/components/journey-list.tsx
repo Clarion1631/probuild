@@ -80,7 +80,7 @@ function EmptyState() {
             </div>
             <h3 className="text-base font-semibold text-hui-textMain">No receipts tracked yet</h3>
             <p className="text-sm text-hui-textMuted mt-1 max-w-md">
-                The journey log starts filling as new receipts process.
+                This list fills in as new receipts come through.
             </p>
         </div>
     );
@@ -176,7 +176,7 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
                         {!journey.keyConfirmed && (
                             <span
                                 className="ml-1.5 inline-block align-middle text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700"
-                                title="Two different Drive files can share this id prefix — this receipt's identity isn't confirmed."
+                                title="Two different files can share this same ID, so this might be a different receipt than the one shown."
                             >
                                 Unconfirmed match
                             </span>

@@ -19,13 +19,13 @@ export function OrphanReceipts({
     return (
         <details className="hui-card group" open={!isEmpty}>
             <summary className="cursor-pointer list-none px-5 py-4 flex items-center justify-between text-base font-semibold text-hui-textMain select-none">
-                <span>Orphan receipts {!isEmpty && <span className="text-hui-textMuted font-normal">({orphans.length})</span>}</span>
+                <span>Receipts that never reached the bank {!isEmpty && <span className="text-hui-textMuted font-normal">({orphans.length})</span>}</span>
                 <span className="text-xs font-normal text-hui-textMuted group-open:hidden">Show</span>
                 <span className="text-xs font-normal text-hui-textMuted hidden group-open:inline">Hide</span>
             </summary>
             <div className="border-t border-hui-border overflow-hidden">
                 {isEmpty ? (
-                    <p className="text-sm text-hui-textMuted px-5 py-6">No receipts stuck outside the register right now.</p>
+                    <p className="text-sm text-hui-textMuted px-5 py-6">No receipts stuck outside the bank register right now.</p>
                 ) : (
                     <div className="overflow-x-auto">
                         <table className="w-full text-sm">
