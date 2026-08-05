@@ -268,11 +268,13 @@ export function drawWrappedText(
 export function measureWrappedLines(text: string, font: PDFFont, size: number, maxWidth: number): number {
     const src = stripUnencodable(text || "").replace(/\r\n?/g, "\n");
     if (!src.trim()) return 0;
-    let count = 0;
+    // Mirrors drawTokens exactly (a line per newline() call, +1 for the first
+    // row of each source line) so preflight height estimates match what draws.
+    const spaceW = font.widthOfTextAtSize(" ", size);
+    let lines = 0;
     for (const line of src.split("\n")) {
-        if (!line.trim()) { count += 1; continue; }
-        const spaceW = font.widthOfTextAtSize(" ", size);
-        let lineCount = 1;
+        lines += 1;
+        if (!line.trim()) continue;
         let curW = 0;
         let drewOnLine = false;
         for (const part of line.split(/(\s+)/)) {
@@ -280,20 +282,27 @@ export function measureWrappedLines(text: string, font: PDFFont, size: number, m
             if (/^\s+$/.test(part)) { if (drewOnLine) curW += spaceW; continue; }
             const wordW = font.widthOfTextAtSize(part, size);
             if (wordW <= maxWidth) {
-                if (drewOnLine && curW + wordW > maxWidth) { lineCount += 1; curW = 0; }
+                if (drewOnLine && curW + wordW > maxWidth) { lines += 1; curW = 0; }
                 curW += wordW;
                 drewOnLine = true;
             } else {
-                // Over-long word hard-breaks by characters; approximate its line usage.
-                if (drewOnLine) { lineCount += 1; curW = 0; }
-                lineCount += Math.max(1, Math.ceil(wordW / maxWidth)) - 1;
-                curW = wordW % maxWidth;
+                // Over-long word: same character-greedy hard-break as drawTokens.
+                if (drewOnLine) { lines += 1; curW = 0; }
+                let chunk = "";
+                for (const ch of part) {
+                    if (chunk && font.widthOfTextAtSize(chunk + ch, size) > maxWidth) {
+                        lines += 1;
+                        chunk = ch;
+                    } else {
+                        chunk += ch;
+                    }
+                }
+                curW = font.widthOfTextAtSize(chunk, size);
                 drewOnLine = true;
             }
         }
-        count += lineCount;
     }
-    return count;
+    return lines;
 }
 
 /**

@@ -1127,14 +1127,17 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     }
 
     if (co.pricingType === 'COST_PLUS') {
-        checkNewPage(70);
+        // Terms block (40pt) + table header (22pt) + first item row stay together.
+        checkNewPage(margin + 100);
         page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
         y -= 16;
         page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
         y -= 24;
     }
 
-    // Items table
+    // Items table — a long description above may have flowed near the page
+    // bottom; keep the column header with at least the first item row.
+    checkNewPage(margin + 60);
     const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
 
     page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
@@ -1158,7 +1161,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         const itemDesc = item.description || '';
         const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
         const descLines = itemDesc ? measureWrappedLines(itemDesc, helvetica, 8.5, coNameWidth) : 0;
-        const estHeight = nameLines * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
+        // An empty name still consumes one 13pt row (the money columns' baseline).
+        const estHeight = Math.max(1, nameLines) * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
         checkNewPage(Math.min(margin + estHeight, 500));
 
         const qtyStr = String(item.quantity || 0);

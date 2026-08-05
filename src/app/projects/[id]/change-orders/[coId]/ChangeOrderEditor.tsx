@@ -403,8 +403,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                         disabled={isScopeLocked}
                                                         onChange={e => updateItem(index, "description", e.target.value)}
                                                         placeholder="Detailed description (shown to the client)"
-                                                        rows={Math.min(12, Math.max(1, ((item.description || "").match(/
-/g)?.length ?? 0) + 1, Math.ceil((item.description || "").length / 90)))}
+                                                        rows={Math.min(12, Math.max(1, ((item.description || "").match(/\n/g)?.length ?? 0) + 1, Math.ceil((item.description || "").length / 90)))}
                                                         className="w-full mt-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-xs text-slate-500 leading-relaxed resize-y placeholder:text-slate-300"
                                                     />
                                                 )}
