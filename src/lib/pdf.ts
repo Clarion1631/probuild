@@ -1126,9 +1126,23 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         y -= 7;
     }
 
+    // Full name and description render wrapped (no truncation — the client must
+    // see the entire scope text). Items are pre-measured so short items never
+    // split across a page break; very long ones flow and paginate on their own.
+    // An empty name still consumes one 13pt row (the money columns' baseline).
+    const coNameWidth = contentWidth * 0.5;
+    const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
+        const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
+        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coNameWidth) : 0;
+        return Math.max(1, nameLines) * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
+    };
+    // Reserve through the first item so neither the cost-plus terms block nor
+    // the table header is left orphaned when the first row's preflight breaks.
+    const coFirstItemH = co.items.length ? coItemEstHeight(co.items[0]) : 30;
+
     if (co.pricingType === 'COST_PLUS') {
-        // Terms block (40pt) + table header (22pt) + first item row stay together.
-        checkNewPage(margin + 100);
+        // Terms block (40pt) + table header (22pt) + first item stay together.
+        checkNewPage(Math.min(margin + 62 + coFirstItemH, 500));
         page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
         y -= 16;
         page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
@@ -1136,8 +1150,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     }
 
     // Items table — a long description above may have flowed near the page
-    // bottom; keep the column header with at least the first item row.
-    checkNewPage(margin + 60);
+    // bottom; keep the column header (22pt) with the complete first item.
+    checkNewPage(Math.min(margin + 22 + coFirstItemH, 500));
     const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
 
     page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
@@ -1152,18 +1166,11 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 14;
 
-    const coNameWidth = contentWidth * 0.5;
     for (const item of co.items) {
-        // Full name and description render wrapped (no truncation — the client
-        // must see the entire scope text). Pre-measure so short items never split
-        // across a page break; very long ones flow and paginate on their own.
         const itemName = item.name || '';
         const itemDesc = item.description || '';
         const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
-        const descLines = itemDesc ? measureWrappedLines(itemDesc, helvetica, 8.5, coNameWidth) : 0;
-        // An empty name still consumes one 13pt row (the money columns' baseline).
-        const estHeight = Math.max(1, nameLines) * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
-        checkNewPage(Math.min(margin + estHeight, 500));
+        checkNewPage(Math.min(margin + coItemEstHeight(item), 500));
 
         const qtyStr = String(item.quantity || 0);
         const qtyStrW = helvetica.widthOfTextAtSize(qtyStr, 10);
