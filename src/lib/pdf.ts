@@ -5,7 +5,7 @@ import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
 import { coTaxRate, coTaxLabel } from './co-tax';
-import { drawRichHtml, type RichTextCtx } from './pdf-richtext';
+import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 
 /** pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so a failed PNG embed
  *  falls through to a JPG attempt (no content-type header is available once bytes come
@@ -1067,6 +1067,20 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
     }
 
+    // Flow wrapped multi-line text (descriptions can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const coFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: coFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
+    }
+
     // --- Letterhead ---
     const coLhConfig = buildLetterheadConfig(company);
     y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
@@ -1108,19 +1122,36 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     if (co.description) {
         page.drawText('Description:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        page.drawText(co.description, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
-        y -= 20;
+        flowText(co.description, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
+        y -= 7;
     }
 
+    // Full name and description render wrapped (no truncation — the client must
+    // see the entire scope text). Items are pre-measured so short items never
+    // split across a page break; very long ones flow and paginate on their own.
+    // An empty name still consumes one 13pt row (the money columns' baseline).
+    const coNameWidth = contentWidth * 0.5;
+    const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
+        const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
+        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coNameWidth) : 0;
+        return Math.max(1, nameLines) * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
+    };
+    // Reserve through the first item so neither the cost-plus terms block nor
+    // the table header is left orphaned when the first row's preflight breaks.
+    const coFirstItemH = co.items.length ? coItemEstHeight(co.items[0]) : 30;
+
     if (co.pricingType === 'COST_PLUS') {
-        checkNewPage(70);
+        // Terms block (40pt) + table header (22pt) + first item stay together.
+        checkNewPage(Math.min(margin + 62 + coFirstItemH, 500));
         page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
         y -= 16;
         page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
         y -= 24;
     }
 
-    // Items table
+    // Items table — a long description above may have flowed near the page
+    // bottom; keep the column header (22pt) with the complete first item.
+    checkNewPage(Math.min(margin + 22 + coFirstItemH, 500));
     const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
 
     page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
@@ -1136,13 +1167,10 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     y -= 14;
 
     for (const item of co.items) {
-        checkNewPage(60);
-
-        let displayName = item.name || '';
-        const maxNameWidth = contentWidth * 0.5;
-        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) displayName = displayName.slice(0, -1);
-
-        page.drawText(displayName, { x: coCols.name, y, size: 10, font: helvetica, color: colors.textMain });
+        const itemName = item.name || '';
+        const itemDesc = item.description || '';
+        const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
+        checkNewPage(Math.min(margin + coItemEstHeight(item), 500));
 
         const qtyStr = String(item.quantity || 0);
         const qtyStrW = helvetica.widthOfTextAtSize(qtyStr, 10);
@@ -1156,7 +1184,13 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         const itemTotalW = helveticaBold.widthOfTextAtSize(itemTotalStr, 10);
         page.drawText(itemTotalStr, { x: coCols.total - itemTotalW, y, size: 10, font: helveticaBold, color: colors.textMain });
 
-        y -= 20;
+        if (nameLines > 0) flowText(itemName, { x: coCols.name, maxWidth: coNameWidth, size: 10, color: colors.textMain, lineHeight: 13 });
+        else y -= 13;
+        if (itemDesc) {
+            y -= 2;
+            flowText(itemDesc, { x: coCols.name, maxWidth: coNameWidth, size: 8.5, color: colors.textMuted, lineHeight: 11 });
+        }
+        y -= 7;
     }
 
     // Total
