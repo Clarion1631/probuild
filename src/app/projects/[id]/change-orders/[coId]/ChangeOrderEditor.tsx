@@ -388,7 +388,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     {items.map((item, index) => {
                                         const itemTotal = coLineCents(parseFloat(item.quantity) || 0, parseFloat(item.unitCost) || 0) / 100;
                                         return (
-                                            <div key={item.id} className="flex items-center px-8 py-3 bg-white group hover:bg-slate-50 transition border-transparent border-l-2">
+                                            <div key={item.id} className="flex items-start px-8 py-3 bg-white group hover:bg-slate-50 transition border-transparent border-l-2">
                                                 <div className="flex-1">
                                                     <input
                                                         type="text"
@@ -397,6 +397,17 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                                         onChange={e => updateItem(index, "name", e.target.value)}
                                                         className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-sm font-medium text-hui-textMain"
                                                     />
+                                                {(!isScopeLocked || item.description) && (
+                                                    <textarea
+                                                        value={item.description || ""}
+                                                        disabled={isScopeLocked}
+                                                        onChange={e => updateItem(index, "description", e.target.value)}
+                                                        placeholder="Detailed description (shown to the client)"
+                                                        rows={Math.min(12, Math.max(1, ((item.description || "").match(/
+/g)?.length ?? 0) + 1, Math.ceil((item.description || "").length / 90)))}
+                                                        className="w-full mt-1 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 -ml-2 transition text-xs text-slate-500 leading-relaxed resize-y placeholder:text-slate-300"
+                                                    />
+                                                )}
                                                 </div>
                                                 <div className="w-24 px-4 pt-1 text-right">
                                                     <input

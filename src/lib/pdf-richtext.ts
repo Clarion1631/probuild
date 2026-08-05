@@ -237,6 +237,66 @@ function drawTokens(
 }
 
 /**
+ * Flow PLAIN text (not HTML) onto the pdf-lib context with word wrapping and
+ * pagination, preserving typed line breaks. Used for fields users enter as
+ * free text (e.g. change-order descriptions) where "<" or "&" must render
+ * literally rather than being parsed as markup. Mutates ctx.page/ctx.y.
+ */
+export function drawWrappedText(
+    text: string,
+    ctx: RichTextCtx,
+    opts: { x: number; maxWidth: number; size: number; color: RGB; lineHeight: number },
+): { page: PDFPage; y: number } {
+    const src = stripUnencodable(text || "").replace(/\r\n?/g, "\n");
+    if (!src.trim()) return { page: ctx.page, y: ctx.y };
+
+    const tokens: Token[] = [];
+    const lines = src.split("\n");
+    lines.forEach((line, i) => {
+        if (i > 0) tokens.push({ type: "br" });
+        if (line) tokens.push({ type: "run", run: { text: line, bold: false, italic: false } });
+    });
+
+    drawTokens(ctx, tokens, opts);
+    return { page: ctx.page, y: ctx.y };
+}
+
+/**
+ * Number of wrapped lines drawWrappedText would emit for the given text/width —
+ * lets callers estimate block height for page-break decisions without drawing.
+ */
+export function measureWrappedLines(text: string, font: PDFFont, size: number, maxWidth: number): number {
+    const src = stripUnencodable(text || "").replace(/\r\n?/g, "\n");
+    if (!src.trim()) return 0;
+    let count = 0;
+    for (const line of src.split("\n")) {
+        if (!line.trim()) { count += 1; continue; }
+        const spaceW = font.widthOfTextAtSize(" ", size);
+        let lineCount = 1;
+        let curW = 0;
+        let drewOnLine = false;
+        for (const part of line.split(/(\s+)/)) {
+            if (part === "") continue;
+            if (/^\s+$/.test(part)) { if (drewOnLine) curW += spaceW; continue; }
+            const wordW = font.widthOfTextAtSize(part, size);
+            if (wordW <= maxWidth) {
+                if (drewOnLine && curW + wordW > maxWidth) { lineCount += 1; curW = 0; }
+                curW += wordW;
+                drewOnLine = true;
+            } else {
+                // Over-long word hard-breaks by characters; approximate its line usage.
+                if (drewOnLine) { lineCount += 1; curW = 0; }
+                lineCount += Math.max(1, Math.ceil(wordW / maxWidth)) - 1;
+                curW = wordW % maxWidth;
+                drewOnLine = true;
+            }
+        }
+        count += lineCount;
+    }
+    return count;
+}
+
+/**
  * Render a sanitized HTML fragment onto the pdf-lib context, mutating ctx.page/ctx.y
  * as it flows and paginates. Returns the final { page, y } so the caller can continue.
  */
