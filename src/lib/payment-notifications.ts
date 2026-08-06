@@ -63,7 +63,9 @@ function receiptBodyHtml(opts: {
  * receipt (deduped via receiptSentAt), and the project activity-feed entry.
  * Called by every settle path — QuickBooks sync, manual invoice recording,
  * estimate-side recording via its mirrored invoice copy, and the Stripe
- * webhook (which enqueues via the payment outbox and delivers through here).
+ * webhook's invoice branch (which enqueues via the payment outbox and
+ * delivers through here; estimate Stripe events route to
+ * notifyEstimateMilestonePaid instead).
  *
  * Fetches fresh state by id (call AFTER the settle transaction commits, so
  * balanceDue is already recalculated). Never throws.
