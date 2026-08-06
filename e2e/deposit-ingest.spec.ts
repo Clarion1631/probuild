@@ -233,13 +233,23 @@ const F = {
     fileId: "di-e2e-file-nonqbo",
   },
   validation: { fileId: "di-e2e-file-validation" },
+  // Case 12: crash recovery across the NON-QBO money boundary (settleStartedAt) —
+  // one invoice, two Pending milestones with distinct amounts so each sub-case
+  // resumes against its own reservation.
+  settleCrash: {
+    project: "di-e2e-scrash-project", projectName: "Nnexo SettleCrash Project",
+    invoice: "di-e2e-scrash-invoice", invoiceCode: "INV-DI-SCRASH",
+    scheduleSettled: "di-e2e-scrash-sched-a", amountSettled: 700,
+    scheduleUnsettled: "di-e2e-scrash-sched-b", amountUnsettled: 710,
+    fileIdSettled: "di-e2e-file-scrash-settled", fileIdUnsettled: "di-e2e-file-scrash-unsettled",
+  },
 };
 
 const ALL_PROJECT_IDS = [
   F.qbo.project, F.concurrent.project, F.reserve.project, F.resume.project,
   F.cronSame.project, F.cronDiff.project, F.refuseTied.projectA, F.refuseTied.projectB,
   F.refuseZeroAmt.project, F.refuseTwoAmt.project, F.refusePayer.project,
-  F.forceCorrect.project, F.nonQbo.project,
+  F.forceCorrect.project, F.nonQbo.project, F.settleCrash.project,
 ];
 
 const ALL_FILE_IDS = [
@@ -247,6 +257,7 @@ const ALL_FILE_IDS = [
   F.cronSame.fileId, F.cronDiff.fileId, F.refuseUnresolvable.fileId, F.refuseTied.fileId,
   F.refuseZeroAmt.fileId, F.refuseTwoAmt.fileId, F.refuseNoCheckNumber.fileId, F.refuseNoCheckDate.fileId,
   F.refusePayer.fileId, F.forceCorrect.fileId, F.forceCrossedQbo.fileId, F.nonQbo.fileId, F.validation.fileId,
+  F.settleCrash.fileIdSettled, F.settleCrash.fileIdUnsettled,
 ];
 
 test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
@@ -327,12 +338,20 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
       invoiceId: F.nonQbo.invoice, invoiceCode: F.nonQbo.invoiceCode,
       schedules: [{ id: F.nonQbo.schedule, name: "NonQBO Deposit", amount: F.nonQbo.amount }],
     });
+    await seedFixture({
+      projectId: F.settleCrash.project, projectName: F.settleCrash.projectName,
+      invoiceId: F.settleCrash.invoice, invoiceCode: F.settleCrash.invoiceCode,
+      schedules: [
+        { id: F.settleCrash.scheduleSettled, name: "SettleCrash Committed", amount: F.settleCrash.amountSettled },
+        { id: F.settleCrash.scheduleUnsettled, name: "SettleCrash Uncommitted", amount: F.settleCrash.amountUnsettled },
+      ],
+    });
   });
 
   test.afterAll(async () => {
     try {
       await prisma.paymentNotification.deleteMany({
-        where: { scheduleId: { in: [F.qbo.schedule, F.concurrent.schedule, F.reserve.schedule, F.resume.schedule, F.nonQbo.schedule, F.forceCorrect.schedule] } },
+        where: { scheduleId: { in: [F.qbo.schedule, F.concurrent.schedule, F.reserve.schedule, F.resume.schedule, F.nonQbo.schedule, F.forceCorrect.schedule, F.settleCrash.scheduleSettled, F.settleCrash.scheduleUnsettled] } },
       });
       await prisma.activityLog.deleteMany({ where: { projectId: { in: ALL_PROJECT_IDS } } });
       for (const fileId of ALL_FILE_IDS) {
@@ -712,6 +731,74 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     const mockState = await getQboMockState(request);
     expect(mockState.calls.readInvoice, "non-QBO path never touches the QuickBooks mock").toBe(0);
     expect(mockState.calls.paymentCreate).toBe(0);
+  });
+
+  // ── 12: Non-QBO money-boundary crash recovery (settleStartedAt) ──────────────
+  test("12a: settle committed, crash before applied-write — stale reclaim resumes the reserved row and finalizes applied without re-settling", async ({ request }) => {
+    await resetQboMock(request);
+    const extracted = {
+      fileId: F.settleCrash.fileIdSettled, fileUrl: null, fileName: null, projectName: F.settleCrash.projectName,
+      payerName: null, amount: F.settleCrash.amountSettled, checkDate: "2026-07-25", checkNumber: "7001", memo: null,
+    };
+    // Simulate: recordPaymentCore committed (milestone Paid with our method/ref/date),
+    // then the process died before the row's applied-write. Boundary marker set,
+    // reservation held, lease stale.
+    await prisma.paymentSchedule.update({
+      where: { id: F.settleCrash.scheduleSettled },
+      data: { status: "Paid", paymentMethod: "check", referenceNumber: "7001", paymentDate: new Date("2026-07-25T00:00:00Z"), paidAt: new Date() },
+    });
+    await prisma.depositIngest.create({
+      data: {
+        fileId: F.settleCrash.fileIdSettled, status: "processing", extracted: JSON.stringify(extracted),
+        paymentScheduleId: F.settleCrash.scheduleSettled, settleStartedAt: new Date(Date.now() - 6 * 60_000),
+        attempts: 1, processingStartedAt: new Date(Date.now() - 6 * 60_000),
+      },
+    });
+
+    const res = await postDeposit(request, {
+      fileId: F.settleCrash.fileIdSettled, projectName: F.settleCrash.projectName,
+      amount: F.settleCrash.amountSettled, checkDate: "2026-07-25", checkNumber: "7001",
+    });
+    expect(res.res.status()).toBe(200);
+    expect(res.body.status).toBe("applied");
+
+    const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: F.settleCrash.fileIdSettled } });
+    expect(row.status).toBe("applied");
+    expect(row.paymentScheduleId, "reservation survives the reclaim (boundary marker)").toBe(F.settleCrash.scheduleSettled);
+    const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.settleCrash.scheduleSettled } });
+    expect(schedule.referenceNumber, "the committed settle is untouched").toBe("7001");
+    const tasks = await officeTasksMentioning(F.settleCrash.fileIdSettled);
+    expect(tasks, "recovered-as-ours is not a review case").toHaveLength(0);
+  });
+
+  test("12b: marker set but settle never committed — reclaim keeps the reservation and settles using the PRESERVED extracted payload, not the divergent re-POST", async ({ request }) => {
+    const extracted = {
+      fileId: F.settleCrash.fileIdUnsettled, fileUrl: null, fileName: null, projectName: F.settleCrash.projectName,
+      payerName: null, amount: F.settleCrash.amountUnsettled, checkDate: "2026-07-26", checkNumber: "7002", memo: null,
+    };
+    await prisma.depositIngest.create({
+      data: {
+        fileId: F.settleCrash.fileIdUnsettled, status: "processing", extracted: JSON.stringify(extracted),
+        paymentScheduleId: F.settleCrash.scheduleUnsettled, settleStartedAt: new Date(Date.now() - 6 * 60_000),
+        attempts: 1, processingStartedAt: new Date(Date.now() - 6 * 60_000),
+      },
+    });
+
+    // The bot re-sends with a DIVERGENT re-extraction (different check number/date):
+    // the reserved-row resume must settle with the ORIGINAL stored payload.
+    const res = await postDeposit(request, {
+      fileId: F.settleCrash.fileIdUnsettled, projectName: F.settleCrash.projectName,
+      amount: F.settleCrash.amountUnsettled, checkDate: "2026-07-27", checkNumber: "9999",
+    });
+    expect(res.res.status()).toBe(200);
+    expect(res.body.status).toBe("applied");
+
+    const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.settleCrash.scheduleUnsettled } });
+    expect(schedule.status).toBe("Paid");
+    expect(schedule.referenceNumber, "settled with the preserved original check number").toBe("7002");
+    expect(schedule.paymentDate?.toISOString().slice(0, 10)).toBe("2026-07-26");
+    const row = await prisma.depositIngest.findUniqueOrThrow({ where: { fileId: F.settleCrash.fileIdUnsettled } });
+    expect(row.status).toBe("applied");
   });
 
   // ── 10: Auth ─────────────────────────────────────────────────────────────────
