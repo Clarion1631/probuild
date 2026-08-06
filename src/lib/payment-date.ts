@@ -15,13 +15,14 @@ function dayNumber(y: number, m: number, d: number): number {
 }
 
 // "Today" as the business's calendar day (America/Los_Angeles), regardless of
-// where the server or browser runs. en-CA formats as YYYY-MM-DD.
+// where the server or browser runs. formatToParts avoids any locale-dependent
+// assembled-string format assumptions.
 function todayDayNumber(now: Date): number {
-    const ymd = new Intl.DateTimeFormat("en-CA", {
+    const parts = new Intl.DateTimeFormat("en-CA", {
         timeZone: BUSINESS_TZ, year: "numeric", month: "2-digit", day: "2-digit",
-    }).format(now);
-    const [y, m, d] = ymd.split("-").map(Number);
-    return dayNumber(y, m, d);
+    }).formatToParts(now);
+    const get = (type: string) => Number(parts.find((p) => p.type === type)?.value);
+    return dayNumber(get("year"), get("month"), get("day"));
 }
 
 /**

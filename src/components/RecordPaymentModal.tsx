@@ -119,7 +119,7 @@ export default function RecordPaymentModal({
                         />
                         {isBackdatedPayment(paymentDate) && (
                             <p className="mt-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
-                                Back-dated payment — the client won&apos;t be emailed a receipt automatically. Use Send Receipt on the invoice if you want one.
+                                Back-dated payment — the client won&apos;t be emailed a receipt automatically. Use the Send Receipt button if you want one.
                             </p>
                         )}
                     </div>
