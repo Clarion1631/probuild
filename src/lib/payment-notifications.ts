@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
+import { isBackdatedPayment } from "@/lib/payment-date";
 
 function isToggleOn(settings: { notificationToggles?: string | null } | null, key: string): boolean {
     if (!settings?.notificationToggles) return true;
@@ -191,7 +192,11 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         // 3. Client receipt (once per milestone — receiptSentAt is the guard).
         //    Stamp receiptSentAt ONLY when the send actually succeeded, so a failed
         //    send stays retryable by the outbox drainer instead of being marked sent.
-        if (s.invoice.client?.email && !s.receiptSentAt) {
+        //    Back-dated payments (recorded days after the money actually arrived) skip
+        //    the auto-receipt — a stale "Payment Confirmed" email blindsides the client.
+        //    receiptSentAt stays null so staff can still send one via the Send Receipt
+        //    button when they want to.
+        if (s.invoice.client?.email && !s.receiptSentAt && !isBackdatedPayment(s.paymentDate)) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
             const receiptSend = await sendNotification(
                 s.invoice.client.email,
@@ -239,7 +244,7 @@ export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { d
         const s = await prisma.estimatePaymentSchedule.findUnique({
             where: { id: scheduleId },
             select: {
-                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true, receiptSentAt: true,
+                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true, receiptSentAt: true, paymentDate: true,
                 estimate: {
                     select: {
                         id: true, code: true, title: true, projectId: true, leadId: true, balanceDue: true,
@@ -305,10 +310,12 @@ export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { d
             if (adminSend && !adminSend.success) ok = false;
         }
 
-        // 3. Client receipt (once per milestone — receiptSentAt guard, stamped only on success)
+        // 3. Client receipt (once per milestone — receiptSentAt guard, stamped only on success).
+        //    Back-dated payments skip the auto-receipt (see notifyMilestonePaid); receiptSentAt
+        //    stays null so a manual Send Receipt is still possible.
         const clientEmail = est.project?.client?.email || est.lead?.client?.email || null;
         const clientName = est.project?.client?.name || est.lead?.client?.name || est.lead?.name || "";
-        if (clientEmail && !s.receiptSentAt) {
+        if (clientEmail && !s.receiptSentAt && !isBackdatedPayment(s.paymentDate)) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/estimates/${est.id}`;
             const receiptSend = await sendNotification(
                 clientEmail,
