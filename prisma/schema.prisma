@@ -621,6 +621,44 @@ model PaymentSchedule {
   @@index([scheduleTaskId])
 }
 
+// Deposit auto-apply pipeline (Phase B1): one row per Drive file the GTR
+// receipt bot classifies as a `customer_payment` (an incoming check/deposit
+// photo). Backs the crash-safe idempotency + state machine owned by
+// POST /api/payments/deposit-ingest — see that route for the full state
+// machine (processing/qbo_unknown/qbo_created/applied/unmatched/failed/reconcile).
+//
+// NOTE: a partial unique index reserves paymentScheduleId while a deposit is
+// in flight, so two different files can never both claim the same pending
+// milestone. Prisma cannot express a partial index — it is created ONLY by
+// scripts/apply-deposit-ingest-schema.mjs:
+//   CREATE UNIQUE INDEX ... ON "DepositIngest" ("paymentScheduleId")
+//     WHERE "status" IN ('processing','qbo_unknown','qbo_created','applied','reconcile')
+//     AND "paymentScheduleId" IS NOT NULL
+model DepositIngest {
+  id     String @id @default(cuid())
+  fileId String @unique // Drive file id — stable idempotency key across the bot's archive move
+
+  status    String // processing | qbo_unknown | qbo_created | applied | unmatched | failed | reconcile
+  extracted String // JSON snapshot of the inbound payload — carried into the OfficeTask + audit trail
+
+  // Reserved milestone (see the partial unique index note above). NULLed on
+  // pre-QBO-boundary retry exhaustion so the reservation frees the milestone.
+  paymentScheduleId String?
+  qbPaymentId       String? // set once the QuickBooks Payment is created
+  qbRequestPayload  String? // exact JSON body sent to QBO POST /payment — replayed byte-identical on qbo_unknown recovery
+  officeTaskId      String? // set once, on the first unmatched/reconcile — re-POSTs never create a second task
+
+  attempts            Int       @default(0)
+  lastError           String?
+  processingStartedAt DateTime? // claim lease — stale after 5 min, like the notification outbox
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([paymentScheduleId])
+}
+
 // Progress billing: the billable artifact the user builds by picking
 // milestones and/or a custom amount, writing one client-facing description,
 // and staging exactly ONE QuickBooks invoice. An approved change order is

@@ -430,6 +430,85 @@ export async function createQBPaymentForInvoice(tokens: QBTokens, qbInvoiceId: s
     return { paymentId: String(p.Id), amount: Number(p.TotalAmt ?? inv.balance) };
 }
 
+export type QBPaymentBuildFailure =
+    | { ok: false; reason: "invoice-not-found" }
+    | { ok: false; reason: "missing-customer" }
+    | { ok: false; reason: "balance-mismatch"; qbBalance: number; expected: number };
+
+/**
+ * Build (but do not send) the exact JSON body for a Payment create against a
+ * specific amount/date/check-ref — split out from the deposit-ingest send
+ * step so a caller can PERSIST the body before the network call fires (the
+ * deposit-ingest endpoint's `qbo_unknown` recovery depends on the row already
+ * holding the exact bytes it's about to send, in case the process dies
+ * mid-request or the response is lost). Guards the QBO invoice's open balance
+ * against `opts.amount` to the cent — a deposit must exactly retire the
+ * milestone it matched, never partially settle it.
+ */
+export async function buildQBPaymentRequest(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    opts: { amount: number; txnDate: string; paymentRefNum: string },
+): Promise<{ ok: true; requestBody: string } | QBPaymentBuildFailure> {
+    const inv = await readQBInvoice(tokens, qbInvoiceId);
+    if (!inv) return { ok: false, reason: "invoice-not-found" };
+    if (!inv.customerId) return { ok: false, reason: "missing-customer" };
+    if (Math.round(inv.balance * 100) !== Math.round(opts.amount * 100)) {
+        return { ok: false, reason: "balance-mismatch", qbBalance: inv.balance, expected: opts.amount };
+    }
+    const payload = {
+        TotalAmt: opts.amount,
+        TxnDate: opts.txnDate,
+        PaymentRefNum: opts.paymentRefNum,
+        CustomerRef: { value: inv.customerId },
+        Line: [{ Amount: opts.amount, LinkedTxn: [{ TxnId: qbInvoiceId, TxnType: "Invoice" }] }],
+    };
+    return { ok: true, requestBody: JSON.stringify(payload) };
+}
+
+/**
+ * Send a Payment create request whose body was already built (by
+ * `buildQBPaymentRequest`) and possibly already persisted. The SAME function
+ * is the replay path: calling it again with the identical `requestBody` +
+ * `requestId` after a lost response returns Intuit's ORIGINAL response
+ * instead of creating a duplicate Payment (`requestid` is QBO's server-side
+ * idempotency key on the create) — see qbo-receipt-push.ts's requestid
+ * pattern, `?requestid=...` as a query param.
+ */
+export async function sendQBPaymentCreateRequest(
+    tokens: QBTokens,
+    requestBody: string,
+    requestId: string,
+): Promise<{ paymentId: string; amount: number }> {
+    const res = await qbFetch(`/payment?requestid=${encodeURIComponent(requestId)}`, tokens, {
+        method: "POST",
+        body: requestBody,
+    });
+    if (!res.ok) throw new Error(`QB payment create failed: ${await res.text()}`);
+    const data = await res.json().catch(() => null);
+    const p = data?.Payment;
+    if (!p?.Id) throw new Error("QB payment create returned no Payment body");
+    return { paymentId: String(p.Id), amount: Number(p.TotalAmt ?? 0) };
+}
+
+/**
+ * Convenience wrapper for callers that don't need the persist-before-send
+ * seam: build + guard + send in one call. The deposit-ingest endpoint does
+ * NOT use this directly — it calls `buildQBPaymentRequest` and
+ * `sendQBPaymentCreateRequest` separately so it can commit the request body
+ * to the DepositIngest row between the two steps.
+ */
+export async function createQBPaymentForInvoiceWithDetails(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    opts: { amount: number; txnDate: string; paymentRefNum: string; requestId: string },
+): Promise<{ ok: true; paymentId: string; amount: number; requestBody: string } | QBPaymentBuildFailure> {
+    const built = await buildQBPaymentRequest(tokens, qbInvoiceId, opts);
+    if (!built.ok) return built;
+    const sent = await sendQBPaymentCreateRequest(tokens, built.requestBody, opts.requestId);
+    return { ok: true, paymentId: sent.paymentId, amount: sent.amount, requestBody: built.requestBody };
+}
+
 /** Hard-delete a payment (test cleanup). */
 export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Promise<boolean> {
     const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
