@@ -117,7 +117,11 @@ export default function TimeClockPage() {
         userPickedBucket.current = false;
         setSuggestion(null);
 
-        fetch(`/api/projects/${selectedProject}/estimate-items`)
+        // Abort both per-project fetches on project switch — a slow response
+        // for the previous project must not overwrite the current one's state.
+        const controller = new AbortController();
+
+        fetch(`/api/projects/${selectedProject}/estimate-items`, { signal: controller.signal })
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
@@ -125,13 +129,14 @@ export default function TimeClockPage() {
                 }
             })
             .catch(e => {
+                if (e.name === "AbortError") return;
                 console.error("Could not fetch estimate items", e);
                 setBucketsError("Failed to load budget phases");
             });
 
         // Suggested task for today (from the latest daily log / schedule).
         // Best-effort: a failure here must never block clocking in.
-        fetch(`/api/mobile/time-suggestion?projectId=${selectedProject}`)
+        fetch(`/api/mobile/time-suggestion?projectId=${selectedProject}`, { signal: controller.signal })
             .then(res => res.ok ? res.json() : { suggestion: null })
             .then(data => {
                 const s: ClockInSuggestion | null = data?.suggestion ?? null;
@@ -140,8 +145,9 @@ export default function TimeClockPage() {
                     setSelectedBucket(s.clockInEstimateItemId);
                 }
             })
-            .catch(() => setSuggestion(null));
+            .catch(() => { /* aborted or failed — no suggestion */ });
 
+        return () => controller.abort();
     }, [selectedProject]);
 
     // Phase-code-grouped picker: groups ordered by cost code; codeless items

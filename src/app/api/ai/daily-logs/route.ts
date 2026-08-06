@@ -91,7 +91,9 @@ Respond ONLY with valid JSON matching the schema provided.`;
         }
 
         const response = await ai.models.generateContent({
-            model: "gemini-3.0-flash-preview",
+            // "gemini-3.0-flash-preview" was never a real model id (ListModels
+            // verified 2026-08-06) — every call 404'd silently as a 500 here.
+            model: "gemini-3.5-flash",
             contents: { parts },
             config: {
                 responseMimeType: "application/json",

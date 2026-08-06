@@ -68,6 +68,8 @@ export interface KeywordCandidate {
 export interface KeywordMatch {
     taskId: string;
     score: number;
+    /** How many DISTINCT log tokens hit the winner — confidence needs breadth, not one hot word. */
+    matchedTokens: number;
 }
 
 /**
@@ -102,12 +104,15 @@ export function keywordMatchTasks(
             ...tokenizeForMatch(candidate.costCodeCode?.replace(/[-_]/g, " ")),
         ]);
         let score = 0;
+        let matchedTokens = 0;
         for (const token of candidateTokens) {
-            score += weighted.get(token) ?? 0;
+            const weight = weighted.get(token) ?? 0;
+            score += weight;
+            if (weight > 0) matchedTokens += 1;
         }
         if (score === 0) continue;
         if (!best || score > best.score) {
-            best = { taskId: candidate.taskId, score };
+            best = { taskId: candidate.taskId, score, matchedTokens };
             tied = false;
         } else if (score === best.score) {
             tied = true;
@@ -257,9 +262,13 @@ export async function suggestTaskForClockIn(
         reason,
     });
 
-    // 1 + 2 — the latest daily log (within lookback), AI pick first, keywords second.
+    // 1 + 2 — the latest daily log (within lookback), AI pick first, keywords
+    // second. DailyLog.date is stored as UTC midnight of a date-only input, so
+    // the intended calendar day is the ISO date part — running it through a
+    // timezone conversion would shift it back a day. Future-dated logs are
+    // excluded outright: tomorrow's plan can't be evidence for today.
     const latestLog = await db.dailyLog.findFirst({
-        where: { projectId },
+        where: { projectId, date: { lte: new Date(`${todayKey}T23:59:59.999Z`) } },
         orderBy: [{ date: "desc" }, { createdAt: "desc" }],
         select: {
             date: true,
@@ -270,9 +279,9 @@ export async function suggestTaskForClockIn(
             photos: { select: { caption: true } },
         },
     });
-    const logIsFresh = latestLog
-        ? Math.abs(daysBetweenDayKeys(toCompanyDayKey(latestLog.date), todayKey)) <= DAILY_LOG_LOOKBACK_DAYS
-        : false;
+    const logDayKey = latestLog ? latestLog.date.toISOString().slice(0, 10) : null;
+    const logAge = logDayKey ? daysBetweenDayKeys(logDayKey, todayKey) : null;
+    const logIsFresh = logAge !== null && logAge >= 0 && logAge <= DAILY_LOG_LOOKBACK_DAYS;
 
     if (latestLog && logIsFresh) {
         if (latestLog.aiSuggestedTaskId) {
@@ -298,10 +307,12 @@ export async function suggestTaskForClockIn(
         if (match) {
             const task = byTaskId.get(match.taskId);
             if (task) {
+                // "High" needs breadth: two distinct tokens agreeing, not one
+                // hot word that happened to sit in nextSteps.
                 return toSuggestion(
                     task,
                     "daily_log",
-                    match.score >= 2 ? "high" : "medium",
+                    match.matchedTokens >= 2 ? "high" : "medium",
                     "Matched from the latest daily log",
                 );
             }

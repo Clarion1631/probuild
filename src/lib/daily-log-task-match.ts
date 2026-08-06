@@ -18,6 +18,28 @@ import { loadSuggestableTasks, keywordMatchTasks } from "@/lib/time-suggestion";
 const MAX_PHOTOS = 4;
 const PHOTO_FETCH_TIMEOUT_MS = 5_000;
 const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
+const AI_CALL_TIMEOUT_MS = 25_000; // after() shares the route's maxDuration budget — never let the AI call eat it all
+
+// Verified against ListModels with the production key (2026-08-06); the
+// previously used "gemini-3.0-flash-preview" does not exist and every call
+// with it 404s.
+const GEMINI_MODEL = "gemini-3.5-flash";
+
+/**
+ * Photos are fetched server-side for Gemini vision, so only URLs on our own
+ * Supabase storage are eligible — anything else is an SSRF vector. (Both photo
+ * write paths store Supabase URLs; foreign URLs simply aren't fetched.)
+ */
+function isOwnStorageUrl(value: string): boolean {
+    const base = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
+    if (!base) return false;
+    try {
+        const url = new URL(value);
+        return url.protocol === "https:" && url.hostname === new URL(base).hostname;
+    } catch {
+        return false;
+    }
+}
 
 /** Set DAILY_LOG_MATCH_AI_MOCK=1 to force the deterministic keyword path (CI). */
 function aiMocked(): boolean {
@@ -40,17 +62,40 @@ const matchResponseSchema = {
 };
 
 async function fetchPhotoInline(url: string): Promise<Part | null> {
+    if (!isOwnStorageUrl(url)) return null;
     try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), PHOTO_FETCH_TIMEOUT_MS);
-        const res = await fetch(url, { signal: controller.signal });
-        clearTimeout(timer);
-        if (!res.ok) return null;
+        const res = await fetch(url, { signal: controller.signal, redirect: "error" });
+        if (!res.ok || !res.body) {
+            clearTimeout(timer);
+            return null;
+        }
         const contentType = res.headers.get("content-type") ?? "image/jpeg";
-        if (!contentType.startsWith("image/")) return null;
-        const buf = Buffer.from(await res.arrayBuffer());
-        if (buf.byteLength === 0 || buf.byteLength > MAX_PHOTO_BYTES) return null;
-        return { inlineData: { mimeType: contentType, data: buf.toString("base64") } };
+        const declaredLength = Number(res.headers.get("content-length") ?? 0);
+        if (!contentType.startsWith("image/") || declaredLength > MAX_PHOTO_BYTES) {
+            clearTimeout(timer);
+            controller.abort();
+            return null;
+        }
+        // Stream with a hard byte cap — content-length is advisory.
+        const reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            received += value.byteLength;
+            if (received > MAX_PHOTO_BYTES) {
+                controller.abort();
+                clearTimeout(timer);
+                return null;
+            }
+            chunks.push(value);
+        }
+        clearTimeout(timer);
+        if (received === 0) return null;
+        return { inlineData: { mimeType: contentType, data: Buffer.concat(chunks).toString("base64") } };
     } catch {
         return null;
     }
@@ -68,18 +113,23 @@ export async function runDailyLogTaskMatch(dailyLogId: string): Promise<void> {
                 id: true,
                 projectId: true,
                 createdById: true,
+                updatedAt: true,
                 workPerformed: true,
                 nextSteps: true,
                 issues: true,
                 aiSuggestedTaskId: true,
-                photos: { select: { url: true, caption: true } },
+                photos: { select: { id: true, url: true, caption: true } },
             },
         });
         if (!log) return;
+        // Snapshot for the stale-store guard: two matcher runs can race (edit +
+        // photo add each schedule one); only the run that saw the CURRENT log
+        // content may store, so a slow older run never clobbers a newer result.
+        const contentStamp = `${log.updatedAt.getTime()}:${log.photos.map(photo => photo.id).sort().join(",")}`;
 
         const candidates = await loadSuggestableTasks(log.projectId, log.createdById);
         if (candidates.length === 0) {
-            await storeMatch(log.id, null, null);
+            await storeMatch(log.id, null, null, contentStamp);
             return;
         }
 
@@ -105,7 +155,7 @@ export async function runDailyLogTaskMatch(dailyLogId: string): Promise<void> {
         const apiKey = process.env.GEMINI_API_KEY;
         if (aiMocked() || !apiKey) {
             const picked = keywordFallback();
-            await storeMatch(log.id, picked?.taskId ?? null, picked?.reason ?? null);
+            await storeMatch(log.id, picked?.taskId ?? null, picked?.reason ?? null, contentStamp);
             return;
         }
 
@@ -144,41 +194,59 @@ Respond ONLY with valid JSON matching the schema.`;
         }
 
         const ai = new GoogleGenAI({ apiKey });
-        const response = await ai.models.generateContent({
-            model: "gemini-3.0-flash-preview",
-            contents: { parts },
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: matchResponseSchema as any,
-                temperature: 0.1,
-            },
-        });
+        const response = await Promise.race([
+            ai.models.generateContent({
+                model: GEMINI_MODEL,
+                contents: { parts },
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: matchResponseSchema as any,
+                    temperature: 0.1,
+                },
+            }),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error("AI call timed out")), AI_CALL_TIMEOUT_MS)),
+        ]);
         if (!response.text) throw new Error("empty AI response");
         const parsed = JSON.parse(response.text) as { taskId?: string; reason?: string };
 
         const pickedId = typeof parsed.taskId === "string" ? parsed.taskId.trim() : "";
         if (!pickedId) {
             // The model ran and declined — that's a successful no-match: clear.
-            await storeMatch(log.id, null, null);
+            await storeMatch(log.id, null, null, contentStamp);
             return;
         }
         const valid = candidates.find(task => task.taskId === pickedId);
         if (!valid) {
             // Hallucinated id — treat as no confident match rather than storing garbage.
-            await storeMatch(log.id, null, null);
+            await storeMatch(log.id, null, null, contentStamp);
             return;
         }
         const reason = typeof parsed.reason === "string" && parsed.reason.trim()
             ? parsed.reason.trim().slice(0, 500)
             : null;
-        await storeMatch(log.id, valid.taskId, reason);
+        await storeMatch(log.id, valid.taskId, reason, contentStamp);
     } catch (error) {
         // Transient failure: preserve whatever is stored.
         console.error("[daily-log-task-match] failed", { dailyLogId, error });
     }
 }
 
-async function storeMatch(dailyLogId: string, taskId: string | null, reason: string | null): Promise<void> {
+async function storeMatch(
+    dailyLogId: string,
+    taskId: string | null,
+    reason: string | null,
+    contentStamp: string,
+): Promise<void> {
+    // Stale-store guard: skip if the log changed while this run was in flight —
+    // the mutation that changed it scheduled a fresh run that owns the store.
+    const current = await prisma.dailyLog.findUnique({
+        where: { id: dailyLogId },
+        select: { updatedAt: true, photos: { select: { id: true } } },
+    });
+    if (!current) return;
+    const currentStamp = `${current.updatedAt.getTime()}:${current.photos.map(photo => photo.id).sort().join(",")}`;
+    if (currentStamp !== contentStamp) return;
     await prisma.dailyLog.update({
         where: { id: dailyLogId },
         data: { aiSuggestedTaskId: taskId, aiSuggestionReason: taskId ? reason : null },

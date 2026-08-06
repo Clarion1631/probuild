@@ -22,6 +22,8 @@ const FIELD_CREW_PIN = "246810";
 // Unique per run so reruns after a failed/aborted prior run never collide on IDs.
 const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const TSUG_TASK2_ID = `e2e-tsug-task2-${RUN}`;
+const TSUG_STALE_TASK_ID = `e2e-tsug-stale-${RUN}`;
+const TSUG_ITEM_NOCODE_ID = `e2e-tsug-nocode-${RUN}`;
 const TSUG_LOG_ID = `e2e-tsug-log-${RUN}`;
 const TSUG_PROJECT_AUTH_ID = `e2e-tsug-projauth-${RUN}`;
 const TSUG_CLIENT_AUTH_ID = `e2e-tsug-cliauth-${RUN}`;
@@ -46,6 +48,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
     let api: APIRequestContext;
     let fieldCrewToken: string;
     let fieldCrewId: string;
+    const suiteStart = new Date();
 
     test.beforeAll(async ({ playwright }) => {
         api = await playwright.request.newContext({ baseURL: BASE_URL, storageState: { cookies: [], origins: [] } });
@@ -65,12 +68,15 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             where: { id: MOBILE_DAILYLOG_ID },
             data: { aiSuggestedTaskId: null, aiSuggestionReason: null },
         }).catch(() => {});
-        await prisma.scheduleTask.update({
-            where: { id: MOBILE_TASK_DRYW_ID },
-            data: { status: "In Progress" },
+        // Entries this file POSTed but failed to delete inline (assertion threw
+        // before the inline cleanup). The fixture history entry has an endTime,
+        // so open entries created since suite start are unambiguously ours.
+        await prisma.timeEntry.deleteMany({
+            where: { userId: fieldCrewId, projectId: PROJECT_ID, endTime: null, createdAt: { gte: suiteStart } },
         }).catch(() => {});
-        await prisma.taskAssignment.deleteMany({ where: { taskId: TSUG_TASK2_ID } });
-        await prisma.scheduleTask.deleteMany({ where: { id: TSUG_TASK2_ID } });
+        await prisma.taskAssignment.deleteMany({ where: { taskId: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID] } } });
+        await prisma.scheduleTask.deleteMany({ where: { id: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID] } } });
+        await prisma.estimateItem.deleteMany({ where: { id: TSUG_ITEM_NOCODE_ID } });
         await prisma.dailyLogPhoto.deleteMany({ where: { dailyLogId: TSUG_LOG_ID } });
         await prisma.dailyLog.deleteMany({ where: { id: TSUG_LOG_ID } });
         await prisma.dailyLog.deleteMany({ where: { workPerformed: DAILYLOG_MARKER } });
@@ -112,30 +118,42 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         });
     });
 
-    test("2. stale stored pick falls through when the task is Complete", async () => {
-        // The stored pick names the ONLY suggestable task on this project. Marking
-        // it Complete removes it from loadSuggestableTasks entirely (Complete tasks
-        // are excluded outright), so the candidate set is empty and
-        // suggestTaskForClockIn short-circuits to null before the daily-log lookup
-        // (and thus before the keyword fallback) ever runs.
+    test("2. stale stored pick (Complete task) falls through to the keyword match", async () => {
+        // The stored pick names a task that has since been Completed — it is no
+        // longer suggestable, so the engine must discard it and fall through to
+        // the keyword match over the same log (which finds the drywall task).
+        // Uses a throwaway Complete task rather than flipping the shared
+        // fixture task's status, so parallel suites never see a mutated fixture.
+        await prisma.scheduleTask.create({
+            data: {
+                id: TSUG_STALE_TASK_ID,
+                projectId: PROJECT_ID,
+                name: "Old finished punch work",
+                type: "task",
+                status: "Complete",
+                startDate: daysAgo(10),
+                endDate: daysAgo(5),
+            },
+        });
         await prisma.dailyLog.update({
             where: { id: MOBILE_DAILYLOG_ID },
-            data: { aiSuggestedTaskId: MOBILE_TASK_DRYW_ID, aiSuggestionReason: "Stale pick" },
+            data: { aiSuggestedTaskId: TSUG_STALE_TASK_ID, aiSuggestionReason: "Stale pick" },
         });
-        await prisma.scheduleTask.update({ where: { id: MOBILE_TASK_DRYW_ID }, data: { status: "Complete" } });
 
         const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
             headers: { authorization: `Bearer ${fieldCrewToken}` },
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const { suggestion } = await res.json();
-        expect(suggestion).toBeNull();
+        expect(suggestion).not.toBeNull();
+        expect(suggestion.source).toBe("daily_log");
+        expect(suggestion.scheduleTaskId).toBe(MOBILE_TASK_DRYW_ID); // keyword fallback, not the stale pick
 
-        await prisma.scheduleTask.update({ where: { id: MOBILE_TASK_DRYW_ID }, data: { status: "In Progress" } });
         await prisma.dailyLog.update({
             where: { id: MOBILE_DAILYLOG_ID },
             data: { aiSuggestedTaskId: null, aiSuggestionReason: null },
         });
+        await prisma.scheduleTask.delete({ where: { id: TSUG_STALE_TASK_ID } });
     });
 
     test("3. keyword match against the latest log picks the drywall task", async () => {
@@ -230,6 +248,9 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             data: {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DRYW_ID,
+                // Deliberately WRONG client cost code — the server must charge
+                // the estimate item's code, not this.
+                costCodeId: COST_CODE_DEMO_ID,
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 suggestedCostCodeId: COST_CODE_DRYW_ID,
                 suggestionSource: "daily_log",
@@ -253,7 +274,8 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
 
     test("7. legacy POST without suggestion fields still derives the cost code", async () => {
         const res = await api.post("/api/time-entries", {
-            data: { projectId: PROJECT_ID, estimateItemId: MOBILE_ITEM_DEMO_ID },
+            // Explicit null costCodeId — exactly what the shipped mobile client sends.
+            data: { projectId: PROJECT_ID, estimateItemId: MOBILE_ITEM_DEMO_ID, costCodeId: null },
             headers: { authorization: `Bearer ${fieldCrewToken}` },
         });
         expect(res.ok(), await res.text()).toBeTruthy();
@@ -268,6 +290,35 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         expect(entry.suggestionSource).toBeNull();
 
         await prisma.timeEntry.delete({ where: { id: created.id } });
+    });
+
+    test("7b. codeless estimate item never inherits a client-sent cost code", async () => {
+        await prisma.estimateItem.create({
+            data: {
+                id: TSUG_ITEM_NOCODE_ID,
+                estimateId: "e2e-mob-estimate",
+                name: "Codeless phase",
+                parentId: null,
+                quantity: 1,
+                unitCost: 100,
+                total: 100,
+            },
+        });
+
+        const res = await api.post("/api/time-entries", {
+            data: { projectId: PROJECT_ID, estimateItemId: TSUG_ITEM_NOCODE_ID, costCodeId: COST_CODE_DEMO_ID },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(res.ok(), await res.text()).toBeTruthy();
+        const created = await res.json();
+
+        const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
+        // The item decides the charge; a codeless item means NO cost code — the
+        // client-sent one must not sneak in.
+        expect(entry.costCodeId).toBeNull();
+
+        await prisma.timeEntry.delete({ where: { id: created.id } });
+        await prisma.estimateItem.delete({ where: { id: TSUG_ITEM_NOCODE_ID } });
     });
 
     test("8. estimate item belonging to another project is rejected with 400", async () => {

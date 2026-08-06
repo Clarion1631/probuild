@@ -122,11 +122,24 @@ export async function postDailyLogSummary(dailyLogId: string): Promise<boolean> 
                 where: { id: log.aiSuggestedTaskId },
                 select: {
                     name: true,
-                    estimateItem: { select: { costCode: { select: { code: true, name: true } } } },
+                    // A leaf's item may be codeless with the code on its parent
+                    // bucket (the thing actually charged) — walk up for display.
+                    estimateItem: {
+                        select: {
+                            costCode: { select: { code: true, name: true } },
+                            parent: {
+                                select: {
+                                    costCode: { select: { code: true, name: true } },
+                                    parent: { select: { costCode: { select: { code: true, name: true } } } },
+                                },
+                            },
+                        },
+                    },
                 },
             });
             if (task) {
-                const costCode = task.estimateItem?.costCode;
+                const item = task.estimateItem;
+                const costCode = item?.costCode ?? item?.parent?.costCode ?? item?.parent?.parent?.costCode ?? null;
                 suggestedTask = {
                     taskName: task.name,
                     costCodeLabel: costCode ? `${costCode.code} — ${costCode.name}` : "",

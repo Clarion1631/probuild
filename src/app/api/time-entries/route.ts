@@ -26,7 +26,15 @@ export async function GET(req: Request) {
         where: whereClause,
         include: {
             user: true,
-            project: true,
+            // Explicit select — a full Project row would serialize
+            // chatWebhookUrl (a credential) to field crew.
+            project: {
+                select: {
+                    id: true, name: true, status: true, location: true,
+                    locationLat: true, locationLng: true, geofenceRadiusMeters: true,
+                    color: true, code: true, clientId: true,
+                },
+            },
             costCode: true
         },
         orderBy: {
@@ -61,7 +69,7 @@ export async function POST(req: Request) {
     // wins over whatever the client sent. Mobile historically sent
     // costCodeId: null, which is exactly how wrong/missing cost codes happened.
     let resolvedEstimateItemId: string | null = null;
-    let resolvedCostCodeId: string | null = costCodeId || null;
+    let resolvedCostCodeId: string | null = null;
     if (estimateItemId) {
         const item = await prisma.estimateItem.findFirst({
             where: {
@@ -78,7 +86,14 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: "Estimate item does not belong to an eligible estimate on this project" }, { status: 400 });
         }
         resolvedEstimateItemId = item.id;
-        if (item.costCodeId) resolvedCostCodeId = item.costCodeId;
+        // The item alone decides the charge — a client-sent costCodeId must not
+        // fill in for a codeless item, or crew can charge any code they like.
+        resolvedCostCodeId = item.costCodeId ?? null;
+    } else if (costCodeId && typeof costCodeId === "string") {
+        // True legacy path (no estimate item): keep the client's code, but only
+        // if it actually exists.
+        const code = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
+        resolvedCostCodeId = code?.id ?? null;
     }
 
     // Suggestion audit fields: trust nothing about the suggested task without
