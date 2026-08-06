@@ -920,6 +920,12 @@ function createHandler(actor: RouteMcpActor) {
                     const costCodes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
                     const codeMap = new Map(costCodes.map(c => [c.code, c.id]));
                     const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
+                    // An explicit costType must set BOTH the scalar `type` and the
+                    // costTypeId relation (scheduling prefers the relation) — a
+                    // keep-prior costTypeId under a changed `type` would leave the
+                    // item contradicting itself.
+                    const costTypes = await prisma.costType.findMany({ where: { isActive: true }, select: { id: true, name: true } });
+                    const typeMap = new Map(costTypes.map(t => [t.name, t.id]));
                     const priorItemIds = new Set(before.items.map(item => item.id));
                     data.items = args.items.map((item, idx) => {
                         const knownId = item.id !== undefined && priorItemIds.has(item.id);
@@ -946,7 +952,9 @@ function createHandler(actor: RouteMcpActor) {
                             id: knownId ? item.id : undefined,
                             name: item.name,
                             description: item.description,
-                            ...(item.costType && validTypes.includes(item.costType) ? { type: item.costType } : {}),
+                            ...(item.costType && validTypes.includes(item.costType)
+                                ? { type: item.costType, costTypeId: typeMap.get(item.costType) ?? null }
+                                : {}),
                             quantity: item.quantity,
                             unitCost: item.unitCost,
                             order: idx,
