@@ -855,11 +855,15 @@ function createHandler(actor: RouteMcpActor) {
             "update_change_order",
             {
                 title: "Edit an unsigned change order",
-                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                // destructiveHint: replacement lists DELETE rows that are left out.
+                // Not idempotent: retrying a call whose new rows carry no id
+                // deletes and recreates those rows under fresh ids.
+                annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
                 description:
                     "Edits an unsigned Draft or Sent change order: title, description, pricing, line items, payment schedule. Omitted fields are unchanged. " +
                     "items and paymentSchedules are FULL REPLACEMENT lists — call list_change_orders first and resend every row you want to keep (with its id); rows left out are DELETED. " +
-                    "Item edits recompute the subtotal server-side. A scope edit to a Sent change order returns it to Draft (re-send with send_change_order before the customer can sign). " +
+                    "On a row with an existing id, omitted description/costCode/dueDate keep their stored values. Item edits recompute the subtotal server-side. " +
+                    "A scope edit to a Sent change order returns it to Draft (re-send with send_change_order before the customer can sign). " +
                     "Approved/signed change orders are locked; status cannot be changed here.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Change order id from list_change_orders or list_project_billing"),
@@ -873,24 +877,30 @@ function createHandler(actor: RouteMcpActor) {
                         description: z.string().max(2000).optional().describe("Omitted on an existing row = keep its current description; empty string clears it"),
                         costCode: z.string().max(50).optional().describe("Omitted on an existing row = keep its current cost code; empty string clears it"),
                         costType: z.string().max(50).optional(),
-                        quantity: z.number().min(0).max(1_000_000),
-                        unitCost: z.number().min(0).max(10_000_000),
+                        quantity: z.number().min(0).max(10_000),
+                        unitCost: z.number().min(0).max(1_000_000),
                     })).min(1).max(100).optional().describe("Full replacement list of ALL line items (to clear every item, edit in ProBuild instead)"),
                     paymentSchedules: z.array(z.object({
                         id: z.string().max(50).optional().describe("Existing schedule id to update that row in place; omit for a new payment"),
                         name: z.string().min(1).max(300),
                         amount: z.number().positive().max(10_000_000),
-                        dueDate: z.string().optional(),
+                        dueDate: z.string().optional().describe("Omitted on an existing row = keep its current due date; empty string clears it"),
                         order: z.number().int().min(0).optional(),
                     })).max(20).optional().describe("Full replacement: two or more payments, or an empty array to remove the schedule. The final payment is adjusted so the schedule sums to the subtotal."),
                 },
             },
             async ({ changeOrderId, ...args }) => {
+                // Advisory prefetch: existence check, id-strip warnings, and the
+                // reverted-to-Draft note. All authoritative merge decisions
+                // (keep-prior fields, signed-scope lock, status) happen inside
+                // updateChangeOrderCore's FOR UPDATE transaction, so a concurrent
+                // edit between this read and the core can at worst mislabel a
+                // warning — never corrupt the row.
                 const before = await prisma.changeOrder.findUnique({
                     where: { id: changeOrderId },
                     select: {
                         code: true, status: true, projectId: true,
-                        items: { select: { id: true, costCodeId: true, description: true } },
+                        items: { select: { id: true } },
                     },
                 });
                 if (!before) return { ...textResult({ error: "Change order not found" }), isError: true };
@@ -904,35 +914,38 @@ function createHandler(actor: RouteMcpActor) {
 
                 if (args.items) {
                     // Same code-string → id mapping and type validation as create_change_order.
+                    // Keep-prior for omitted description/costCode/costType on existing rows is
+                    // resolved inside updateChangeOrderCore's locked transaction — this layer
+                    // only translates strings to ids (undefined passes through as "keep").
                     const costCodes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
                     const codeMap = new Map(costCodes.map(c => [c.code, c.id]));
                     const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
-                    const priorById = new Map(before.items.map(item => [item.id, item]));
+                    const priorItemIds = new Set(before.items.map(item => item.id));
                     data.items = args.items.map((item, idx) => {
-                        const prior = item.id ? priorById.get(item.id) : undefined;
-                        if (item.id && !prior) {
+                        const knownId = item.id !== undefined && priorItemIds.has(item.id);
+                        if (item.id && !knownId) {
                             // Don't forward a foreign/stale id into the create path — it
                             // could collide with an item on another change order.
                             warnings.push(`Item id "${item.id}" is not on this change order — added as a new row instead.`);
                         }
-                        let costCodeId: string | null;
+                        let costCodeId: string | null | undefined;
                         if (item.costCode === undefined) {
-                            costCodeId = prior?.costCodeId ?? null;
+                            costCodeId = undefined; // keep-prior in the core
                         } else if (item.costCode === "") {
                             costCodeId = null;
                         } else if (codeMap.has(item.costCode)) {
                             costCodeId = codeMap.get(item.costCode)!;
                         } else {
-                            costCodeId = prior?.costCodeId ?? null;
-                            warnings.push(`Unknown cost code "${item.costCode}" on item "${item.name}" — ${costCodeId ? "kept its current code" : "left uncoded"}.`);
+                            costCodeId = undefined; // keep-prior; uncoded for a new row
+                            warnings.push(`Unknown cost code "${item.costCode}" on item "${item.name}" — ${knownId ? "kept its current code" : "left uncoded"}.`);
                         }
                         if (item.costType && !validTypes.includes(item.costType)) {
                             warnings.push(`Unknown cost type "${item.costType}" on item "${item.name}" — use one of: ${validTypes.join(", ")}.`);
                         }
                         return {
-                            id: prior ? item.id : undefined,
+                            id: knownId ? item.id : undefined,
                             name: item.name,
-                            description: item.description !== undefined ? item.description : (prior?.description ?? null),
+                            description: item.description,
                             ...(item.costType && validTypes.includes(item.costType) ? { type: item.costType } : {}),
                             quantity: item.quantity,
                             unitCost: item.unitCost,
@@ -946,7 +959,9 @@ function createHandler(actor: RouteMcpActor) {
                         id: row.id,
                         name: row.name,
                         amount: row.amount,
-                        dueDate: row.dueDate ?? null,
+                        // undefined passes through: the core keeps the stored due
+                        // date on a matching row; "" or null clears it.
+                        dueDate: row.dueDate,
                         order: row.order ?? idx,
                     }));
                 }
