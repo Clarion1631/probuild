@@ -122,10 +122,12 @@ export async function runDailyLogTaskMatch(dailyLogId: string): Promise<void> {
             },
         });
         if (!log) return;
-        // Snapshot for the stale-store guard: two matcher runs can race (edit +
-        // photo add each schedule one); only the run that saw the CURRENT log
-        // content may store, so a slow older run never clobbers a newer result.
-        const contentStamp = `${log.updatedAt.getTime()}:${log.photos.map(photo => photo.id).sort().join(",")}`;
+        // Stale-store guard: two matcher runs can race (edit + photo add each
+        // schedule one); only the run that saw the CURRENT log row may store.
+        // Photo mutations bump the log row's updatedAt (see addDailyLogPhotos /
+        // deleteDailyLogPhoto), so updatedAt alone versions the content and the
+        // store can be a single atomic conditional write.
+        const contentStamp = log.updatedAt;
 
         const candidates = await loadSuggestableTasks(log.projectId, log.createdById);
         if (candidates.length === 0) {
@@ -188,25 +190,39 @@ Pick the ONE task that "next steps" (preferred) or the most recent work points t
 Respond ONLY with valid JSON matching the schema.`;
 
         const parts: Part[] = [{ text: prompt }];
-        for (const photo of log.photos.slice(0, MAX_PHOTOS)) {
-            const inline = await fetchPhotoInline(photo.url);
+        // Parallel fetch keeps worst-case photo time at ONE per-fetch timeout,
+        // not four — this whole pipeline runs inside after()'s shared duration
+        // budget.
+        const inlines = await Promise.all(
+            log.photos.slice(0, MAX_PHOTOS).map(photo => fetchPhotoInline(photo.url)),
+        );
+        for (const inline of inlines) {
             if (inline) parts.push(inline);
         }
 
         const ai = new GoogleGenAI({ apiKey });
-        const response = await Promise.race([
-            ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: { parts },
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: matchResponseSchema as any,
-                    temperature: 0.1,
-                },
-            }),
-            new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error("AI call timed out")), AI_CALL_TIMEOUT_MS)),
-        ]);
+        // Bounds the await, not the SDK's underlying request (it has no abort
+        // hook) — the orphaned promise resolves into nothing.
+        let aiTimer: ReturnType<typeof setTimeout> | undefined;
+        let response;
+        try {
+            response = await Promise.race([
+                ai.models.generateContent({
+                    model: GEMINI_MODEL,
+                    contents: { parts },
+                    config: {
+                        responseMimeType: "application/json",
+                        responseSchema: matchResponseSchema as any,
+                        temperature: 0.1,
+                    },
+                }),
+                new Promise<never>((_, reject) => {
+                    aiTimer = setTimeout(() => reject(new Error("AI call timed out")), AI_CALL_TIMEOUT_MS);
+                }),
+            ]);
+        } finally {
+            clearTimeout(aiTimer);
+        }
         if (!response.text) throw new Error("empty AI response");
         const parsed = JSON.parse(response.text) as { taskId?: string; reason?: string };
 
@@ -236,19 +252,14 @@ async function storeMatch(
     dailyLogId: string,
     taskId: string | null,
     reason: string | null,
-    contentStamp: string,
+    contentStamp: Date,
 ): Promise<void> {
-    // Stale-store guard: skip if the log changed while this run was in flight —
-    // the mutation that changed it scheduled a fresh run that owns the store.
-    const current = await prisma.dailyLog.findUnique({
-        where: { id: dailyLogId },
-        select: { updatedAt: true, photos: { select: { id: true } } },
-    });
-    if (!current) return;
-    const currentStamp = `${current.updatedAt.getTime()}:${current.photos.map(photo => photo.id).sort().join(",")}`;
-    if (currentStamp !== contentStamp) return;
-    await prisma.dailyLog.update({
-        where: { id: dailyLogId },
+    // Atomic compare-and-write: the row must still carry the updatedAt this run
+    // read, or the write is silently skipped — the mutation that changed the
+    // log scheduled a fresh run that owns the store. (updateMany allows non-id
+    // filters; count 0 simply means we lost the race.)
+    await prisma.dailyLog.updateMany({
+        where: { id: dailyLogId, updatedAt: contentStamp },
         data: { aiSuggestedTaskId: taskId, aiSuggestionReason: taskId ? reason : null },
     });
 }

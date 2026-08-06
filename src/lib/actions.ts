@@ -12197,6 +12197,9 @@ export async function addDailyLogPhotos(dailyLogId: string, photos: { url: strin
             caption: p.caption || null,
         })),
     });
+    // Bump the log row: its updatedAt versions the content for the matcher's
+    // atomic stale-store guard, and photo rows alone don't touch it.
+    await prisma.dailyLog.update({ where: { id: dailyLogId }, data: { updatedAt: new Date() } });
 
     // Photos are matcher evidence — refresh the pick. No Chat re-post for
     // photo-only mutations.
@@ -12217,12 +12220,12 @@ export async function deleteDailyLogPhoto(photoId: string) {
 
     await prisma.$transaction(async tx => {
         await tx.dailyLogPhoto.delete({ where: { id: photoId } });
-        if (photo.sharedToPortal) {
-            await tx.dailyLog.update({
-                where: { id: photo.dailyLog.id },
-                data: { sharedContentHash: null },
-            });
-        }
+        // Bump the log row regardless: updatedAt versions the content for the
+        // matcher's atomic stale-store guard.
+        await tx.dailyLog.update({
+            where: { id: photo.dailyLog.id },
+            data: photo.sharedToPortal ? { sharedContentHash: null, updatedAt: new Date() } : { updatedAt: new Date() },
+        });
     });
 
     // Photos are matcher evidence — refresh the pick after removal too.

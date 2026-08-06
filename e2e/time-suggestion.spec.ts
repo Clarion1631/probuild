@@ -48,7 +48,9 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
     let api: APIRequestContext;
     let fieldCrewToken: string;
     let fieldCrewId: string;
-    const suiteStart = new Date();
+    // Every entry id this file creates via POST — the afterAll safety net
+    // deletes exactly these, nothing broader.
+    const createdEntryIds = new Set<string>();
 
     test.beforeAll(async ({ playwright }) => {
         api = await playwright.request.newContext({ baseURL: BASE_URL, storageState: { cookies: [], origins: [] } });
@@ -69,11 +71,11 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             data: { aiSuggestedTaskId: null, aiSuggestionReason: null },
         }).catch(() => {});
         // Entries this file POSTed but failed to delete inline (assertion threw
-        // before the inline cleanup). The fixture history entry has an endTime,
-        // so open entries created since suite start are unambiguously ours.
-        await prisma.timeEntry.deleteMany({
-            where: { userId: fieldCrewId, projectId: PROJECT_ID, endTime: null, createdAt: { gte: suiteStart } },
-        }).catch(() => {});
+        // before the inline cleanup). Exact IDs only — a time/user-scoped
+        // deleteMany could reap another parallel spec's in-flight entries.
+        if (createdEntryIds.size > 0) {
+            await prisma.timeEntry.deleteMany({ where: { id: { in: [...createdEntryIds] } } }).catch(() => {});
+        }
         await prisma.taskAssignment.deleteMany({ where: { taskId: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID] } } });
         await prisma.scheduleTask.deleteMany({ where: { id: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID] } } });
         await prisma.estimateItem.deleteMany({ where: { id: TSUG_ITEM_NOCODE_ID } });
@@ -260,6 +262,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const created = await res.json();
+        createdEntryIds.add(created.id);
 
         const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
         expect(entry.costCodeId).toBe(COST_CODE_DRYW_ID); // derived from estimateItemId, not the client-sent value
@@ -280,6 +283,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const created = await res.json();
+        createdEntryIds.add(created.id);
 
         const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
         expect(entry.costCodeId).toBe(COST_CODE_DEMO_ID);
@@ -311,6 +315,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         });
         expect(res.ok(), await res.text()).toBeTruthy();
         const created = await res.json();
+        createdEntryIds.add(created.id);
 
         const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
         // The item decides the charge; a codeless item means NO cost code — the

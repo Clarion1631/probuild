@@ -68,6 +68,20 @@ function verifyCostCodeTokensMatch(): void {
     console.log("PASS ranking: cost-code name tokens participate");
 }
 
+function verifyDistinctTokenCount(): void {
+    // One hot nextSteps word = 1 distinct matched token (callers demote that to
+    // medium confidence); two agreeing words = 2.
+    const single = keywordMatchTasks({ nextSteps: "concrete order confirmed" }, CANDIDATES);
+    assert.ok(single);
+    assert.equal(single.taskId, "t-conc");
+    assert.equal(single.matchedTokens, 1);
+    const double = keywordMatchTasks({ nextSteps: "pour the concrete pad" }, CANDIDATES);
+    assert.ok(double);
+    assert.equal(double.taskId, "t-conc");
+    assert.equal(double.matchedTokens, 2);
+    console.log("PASS ranking: matchedTokens counts distinct hits for confidence");
+}
+
 function verifyDuplicateTokensDontStack(): void {
     // Repeating a word in the log must not multiply its score: candidate token
     // sets are deduped, and each candidate token scores once.
@@ -94,6 +108,7 @@ verifyNextStepsOutranksWorkPerformed();
 verifyPhotoCaptionsCount();
 verifyNoMatchAndTieReturnNull();
 verifyCostCodeTokensMatch();
+verifyDistinctTokenCount();
 verifyDuplicateTokensDontStack();
 verifyWebhookUrlGuard();
 console.log("\nverify-time-suggestion: all checks passed");

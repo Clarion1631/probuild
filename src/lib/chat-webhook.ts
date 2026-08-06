@@ -120,26 +120,27 @@ export async function postDailyLogSummary(dailyLogId: string): Promise<boolean> 
         if (log.aiSuggestedTaskId) {
             const task = await prisma.scheduleTask.findUnique({
                 where: { id: log.aiSuggestedTaskId },
-                select: {
-                    name: true,
-                    // A leaf's item may be codeless with the code on its parent
-                    // bucket (the thing actually charged) — walk up for display.
-                    estimateItem: {
-                        select: {
-                            costCode: { select: { code: true, name: true } },
-                            parent: {
-                                select: {
-                                    costCode: { select: { code: true, name: true } },
-                                    parent: { select: { costCode: { select: { code: true, name: true } } } },
-                                },
-                            },
-                        },
-                    },
-                },
+                select: { name: true, estimateItemId: true },
             });
             if (task) {
-                const item = task.estimateItem;
-                const costCode = item?.costCode ?? item?.parent?.costCode ?? item?.parent?.parent?.costCode ?? null;
+                // The charge lands on the TOP-LEVEL bucket, so the label must be
+                // that bucket's cost code — not the nearest coded ancestor.
+                // Same walk the suggestion mapper does (bounded hop count).
+                let costCode: { code: string; name: string } | null = null;
+                let itemId: string | null = task.estimateItemId;
+                for (let hops = 0; itemId && hops < 10; hops += 1) {
+                    const item: { parentId: string | null; costCode: { code: string; name: string } | null } | null =
+                        await prisma.estimateItem.findUnique({
+                            where: { id: itemId },
+                            select: { parentId: true, costCode: { select: { code: true, name: true } } },
+                        });
+                    if (!item) break;
+                    if (!item.parentId) {
+                        costCode = item.costCode;
+                        break;
+                    }
+                    itemId = item.parentId;
+                }
                 suggestedTask = {
                     taskName: task.name,
                     costCodeLabel: costCode ? `${costCode.code} — ${costCode.name}` : "",
