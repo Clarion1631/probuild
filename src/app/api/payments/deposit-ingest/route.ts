@@ -255,8 +255,10 @@ export async function POST(req: Request) {
 
     if (!freshlyClaimed) {
         // Someone else is actively working this file (fresh lease) — the bot's next
-        // 10-minute run retries safely (idempotent by fileId).
-        return NextResponse.json({ ok: true, status: row.status, reason: "in progress — retry shortly" });
+        // 10-minute run retries safely (idempotent by fileId). Re-read for the current
+        // status: our snapshot can be stale (e.g. a failed→processing CAS we just lost).
+        const current = await prisma.depositIngest.findUnique({ where: { id: row.id }, select: { status: true } });
+        return NextResponse.json({ ok: true, status: current?.status ?? row.status, reason: "in progress — retry shortly" });
     }
 
     // `>` (not `>=`): the claim above just incremented attempts, so this value IS the
@@ -345,6 +347,38 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
             if (payerWords.length > 0 && clientWords.length > 0 && !payerWords.some(w => clientWords.includes(w))) {
                 return await finalizeUnmatched(row, `payer "${payload.payerName}" shares no name with client "${project.client.name}"`);
             }
+        }
+
+        // Crash recovery for the non-QBO path: a prior attempt may have SETTLED the
+        // milestone (recordPaymentCore committed) and died before the "applied" write —
+        // and the pre-QBO reclaim then released the reservation, so this retry arrives
+        // with no pointer to it. The physical check is identified by project + check
+        // number + amount: a Paid milestone bearing exactly those IS our earlier
+        // attempt. This runs BEFORE Pending matching so the deposit can never re-apply
+        // to a different (later-added) same-amount milestone.
+        const priorSettle = await prisma.paymentSchedule.findFirst({
+            where: {
+                status: "Paid", paymentMethod: "check", referenceNumber: payload.checkNumber,
+                invoice: { projectId: project.id },
+            },
+            select: { id: true, amount: true, invoice: { select: { code: true } } },
+        });
+        if (priorSettle && Math.abs(toNum(priorSettle.amount) - payload.amount) <= 0.005) {
+            try {
+                await prisma.depositIngest.update({
+                    where: { id: row.id },
+                    data: { status: "applied", paymentScheduleId: priorSettle.id, lastError: null },
+                });
+            } catch (e: any) {
+                if (e?.code !== "P2002") throw e;
+                // Another deposit row terminally holds this schedule — this file is a
+                // second photo of an already-applied check, not a recovery of our own.
+                return await finalizeUnmatched(row, `check #${payload.checkNumber} was already applied via another deposit file`);
+            }
+            return NextResponse.json({
+                ok: true, status: "applied", recovered: true,
+                scheduleId: priorSettle.id, invoiceCode: priorSettle.invoice.code,
+            });
         }
 
         const candidates = await prisma.paymentSchedule.findMany({
