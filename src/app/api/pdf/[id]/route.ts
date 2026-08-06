@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateEstimatePdf } from "@/lib/pdf";
+import { isStaffRequest } from "@/lib/pdf-route-auth";
 
 export async function GET(
     req: NextRequest,
@@ -12,6 +13,11 @@ export async function GET(
         return NextResponse.json({ error: "Missing ID" }, { status: 400 });
     }
 
+    // Legacy staff-facing estimate PDF; clients get theirs via /portal/estimates.
+    if (!await isStaffRequest()) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
     try {
         const pdfBuffer = await generateEstimatePdf(id);
 
@@ -21,6 +27,7 @@ export async function GET(
             status: 200,
             headers: {
                 "Content-Type": "application/pdf",
+                "Cache-Control": "private, no-store",
                 "Content-Disposition": inline
                     ? `inline; filename="Estimate_${id}.pdf"`
                     : `attachment; filename="Estimate_${id}.pdf"`,

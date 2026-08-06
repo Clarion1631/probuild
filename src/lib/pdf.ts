@@ -144,7 +144,10 @@ function hexToRgb(hex: string) {
 }
 
 function formatCurrency(amount: number): string {
-    return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const n = Number(amount);
+    const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    // Sign before the dollar sign: -$4,629.63, not $-4,629.63.
+    return n < 0 ? `-$${abs}` : `$${abs}`;
 }
 
 async function drawLetterhead(
@@ -1085,21 +1088,25 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     const coLhConfig = buildLetterheadConfig(company);
     y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    page.drawText('CHANGE ORDER', { x: margin, y, size: 22, font: helveticaBold, color: colors.textMain });
+    // Header mirrors the invoice PDF: 26pt title, BILL TO block (name + email),
+    // right-aligned meta column, then a divider clear of both columns.
+    page.drawText('CHANGE ORDER', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
 
-    y -= 22;
     if (co.title) {
-        page.drawText(co.title, { x: margin, y, size: 12, font: helvetica, color: colors.textMain });
-        y -= 10;
+        y -= 22;
+        page.drawText(co.title, { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
     }
+    y -= 30;
 
-    y -= 20;
     const coClientName = co.project?.client?.name || '';
-    page.drawText('CLIENT', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+    const coClientEmail = co.project?.client?.email || '';
+    const coBillToY = y; // meta column anchors to the BILL TO baseline
+    page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
     if (coClientName) { y -= 16; page.drawText(coClientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
+    if (coClientEmail) { y -= 14; page.drawText(coClientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
 
     const coRightX = pageWidth - margin;
-    let coRy = y + (coClientName ? 16 : 0);
+    let coRy = coBillToY;
 
     const drawCORL = (label: string, value: string, yPos: number) => {
         page.drawText(label, { x: coRightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
@@ -1115,7 +1122,9 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     coRy -= 16;
     drawCORL('Project', co.project?.name || '', coRy);
 
-    y -= 20;
+    // The meta column is 4 rows tall; the client block can be shorter. Drop the
+    // divider below whichever column ends lower so it never crosses a meta row.
+    y = Math.min(y, coRy) - 20;
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 20;
 
@@ -1123,22 +1132,30 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         page.drawText('Description:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
         flowText(co.description, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
-        y -= 7;
+        y -= 10;
     }
 
     // Full name and description render wrapped (no truncation — the client must
     // see the entire scope text). Items are pre-measured so short items never
     // split across a page break; very long ones flow and paginate on their own.
     // An empty name still consumes one 13pt row (the money columns' baseline).
+    // The name shares its first row with the QTY/UNIT COST/TOTAL figures so it
+    // stays inside its column; description lines sit below that row and can run
+    // wider without colliding with the money columns.
     const coNameWidth = contentWidth * 0.5;
+    const coDescWidth = contentWidth * 0.78;
     const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
         const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
-        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coNameWidth) : 0;
-        return Math.max(1, nameLines) * 13 + (descLines ? 2 + descLines * 11 : 0) + 7;
+        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coDescWidth) : 0;
+        return Math.max(1, nameLines) * 13 + (descLines ? 4 + descLines * 11.5 : 0) + 16;
     };
+    // Fully empty placeholder rows (no name, no description, $0) would render
+    // as orphan "$0.00" lines — drop them. Anything with text or money stays.
+    const coVisibleItems = co.items.filter(it =>
+        (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
     // Reserve through the first item so neither the cost-plus terms block nor
     // the table header is left orphaned when the first row's preflight breaks.
-    const coFirstItemH = co.items.length ? coItemEstHeight(co.items[0]) : 30;
+    const coFirstItemH = coVisibleItems.length ? coItemEstHeight(coVisibleItems[0]) : 30;
 
     if (co.pricingType === 'COST_PLUS') {
         // Terms block (40pt) + table header (22pt) + first item stay together.
@@ -1166,7 +1183,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 14;
 
-    for (const item of co.items) {
+    for (let itemIdx = 0; itemIdx < coVisibleItems.length; itemIdx++) {
+        const item = coVisibleItems[itemIdx];
         const itemName = item.name || '';
         const itemDesc = item.description || '';
         const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
@@ -1187,15 +1205,25 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         if (nameLines > 0) flowText(itemName, { x: coCols.name, maxWidth: coNameWidth, size: 10, color: colors.textMain, lineHeight: 13 });
         else y -= 13;
         if (itemDesc) {
-            y -= 2;
-            flowText(itemDesc, { x: coCols.name, maxWidth: coNameWidth, size: 8.5, color: colors.textMuted, lineHeight: 11 });
+            y -= 4;
+            flowText(itemDesc, { x: coCols.name, maxWidth: coDescWidth, size: 8.5, color: colors.textMuted, lineHeight: 11.5 });
         }
-        y -= 7;
+        // Hairline between items keeps long scope lists scannable; the totals
+        // rule already follows the last item, so skip it there.
+        if (itemIdx < coVisibleItems.length - 1) {
+            const ruleY = y + 5;
+            page.drawLine({ start: { x: margin, y: ruleY }, end: { x: pageWidth - margin, y: ruleY }, thickness: 0.5, color: colors.border });
+            y = ruleY - 16;
+        } else {
+            y -= 7;
+        }
     }
 
-    // Total
+    // Total — reserve the whole Subtotal/Tax/Revised Amount block (rule + 3 rows)
+    // so it never straddles the bottom margin or splits across pages. Cost-plus
+    // shows a single terms row, so the smaller reserve avoids early page breaks.
     y -= 10;
-    checkNewPage(80);
+    checkNewPage(co.pricingType === 'COST_PLUS' ? 80 : 125);
     page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 25;
 
