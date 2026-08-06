@@ -1,6 +1,6 @@
 import type { Prisma } from "@prisma/client";
-import { after } from "next/server";
 
+import { runAfterRequest } from "./after-request";
 import { postDailyLogSummary } from "./chat-webhook";
 import { createDailyLogCore } from "./daily-log-core";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
@@ -583,7 +583,7 @@ export async function createDailyLogWithConfirmation(
     // tool result.
     if (result && typeof result === "object" && "dailyLogId" in result) {
         const dailyLogId = (result as { dailyLogId: string }).dailyLogId;
-        after(async () => {
+        runAfterRequest(async () => {
             await runDailyLogTaskMatch(dailyLogId);
             await postDailyLogSummary(dailyLogId);
         });

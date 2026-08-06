@@ -22,6 +22,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { appendPunchItemsInTransaction } from "./punch-items";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import { postDailyLogSummary } from "./chat-webhook";
+import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
@@ -12116,7 +12117,7 @@ export async function createDailyLog(projectId: string, data: {
     // Best-effort enrichment after the response: pin the AI task match on the
     // log, then post the summary (with tomorrow's task) to the project's Chat
     // space. Neither may block or fail the log write.
-    after(async () => {
+    runAfterRequest(async () => {
         await runDailyLogTaskMatch(log.id);
         await postDailyLogSummary(log.id);
     });
@@ -12163,7 +12164,7 @@ export async function updateDailyLog(id: string, data: {
     const narrativeChanged = data.workPerformed !== undefined
         || data.nextSteps !== undefined
         || data.issues !== undefined;
-    after(async () => {
+    runAfterRequest(async () => {
         await runDailyLogTaskMatch(log.id);
         if (narrativeChanged) await postDailyLogSummary(log.id);
     });
@@ -12199,7 +12200,7 @@ export async function addDailyLogPhotos(dailyLogId: string, photos: { url: strin
 
     // Photos are matcher evidence — refresh the pick. No Chat re-post for
     // photo-only mutations.
-    after(() => runDailyLogTaskMatch(dailyLogId));
+    runAfterRequest(() => runDailyLogTaskMatch(dailyLogId));
 
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
     return { success: true };
@@ -12225,7 +12226,7 @@ export async function deleteDailyLogPhoto(photoId: string) {
     });
 
     // Photos are matcher evidence — refresh the pick after removal too.
-    after(() => runDailyLogTaskMatch(photo.dailyLog.id));
+    runAfterRequest(() => runDailyLogTaskMatch(photo.dailyLog.id));
 
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
     return { success: true };
