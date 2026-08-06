@@ -174,27 +174,6 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                 throw new Error(`Duplicate change-order item ID: ${duplicateItemId}`);
             }
 
-            let totalCents = 0;
-            const rows = items.map((item, idx) => {
-                const quantity = parseFloat(String(item.quantity ?? "")) || 0;
-                const unitCost = parseFloat(String(item.unitCost ?? "")) || 0;
-                const unitCents = Math.round(unitCost * 100);
-                const lineCents = coLineCents(quantity, unitCost);
-                totalCents += lineCents;
-                return {
-                    id: item.id || undefined,
-                    name: item.name || "",
-                    description: item.description || null,
-                    ...(item.type ? { type: item.type } : {}),
-                    quantity,
-                    unitCost: unitCents / 100,
-                    total: lineCents / 100,
-                    order: item.order ?? idx,
-                    costCodeId: item.costCodeId || null,
-                    costTypeId: item.costTypeId || null,
-                };
-            });
-
             const existing = await tx.changeOrderItem.findMany({
                 where: { changeOrderId: id },
                 select: {
@@ -212,6 +191,34 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             });
             const existingIds = new Set(existing.map(i => i.id));
             const existingById = new Map(existing.map((item) => [item.id, item]));
+
+            let totalCents = 0;
+            const rows = items.map((item, idx) => {
+                const quantity = parseFloat(String(item.quantity ?? "")) || 0;
+                const unitCost = parseFloat(String(item.unitCost ?? "")) || 0;
+                const unitCents = Math.round(unitCost * 100);
+                const lineCents = coLineCents(quantity, unitCost);
+                totalCents += lineCents;
+                // On a row that matches an existing item, an omitted (undefined)
+                // description/costCodeId/costTypeId keeps the stored value —
+                // resolved here, under the same row lock as the write, so a
+                // partial payload can't erase relations it never mentioned. The
+                // editor always sends explicit values (x || null), so this only
+                // affects connector callers. Empty string / null still clears.
+                const prior = item.id ? existingById.get(item.id) : undefined;
+                return {
+                    id: item.id || undefined,
+                    name: item.name || "",
+                    description: item.description === undefined ? (prior?.description ?? null) : (item.description || null),
+                    ...(item.type ? { type: item.type } : {}),
+                    quantity,
+                    unitCost: unitCents / 100,
+                    total: lineCents / 100,
+                    order: item.order ?? idx,
+                    costCodeId: item.costCodeId === undefined ? (prior?.costCodeId ?? null) : (item.costCodeId || null),
+                    costTypeId: item.costTypeId === undefined ? (prior?.costTypeId ?? null) : (item.costTypeId || null),
+                };
+            });
             const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
             const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
             const itemRowsChanged = rows.length !== existing.length || rows.some((row) => {
@@ -256,13 +263,24 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             orderBy: [{ order: "asc" }, { id: "asc" }],
             select: { id: true, name: true, amount: true, dueDate: true, order: true },
         });
-        const requestedSchedules = schedules ?? existingSchedules.map((row) => ({
-            id: row.id,
-            name: row.name,
-            amount: Number(row.amount),
-            dueDate: row.dueDate,
-            order: row.order,
-        }));
+        // Same keep-prior rule as item fields: an omitted (undefined) dueDate on
+        // a row that matches an existing schedule keeps the stored date; null or
+        // "" still clears it. Resolved under the row lock.
+        const priorScheduleById = new Map(existingSchedules.map((row) => [row.id, row]));
+        const requestedSchedules = schedules
+            ? schedules.map((row) => ({
+                ...row,
+                dueDate: row.dueDate === undefined && row.id && priorScheduleById.has(row.id)
+                    ? priorScheduleById.get(row.id)!.dueDate
+                    : row.dueDate,
+            }))
+            : existingSchedules.map((row) => ({
+                id: row.id,
+                name: row.name,
+                amount: Number(row.amount),
+                dueDate: row.dueDate,
+                order: row.order,
+            }));
 
         if (nextPricingType === "COST_PLUS" && requestedSchedules.length > 0) {
             throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
