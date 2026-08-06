@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generatePurchaseOrderPdf } from "@/lib/pdf";
+import { isStaffRequest } from "@/lib/pdf-route-auth";
 
 export async function GET(
     req: NextRequest,
@@ -12,6 +13,11 @@ export async function GET(
         return NextResponse.json({ error: "Missing ID" }, { status: 400 });
     }
 
+    // Purchase orders are internal documents — staff only, no portal path.
+    if (!await isStaffRequest()) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
     try {
         const pdfBuffer = await generatePurchaseOrderPdf(id);
 
@@ -21,6 +27,7 @@ export async function GET(
             status: 200,
             headers: {
                 "Content-Type": "application/pdf",
+                "Cache-Control": "private, no-store",
                 "Content-Disposition": inline
                     ? `inline; filename="PurchaseOrder_${id}.pdf"`
                     : `attachment; filename="PurchaseOrder_${id}.pdf"`,
