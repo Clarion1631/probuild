@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
+import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
@@ -166,7 +167,7 @@ function formatBytes(bytes: number): string {
 const WRITE_TOOLS = new Set([
     "create_estimate", "update_estimate", "send_estimate",
     "send_milestone_invoice", "resend_invoice", "create_invoice_from_estimate",
-    "create_change_order", "send_change_order", "bill_change_order",
+    "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
     "create_lead", "log_time", "log_expense",
     "upload_file", "upload_files", "create_folder", "move_file",
     "create_daily_log", "add_punch_items",
@@ -186,7 +187,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     create_contract: "contract", update_contract: "contract", send_contract: "contract",
     create_estimate: "estimate", update_estimate: "estimate", send_estimate: "estimate",
     create_invoice_from_estimate: "invoice", send_milestone_invoice: "invoice", resend_invoice: "invoice",
-    create_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
+    create_change_order: "change_order", update_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
     apply_change_order_to_schedule: "change_order",
     create_lead: "lead",
     plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
@@ -851,6 +852,129 @@ function createHandler(actor: RouteMcpActor) {
         );
 
         server.registerTool(
+            "update_change_order",
+            {
+                title: "Edit an unsigned change order",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                description:
+                    "Edits an unsigned Draft or Sent change order: title, description, pricing, line items, payment schedule. Omitted fields are unchanged. " +
+                    "items and paymentSchedules are FULL REPLACEMENT lists — call list_change_orders first and resend every row you want to keep (with its id); rows left out are DELETED. " +
+                    "Item edits recompute the subtotal server-side. A scope edit to a Sent change order returns it to Draft (re-send with send_change_order before the customer can sign). " +
+                    "Approved/signed change orders are locked; status cannot be changed here.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Change order id from list_change_orders or list_project_billing"),
+                    title: z.string().min(1).max(300).optional(),
+                    description: z.string().max(2000).optional().describe("Empty string clears the description"),
+                    pricingType: z.enum(["FIXED", "COST_PLUS"]).optional(),
+                    markupPercent: z.number().min(0).max(1000).nullable().optional(),
+                    items: z.array(z.object({
+                        id: z.string().max(50).optional().describe("Existing item id (from list_change_orders) to update that row in place; omit for a new item"),
+                        name: z.string().min(1).max(300),
+                        description: z.string().max(2000).optional().describe("Omitted on an existing row = keep its current description; empty string clears it"),
+                        costCode: z.string().max(50).optional().describe("Omitted on an existing row = keep its current cost code; empty string clears it"),
+                        costType: z.string().max(50).optional(),
+                        quantity: z.number().min(0).max(1_000_000),
+                        unitCost: z.number().min(0).max(10_000_000),
+                    })).min(1).max(100).optional().describe("Full replacement list of ALL line items (to clear every item, edit in ProBuild instead)"),
+                    paymentSchedules: z.array(z.object({
+                        id: z.string().max(50).optional().describe("Existing schedule id to update that row in place; omit for a new payment"),
+                        name: z.string().min(1).max(300),
+                        amount: z.number().positive().max(10_000_000),
+                        dueDate: z.string().optional(),
+                        order: z.number().int().min(0).optional(),
+                    })).max(20).optional().describe("Full replacement: two or more payments, or an empty array to remove the schedule. The final payment is adjusted so the schedule sums to the subtotal."),
+                },
+            },
+            async ({ changeOrderId, ...args }) => {
+                const before = await prisma.changeOrder.findUnique({
+                    where: { id: changeOrderId },
+                    select: {
+                        code: true, status: true, projectId: true,
+                        items: { select: { id: true, costCodeId: true, description: true } },
+                    },
+                });
+                if (!before) return { ...textResult({ error: "Change order not found" }), isError: true };
+
+                const warnings: string[] = [];
+                const data: ChangeOrderUpdateInput = {};
+                if (args.title !== undefined) data.title = args.title;
+                if (args.description !== undefined) data.description = args.description;
+                if (args.pricingType !== undefined) data.pricingType = args.pricingType;
+                if (args.markupPercent !== undefined) data.markupPercent = args.markupPercent;
+
+                if (args.items) {
+                    // Same code-string → id mapping and type validation as create_change_order.
+                    const costCodes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
+                    const codeMap = new Map(costCodes.map(c => [c.code, c.id]));
+                    const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
+                    const priorById = new Map(before.items.map(item => [item.id, item]));
+                    data.items = args.items.map((item, idx) => {
+                        const prior = item.id ? priorById.get(item.id) : undefined;
+                        if (item.id && !prior) {
+                            // Don't forward a foreign/stale id into the create path — it
+                            // could collide with an item on another change order.
+                            warnings.push(`Item id "${item.id}" is not on this change order — added as a new row instead.`);
+                        }
+                        let costCodeId: string | null;
+                        if (item.costCode === undefined) {
+                            costCodeId = prior?.costCodeId ?? null;
+                        } else if (item.costCode === "") {
+                            costCodeId = null;
+                        } else if (codeMap.has(item.costCode)) {
+                            costCodeId = codeMap.get(item.costCode)!;
+                        } else {
+                            costCodeId = prior?.costCodeId ?? null;
+                            warnings.push(`Unknown cost code "${item.costCode}" on item "${item.name}" — ${costCodeId ? "kept its current code" : "left uncoded"}.`);
+                        }
+                        if (item.costType && !validTypes.includes(item.costType)) {
+                            warnings.push(`Unknown cost type "${item.costType}" on item "${item.name}" — use one of: ${validTypes.join(", ")}.`);
+                        }
+                        return {
+                            id: prior ? item.id : undefined,
+                            name: item.name,
+                            description: item.description !== undefined ? item.description : (prior?.description ?? null),
+                            ...(item.costType && validTypes.includes(item.costType) ? { type: item.costType } : {}),
+                            quantity: item.quantity,
+                            unitCost: item.unitCost,
+                            order: idx,
+                            costCodeId,
+                        };
+                    });
+                }
+                if (args.paymentSchedules) {
+                    data.paymentSchedules = args.paymentSchedules.map((row, idx) => ({
+                        id: row.id,
+                        name: row.name,
+                        amount: row.amount,
+                        dueDate: row.dueDate ?? null,
+                        order: row.order ?? idx,
+                    }));
+                }
+
+                let updated;
+                try {
+                    updated = await updateChangeOrderCore(changeOrderId, data);
+                } catch (error: any) {
+                    return { ...textResult({ error: error?.message || "Failed to update change order" }), isError: true };
+                }
+                revalidatePath(`/projects/${updated.projectId}/change-orders/${changeOrderId}`);
+                revalidatePath(`/projects/${updated.projectId}/change-orders`);
+                const revertedToDraft = before.status === "Sent" && updated.status === "Draft";
+                return textResult({
+                    changeOrderId,
+                    code: updated.code,
+                    status: updated.status,
+                    pricingType: updated.pricingType,
+                    markupPercent: updated.markupPercent,
+                    subtotal: Number(updated.totalAmount),
+                    warnings,
+                    ...(revertedToDraft ? { note: "Scope changed on a Sent change order — it is back in Draft and must be re-sent (send_change_order) before the customer can sign." } : {}),
+                    url: `https://probuild.goldentouchremodeling.com/projects/${updated.projectId}/change-orders/${changeOrderId}`,
+                });
+            },
+        );
+
+        server.registerTool(
             "send_change_order",
             {
                 title: "Send a change order to the customer for signature",
@@ -1107,7 +1231,7 @@ function createHandler(actor: RouteMcpActor) {
             {
                 title: "List project change orders and actuals",
                 annotations: { readOnlyHint: true },
-                description: "Lists change orders with pricing type, signature state, unbilled billable actuals, hours, and billed-to-date. Use this before logging or billing cost-plus work.",
+                description: "Lists change orders with line items, pricing type, signature state, unbilled billable actuals, hours, and billed-to-date. Use this before logging or billing cost-plus work, and to fetch current items (with ids) before update_change_order.",
                 inputSchema: { projectId: z.string().max(50) },
             },
             async ({ projectId }) => {
@@ -1115,6 +1239,7 @@ function createHandler(actor: RouteMcpActor) {
                     where: { projectId },
                     orderBy: { createdAt: "desc" },
                     include: {
+                        items: { orderBy: { order: "asc" }, select: { id: true, name: true, description: true, type: true, quantity: true, unitCost: true, total: true, costCode: { select: { code: true } } } },
                         timeEntries: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { durationHours: true, laborCost: true, burdenCost: true } },
                         expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
                         billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
@@ -1126,6 +1251,16 @@ function createHandler(actor: RouteMcpActor) {
                     code: co.code,
                     title: co.title,
                     status: co.status,
+                    items: co.items.map((item) => ({
+                        id: item.id,
+                        name: item.name,
+                        description: item.description,
+                        type: item.type,
+                        quantity: item.quantity,
+                        unitCost: Number(item.unitCost),
+                        total: Number(item.total),
+                        costCode: item.costCode?.code ?? null,
+                    })),
                     pricingType: co.pricingType,
                     markupPercent: co.markupPercent,
                     subtotal: Number(co.totalAmount),
@@ -2448,7 +2583,7 @@ function createHandler(actor: RouteMcpActor) {
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.14.0" },
+        serverInfo: { name: "probuild", version: "1.15.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
