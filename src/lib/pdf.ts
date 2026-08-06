@@ -144,7 +144,10 @@ function hexToRgb(hex: string) {
 }
 
 function formatCurrency(amount: number): string {
-    return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const n = Number(amount);
+    const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    // Sign before the dollar sign: -$4,629.63, not $-4,629.63.
+    return n < 0 ? `-$${abs}` : `$${abs}`;
 }
 
 async function drawLetterhead(
@@ -1145,9 +1148,13 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coDescWidth) : 0;
         return Math.max(1, nameLines) * 13 + (descLines ? 4 + descLines * 11.5 : 0) + 16;
     };
+    // Fully empty placeholder rows (no name, no description, $0) would render
+    // as orphan "$0.00" lines — drop them. Anything with text or money stays.
+    const coVisibleItems = co.items.filter(it =>
+        (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
     // Reserve through the first item so neither the cost-plus terms block nor
     // the table header is left orphaned when the first row's preflight breaks.
-    const coFirstItemH = co.items.length ? coItemEstHeight(co.items[0]) : 30;
+    const coFirstItemH = coVisibleItems.length ? coItemEstHeight(coVisibleItems[0]) : 30;
 
     if (co.pricingType === 'COST_PLUS') {
         // Terms block (40pt) + table header (22pt) + first item stay together.
@@ -1175,8 +1182,8 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 14;
 
-    for (let itemIdx = 0; itemIdx < co.items.length; itemIdx++) {
-        const item = co.items[itemIdx];
+    for (let itemIdx = 0; itemIdx < coVisibleItems.length; itemIdx++) {
+        const item = coVisibleItems[itemIdx];
         const itemName = item.name || '';
         const itemDesc = item.description || '';
         const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
@@ -1202,7 +1209,7 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
         // Hairline between items keeps long scope lists scannable; the totals
         // rule already follows the last item, so skip it there.
-        if (itemIdx < co.items.length - 1) {
+        if (itemIdx < coVisibleItems.length - 1) {
             const ruleY = y + 5;
             page.drawLine({ start: { x: margin, y: ruleY }, end: { x: pageWidth - margin, y: ruleY }, thickness: 0.5, color: colors.border });
             y = ruleY - 16;
