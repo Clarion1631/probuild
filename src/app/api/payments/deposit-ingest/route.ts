@@ -302,11 +302,11 @@ export async function POST(req: Request) {
             where: { id: fresh.id, status: { in: ["processing", "qbo_unknown", "qbo_created", "failed"] } },
             data: {
                 status: retryStatus, lastError: message.slice(0, 1000),
-                // Entering "failed" pre-boundary leaves the reservation index — release
-                // the milestone so the row can't shadow-hold it un-indexed (that retry
-                // re-matches and re-reserves from scratch). Past the NON-QBO boundary
-                // (settleStartedAt) the reservation is preserved: the retry must resume
-                // the reserved-row path, because the settle may already have committed.
+                // Pre-boundary "failed" releases the milestone (NULL leaves the partial
+                // index; that retry re-matches and re-reserves from scratch). Past the
+                // NON-QBO boundary (settleStartedAt) the reservation is preserved — and
+                // "failed" is in the index predicate, so the hold stays continuously
+                // indexed and no second file can slip in before the retry resumes.
                 ...(retryStatus === "failed" && !fresh.settleStartedAt ? { paymentScheduleId: null } : {}),
             },
         });
@@ -416,7 +416,10 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
         });
         const isOurs = fresh?.status === "Paid" && fresh.paymentMethod === "check" && fresh.referenceNumber === payload.checkNumber;
         if (!isOurs) {
-            return await finalizeReconcile(row, `ProBuild settle failed: ${result.error}`, { nullReservation: true });
+            // Reservation kept: settleStartedAt is stamped, so the reconcile human
+            // must see exactly which milestone this deposit was applying to (and the
+            // index hold stops another file from claiming it mid-review).
+            return await finalizeReconcile(row, `ProBuild settle failed: ${result.error}`, {});
         }
     }
     await prisma.depositIngest.update({ where: { id: row.id }, data: { status: "applied", lastError: null } });

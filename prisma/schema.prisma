@@ -632,8 +632,11 @@ model PaymentSchedule {
 // milestone. Prisma cannot express a partial index — it is created ONLY by
 // scripts/apply-deposit-ingest-schema.mjs:
 //   CREATE UNIQUE INDEX ... ON "DepositIngest" ("paymentScheduleId")
-//     WHERE "status" IN ('processing','qbo_unknown','qbo_created','applied','reconcile')
+//     WHERE "status" IN ('processing','qbo_unknown','qbo_created','applied','reconcile','failed')
 //     AND "paymentScheduleId" IS NOT NULL
+// ('failed' is in the predicate for boundary-marked rows that keep their
+//  reservation; unmarked failed rows carry NULL and are excluded. 'unmatched'
+//  is deliberately NOT — that transition releases the milestone.)
 model DepositIngest {
   id     String @id @default(cuid())
   fileId String @unique // Drive file id — stable idempotency key across the bot's archive move

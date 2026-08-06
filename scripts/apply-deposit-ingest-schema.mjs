@@ -45,14 +45,24 @@ const statements = [
      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
      CONSTRAINT "DepositIngest_pkey" PRIMARY KEY ("id")
    )`,
+  // Additive upgrade path: the column also lives in CREATE TABLE above, which is a
+  // no-op when the table already exists — this ALTER is what actually adds it there.
+  `ALTER TABLE "DepositIngest" ADD COLUMN IF NOT EXISTS "settleStartedAt" TIMESTAMP(3)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "DepositIngest_fileId_key" ON "DepositIngest" ("fileId")`,
   `CREATE INDEX IF NOT EXISTS "DepositIngest_status_idx" ON "DepositIngest" ("status")`,
   `CREATE INDEX IF NOT EXISTS "DepositIngest_paymentScheduleId_idx" ON "DepositIngest" ("paymentScheduleId")`,
   // Partial reservation index — see the header comment + the matching note in
   // prisma/schema.prisma above the DepositIngest model. NOT expressible in Prisma.
+  // "failed" is IN the predicate: unmarked failed rows carry NULL paymentScheduleId
+  // (excluded by the IS NOT NULL clause), while a boundary-marked failed row keeps
+  // its index hold — without it, a marked failed row shadow-holds the milestone
+  // outside the index, a second file reserves it, and the first row's
+  // failed→processing CAS then throws unhandled P2002 forever (never reaching
+  // exhaustion). Rebuilt via DROP so re-runs converge on the correct predicate.
+  `DROP INDEX IF EXISTS "DepositIngest_paymentScheduleId_reservation_key"`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "DepositIngest_paymentScheduleId_reservation_key"
      ON "DepositIngest" ("paymentScheduleId")
-     WHERE "status" IN ('processing', 'qbo_unknown', 'qbo_created', 'applied', 'reconcile')
+     WHERE "status" IN ('processing', 'qbo_unknown', 'qbo_created', 'applied', 'reconcile', 'failed')
        AND "paymentScheduleId" IS NOT NULL`,
   // Server-only table (payer names, amounts, QBO ids) in Supabase's exposed schema —
   // RLS on with no policies, so only the service role / direct Prisma access can read it
