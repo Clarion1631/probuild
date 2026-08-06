@@ -36,6 +36,7 @@ const statements = [
      "paymentScheduleId" TEXT,
      "qbPaymentId" TEXT,
      "qbRequestPayload" TEXT,
+     "settleStartedAt" TIMESTAMP(3),
      "officeTaskId" TEXT,
      "attempts" INTEGER NOT NULL DEFAULT 0,
      "lastError" TEXT,

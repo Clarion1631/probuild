@@ -646,7 +646,12 @@ model DepositIngest {
   paymentScheduleId String?
   qbPaymentId       String? // set once the QuickBooks Payment is created
   qbRequestPayload  String? // exact JSON body sent to QBO POST /payment — replayed byte-identical on qbo_unknown recovery
-  officeTaskId      String? // set once, on the first unmatched/reconcile — re-POSTs never create a second task
+  // Money-boundary marker for the NON-QBO settle path (the analog of qbRequestPayload
+  // for the QBO path): stamped immediately before recordPaymentCore runs. While any
+  // boundary marker is set, retry reclaims preserve the reservation + extracted payload
+  // so recovery goes through the exact reserved-row path, never a re-match.
+  settleStartedAt DateTime?
+  officeTaskId    String? // set once, on the first unmatched/reconcile — re-POSTs never create a second task
 
   attempts            Int       @default(0)
   lastError           String?

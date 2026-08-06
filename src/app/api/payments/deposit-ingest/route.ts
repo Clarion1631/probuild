@@ -193,10 +193,10 @@ export async function POST(req: Request) {
     // Never force-reset a row that already crossed the QBO boundary — that money
     // decision needs a human looking at QuickBooks, not a silent re-run.
     if (row.status === "unmatched" && force) {
-        if (row.qbPaymentId || row.qbRequestPayload) {
+        if (row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt) {
             return NextResponse.json({
                 ok: true, status: "unmatched",
-                reason: "cannot force-retry — this deposit already reached QuickBooks; reconcile it manually",
+                reason: "cannot force-retry — this deposit already crossed a money boundary (QuickBooks or a ProBuild settle); reconcile it manually",
                 officeTaskId: row.officeTaskId,
             });
         }
@@ -224,7 +224,14 @@ export async function POST(req: Request) {
     if (!freshlyClaimed && inFlightStatuses.includes(row.status)) {
         const needsLease = row.status !== "failed";
         const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS);
-        const preQbo = row.status === "processing" || row.status === "failed";
+        const retriable = row.status === "processing" || row.status === "failed";
+        // Clean-slate ONLY before any money boundary: qbRequestPayload marks the QBO
+        // boundary, settleStartedAt marks the non-QBO one. Once either is set, the
+        // reservation and ORIGINAL extracted payload are preserved so recovery goes
+        // through the exact reserved-row path (matchAndApply's reserved branch /
+        // resumeFromQboUnknown) — never a heuristic re-match against a settle that
+        // may already have committed.
+        const boundaryMarked = !!(row.qbPaymentId || row.qbRequestPayload || row.settleStartedAt);
         const claim = await prisma.depositIngest.updateMany({
             where: {
                 id: row.id, status: row.status,
@@ -235,16 +242,11 @@ export async function POST(req: Request) {
                 // concurrent retry match the same claim (failed has no lease) and both
                 // would send QBO bodies under the same requestid. The winner takes a
                 // fresh processing lease; the loser's status CAS fails.
-                status: preQbo ? "processing" : row.status,
+                status: retriable ? "processing" : row.status,
                 attempts: { increment: 1 }, processingStartedAt: new Date(),
-                // Pre-QBO retries restart from a clean slate: fresh payload AND a
-                // released reservation, so matching re-runs end-to-end against current
-                // inputs — a stale reservation must never survive a payload overwrite.
-                // (A "processing"/"failed" row is pre-QBO-boundary by construction: the
-                // status flips to qbo_unknown before qbRequestPayload is ever sent.)
                 // qbo_unknown/qbo_created resumes deliberately replay the ORIGINAL
                 // extracted values (see resumeFromQboUnknown/resumeFromQboCreated).
-                ...(preQbo ? { extracted: JSON.stringify(payload), paymentScheduleId: null } : {}),
+                ...(retriable && !boundaryMarked ? { extracted: JSON.stringify(payload), paymentScheduleId: null } : {}),
             },
         });
         if (claim.count > 0) {
@@ -266,11 +268,11 @@ export async function POST(req: Request) {
     // crash mid-attempt-MAX) reconciles. The post-failure check in the catch below uses
     // `>=` because it runs AFTER the attempt completed. Together: at most MAX real runs.
     if (row.attempts > MAX_ATTEMPTS) {
-        const crossedQboBoundary = !!row.qbPaymentId || !!row.qbRequestPayload;
+        const crossedAnyBoundary = !!row.qbPaymentId || !!row.qbRequestPayload || !!row.settleStartedAt;
         return await finalizeReconcile(
             row,
             `exceeded ${MAX_ATTEMPTS} retry attempts (last error: ${row.lastError ?? "none"})`,
-            { nullReservation: !crossedQboBoundary },
+            { nullReservation: !crossedAnyBoundary },
         );
     }
 
@@ -286,8 +288,11 @@ export async function POST(req: Request) {
         const message = e instanceof Error ? e.message : String(e);
         const fresh = (await prisma.depositIngest.findUnique({ where: { id: row.id } })) ?? row;
         const crossedQboBoundary = !!fresh.qbPaymentId || !!fresh.qbRequestPayload;
+        const crossedAnyBoundary = crossedQboBoundary || !!fresh.settleStartedAt;
         if (fresh.attempts >= MAX_ATTEMPTS) {
-            return await finalizeReconcile(fresh, message, { nullReservation: !crossedQboBoundary });
+            // Reservation survives exhaustion whenever ANY money boundary was crossed —
+            // the reconcile human must see which milestone this deposit may have paid.
+            return await finalizeReconcile(fresh, message, { nullReservation: !crossedAnyBoundary });
         }
         const retryStatus = !crossedQboBoundary ? "failed" : fresh.qbPaymentId ? "qbo_created" : "qbo_unknown";
         await prisma.depositIngest.updateMany({
@@ -297,10 +302,12 @@ export async function POST(req: Request) {
             where: { id: fresh.id, status: { in: ["processing", "qbo_unknown", "qbo_created", "failed"] } },
             data: {
                 status: retryStatus, lastError: message.slice(0, 1000),
-                // Entering "failed" leaves the reservation index — release the milestone
-                // explicitly so the row can't shadow-hold it un-indexed (the retry
-                // re-matches and re-reserves from scratch).
-                ...(retryStatus === "failed" ? { paymentScheduleId: null } : {}),
+                // Entering "failed" pre-boundary leaves the reservation index — release
+                // the milestone so the row can't shadow-hold it un-indexed (that retry
+                // re-matches and re-reserves from scratch). Past the NON-QBO boundary
+                // (settleStartedAt) the reservation is preserved: the retry must resume
+                // the reserved-row path, because the settle may already have committed.
+                ...(retryStatus === "failed" && !fresh.settleStartedAt ? { paymentScheduleId: null } : {}),
             },
         });
         return NextResponse.json({ ok: false, status: retryStatus, reason: message });
@@ -314,7 +321,16 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
 
     if (row.paymentScheduleId) {
         // A prior crashed attempt already reserved a schedule — resume with THAT
-        // reservation rather than re-matching (state may have moved since).
+        // reservation rather than re-matching (state may have moved since), and with
+        // the PRESERVED original payload: the boundary-marked reclaim deliberately
+        // kept row.extracted, and the settle (possibly already committed) used those
+        // values — a re-extracted inbound payload must not shift the check number or
+        // date mid-recovery.
+        try {
+            payload = JSON.parse(row.extracted) as NormalizedPayload;
+        } catch {
+            return await finalizeReconcile(row, "reserved row has unreadable extracted payload", {});
+        }
         schedule = await loadMatchedSchedule(row.paymentScheduleId);
         if (!schedule) {
             return await finalizeReconcile(row, "reserved milestone no longer exists", {});
@@ -349,38 +365,6 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
             }
         }
 
-        // Crash recovery for the non-QBO path: a prior attempt may have SETTLED the
-        // milestone (recordPaymentCore committed) and died before the "applied" write —
-        // and the pre-QBO reclaim then released the reservation, so this retry arrives
-        // with no pointer to it. The physical check is identified by project + check
-        // number + amount: a Paid milestone bearing exactly those IS our earlier
-        // attempt. This runs BEFORE Pending matching so the deposit can never re-apply
-        // to a different (later-added) same-amount milestone.
-        const priorSettle = await prisma.paymentSchedule.findFirst({
-            where: {
-                status: "Paid", paymentMethod: "check", referenceNumber: payload.checkNumber,
-                invoice: { projectId: project.id },
-            },
-            select: { id: true, amount: true, invoice: { select: { code: true } } },
-        });
-        if (priorSettle && Math.abs(toNum(priorSettle.amount) - payload.amount) <= 0.005) {
-            try {
-                await prisma.depositIngest.update({
-                    where: { id: row.id },
-                    data: { status: "applied", paymentScheduleId: priorSettle.id, lastError: null },
-                });
-            } catch (e: any) {
-                if (e?.code !== "P2002") throw e;
-                // Another deposit row terminally holds this schedule — this file is a
-                // second photo of an already-applied check, not a recovery of our own.
-                return await finalizeUnmatched(row, `check #${payload.checkNumber} was already applied via another deposit file`);
-            }
-            return NextResponse.json({
-                ok: true, status: "applied", recovered: true,
-                scheduleId: priorSettle.id, invoiceCode: priorSettle.invoice.code,
-            });
-        }
-
         const candidates = await prisma.paymentSchedule.findMany({
             where: { status: "Pending", invoice: { projectId: project.id, status: { in: OPEN_INVOICE_STATUSES } } },
             select: { id: true, amount: true, invoiceId: true, qbInvoiceId: true, invoice: { select: { code: true } } },
@@ -412,6 +396,12 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
 }
 
 async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
+    // Money-boundary marker (the non-QBO analog of persisting qbRequestPayload):
+    // stamped BEFORE the settle so any crash from here on preserves the reservation
+    // and the original payload, and recovery resumes THIS reserved row exactly.
+    if (!row.settleStartedAt) {
+        await prisma.depositIngest.update({ where: { id: row.id }, data: { settleStartedAt: new Date() } });
+    }
     const paymentDate = parseCheckDateLocalMidnight(payload.checkDate!);
     const result = await recordPaymentCore(schedule.id, schedule.invoiceId, {
         paymentDate, method: "check", referenceNumber: payload.checkNumber, notes: payload.memo,
