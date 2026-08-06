@@ -39,10 +39,14 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // self-authorize in the handler via src/lib/pdf-route-auth (staff session or
 // matching portal client), so portal clients can fetch their documents
 // without a staff session.
+// api/office-tasks/ingest is a machine-to-machine endpoint (GTR Automations
+// bot) that self-authenticates with a Bearer secret (OFFICE_TASKS_INGEST_SECRET)
+// and must return a clean 401, not a redirect to /login. Exact-match only —
+// future descendants under /api/office-tasks/ must NOT inherit the bypass.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 // The legal pages are static server components that define no Server Actions.
 // Next's action IDs are global, so a bypassed path is a place an anonymous caller
