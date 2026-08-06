@@ -1100,12 +1100,13 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
 
     const coClientName = co.project?.client?.name || '';
     const coClientEmail = co.project?.client?.email || '';
+    const coBillToY = y; // meta column anchors to the BILL TO baseline
     page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
     if (coClientName) { y -= 16; page.drawText(coClientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
     if (coClientEmail) { y -= 14; page.drawText(coClientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
 
     const coRightX = pageWidth - margin;
-    let coRy = y + (coClientEmail ? 30 : coClientName ? 16 : 0);
+    let coRy = coBillToY;
 
     const drawCORL = (label: string, value: string, yPos: number) => {
         page.drawText(label, { x: coRightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
@@ -1218,9 +1219,11 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
     }
 
-    // Total
+    // Total — reserve the whole Subtotal/Tax/Revised Amount block (rule + 3 rows)
+    // so it never straddles the bottom margin or splits across pages. Cost-plus
+    // shows a single terms row, so the smaller reserve avoids early page breaks.
     y -= 10;
-    checkNewPage(80);
+    checkNewPage(co.pricingType === 'COST_PLUS' ? 80 : 125);
     page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 25;
 
