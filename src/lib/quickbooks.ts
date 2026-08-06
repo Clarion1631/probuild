@@ -3,6 +3,12 @@
  * Uses OAuth2 tokens stored in integration-store.
  * Docs: https://developer.intuit.com/app/developer/qbo/docs/api/accounting
  */
+import {
+    isE2eQboMockEnabled,
+    recordMockReadInvoiceCall,
+    getMockQboInvoice,
+    mockSendQBPaymentCreate,
+} from "./quickbooks-mock";
 
 export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
@@ -450,6 +456,26 @@ export async function buildQBPaymentRequest(
     qbInvoiceId: string,
     opts: { amount: number; txnDate: string; paymentRefNum: string },
 ): Promise<{ ok: true; requestBody: string } | QBPaymentBuildFailure> {
+    // E2E_QBO_MOCK (deposit-ingest hermeticity, gated in quickbooks-mock.ts):
+    // skip the real readQBInvoice() network call entirely — the caller seeds
+    // this mock's invoice state via /api/payments/test-only/qbo-mock.
+    if (isE2eQboMockEnabled()) {
+        recordMockReadInvoiceCall(qbInvoiceId);
+        const inv = getMockQboInvoice(qbInvoiceId);
+        if (!inv) return { ok: false, reason: "invoice-not-found" };
+        if (!inv.customerId) return { ok: false, reason: "missing-customer" };
+        if (Math.round(inv.balance * 100) !== Math.round(opts.amount * 100)) {
+            return { ok: false, reason: "balance-mismatch", qbBalance: inv.balance, expected: opts.amount };
+        }
+        const mockPayload = {
+            TotalAmt: opts.amount,
+            TxnDate: opts.txnDate,
+            PaymentRefNum: opts.paymentRefNum,
+            CustomerRef: { value: inv.customerId },
+            Line: [{ Amount: opts.amount, LinkedTxn: [{ TxnId: qbInvoiceId, TxnType: "Invoice" }] }],
+        };
+        return { ok: true, requestBody: JSON.stringify(mockPayload) };
+    }
     const inv = await readQBInvoice(tokens, qbInvoiceId);
     if (!inv) return { ok: false, reason: "invoice-not-found" };
     if (!inv.customerId) return { ok: false, reason: "missing-customer" };
@@ -480,6 +506,13 @@ export async function sendQBPaymentCreateRequest(
     requestBody: string,
     requestId: string,
 ): Promise<{ paymentId: string; amount: number }> {
+    // E2E_QBO_MOCK: no network I/O — see quickbooks-mock.ts's doc comment.
+    // mockSendQBPaymentCreate replicates QBO's requestid dedupe (the SAME
+    // requestId always returns the SAME payment), which the qbo_unknown
+    // replay path below depends on.
+    if (isE2eQboMockEnabled()) {
+        return mockSendQBPaymentCreate(requestBody, requestId);
+    }
     const res = await qbFetch(`/payment?requestid=${encodeURIComponent(requestId)}`, tokens, {
         method: "POST",
         body: requestBody,

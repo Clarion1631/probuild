@@ -28,6 +28,7 @@ import {
     getQBPayment,
     deleteQBInvoice,
 } from "./quickbooks";
+import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
 
 export class QBNotConnectedError extends Error {
@@ -39,6 +40,8 @@ export class QBNotConnectedError extends Error {
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
 export async function getFreshQBTokens(): Promise<QBTokens> {
+    // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts.
+    if (isE2eQboMockEnabled()) return MOCK_QB_TOKENS;
     const qb = await getQBSettings();
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
