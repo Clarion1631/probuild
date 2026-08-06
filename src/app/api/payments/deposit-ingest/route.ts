@@ -165,10 +165,13 @@ export async function POST(req: Request) {
         });
     }
     if (row.status === "reconcile") {
-        return NextResponse.json({ ok: true, status: "reconcile", reason: row.lastError, officeTaskId: row.officeTaskId });
+        // Heal a crash between the terminal write and the task create (see ensureReviewTask).
+        const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? "reconcile", "reconcile");
+        return NextResponse.json({ ok: true, status: "reconcile", reason: row.lastError, officeTaskId });
     }
     if (row.status === "unmatched" && !force) {
-        return NextResponse.json({ ok: true, status: "unmatched", reason: row.lastError, officeTaskId: row.officeTaskId });
+        const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, row.lastError ?? "unmatched", "unmatched");
+        return NextResponse.json({ ok: true, status: "unmatched", reason: row.lastError, officeTaskId });
     }
 
     // ── Force-reset an unmatched row (human retry after fixing the cause) ──
@@ -231,6 +234,10 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, status: row.status, reason: "in progress — retry shortly" });
     }
 
+    // `>` (not `>=`): the claim above just incremented attempts, so this value IS the
+    // attempt number about to run — 1..MAX_ATTEMPTS execute, MAX+1 (a reclaim after a
+    // crash mid-attempt-MAX) reconciles. The post-failure check in the catch below uses
+    // `>=` because it runs AFTER the attempt completed. Together: at most MAX real runs.
     if (row.attempts > MAX_ATTEMPTS) {
         const crossedQboBoundary = !!row.qbPaymentId || !!row.qbRequestPayload;
         return await finalizeReconcile(
@@ -478,14 +485,17 @@ async function settleAndFinalize(
 
 // ── Terminal-state helpers ───────────────────────────────────────────────────
 
+// Terminal state is ALWAYS persisted before the review task is created: a crash
+// between the two leaves a terminal row whose missing task is healed on the next
+// re-POST (the terminal-state reads above call ensureReviewTask), whereas the
+// reverse order would leave a NON-terminal row that re-runs the match on the next
+// retry and files a duplicate task. A briefly-missing task is also visible
+// elsewhere (the bot parks the file in _Needs Review); a duplicate would not be.
 async function finalizeUnmatched(row: DepositIngest, reason: string): Promise<NextResponse> {
-    if (row.officeTaskId) {
-        await prisma.depositIngest.update({ where: { id: row.id }, data: { status: "unmatched", lastError: reason } });
-        return NextResponse.json({ ok: true, status: "unmatched", reason, officeTaskId: row.officeTaskId });
-    }
-    const extracted = JSON.parse(row.extracted) as NormalizedPayload;
-    const officeTaskId = await createDepositReviewTask(extracted, reason, "unmatched");
-    await prisma.depositIngest.update({ where: { id: row.id }, data: { status: "unmatched", lastError: reason, officeTaskId } });
+    // "unmatched" is not in the partial reservation index's status list, so this
+    // transition releases any held milestone reservation by itself.
+    await prisma.depositIngest.update({ where: { id: row.id }, data: { status: "unmatched", lastError: reason.slice(0, 1000) } });
+    const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, reason, "unmatched");
     return NextResponse.json({ ok: true, status: "unmatched", reason, officeTaskId });
 }
 
@@ -494,13 +504,33 @@ async function finalizeReconcile(row: DepositIngest, reason: string, opts: { nul
         where: { id: row.id },
         data: { status: "reconcile", lastError: reason.slice(0, 1000), ...(opts.nullReservation ? { paymentScheduleId: null } : {}) },
     });
-    if (row.officeTaskId) {
-        return NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId: row.officeTaskId });
-    }
-    const extracted = JSON.parse(row.extracted) as NormalizedPayload;
-    const officeTaskId = await createDepositReviewTask(extracted, reason, "reconcile");
-    await prisma.depositIngest.update({ where: { id: row.id }, data: { officeTaskId } });
+    const officeTaskId = row.officeTaskId ?? await ensureReviewTask(row, reason, "reconcile");
     return NextResponse.json({ ok: true, status: "reconcile", reason, officeTaskId });
+}
+
+/** Create the ONE review task for a terminal row, tolerating crashes and concurrent
+ *  healers: the task is created first, then claimed onto the row with an atomic
+ *  officeTaskId-is-null update — a claim loser deletes its own just-created copy, so
+ *  exactly one task survives no matter how many callers race. */
+async function ensureReviewTask(row: DepositIngest, reason: string, kind: "unmatched" | "reconcile"): Promise<string | null> {
+    let extracted: NormalizedPayload;
+    try {
+        extracted = JSON.parse(row.extracted) as NormalizedPayload;
+    } catch {
+        return null;
+    }
+    const officeTaskId = await createDepositReviewTask(extracted, reason, kind);
+    if (!officeTaskId) return null;
+    const claim = await prisma.depositIngest.updateMany({
+        where: { id: row.id, officeTaskId: null },
+        data: { officeTaskId },
+    });
+    if (claim.count === 0) {
+        await prisma.officeTask.delete({ where: { id: officeTaskId } }).catch(() => {});
+        const fresh = await prisma.depositIngest.findUnique({ where: { id: row.id }, select: { officeTaskId: true } });
+        return fresh?.officeTaskId ?? null;
+    }
+    return officeTaskId;
 }
 
 /** Column-resolution + position logic inlined from src/app/api/office-tasks/ingest/route.ts. */
