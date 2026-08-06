@@ -59,6 +59,13 @@ const statements = [
   // outside the index, a second file reserves it, and the first row's
   // failed→processing CAS then throws unhandled P2002 forever (never reaching
   // exhaustion). Rebuilt via DROP so re-runs converge on the correct predicate.
+  // Legacy-data preflight: pre-predicate-change code could leave an UNMARKED failed
+  // row holding a reservation; such rows are exactly the ones current code releases,
+  // and clearing them first guarantees the CREATE below can never fail mid-rebuild
+  // (the statements are separate pooler calls — a failed CREATE after a committed
+  // DROP would leave the table with NO reservation index).
+  `UPDATE "DepositIngest" SET "paymentScheduleId" = NULL
+     WHERE "status" = 'failed' AND "settleStartedAt" IS NULL AND "paymentScheduleId" IS NOT NULL`,
   `DROP INDEX IF EXISTS "DepositIngest_paymentScheduleId_reservation_key"`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "DepositIngest_paymentScheduleId_reservation_key"
      ON "DepositIngest" ("paymentScheduleId")
