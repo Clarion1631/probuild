@@ -491,8 +491,12 @@ model EstimateItem {
   costType      CostType?      @relation(fields: [costTypeId], references: [id])
   approvalStatus String?        // pending, approved, rejected
   approvalNote   String?
+  /// @deprecated legacy single-PO link. Superseded by purchaseOrderLinks; kept
+  /// dual-written (syncLegacyPoLink) so a rollback to the pre-many-to-many build
+  /// still reads correctly. Drop in a follow-up once this has been stable on prod.
   purchaseOrderId  String?
   purchaseOrder    PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  purchaseOrderLinks EstimateItemPurchaseOrder[]
   budgetQuantity   Float?
   budgetUnit       String?
   budgetRate       Decimal?
@@ -1570,13 +1574,29 @@ model PurchaseOrder {
   files    PurchaseOrderFile[]
   expenses Expense[]
   messages PurchaseOrderMessage[]
+  /// @deprecated back-relation for the legacy single-PO link. See EstimateItem.purchaseOrderId.
   estimateItems EstimateItem[]
+  estimateItemLinks EstimateItemPurchaseOrder[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([projectId])
   @@index([vendorId])
+}
+
+/// Join table letting one estimate line item carry several purchase orders.
+/// Replaces the one-PO-per-item cap of EstimateItem.purchaseOrderId.
+model EstimateItemPurchaseOrder {
+  id              String        @id @default(cuid())
+  estimateItemId  String
+  estimateItem    EstimateItem  @relation(fields: [estimateItemId], references: [id], onDelete: Cascade)
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+
+  @@unique([estimateItemId, purchaseOrderId])
+  @@index([purchaseOrderId])
 }
 
 model PurchaseOrderMessage {
