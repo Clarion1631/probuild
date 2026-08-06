@@ -53,6 +53,10 @@ const statements = [
      ON "DepositIngest" ("paymentScheduleId")
      WHERE "status" IN ('processing', 'qbo_unknown', 'qbo_created', 'applied', 'reconcile')
        AND "paymentScheduleId" IS NOT NULL`,
+  // Server-only table (payer names, amounts, QBO ids) in Supabase's exposed schema —
+  // RLS on with no policies, so only the service role / direct Prisma access can read it
+  // (matches the other apply-*.mjs scripts' convention for server-only tables).
+  `ALTER TABLE "DepositIngest" ENABLE ROW LEVEL SECURITY`,
 ];
 
 try {

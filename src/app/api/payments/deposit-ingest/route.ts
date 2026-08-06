@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { DepositIngest } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
@@ -83,8 +83,12 @@ export async function POST(req: Request) {
         console.error("DEPOSIT_INGEST_SECRET is not configured");
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
-    const authHeader = req.headers.get("authorization");
-    if (authHeader !== `Bearer ${secret}`) {
+    // Hash both sides to fixed length so timingSafeEqual is usable regardless of
+    // header length — removes the string-compare timing side channel.
+    const authHeader = req.headers.get("authorization") ?? "";
+    const expectedDigest = createHash("sha256").update(`Bearer ${secret}`).digest();
+    const gotDigest = createHash("sha256").update(authHeader).digest();
+    if (!timingSafeEqual(expectedDigest, gotDigest)) {
         return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
     }
 
@@ -94,19 +98,30 @@ export async function POST(req: Request) {
     } catch {
         return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
     }
+    // JSON `null`/arrays parse fine but aren't a payload — 400, not a 500 from field access.
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        return NextResponse.json({ ok: false, reason: "invalid-json" }, { status: 400 });
+    }
 
     const fileId = String(raw.fileId ?? "").trim();
     const projectName = String(raw.projectName ?? "").trim();
-    const amount = Number(raw.amount);
+    const rawAmount = Number(raw.amount);
     // Hard 400s: without these, there's no row to claim and nothing to match against.
     // checkDate/checkNumber are ALSO required but are deliberately NOT 400s — the bot's
     // Gemini extraction can legitimately come back incomplete, and that's an `unmatched`
     // outcome (with an OfficeTask), not a request the bot needs to special-case.
-    if (!fileId) return NextResponse.json({ ok: false, reason: "fileId is required" }, { status: 400 });
-    if (!projectName) return NextResponse.json({ ok: false, reason: "projectName is required" }, { status: 400 });
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (!fileId || fileId.length > 200) return NextResponse.json({ ok: false, reason: "fileId is required (max 200 chars)" }, { status: 400 });
+    if (!projectName || projectName.length > 300) return NextResponse.json({ ok: false, reason: "projectName is required (max 300 chars)" }, { status: 400 });
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
         return NextResponse.json({ ok: false, reason: "amount must be a positive number" }, { status: 400 });
     }
+    // Money is cents-exact: a 3-decimal extraction (100.005) would pass the epsilon
+    // match yet reach QBO unrounded. Normalize once, reject anything not representable.
+    const amountCents = Math.round(rawAmount * 100);
+    if (Math.abs(rawAmount * 100 - amountCents) > 1e-6 || amountCents <= 0) {
+        return NextResponse.json({ ok: false, reason: "amount must have at most 2 decimal places" }, { status: 400 });
+    }
+    const amount = amountCents / 100;
 
     const payload: NormalizedPayload = {
         fileId,
@@ -209,17 +224,27 @@ export async function POST(req: Request) {
     if (!freshlyClaimed && inFlightStatuses.includes(row.status)) {
         const needsLease = row.status !== "failed";
         const staleBefore = new Date(Date.now() - STALE_PROCESSING_MS);
+        const preQbo = row.status === "processing" || row.status === "failed";
         const claim = await prisma.depositIngest.updateMany({
             where: {
                 id: row.id, status: row.status,
                 ...(needsLease ? { processingStartedAt: { lt: staleBefore } } : {}),
             },
             data: {
+                // CAS failed→processing: leaving status as "failed" would let a second
+                // concurrent retry match the same claim (failed has no lease) and both
+                // would send QBO bodies under the same requestid. The winner takes a
+                // fresh processing lease; the loser's status CAS fails.
+                status: preQbo ? "processing" : row.status,
                 attempts: { increment: 1 }, processingStartedAt: new Date(),
-                // Only overwrite the audit-trail payload for pre-QBO-boundary retries — a
-                // qbo_unknown/qbo_created resume deliberately replays against the ORIGINAL
-                // extracted values (see resumeFromQboUnknown/resumeFromQboCreated below).
-                ...(row.status === "processing" || row.status === "failed" ? { extracted: JSON.stringify(payload) } : {}),
+                // Pre-QBO retries restart from a clean slate: fresh payload AND a
+                // released reservation, so matching re-runs end-to-end against current
+                // inputs — a stale reservation must never survive a payload overwrite.
+                // (A "processing"/"failed" row is pre-QBO-boundary by construction: the
+                // status flips to qbo_unknown before qbRequestPayload is ever sent.)
+                // qbo_unknown/qbo_created resumes deliberately replay the ORIGINAL
+                // extracted values (see resumeFromQboUnknown/resumeFromQboCreated).
+                ...(preQbo ? { extracted: JSON.stringify(payload), paymentScheduleId: null } : {}),
             },
         });
         if (claim.count > 0) {
@@ -264,8 +289,17 @@ export async function POST(req: Request) {
         }
         const retryStatus = !crossedQboBoundary ? "failed" : fresh.qbPaymentId ? "qbo_created" : "qbo_unknown";
         await prisma.depositIngest.updateMany({
-            where: { id: fresh.id },
-            data: { status: retryStatus, lastError: message.slice(0, 1000) },
+            // Conditioned on an active status: a throw AFTER a terminal write (e.g. the
+            // review-task transaction hiccuping post-finalize) must never regress
+            // applied/unmatched/reconcile back into the retry loop.
+            where: { id: fresh.id, status: { in: ["processing", "qbo_unknown", "qbo_created", "failed"] } },
+            data: {
+                status: retryStatus, lastError: message.slice(0, 1000),
+                // Entering "failed" leaves the reservation index — release the milestone
+                // explicitly so the row can't shadow-hold it un-indexed (the retry
+                // re-matches and re-reserves from scratch).
+                ...(retryStatus === "failed" ? { paymentScheduleId: null } : {}),
+            },
         });
         return NextResponse.json({ ok: false, status: retryStatus, reason: message });
     }
@@ -513,24 +547,27 @@ async function finalizeReconcile(row: DepositIngest, reason: string, opts: { nul
  *  officeTaskId-is-null update — a claim loser deletes its own just-created copy, so
  *  exactly one task survives no matter how many callers race. */
 async function ensureReviewTask(row: DepositIngest, reason: string, kind: "unmatched" | "reconcile"): Promise<string | null> {
-    let extracted: NormalizedPayload;
+    // Never throws: callers run AFTER the terminal-state write, and an exception here
+    // would fall into the outer catch — which must not touch terminal rows (and a
+    // missing task self-heals on the next read anyway).
     try {
-        extracted = JSON.parse(row.extracted) as NormalizedPayload;
-    } catch {
+        const extracted = JSON.parse(row.extracted) as NormalizedPayload;
+        const officeTaskId = await createDepositReviewTask(extracted, reason, kind);
+        if (!officeTaskId) return null;
+        const claim = await prisma.depositIngest.updateMany({
+            where: { id: row.id, officeTaskId: null },
+            data: { officeTaskId },
+        });
+        if (claim.count === 0) {
+            await prisma.officeTask.delete({ where: { id: officeTaskId } }).catch(() => {});
+            const fresh = await prisma.depositIngest.findUnique({ where: { id: row.id }, select: { officeTaskId: true } });
+            return fresh?.officeTaskId ?? null;
+        }
+        return officeTaskId;
+    } catch (e) {
+        console.error("[deposit-ingest] review-task create failed (will heal on next read):", e);
         return null;
     }
-    const officeTaskId = await createDepositReviewTask(extracted, reason, kind);
-    if (!officeTaskId) return null;
-    const claim = await prisma.depositIngest.updateMany({
-        where: { id: row.id, officeTaskId: null },
-        data: { officeTaskId },
-    });
-    if (claim.count === 0) {
-        await prisma.officeTask.delete({ where: { id: officeTaskId } }).catch(() => {});
-        const fresh = await prisma.depositIngest.findUnique({ where: { id: row.id }, select: { officeTaskId: true } });
-        return fresh?.officeTaskId ?? null;
-    }
-    return officeTaskId;
 }
 
 /** Column-resolution + position logic inlined from src/app/api/office-tasks/ingest/route.ts. */
