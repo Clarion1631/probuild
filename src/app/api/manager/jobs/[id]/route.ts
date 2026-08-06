@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canonicalProjectStatus } from "@/lib/project-status";
 import { geocodeJobSiteAddress } from "@/lib/geocode";
+import { isValidChatWebhookUrl } from "@/lib/chat-webhook";
 
 const SELECT = {
     id: true,
@@ -14,6 +15,9 @@ const SELECT = {
     locationLng: true,
     geofenceRadiusMeters: true,
     clientId: true,
+    // Only safe here because this route is MANAGER/ADMIN-gated; the webhook URL
+    // is a credential and must never appear in crew-visible project responses.
+    chatWebhookUrl: true,
 } as const;
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -127,6 +131,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         const geocoded = await geocodeJobSiteAddress(body.location);
         data.locationLat = geocoded?.lat ?? null;
         data.locationLng = geocoded?.lng ?? null;
+    }
+
+    if (body.chatWebhookUrl !== undefined) {
+        if (body.chatWebhookUrl === null || body.chatWebhookUrl === "") {
+            data.chatWebhookUrl = null;
+        } else if (typeof body.chatWebhookUrl === "string" && isValidChatWebhookUrl(body.chatWebhookUrl)) {
+            data.chatWebhookUrl = body.chatWebhookUrl.trim();
+        } else {
+            return NextResponse.json(
+                { error: "chatWebhookUrl must be a Google Chat incoming webhook (https://chat.googleapis.com/v1/spaces/...)" },
+                { status: 400 }
+            );
+        }
     }
 
     if (Object.keys(data).length === 0) {

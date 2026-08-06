@@ -1,8 +1,19 @@
 "use client";
 export const dynamic = "force-dynamic";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
+
+type ClockInSuggestion = {
+    scheduleTaskId: string;
+    clockInEstimateItemId: string;
+    costCodeId: string;
+    costCodeLabel: string;
+    taskName: string;
+    source: "daily_log" | "today_schedule" | "user_history";
+    confidence: "high" | "medium" | "low";
+    reason: string | null;
+};
 
 export default function TimeClockPage() {
     const router = useRouter();
@@ -16,6 +27,13 @@ export default function TimeClockPage() {
 
     const [budgetBuckets, setBudgetBuckets] = useState<any[]>([]);
     const [selectedBucket, setSelectedBucket] = useState<string>("");
+
+    const [suggestion, setSuggestion] = useState<ClockInSuggestion | null>(null);
+    // True once the user has picked a phase themselves — the suggestion preselect
+    // must never fight a manual choice.
+    const userPickedBucket = useRef(false);
+    // Set while the "are you sure?" mismatch dialog is showing.
+    const [confirmMismatch, setConfirmMismatch] = useState(false);
 
     const [projectsError, setProjectsError] = useState<string>("");
     const [timeEntriesError, setTimeEntriesError] = useState<string>("");
@@ -91,8 +109,13 @@ export default function TimeClockPage() {
         if (!selectedProject) {
             setBudgetBuckets([]);
             setSelectedBucket("");
+            setSuggestion(null);
+            userPickedBucket.current = false;
             return;
         }
+
+        userPickedBucket.current = false;
+        setSuggestion(null);
 
         fetch(`/api/projects/${selectedProject}/estimate-items`)
             .then(res => res.json())
@@ -106,7 +129,41 @@ export default function TimeClockPage() {
                 setBucketsError("Failed to load budget phases");
             });
 
+        // Suggested task for today (from the latest daily log / schedule).
+        // Best-effort: a failure here must never block clocking in.
+        fetch(`/api/mobile/time-suggestion?projectId=${selectedProject}`)
+            .then(res => res.ok ? res.json() : { suggestion: null })
+            .then(data => {
+                const s: ClockInSuggestion | null = data?.suggestion ?? null;
+                setSuggestion(s);
+                if (s && !userPickedBucket.current) {
+                    setSelectedBucket(s.clockInEstimateItemId);
+                }
+            })
+            .catch(() => setSuggestion(null));
+
     }, [selectedProject]);
+
+    // Phase-code-grouped picker: groups ordered by cost code; codeless items
+    // surface last, flagged — every estimate item is supposed to carry a phase code.
+    const bucketGroups = useMemo(() => {
+        const groups = new Map<string, { label: string; items: any[] }>();
+        for (const bucket of budgetBuckets) {
+            const key = bucket.costCode ? bucket.costCode.code : "~none";
+            const label = bucket.costCode
+                ? `${bucket.costCode.code} — ${bucket.costCode.name}`
+                : "No phase code (fix in estimate)";
+            if (!groups.has(key)) groups.set(key, { label, items: [] });
+            groups.get(key)!.items.push(bucket);
+        }
+        return [...groups.entries()]
+            .sort(([a], [b]) => {
+                if (a === "~none") return 1;
+                if (b === "~none") return -1;
+                return a.localeCompare(b, undefined, { numeric: true });
+            })
+            .map(([, group]) => group);
+    }, [budgetBuckets]);
 
     const getLocation = (): Promise<{ lat: number, lng: number }> => {
         return new Promise((resolve, reject) => {
@@ -125,8 +182,7 @@ export default function TimeClockPage() {
         });
     };
 
-    const handleClockInOut = async () => {
-        setError("");
+    const performClockIn = async (bucketId: string, overridden: boolean) => {
         let loc = null;
         try {
             loc = await getLocation();
@@ -135,32 +191,57 @@ export default function TimeClockPage() {
             setError(e);
         }
 
+        try {
+            const res = await fetch('/api/time-entries', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    projectId: selectedProject,
+                    estimateItemId: bucketId || null,
+                    latitude: loc?.lat,
+                    longitude: loc?.lng,
+                    ...(suggestion ? {
+                        suggestedScheduleTaskId: suggestion.scheduleTaskId,
+                        suggestedCostCodeId: suggestion.costCodeId,
+                        suggestionSource: suggestion.source,
+                        suggestionOverridden: overridden,
+                    } : {}),
+                })
+            });
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+
+            setStatus("Clocked In");
+            setCurrentTimeEntryId(data.id);
+            if (bucketId !== selectedBucket) setSelectedBucket(bucketId);
+        } catch (err: any) {
+            setError(err.message);
+        }
+    };
+
+    const handleClockInOut = async () => {
+        setError("");
+
         if (status === "Clocked Out") {
             if (!selectedProject) {
                 setError("Please select a project before clocking in.");
                 return;
             }
 
-            try {
-                const res = await fetch('/api/time-entries', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        projectId: selectedProject,
-                        estimateItemId: selectedBucket || null,
-                        latitude: loc?.lat,
-                        longitude: loc?.lng
-                    })
-                });
-                const data = await res.json();
-                if (data.error) throw new Error(data.error);
-
-                setStatus("Clocked In");
-                setCurrentTimeEntryId(data.id);
-            } catch (err: any) {
-                setError(err.message);
+            // Red flag: picked something other than today's plan? Confirm first.
+            if (suggestion && selectedBucket !== suggestion.clockInEstimateItemId) {
+                setConfirmMismatch(true);
+                return;
             }
+            await performClockIn(selectedBucket, false);
         } else {
+            let loc = null;
+            try {
+                loc = await getLocation();
+                setLocation(loc);
+            } catch (e: any) {
+                setError(e);
+            }
             try {
                 if (!currentTimeEntryId) return;
 
@@ -217,23 +298,47 @@ export default function TimeClockPage() {
                             )}
                         </div>
 
+                        {suggestion && (
+                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                                <div className="text-sm text-blue-800 font-medium">
+                                    Suggested: {suggestion.taskName}
+                                </div>
+                                <div className="text-xs text-blue-700 mt-0.5">{suggestion.costCodeLabel}</div>
+                                {suggestion.reason && (
+                                    <div className="text-xs text-blue-600 mt-1">{suggestion.reason}</div>
+                                )}
+                            </div>
+                        )}
+
                         {budgetBuckets.length > 0 && (
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-2">Budget Bucket (Phase)</label>
                                 <select
                                     value={selectedBucket}
-                                    onChange={(e) => setSelectedBucket(e.target.value)}
+                                    onChange={(e) => {
+                                        userPickedBucket.current = true;
+                                        setSelectedBucket(e.target.value);
+                                    }}
                                     className="hui-input"
                                 >
                                     <option value="">Select a Phase...</option>
-                                    {budgetBuckets.map(b => (
-                                        <option key={b.id} value={b.id}>
-                                            {b.name}{b.costCode ? ` — ${b.costCode.code}` : ''}
-                                        </option>
+                                    {bucketGroups.map(group => (
+                                        <optgroup key={group.label} label={group.label}>
+                                            {group.items.map((b: any) => (
+                                                <option key={b.id} value={b.id}>
+                                                    {b.costCode ? `${b.costCode.code} — ` : ''}{b.name}
+                                                </option>
+                                            ))}
+                                        </optgroup>
                                     ))}
                                 </select>
                                 {bucketsError && (
                                     <p className="text-xs text-red-600 mt-1">{bucketsError}</p>
+                                )}
+                                {budgetBuckets.some((b: any) => !b.costCode) && (
+                                    <p className="text-xs text-amber-600 mt-1">
+                                        Some phases have no phase code — assign cost codes in the estimate.
+                                    </p>
                                 )}
                             </div>
                         )}
@@ -282,6 +387,46 @@ export default function TimeClockPage() {
                     </div>
                 )}
             </div>
+
+            {confirmMismatch && suggestion && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-6">
+                    <div className="hui-card w-full max-w-sm p-6 text-left">
+                        <h2 className="text-lg font-bold text-hui-textMain mb-2">
+                            Are you sure this is the correct task?
+                        </h2>
+                        <p className="text-sm text-slate-600 mb-5">
+                            Today&apos;s plan is <span className="font-semibold">{suggestion.taskName}</span> ({suggestion.costCodeLabel}).
+                        </p>
+                        <div className="space-y-2">
+                            <button
+                                className="hui-btn hui-btn-green w-full"
+                                onClick={async () => {
+                                    setConfirmMismatch(false);
+                                    userPickedBucket.current = true;
+                                    await performClockIn(suggestion.clockInEstimateItemId, false);
+                                }}
+                            >
+                                Use suggested task
+                            </button>
+                            <button
+                                className="hui-btn w-full"
+                                onClick={async () => {
+                                    setConfirmMismatch(false);
+                                    await performClockIn(selectedBucket, true);
+                                }}
+                            >
+                                Keep my choice
+                            </button>
+                            <button
+                                className="w-full py-2 text-sm text-slate-500 hover:text-slate-700"
+                                onClick={() => setConfirmMismatch(false)}
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

@@ -19,12 +19,16 @@ const responseSchema = {
             type: "STRING",
             description: "Any issues, delays, or concerns mentioned. If none, return empty string."
         },
+        nextSteps: {
+            type: "STRING",
+            description: "What the crew should do next, based on the notes and photos (e.g. 'Install window trim on west wall; drywall inspection in the morning'). Empty string if unclear."
+        },
         weather: {
             type: "STRING",
             description: "Inferred weather conditions if mentioned, otherwise empty string. Must be a short string like 'Sunny, 80F' or 'Rainy'."
         }
     },
-    required: ["workPerformed", "materialsDelivered", "issues", "weather"],
+    required: ["workPerformed", "materialsDelivered", "issues", "nextSteps", "weather"],
 };
 
 export async function POST(req: NextRequest) {
@@ -68,6 +72,7 @@ Please extract and expand upon this information into the following structured fo
 - workPerformed: Detail what was done today. Make it read well.
 - materialsDelivered: Any materials.
 - issues: Any issues or delays.
+- nextSteps: What the crew should do next, based on the notes and photos.
 - weather: If any weather info is included.
 
 Respond ONLY with valid JSON matching the schema provided.`;
