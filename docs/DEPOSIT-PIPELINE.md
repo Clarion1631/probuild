@@ -22,7 +22,7 @@ flowchart TD
     H -- "yes" --> I["QuickBooks: create/settle payment<br/>with real check date + number"]
     I --> J["ProBuild: milestone marked Paid<br/>same date + check number"]
     J --> K["Photo archived to<br/>Processed Receipts/…/Deposits"]
-    K --> L["Bank feed: deposit auto-matches<br/>the payment — Vanessa clicks Match"]
+    K --> L["Vanessa: record a Deposit selecting<br/>the associated payment(s) — the bank<br/>feed line then matches it"]
     H -- "no / ambiguous" --> M["NO money moves"]
     M --> N["Photo parked in '_Needs Review'<br/>+ card on the /tasks board<br/>+ alert email to the team"]
 ```
@@ -45,7 +45,7 @@ flowchart LR
     end
     subgraph Money["Money rules"]
         M1["One Drive file = one payment, ever<br/>(retries and crashes can't duplicate)"]
-        M2["QuickBooks payments land in Undeposited Funds —<br/>Vanessa MATCHES the bank deposit, never re-adds"]
+        M2["QuickBooks payments land in Undeposited Funds —<br/>record a Deposit selecting the payment(s), then match<br/>the bank feed line to it. Never re-add the income.<br/>(A single-check deposit can also match the payment<br/>directly — QBO creates the deposit for you.)"]
         M3["Amounts must match to the cent"]
     end
 ```
@@ -68,7 +68,7 @@ flowchart LR
 
 1. Find the deposit in the Washington Trust site — the deposit row's **Image → View** shows the actual check (payer, number, memo).
 2. ProBuild: open the project invoice → milestone → **Record Payment** with the check's real date + number. Back-dated recordings do not email the client.
-3. QuickBooks: bank feed → the deposit → **Match** to the milestone invoice (create it first from ProBuild's "QuickBooks Link" button if it doesn't exist; if the invoice is dated more than ~30 days after the deposit, edit its invoice date or QBO won't offer the match).
+3. QuickBooks: receive the payment against the milestone invoice (create the invoice first from ProBuild's "QuickBooks Link" button if it doesn't exist; if the invoice is dated more than ~30 days after the deposit, edit its invoice date or QBO won't offer the match). Then per Vanessa's workflow: **record a Deposit selecting the associated payment(s)** — until the deposit is recorded, QuickBooks won't allow the bank-feed match. Single-check deposits can also be matched straight to the payment from the feed.
 
 ## State machine (endpoint internals, for debugging)
 
