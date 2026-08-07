@@ -129,8 +129,115 @@ type DbClient = PrismaClient | Prisma.TransactionClient;
 interface EligibleItem {
     id: string;
     parentId: string | null;
+    estimateId: string;
     costCodeId: string | null;
     costCode: { code: string; name: string } | null;
+}
+
+export interface ChargeableItem {
+    id: string;
+    name: string;
+    total: unknown;
+    estimateId: string;
+    estimateTitle: string | null;
+    costCodeId: string | null;
+    costCode: { code: string; name: string } | null;
+}
+
+/**
+ * THE one resolver for "what can a punch charge to" — used by the picker
+ * route, the suggestion engine, and the chat post-back so they can never
+ * disagree.
+ *
+ * Per eligible estimate: enumerate LEAF items, resolve each leaf to its
+ * nearest coded item at-or-above (same estimate only, visited-set guarded),
+ * and dedupe those targets. A coded parent whose children are also coded is
+ * therefore never offered alongside them (the children win), and a summary
+ * parent is offered exactly once when its children are uncoded. An estimate
+ * with no coded items at all falls back to its own top-level rows (legacy,
+ * chargeless) — per estimate, so one coded estimate can't suppress another's
+ * fallback.
+ */
+export async function resolveChargeableItems(
+    projectId: string,
+    db: DbClient = prisma,
+): Promise<{ items: ChargeableItem[]; targetByItemId: Map<string, ChargeableItem> }> {
+    const estimates = await db.estimate.findMany({
+        where: { projectId, status: { in: ELIGIBLE_ESTIMATE_STATUSES }, archivedAt: null },
+        orderBy: { createdAt: "asc" },
+        select: {
+            id: true,
+            title: true,
+            items: {
+                orderBy: { order: "asc" },
+                select: {
+                    id: true,
+                    name: true,
+                    total: true,
+                    parentId: true,
+                    costCodeId: true,
+                    costCode: { select: { code: true, name: true } },
+                },
+            },
+        },
+    });
+
+    const offered: ChargeableItem[] = [];
+    const targetByItemId = new Map<string, ChargeableItem>();
+
+    for (const estimate of estimates) {
+        const byId = new Map(estimate.items.map(item => [item.id, item]));
+        const hasChildren = new Set(
+            estimate.items.map(item => item.parentId).filter((id): id is string => !!id),
+        );
+
+        const toChargeable = (item: (typeof estimate.items)[number]): ChargeableItem => ({
+            id: item.id,
+            name: item.name,
+            total: item.total,
+            estimateId: estimate.id,
+            estimateTitle: estimate.title ?? null,
+            costCodeId: item.costCodeId,
+            costCode: item.costCode,
+        });
+
+        // Nearest coded item at-or-above, WITHIN this estimate, cycle-safe.
+        const nearestCoded = (itemId: string): (typeof estimate.items)[number] | null => {
+            const visited = new Set<string>();
+            let current = byId.get(itemId);
+            while (current && !visited.has(current.id)) {
+                visited.add(current.id);
+                if (current.costCodeId && current.costCode) return current;
+                current = current.parentId ? byId.get(current.parentId) : undefined;
+            }
+            return null;
+        };
+
+        const seenTargets = new Set<string>();
+        for (const item of estimate.items) {
+            if (hasChildren.has(item.id)) continue; // leaves only drive the offer
+            const target = nearestCoded(item.id);
+            if (target && !seenTargets.has(target.id)) {
+                seenTargets.add(target.id);
+                offered.push(toChargeable(target));
+            }
+        }
+
+        if (seenTargets.size === 0) {
+            // Fully uncoded estimate — legacy top-level rows, chargeless.
+            for (const item of estimate.items) {
+                if (item.parentId === null) offered.push(toChargeable(item));
+            }
+        }
+
+        // Resolution map for EVERY item on the estimate (engine + chat use it).
+        for (const item of estimate.items) {
+            const target = nearestCoded(item.id);
+            if (target) targetByItemId.set(item.id, toChargeable(target));
+        }
+    }
+
+    return { items: offered, targetByItemId };
 }
 
 export interface SuggestableTask {
@@ -140,8 +247,10 @@ export interface SuggestableTask {
     startDate: Date;
     endDate: Date;
     type: string;
+    /** ScheduleTask.order — the canonical schedule sequence. */
+    order: number;
     assignedToUser: boolean;
-    /** Top-level estimate item this task charges to. */
+    /** The chargeable estimate item this task resolves to (offered by the picker). */
     clockInEstimateItemId: string;
     costCodeId: string;
     costCodeLabel: string;
@@ -151,16 +260,16 @@ export interface SuggestableTask {
 
 /**
  * Load the project's leaf tasks that a suggestion is allowed to name:
- * non-Complete `type === "task"` leaves whose estimate item maps up to a
- * top-level item on an eligible estimate, where the bucket has a cost code
- * and the leaf's own cost code (if any) agrees with it.
+ * non-Complete `type === "task"` leaves whose linked estimate item resolves —
+ * via resolveChargeableItems, the same resolver the picker uses — to a
+ * cost-coded chargeable target on an eligible estimate.
  */
 export async function loadSuggestableTasks(
     projectId: string,
     userId: string,
     db: DbClient = prisma,
 ): Promise<SuggestableTask[]> {
-    const [tasks, items] = await Promise.all([
+    const [tasks, { targetByItemId }] = await Promise.all([
         db.scheduleTask.findMany({
             where: { projectId },
             select: {
@@ -172,40 +281,14 @@ export async function loadSuggestableTasks(
                 endDate: true,
                 status: true,
                 type: true,
+                order: true,
                 assignments: { where: { userId }, select: { id: true } },
             },
         }),
-        db.estimateItem.findMany({
-            where: {
-                estimate: { projectId, status: { in: ELIGIBLE_ESTIMATE_STATUSES }, archivedAt: null },
-            },
-            select: {
-                id: true,
-                parentId: true,
-                costCodeId: true,
-                costCode: { select: { code: true, name: true } },
-            },
-        }),
+        resolveChargeableItems(projectId, db),
     ]);
 
-    const itemById = new Map<string, EligibleItem>(items.map(item => [item.id, item]));
     const parentIds = new Set(tasks.map(task => task.parentId).filter((id): id is string => !!id));
-
-    // The picker offers COST-CODED items at any depth (see the estimate-items
-    // route): flat estimates code their top-level items, sectioned estimates
-    // code the leaves under uncoded Section rows. The selectable target for a
-    // task is therefore the nearest coded item at-or-above its linked item —
-    // usually the item itself.
-    const toNearestCoded = (itemId: string): EligibleItem | null => {
-        let current = itemById.get(itemId);
-        let hops = 0;
-        while (current && hops < 10) {
-            if (current.costCodeId && current.costCode) return current;
-            current = current.parentId ? itemById.get(current.parentId) : undefined;
-            hops += 1;
-        }
-        return null;
-    };
 
     const out: SuggestableTask[] = [];
     for (const task of tasks) {
@@ -213,13 +296,8 @@ export async function loadSuggestableTasks(
         if (task.status === "Complete") continue;
         if (parentIds.has(task.id)) continue; // never suggest a phase parent
         if (!task.estimateItemId) continue;
-        const leafItem = itemById.get(task.estimateItemId);
-        if (!leafItem) continue; // item not on an eligible estimate
-        const target = toNearestCoded(task.estimateItemId);
-        if (!target) continue; // nothing chargeable anywhere up the chain
-        // Walking up only happens when the task's own item is uncoded, so the
-        // charged code can never contradict the leaf's — coded leaves map to
-        // themselves.
+        const target = targetByItemId.get(task.estimateItemId);
+        if (!target || !target.costCodeId || !target.costCode) continue; // nothing chargeable up the (same-estimate) chain
         out.push({
             taskId: task.id,
             taskName: task.name,
@@ -227,12 +305,13 @@ export async function loadSuggestableTasks(
             startDate: task.startDate,
             endDate: task.endDate,
             type: task.type,
+            order: task.order,
             assignedToUser: task.assignments.length > 0,
             clockInEstimateItemId: target.id,
-            costCodeId: target.costCodeId!,
-            costCodeCode: target.costCode!.code,
-            costCodeName: target.costCode!.name,
-            costCodeLabel: `${target.costCode!.code} — ${target.costCode!.name}`,
+            costCodeId: target.costCodeId,
+            costCodeCode: target.costCode.code,
+            costCodeName: target.costCode.name,
+            costCodeLabel: `${target.costCode.code} — ${target.costCode.name}`,
         });
     }
     return out;
