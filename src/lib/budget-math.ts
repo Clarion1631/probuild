@@ -2,7 +2,57 @@
  * Budget math utilities for estimate internal costing.
  * Uses plain JS arithmetic (sufficient for display-only calculations).
  * Precision-critical storage uses Prisma Decimal on the server side.
+ *
+ * CANONICAL SEMANTIC: `EstimateItem.markupPercent` stores GROSS MARGIN ON
+ * SELL PRICE despite its name (cost = sell * (1 - m/100), sell = cost / (1 - m/100)).
+ * baseCost + unitCost are the authoritative pair; markupPercent is derived
+ * from them (see derivedMarginPct). Do not treat it as markup-on-cost.
  */
+
+/**
+ * Round a number to `decimals` places, collapsing IEEE-754 floating-point
+ * drift before rounding. Plain `Math.round(x * f) / f` can disagree with an
+ * algebraically equivalent computation when a value lands exactly on a
+ * rounding boundary (e.g. 20.40 / 0.8 === 25.499999999999996, which rounds
+ * down, while the algebraically identical 20.40 * 1.25 === 25.5, which
+ * rounds up). Snapping to 12 significant digits first removes that drift so
+ * sellFromMargin(cost, margin) rounds the same way the legacy
+ * markup-on-cost formula did — this is what keeps price conversion neutral
+ * (NO SELL PRICE MAY MOVE).
+ *
+ * Uses toPrecision (relative) rather than toFixed (absolute): a fixed number
+ * of decimal places leaves too little headroom at decimals=2 and would round
+ * genuinely-below-the-boundary values UP (1.004999996 -> 1.01). Binary drift
+ * from these operations shows up around the 15th significant digit, so 12 is
+ * comfortably clear of real precision while still absorbing the noise.
+ */
+export function roundMoney(value: number, decimals = 0): number {
+  const f = 10 ** decimals;
+  const scaled = value * f;
+  if (!Number.isFinite(scaled)) return value;
+  return Math.round(Number(scaled.toPrecision(12))) / f;
+}
+
+/**
+ * Default gross margin for items produced by paths that USED to apply a 25%
+ * markup-on-cost (Room Studio furnish, AI takeoff). Equals that legacy markup
+ * exactly (base * 1.25 === base / 0.8), which is what makes the conversion
+ * price-neutral.
+ *
+ * Deliberately NOT the same as the plain `25` default used by the schema and
+ * by hand-added estimate items (EstimateItem.markupPercent @default(25),
+ * saveEstimate's fallback). Those 25s were always a 25% MARGIN and are already
+ * canonical, so they must stay 25 — do not "unify" them to this constant.
+ */
+export const DEFAULT_MARGIN_PCT = 20;
+
+/**
+ * Convert a legacy markup-on-cost percentage to the canonical gross-margin
+ * percentage. Formula: margin% = markup% / (100 + markup%) * 100.
+ */
+export function marginFromMarkup(markupPct: number): number {
+  return (markupPct / (100 + markupPct)) * 100;
+}
 
 /**
  * Calculate internal budget for an estimate item.

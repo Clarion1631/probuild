@@ -894,6 +894,8 @@ async function importDocumentItems(section) {
             total: totalPayment,
             order: order++,
             baseCost: materialCost > 0 ? (quantity > 0 ? materialCost / quantity : materialCost) : null,
+            // Houzz PROFIT_PERCENTAGE is already a gross-margin-on-sell value, matching
+            // the canonical markupPercent semantic (see src/lib/budget-math.ts) — no conversion needed.
             markupPercent: parseMoney(row.PROFIT_PERCENTAGE) || 0,
           },
         });
