@@ -477,9 +477,9 @@ model EstimateItem {
   description   String?
   type          String         @default("Material") // Legacy fallback
   quantity      Float          @default(1)
-  baseCost      Decimal? // Raw cost before markup (internal only)
-  markupPercent Float          @default(25) // Markup percentage (internal only)
-  unitCost      Decimal          @default(0) // Sell price = baseCost * (1 + markupPercent/100)
+  baseCost      Decimal? // Raw cost before margin (internal only)
+  markupPercent Float          @default(25) // Gross margin % on sell price (internal only; field name is legacy/misleading — see src/lib/budget-math.ts)
+  unitCost      Decimal          @default(0) // Sell price = baseCost / (1 - markupPercent/100)
   total         Decimal          @default(0)
   order         Int            @default(0)
   parentId      String?

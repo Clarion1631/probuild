@@ -17,6 +17,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { normalizeEstimateItemForSave } from "./estimate-item-payload";
+import { DEFAULT_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -13858,7 +13859,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             ? productById.get(asset.assetId.slice(5))
             : undefined;
         const def = getItemDef(asset.assetId);
-        const markupPercent = 25;
+        const marginPercent = DEFAULT_MARGIN_PCT;
         const name = product?.name ?? def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
@@ -13894,7 +13895,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             ?? `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
         detailsArray.unshift(`SKU: ${sku}`);
 
-        const unitCost = Math.round(baseCost * (1 + markupPercent / 100));
+        const unitCost = roundMoney(sellFromMargin(baseCost, marginPercent));
         const total = unitCost * 1;
         totalEstimate += total;
 
@@ -13906,7 +13907,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             type: "Material",
             quantity: 1,
             baseCost,
-            markupPercent,
+            markupPercent: marginPercent,
             unitCost,
             total,
             costCodeId,

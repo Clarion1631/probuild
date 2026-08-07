@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({
                 success: true,
                 analysis:
-                    "No historical pricing data found yet. As you create more estimates across projects, this tool will analyze your pricing patterns, average costs by category, markup trends, and give you recommendations for competitive yet profitable pricing.",
+                    "No historical pricing data found yet. As you create more estimates across projects, this tool will analyze your pricing patterns, average costs by category, margin trends, and give you recommendations for competitive yet profitable pricing.",
             });
         }
 
@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
                 count: number;
                 totalCost: number;
                 totalUnitCost: number;
-                markups: number[];
+                margins: number[];
                 names: string[];
                 projectTypes: string[];
             }
@@ -54,7 +54,7 @@ export async function POST(req: NextRequest) {
                     count: 0,
                     totalCost: 0,
                     totalUnitCost: 0,
-                    markups: [],
+                    margins: [],
                     names: [],
                     projectTypes: [],
                 };
@@ -63,7 +63,7 @@ export async function POST(req: NextRequest) {
             entry.count++;
             entry.totalCost += Number(item.total) || 0;
             entry.totalUnitCost += Number(item.unitCost) || 0;
-            entry.markups.push(item.markupPercent || 0);
+            entry.margins.push(item.markupPercent || 0);
             if (!entry.names.includes(item.name)) {
                 entry.names.push(item.name);
             }
@@ -80,10 +80,10 @@ export async function POST(req: NextRequest) {
                 itemCount: data.count,
                 averageCost: data.totalCost / data.count,
                 averageUnitCost: data.totalUnitCost / data.count,
-                averageMarkup:
-                    data.markups.reduce((a, b) => a + b, 0) / data.markups.length,
-                minMarkup: Math.min(...data.markups),
-                maxMarkup: Math.max(...data.markups),
+                averageMargin:
+                    data.margins.reduce((a, b) => a + b, 0) / data.margins.length,
+                minMargin: Math.min(...data.margins),
+                maxMargin: Math.max(...data.margins),
                 sampleItems: data.names.slice(0, 10),
                 projectTypes: data.projectTypes.slice(0, 5),
             })
@@ -110,7 +110,7 @@ Location: ${currentEstimate.project?.location || "Not specified"}
 Current items: ${currentEstimate.items
                     .map(
                         (i) =>
-                            `${i.name} (${i.type}) - qty: ${i.quantity}, unit: $${Number(i.unitCost).toFixed(2)}, total: $${Number(i.total).toFixed(2)}, markup: ${i.markupPercent}%`
+                            `${i.name} (${i.type}) - qty: ${i.quantity}, unit: $${Number(i.unitCost).toFixed(2)}, total: $${Number(i.total).toFixed(2)}, margin: ${i.markupPercent}%`
                     )
                     .join("; ")}
 Total estimate: $${currentEstimate.items.reduce((sum, i) => sum + (Number(i.total) || 0), 0).toFixed(2)}
@@ -118,9 +118,9 @@ Total estimate: $${currentEstimate.items.reduce((sum, i) => sum + (Number(i.tota
             }
         }
 
-        const prompt = `Analyze historical pricing data from this contractor's past projects. Provide: average costs by category, markup patterns, price trends, and recommendations for competitive yet profitable pricing.
+        const prompt = `Analyze historical pricing data from this contractor's past projects. Provide: average costs by category, margin patterns, price trends, and recommendations for competitive yet profitable pricing.
 
-Historical Data Summary (${allItems.length} total line items across all projects):
+Historical Data Summary (${allItems.length} total line items across all projects). averageMargin/minMargin/maxMargin are gross margin percentages of sell price (margin% = (1 - baseCost/unitCost) * 100), not markup-on-cost:
 ${JSON.stringify(categorySummaries, null, 2)}
 
 ${currentEstimateContext}
