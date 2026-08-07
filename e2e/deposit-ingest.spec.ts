@@ -233,6 +233,12 @@ const F = {
     fileId: "di-e2e-file-nonqbo",
   },
   validation: { fileId: "di-e2e-file-validation" },
+  weakMatch: {
+    project: "di-e2e-weak-project", projectName: "Weakguard Kitchen Remodel",
+    invoice: "di-e2e-weak-invoice", invoiceCode: "INV-DI-WEAK",
+    schedule: "di-e2e-weak-schedule", amount: 123,
+    fileId: "di-e2e-file-weakmatch",
+  },
   // Case 12: crash recovery across the NON-QBO money boundary (settleStartedAt) —
   // one invoice, two Pending milestones with distinct amounts so each sub-case
   // resumes against its own reservation.
@@ -249,7 +255,7 @@ const ALL_PROJECT_IDS = [
   F.qbo.project, F.concurrent.project, F.reserve.project, F.resume.project,
   F.cronSame.project, F.cronDiff.project, F.refuseTied.projectA, F.refuseTied.projectB,
   F.refuseZeroAmt.project, F.refuseTwoAmt.project, F.refusePayer.project,
-  F.forceCorrect.project, F.nonQbo.project, F.settleCrash.project,
+  F.forceCorrect.project, F.nonQbo.project, F.settleCrash.project, F.weakMatch.project,
 ];
 
 const ALL_FILE_IDS = [
@@ -257,7 +263,7 @@ const ALL_FILE_IDS = [
   F.cronSame.fileId, F.cronDiff.fileId, F.refuseUnresolvable.fileId, F.refuseTied.fileId,
   F.refuseZeroAmt.fileId, F.refuseTwoAmt.fileId, F.refuseNoCheckNumber.fileId, F.refuseNoCheckDate.fileId,
   F.refusePayer.fileId, F.forceCorrect.fileId, F.forceCrossedQbo.fileId, F.nonQbo.fileId, F.validation.fileId,
-  F.settleCrash.fileIdSettled, F.settleCrash.fileIdUnsettled,
+  F.settleCrash.fileIdSettled, F.settleCrash.fileIdUnsettled, F.weakMatch.fileId,
 ];
 
 test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
@@ -337,6 +343,11 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
       projectId: F.nonQbo.project, projectName: F.nonQbo.projectName,
       invoiceId: F.nonQbo.invoice, invoiceCode: F.nonQbo.invoiceCode,
       schedules: [{ id: F.nonQbo.schedule, name: "NonQBO Deposit", amount: F.nonQbo.amount }],
+    });
+    await seedFixture({
+      projectId: F.weakMatch.project, projectName: F.weakMatch.projectName,
+      invoiceId: F.weakMatch.invoice, invoiceCode: F.weakMatch.invoiceCode,
+      schedules: [{ id: F.weakMatch.schedule, name: "Weak Match Deposit", amount: F.weakMatch.amount }],
     });
     await seedFixture({
       projectId: F.settleCrash.project, projectName: F.settleCrash.projectName,
@@ -587,12 +598,29 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
     const payload = { fileId: F.refuseUnresolvable.fileId, projectName: "Zzqxw Nonexistent Ferngully 9999", amount: 123, checkDate: "2026-07-01", checkNumber: "1001" };
     const first = await postDeposit(request, payload);
     expect(first.body.status).toBe("unmatched");
-    expect(first.body.reason).toContain("no project matched");
+    // The e2e DB is shared across specs in one CI run: sibling specs' projects can
+    // accidentally share two generic words with the gibberish label and turn "no
+    // project matched" into "ambiguous" or the first-word weak-match refusal. All
+    // three are correct refusals of an unresolvable name — the invariant under test
+    // is unmatched + exactly one task, not the specific reason string.
+    expect(first.body.reason).toMatch(/no project matched|ambiguous|first word differs/);
     expect(first.body.officeTaskId).toBeTruthy();
 
     const second = await postDeposit(request, payload);
     expect(second.body.officeTaskId).toBe(first.body.officeTaskId);
     expect(await officeTasksMentioning(F.refuseUnresolvable.fileId)).toHaveLength(1);
+  });
+
+  test("7a2: single weak fuzzy match (generic shared words, first word differs) refuses", async ({ request }) => {
+    // "Kitchen Remodel" alone scores 2 in the shared matcher — enough to route an
+    // expense receipt, not enough to move money. The winner (if unique) must also
+    // contain the label's first word (client surname convention).
+    const payload = { fileId: F.weakMatch.fileId, projectName: "Zzyxfirst Kitchen Remodel", amount: 123, checkDate: "2026-07-01", checkNumber: "1003" };
+    const first = await postDeposit(request, payload);
+    expect(first.body.status).toBe("unmatched");
+    expect(first.body.reason, "either the weak-match guard fires or sibling-spec data makes it ambiguous — both refuse").toMatch(/first word differs|ambiguous/);
+    const schedule = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.weakMatch.schedule } });
+    expect(schedule.status, "no money moved on a weak match").toBe("Pending");
   });
 
   test("7b: tied project names refuse (findBestProjectNameMatches ties)", async ({ request }) => {

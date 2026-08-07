@@ -354,6 +354,16 @@ async function matchAndApply(row: DepositIngest, payload: NormalizedPayload): Pr
         }
         const project = projectMatches[0];
 
+        // Money-grade bar on top of the shared fuzzy matcher: the label's first word
+        // (the client surname by folder convention) must appear in the winning project's
+        // name. The matcher alone scores two shared GENERIC words ("Kitchen Remodel")
+        // as a match, which is fine for routing expense receipts but could point a
+        // deposit at the wrong client's project when the payer line failed to extract.
+        const labelWords = normalizeWords(payload.projectName);
+        if (labelWords.length === 0 || !normalizeWords(project.name).includes(labelWords[0])) {
+            return await finalizeUnmatched(row, `"${payload.projectName}" only weakly matched "${project.name}" (first word differs) — not safe for money`);
+        }
+
         // Conservative gross-conflict check only: the Drive-folder project match is
         // authoritative, the payer line is corroboration. Skip when there's nothing
         // meaningful to compare (short/empty names on either side).
