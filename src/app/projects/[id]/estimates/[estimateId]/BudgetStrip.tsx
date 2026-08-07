@@ -2,15 +2,12 @@
 
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
-import { internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin, derivedMarginPct } from "@/lib/budget-math";
+import {
+    internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin, derivedMarginPct,
+    normalizeMarginInput, formatDerivedRate, DEFAULT_MARGIN_PCT, MAX_MARGIN_PCT,
+} from "@/lib/budget-math";
 
 const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"];
-
-/** Returns a numeric margin %, defaulting to 25 when the value is empty/NaN. Capped at 99 to prevent costFromMargin returning 0. */
-function effectiveMargin(raw: string | number | null | undefined): number {
-    const n = parseFloat(String(raw ?? ""));
-    return Number.isFinite(n) ? Math.min(n, 99) : 25;
-}
 
 interface BudgetStripProps {
     item: any;
@@ -139,16 +136,19 @@ export default function BudgetStrip({
                 <div className="relative">
                     <input
                         type="number"
-                        value={item.markupPercent ?? 25}
+                        value={item.markupPercent ?? DEFAULT_MARGIN_PCT}
+                        min={0}
+                        max={MAX_MARGIN_PCT}
                         onChange={e => {
                             // Margin edit: recompute budgetRate from the preserved sell price.
                             // unitCost is never written — customer pricing stays locked.
-                            const m = effectiveMargin(e.target.value);
+                            // `stored` and `derivedFrom` come out of one normalization so the margin
+                            // we persist is always the margin the rate was derived from.
+                            const { stored, derivedFrom } = normalizeMarginInput(e.target.value);
                             const price = parseFloat(item.unitCost) || 0;
-                            updateItem(index, "markupPercent", e.target.value === "" ? null : e.target.value);
-                            if (price > 0) {
-                                const newRate = costFromMargin(price, m);
-                                const rateStr = newRate.toFixed(2);
+                            updateItem(index, "markupPercent", stored);
+                            if (derivedFrom !== null && price > 0) {
+                                const rateStr = formatDerivedRate(costFromMargin(price, derivedFrom));
                                 updateItem(index, "budgetRate", rateStr);
                                 updateItem(index, "baseCost", rateStr);
                             }

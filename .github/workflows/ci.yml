@@ -33,6 +33,12 @@ jobs:
         run: npx prettier --check . --ignore-unknown
         continue-on-error: true
 
+      # Hermetic pure-logic suites — no DB, no network, so they belong in this job rather
+      # than the Postgres one. CI ran neither of these before: tests/ was never wired up at
+      # all, so the estimate money-math coverage added with PR #315 was gating nothing.
+      - name: Unit tests
+        run: npm run test:unit
+
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
         env:
