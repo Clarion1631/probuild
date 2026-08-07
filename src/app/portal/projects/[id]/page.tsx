@@ -13,6 +13,7 @@ import { resolveSessionClientId } from "@/lib/portal-auth";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import PortalProjectTracker from "./PortalProjectTracker";
+import { formatMoneyDate } from "@/lib/payment-date";
 import PortalStagePin from "./PortalStagePin";
 import PortalUpdatesFeed from "./PortalUpdatesFeed";
 import {
@@ -425,7 +426,7 @@ export default async function PortalProjectDetail(props: {
                                                         {payment.status === 'Paid' && (
                                                             <span className="inline-flex items-center text-xs text-green-600 bg-green-50 px-1.5 py-0.5 rounded-full border border-green-200">
                                                                 <svg className="w-3 h-3 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                                                Paid{payment.paymentMethod ? ` via ${payment.paymentMethod === 'quickbooks' ? 'QuickBooks' : payment.paymentMethod.toUpperCase()}` : ''}{(payment.paidAt || payment.paymentDate) ? ` · ${new Date(payment.paidAt || payment.paymentDate).toLocaleDateString()}` : ''}
+                                                                Paid{payment.paymentMethod ? ` via ${payment.paymentMethod === 'quickbooks' ? 'QuickBooks' : payment.paymentMethod.toUpperCase()}` : ''}{(payment.paidAt || payment.paymentDate) ? ` · ${formatMoneyDate(payment.paidAt || payment.paymentDate, {})}` : ''}
                                                             </span>
                                                         )}
                                                         {payment.status === 'Processing' && (

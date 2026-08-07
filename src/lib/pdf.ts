@@ -6,6 +6,7 @@ import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
 import { coTaxRate, coTaxLabel } from './co-tax';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
+import { isEstimateSectionRow, rm } from './estimate-item-payload';
 
 /** pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so a failed PNG embed
  *  falls through to a JPG attempt (no content-type header is available once bytes come
@@ -413,7 +414,11 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     for (const item of estimate.items) {
         checkNewPage(100);
 
-        const isSection = !item.parentId && estimate.items.some(i => i.parentId === item.id);
+        // Shared with serializeEstimateItemsForSave: a row is a section if it is typed as one
+        // or has children. Keying off children alone rendered an emptied section (and any
+        // nested section) as a billable line with qty/unit-cost columns, even though its
+        // stored total is a rolled-up figure that does not equal qty * unitCost.
+        const isSection = isEstimateSectionRow(item, estimate.items);
         const isSubItem = !!item.parentId;
         const nameX = isSubItem ? cols.name + 16 : cols.name;
         const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
@@ -476,11 +481,18 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((acc, item) => {
-        if (item.parentId) return acc + toNum(item.total);
-        if (!estimate.items.some(i => i.parentId === item.id)) return acc + toNum(item.total);
-        return acc;
-    }, 0);
+    // Leaf rows only, using the same predicate as the rows above. Keying off `parentId`
+    // added a nested section's rolled-up total on top of the child totals it already
+    // contains, inflating the subtotal (and therefore tax and the grand total).
+    // `rm` on the accumulated sum matches computeEstimateSubtotal: without it the raw float
+    // sum can land a hair under the canonical figure and drag tax, the processing fee and
+    // the grand total a cent below what the editor showed.
+    const subtotal = rm(
+        estimate.items.reduce(
+            (acc, item) => (isEstimateSectionRow(item, estimate.items) ? acc : acc + toNum(item.total)),
+            0,
+        ),
+    );
 
     const taxRatePercent = toNum(estimate.taxRatePercent);
     const taxExempt = !!estimate.taxExempt;

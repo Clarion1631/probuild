@@ -1,7 +1,13 @@
 "use client";
 
-/** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
-const rm = (n: number) => Math.round(n * 100) / 100;
+import {
+    computeEstimateItemTotals,
+    computeEstimateSubtotal,
+    normalizeSectionTypes,
+    rm,
+    serializeEstimateItemsForSave,
+    normalizeEstimateItemForSave,
+} from "@/lib/estimate-item-payload";
 
 /** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
 function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
@@ -40,9 +46,92 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     return cloned;
 }
 
+/** A PO-link / schedule-task restore payload left pending after an undo or history revert
+ *  whose item-row save succeeded but whose association restore failed (or hasn't run yet). */
+type PendingAssociationRestore = {
+    links: { estimateItemId: string; purchaseOrderId: string; createdAt?: string }[];
+    scheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+    /** Bounded-retry counter — see MAX_PENDING_RESTORE_ATTEMPTS/attemptPendingRestore below.
+     *  Persisted alongside the payload so a browser refresh/remount doesn't reset the budget
+     *  and let a permanently-failing restore retry forever. */
+    attempts?: number;
+};
+
+/** After this many failed attempts, stop retrying a pending restore automatically and tell
+ *  the user once instead of silently looping on every future save. */
+const MAX_PENDING_RESTORE_ATTEMPTS = 5;
+
+/** Errors that retrying won't fix — the caller lacks permission, or the estimate/PO/schedule
+ *  target no longer exists. Give up on these immediately rather than burning the attempt
+ *  budget on a request that will never succeed. */
+function isPermanentRestoreError(e: any): boolean {
+    const msg = e?.message || "";
+    return /forbidden/i.test(msg) || /not found/i.test(msg) || /requires a project/i.test(msg);
+}
+
+/** sessionStorage key for a pending restore, scoped per estimate — so a browser refresh or
+ *  component remount between the row-recreation save and the association restore doesn't
+ *  silently lose the payload (see pendingAssociationRestoreRef comment in the component). */
+function pendingRestoreStorageKey(estimateId: string) {
+    return `probuild:estimate-pending-restore:${estimateId}`;
+}
+
+function loadPendingRestore(estimateId: string): PendingAssociationRestore | null {
+    if (typeof window === "undefined") return null;
+    try {
+        const raw = window.sessionStorage.getItem(pendingRestoreStorageKey(estimateId));
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+}
+
+function persistPendingRestore(estimateId: string, payload: PendingAssociationRestore | null) {
+    if (typeof window === "undefined") return;
+    try {
+        const key = pendingRestoreStorageKey(estimateId);
+        if (!payload || (payload.links.length === 0 && payload.scheduleTasks.length === 0)) {
+            window.sessionStorage.removeItem(key);
+        } else {
+            window.sessionStorage.setItem(key, JSON.stringify(payload));
+        }
+    } catch {
+        // sessionStorage unavailable (private browsing, quota) — the in-memory ref still
+        // covers the same-session cases; only the across-remount case degrades.
+    }
+}
+
+/** Merge a new restore payload into whatever's already pending, deduped by
+ *  (estimateItemId, purchaseOrderId) for links and by scheduleTaskId for schedule tasks, so
+ *  two restores queued before either resolves don't clobber each other. */
+function mergePendingRestore(existing: PendingAssociationRestore | null, addition: PendingAssociationRestore): PendingAssociationRestore {
+    const linkMap = new Map((existing?.links ?? []).map(l => [`${l.estimateItemId}:${l.purchaseOrderId}`, l] as const));
+    for (const l of addition.links) linkMap.set(`${l.estimateItemId}:${l.purchaseOrderId}`, l);
+    const taskMap = new Map((existing?.scheduleTasks ?? []).map(t => [t.scheduleTaskId, t] as const));
+    for (const t of addition.scheduleTasks) taskMap.set(t.scheduleTaskId, t);
+    // Reset the attempt counter — merging in new links/tasks is meaningfully different work
+    // from whatever may have already failed a few times, so it gets a fresh bounded-retry
+    // budget instead of inheriting a near-exhausted count from an unrelated prior restore.
+    return { links: Array.from(linkMap.values()), scheduleTasks: Array.from(taskMap.values()), attempts: 0 };
+}
+
+/** Remove entries matching the given (estimateItemId, purchaseOrderId) pairs from a pending
+ *  restore payload. Used whenever a later user action explicitly removes a link (a manual
+ *  unlink, or a "replace"-mode revert's own stale-link cleanup) — without this, a still-pending
+ *  restore queued before that removal could replay afterward and resurrect the link the user
+ *  just deliberately removed, since mergePendingRestore only ever unions entries in. */
+function removePendingLinks(existing: PendingAssociationRestore | null, toRemove: { estimateItemId: string; purchaseOrderId: string }[]): PendingAssociationRestore | null {
+    if (!existing || toRemove.length === 0) return existing;
+    const removeKeys = new Set(toRemove.map(l => `${l.estimateItemId}:${l.purchaseOrderId}`));
+    const links = existing.links.filter(l => !removeKeys.has(`${l.estimateItemId}:${l.purchaseOrderId}`));
+    if (links.length === existing.links.length) return existing;
+    return { ...existing, links };
+}
+
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, restoreEstimateItemAssociations, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import type { RestoreEstimateItemAssociationsResult } from "@/lib/actions";
 import RichTextEditor from "@/components/RichTextEditor";
 import { useRouter } from "next/navigation";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
@@ -84,6 +173,8 @@ const POQuickCreateModal = dynamic(() => import("./POQuickCreateModal"), { ssr: 
 const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), { ssr: false });
 
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
+import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
+import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
 // Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
 // Mirrors the JSON shape that /api/ai-estimate/import + transformPhasesToItems expect.
@@ -119,7 +210,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [title, setTitle] = useState(initialEstimate.title);
     const [code, setCode] = useState(initialEstimate.code);
     const [status, setStatus] = useState(initialEstimate.status);
-    const [items, setItems] = useState<any[]>(initialEstimate.items || []);
+    const [items, setItems] = useState<any[]>(() => (initialEstimate.items || []).map(normalizeItemPoLinks));
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialEstimate.paymentSchedules || []);
     // Invoice generated from this estimate (if any) — milestone edits here do not
     // cascade to it, so the schedule UI warns when one exists.
@@ -230,38 +321,81 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     const lastSavedStateRef = useRef<string>("");
 
-    const getEstimateSnapshot = useCallback(() => {
-        const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
+    // Mirrors `items` so undo/restore code can read the just-restored array immediately —
+    // `items` itself is frozen inside whatever render's closure captured it (e.g. a toast's
+    // onClick from a stale render), so it can't be trusted for that. Kept in sync for the
+    // normal case by the effect below; restoreItems also writes it directly so handleSave
+    // sees the restored rows synchronously, before that effect has a chance to run.
+    const itemsRef = useRef(items);
+    useEffect(() => { itemsRef.current = items; }, [items]);
 
-        const childTotals = new Map<string, number>();
-        for (const item of items) {
-            if (item.parentId) {
-                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-            }
+    // Mirrors every estimate-level field that runSave persists alongside items (title, tax,
+    // notes, payment schedules, etc.) — same reason as itemsRef: a save triggered from a
+    // stale render's closure (e.g. the delete-undo toast's onClick, bound at delete time)
+    // must send whatever the user has typed/changed SINCE, not whatever was current when
+    // that closure was created. Kept in sync every render by the effect below.
+    const fieldsRef = useRef({
+        title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
+        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+        notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
+        taxExempt, selectedTaxName, paymentSchedules,
+    });
+    useEffect(() => {
+        fieldsRef.current = {
+            title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
+            memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+            notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
+            taxExempt, selectedTaxName, paymentSchedules,
+        };
+    }, [
+        title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
+        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
+        notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
+        taxExempt, selectedTaxName, paymentSchedules,
+    ]);
+
+    // Serializes every call to handleSave so overlapping saves (e.g. the blur-triggered
+    // autosave racing the delete-undo's own restore save) always execute in enqueue order
+    // instead of concurrently, where whichever server request happened to land last would
+    // silently win and could re-delete a just-restored item. Each call chains onto whatever
+    // is already in flight and waits for it to settle (success or failure) before starting.
+    const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+    // Holds a PO-link/schedule-task restore payload after step 2 (the item save) of undo
+    // has succeeded but step 3 (restoreEstimateItemAssociations) has failed. Kept here —
+    // not just reported as a one-off error — so the next save (or the toast's Retry action)
+    // can retry it; without this, lastSavedStateRef already marks the item state saved and a
+    // later save would silently early-return, permanently losing the associations. Also
+    // mirrored to sessionStorage (see loadPendingRestore/persistPendingRestore) so a browser
+    // refresh or component remount between step 2 and step 3 doesn't lose it either.
+    const pendingAssociationRestoreRef = useRef<PendingAssociationRestore | null>(null);
+
+    // Recover a pending restore left over from a previous session/tab that never resolved —
+    // e.g. the row-recreation save succeeded but the tab closed before the association
+    // restore ran. retryAssociationRestore is a stable function declaration (hoisted) that
+    // reads the ref fresh at call time, so referencing it here before its definition is fine.
+    useEffect(() => {
+        const saved = loadPendingRestore(initialEstimate.id);
+        if (saved && (saved.links.length > 0 || saved.scheduleTasks.length > 0)) {
+            pendingAssociationRestoreRef.current = saved;
+            retryAssociationRestore();
         }
-        const mappedItems = items.map((item, index) => {
-            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
-            const computedTotal = isSection
-                ? (childTotals.get(item.id) || 0)
-                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-            return {
-                id: item.id || null,
-                parentId: item.parentId || null,
-                name: item.name || "",
-                description: item.description || "",
-                type: item.type || "Material",
-                quantity: String(item.quantity || "0"),
-                unitCost: String(item.unitCost || "0"),
-                costCodeId: item.costCodeId || null,
-                costTypeId: item.costTypeId || null,
-                vendorId: item.vendorId || null,
-                approvalStatus: item.approvalStatus || null,
-                order: index,
-                total: computedTotal,
-            };
-        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only recovery
+    }, []);
 
-        const mappedSchedules = paymentSchedules.map((schedule, index) => ({
+    const getEstimateSnapshot = useCallback((itemsOverride?: any[], fieldsOverride?: Partial<typeof fieldsRef.current>) => {
+        const srcItems = itemsOverride ?? itemsRef.current;
+        const f = { ...fieldsRef.current, ...fieldsOverride };
+        const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
+
+        // Exactly what a save would write, field for field: serialize (order, section
+        // roll-up, unitCost mirror) then project through the same function saveEstimate's
+        // toItemData uses. Hand-rolling a shorter list here is what made budget-only edits
+        // invisible to the change check, so the save reported success and wrote nothing.
+        const mappedItems = serializeEstimateItemsForSave(srcItems)
+            .map((item, index) => normalizeEstimateItemForSave(item, index));
+
+        const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
             id: schedule.id || null,
             name: schedule.name || "",
             amount: String(schedule.amount || "0"),
@@ -275,54 +409,47 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         }));
 
         return {
-            title: title || "",
-            code: code || "",
-            status: status || "Draft",
-            processingFeeMarkup: Number(processingFeeMarkup) || 0,
-            hideProcessingFee: !!hideProcessingFee,
-            expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
-            memo: memo || null,
-            termsAndConditions: termsAndConditions || null,
-            overviewEnabled: !!overviewEnabled,
-            overviewTitle: overviewTitle || null,
-            overviewBody: overviewBody || null,
-            notesEnabled: !!notesEnabled,
-            notesTitle: notesTitle || null,
-            notesBody: notesBody || null,
-            notesPlacement,
-            signatureUrl: signatureUrl || null,
-            targetMarginPercent: parseFloat(targetMargin) || 25,
-            taxExempt: !!taxExempt,
-            taxRateName: taxExempt ? null : (activeTax?.name || null),
-            taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
+            title: f.title || "",
+            code: f.code || "",
+            status: f.status || "Draft",
+            processingFeeMarkup: Number(f.processingFeeMarkup) || 0,
+            hideProcessingFee: !!f.hideProcessingFee,
+            expirationDate: f.expirationDate ? new Date(f.expirationDate).toISOString().split("T")[0] : null,
+            memo: f.memo || null,
+            termsAndConditions: f.termsAndConditions || null,
+            overviewEnabled: !!f.overviewEnabled,
+            overviewTitle: f.overviewTitle || null,
+            overviewBody: f.overviewBody || null,
+            notesEnabled: !!f.notesEnabled,
+            notesTitle: f.notesTitle || null,
+            notesBody: f.notesBody || null,
+            notesPlacement: f.notesPlacement,
+            signatureUrl: f.signatureUrl || null,
+            targetMarginPercent: parseFloat(f.targetMargin) || 25,
+            taxExempt: !!f.taxExempt,
+            taxRateName: f.taxExempt ? null : (activeTax?.name || null),
+            taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
             items: mappedItems,
             paymentSchedules: mappedSchedules,
         };
-    }, [
-        title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
-        memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
-        notesEnabled, notesTitle, notesBody, notesPlacement,
-        signatureUrl, targetMargin, taxExempt, selectedTaxName,
-        taxOptions, defaultTaxRate, items, paymentSchedules
-    ]);
+    }, [taxOptions, defaultTaxRate]);
 
     useEffect(() => {
         lastSavedStateRef.current = JSON.stringify(getEstimateSnapshot());
     }, []);
 
-    // Derived: sum of children totals per section header
+    // Derived: rolled-up total per section header, aggregating through nested sections
     const sectionTotals = useMemo(() => {
+        const totals = computeEstimateItemTotals(items);
         const map = new Map<string, number>();
-        for (const item of items) {
-            if (item.parentId) {
-                map.set(item.parentId, (map.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-            }
-        }
+        items.forEach((item, index) => {
+            if (totals[index].isSection && item.id) map.set(item.id, totals[index].total);
+        });
         return map;
     }, [items]);
 
-    // A row is a section header if it has no parentId and at least one child references it
-    const sectionIds = useMemo(() => new Set(items.filter(i => i.parentId).map((i: any) => i.parentId)), [items]);
+    // A row is a section header if it is typed as one or at least one child references it
+    const sectionIds = useMemo(() => new Set(sectionTotals.keys()), [sectionTotals]);
 
     // Auto-expand textarea ref handler
     const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
@@ -352,7 +479,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             if (res.ok) {
                 const data = await res.json();
                 if (data.description) {
-                    updateItem(itemIndex, "description", data.description);
+                    updateItemById(item.id, "description", data.description);
                     toast.success("AI description added");
                 }
             }
@@ -711,12 +838,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
     }, []);
 
+    // Section flags / rolled-up totals, shared by the subtotal and the margin math below
+    const itemTotals = useMemo(() => computeEstimateItemTotals(items), [items]);
     // Subtotal from leaf items only (sections would double-count)
-    const subtotal = items.reduce((acc, item) => {
-        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-        if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-        return acc;
-    }, 0);
+    const subtotal = computeEstimateSubtotal(items);
     const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
     const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
@@ -745,90 +870,145 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     // Internal margin calculations
     // Base cost from leaf items only (sections would double-count)
-    const totalBaseCost = items.reduce((acc, item) => {
+    const totalBaseCost = items.reduce((acc, item, index) => {
+        if (itemTotals[index].isSection) return acc;
         const rate = (item.budgetRate !== null && item.budgetRate !== undefined && item.budgetRate !== "")
             ? parseFloat(item.budgetRate)
             : (parseFloat(item.baseCost) || 0);
         const qty = item.budgetQuantity ?? (parseFloat(item.quantity) || 0);
-        if (item.parentId) return acc + (qty * rate);
-        if (!items.some((i: any) => i.parentId === item.id)) return acc + (qty * rate);
-        return acc;
+        return acc + (qty * rate);
     }, 0);
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
-    async function handleSave({ silent = false, skipRefresh = false } = {}) {
-        captureHistory(new Date().toLocaleString());
+    /**
+     * Sell-side subtotal/tax/fee/total for an explicit items array + field set, rather than
+     * the render's `total`/`taxRate` consts, which are frozen to whatever render created a
+     * stale caller's closure. Shared so every writer of `totalAmount` — and anything that
+     * needs the new total BEFORE the state updates land, like applyGeneratedEstimate
+     * rebalancing percentage milestones — computes money exactly one way.
+     */
+    function computeSellTotals(sourceItems: any[], f: typeof fieldsRef.current) {
+        const sourceSubtotal = computeEstimateSubtotal(sourceItems);
+        const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
+        const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+        const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
+        const sourceTax = rm(sourceSubtotal * sourceTaxRate);
+        return { activeTax, subtotal: sourceSubtotal, total: rm(sourceSubtotal + sourceTax + sourceProcessingFee) };
+    }
+
+    async function handleSave(opts: { silent?: boolean; skipRefresh?: boolean; itemsOverride?: any[]; fieldsOverride?: Partial<typeof fieldsRef.current>; skipHistoryCapture?: boolean } = {}) {
+        // Chain this save behind whatever is already in flight (see saveQueueRef comment
+        // above) so saves always run one at a time, in the order they were requested. The
+        // queue promise itself must never reject — that would break the chain for every
+        // future caller — so failures are swallowed there; this call's own promise (`run`)
+        // still resolves/rejects normally for its caller.
+        const run = saveQueueRef.current.catch(() => {}).then(() => runSave(opts));
+        saveQueueRef.current = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
+    async function runSave({ silent = false, skipRefresh = false, itemsOverride, fieldsOverride, skipHistoryCapture = false }: { silent?: boolean; skipRefresh?: boolean; itemsOverride?: any[]; fieldsOverride?: Partial<typeof fieldsRef.current>; skipHistoryCapture?: boolean } = {}) {
+        // `itemsOverride`/`fieldsOverride` let restoreItems (undo / history revert) pass the
+        // just-restored items and any fields it wants to force explicitly. Everything else
+        // is read from fieldsRef/itemsRef rather than this function's own closure — that
+        // closure is frozen to whatever render created it, which is stale for a caller like
+        // the delete-undo toast's onClick (bound at delete time, possibly long before the
+        // user clicks Undo and edits the title/tax/notes in between).
+        const sourceItems = itemsOverride ?? itemsRef.current;
+        const f = { ...fieldsRef.current, ...fieldsOverride };
+        // Skipped when restoreItems already captured the pre-swap state itself (see its
+        // comment) — otherwise this would capture itemsRef.current AFTER restoreItems has
+        // already swapped it to the restored/reverted target, recording the wrong snapshot.
+        if (!skipHistoryCapture) captureHistory(new Date().toLocaleString());
 
         // Check if there are actual changes before saving
-        const currentSnapshot = getEstimateSnapshot();
+        const currentSnapshot = getEstimateSnapshot(itemsOverride, fieldsOverride);
         const currentSnapshotStr = JSON.stringify(currentSnapshot);
-        if (currentSnapshotStr === lastSavedStateRef.current) {
-            if (!silent) {
-                toast.success("Estimate saved successfully");
-            }
-            return;
-        }
+        const hasChanges = currentSnapshotStr !== lastSavedStateRef.current;
 
-        if (!silent) setIsSaving(true);
-        try {
-            // Recompute section header totals from children before saving
-            const childTotals = new Map<string, number>();
-            for (const item of items) {
-                if (item.parentId) {
-                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
+        if (hasChanges) {
+            if (!silent) setIsSaving(true);
+            try {
+                // The rows the change check just compared — reusing them is what keeps the
+                // comparison and the write from ever describing different things.
+                const mappedItems = currentSnapshot.items;
+                const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
+                    ...schedule,
+                    order: index
+                }));
+
+                const { activeTax, total: sourceTotal } = computeSellTotals(sourceItems, f);
+
+                await saveEstimate(initialEstimate.id, context.id, context.type, {
+                    title: f.title, code: f.code, status: f.status, totalAmount: sourceTotal, paymentSchedules: mappedSchedules,
+                    processingFeeMarkup: f.processingFeeMarkup, hideProcessingFee: f.hideProcessingFee,
+                    expirationDate: f.expirationDate ? new Date(f.expirationDate).toISOString() : null,
+                    memo: f.memo || null,
+                    termsAndConditions: f.termsAndConditions || null,
+                    overviewEnabled: f.overviewEnabled,
+                    overviewTitle: f.overviewTitle || null,
+                    overviewBody: f.overviewBody || null,
+                    notesEnabled: f.notesEnabled,
+                    notesTitle: f.notesTitle || null,
+                    notesBody: f.notesBody || null,
+                    notesPlacement: f.notesPlacement,
+                    signatureUrl: f.signatureUrl || null,
+                    targetMarginPercent: parseFloat(f.targetMargin) || 25,
+                    taxExempt: f.taxExempt,
+                    taxRateName: f.taxExempt ? null : (activeTax?.name || null),
+                    taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
+                }, mappedItems);
+
+                // Mirror the section tags we just persisted back into local state. Serialization
+                // is non-mutating, so without this a legacy section (detected only via its
+                // children) stays untagged in memory: delete its last child in this same session
+                // and it bills its mirrored unitCost again, and the next save overwrites the tag
+                // that was just written.
+                setItems(prev => normalizeSectionTypes(prev));
+                itemsRef.current = normalizeSectionTypes(itemsRef.current);
+
+                // Update the last saved state ref to the new state
+                lastSavedStateRef.current = currentSnapshotStr;
+            } catch (e: any) {
+                console.error("[EstimateEditor] Failed to save estimate:", e);
+                if (!silent) {
+                    toast.error(e?.message || "Failed to save estimate. Please try again.");
                 }
+                throw e;
+            } finally {
+                if (!silent) setIsSaving(false);
             }
-            const mappedItems = items.map((item, index) => {
-                const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
-                const computedTotal = isSection
-                    ? (childTotals.get(item.id) || 0)
-                    : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
-            });
-            const mappedSchedules = paymentSchedules.map((schedule, index) => ({
-                ...schedule,
-                order: index
-            }));
-
-            await saveEstimate(initialEstimate.id, context.id, context.type, {
-                title, code, status, totalAmount: total, paymentSchedules: mappedSchedules,
-                processingFeeMarkup, hideProcessingFee,
-                expirationDate: expirationDate ? new Date(expirationDate).toISOString() : null,
-                memo: memo || null,
-                termsAndConditions: termsAndConditions || null,
-                overviewEnabled,
-                overviewTitle: overviewTitle || null,
-                overviewBody: overviewBody || null,
-                notesEnabled,
-                notesTitle: notesTitle || null,
-                notesBody: notesBody || null,
-                notesPlacement,
-                signatureUrl: signatureUrl || null,
-                targetMarginPercent: parseFloat(targetMargin) || 25,
-                taxExempt,
-                taxRateName: taxExempt ? null : (activeTax?.name || null),
-                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-            }, mappedItems);
-
-            // Update the last saved state ref to the new state
-            lastSavedStateRef.current = currentSnapshotStr;
-
-            if (!silent) {
-                toast.success("Estimate saved successfully");
-            }
-            if (!skipRefresh) {
-                router.refresh();
-            }
-        } catch (e: any) {
-            console.error("[EstimateEditor] Failed to save estimate:", e);
-            if (!silent) {
-                toast.error(e?.message || "Failed to save estimate. Please try again.");
-            }
-            throw e;
-        } finally {
-            if (!silent) setIsSaving(false);
         }
+
+        // Retry any association restore left pending from a previous undo/revert whose step 3
+        // (restoreEstimateItemAssociations) failed after step 2 (the row save) already
+        // committed — see pendingAssociationRestoreRef comment. This runs AFTER the row save
+        // above, not before: the payload may belong to THIS very save (restoreItems sets it
+        // right before calling handleSave to recreate deleted rows), and the associated rows
+        // don't exist again until saveEstimate resolves. Running it at the top of runSave (as
+        // this used to) would replay against not-yet-existent rows — which the server treats
+        // as a harmless no-op success — clearing the payload before the row save even had a
+        // chance to fail, permanently losing the one thing the payload exists to protect.
+        // If the row save above threw, we never reach here, so the payload is left untouched
+        // for the next attempt.
+        //
+        // The status is returned (handleSave resolves to whatever runSave returns) so a
+        // caller that specifically wants to know how the replay went — retryAssociationRestore,
+        // driving the manual "Retry" action and mount-time recovery — doesn't have to guess
+        // from ref state alone or invoke a second, redundant restore call of its own.
+        let pendingRestoreStatus: "success" | "retrying" | "gave-up" | undefined;
+        if (pendingAssociationRestoreRef.current) {
+            pendingRestoreStatus = await attemptPendingRestore(pendingAssociationRestoreRef.current);
+        }
+
+        if (!silent) {
+            toast.success("Estimate saved successfully");
+        }
+        if (hasChanges && !skipRefresh) {
+            router.refresh();
+        }
+        return pendingRestoreStatus;
     }
 
     async function handleCreateInvoice() {
@@ -906,13 +1086,258 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function captureHistory(label: string) {
-        setHistory(prev => [{ ts: Date.now(), label, snapshot: JSON.parse(JSON.stringify(items)) }, ...prev.slice(0, 49)]);
+        // Reads itemsRef rather than the `items` closure so a capture triggered from inside
+        // handleSave (a normal save) snapshots the actually-current items, not whatever
+        // render created this particular closure. restoreItems calls this itself BEFORE
+        // swapping itemsRef to a restored/reverted target (and tells runSave to skip its own
+        // automatic capture) so this always records the state being left, not the state
+        // being restored to.
+        setHistory(prev => [{ ts: Date.now(), label, snapshot: JSON.parse(JSON.stringify(itemsRef.current)) }, ...prev.slice(0, 49)]);
     }
 
-    function revertToHistory(entry: { ts: number; label: string; snapshot: any[] }) {
-        setItems(entry.snapshot);
-        setExpandedHistoryTs(null);
-        toast.success(`Reverted to ${entry.label}`);
+    // Shared by the delete-undo toast (B2/B3) and the History panel (B4). Runs three steps,
+    // in order: local state, then the save that recreates the rows (with their original ids),
+    // then re-attaching the PO links / schedule task that only the save step could not restore
+    // (they were severed at the DB level when the row was deleted). Step 3 must come after
+    // step 2 — the item row doesn't exist again until the save completes.
+    //
+    // `mode` distinguishes the two callers: delete-undo ("additive") only ever needs to
+    // re-add what THIS delete severed, since nothing else changed underneath it. History
+    // revert ("replace") can jump back across other edits that happened after the snapshot
+    // was taken, so it also needs to strip associations that don't belong in the target
+    // state — see the linksToRemove block below.
+    async function restoreItems({ nextItems, links, scheduleTasks, mode = "additive", label }: {
+        nextItems: any[];
+        links: { estimateItemId: string; purchaseOrderId: string; createdAt?: string }[];
+        scheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+        mode?: "additive" | "replace";
+        label: string;
+    }) {
+        // Capture the state we're LEAVING before swapping itemsRef to nextItems below.
+        // captureHistory reads itemsRef.current, so capturing after the swap (as this used
+        // to) records the state we're restoring TO, not the one we're restoring FROM — making
+        // it impossible to undo an undo or revert a revert. runSave's own automatic capture
+        // is skipped for this save (skipHistoryCapture) so it doesn't immediately overwrite
+        // this with the target state again.
+        captureHistory(label);
+
+        // "replace" mode: strip any PO link that exists on the CURRENT (pre-revert) items but
+        // isn't part of the target snapshot — e.g. a link added after this history entry was
+        // captured. Computed from itemsRef.current before it gets swapped below.
+        //
+        // NOTE: schedule-task detachment can't be replayed the same way — the server action
+        // (restoreEstimateItemAssociations) only ever attaches/repoints a ScheduleTask, it
+        // never detaches one, so a task attached to an item AFTER this snapshot (or moved to
+        // a different item) stays attached. That needs a server-side "replace" mode we don't
+        // have; flagging as a known gap rather than working around it with an unrelated action.
+        let linksToRemove: { estimateItemId: string; purchaseOrderId: string }[] = [];
+        if (mode === "replace") {
+            const targetLinkKeys = new Set(links.map(l => `${l.estimateItemId}:${l.purchaseOrderId}`));
+            linksToRemove = itemsRef.current.flatMap((it: any) =>
+                (it.purchaseOrderLinks ?? [])
+                    .map((l: any) => ({ estimateItemId: it.id, purchaseOrderId: l.purchaseOrder.id }))
+                    .filter((l: any) => !targetLinkKeys.has(`${l.estimateItemId}:${l.purchaseOrderId}`))
+            );
+        }
+
+        // Recorded (merged with anything already pending, deduped) BEFORE attempting the row
+        // save below — previously this was only set after that save succeeded, so if the row
+        // save itself failed, the links/schedule-task payload was lost forever: a later manual
+        // save would recreate the rows but never re-attach them. Also persisted to
+        // sessionStorage so a remount/refresh between now and step 3 doesn't lose it either.
+        let mergedPending: PendingAssociationRestore | null = null;
+        if (links.length > 0 || scheduleTasks.length > 0) {
+            mergedPending = mergePendingRestore(pendingAssociationRestoreRef.current, { links, scheduleTasks });
+            pendingAssociationRestoreRef.current = mergedPending;
+            persistPendingRestore(initialEstimate.id, mergedPending);
+        }
+
+        itemsRef.current = nextItems;
+        setItems(nextItems);
+        // The row save below (via runSave) also replays whatever's currently pending in
+        // pendingAssociationRestoreRef AFTER it commits — including the payload just set
+        // above for this very restore, now that the rows exist again (see runSave comment).
+        await handleSave({ silent: true, itemsOverride: nextItems, skipHistoryCapture: true });
+
+        if (linksToRemove.length > 0) {
+            await Promise.all(linksToRemove.map(l =>
+                unlinkPOFromEstimateItem(l.estimateItemId, l.purchaseOrderId)
+                    .then(() => {
+                        // Supersede: a link this revert deliberately strips must not be
+                        // resurrected by some OTHER still-pending restore that happens to
+                        // reference the same (item, PO) pair (mergePendingRestore only
+                        // unions, so without this an unrelated pending payload could replay
+                        // the very link we just removed).
+                        const updated = removePendingLinks(pendingAssociationRestoreRef.current, [{ estimateItemId: l.estimateItemId, purchaseOrderId: l.purchaseOrderId }]);
+                        if (updated !== pendingAssociationRestoreRef.current) {
+                            pendingAssociationRestoreRef.current = updated;
+                            persistPendingRestore(initialEstimate.id, updated);
+                        }
+                    })
+                    .catch(() => {
+                        console.error(`[EstimateEditor] Failed to unlink stale PO ${l.purchaseOrderId} from item ${l.estimateItemId} during history revert`);
+                    })
+            ));
+        }
+
+        // If mergedPending is still pending on the ref at this point, the replay inside the
+        // row save above either hasn't fully succeeded yet (still retrying, bounded) or gave
+        // up permanently (already told the user — see attemptPendingRestore). Either way,
+        // surface that this restore isn't fully done rather than reporting full success.
+        if (mergedPending && pendingAssociationRestoreRef.current) {
+            throw new Error("Row restored, but its purchase order / schedule links could not be reattached yet.");
+        }
+    }
+
+    // Attempts one pending association restore and diffs the server's structured result
+    // (RestoreEstimateItemAssociationsResult) against what was sent, so the payload is only
+    // ever cleared for entries the server actually confirms — either restored, or reported as
+    // PERMANENTLY impossible (its PO/ScheduleTask target is gone or out of scope). Anything the
+    // server reports as RETRYABLE (missing.itemIds — the EstimateItem itself isn't back yet)
+    // stays pending untouched. This replaces the old "any non-throwing response == full
+    // success" assumption, which is what let a call that silently skipped every entry (because
+    // the item wasn't recreated yet) still clear the whole payload.
+    //
+    // A thrown exception here is a genuine server-side failure (auth, estimate/project gone) —
+    // no longer how "stale id" skips are reported — so it keeps the same permanent-vs-bounded-
+    // retry handling as before.
+    async function attemptPendingRestore(pending: PendingAssociationRestore): Promise<"success" | "retrying" | "gave-up"> {
+        let result: RestoreEstimateItemAssociationsResult;
+        try {
+            result = await restoreEstimateItemAssociations({ estimateId: initialEstimate.id, links: pending.links, scheduleTasks: pending.scheduleTasks });
+        } catch (e: any) {
+            const attempts = (pending.attempts ?? 0) + 1;
+            const permanent = isPermanentRestoreError(e);
+            if (permanent || attempts >= MAX_PENDING_RESTORE_ATTEMPTS) {
+                pendingAssociationRestoreRef.current = null;
+                persistPendingRestore(initialEstimate.id, null);
+                toast.error(
+                    permanent
+                        ? `Could not restore purchase order / schedule links: ${e?.message || "not permitted"}. Please re-link manually.`
+                        : "Failed to restore purchase order / schedule links after repeated attempts. Please re-link manually."
+                );
+                return "gave-up";
+            }
+            const updated = { ...pending, attempts };
+            pendingAssociationRestoreRef.current = updated;
+            persistPendingRestore(initialEstimate.id, updated);
+            return "retrying";
+        }
+
+        const restoredLinkKeys = new Set(result.restoredLinks.map(l => `${l.estimateItemId}:${l.purchaseOrderId}`));
+        const permanentPoIds = new Set(result.missing.purchaseOrderIds);
+        const retryableItemIds = new Set(result.missing.itemIds);
+        // A link entry is kept pending unless the server confirms it restored, or confirms its
+        // PO target is permanently gone — an item reported retryable-missing always stays,
+        // even if its purchaseOrderId also happens to appear in `permanentPoIds` for some OTHER
+        // (already-existing) item's entry.
+        const remainingLinks = pending.links.filter(l => {
+            if (restoredLinkKeys.has(`${l.estimateItemId}:${l.purchaseOrderId}`)) return false;
+            if (retryableItemIds.has(l.estimateItemId)) return true;
+            if (permanentPoIds.has(l.purchaseOrderId)) return false;
+            return true;
+        });
+
+        const restoredTaskIds = new Set(result.restoredScheduleTasks.map(t => t.scheduleTaskId));
+        const permanentTaskIds = new Set(result.missing.scheduleTaskIds);
+        const remainingScheduleTasks = pending.scheduleTasks.filter(st => {
+            if (restoredTaskIds.has(st.scheduleTaskId)) return false;
+            if (retryableItemIds.has(st.estimateItemId)) return true;
+            if (permanentTaskIds.has(st.scheduleTaskId)) return false;
+            return true;
+        });
+
+        if (remainingLinks.length === 0 && remainingScheduleTasks.length === 0) {
+            pendingAssociationRestoreRef.current = null;
+            persistPendingRestore(initialEstimate.id, null);
+            return "success";
+        }
+
+        // Something is still pending (retryable). Only spend a unit of the attempt budget when
+        // this call made literally zero progress (nothing restored, nothing permanently
+        // resolved) — a call that DID clear some entries but left others waiting on a
+        // not-yet-recreated row is forward progress, not a failure, so it shouldn't count
+        // toward giving up. In practice this keeps the manual Retry / mount-recovery paths
+        // (which now trigger a real row save first — see retryAssociationRestore) from burning
+        // through MAX_PENDING_RESTORE_ATTEMPTS purely because a row simply isn't back yet.
+        // The attempt budget exists to stop us retrying a call that keeps FAILING — not to time
+        // out work the server has explicitly told us to come back for. When every remaining
+        // entry is one the server reported as retryable-missing (its EstimateItem row simply
+        // isn't back yet), retain the payload without spending any budget: the remedy is a
+        // successful row save, which may legitimately be several user actions away, and
+        // dropping the payload on a countdown would silently lose the very links this mechanism
+        // exists to protect. The budget is spent only by a thrown transient failure (the catch
+        // path above) or by a call that resolved nothing and explained nothing.
+        const allRemainingRetryable =
+            remainingLinks.every(l => retryableItemIds.has(l.estimateItemId)) &&
+            remainingScheduleTasks.every(st => retryableItemIds.has(st.estimateItemId));
+
+        const totalBefore = pending.links.length + pending.scheduleTasks.length;
+        const totalAfter = remainingLinks.length + remainingScheduleTasks.length;
+        const madeProgress = totalAfter < totalBefore;
+        const attempts = (madeProgress || allRemainingRetryable)
+            ? (pending.attempts ?? 0)
+            : (pending.attempts ?? 0) + 1;
+
+        if (!madeProgress && !allRemainingRetryable && attempts >= MAX_PENDING_RESTORE_ATTEMPTS) {
+            pendingAssociationRestoreRef.current = null;
+            persistPendingRestore(initialEstimate.id, null);
+            toast.error("Failed to restore purchase order / schedule links after repeated attempts. Please re-link manually.");
+            return "gave-up";
+        }
+
+        const updated: PendingAssociationRestore = { links: remainingLinks, scheduleTasks: remainingScheduleTasks, attempts };
+        pendingAssociationRestoreRef.current = updated;
+        persistPendingRestore(initialEstimate.id, updated);
+        return "retrying";
+    }
+
+    // Retries a pending association restore on demand (wired to the error toast's Retry
+    // action, and to the mount-time recovery effect above). Drives it through handleSave
+    // rather than calling attemptPendingRestore in isolation — the actual remedy for a
+    // RETRYABLE (item-missing) entry is a normal save that recreates the row, and calling the
+    // restore directly (as this used to) replayed against rows that weren't back yet, which
+    // read as "nothing to do" and (under the old server contract) cleared the payload for
+    // good. handleSave recreates the row when there are pending changes and, once that
+    // succeeds, itself runs the same replay afterward (see runSave) and returns its outcome —
+    // so a caller here never duplicates that call.
+    async function retryAssociationRestore() {
+        if (!pendingAssociationRestoreRef.current) return;
+        let status: "success" | "retrying" | "gave-up" | undefined;
+        try {
+            status = await handleSave({ silent: true });
+        } catch {
+            // The row save itself failed — runSave already toasted that error and never
+            // reached the replay step (see its comment), so the pending payload is untouched.
+            // Nothing further to report here.
+            return;
+        }
+        if (status === "success") toast.success("Purchase order / schedule links restored");
+        else if (status === "retrying") toast.error("Still failed to restore purchase order / schedule links — will retry on next save.");
+        // "gave-up" already showed its own toast inside attemptPendingRestore; `undefined`
+        // means there was nothing pending by the time runSave got there — nothing to report.
+    }
+
+    async function revertToHistory(entry: { ts: number; label: string; snapshot: any[] }) {
+        const nextItems = entry.snapshot;
+        const links = nextItems.flatMap((it: any) =>
+            (it.purchaseOrderLinks ?? []).map((l: any) => ({ estimateItemId: it.id, purchaseOrderId: l.purchaseOrder.id, createdAt: l.createdAt }))
+        );
+        const scheduleTasks = nextItems
+            .filter((it: any) => it.scheduleTask?.id)
+            .map((it: any) => ({ scheduleTaskId: it.scheduleTask.id, estimateItemId: it.id }));
+        try {
+            await restoreItems({ nextItems, links, scheduleTasks, mode: "replace", label: `Before reverting to ${entry.label}` });
+            setExpandedHistoryTs(null);
+            toast.success(`Reverted to ${entry.label}`);
+        } catch (e: any) {
+            setExpandedHistoryTs(null);
+            toast.error(e?.message || "Reverted locally, but failed to save — please review and save manually.", {
+                action: pendingAssociationRestoreRef.current
+                    ? { label: "Retry", onClick: () => retryAssociationRestore() }
+                    : undefined,
+            });
+        }
     }
 
     function diffSnapshots(prev: any[], curr: any[]) {
@@ -1038,105 +1463,52 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             toast.error('No line items found to add');
             return;
         }
-        const newItems = [...items, ...data.items];
-        const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
-            ? [...paymentSchedules, ...data.paymentMilestones]
-            : paymentSchedules;
+        // Base off the refs, not this function's closure: the AI/import request is async, so
+        // `items`/`paymentSchedules` here belong to whatever render kicked it off and may be
+        // several edits stale by the time the response lands.
+        const baseItems = itemsRef.current;
+        const baseSchedules = fieldsRef.current.paymentSchedules;
+        const newItems = [...baseItems, ...data.items];
 
-        // Update UI immediately — don't wait for save
+        // Rebalance percentage-driven milestones against the post-merge total. The [total]
+        // effect only repairs client state on the next render — it runs after the save below,
+        // so without this the DB keeps amounts split against the pre-merge total until some
+        // later save happens to correct them, and an invoice raised in between bills the
+        // stale split.
+        //
+        // Deliberately NOT applied when the payload brings its own milestones: that appends a
+        // second complete plan to the existing one, and rebalancing two 100% plans against a
+        // single total over-allocates (recalcMilestoneAmounts can only clamp the last
+        // residual). Normalizing or replacing there is a product decision, not a bug fix.
+        const incomingMilestones = data.paymentMilestones && data.paymentMilestones.length > 0;
+        const newSchedules = incomingMilestones
+            ? [...baseSchedules, ...data.paymentMilestones!]
+            : recalcMilestoneAmounts(baseSchedules, computeSellTotals(newItems, fieldsRef.current).total);
+
+        // Update UI immediately — don't wait for save. itemsRef is set synchronously (not
+        // just via the effect that mirrors `items`) so a save queued right behind this one
+        // sees the merged items immediately, and so this save's own captureHistory call
+        // records them correctly.
+        itemsRef.current = newItems;
         setItems(newItems);
-        if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+        // Only assigned when the payload brings milestones. On the items-only path the
+        // rebalanced schedules go to the save alone: the [total] effect updates client state
+        // itself, and it does so with a functional updater, so it can't clobber a schedule
+        // edit that has reached state but not yet the ref.
+        if (incomingMilestones) {
             setPaymentSchedules(newSchedules);
         }
         onMerged?.();
         toast.success(`${verb} ${data.count} items (est. ${formatCurrency(Number(data.totalEstimate || 0))})`);
 
-        // Auto-save in background — set isSaving to block concurrent blur-triggered save
-        setIsSaving(true);
+        // Auto-save in background, routed through the same save queue as every other write
+        // (see saveQueueRef comment). This used to call saveEstimate directly, bypassing the
+        // queue — a save already in flight (e.g. a blur autosave) could land afterwards with
+        // a stale items array and silently wipe out the just-generated/imported lines.
+        setIsSaving(true); // blocks the onBlur-triggered autosave guard while this is in flight
         try {
-            // Recompute section header totals from children before saving
-            const childTotals = new Map<string, number>();
-            for (const item of newItems) {
-                if (item.parentId) {
-                    childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-                }
-            }
-            const mappedItems = newItems.map((item: any, index: number) => {
-                const isSect = !item.parentId && newItems.some((i: any) => i.parentId === item.id);
-                const ct = isSect ? (childTotals.get(item.id) || 0) : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                return { ...item, order: index, total: ct, ...(isSect ? { unitCost: ct } : {}) };
-            });
-            const mappedSchedules = newSchedules.map((schedule, index) => ({
-                ...schedule,
-                order: index
-            }));
-            // Subtotal from leaf items only (sections would double-count)
-            const newSubtotal = newItems.reduce((acc: number, item: any) => {
-                if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                if (!newItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                return acc;
-            }, 0);
-            const newTotal = rm(newSubtotal + rm(newSubtotal * taxRate));
-            await saveEstimate(initialEstimate.id, context.id, context.type, {
-                title, code, status, totalAmount: newTotal, paymentSchedules: mappedSchedules, taxExempt,
-                taxRateName: taxExempt ? null : (activeTax?.name || null),
-                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-            }, mappedItems);
+            await handleSave({ silent: true, itemsOverride: newItems, fieldsOverride: { paymentSchedules: newSchedules } });
             toast.success("Estimate auto-saved");
-
-            // Update lastSavedStateRef so subsequent blur saves are skipped
-            const savedSnapshot = {
-                title: title || "",
-                code: code || "",
-                status: status || "Draft",
-                processingFeeMarkup: Number(processingFeeMarkup) || 0,
-                hideProcessingFee: !!hideProcessingFee,
-                expirationDate: expirationDate ? new Date(expirationDate).toISOString().split("T")[0] : null,
-                memo: memo || null,
-                termsAndConditions: termsAndConditions || null,
-                overviewEnabled,
-                overviewTitle: overviewTitle || null,
-                overviewBody: overviewBody || null,
-                notesEnabled,
-                notesTitle: notesTitle || null,
-                notesBody: notesBody || null,
-                notesPlacement,
-                signatureUrl: signatureUrl || null,
-                targetMarginPercent: parseFloat(targetMargin) || 25,
-                taxExempt: !!taxExempt,
-                taxRateName: taxExempt ? null : (activeTax?.name || null),
-                taxRatePercent: taxExempt ? null : (activeTax?.rate ?? null),
-                items: mappedItems.map((item: any, index: number) => ({
-                    id: item.id || null,
-                    parentId: item.parentId || null,
-                    name: item.name || "",
-                    description: item.description || "",
-                    type: item.type || "Material",
-                    quantity: String(item.quantity || "0"),
-                    unitCost: String(item.unitCost || "0"),
-                    costCodeId: item.costCodeId || null,
-                    costTypeId: item.costTypeId || null,
-                    vendorId: item.vendorId || null,
-                    approvalStatus: item.approvalStatus || null,
-                    order: index,
-                    total: item.total,
-                })),
-                paymentSchedules: mappedSchedules.map((schedule: any, index: number) => ({
-                    id: schedule.id || null,
-                    name: schedule.name || "",
-                    amount: String(schedule.amount || "0"),
-                    dueDate: schedule.dueDate ? new Date(schedule.dueDate).toISOString().split("T")[0] : null,
-                    status: schedule.status || "Pending",
-                    paymentMethod: schedule.paymentMethod || null,
-                    paymentReference: schedule.paymentReference || null,
-                    percentage: String(schedule.percentage || "0"),
-                    type: schedule.type || null,
-                    order: index
-                })),
-            };
-            lastSavedStateRef.current = JSON.stringify(savedSnapshot);
-
-            router.refresh();
         } catch (saveErr) {
             console.error("Auto-save after estimate merge failed:", saveErr);
             toast.error("Items added — but auto-save failed. Click Save to persist.");
@@ -1187,16 +1559,117 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         }
     }
 
+    /**
+     * Must use the functional setState form: several callers (BudgetStrip's rate and margin
+     * inputs) fire two or three updateItem calls from one event. Building from the
+     * render-closure `items` made each call overwrite the previous, so a rate edit persisted
+     * only markupPercent and a margin edit only baseCost — the rest were silently dropped.
+     */
     function updateItem(index: number, field: string, value: any) {
-        const newItems = [...items];
-        newItems[index] = { ...newItems[index], [field]: value };
-        setItems(newItems);
+        setItems(prev => {
+            const newItems = [...prev];
+            newItems[index] = { ...newItems[index], [field]: value };
+            return newItems;
+        });
+    }
+
+    /**
+     * Index-free variant for callers that resolve their row BEFORE an await (AI description
+     * fill, approve/reject). Rows can be reordered, added or deleted while the request is in
+     * flight, so a position captured beforehand may point at a different row — or past the
+     * end — by the time the updater runs. Matching on id is stable across all of those.
+     */
+    function updateItemById(itemId: string, field: string, value: any) {
+        setItems(prev => prev.map(item => item.id === itemId ? { ...item, [field]: value } : item));
+    }
+
+    // Re-inserts each removed row at its original index, for the case where other edits
+    // happened to `current` while the undo toast was up (so we can't just restore `preDelete`
+    // wholesale — that would also discard those other edits).
+    function spliceBackByIndex(current: any[], removed: Array<{ item: any; index: number }>) {
+        const next = [...current];
+        const sorted = [...removed].sort((a, b) => a.index - b.index);
+        for (const { item, index } of sorted) {
+            next.splice(Math.min(index, next.length), 0, item);
+        }
+        return next;
     }
 
     function removeItem(index: number) {
         const itemToRemove = items[index];
-        // Also remove children if it's a parent
-        setItems(items.filter((item, i) => i !== index && item.parentId !== itemToRemove.id));
+        const children = items.filter(i => i.parentId === itemToRemove.id);
+        const group = [itemToRemove, ...children];
+
+        // B1: block outright if the item or any sub-item has logged time/expenses —
+        // saveEstimate hard-rejects deleting those server-side, so a local delete here
+        // would just wedge the editor unable to save.
+        const hasProtectedData = group.some(it => (it._count?.timeEntries ?? 0) > 0 || (it.expenses?.length ?? 0) > 0);
+        if (hasProtectedData) {
+            toast.error(`"${itemToRemove.name || "This item"}" can't be deleted — it has logged time entries or expenses attached. Remove those first.`);
+            return;
+        }
+
+        // B1: confirm if PO links or a schedule task would be severed.
+        const poLinks = group.flatMap(it => it.purchaseOrderLinks ?? []);
+        const scheduleTasks = group.filter(it => it.scheduleTask);
+        if (poLinks.length > 0 || scheduleTasks.length > 0) {
+            const parts: string[] = [];
+            if (poLinks.length > 0) parts.push(`${poLinks.length} purchase order${poLinks.length !== 1 ? "s" : ""}`);
+            if (scheduleTasks.length > 0) parts.push(`${scheduleTasks.length} schedule task${scheduleTasks.length !== 1 ? "s" : ""}`);
+            const ok = window.confirm(`"${itemToRemove.name || "This item"}" has ${parts.join(" and ")} attached. Delete anyway?`);
+            if (!ok) return;
+        }
+
+        captureHistory(`Before deleting "${itemToRemove.name || "item"}"`);
+        const preDelete = items;
+        const postDelete = items.filter((it, i) => i !== index && it.parentId !== itemToRemove.id);
+        const removed = group.map(it => ({ item: it, index: items.indexOf(it) }));
+        setItems(postDelete);
+        itemsRef.current = postDelete;
+
+        toast(`Deleted "${itemToRemove.name || "item"}"${children.length ? ` and ${children.length} sub-item(s)` : ""}`, {
+            action: { label: "Undo", onClick: () => undoDelete({ preDelete, postDelete, removed }) },
+            duration: 10000,
+        });
+    }
+
+    async function undoDelete({ preDelete, postDelete, removed }: {
+        preDelete: any[];
+        postDelete: any[];
+        removed: Array<{ item: any; index: number }>;
+    }) {
+        // Compute nextItems synchronously from itemsRef.current — the canonical current
+        // state — BEFORE calling setItems. A functional setItems(current => ...) updater is
+        // not guaranteed to run before this handler continues (React can defer it to the
+        // render phase), so extracting the computed array out of the updater via a captured
+        // variable previously reached restoreItems as `[]`, which saveEstimate interprets as
+        // "delete every line item" — a catastrophic false undo. itemsRef.current is safe to
+        // read here directly because it was set synchronously in removeItem right after the
+        // delete (and by restoreItems on every prior restore), so it always reflects the
+        // actual current items regardless of render timing.
+        const current = itemsRef.current;
+        const nextItems = current === postDelete ? preDelete : spliceBackByIndex(current, removed);
+
+        const links = removed.flatMap(r =>
+            (r.item.purchaseOrderLinks ?? []).map((l: any) => ({ estimateItemId: r.item.id, purchaseOrderId: l.purchaseOrder.id, createdAt: l.createdAt }))
+        );
+        const scheduleTasks = removed
+            .filter(r => r.item.scheduleTask?.id)
+            .map(r => ({ scheduleTaskId: r.item.scheduleTask.id, estimateItemId: r.item.id }));
+
+        try {
+            await restoreItems({
+                nextItems, links, scheduleTasks, mode: "additive",
+                label: `Before undoing delete of "${removed[0]?.item?.name || "item"}"`,
+            });
+            toast.success("Item restored");
+        } catch (e: any) {
+            toast.error(e?.message || "Restored locally, but failed to save — please review and save manually.", {
+                action: pendingAssociationRestoreRef.current
+                    ? { label: "Retry", onClick: () => retryAssociationRestore() }
+                    : undefined,
+            });
+        }
     }
 
     async function handleLinkPO(itemId: string) {
@@ -1210,29 +1683,55 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         finally { setLoadingPOs(false); }
     }
 
+    // Appends/removes a single item's purchaseOrderLinks inside one functional setItems
+    // update, deduplicated by PO id. Rapid-fire clicks (link A, then B, then C before any
+    // request resolves) each call this from their own event handler with whatever `items`
+    // their render closure captured — reading/writing through the closure directly would
+    // have each call overwrite the others' additions with a stale array. Routing every
+    // mutation through the same functional updater means each one applies on top of
+    // whatever the previous one just committed, and itemsRef is kept in sync inside the
+    // same update (not via the separate effect, which could still be pending).
+    function applyPoLinkChange(itemId: string, mutate: (links: any[]) => any[]) {
+        setItems(prev => {
+            const next = prev.map((it: any) => {
+                if (it.id !== itemId) return it;
+                return { ...it, purchaseOrderLinks: mutate(it.purchaseOrderLinks ?? []) };
+            });
+            itemsRef.current = next;
+            return next;
+        });
+    }
+
     async function handleSelectPO(itemId: string, po: any) {
         try {
             await linkPOToEstimateItem(itemId, po.id);
-            const idx = items.findIndex((i: any) => i.id === itemId);
-            if (idx >= 0) updateItem(idx, "purchaseOrderId", po.id);
-            if (idx >= 0) updateItem(idx, "purchaseOrder", po);
+            applyPoLinkChange(itemId, links =>
+                links.some((l: any) => l.purchaseOrder.id === po.id) ? links : [...links, { purchaseOrder: po }]
+            );
             toast.success(`Linked ${po.code}`);
         } catch (err: any) { toast.error(err.message); }
-        finally { setPOLinkItemId(null); }
     }
 
-    async function handleUnlinkPO(itemId: string) {
+    async function handleUnlinkPO(itemId: string, poId: string) {
         try {
-            await unlinkPOFromEstimateItem(itemId);
-            const idx = items.findIndex((i: any) => i.id === itemId);
-            if (idx >= 0) { updateItem(idx, "purchaseOrderId", null); updateItem(idx, "purchaseOrder", null); }
+            await unlinkPOFromEstimateItem(itemId, poId);
+            applyPoLinkChange(itemId, links => links.filter((l: any) => l.purchaseOrder.id !== poId));
+            // Supersede: this is a deliberate, explicit user action — if some earlier undo/
+            // revert still has this exact (item, PO) pair queued for restore, that queued
+            // restore must not be allowed to replay it back in on the next save.
+            const updated = removePendingLinks(pendingAssociationRestoreRef.current, [{ estimateItemId: itemId, purchaseOrderId: poId }]);
+            if (updated !== pendingAssociationRestoreRef.current) {
+                pendingAssociationRestoreRef.current = updated;
+                persistPendingRestore(initialEstimate.id, updated);
+            }
             toast.success("PO unlinked");
         } catch (err: any) { toast.error(err.message); }
     }
 
     function handlePOCreated(itemId: string, po: any) {
-        const idx = items.findIndex((i: any) => i.id === itemId);
-        if (idx >= 0) { updateItem(idx, "purchaseOrderId", po.id); updateItem(idx, "purchaseOrder", po); }
+        applyPoLinkChange(itemId, links =>
+            links.some((l: any) => l.purchaseOrder.id === po.id) ? links : [...links, { purchaseOrder: po }]
+        );
     }
 
     async function handleAiFillAll({ overwriteExisting: overwrite }: { overwriteExisting: boolean }) {
@@ -1244,7 +1743,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
         // Lock partition. PO-locked items are ALWAYS skipped regardless of overwrite flag —
         // a cut purchase order is a real dollar commitment, not a suggestion.
-        const isPoLocked = (it: any) => it.purchaseOrderId != null;
+        const isPoLocked = (it: any) => (it.purchaseOrderLinks?.length ?? 0) > 0;
         const hasBudget = (it: any) => {
             const n = parseFloat(it.budgetRate);
             return Number.isFinite(n) && n > 0;
@@ -1332,7 +1831,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         budgetUnit: s.budgetUnit || next[idx].budgetUnit,
                         budgetQuantity: sellQty,
                         markupPercent: derivedMarginPct(rate, sellPrice),
-                        // DO NOT touch: unitCost, quantity, total, purchaseOrderId
+                        // DO NOT touch: unitCost, quantity, total, purchaseOrderLinks
                     };
                     filled++;
                 }
@@ -1417,7 +1916,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         if (!window.confirm("Clear all budget values? Items with purchase orders will be preserved.")) return;
         const resetMargin = Math.max(0, Math.min(70, parseFloat(targetMargin) || 25));
         setItems(prev => prev.map(it => {
-            if (it.purchaseOrderId != null) return it;                            // PO-locked, never touch
+            if ((it.purchaseOrderLinks?.length ?? 0) > 0) return it;               // PO-locked, never touch
             if (!it.parentId && prev.some((c: any) => c.parentId === it.id)) return it; // category header
             return {
                 ...it,
@@ -1433,10 +1932,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     async function handleAiAssignPhases() {
-        const eligibleItems = items.filter(item => {
-            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
-            return !isSection;
-        });
+        const eligibleItems = items.filter((_item, index) => !itemTotals[index].isSection);
 
         if (eligibleItems.length === 0) {
             toast.info("No items found to assign phases.");
@@ -2100,7 +2596,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                         <div {...provided.droppableProps} ref={provided.innerRef} className="divide-y divide-slate-100">
                                             {items.map((item, index) => {
                                                 const isSubItem = !!item.parentId;
-                                                const isSection = !item.parentId && sectionIds.has(item.id);
+                                                const isSection = sectionIds.has(item.id);
                                                 // Hide children of collapsed sections
                                                 if (isSubItem && collapsedSections.has(item.parentId)) return null;
                                                 const sectionTotal = isSection ? (sectionTotals.get(item.id) || 0) : 0;
@@ -2212,21 +2708,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     </div>
                                                                     <div className="w-24 flex items-center justify-end gap-0.5 flex-shrink-0">
                                                                         {item.approvalStatus === "approved" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 Approved
                                                                             </span>
                                                                         ) : item.approvalStatus === "rejected" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 Rejected
                                                                             </span>
                                                                         ) : (
                                                                             <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItemById(item.id, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItemById(item.id, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 </button>
                                                                             </span>
@@ -2516,7 +3012,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                             Paid
                                                         </span>
                                                         {paidOn && (
-                                                            <span className="text-[10px] text-slate-400">{new Date(paidOn).toLocaleDateString()}</span>
+                                                            <span className="text-[10px] text-slate-400">{formatMoneyDate(paidOn, {})}</span>
                                                         )}
                                                         <button
                                                             onClick={async () => {
@@ -3222,7 +3718,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     <div className="min-w-0">
                                                         <p className="text-sm font-medium text-slate-800">{ev.title}</p>
                                                         {ev.detail && <p className="text-xs text-slate-500 truncate" title={ev.detail}>{ev.detail}</p>}
-                                                        <p className="text-xs text-slate-400">{new Date(ev.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                        <p className="text-xs text-slate-400">
+                                                            {(() => {
+                                                                const evDate = new Date(ev.ts);
+                                                                const dateStr = formatMoneyDate(evDate, { month: 'short', day: 'numeric', year: 'numeric' });
+                                                                // Calendar-day values (e.g. paidAt-less settled payments) carry no real
+                                                                // time-of-day — showing "12:00 AM" would be misleading, so only append
+                                                                // a time for values that are genuine instants.
+                                                                if (isDateOnly(evDate)) return dateStr;
+                                                                return `${dateStr}, ${evDate.toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+                                                            })()}
+                                                        </p>
                                                     </div>
                                                 </div>
                                             );
@@ -3689,16 +4195,34 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                 <div className="text-sm text-slate-400 text-center py-4">Loading...</div>
                             ) : projectPOs.length === 0 ? (
                                 <div className="text-sm text-slate-400 text-center py-4">No purchase orders found</div>
-                            ) : projectPOs.map(po => (
-                                <button
-                                    key={po.id}
-                                    onClick={() => handleSelectPO(poLinkItemId, po)}
-                                    className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition flex justify-between items-center"
-                                >
-                                    <span className="font-medium">{po.code} — {po.vendor?.name}</span>
-                                    <span className="text-slate-500">{formatCurrency(Number(po.totalAmount))}</span>
-                                </button>
-                            ))}
+                            ) : projectPOs.map(po => {
+                                const currentItem = items.find((i: any) => i.id === poLinkItemId);
+                                const alreadyLinked = (currentItem?.purchaseOrderLinks ?? []).some((l: any) => l.purchaseOrder.id === po.id);
+                                return (
+                                    <button
+                                        key={po.id}
+                                        disabled={alreadyLinked}
+                                        onClick={() => handleSelectPO(poLinkItemId, po)}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition flex justify-between items-center disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                    >
+                                        <span className="font-medium flex items-center gap-1.5">
+                                            {alreadyLinked && (
+                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-green-600 flex-shrink-0"><path d="M20 6 9 17l-5-5" /></svg>
+                                            )}
+                                            {po.code} — {po.vendor?.name}
+                                        </span>
+                                        <span className="text-slate-500">{formatCurrency(Number(po.totalAmount))}</span>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <div className="px-6 py-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                            <button
+                                onClick={() => setPOLinkItemId(null)}
+                                className="hui-btn hui-btn-primary"
+                            >
+                                Done
+                            </button>
                         </div>
                     </div>
                 </div>

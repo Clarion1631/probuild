@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 type SerializedRow = {
     id: string;
@@ -98,11 +99,7 @@ export default function TransactionTabs({
                                             className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50"
                                         >
                                             <td className="px-4 py-3 text-hui-textMuted">
-                                                {new Date(row.date).toLocaleDateString("en-US", {
-                                                    month: "short",
-                                                    day: "numeric",
-                                                    year: "numeric",
-                                                })}
+                                                {formatMoneyDate(row.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                             </td>
                                             <td className="px-4 py-3 text-hui-textMain">
                                                 {row.description}
@@ -212,11 +209,7 @@ export default function TransactionTabs({
                                                 className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50"
                                             >
                                                 <td className="px-4 py-3 text-hui-textMuted">
-                                                    {new Date(row.date).toLocaleDateString("en-US", {
-                                                        month: "short",
-                                                        day: "numeric",
-                                                        year: "numeric",
-                                                    })}
+                                                    {formatMoneyDate(row.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                                 </td>
                                                 <td className="px-4 py-3 text-hui-textMain">
                                                     {row.description}
