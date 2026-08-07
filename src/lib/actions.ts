@@ -16,6 +16,7 @@ import { resolveSessionClientId } from "./portal-auth";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
+import { normalizeEstimateItemForSave } from "./estimate-item-payload";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -3076,26 +3077,12 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             });
         }
 
+        // The field list lives in lib/estimate-item-payload, shared with the editor's
+        // change-detection snapshot so the two can't drift (a snapshot missing a field
+        // saveEstimate writes makes edits to it invisible, and the save silently no-ops).
         const toItemData = (item: any, fallbackOrder: number) => ({
-            id: item.id,
+            ...normalizeEstimateItemForSave(item, fallbackOrder),
             estimateId,
-            name: item.name,
-            description: item.description || "",
-            type: item.type,
-            quantity: parseFloat(item.quantity) || 0,
-            baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
-            markupPercent: parseFloat(item.markupPercent) || 25,
-            unitCost: parseFloat(item.unitCost) || 0,
-            total: parseFloat(item.total) || 0,
-            order: item.order ?? fallbackOrder,
-            parentId: item.parentId || null,
-            costCodeId: item.costCodeId || null,
-            costTypeId: item.costTypeId || null,
-            // purchaseOrderId is intentionally NOT set here — links live in
-            // EstimateItemPurchaseOrder and are maintained exclusively by syncLegacyPoLink.
-            budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
-            budgetUnit: item.budgetUnit || null,
-            budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
         });
 
         const parentItems = items.filter((i: any) => !i.parentId);

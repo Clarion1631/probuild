@@ -8,6 +8,8 @@ import {
     normalizeSectionTypes,
     rm,
     serializeEstimateItemsForSave,
+    ESTIMATE_ITEM_SAVE_FIELDS,
+    normalizeEstimateItemForSave,
 } from "../src/lib/estimate-item-payload";
 
 type Row = {
@@ -315,4 +317,82 @@ test("an orphaned child (parent row deleted) is still billed as a leaf", () => {
 test("an empty estimate has a zero subtotal", () => {
     assert.deepEqual(computeEstimateItemTotals([]), []);
     assert.equal(computeEstimateSubtotal([]), 0);
+});
+
+
+// --- the persisted-field projection ----------------------------------------------
+// Regression cover for the change-detection drift: the editor's snapshot used to
+// hand-roll a shorter field list than saveEstimate writes, so an edit touching only
+// the omitted fields produced an identical snapshot and the save silently no-opped.
+
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+const persistable = {
+    id: "item-1", name: "Cabinets", description: "Uppers", type: "Material",
+    quantity: 2, baseCost: 100, markupPercent: 25, unitCost: 125, total: 250,
+    parentId: null, costCodeId: null, costTypeId: null,
+    budgetQuantity: null, budgetUnit: null, budgetRate: null,
+};
+
+test("the projection emits exactly the fields saveEstimate persists", () => {
+    assert.deepEqual(
+        Object.keys(normalizeEstimateItemForSave(persistable, 0)).sort(),
+        [...ESTIMATE_ITEM_SAVE_FIELDS].sort(),
+    );
+});
+
+test("every budget field is visible to the change check", () => {
+    const before = JSON.stringify(serializeEstimateItemsForSave([persistable]).map((i, n) => normalizeEstimateItemForSave(i, n)));
+    for (const edit of [
+        { budgetQuantity: 3 }, { budgetUnit: "sf" }, { budgetRate: 42 },
+        { baseCost: 90 }, { markupPercent: 40 },
+    ]) {
+        const after = JSON.stringify(serializeEstimateItemsForSave([{ ...persistable, ...edit }]).map((i, n) => normalizeEstimateItemForSave(i, n)));
+        assert.notEqual(after, before, `editing ${Object.keys(edit)[0]} must be visible to the change check`);
+    }
+});
+
+test("an explicit zero survives; only an unset value falls back", () => {
+    // A zero margin is real (derivedMarginPct clamps to 0) and a zero budget is real.
+    // For budgetQuantity, null does not mean zero - it means "use the sell quantity".
+    for (const zero of [0, "0", "0.00"]) {
+        const row = normalizeEstimateItemForSave({ ...persistable, markupPercent: zero, budgetQuantity: zero, budgetRate: zero }, 0);
+        assert.equal(row.markupPercent, 0, `markupPercent ${JSON.stringify(zero)}`);
+        assert.equal(row.budgetQuantity, 0, `budgetQuantity ${JSON.stringify(zero)}`);
+        assert.equal(row.budgetRate, 0, `budgetRate ${JSON.stringify(zero)}`);
+    }
+    for (const unset of [null, undefined, "", "  ", "abc", NaN, Infinity]) {
+        const row = normalizeEstimateItemForSave({ ...persistable, markupPercent: unset, budgetQuantity: unset, budgetRate: unset }, 0);
+        assert.equal(row.markupPercent, 25, `markupPercent ${String(unset)}`);
+        assert.equal(row.budgetQuantity, null, `budgetQuantity ${String(unset)}`);
+        assert.equal(row.budgetRate, null, `budgetRate ${String(unset)}`);
+    }
+});
+
+test("string and numeric spellings of the same value compare equal", () => {
+    assert.equal(
+        JSON.stringify(normalizeEstimateItemForSave({ ...persistable, quantity: "2", unitCost: "125", baseCost: "100" }, 0)),
+        JSON.stringify(normalizeEstimateItemForSave(persistable, 0)),
+    );
+});
+
+test("PO links are not part of the save projection", () => {
+    // They live in EstimateItemPurchaseOrder, maintained solely by syncLegacyPoLink;
+    // writing the legacy scalar from here would fight that.
+    assert.ok(!("purchaseOrderId" in normalizeEstimateItemForSave({ ...persistable, purchaseOrderId: "po-1" }, 0)));
+});
+
+test("saveEstimate and the editor both go through the shared projection", () => {
+    // Guards the drift this module exists to prevent.
+    const root = path.join(__dirname, "..");
+    const actions = readFileSync(path.join(root, "src/lib/actions.ts"), "utf8");
+    assert.match(actions, /normalizeEstimateItemForSave\(item, fallbackOrder\)/);
+    const editor = readFileSync(path.join(root, "src/app/projects/[id]/estimates/[estimateId]/EstimateEditor.tsx"), "utf8");
+    assert.match(editor, /normalizeEstimateItemForSave\(item, index\)/);
+    // and updateItem must stay on the functional setState form
+    const body = editor.slice(editor.indexOf("function updateItem(index: number"));
+    const fn = body.slice(0, body.indexOf("\n    }") + 6);
+    assert.match(fn, /setItems\(prev =>/);
+    assert.doesNotMatch(fn, /\[\.\.\.items\]/);
 });

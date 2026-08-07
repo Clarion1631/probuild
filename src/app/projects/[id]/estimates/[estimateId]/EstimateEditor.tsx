@@ -6,6 +6,7 @@ import {
     normalizeSectionTypes,
     rm,
     serializeEstimateItemsForSave,
+    normalizeEstimateItemForSave,
 } from "@/lib/estimate-item-payload";
 
 /** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
@@ -387,25 +388,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         const f = { ...fieldsRef.current, ...fieldsOverride };
         const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
 
-        const srcTotals = computeEstimateItemTotals(srcItems);
-        const mappedItems = srcItems.map((item, index) => {
-            const computedTotal = srcTotals[index].total;
-            return {
-                id: item.id || null,
-                parentId: item.parentId || null,
-                name: item.name || "",
-                description: item.description || "",
-                type: item.type || "Material",
-                quantity: String(item.quantity || "0"),
-                unitCost: String(item.unitCost || "0"),
-                costCodeId: item.costCodeId || null,
-                costTypeId: item.costTypeId || null,
-                vendorId: item.vendorId || null,
-                approvalStatus: item.approvalStatus || null,
-                order: index,
-                total: computedTotal,
-            };
-        });
+        // Exactly what a save would write, field for field: serialize (order, section
+        // roll-up, unitCost mirror) then project through the same function saveEstimate's
+        // toItemData uses. Hand-rolling a shorter list here is what made budget-only edits
+        // invisible to the change check, so the save reported success and wrote nothing.
+        const mappedItems = serializeEstimateItemsForSave(srcItems)
+            .map((item, index) => normalizeEstimateItemForSave(item, index));
 
         const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
             id: schedule.id || null,
@@ -491,7 +479,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             if (res.ok) {
                 const data = await res.json();
                 if (data.description) {
-                    updateItem(itemIndex, "description", data.description);
+                    updateItemById(item.id, "description", data.description);
                     toast.success("AI description added");
                 }
             }
@@ -942,8 +930,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         if (hasChanges) {
             if (!silent) setIsSaving(true);
             try {
-                // Recompute section header totals from children before saving
-                const mappedItems = serializeEstimateItemsForSave(sourceItems);
+                // The rows the change check just compared — reusing them is what keeps the
+                // comparison and the write from ever describing different things.
+                const mappedItems = currentSnapshot.items;
                 const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
                     ...schedule,
                     order: index
@@ -1570,10 +1559,28 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         }
     }
 
+    /**
+     * Must use the functional setState form: several callers (BudgetStrip's rate and margin
+     * inputs) fire two or three updateItem calls from one event. Building from the
+     * render-closure `items` made each call overwrite the previous, so a rate edit persisted
+     * only markupPercent and a margin edit only baseCost — the rest were silently dropped.
+     */
     function updateItem(index: number, field: string, value: any) {
-        const newItems = [...items];
-        newItems[index] = { ...newItems[index], [field]: value };
-        setItems(newItems);
+        setItems(prev => {
+            const newItems = [...prev];
+            newItems[index] = { ...newItems[index], [field]: value };
+            return newItems;
+        });
+    }
+
+    /**
+     * Index-free variant for callers that resolve their row BEFORE an await (AI description
+     * fill, approve/reject). Rows can be reordered, added or deleted while the request is in
+     * flight, so a position captured beforehand may point at a different row — or past the
+     * end — by the time the updater runs. Matching on id is stable across all of those.
+     */
+    function updateItemById(itemId: string, field: string, value: any) {
+        setItems(prev => prev.map(item => item.id === itemId ? { ...item, [field]: value } : item));
     }
 
     // Re-inserts each removed row at its original index, for the case where other edits
@@ -2701,21 +2708,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     </div>
                                                                     <div className="w-24 flex items-center justify-end gap-0.5 flex-shrink-0">
                                                                         {item.approvalStatus === "approved" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 Approved
                                                                             </span>
                                                                         ) : item.approvalStatus === "rejected" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(index, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 Rejected
                                                                             </span>
                                                                         ) : (
                                                                             <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(index, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItemById(item.id, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(index, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItemById(item.id, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 </button>
                                                                             </span>
