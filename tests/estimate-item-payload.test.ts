@@ -11,6 +11,7 @@ import {
     ESTIMATE_ITEM_SAVE_FIELDS,
     normalizeEstimateItemForSave,
 } from "../src/lib/estimate-item-payload";
+import { buildQBEstimateLines } from "../src/lib/quickbooks";
 
 type Row = {
     id: string;
@@ -305,6 +306,81 @@ test("summing stored totals over non-section rows matches the subtotal (PDF path
 
     assert.equal(pdfSubtotal, 275);
     assert.equal(pdfSubtotal, computeEstimateSubtotal(items), "PDF and editor must agree");
+});
+
+// --- QuickBooks estimate sync ----------------------------------------------------
+// These exercise the real `buildQBEstimateLines` used by syncEstimateToQB, not a
+// re-implementation of it — deleting the filter must turn these red.
+
+const qbRows = (items: readonly Row[]) =>
+    serializeEstimateItemsForSave(items).map(item => ({
+        ...item,
+        name: String(item.id),
+        parentId: item.parentId ?? null,
+        quantity: Number(item.quantity ?? 0),
+        unitCost: Number(item.unitCost ?? 0),
+        type: String(item.type ?? ""),
+    }));
+
+test("QB estimate lines exclude section rows and sum to the pre-tax subtotal", () => {
+    const items = [
+        section("outer"),
+        section("inner", "outer", 999),
+        leaf("g1", "inner", 2, 100),
+        leaf("g2", "inner", 1, 50),
+        leaf("direct", "outer", 1, 25),
+    ];
+    const stored = qbRows(items);
+
+    // What the pre-fix payload shipped: every row, including both section levels.
+    assert.equal(stored.reduce((acc, item) => acc + item.total, 0), 800);
+
+    const lines = buildQBEstimateLines(stored, "svc-1");
+
+    assert.deepEqual(lines.map(l => l.Description), ["g1", "g2", "direct"]);
+    assert.equal(
+        rm(lines.reduce((acc, l) => acc + l.Amount, 0)),
+        computeEstimateSubtotal(items),
+        "QB line amounts must sum to the estimate subtotal",
+    );
+    assert.equal(rm(lines.reduce((acc, l) => acc + l.Amount, 0)), 275);
+});
+
+test("QB line numbers stay contiguous after sections are filtered out", () => {
+    const stored = qbRows([
+        section("s"),
+        leaf("a", "s", 1, 10),
+        leaf("b", "s", 1, 20),
+        leaf("c", null, 1, 30),
+    ]);
+
+    assert.deepEqual(buildQBEstimateLines(stored, "svc-1").map(l => l.LineNum), [1, 2, 3]);
+});
+
+test("QB lines keep Qty/UnitPrice from the leaf row", () => {
+    const stored = qbRows([leaf("a", null, 3, 19.999)]);
+    const [line] = buildQBEstimateLines(stored, "svc-1");
+
+    assert.equal(line.Amount, 60);
+    assert.equal(line.SalesItemLineDetail.Qty, 3);
+    assert.equal(line.SalesItemLineDetail.ItemRef.value, "svc-1");
+});
+
+test("an estimate of nothing but sections produces zero QB lines", () => {
+    // syncEstimateToQB turns this into a legible error rather than a QBO 2020.
+    const stored = qbRows([section("outer"), section("inner", "outer")]);
+
+    assert.equal(buildQBEstimateLines(stored, "svc-1").length, 0);
+    assert.equal(buildQBEstimateLines([], "svc-1").length, 0);
+});
+
+test("orphaned and legacy rows still bill as QB lines", () => {
+    // An orphan (parent deleted) is a leaf; an untyped row WITH children is a section.
+    const stored = qbRows([leaf("orphan", "gone", 2, 15), leaf("legacy", null, 1, 999, "Material"), leaf("kid", "legacy", 2, 25)]);
+    const lines = buildQBEstimateLines(stored, "svc-1");
+
+    assert.deepEqual(lines.map(l => l.Description), ["orphan", "kid"]);
+    assert.equal(rm(lines.reduce((acc, l) => acc + l.Amount, 0)), 80);
 });
 
 test("an orphaned child (parent row deleted) is still billed as a leaf", () => {
