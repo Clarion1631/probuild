@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // Expo-web specs need the mobile checkout + its static export — they run
+  // via playwright.config.mobile.ts (npm run test:mobile-e2e), never here/CI.
+  testIgnore: "**/mobile-app/**",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

@@ -209,7 +209,9 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
                         name: pendingNewVendor.name,
                         email: pendingNewVendor.email || undefined,
                         phone: pendingNewVendor.phone || undefined,
-                        address: pendingNewVendor.address || undefined,
+                        // Vendor's column is address1 — "address" was never a real
+                        // field, so the extracted address was being lost here.
+                        address1: pendingNewVendor.address || undefined,
                     });
                     finalVendorId = newVendor.id;
                 }
