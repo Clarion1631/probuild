@@ -1,5 +1,36 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { derivedMarginPct } from "@/lib/budget-math";
+import { isTaxCostCode, numOr, numOrNull } from "@/lib/takeoff-costing";
+
+/** The margin stored when a takeoff row carries no usable costing at all. */
+const DEFAULT_MARGIN_PCT = 25;
+
+/**
+ * Translate a takeoff row's costing into the value `EstimateItem.markupPercent` actually holds.
+ *
+ * Despite the column name, the estimate side stores GROSS MARGIN — `sellFromMargin` inverts it as
+ * `sell = cost / (1 - m/100)` (see the note in `lib/budget-math.ts`). The AI takeoff prompt speaks
+ * true MARKUP instead (`sell = cost x (1 + m/100)`), so the model's "25" describes a 20% margin.
+ * Writing it through unconverted would put a number on the line that disagrees with the line's own
+ * cost and price, and every downstream margin read would inherit that.
+ *
+ * Preference order:
+ *  1. Derive from the row's own cost and price — the pair is what the client was quoted, so the
+ *     margin derived from it keeps the row internally consistent no matter what the model claimed.
+ *  2. Convert the stated markup: margin = markup / (100 + markup) x 100.
+ *  3. Fall back to the default margin (also covers legacy rows saved before costing was carried).
+ */
+function marginPercentFor(item: any, baseCost: number | null, unitCost: number): number {
+    if (baseCost != null && baseCost > 0 && unitCost > 0) {
+        return derivedMarginPct(baseCost, unitCost);
+    }
+    const markup = numOrNull(item.markupPercent);
+    if (markup != null && markup > -100) {
+        return (markup / (100 + markup)) * 100;
+    }
+    return DEFAULT_MARGIN_PCT;
+}
 
 // POST /api/takeoffs/convert-to-estimate
 // Converts AI-generated takeoff data into a real Estimate with line items
@@ -56,17 +87,26 @@ export async function POST(req: NextRequest) {
         // Create all estimate line items
         for (let idx = 0; idx < items.length; idx++) {
             const item = items[idx];
+            // Tax is a pass-through: never let the default margin land on a tax line. Takeoffs
+            // generated before the AI mapping carried markupPercent have no value stored at all,
+            // so this guard also repairs those.
+            const isTaxItem = isTaxCostCode(item.costCode);
+
+            const baseCost = numOrNull(item.baseCost);
+            const unitCost = numOr(item.unitCost, 0);
+            const quantity = numOr(item.quantity, 1);
+
             await prisma.estimateItem.create({
                 data: {
                     estimateId: estimate.id,
                     name: item.name || "Unnamed Item",
                     description: item.description || "",
                     type: item.type || item.costType || "Material",
-                    quantity: parseFloat(item.quantity) || 1,
-                    baseCost: item.baseCost != null ? parseFloat(item.baseCost) : null,
-                    markupPercent: item.markupPercent != null ? parseFloat(item.markupPercent) : 25,
-                    unitCost: parseFloat(item.unitCost) || 0,
-                    total: parseFloat(item.total) || 0,
+                    quantity,
+                    baseCost,
+                    markupPercent: isTaxItem ? 0 : marginPercentFor(item, baseCost, unitCost),
+                    unitCost,
+                    total: numOr(item.total, 0),
                     order: idx,
                     parentId: null,
                     costCodeId: item.costCodeId || null,

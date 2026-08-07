@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { isTaxCostCode, numOr, numOrNull } from "@/lib/takeoff-costing";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
@@ -321,24 +322,42 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
         const typeMap: Record<string, string> = {};
         for (const ct of costTypes) typeMap[ct.name] = ct.id;
 
-        const estimateItems = aiItems.map((item: any, idx: number) => ({
-            id: `ai_${Date.now()}_${idx}`,
-            name: item.name || "Unnamed Item",
-            description: item.description || "",
-            type: item.costType || "Material",
-            quantity: item.quantity || 1,
-            unit: item.unit || "each",
-            unitCost: item.unitCost || 0,
-            total: item.total || (item.quantity || 1) * (item.unitCost || 0),
-            parentId: null,
-            costCodeId: codeMap[item.costCode] || null,
-            costTypeId: typeMap[item.costType] || null,
-            costCode: item.costCode || "",
-            order: idx,
-            isAllowance: item.isAllowance || false,
-        }));
+        // The prompt asks for baseCost/markupPercent per item — that is the internal costing the
+        // BudgetStrip and margin reporting read, and it used to be dropped here entirely. Carry it
+        // through, but normalize first: the model returns JSON, and a stringy or garbage number
+        // silently poisons the totals below (0 + "250" is the string "0250").
+        //
+        // These rows stay in the AI's own vocabulary — `markupPercent` here is TRUE MARKUP
+        // (sell = cost x (1 + m/100)), which is what the prompt asks for and what the takeoff
+        // preview screen renders. The estimate side stores gross margin under the same field name;
+        // convert-to-estimate does that translation when it writes EstimateItem rows.
+        const estimateItems = aiItems.map((item: any, idx: number) => {
+            const costCode = String(item.costCode || "").trim();
+            // Sales tax is a pass-through: no markup, whatever the model returned.
+            const isTaxItem = isTaxCostCode(costCode);
+            const quantity = numOr(item.quantity, 1);
+            const unitCost = numOr(item.unitCost, 0);
+            return {
+                id: `ai_${Date.now()}_${idx}`,
+                name: item.name || "Unnamed Item",
+                description: item.description || "",
+                type: item.costType || "Material",
+                quantity,
+                unit: item.unit || "each",
+                baseCost: numOrNull(item.baseCost),
+                markupPercent: isTaxItem ? 0 : numOrNull(item.markupPercent),
+                unitCost,
+                total: numOr(item.total, quantity * unitCost),
+                parentId: null,
+                costCodeId: codeMap[costCode] || null,
+                costTypeId: typeMap[item.costType] || null,
+                costCode,
+                order: idx,
+                isAllowance: item.isAllowance || false,
+            };
+        });
 
-        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
+        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + i.total, 0);
 
         const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
             id: `pm_${Date.now()}_${idx}`,
