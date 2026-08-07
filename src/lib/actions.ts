@@ -20,6 +20,9 @@ import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermis
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { appendPunchItemsInTransaction } from "./punch-items";
+import { runDailyLogTaskMatch } from "./daily-log-task-match";
+import { postDailyLogSummary } from "./chat-webhook";
+import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { recordPaymentCore } from "./payment-record-core";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
@@ -12004,6 +12007,7 @@ export async function createDailyLog(projectId: string, data: {
     workPerformed: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
     photoUrls?: { url: string; caption?: string }[];
 }) {
     // Hardened (dispatch-arc foundation): derive the author from an authorized staff session.
@@ -12012,6 +12016,14 @@ export async function createDailyLog(projectId: string, data: {
         projectId,
         actorUserId: author.id,
         ...data,
+    });
+
+    // Best-effort enrichment after the response: pin the AI task match on the
+    // log, then post the summary (with tomorrow's task) to the project's Chat
+    // space. Neither may block or fail the log write.
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(log.id);
+        await postDailyLogSummary(log.id);
     });
 
     revalidatePath(`/projects/${projectId}/dailylogs`);
@@ -12025,6 +12037,7 @@ export async function updateDailyLog(id: string, data: {
     workPerformed?: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
 }) {
     // Hardened (dispatch-arc foundation): authorize against the persisted log project before updating.
     const target = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
@@ -12042,10 +12055,22 @@ export async function updateDailyLog(id: string, data: {
     }
     if (data.materialsDelivered !== undefined) updateData.materialsDelivered = data.materialsDelivered || null;
     if (data.issues !== undefined) updateData.issues = data.issues || null;
+    if (data.nextSteps !== undefined) updateData.nextSteps = data.nextSteps || null;
 
     const log = await prisma.dailyLog.update({
         where: { id },
         data: updateData,
+    });
+
+    // Re-run the task match on any edit; re-post to Chat only when the
+    // narrative fields changed (a weather/date touch-up shouldn't re-ping the
+    // whole crew space).
+    const narrativeChanged = data.workPerformed !== undefined
+        || data.nextSteps !== undefined
+        || data.issues !== undefined;
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(log.id);
+        if (narrativeChanged) await postDailyLogSummary(log.id);
     });
 
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
@@ -12076,6 +12101,13 @@ export async function addDailyLogPhotos(dailyLogId: string, photos: { url: strin
             caption: p.caption || null,
         })),
     });
+    // Bump the log row: its updatedAt versions the content for the matcher's
+    // atomic stale-store guard, and photo rows alone don't touch it.
+    await prisma.dailyLog.update({ where: { id: dailyLogId }, data: { updatedAt: new Date() } });
+
+    // Photos are matcher evidence — refresh the pick. No Chat re-post for
+    // photo-only mutations.
+    runAfterRequest(() => runDailyLogTaskMatch(dailyLogId));
 
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
     return { success: true };
@@ -12092,13 +12124,17 @@ export async function deleteDailyLogPhoto(photoId: string) {
 
     await prisma.$transaction(async tx => {
         await tx.dailyLogPhoto.delete({ where: { id: photoId } });
-        if (photo.sharedToPortal) {
-            await tx.dailyLog.update({
-                where: { id: photo.dailyLog.id },
-                data: { sharedContentHash: null },
-            });
-        }
+        // Bump the log row regardless: updatedAt versions the content for the
+        // matcher's atomic stale-store guard.
+        await tx.dailyLog.update({
+            where: { id: photo.dailyLog.id },
+            data: photo.sharedToPortal ? { sharedContentHash: null, updatedAt: new Date() } : { updatedAt: new Date() },
+        });
     });
+
+    // Photos are matcher evidence — refresh the pick after removal too.
+    runAfterRequest(() => runDailyLogTaskMatch(photo.dailyLog.id));
+
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
     return { success: true };
 }

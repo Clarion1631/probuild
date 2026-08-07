@@ -128,6 +128,10 @@ jobs:
       # against the throwaway DB — so unlike the provider secrets above it's a
       # literal here rather than a repo secret (there's nothing to rotate).
       DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+      # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
+      # its deterministic keyword fallback instead of calling Gemini, so
+      # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
+      DAILY_LOG_MATCH_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}

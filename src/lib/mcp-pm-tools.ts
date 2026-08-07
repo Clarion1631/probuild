@@ -1,6 +1,9 @@
 import type { Prisma } from "@prisma/client";
 
+import { runAfterRequest } from "./after-request";
+import { postDailyLogSummary } from "./chat-webhook";
 import { createDailyLogCore } from "./daily-log-core";
+import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import {
     executeConfirmed,
     issueConfirmation,
@@ -431,6 +434,7 @@ export async function listDailyLogs(input: {
             workPerformed: true,
             materialsDelivered: true,
             issues: true,
+            nextSteps: true,
             sharedToPortal: true,
             _count: { select: { photos: true } },
         },
@@ -445,6 +449,7 @@ export async function listDailyLogs(input: {
             workPerformed: log.workPerformed,
             materialsDelivered: log.materialsDelivered,
             issues: log.issues,
+            nextSteps: log.nextSteps,
             photoCount: log._count.photos,
             sharedToPortal: log.sharedToPortal,
         })),
@@ -459,6 +464,7 @@ type CreateDailyLogInput = {
     workPerformed: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
     photos?: Array<{ fileId: string; caption?: string }>;
     confirmToken?: string;
 };
@@ -513,6 +519,7 @@ export async function createDailyLogWithConfirmation(
         workPerformed,
         materialsDelivered: input.materialsDelivered?.trim() || undefined,
         issues: input.issues?.trim() || undefined,
+        nextSteps: input.nextSteps?.trim() || undefined,
         photos: photos.map(photo => ({
             fileId: photo.fileId,
             caption: photo.caption?.trim() || undefined,
@@ -528,11 +535,11 @@ export async function createDailyLogWithConfirmation(
         return issueConfirmation(
             "create_daily_log",
             args,
-            `Create the ${input.date} daily log on "${project.name}" with ${resolvedPhotos.length} photo${resolvedPhotos.length === 1 ? "" : "s"}: ${workPerformed}`,
+            `Create the ${input.date} daily log on "${project.name}" with ${resolvedPhotos.length} photo${resolvedPhotos.length === 1 ? "" : "s"}: ${workPerformed}${args.nextSteps ? ` Next steps: ${args.nextSteps}` : ""}`,
             actor.actorLabel,
         );
     }
-    return executePmConfirmed("create_daily_log", args, input.confirmToken, actor, async tx => {
+    const result = await executePmConfirmed("create_daily_log", args, input.confirmToken, actor, async tx => {
         const project = await tx.project.findUnique({
             where: { id: input.projectId },
             select: { id: true, name: true },
@@ -548,6 +555,7 @@ export async function createDailyLogWithConfirmation(
             workPerformed: args.workPerformed,
             materialsDelivered: args.materialsDelivered,
             issues: args.issues,
+            nextSteps: args.nextSteps,
             photoUrls: resolvedPhotos.map(photo => ({
                 url: photo.url,
                 caption: photo.caption,
@@ -569,6 +577,18 @@ export async function createDailyLogWithConfirmation(
             sharedToPortal: log.sharedToPortal,
         };
     });
+    // After commit (this is the chat-ingest path — the primary daily-log
+    // source): pin the AI task match, then post the summary with tomorrow's
+    // task back to the project's Chat space. Best-effort; never blocks the
+    // tool result.
+    if (result && typeof result === "object" && "dailyLogId" in result) {
+        const dailyLogId = (result as { dailyLogId: string }).dailyLogId;
+        runAfterRequest(async () => {
+            await runDailyLogTaskMatch(dailyLogId);
+            await postDailyLogSummary(dailyLogId);
+        });
+    }
+    return result;
 }
 
 export async function listPunchItems(input: {

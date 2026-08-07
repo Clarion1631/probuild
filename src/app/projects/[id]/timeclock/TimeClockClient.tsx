@@ -20,6 +20,9 @@ type TimeEntryDetailed = {
     laborCost: number | null;
     user: { id: string; name: string | null; email: string };
     costCode: CostCodeBasic | null;
+    suggestionOverridden?: boolean;
+    suggestedTaskName?: string | null;
+    suggestionSource?: string | null;
 };
 
 interface TimeClockClientProps {
@@ -366,13 +369,23 @@ export default function TimeClockClient({
                                         </div>
                                     </td>
                                     <td className="px-5 py-3.5">
-                                        {entry.costCode ? (
-                                            <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-100">
-                                                {entry.costCode.code} – {entry.costCode.name}
-                                            </span>
-                                        ) : (
-                                            <span className="text-slate-400 italic text-xs">Unassigned</span>
-                                        )}
+                                        <div className="flex flex-col items-start gap-1">
+                                            {entry.costCode ? (
+                                                <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-100">
+                                                    {entry.costCode.code} – {entry.costCode.name}
+                                                </span>
+                                            ) : (
+                                                <span className="text-slate-400 italic text-xs">Unassigned</span>
+                                            )}
+                                            {entry.suggestionOverridden && (
+                                                <span
+                                                    className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-100 text-amber-700"
+                                                    title={entry.suggestionSource ? `Suggestion source: ${entry.suggestionSource}` : undefined}
+                                                >
+                                                    Overrode suggestion: {entry.suggestedTaskName ?? "suggested task"}
+                                                </span>
+                                            )}
+                                        </div>
                                     </td>
                                     <td className="px-5 py-3.5 text-right font-semibold tabular-nums">
                                         {entry.durationHours === 0

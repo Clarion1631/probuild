@@ -238,6 +238,7 @@ model Project {
   color               String?                      @default("#3b82f6") // Added color field
   paymentRemindersEnabled Boolean                  @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
   portalStageOverride String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
+  chatWebhookUrl      String? // Google Chat incoming webhook for the project's team space — treated as a credential: manager-only, never serialized to field crew
   managerId           String?
   manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
   estimates           Estimate[]
@@ -820,6 +821,13 @@ model TimeEntry {
 
   // Invoice linkage — set when pulled into a cost-plus invoice
   invoicedAt DateTime?
+
+  // Clock-in task suggestion audit (daily-log-driven accuracy feature)
+  suggestedScheduleTaskId String?
+  suggestedCostCodeId     String?
+  suggestedTaskName       String? // denormalized — survives task edits/deletes
+  suggestionSource        String? // "daily_log" | "today_schedule" | "user_history"
+  suggestionOverridden    Boolean @default(false)
 
   @@index([projectId])
   @@index([userId])
@@ -1954,6 +1962,9 @@ model DailyLog {
   workPerformed      String          @db.Text
   materialsDelivered String?         @db.Text
   issues             String?         @db.Text
+  nextSteps          String?         @db.Text // what's planned next — drives clock-in task suggestions
+  aiSuggestedTaskId  String? // ScheduleTask picked by the task matcher from this log's text + photos
+  aiSuggestionReason String?         @db.Text
   sharedToPortal     Boolean         @default(false)
   sharedContentHash  String?
   photos             DailyLogPhoto[]

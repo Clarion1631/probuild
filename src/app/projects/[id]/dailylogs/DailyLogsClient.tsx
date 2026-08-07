@@ -65,6 +65,7 @@ type DailyLog = {
     workPerformed: string;
     materialsDelivered: string | null;
     issues: string | null;
+    nextSteps: string | null;
     photos: DailyLogPhoto[];
     createdBy: { id: string; name: string | null; email: string };
     createdAt: string;
@@ -133,6 +134,7 @@ export default function DailyLogsClient({
     const [formWork, setFormWork] = useState("");
     const [formMaterials, setFormMaterials] = useState("");
     const [formIssues, setFormIssues] = useState("");
+    const [formNextSteps, setFormNextSteps] = useState("");
     const [formPhotos, setFormPhotos] = useState<File[]>([]);
     const [uploading, setUploading] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -145,6 +147,7 @@ export default function DailyLogsClient({
         setFormWork("");
         setFormMaterials("");
         setFormIssues("");
+        setFormNextSteps("");
         setFormPhotos([]);
     };
 
@@ -224,6 +227,7 @@ export default function DailyLogsClient({
             if (data.workPerformed) setFormWork(data.workPerformed);
             if (data.materialsDelivered) setFormMaterials(data.materialsDelivered);
             if (data.issues) setFormIssues(data.issues);
+            if (data.nextSteps) setFormNextSteps(data.nextSteps);
             
             // If weather wasn't explicitly set by user, suggest it if AI found it
             if (!formWeather && !formTemp && data.weather) {
@@ -265,6 +269,7 @@ export default function DailyLogsClient({
                         workPerformed: formWork,
                         materialsDelivered: formMaterials || undefined,
                         issues: formIssues || undefined,
+                        nextSteps: formNextSteps || undefined,
                         photoUrls: photoUrls.length > 0 ? photoUrls : undefined,
                     });
                     toast.success("Daily log created!");
@@ -725,6 +730,16 @@ export default function DailyLogsClient({
                                                                         </div>
                                                                     )}
 
+                                                                    {/* Next Steps */}
+                                                                    {log.nextSteps && (
+                                                                        <div>
+                                                                            <p className="text-[10px] font-bold text-blue-600 uppercase tracking-wider mb-2">Next Steps</p>
+                                                                            <div className="text-sm text-hui-textMain whitespace-pre-wrap bg-blue-50/50 rounded-lg p-4 border border-blue-100">
+                                                                                {log.nextSteps}
+                                                                            </div>
+                                                                        </div>
+                                                                    )}
+
                                                                     {/* Photos */}
                                                                     {log.photos.length > 0 && (
                                                                         <div>
@@ -960,6 +975,18 @@ export default function DailyLogsClient({
                                     placeholder="Note any issues, delays, or concerns..."
                                     value={formIssues}
                                     onChange={e => setFormIssues(e.target.value)}
+                                    className="hui-input w-full"
+                                    rows={2}
+                                />
+                            </div>
+
+                            {/* Next Steps */}
+                            <div>
+                                <label className="block text-sm font-medium text-hui-textMain mb-1">Next Steps (optional)</label>
+                                <textarea
+                                    placeholder="What's the plan for tomorrow?"
+                                    value={formNextSteps}
+                                    onChange={e => setFormNextSteps(e.target.value)}
                                     className="hui-input w-full"
                                     rows={2}
                                 />

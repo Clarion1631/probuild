@@ -1841,6 +1841,9 @@ function createHandler(actor: RouteMcpActor) {
                     workPerformed: z.string().trim().min(1).max(20_000),
                     materialsDelivered: z.string().max(20_000).optional(),
                     issues: z.string().max(20_000).optional(),
+                    nextSteps: z.string().max(20_000).optional().describe(
+                        "What's planned next / for tomorrow, if the chat mentions it—pull this from the conversation's \"next steps\" or \"tomorrow\" content."
+                    ),
                     photos: z.array(z.object({
                         fileId: z.string().max(50),
                         caption: z.string().max(500).optional(),
@@ -2606,7 +2609,7 @@ function createHandler(actor: RouteMcpActor) {
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.15.0" },
+        serverInfo: { name: "probuild", version: "1.16.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +
