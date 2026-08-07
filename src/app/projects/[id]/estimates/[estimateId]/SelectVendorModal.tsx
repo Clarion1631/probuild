@@ -36,7 +36,10 @@ export default function SelectVendorModal({ onSelect, onClose }: SelectVendorMod
         if (statusFilter !== "ALL" && v.status !== statusFilter) return false;
         if (search) {
             const q = search.toLowerCase();
-            return v.name.toLowerCase().includes(q) || (v.type && v.type.toLowerCase().includes(q));
+            // Trade lives in vendor tags — v.type never existed, so searching by
+            // trade silently matched nothing.
+            return v.name.toLowerCase().includes(q)
+                || (v.tags || []).some((t: any) => t.name?.toLowerCase().includes(q));
         }
         return true;
     });
@@ -161,9 +164,11 @@ export default function SelectVendorModal({ onSelect, onClose }: SelectVendorMod
                                                     <span className="text-[10px] bg-slate-100 text-slate-500 font-bold px-2 py-0.5 rounded-full uppercase tracking-wider">Inactive</span>
                                                 )}
                                             </div>
-                                            {(v.type || v.email) && (
+                                            {((v.tags?.length ?? 0) > 0 || v.email) && (
                                                 <div className="text-xs text-slate-500 space-y-0.5">
-                                                    {v.type && <p>{v.type}</p>}
+                                                    {(v.tags?.length ?? 0) > 0 && (
+                                                        <p className="line-clamp-1">{v.tags.map((t: any) => t.name).join(", ")}</p>
+                                                    )}
                                                     {v.email && <p className="truncate text-slate-400">{v.email}</p>}
                                                 </div>
                                             )}

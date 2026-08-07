@@ -9280,6 +9280,9 @@ function pickVendorFiles(files: any[]) {
 // Free-text trade labels ("Supplier, Lumber") normalised into VendorTag names.
 // Tags are how the vendors list filters, so a trade typed during inline vendor
 // creation belongs here rather than buried in a text column.
+const MAX_TAG_NAME_LENGTH = 40;
+const MAX_NEW_TAGS = 10;
+
 function parseTagNames(tagNames: any): string[] {
     if (!tagNames) return [];
     const raw = Array.isArray(tagNames) ? tagNames : [tagNames];
@@ -9287,8 +9290,9 @@ function parseTagNames(tagNames: any): string[] {
     for (const entry of raw) {
         if (typeof entry !== "string") continue;
         for (const part of entry.split(",")) {
-            const name = part.trim();
+            const name = part.trim().slice(0, MAX_TAG_NAME_LENGTH);
             if (name) seen.add(name);
+            if (seen.size >= MAX_NEW_TAGS) return [...seen];
         }
     }
     return [...seen];
@@ -9311,22 +9315,43 @@ export async function createVendor(data: any) {
         throw err;
     }
 
-    const v = await prisma.vendor.create({
+    const tagWrite = {
+        ...(tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : {}),
+        // connectOrCreate so an existing trade tag is reused rather than
+        // colliding on VendorTag.name's unique constraint.
+        ...(newTagNames.length
+            ? { connectOrCreate: newTagNames.map(tagName => ({ where: { name: tagName }, create: { name: tagName } })) }
+            : {}),
+    };
+
+    const createArgs = {
         data: {
             ...fields,
             name,
-            tags: (tagIds?.length || newTagNames.length) ? {
-                connect: tagIds?.length ? tagIds.map((id: string) => ({ id })) : undefined,
-                // connectOrCreate so an existing trade tag is reused rather than
-                // colliding on VendorTag.name's unique constraint.
-                connectOrCreate: newTagNames.length
-                    ? newTagNames.map(tagName => ({ where: { name: tagName }, create: { name: tagName } }))
-                    : undefined,
-            } : undefined,
-            files: files?.length ? { create: pickVendorFiles(files) } : undefined
+            ...(Object.keys(tagWrite).length ? { tags: tagWrite } : {}),
+            ...(files?.length ? { files: { create: pickVendorFiles(files) } } : {}),
         },
         include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
-    });
+    };
+
+    let v;
+    try {
+        v = await prisma.vendor.create(createArgs);
+    } catch (error: any) {
+        // connectOrCreate is a check-then-create, so two vendors naming the same
+        // new tag at once can race and one loses on VendorTag.name. The retry
+        // finds the tag the winner just created and connects to it instead.
+        const rawTarget = error?.meta?.target;
+        const targets: string[] = Array.isArray(rawTarget)
+            ? rawTarget.map(String)
+            : rawTarget ? [String(rawTarget)] : [];
+        const isTagNameRace = error?.code === "P2002"
+            && targets.includes("name")
+            && newTagNames.length > 0;
+        if (!isTagNameRace) throw error;
+        v = await prisma.vendor.create(createArgs);
+    }
+
     revalidatePath("/company/vendors");
     return v;
 }
