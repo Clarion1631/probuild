@@ -2863,7 +2863,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
             viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
-            payments: { select: { id: true, name: true, amount: true, status: true, qbInvoiceId: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+            payments: { select: { id: true, name: true, amount: true, status: true, qbInvoiceId: true, qbSyncError: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
         },
     });
     if (invoice) {
@@ -2903,8 +2903,14 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
                 // the view to specific milestones, link only those — note this keys off the CLAIM,
                 // not off focusedPayments, so a stale/invalid ?milestone= param doesn't silently
                 // widen into "link everything". Milestones not staged to QuickBooks have no link.
+                //
+                // qbSyncError ("voided" | "notFound") is set by the sync poller when the linked QBO
+                // invoice is gone, and it deliberately KEEPS qbInvoiceId so the Break-QB-Link flow
+                // can still act on it. Linking a flagged row would point at a dead or stale QBO
+                // page, so those fall back to the ProBuild button instead.
                 const scopedView = claimedFocusIds.length > 0;
                 const qbLinked = (scopedView ? focusedPayments : invoice.payments)
+                    .filter(p => !p.qbSyncError)
                     .map(p => ({ name: p.name, amount: Number(p.amount), qbId: (p.qbInvoiceId || "").trim() }))
                     .filter(p => p.qbId.length > 0);
                 const qbUrlFor = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${encodeURIComponent(qbId)}`;
