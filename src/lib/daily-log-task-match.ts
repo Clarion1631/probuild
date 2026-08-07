@@ -169,15 +169,36 @@ export async function runDailyLogTaskMatch(dailyLogId: string): Promise<void> {
         });
         const doneWhenById = new Map(doneWhens.map(task => [task.id, task.doneWhen]));
 
-        const taskLines = candidates.map(task => {
+        // Candidates in schedule order, so "phase X is complete → the phase
+        // after it is next" is inferable. Recently completed tasks are shown as
+        // CONTEXT ONLY — a log declaring a phase done points at whatever
+        // follows it, and without seeing completed phases the model can't make
+        // that jump.
+        const ordered = [...candidates].sort((a, b) => a.startDate.getTime() - b.startDate.getTime());
+        const taskLines = ordered.map(task => {
             const doneWhen = doneWhenById.get(task.taskId);
-            return `- id: ${task.taskId} | ${task.costCodeLabel} | ${task.taskName}${doneWhen ? ` | done when: ${doneWhen}` : ""}`;
+            return `- id: ${task.taskId} | starts ${task.startDate.toISOString().slice(0, 10)} | ${task.costCodeLabel} | ${task.taskName}${doneWhen ? ` | done when: ${doneWhen}` : ""}`;
         }).join("\n");
+
+        const recentlyCompleted = await prisma.scheduleTask.findMany({
+            where: { projectId: log.projectId, type: "task", status: "Complete" },
+            orderBy: { endDate: "desc" },
+            take: 8,
+            select: { name: true, endDate: true },
+        });
+        const completedLines = recentlyCompleted.length > 0
+            ? recentlyCompleted
+                .map(task => `- ${task.name} (ended ${task.endDate.toISOString().slice(0, 10)})`)
+                .join("\n")
+            : "(none)";
 
         const prompt = `You are matching a construction daily log to the schedule task the crew should charge time to.
 
-Open tasks on this project:
+Open tasks on this project, in schedule order (pick ONLY from these ids):
 ${taskLines}
+
+Already-completed tasks (context only — never pick these):
+${completedLines}
 
 Daily log:
 Work performed: ${log.workPerformed || "(none)"}
@@ -185,7 +206,11 @@ Next steps: ${log.nextSteps || "(none)"}
 Issues: ${log.issues || "(none)"}
 ${log.photos.length > 0 ? `\n${Math.min(log.photos.length, MAX_PHOTOS)} site photo(s) attached. Use what the photos show (materials, trade, room, stage of work) as evidence.` : ""}
 
-Pick the ONE task that "next steps" (preferred) or the most recent work points to. If the log doesn't clearly point at one task, return an empty taskId — a wrong pick misfiles labor hours, so only answer when confident.
+Pick the ONE open task the crew should charge time to next, in this priority order:
+1. An explicit "next steps" statement always wins.
+2. If the log declares a phase COMPLETE (text or photos) and names no next step, the crew is almost certainly moving to the phase that FOLLOWS it — pick the earliest open task after the completed work in schedule order.
+3. Otherwise, the task matching the most recent work described.
+If none of these clearly points at one open task, return an empty taskId — a wrong pick misfiles labor hours, so only answer when confident.
 
 Respond ONLY with valid JSON matching the schema.`;
 
