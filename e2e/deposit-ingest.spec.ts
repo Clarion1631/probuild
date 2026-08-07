@@ -1,6 +1,7 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
 import { createHash } from "node:crypto";
+import { saveQBSettings } from "../src/lib/integration-store";
 
 /**
  * Deposit auto-apply pipeline (Phase B1) — hermetic e2e for
@@ -344,6 +345,11 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
       invoiceId: F.nonQbo.invoice, invoiceCode: F.nonQbo.invoiceCode,
       schedules: [{ id: F.nonQbo.schedule, name: "NonQBO Deposit", amount: F.nonQbo.amount }],
     });
+    // The QBO mock replaces the network, NOT the connection state (see
+    // getFreshQBTokens) — QBO-linked cases need a connected settings row. Cleared in
+    // afterAll so later-ordered fail-closed specs (CI runs workers:1, serialized)
+    // keep their disconnected premise.
+    await saveQBSettings({ connected: true, accessToken: "e2e-mock", refreshToken: "e2e-mock", realmId: "e2e-mock-realm" });
     await seedFixture({
       projectId: F.weakMatch.project, projectName: F.weakMatch.projectName,
       invoiceId: F.weakMatch.invoice, invoiceCode: F.weakMatch.invoiceCode,
@@ -361,6 +367,7 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
 
   test.afterAll(async () => {
     try {
+      await saveQBSettings({ connected: false, accessToken: undefined, refreshToken: undefined, realmId: undefined });
       await prisma.paymentNotification.deleteMany({
         where: { scheduleId: { in: [F.qbo.schedule, F.concurrent.schedule, F.reserve.schedule, F.resume.schedule, F.nonQbo.schedule, F.forceCorrect.schedule, F.settleCrash.scheduleSettled, F.settleCrash.scheduleUnsettled] } },
       });

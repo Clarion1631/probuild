@@ -40,8 +40,16 @@ export class QBNotConnectedError extends Error {
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
 export async function getFreshQBTokens(): Promise<QBTokens> {
-    // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts.
-    if (isE2eQboMockEnabled()) return MOCK_QB_TOKENS;
+    // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts. The mock
+    // replaces the NETWORK, not the CONNECTION STATE: with no connected settings row
+    // it still throws QBNotConnectedError, so fail-closed specs (e.g.
+    // milestone-payment-request) keep their "rail is down" premise; specs that need
+    // QuickBooks seed a connected row (see e2e/deposit-ingest.spec.ts beforeAll).
+    if (isE2eQboMockEnabled()) {
+        const qb = await getQBSettings();
+        if (!qb.connected) throw new QBNotConnectedError();
+        return MOCK_QB_TOKENS;
+    }
     const qb = await getQBSettings();
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
