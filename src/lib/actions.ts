@@ -2831,6 +2831,10 @@ export async function getInvoiceForPortal(id: string) {
     }
 }
 
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?: string[]) {
     const sessionClientId = await assertInvoicePortalAccess();
     if (!sessionClientId) return;
@@ -2838,7 +2842,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
     // Client-supplied (from the portal's ?milestone= param) — validated against
     // the invoice's own payments below before it influences anything.
     const claimedFocusIds = Array.isArray(focusedMilestoneIds)
-        ? focusedMilestoneIds.filter((id): id is string => typeof id === "string" && id.length <= 50).slice(0, 40)
+        ? focusedMilestoneIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 50).slice(0, 40)
         : [];
 
     const claim = await prisma.invoice.updateMany({
@@ -2860,7 +2864,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
             viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
-            payments: { select: { id: true, name: true, amount: true, status: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+            payments: { select: { id: true, name: true, amount: true, status: true, qbInvoiceId: true, qbSyncError: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
         },
     });
     if (invoice) {
@@ -2892,22 +2896,58 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
                 }
 
                 const focusedLine = focusedPayments.length > 0
-                    ? `<p style="margin: 0 0 4px; color: #333;">They were viewing the payment request for <strong>${focusedPayments.map(p => p.name).join(" · ")}</strong> (${formatCurrency(focusedTotal)}).</p>`
+                    ? `<p style="margin: 0 0 4px; color: #333;">They were viewing the payment request for <strong>${focusedPayments.map(p => escapeHtml(p.name)).join(" · ")}</strong> (${formatCurrency(focusedTotal)}).</p>`
                     : "";
+
+                // Each milestone maps to its own QBO invoice (schema.prisma:595), so there is no
+                // single "the" QuickBooks invoice for this ProBuild invoice. When the portal scoped
+                // the view to specific milestones, link only those — note this keys off the CLAIM,
+                // not off focusedPayments, so a stale/invalid ?milestone= param doesn't silently
+                // widen into "link everything". Milestones not staged to QuickBooks have no link.
+                //
+                // qbSyncError ("voided" | "notFound") is set by the sync poller when the linked QBO
+                // invoice is gone, and it deliberately KEEPS qbInvoiceId so the Break-QB-Link flow
+                // can still act on it. Linking a flagged row would point at a dead or stale QBO
+                // page, so those fall back to the ProBuild button instead.
+                const scopedView = claimedFocusIds.length > 0;
+                const qbLinked = (scopedView ? focusedPayments : invoice.payments)
+                    .filter(p => !p.qbSyncError)
+                    .map(p => ({ name: p.name, amount: Number(p.amount), qbId: (p.qbInvoiceId || "").trim() }))
+                    .filter(p => p.qbId.length > 0);
+                const qbUrlFor = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${encodeURIComponent(qbId)}`;
+                const btn = (href: string, label: string) =>
+                    `<a href="${href}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">${label}</a>`;
+
+                let ctaBlock: string;
+                if (qbLinked.length === 1) {
+                    ctaBlock = `<div style="text-align: center; margin: 16px 0;">
+                                ${btn(qbUrlFor(qbLinked[0].qbId), "View in QuickBooks")}
+                            </div>`;
+                } else if (qbLinked.length > 1) {
+                    const heading = scopedView
+                        ? "QuickBooks invoices for the milestones they viewed:"
+                        : `This invoice has ${qbLinked.length} QuickBooks invoices, one per milestone:`;
+                    ctaBlock = `<p style="margin: 16px 0 8px; color: #333; font-size: 13px;">${heading}</p>
+                            <div style="margin: 0 0 16px;">
+                                ${qbLinked.map(p => `<p style="margin: 0 0 6px;"><a href="${qbUrlFor(p.qbId)}" style="color: #059669; font-weight: 600; text-decoration: none;">${escapeHtml(p.name)} — ${formatCurrency(p.amount)}</a></p>`).join("")}
+                            </div>`;
+                } else {
+                    // Nothing staged to QuickBooks yet — the ProBuild invoice is the only real target.
+                    ctaBlock = `<div style="text-align: center; margin: 16px 0;">
+                                ${btn(editorUrl, "View Invoice")}
+                            </div>`;
+                }
                 await sendNotification(
                     settings.notificationEmail,
                     `👁️ Invoice Viewed — ${invoice.code}`,
                     `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${escapeHtml(clientName)}</strong> opened invoice <strong>${escapeHtml(invoice.code)}</strong>${projectName ? ` for ${escapeHtml(projectName)}` : ""}.</p>
                             ${focusedLine}
                             <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
-                            <div style="text-align: center; margin: 16px 0;">
-                                <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
-                                    View Invoice
-                                </a>
-                            </div>
+                            ${ctaBlock}
+                            ${qbLinked.length > 0 ? `<p style="margin: 0 0 12px; text-align: center;"><a href="${editorUrl}" style="color: #666; font-size: 12px;">Open in ProBuild</a></p>` : ""}
                             ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of the invoice as the client saw it is attached.</p>` : ""}
                         </div>
                     </div>`,
