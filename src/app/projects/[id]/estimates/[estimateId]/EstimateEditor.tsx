@@ -892,6 +892,22 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
 
+    /**
+     * Sell-side subtotal/tax/fee/total for an explicit items array + field set, rather than
+     * the render's `total`/`taxRate` consts, which are frozen to whatever render created a
+     * stale caller's closure. Shared so every writer of `totalAmount` — and anything that
+     * needs the new total BEFORE the state updates land, like applyGeneratedEstimate
+     * rebalancing percentage milestones — computes money exactly one way.
+     */
+    function computeSellTotals(sourceItems: any[], f: typeof fieldsRef.current) {
+        const sourceSubtotal = computeEstimateSubtotal(sourceItems);
+        const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
+        const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+        const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
+        const sourceTax = rm(sourceSubtotal * sourceTaxRate);
+        return { activeTax, subtotal: sourceSubtotal, total: rm(sourceSubtotal + sourceTax + sourceProcessingFee) };
+    }
+
     async function handleSave(opts: { silent?: boolean; skipRefresh?: boolean; itemsOverride?: any[]; fieldsOverride?: Partial<typeof fieldsRef.current>; skipHistoryCapture?: boolean } = {}) {
         // Chain this save behind whatever is already in flight (see saveQueueRef comment
         // above) so saves always run one at a time, in the order they were requested. The
@@ -932,15 +948,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     order: index
                 }));
 
-                // Recompute the sell subtotal/total (and tax) from `sourceItems`/`f` rather than
-                // the render's `total`/`taxRate` consts, which are equally frozen to the stale
-                // render for a caller with a stale closure.
-                const sourceSubtotal = computeEstimateSubtotal(sourceItems);
-                const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
-                const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
-                const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
-                const sourceTax = rm(sourceSubtotal * sourceTaxRate);
-                const sourceTotal = rm(sourceSubtotal + sourceTax + sourceProcessingFee);
+                const { activeTax, total: sourceTotal } = computeSellTotals(sourceItems, f);
 
                 await saveEstimate(initialEstimate.id, context.id, context.type, {
                     title: f.title, code: f.code, status: f.status, totalAmount: sourceTotal, paymentSchedules: mappedSchedules,
@@ -1465,10 +1473,27 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             toast.error('No line items found to add');
             return;
         }
-        const newItems = [...items, ...data.items];
-        const newSchedules = data.paymentMilestones && data.paymentMilestones.length > 0
-            ? [...paymentSchedules, ...data.paymentMilestones]
-            : paymentSchedules;
+        // Base off the refs, not this function's closure: the AI/import request is async, so
+        // `items`/`paymentSchedules` here belong to whatever render kicked it off and may be
+        // several edits stale by the time the response lands.
+        const baseItems = itemsRef.current;
+        const baseSchedules = fieldsRef.current.paymentSchedules;
+        const newItems = [...baseItems, ...data.items];
+
+        // Rebalance percentage-driven milestones against the post-merge total. The [total]
+        // effect only repairs client state on the next render — it runs after the save below,
+        // so without this the DB keeps amounts split against the pre-merge total until some
+        // later save happens to correct them, and an invoice raised in between bills the
+        // stale split.
+        //
+        // Deliberately NOT applied when the payload brings its own milestones: that appends a
+        // second complete plan to the existing one, and rebalancing two 100% plans against a
+        // single total over-allocates (recalcMilestoneAmounts can only clamp the last
+        // residual). Normalizing or replacing there is a product decision, not a bug fix.
+        const incomingMilestones = data.paymentMilestones && data.paymentMilestones.length > 0;
+        const newSchedules = incomingMilestones
+            ? [...baseSchedules, ...data.paymentMilestones!]
+            : recalcMilestoneAmounts(baseSchedules, computeSellTotals(newItems, fieldsRef.current).total);
 
         // Update UI immediately — don't wait for save. itemsRef is set synchronously (not
         // just via the effect that mirrors `items`) so a save queued right behind this one
@@ -1476,7 +1501,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // records them correctly.
         itemsRef.current = newItems;
         setItems(newItems);
-        if (data.paymentMilestones && data.paymentMilestones.length > 0) {
+        // Only assigned when the payload brings milestones. On the items-only path the
+        // rebalanced schedules go to the save alone: the [total] effect updates client state
+        // itself, and it does so with a functional updater, so it can't clobber a schedule
+        // edit that has reached state but not yet the ref.
+        if (incomingMilestones) {
             setPaymentSchedules(newSchedules);
         }
         onMerged?.();
