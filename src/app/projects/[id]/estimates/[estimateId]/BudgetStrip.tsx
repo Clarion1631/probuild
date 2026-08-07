@@ -11,8 +11,7 @@ const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"
 
 interface BudgetStripProps {
     item: any;
-    index: number;
-    updateItem: (index: number, field: string, value: any) => void;
+    updateItem: (itemId: string, patch: Record<string, any>) => void;
     contextType: "project" | "lead";
     onLinkPO: (itemId: string) => void;
     onCreatePO: (itemId: string) => void;
@@ -21,7 +20,7 @@ interface BudgetStripProps {
 }
 
 export default function BudgetStrip({
-    item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO
+    item, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO
 }: BudgetStripProps) {
     const [showUnitDropdown, setShowUnitDropdown] = useState(false);
     const [openPopoverPoId, setOpenPopoverPoId] = useState<string | null>(null);
@@ -68,7 +67,7 @@ export default function BudgetStrip({
                 <input
                     type="number"
                     value={budgetQty}
-                    onChange={e => updateItem(index, "budgetQuantity", e.target.value === "" ? null : parseFloat(e.target.value))}
+                    onChange={e => updateItem(item.id, { budgetQuantity: e.target.value === "" ? null : parseFloat(e.target.value) })}
                     onBlur={() => {}}
                     className="w-16 bg-white border border-indigo-200 rounded px-1.5 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
                     placeholder="Qty"
@@ -78,7 +77,7 @@ export default function BudgetStrip({
                     <input
                         type="text"
                         value={item.budgetUnit || ""}
-                        onChange={e => updateItem(index, "budgetUnit", e.target.value || null)}
+                        onChange={e => updateItem(item.id, { budgetUnit: e.target.value || null })}
                         onFocus={() => setShowUnitDropdown(true)}
                         onBlur={() => setTimeout(() => setShowUnitDropdown(false), 150)}
                         className="w-16 bg-white border border-indigo-200 rounded px-1.5 py-1 text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
@@ -89,7 +88,7 @@ export default function BudgetStrip({
                             {UNIT_SUGGESTIONS.filter(u => !item.budgetUnit || u.includes(item.budgetUnit.toLowerCase())).map(u => (
                                 <button
                                     key={u}
-                                    onMouseDown={e => { e.preventDefault(); updateItem(index, "budgetUnit", u); setShowUnitDropdown(false); }}
+                                    onMouseDown={e => { e.preventDefault(); updateItem(item.id, { budgetUnit: u }); setShowUnitDropdown(false); }}
                                     className="w-full text-left px-2 py-1 text-xs hover:bg-indigo-50 transition"
                                 >
                                     {u}
@@ -110,11 +109,11 @@ export default function BudgetStrip({
                             const val = e.target.value === "" ? null : e.target.value;
                             const r = parseFloat(e.target.value) || 0;
                             const price = parseFloat(item.unitCost) || 0;
-                            updateItem(index, "budgetRate", val);
-                            updateItem(index, "baseCost", r > 0 ? val : null);
-                            if (r > 0 && price > 0) {
-                                updateItem(index, "markupPercent", derivedMarginPct(r, price).toFixed(2));
-                            }
+                            updateItem(item.id, {
+                                budgetRate: val,
+                                baseCost: r > 0 ? val : null,
+                                ...(r > 0 && price > 0 ? { markupPercent: derivedMarginPct(r, price).toFixed(2) } : {}),
+                            });
                         }}
                         className="w-20 bg-white border border-indigo-200 rounded pl-4 pr-1.5 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
                         placeholder="Rate"
@@ -146,12 +145,11 @@ export default function BudgetStrip({
                             // we persist is always the margin the rate was derived from.
                             const { stored, derivedFrom } = normalizeMarginInput(e.target.value);
                             const price = parseFloat(item.unitCost) || 0;
-                            updateItem(index, "markupPercent", stored);
-                            if (price > 0) {
-                                const rateStr = formatDerivedRate(costFromMargin(price, derivedFrom), price);
-                                updateItem(index, "budgetRate", rateStr);
-                                updateItem(index, "baseCost", rateStr);
-                            }
+                            const rateStr = price > 0 ? formatDerivedRate(costFromMargin(price, derivedFrom), price) : null;
+                            updateItem(item.id, {
+                                markupPercent: stored,
+                                ...(rateStr !== null ? { budgetRate: rateStr, baseCost: rateStr } : {}),
+                            });
                         }}
                         disabled={isPoLocked}
                         className="w-14 bg-white border border-indigo-200 rounded px-1.5 pr-4 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed"

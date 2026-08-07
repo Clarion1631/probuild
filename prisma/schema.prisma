@@ -423,6 +423,13 @@ model Estimate {
   // Tasks generated from this estimate by generateScheduleFromEstimate.
   generatedScheduleTasks ScheduleTask[]
 
+  /// Optimistic-concurrency guard for the whole line-item collection (adds, deletes, updates,
+  /// reorders, wholesale rewrites). saveEstimate compare-and-sets on this under the Estimate row's
+  /// FOR UPDATE lock (see lockMoneyParents); a save carrying a stale revision is rejected instead
+  /// of silently reverting another actor's write. Bumped by every writer that mutates this
+  /// estimate's items — see docs/specs/estimate-item-optimistic-concurrency.md REVISION 2.
+  itemsRevision Int @default(0)
+
   @@index([createdAt])
   @@index([projectId])
   @@index([leadId])

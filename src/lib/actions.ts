@@ -16,11 +16,14 @@ import { resolveSessionClientId } from "./portal-auth";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
-import { normalizeEstimateItemForSave, selectedBillableRows } from "./estimate-item-payload";
+// normalizeEstimateItemForSave is no longer imported here — the item projection moved into
+// estimate-item-upsert.ts, which is now its only caller on the save path.
+import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { upsertEstimateItems, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import { postDailyLogSummary } from "./chat-webhook";
@@ -1575,6 +1578,14 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 code: true, status: true, privacy: true, createdAt: true,
                 totalAmount: true, balanceDue: true, taxExempt: true,
                 taxRateName: true, taxRatePercent: true,
+                // If the apply-estimate-items-revision.mjs migration hasn't run yet, selecting
+                // this column throws P2022 and this whole fallback query fails loudly (caught by
+                // getEstimate's own outer try only if a caller wraps it further) rather than
+                // silently omitting the column and letting the editor fabricate itemsRevision 0
+                // — which would defeat the save-conflict guard for every editor session opened
+                // against a not-yet-migrated DB. That's deliberate: CLAUDE.md's schema-before-
+                // deploy checklist is what's supposed to prevent this state from being reachable.
+                itemsRevision: true,
                 approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
@@ -3022,6 +3033,27 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         //      Either way, no committed payment's balanceDue effect is silently overwritten.
         await lockMoneyParents(tx, { estimateId });
 
+        // Estimate-level optimistic-concurrency compare-and-set — see
+        // docs/specs/estimate-item-optimistic-concurrency.md REVISION 2. The Estimate row is
+        // already locked FOR UPDATE by lockMoneyParents above, so this CAS is airtight (not
+        // merely probable): no other transaction can read or write itemsRevision on this row
+        // until we commit or roll back. No escape hatch — a payload without a numeric
+        // itemsRevision is rejected as stale. The sole caller is the editor, which always sends
+        // one.
+        // Non-negative safe integer only. A plain `typeof === "number"` let NaN, Infinity and
+        // fractional values through to Prisma, where they surface as a generic query/validation
+        // error instead of the structured conflict the client knows how to handle.
+        if (!Number.isSafeInteger(data.itemsRevision) || data.itemsRevision < 0) {
+            throw new EstimateStaleSaveError();
+        }
+        const revisionCas = await tx.estimate.updateMany({
+            where: { id: estimateId, itemsRevision: data.itemsRevision },
+            data: { itemsRevision: { increment: 1 } },
+        });
+        if (revisionCas.count === 0) {
+            throw new EstimateStaleSaveError();
+        }
+
         // Preserve payment credits: subtract already-paid milestones from totalAmount.
         // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
         // snapshot taken before a racing payment committed.
@@ -3118,48 +3150,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             });
         }
 
-        // The field list lives in lib/estimate-item-payload, shared with the editor's
-        // change-detection snapshot so the two can't drift (a snapshot missing a field
-        // saveEstimate writes makes edits to it invisible, and the save silently no-ops).
-        const toItemData = (item: any, fallbackOrder: number) => ({
-            ...normalizeEstimateItemForSave(item, fallbackOrder),
+        // The itemsRevision CAS above already guards this whole write — no per-row conflict
+        // handling needed here. The field list lives in lib/estimate-item-payload, shared with
+        // the editor's change-detection snapshot so the two can't drift (a snapshot missing a
+        // field saveEstimate writes makes edits to it invisible, and the save silently no-ops).
+        await upsertEstimateItems(tx, {
             estimateId,
+            items,
+            existingItemsMap,
         });
-
-        const parentItems = items.filter((i: any) => !i.parentId);
-        const childItems  = items.filter((i: any) =>  i.parentId);
-
-        // Upsert Parents
-        for (let idx = 0; idx < parentItems.length; idx++) {
-            const item = parentItems[idx];
-            const itemData = toItemData(item, idx);
-            if (item.id && existingItemsMap.has(item.id)) {
-                await tx.estimateItem.update({
-                    where: { id: item.id },
-                    data: itemData,
-                });
-            } else {
-                await tx.estimateItem.create({
-                    data: itemData,
-                });
-            }
-        }
-
-        // Upsert Children
-        for (let idx = 0; idx < childItems.length; idx++) {
-            const item = childItems[idx];
-            const itemData = toItemData(item, idx);
-            if (item.id && existingItemsMap.has(item.id)) {
-                await tx.estimateItem.update({
-                    where: { id: item.id },
-                    data: itemData,
-                });
-            } else {
-                await tx.estimateItem.create({
-                    data: itemData,
-                });
-            }
-        }
 
         // 2. Differential Payment Schedule Upsert
         const existingSchedules = await tx.estimatePaymentSchedule.findMany({ where: { estimateId } });
@@ -3257,7 +3256,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             }
         }
 
-        return { success: true };
+        return { success: true as const, itemsRevision: data.itemsRevision + 1 };
     }, {
         // A full estimate save fans out to ~12 + itemCount + scheduleCount sequential statements;
         // the default 5s interactive-transaction limit is too tight for large estimates that
@@ -3270,15 +3269,28 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // behavior). If the deployed DB is missing an optional column, Prisma throws P2022 and the
     // transaction rolls back cleanly; re-run the whole transaction writing only the safe columns.
     // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
+    //
+    // EstimateStaleSaveError is checked around BOTH attempts (not just the first) — a conflict
+    // can just as easily surface on the safeOnly retry, and prod redacts thrown server-action
+    // messages, so an uncaught throw from that retry would reach the client as a generic failure
+    // instead of the named conflict. Nothing was written either way (the transaction rolled
+    // back), so we return immediately, before the revalidatePath/auto-assign-phases calls below.
     let result;
     try {
-        result = await withTxRetry(() => runSave(false));
-    } catch (e: any) {
-        if (e?.code === "P2022") {
-            result = await withTxRetry(() => runSave(true));
-        } else {
-            throw e;
+        try {
+            result = await withTxRetry(() => runSave(false));
+        } catch (e: any) {
+            if (e?.code === "P2022") {
+                result = await withTxRetry(() => runSave(true));
+            } else {
+                throw e;
+            }
         }
+    } catch (e: any) {
+        if (e instanceof EstimateStaleSaveError) {
+            return { success: false as const, conflict: { staleSave: true } };
+        }
+        throw e;
     }
 
     if (contextType === "project") {
@@ -13982,37 +13994,51 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
         throw new Error("No active estimate found for this project. Please create an estimate first.");
     }
 
-    const lastItem = await prisma.estimateItem.findFirst({
-        where: { estimateId: estimate.id },
-        orderBy: { order: "desc" },
-        select: { order: true }
-    });
-    const nextOrder = lastItem ? lastItem.order + 1 : 0;
+    // One transaction, estimate locked FIRST (canonical Estimate → Invoice order), because the
+    // row insert and the itemsRevision bump must be atomic. Split across two autocommit
+    // statements — as this was — a concurrent saveEstimate can interleave between them: it takes
+    // the lock, passes its CAS against the not-yet-bumped revision, sees this brand-new row as
+    // absent from its own payload, deletes it as "removed by the user", and commits. Bumping
+    // inside the lock means that save either ran entirely before this insert (and is now stale,
+    // so its next attempt is rejected) or blocks until the bump is committed and fails its CAS.
+    // See docs/specs/estimate-item-optimistic-concurrency.md REVISION 2.
+    const item = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId: estimate.id });
 
-    const item = await prisma.estimateItem.create({
-        data: {
-            estimateId: estimate.id,
-            name,
-            type: "Material",
-            quantity,
-            baseCost: unitCost,
-            markupPercent: 0,
-            unitCost,
-            total: quantity * unitCost,
-            order: nextOrder
-        }
-    });
+        const lastItem = await tx.estimateItem.findFirst({
+            where: { estimateId: estimate.id },
+            orderBy: { order: "desc" },
+            select: { order: true }
+        });
+        const nextOrder = lastItem ? lastItem.order + 1 : 0;
 
-    const allItems = await prisma.estimateItem.findMany({
-        where: { estimateId: estimate.id },
-        select: { total: true }
-    });
-    const totalAmount = allItems.reduce((sum, it) => sum + Number(it.total), 0);
+        const created = await tx.estimateItem.create({
+            data: {
+                estimateId: estimate.id,
+                name,
+                type: "Material",
+                quantity,
+                baseCost: unitCost,
+                markupPercent: 0,
+                unitCost,
+                total: quantity * unitCost,
+                order: nextOrder
+            }
+        });
 
-    await prisma.estimate.update({
-        where: { id: estimate.id },
-        data: { totalAmount }
-    });
+        const allItems = await tx.estimateItem.findMany({
+            where: { estimateId: estimate.id },
+            select: { total: true }
+        });
+        const totalAmount = allItems.reduce((sum, it) => sum + Number(it.total), 0);
+
+        await tx.estimate.update({
+            where: { id: estimate.id },
+            data: { totalAmount, itemsRevision: { increment: 1 } }
+        });
+
+        return created;
+    }));
 
     revalidatePath(`/projects/${projectId}/estimates/${estimate.id}`);
     revalidatePath(`/projects/${projectId}/estimates`);
