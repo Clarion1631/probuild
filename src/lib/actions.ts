@@ -4070,7 +4070,7 @@ async function assertActiveStaff(): Promise<any> {
     throw new Error("Unauthorized");
 }
 
-async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts") {
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
@@ -4151,6 +4151,22 @@ async function assertFinancialProjectAccess(projectId: string) {
 
 async function assertCompanySettingsPermission() {
     return assertStaffPermission("companySettings");
+}
+
+async function assertVendorPermission() {
+    return assertStaffPermission("manageVendors");
+}
+
+// Creating a vendor is also part of the PO flow — SelectVendorModal and
+// POQuickCreateModal let an estimator add one inline, and those screens gate on
+// financialReports (see quickCreatePOAndLink). So either permission is enough to
+// create; editing and deleting still require manageVendors.
+async function assertVendorCreatePermission() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "manageVendors") && !hasPermission(user, "financialReports")) {
+        throw new Error("Forbidden");
+    }
+    return user;
 }
 
 async function assertEstimateStaffOrPortalAccess(estimateId: string) {
@@ -9221,22 +9237,95 @@ export async function subPortalDeleteCOI() {
 // ==========================================
 export async function getVendors() {
     "use server";
-    return prisma.vendor.findMany({ 
+    // Vendor rows carry EIN, account numbers, contacts and file URLs — this was
+    // reachable unauthenticated. The PO-flow modals need it too, so gate on
+    // active staff and let the two write permissions stay narrower.
+    await assertVendorCreatePermission();
+    return prisma.vendor.findMany({
         orderBy: { name: "asc" },
         include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
     });
 }
 
+// Vendor columns a caller is allowed to write. Anything not listed here — most
+// importantly the `purchaseOrders` relation — is dropped. Spreading the raw
+// payload into Prisma let a caller pass nested relation writes such as
+// { purchaseOrders: { deleteMany: {} } }, which deletes POs directly and so
+// never trips the vendor FK's ON DELETE RESTRICT or deletePurchaseOrder's checks.
+const VENDOR_WRITABLE_FIELDS = [
+    "name", "website", "description", "firstName", "lastName", "email", "phone",
+    "fax", "address1", "address2", "city", "state", "zipCode", "country",
+    "paymentTerms", "chargesTax", "accountNumber", "ein", "notes", "status",
+] as const;
+
+function pickVendorFields(data: any) {
+    const out: Record<string, any> = {};
+    for (const key of VENDOR_WRITABLE_FIELDS) {
+        if (data?.[key] !== undefined) out[key] = data[key];
+    }
+    return out;
+}
+
+// Same reasoning for vendor files — map the scalars explicitly rather than
+// handing Prisma a caller-shaped object.
+function pickVendorFiles(files: any[]) {
+    return files.map((f: any) => ({
+        name: f.name,
+        url: f.url,
+        size: f.size,
+        type: f.type,
+    }));
+}
+
+// Free-text trade labels ("Supplier, Lumber") normalised into VendorTag names.
+// Tags are how the vendors list filters, so a trade typed during inline vendor
+// creation belongs here rather than buried in a text column.
+function parseTagNames(tagNames: any): string[] {
+    if (!tagNames) return [];
+    const raw = Array.isArray(tagNames) ? tagNames : [tagNames];
+    const seen = new Set<string>();
+    for (const entry of raw) {
+        if (typeof entry !== "string") continue;
+        for (const part of entry.split(",")) {
+            const name = part.trim();
+            if (name) seen.add(name);
+        }
+    }
+    return [...seen];
+}
+
 export async function createVendor(data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorCreatePermission();
+    const { tagIds, tagNames, files } = data ?? {};
+    const newTagNames = parseTagNames(tagNames);
 
-    const v = await prisma.vendor.create({ 
+    // name is the one required Vendor column — the allowlist above can't prove
+    // to the type system that it survived, so check it rather than cast it away.
+    const fields = pickVendorFields(data);
+    const name = typeof fields.name === "string" ? fields.name.trim() : "";
+    if (!name) {
+        // status lets the API route answer 400 without matching on the message.
+        const err: any = new Error("Vendor name is required");
+        err.status = 400;
+        throw err;
+    }
+
+    const v = await prisma.vendor.create({
         data: {
-            ...vendorData,
-            tags: tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : undefined,
-            files: files?.length ? { create: files } : undefined
-        }
+            ...fields,
+            name,
+            tags: (tagIds?.length || newTagNames.length) ? {
+                connect: tagIds?.length ? tagIds.map((id: string) => ({ id })) : undefined,
+                // connectOrCreate so an existing trade tag is reused rather than
+                // colliding on VendorTag.name's unique constraint.
+                connectOrCreate: newTagNames.length
+                    ? newTagNames.map(tagName => ({ where: { name: tagName }, create: { name: tagName } }))
+                    : undefined,
+            } : undefined,
+            files: files?.length ? { create: pickVendorFiles(files) } : undefined
+        },
+        include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
     });
     revalidatePath("/company/vendors");
     return v;
@@ -9244,25 +9333,20 @@ export async function createVendor(data: any) {
 
 export async function updateVendor(id: string, data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorPermission();
+    const { tagIds, files } = data ?? {};
 
-    const v = await prisma.vendor.update({ 
-        where: { id }, 
+    const v = await prisma.vendor.update({
+        where: { id },
         data: {
-            ...vendorData,
+            ...pickVendorFields(data),
             tags: tagIds ? { set: tagIds.map((id: string) => ({ id })) } : undefined,
         }
     });
 
     if (files && files.length > 0) {
         await prisma.vendorFile.createMany({
-            data: files.map((f: any) => ({
-                name: f.name,
-                url: f.url,
-                size: f.size,
-                type: f.type,
-                vendorId: id
-            }))
+            data: pickVendorFiles(files).map(f => ({ ...f, vendorId: id }))
         });
     }
 
@@ -9272,12 +9356,41 @@ export async function updateVendor(id: string, data: any) {
 
 export async function deleteVendor(id: string) {
     "use server";
-    await prisma.vendor.delete({ where: { id } });
+    await assertVendorPermission();
+
+    // Purchase orders are financial records — a vendor that still has any must
+    // not be deletable. The FK is ON DELETE RESTRICT, so the database is the
+    // real guard; the count here only turns that into a message naming how many
+    // POs are in the way. The two are not atomic, hence the P2003 catch below.
+    //
+    // This returns a result rather than throwing, because a production Next
+    // build redacts thrown Server Function messages — a throw would reach the
+    // user as a generic error with the count stripped out. Authorization still
+    // throws: being denied is not an expected outcome worth rendering.
+    const poCount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+    if (poCount > 0) {
+        return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: poCount };
+    }
+
+    try {
+        await prisma.vendor.delete({ where: { id } });
+    } catch (error: any) {
+        // P2003 = FK constraint failure, i.e. a PO was attached between the
+        // count above and this delete.
+        if (error?.code === "P2003") {
+            const recount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+            return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: recount };
+        }
+        throw error;
+    }
+
     revalidatePath("/company/vendors");
+    return { ok: true as const };
 }
 
 export async function deleteVendorFile(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorFile.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
@@ -9289,6 +9402,7 @@ export async function getVendorTags() {
 
 export async function createVendorTag(name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.create({ data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9296,6 +9410,7 @@ export async function createVendorTag(name: string) {
 
 export async function updateVendorTag(id: string, name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.update({ where: { id }, data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9303,6 +9418,7 @@ export async function updateVendorTag(id: string, name: string) {
 
 export async function deleteVendorTag(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorTag.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }

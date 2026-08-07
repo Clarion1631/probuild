@@ -52,7 +52,9 @@ export default function SelectVendorModal({ onSelect, onClose }: SelectVendorMod
             const newVendor = await createVendor({
                 name: newName,
                 email: newEmail,
-                type: newType,
+                // Trade becomes a vendor tag — that's what the vendors list filters
+                // on. There is no "type" column; sending one used to throw.
+                tagNames: newType || undefined,
                 status: "ACTIVE"
             });
             toast.success("Vendor created successfully");

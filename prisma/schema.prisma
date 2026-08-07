@@ -1607,7 +1607,10 @@ model PurchaseOrder {
   projectId   String
   project     Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   vendorId    String
-  vendor      Vendor  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade: deleting a vendor must never silently destroy its
+  // purchase orders (and their items, files, messages) behind the app's back.
+  // deleteVendor blocks with a count; this is the backstop for every other caller.
+  vendor      Vendor  @relation(fields: [vendorId], references: [id], onDelete: Restrict)
   status      String  @default("Draft") // Draft, Sent, Received, Cancelled
   totalAmount Decimal   @default(0)
   notes       String?

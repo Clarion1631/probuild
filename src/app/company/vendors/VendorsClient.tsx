@@ -536,12 +536,30 @@ export default function VendorsClient({ initialVendors, initialTags }: { initial
                                                     <button onClick={() => { setRowActionMenuVendorId(null); openVendorModal(v); }} className="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"><Edit2 className="w-3.5 h-3.5"/> Edit Record</button>
                                                     <button onClick={async () => {
                                                         setRowActionMenuVendorId(null);
-                                                        if (confirm("Delete this vendor permanently?")) {
-                                                            await deleteVendor(v.id);
-                                                            setVendors(vendors.filter(vx => vx.id !== v.id));
-                                                            toast.success("Vendor deleted");
-                                                            router.refresh();
+                                                        // The loaded count only shapes the prompt — the server decides.
+                                                        // Blocking on it here would strand a vendor whose POs were
+                                                        // reassigned elsewhere since this list was rendered.
+                                                        const knownPoCount = v._count?.purchaseOrders ?? 0;
+                                                        const prompt = knownPoCount > 0
+                                                            ? `This vendor has ${knownPoCount} purchase order${knownPoCount === 1 ? "" : "s"} and probably cannot be deleted. Try anyway?`
+                                                            : "Delete this vendor permanently?";
+                                                        if (!confirm(prompt)) return;
+                                                        let result;
+                                                        try {
+                                                            result = await deleteVendor(v.id);
+                                                        } catch {
+                                                            toast.error("Could not delete vendor");
+                                                            return;
                                                         }
+                                                        if (!result?.ok) {
+                                                            const n = result?.count ?? 0;
+                                                            toast.error(`This vendor has ${n} purchase order${n === 1 ? "" : "s"}. Delete or reassign them first.`);
+                                                            router.refresh();
+                                                            return;
+                                                        }
+                                                        setVendors(vendors.filter(vx => vx.id !== v.id));
+                                                        toast.success("Vendor deleted");
+                                                        router.refresh();
                                                     }} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">Delete Vendor</button>
                                                 </div>
                                             )}
