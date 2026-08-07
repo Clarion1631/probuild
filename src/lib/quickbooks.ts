@@ -9,6 +9,7 @@ import {
     getMockQboInvoice,
     mockSendQBPaymentCreate,
 } from "./quickbooks-mock";
+import { isEstimateSectionRow } from "./estimate-item-payload";
 
 export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
@@ -760,6 +761,54 @@ export async function getRecentQBPaymentsList(tokens: QBTokens, sinceDaysAgo: nu
     }));
 }
 
+/** The estimate-item shape `buildQBEstimateLines` needs: billing figures plus enough
+ *  hierarchy (`id`/`parentId`/`type`) to tell section headers from billable leaves. */
+export type QBEstimateItem = {
+    // Required, not optional: a caller that omits the hierarchy silently loses legacy
+    // section detection (a section is only recognizable by its type tag OR its children),
+    // which is exactly the bug this function exists to prevent.
+    id: string;
+    parentId: string | null;
+    name: string;
+    quantity: number;
+    unitCost: number;
+    total: number;
+    type: string;
+};
+
+/**
+ * Billable QB estimate lines, one per LEAF row.
+ *
+ * Section headers are dropped. A section's stored total is a roll-up of its children, so
+ * emitting it as a line bills that amount a second time on top of the child rows it
+ * summarizes — a nested section double-counts twice over (an outer section holding a $250
+ * inner section plus a $25 leaf shipped $800 of lines against a $275 subtotal).
+ *
+ * The filter lives here rather than in the caller so any future caller inherits it; it uses
+ * the same `isEstimateSectionRow` predicate as the editor subtotal and the PDF, so all three
+ * readers agree on which rows are headers.
+ *
+ * The returned amounts sum to the estimate's pre-tax SUBTOTAL, which is not the same as its
+ * stored `totalAmount` (that column also carries tax and any processing-fee markup). QBO
+ * computes its own sales tax on the lines it receives, so pushing a tax line here would
+ * double-charge; the processing-fee gap is a separate open question — see the callers.
+ */
+export function buildQBEstimateLines(items: readonly QBEstimateItem[], itemId: string) {
+    return items
+        .filter(item => !isEstimateSectionRow(item, items))
+        .map((item, i) => ({
+            LineNum: i + 1,
+            Description: item.name,
+            Amount: item.total,
+            DetailType: "SalesItemLineDetail",
+            SalesItemLineDetail: {
+                ItemRef: { value: itemId },
+                Qty: item.quantity,
+                UnitPrice: item.unitCost,
+            },
+        }));
+}
+
 /** Push an estimate to QB. Returns the QB estimate ID. */
 export async function syncEstimateToQB(
     tokens: QBTokens,
@@ -768,25 +817,21 @@ export async function syncEstimateToQB(
         code: string;
         title: string;
         totalAmount: number;
-        items: Array<{ name: string; quantity: number; unitCost: number; total: number; type: string }>;
+        items: QBEstimateItem[];
         customerId: string;
         itemId: string;
         project: { name: string } | null;
     },
     glMappings: Record<string, string> = {}
 ): Promise<{ qbId: string; qbUrl: string }> {
-    // Build QB Estimate payload
-    const lines = estimate.items.map((item, i) => ({
-        LineNum: i + 1,
-        Description: item.name,
-        Amount: item.total,
-        DetailType: "SalesItemLineDetail",
-        SalesItemLineDetail: {
-            ItemRef: { value: estimate.itemId },
-            Qty: item.quantity,
-            UnitPrice: item.unitCost,
-        },
-    }));
+    const lines = buildQBEstimateLines(estimate.items, estimate.itemId);
+
+    // QBO rejects a transaction with no lines (error 2020, "Required param missing"). An
+    // estimate that is empty, or that is nothing but section headers, reaches this point with
+    // everything filtered out — fail with something legible instead of a raw QB API error.
+    if (!lines.length) {
+        throw new Error("QB estimate sync failed: estimate has no billable line items");
+    }
 
     const payload = {
         TxnDate: new Date().toISOString().split("T")[0],
