@@ -38,6 +38,19 @@ const prisma = new PrismaClient();
 const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
 const daysFromNow = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
 
+// DailyLog.date convention: every real writer (web form, MCP/chat bot) stores
+// UTC MIDNIGHT of the intended company-local calendar day — never a raw
+// timestamp. A raw `new Date()` in the UTC evening lands on tomorrow's date
+// and the engine rightly discards it as future-dated (this bit CI at 05:24
+// UTC). Company timezone matches src/lib/company-day.ts.
+const companyTodayDateOnly = () => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date());
+    const get = (type: string) => parts.find(p => p.type === type)?.value ?? "";
+    return new Date(`${get("year")}-${get("month")}-${get("day")}T00:00:00.000Z`);
+};
+
 async function mobileLogin(request: APIRequestContext, email: string, pinCode: string): Promise<string> {
     const res = await request.post("/api/mobile/login", { data: { email, pinCode } });
     expect(res.ok(), `login failed: ${await res.text()}`).toBeTruthy();
@@ -204,7 +217,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
                 id: TSUG_LOG_ID,
                 projectId: PROJECT_ID,
                 createdById: fieldCrewId,
-                date: new Date(),
+                date: companyTodayDateOnly(),
                 workPerformed: "Ordered materials for next week delivery",
                 nextSteps: "Confirm supplier invoice totals",
             },
@@ -369,8 +382,10 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
     test("9. daily log form submission triggers Stage A matching end-to-end", async ({ page }) => {
         // Uses the default (admin) storageState session — the daily-log form is a
         // staff-only server action, not a mobile-token endpoint.
-        await page.goto(`/projects/${PROJECT_ID}/dailylogs`, { waitUntil: "networkidle" });
-
+        // "load" + element auto-wait, not networkidle — the app shell keeps
+        // background requests going (polling), so idle may never arrive.
+        await page.goto(`/projects/${PROJECT_ID}/dailylogs`);
+        await expect(page.getByRole("button", { name: "Add Log", exact: true })).toBeVisible({ timeout: 20_000 });
         await page.getByRole("button", { name: "Add Log", exact: true }).click();
         await page.getByPlaceholder(/shorthand notes/i).fill(DAILYLOG_MARKER);
         await page.getByPlaceholder(/plan for tomorrow/i).fill("hang drywall in hall bath");

@@ -287,7 +287,19 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
         });
         console.log("[data.setup] schedule task + assignment upserted:", { id: MOBILE_TASK_DRYW_ID, assignee: fieldCrew.id });
 
-        const dailyLogDate = daysAgo(1);
+        // DailyLog.date convention: every real writer stores UTC MIDNIGHT of the
+        // intended company-local (America/Los_Angeles) calendar day, never a raw
+        // timestamp — the suggestion engine reads the ISO date part as the day.
+        // A raw timestamp here sorts above date-only rows from the same day and
+        // flips "latest log" ordering depending on the wall clock (bit CI once).
+        const companyDayUtcMidnight = (offsetDays: number) => {
+            const parts = new Intl.DateTimeFormat("en-CA", {
+                timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+            }).formatToParts(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000));
+            const get = (type: string) => parts.find(p => p.type === type)?.value ?? "";
+            return new Date(`${get("year")}-${get("month")}-${get("day")}T00:00:00.000Z`);
+        };
+        const dailyLogDate = companyDayUtcMidnight(-1);
         await prisma.dailyLog.upsert({
             where: { id: MOBILE_DAILYLOG_ID },
             update: { date: dailyLogDate },
