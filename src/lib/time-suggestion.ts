@@ -191,14 +191,20 @@ export async function loadSuggestableTasks(
     const itemById = new Map<string, EligibleItem>(items.map(item => [item.id, item]));
     const parentIds = new Set(tasks.map(task => task.parentId).filter((id): id is string => !!id));
 
-    const toTopLevel = (itemId: string): EligibleItem | null => {
+    // The picker offers COST-CODED items at any depth (see the estimate-items
+    // route): flat estimates code their top-level items, sectioned estimates
+    // code the leaves under uncoded Section rows. The selectable target for a
+    // task is therefore the nearest coded item at-or-above its linked item —
+    // usually the item itself.
+    const toNearestCoded = (itemId: string): EligibleItem | null => {
         let current = itemById.get(itemId);
         let hops = 0;
-        while (current && current.parentId && hops < 10) {
-            current = itemById.get(current.parentId);
+        while (current && hops < 10) {
+            if (current.costCodeId && current.costCode) return current;
+            current = current.parentId ? itemById.get(current.parentId) : undefined;
             hops += 1;
         }
-        return current && !current.parentId ? current : null;
+        return null;
     };
 
     const out: SuggestableTask[] = [];
@@ -209,11 +215,11 @@ export async function loadSuggestableTasks(
         if (!task.estimateItemId) continue;
         const leafItem = itemById.get(task.estimateItemId);
         if (!leafItem) continue; // item not on an eligible estimate
-        const top = toTopLevel(task.estimateItemId);
-        if (!top || !top.costCodeId || !top.costCode) continue; // picker can't charge it
-        // The picker charges the bucket's cost code; a leaf that codes elsewhere
-        // must not be suggested as if it billed to this bucket.
-        if (leafItem.costCodeId && leafItem.costCodeId !== top.costCodeId) continue;
+        const target = toNearestCoded(task.estimateItemId);
+        if (!target) continue; // nothing chargeable anywhere up the chain
+        // Walking up only happens when the task's own item is uncoded, so the
+        // charged code can never contradict the leaf's — coded leaves map to
+        // themselves.
         out.push({
             taskId: task.id,
             taskName: task.name,
@@ -222,11 +228,11 @@ export async function loadSuggestableTasks(
             endDate: task.endDate,
             type: task.type,
             assignedToUser: task.assignments.length > 0,
-            clockInEstimateItemId: top.id,
-            costCodeId: top.costCodeId,
-            costCodeCode: top.costCode.code,
-            costCodeName: top.costCode.name,
-            costCodeLabel: `${top.costCode.code} — ${top.costCode.name}`,
+            clockInEstimateItemId: target.id,
+            costCodeId: target.costCodeId!,
+            costCodeCode: target.costCode!.code,
+            costCodeName: target.costCode!.name,
+            costCodeLabel: `${target.costCode!.code} — ${target.costCode!.name}`,
         });
     }
     return out;

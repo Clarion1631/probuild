@@ -64,9 +64,14 @@ export async function postDailyLogToChat(input: DailyLogPostBackInput): Promise<
         if (input.issues?.trim()) lines.push(`*Issues:* ${truncate(input.issues)}`);
         if (input.photoCount > 0) lines.push(`📷 ${input.photoCount} photo${input.photoCount === 1 ? "" : "s"}`);
         if (input.suggestedTask) {
-            const label = input.suggestedTask.costCodeLabel
-                ? `${input.suggestedTask.costCodeLabel} — ${input.suggestedTask.taskName}`
-                : input.suggestedTask.taskName;
+            const { costCodeLabel, taskName } = input.suggestedTask;
+            // "04-ELEC — Electrical — Electrical" reads silly when the task is
+            // named after its trade; drop the redundant tail.
+            const label = !costCodeLabel
+                ? taskName
+                : costCodeLabel.toLowerCase().endsWith(`— ${taskName.toLowerCase()}`)
+                    ? costCodeLabel
+                    : `${costCodeLabel} — ${taskName}`;
             lines.push(``, `👉 *Tomorrow's task: ${label}*`);
         }
 
