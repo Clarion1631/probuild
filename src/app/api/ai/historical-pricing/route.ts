@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { computeEstimateItemTotals, computeEstimateSubtotal, isEstimateSectionRow } from "@/lib/estimate-item-payload";
+
+/** How many recent estimates feed the pricing history. Bounds the query as the book grows. */
+const HISTORY_ESTIMATE_LIMIT = 500;
 
 export async function POST(req: NextRequest) {
     try {
@@ -10,9 +14,19 @@ export async function POST(req: NextRequest) {
             query?: string;
         };
 
-        // Fetch all estimate items across all projects with their relations
-        const allItems = await prisma.estimateItem.findMany({
-            where: { parentId: null }, // top-level items only (skip sub-items to avoid double-counting)
+        // Fetch every item of the most recent estimates, with their relations. Section headers
+        // are dropped below rather than in the query: `parentId: null` looked like a
+        // double-count guard but actually kept the headers and threw away the billable
+        // children underneath them. The bound is on estimates, not items, because section
+        // detection needs an estimate's rows to arrive whole.
+        const recentEstimates = await prisma.estimate.findMany({
+            select: { id: true },
+            // id breaks ties so the cut-off is stable when timestamps collide.
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+            take: HISTORY_ESTIMATE_LIMIT,
+        });
+        const everyItem = await prisma.estimateItem.findMany({
+            where: { estimateId: { in: recentEstimates.map(e => e.id) } },
             include: {
                 estimate: {
                     select: {
@@ -24,6 +38,18 @@ export async function POST(req: NextRequest) {
                 costType: { select: { id: true, name: true } },
             },
             orderBy: { createdAt: "desc" },
+        });
+
+        // Section detection is per-estimate: a row is a header relative to its own siblings.
+        const itemsByEstimate = new Map<string, typeof everyItem>();
+        for (const item of everyItem) {
+            const siblings = itemsByEstimate.get(item.estimateId);
+            if (siblings) siblings.push(item);
+            else itemsByEstimate.set(item.estimateId, [item]);
+        }
+        const allItems = [...itemsByEstimate.values()].flatMap(siblings => {
+            const totals = computeEstimateItemTotals(siblings);
+            return siblings.filter((_item, index) => !totals[index].isSection);
         });
 
         if (allItems.length === 0) {
@@ -97,7 +123,7 @@ export async function POST(req: NextRequest) {
                 select: {
                     id: true, code: true, title: true, status: true,
                     totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
-                    items: { orderBy: { order: "asc" }, select: { name: true, type: true, quantity: true, unitCost: true, total: true, markupPercent: true } },
+                    items: { orderBy: { order: "asc" }, select: { id: true, parentId: true, name: true, type: true, quantity: true, unitCost: true, total: true, markupPercent: true } },
                     project: {
                         select: { name: true, type: true, location: true },
                     },
@@ -108,12 +134,15 @@ export async function POST(req: NextRequest) {
 Current Estimate: "${currentEstimate.title}" (${currentEstimate.project?.type || "General"} project)
 Location: ${currentEstimate.project?.location || "Not specified"}
 Current items: ${currentEstimate.items
+                    // Drop section headers: their total is a roll-up of the lines listed here,
+                    // not a billable line of their own to price-compare.
+                    .filter((i) => !isEstimateSectionRow(i, currentEstimate.items))
                     .map(
                         (i) =>
                             `${i.name} (${i.type}) - qty: ${i.quantity}, unit: $${Number(i.unitCost).toFixed(2)}, total: $${Number(i.total).toFixed(2)}, markup: ${i.markupPercent}%`
                     )
                     .join("; ")}
-Total estimate: $${currentEstimate.items.reduce((sum, i) => sum + (Number(i.total) || 0), 0).toFixed(2)}
+Total estimate: $${computeEstimateSubtotal(currentEstimate.items).toFixed(2)}
 `;
             }
         }
