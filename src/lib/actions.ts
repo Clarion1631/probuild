@@ -24,6 +24,7 @@ import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import { postDailyLogSummary } from "./chat-webhook";
 import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
+import { recordPaymentCore } from "./payment-record-core";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
@@ -3589,110 +3590,13 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-        // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
-        // DIFFERENT milestones of the SAME invoice each claim their own schedule row (no mutual
-        // block), so without a parent lock they both read a stale sibling set and overwrite each
-        // other's Invoice.balanceDue — one payment's balance effect is silently lost, and no
-        // deadlock fires to trigger a retry. Locking the parent(s) first serializes the recompute:
-        // the second call blocks until the first commits, then recomputes against fresh state.
-        // Read the estimate link (non-locking) so we can lock Estimate BEFORE Invoice, matching
-        // recordEstimatePayment's mirror order so the two flows never invert and deadlock.
-        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
-        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
-
-        const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
-        if (!payment) return { success: false as const, error: "Milestone not found" as const };
-        if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
-        if (payment.invoiceId !== invoiceId) return { success: false as const, error: "Milestone/invoice mismatch" as const };
-
-        const claim = await t.paymentSchedule.updateMany({
-            where: { id: paymentId, status: { not: "Paid" } },
-            data: {
-                status: "Paid",
-                paymentDate,
-                paidAt: new Date(),
-                paymentMethod: method,
-                referenceNumber,
-                notes,
-            },
-        });
-        if (claim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
-
-        // Recalculate from scratch (matches Stripe webhook) to avoid drift.
-        const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
-        if (!invoice) return { success: false as const, error: "Invoice not found" as const };
-
-        const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
-        const totalPaid = allSchedules
-            .filter((s) => s.status === "Paid")
-            .reduce((sum, s) => sum + toNum(s.amount), 0);
-        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : totalPaid > 0 ? "Partially Paid"
-            : invoice.status;
-
-        await t.invoice.update({
-            where: { id: invoiceId },
-            data: { balanceDue: newBalance, status: newStatus },
-        });
-
-        // Mirror to the estimate-side milestone copy so the estimate editor and
-        // its balance don't drift from the invoice that actually got paid.
-        // Link-first (this milestone's sourceScheduleId points at its estimate
-        // original); name+amount fallback only when exactly one row matches.
-        if (invoice.estimateId) {
-            let estCopy: { id: string } | null = null;
-            if (payment.sourceScheduleId) {
-                estCopy = await t.estimatePaymentSchedule.findFirst({
-                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
-                });
-            } else {
-                const candidates = await t.estimatePaymentSchedule.findMany({
-                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: payment.name },
-                    take: 2,
-                });
-                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
-                estCopy = matching.length === 1 ? matching[0] : null;
-            }
-            if (estCopy) {
-                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
-                    where: { id: estCopy.id, status: { not: "Paid" } },
-                    data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
-                });
-                if (mirrorClaim.count > 0) {
-                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
-                    if (estimate) {
-                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
-                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
-                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
-                        await t.estimate.update({
-                            where: { id: invoice.estimateId },
-                            data: {
-                                balanceDue: estBalance,
-                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
-                                // Captured so unrecording can restore the pre-payment status
-                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
-                            },
-                        });
-                    }
-                }
-            }
-        }
-
-        // Durable notification: enqueue INSIDE the tx so it commits atomically with the
-        // settle — a crash before delivery can't drop the team alert / receipt / activity log.
-        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
-        return { success: true as const, projectId: invoice.projectId };
-    }));
-
-    if (!tx.success) return tx;
-
-    // Inline fast-path delivery of the just-enqueued notification (single canonical writer,
-    // via the outbox). Best-effort — the cron backstop redelivers anything left pending.
-    await drainPaymentNotifications({ scheduleId: paymentId }).catch(() => {});
+    // Core transaction (claim → recalc → estimate mirror → enqueue notification)
+    // lives in payment-record-core.ts, shared with the deposit-ingest endpoint
+    // (src/app/api/payments/deposit-ingest/route.ts, Phase B1) so both settle a
+    // milestone through the exact same claim-then-recalculate-then-mirror path.
+    const result = await recordPaymentCore(paymentId, invoiceId, { paymentDate, method, referenceNumber, notes });
+    if (!result.success) return result;
+    const tx = result;
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -4166,7 +4070,7 @@ async function assertActiveStaff(): Promise<any> {
     throw new Error("Unauthorized");
 }
 
-async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts") {
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
@@ -4247,6 +4151,22 @@ async function assertFinancialProjectAccess(projectId: string) {
 
 async function assertCompanySettingsPermission() {
     return assertStaffPermission("companySettings");
+}
+
+async function assertVendorPermission() {
+    return assertStaffPermission("manageVendors");
+}
+
+// Creating a vendor is also part of the PO flow — SelectVendorModal and
+// POQuickCreateModal let an estimator add one inline, and those screens gate on
+// financialReports (see quickCreatePOAndLink). So either permission is enough to
+// create; editing and deleting still require manageVendors.
+async function assertVendorCreatePermission() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "manageVendors") && !hasPermission(user, "financialReports")) {
+        throw new Error("Forbidden");
+    }
+    return user;
 }
 
 async function assertEstimateStaffOrPortalAccess(estimateId: string) {
@@ -9317,48 +9237,141 @@ export async function subPortalDeleteCOI() {
 // ==========================================
 export async function getVendors() {
     "use server";
-    return prisma.vendor.findMany({ 
+    // Vendor rows carry EIN, account numbers, contacts and file URLs — this was
+    // reachable unauthenticated. The PO-flow modals need it too, so gate on
+    // active staff and let the two write permissions stay narrower.
+    await assertVendorCreatePermission();
+    return prisma.vendor.findMany({
         orderBy: { name: "asc" },
         include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
     });
 }
 
+// Vendor columns a caller is allowed to write. Anything not listed here — most
+// importantly the `purchaseOrders` relation — is dropped. Spreading the raw
+// payload into Prisma let a caller pass nested relation writes such as
+// { purchaseOrders: { deleteMany: {} } }, which deletes POs directly and so
+// never trips the vendor FK's ON DELETE RESTRICT or deletePurchaseOrder's checks.
+const VENDOR_WRITABLE_FIELDS = [
+    "name", "website", "description", "firstName", "lastName", "email", "phone",
+    "fax", "address1", "address2", "city", "state", "zipCode", "country",
+    "paymentTerms", "chargesTax", "accountNumber", "ein", "notes", "status",
+] as const;
+
+function pickVendorFields(data: any) {
+    const out: Record<string, any> = {};
+    for (const key of VENDOR_WRITABLE_FIELDS) {
+        if (data?.[key] !== undefined) out[key] = data[key];
+    }
+    return out;
+}
+
+// Same reasoning for vendor files — map the scalars explicitly rather than
+// handing Prisma a caller-shaped object.
+function pickVendorFiles(files: any[]) {
+    return files.map((f: any) => ({
+        name: f.name,
+        url: f.url,
+        size: f.size,
+        type: f.type,
+    }));
+}
+
+// Free-text trade labels ("Supplier, Lumber") normalised into VendorTag names.
+// Tags are how the vendors list filters, so a trade typed during inline vendor
+// creation belongs here rather than buried in a text column.
+const MAX_TAG_NAME_LENGTH = 40;
+const MAX_NEW_TAGS = 10;
+
+function parseTagNames(tagNames: any): string[] {
+    if (!tagNames) return [];
+    const raw = Array.isArray(tagNames) ? tagNames : [tagNames];
+    const seen = new Set<string>();
+    for (const entry of raw) {
+        if (typeof entry !== "string") continue;
+        for (const part of entry.split(",")) {
+            const name = part.trim().slice(0, MAX_TAG_NAME_LENGTH);
+            if (name) seen.add(name);
+            if (seen.size >= MAX_NEW_TAGS) return [...seen];
+        }
+    }
+    return [...seen];
+}
+
 export async function createVendor(data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorCreatePermission();
+    const { tagIds, tagNames, files } = data ?? {};
+    const newTagNames = parseTagNames(tagNames);
 
-    const v = await prisma.vendor.create({ 
+    // name is the one required Vendor column — the allowlist above can't prove
+    // to the type system that it survived, so check it rather than cast it away.
+    const fields = pickVendorFields(data);
+    const name = typeof fields.name === "string" ? fields.name.trim() : "";
+    if (!name) {
+        // status lets the API route answer 400 without matching on the message.
+        const err: any = new Error("Vendor name is required");
+        err.status = 400;
+        throw err;
+    }
+
+    const tagWrite = {
+        ...(tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : {}),
+        // connectOrCreate so an existing trade tag is reused rather than
+        // colliding on VendorTag.name's unique constraint.
+        ...(newTagNames.length
+            ? { connectOrCreate: newTagNames.map(tagName => ({ where: { name: tagName }, create: { name: tagName } })) }
+            : {}),
+    };
+
+    const createArgs = {
         data: {
-            ...vendorData,
-            tags: tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : undefined,
-            files: files?.length ? { create: files } : undefined
-        }
-    });
+            ...fields,
+            name,
+            ...(Object.keys(tagWrite).length ? { tags: tagWrite } : {}),
+            ...(files?.length ? { files: { create: pickVendorFiles(files) } } : {}),
+        },
+        include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
+    };
+
+    let v;
+    try {
+        v = await prisma.vendor.create(createArgs);
+    } catch (error: any) {
+        // connectOrCreate is a check-then-create, so two vendors naming the same
+        // new tag at once can race and one loses on VendorTag.name. The retry
+        // finds the tag the winner just created and connects to it instead.
+        const rawTarget = error?.meta?.target;
+        const targets: string[] = Array.isArray(rawTarget)
+            ? rawTarget.map(String)
+            : rawTarget ? [String(rawTarget)] : [];
+        const isTagNameRace = error?.code === "P2002"
+            && targets.includes("name")
+            && newTagNames.length > 0;
+        if (!isTagNameRace) throw error;
+        v = await prisma.vendor.create(createArgs);
+    }
+
     revalidatePath("/company/vendors");
     return v;
 }
 
 export async function updateVendor(id: string, data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorPermission();
+    const { tagIds, files } = data ?? {};
 
-    const v = await prisma.vendor.update({ 
-        where: { id }, 
+    const v = await prisma.vendor.update({
+        where: { id },
         data: {
-            ...vendorData,
+            ...pickVendorFields(data),
             tags: tagIds ? { set: tagIds.map((id: string) => ({ id })) } : undefined,
         }
     });
 
     if (files && files.length > 0) {
         await prisma.vendorFile.createMany({
-            data: files.map((f: any) => ({
-                name: f.name,
-                url: f.url,
-                size: f.size,
-                type: f.type,
-                vendorId: id
-            }))
+            data: pickVendorFiles(files).map(f => ({ ...f, vendorId: id }))
         });
     }
 
@@ -9368,12 +9381,41 @@ export async function updateVendor(id: string, data: any) {
 
 export async function deleteVendor(id: string) {
     "use server";
-    await prisma.vendor.delete({ where: { id } });
+    await assertVendorPermission();
+
+    // Purchase orders are financial records — a vendor that still has any must
+    // not be deletable. The FK is ON DELETE RESTRICT, so the database is the
+    // real guard; the count here only turns that into a message naming how many
+    // POs are in the way. The two are not atomic, hence the P2003 catch below.
+    //
+    // This returns a result rather than throwing, because a production Next
+    // build redacts thrown Server Function messages — a throw would reach the
+    // user as a generic error with the count stripped out. Authorization still
+    // throws: being denied is not an expected outcome worth rendering.
+    const poCount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+    if (poCount > 0) {
+        return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: poCount };
+    }
+
+    try {
+        await prisma.vendor.delete({ where: { id } });
+    } catch (error: any) {
+        // P2003 = FK constraint failure, i.e. a PO was attached between the
+        // count above and this delete.
+        if (error?.code === "P2003") {
+            const recount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+            return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: recount };
+        }
+        throw error;
+    }
+
     revalidatePath("/company/vendors");
+    return { ok: true as const };
 }
 
 export async function deleteVendorFile(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorFile.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
@@ -9385,6 +9427,7 @@ export async function getVendorTags() {
 
 export async function createVendorTag(name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.create({ data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9392,6 +9435,7 @@ export async function createVendorTag(name: string) {
 
 export async function updateVendorTag(id: string, name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.update({ where: { id }, data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9399,6 +9443,7 @@ export async function updateVendorTag(id: string, name: string) {
 
 export async function deleteVendorTag(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorTag.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
