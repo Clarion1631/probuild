@@ -19,7 +19,7 @@ interface BudgetStripProps {
     contextType: "project" | "lead";
     onLinkPO: (itemId: string) => void;
     onCreatePO: (itemId: string) => void;
-    onUnlinkPO: (itemId: string) => void;
+    onUnlinkPO: (itemId: string, poId: string) => void;
     onViewPO: (poId: string) => void;
 }
 
@@ -27,7 +27,7 @@ export default function BudgetStrip({
     item, index, updateItem, contextType, onLinkPO, onCreatePO, onUnlinkPO, onViewPO
 }: BudgetStripProps) {
     const [showUnitDropdown, setShowUnitDropdown] = useState(false);
-    const [showPOPopover, setShowPOPopover] = useState(false);
+    const [openPopoverPoId, setOpenPopoverPoId] = useState<string | null>(null);
 
     const budgetQty = item.budgetQuantity ?? item.quantity ?? 0;
     const budgetRateVal = item.budgetRate ?? item.baseCost ?? "";
@@ -45,9 +45,9 @@ export default function BudgetStrip({
         baseCost: item.baseCost,
     });
 
-    const po = item.purchaseOrder;
+    const links = item.purchaseOrderLinks ?? [];
     const isLead = contextType === "lead";
-    const isPoLocked = item.purchaseOrderId != null;
+    const isPoLocked = links.length > 0;
     const sellPrice = parseFloat(item.unitCost) || 0;
 
     return (
@@ -56,7 +56,7 @@ export default function BudgetStrip({
             {isPoLocked && (
                 <span
                     className="flex items-center justify-center w-5 h-5 text-slate-500 flex-shrink-0"
-                    title={`Budget protected by PO${po?.code ? ` ${po.code}` : ""}`}
+                    title={`Budget protected by PO${links.length ? ` ${links.map((l: any) => l.purchaseOrder.code).join(", ")}` : ""}`}
                 >
                     <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                         <rect x="3" y="11" width="18" height="11" rx="2" />
@@ -177,36 +177,40 @@ export default function BudgetStrip({
             <div className="w-px h-5 bg-indigo-200" />
 
             {/* PO Section */}
-            <div className="flex items-center gap-2 ml-auto">
-                {po ? (
-                    <div className="relative">
-                        <button
-                            onClick={() => setShowPOPopover(!showPOPopover)}
-                            className="flex items-center gap-1.5 bg-white border border-indigo-200 rounded-full px-2.5 py-0.5 text-xs font-medium text-indigo-700 hover:border-indigo-400 transition"
-                        >
-                            <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
-                            {po.code} — {po.vendor?.name || "Vendor"} — {formatCurrency(Number(po.totalAmount))}
-                        </button>
-                        {showPOPopover && (
-                            <div className="absolute top-full right-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-30 w-40 py-1">
-                                <button
-                                    onClick={() => { onViewPO(po.id); setShowPOPopover(false); }}
-                                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 transition flex items-center gap-2"
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" /></svg>
-                                    View PO
-                                </button>
-                                <button
-                                    onClick={() => { onUnlinkPO(item.id); setShowPOPopover(false); }}
-                                    className="w-full text-left px-3 py-1.5 text-xs text-red-600 hover:bg-red-50 transition flex items-center gap-2"
-                                >
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                                    Unlink
-                                </button>
-                            </div>
-                        )}
-                    </div>
-                ) : isLead ? (
+            <div className="flex items-center gap-2 ml-auto flex-wrap justify-end">
+                {links.map((link: any) => {
+                    const linkPo = link.purchaseOrder;
+                    return (
+                        <div key={linkPo.id} className="relative">
+                            <button
+                                onClick={() => setOpenPopoverPoId(openPopoverPoId === linkPo.id ? null : linkPo.id)}
+                                className="flex items-center gap-1.5 bg-white border border-indigo-200 rounded-full px-2.5 py-0.5 text-xs font-medium text-indigo-700 hover:border-indigo-400 transition"
+                            >
+                                <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
+                                {linkPo.code} — {linkPo.vendor?.name || "Vendor"} — {formatCurrency(Number(linkPo.totalAmount))}
+                            </button>
+                            {openPopoverPoId === linkPo.id && (
+                                <div className="absolute top-full right-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-30 w-40 py-1">
+                                    <button
+                                        onClick={() => { onViewPO(linkPo.id); setOpenPopoverPoId(null); }}
+                                        className="w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 transition flex items-center gap-2"
+                                    >
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" /></svg>
+                                        View PO
+                                    </button>
+                                    <button
+                                        onClick={() => { onUnlinkPO(item.id, linkPo.id); setOpenPopoverPoId(null); }}
+                                        className="w-full text-left px-3 py-1.5 text-xs text-red-600 hover:bg-red-50 transition flex items-center gap-2"
+                                    >
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                                        Unlink
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+                {isLead ? (
                     <span className="text-slate-400 italic text-[10px]" title="Convert to project to create purchase orders">
                         Requires project
                     </span>
