@@ -44,6 +44,80 @@ export function bufferPercent(item: {
 }
 
 /**
+ * The margin range the cost/sell conversions can actually represent.
+ * At 100 both costFromMargin and sellFromMargin collapse to 0, and below 0 the reverse
+ * derivation (derivedMarginPct) floors at 0 — so a stored value outside this range can
+ * never round-trip, and the stored margin stops describing the stored cost.
+ */
+export const MIN_MARGIN_PCT = 0;
+export const MAX_MARGIN_PCT = 99;
+
+/** Clamp a margin % into the representable range. The single clamp every margin input shares. */
+export function clampMarginPct(pct: number): number {
+  // NaN first — it compares false against everything, so it must not fall through to `return pct`.
+  // ±Infinity deliberately clamps by comparison (an overflowing entry lands on the nearer bound).
+  if (Number.isNaN(pct)) return MIN_MARGIN_PCT;
+  if (pct < MIN_MARGIN_PCT) return MIN_MARGIN_PCT;
+  if (pct > MAX_MARGIN_PCT) return MAX_MARGIN_PCT;
+  return pct;
+}
+
+/** What a margin input shows when markupPercent is unset. Any rate derived while the field is
+ *  empty must use this same number, or the visible margin stops matching the stored cost. */
+export const DEFAULT_MARGIN_PCT = 25;
+
+export type NormalizedMarginInput = {
+  /** Value to persist to `markupPercent`; null clears the field. */
+  stored: string | null;
+  /** The margin the budget rate must be derived from. */
+  derivedFrom: number;
+};
+
+/**
+ * Normalize a raw margin-input keystroke into the pair that must be written together.
+ *
+ * The invariant: `stored` and `derivedFrom` always describe the SAME margin. Clamping the
+ * value that feeds the rate while persisting the raw input is what let `markupPercent = 100`
+ * sit next to a cost derived from 99% — and since costFromMargin/sellFromMargin both return 0
+ * at >= 100, a stored 100 also collapsed downstream sell/cost math to zero.
+ */
+export function normalizeMarginInput(raw: string): NormalizedMarginInput {
+  const parsed = parseFloat(raw);
+
+  // Empty, or a fragment that is not a number yet ("-", "."), clears the stored value. The
+  // input then displays the default, so the rate has to be derived from that same default to
+  // keep the two agreeing. Storing the fragment instead would be worse than useless:
+  // saveEstimate turns an unparseable markupPercent into the default anyway, so it would
+  // persist a margin that contradicts the cost sitting next to it.
+  // Only NaN counts as a fragment — an entry that overflows to Infinity ("1e309") is a real
+  // number and clamps like any other out-of-range value.
+  if (raw === "" || Number.isNaN(parsed)) return { stored: null, derivedFrom: DEFAULT_MARGIN_PCT };
+
+  const clamped = clampMarginPct(parsed);
+  // Preserve the raw text when it is already in range, so "25." and "25.0" survive typing.
+  // Safe because it re-parses to `clamped`, which is what keeps stored and derived in agreement.
+  return { stored: clamped === parsed ? raw : String(clamped), derivedFrom: clamped };
+}
+
+/**
+ * Format a derived per-unit rate for storage, at enough precision that the margin implied by
+ * the stored rate still matches the margin stored beside it.
+ *
+ * Cents are plenty for ordinary unit prices, but rounding to cents is not scale-free: a half
+ * cent is a rounding error of `0.5 / price` percent of margin. At a $1,500 sell that is
+ * invisible; at a $0.49 sell it moves the implied margin by a full point, and at $0.01 it can
+ * round a 50% margin to a rate implying 0%. `budgetRate`/`baseCost` are unconstrained Decimals,
+ * so the extra places persist. Kept to whatever keeps the implied margin accurate to 2dp.
+ */
+export function formatDerivedRate(rate: number, price: number): string {
+  // A zero rate reads as "no budget" (internalBudget returns null, saveEstimate persists null),
+  // which would contradict any non-zero margin stored beside it.
+  if (!Number.isFinite(rate) || rate <= 0) return "0.00";
+  const needed = Number.isFinite(price) && price > 0 ? Math.ceil(4 - Math.log10(price)) : 2;
+  return rate.toFixed(Math.min(10, Math.max(2, needed)));
+}
+
+/**
  * Calculate sell price from cost and target margin percentage.
  * Formula: sell = cost / (1 - margin/100).
  * Returns 0 if margin >= 100 (would be infinite).
@@ -77,10 +151,7 @@ export function costFromMargin(sell: number, marginPct: number): number {
  */
 export function derivedMarginPct(rate: number, price: number): number {
   if (!Number.isFinite(rate) || !Number.isFinite(price) || price <= 0) return 0;
-  const m = (1 - rate / price) * 100;
-  if (m < 0) return 0;
-  if (m > 99) return 99;
-  return m;
+  return clampMarginPct((1 - rate / price) * 100);
 }
 
 /**
