@@ -2,6 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { formatCurrency } from "@/lib/utils";
+import { isTaxRow, numOr, rmc } from "@/lib/takeoff-costing";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
@@ -32,6 +33,35 @@ interface TakeoffsClientProps {
     contextName: string;
 }
 
+const preTaxTotal = (items: any[]) =>
+    items.filter(i => !isTaxRow(i)).reduce((sum, i) => sum + numOr(i.total, 0), 0);
+
+/**
+ * Re-scale the sales-tax row after a markup change.
+ *
+ * Markup edits deliberately skip the tax row (tax carries no margin), but tax is a percentage of
+ * everything else — so raising the markup raises the tax owed too. Leaving the row alone quietly
+ * under-bills: a $1,000 subtotal marked up to $1,200 still carried the $84 tax computed on $1,000.
+ *
+ * The rate is taken from the row's own share of the pre-tax subtotal it was computed against,
+ * which keeps this correct for any rate without re-parsing it out of the line's name.
+ */
+function withTaxFollowingSubtotal(sourceItems: any[], nextItems: any[]): any[] {
+    const oldPreTax = preTaxTotal(sourceItems);
+    const newPreTax = preTaxTotal(nextItems);
+    if (oldPreTax <= 0 || newPreTax === oldPreTax) return nextItems;
+
+    const factor = newPreTax / oldPreTax;
+    return nextItems.map(item => {
+        if (!isTaxRow(item)) return item;
+        const total = rmc(numOr(item.total, 0) * factor);
+        const quantity = numOr(item.quantity, 1) || 1;
+        const unitCost = rmc(total / quantity);
+        // Tax is a pure pass-through, so its internal cost is the tax itself.
+        return { ...item, total, unitCost, ...(item.baseCost != null ? { baseCost: unitCost } : {}) };
+    });
+}
+
 export default function TakeoffsClient({ contextType, contextId, contextName }: TakeoffsClientProps) {
     const router = useRouter();
     const [takeoffs, setTakeoffs] = useState<Takeoff[]>([]);
@@ -43,6 +73,14 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
     const [viewMode, setViewMode] = useState<"internal" | "client">("internal");
     const [globalMarkup, setGlobalMarkup] = useState(25);
     const [adjustedItems, setAdjustedItems] = useState<any[] | null>(null);
+
+    // Markup adjustments belong to the takeoff they were made on. They are persisted on convert,
+    // so carrying them across a takeoff switch would write one takeoff's line items onto another.
+    const selectedTakeoffId = selectedTakeoff?.id ?? null;
+    useEffect(() => {
+        setAdjustedItems(null);
+        setGlobalMarkup(25);
+    }, [selectedTakeoffId]);
 
     // Create modal state
     const [createName, setCreateName] = useState("");
@@ -238,6 +276,10 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                 throw new Error(err.error || "AI estimate failed");
             }
             const result = await res.json();
+            // A regeneration replaces the line items, so adjustments made against the old ones
+            // no longer refer to anything real.
+            setAdjustedItems(null);
+            setGlobalMarkup(25);
             setAiResult(result);
             toast.success(`AI analyzed plans and generated ${result.count} line items!`);
             openTakeoff(selectedTakeoff.id);
@@ -252,6 +294,35 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
         if (!selectedTakeoff) return;
         setConverting(true);
         try {
+            // Markup edits (global or per-line) only live in `adjustedItems`, but the convert
+            // endpoint reads the takeoff's stored JSON — so without this the user's adjusted
+            // margins are silently discarded and the original AI pricing is what gets billed.
+            // Persist them first, re-deriving the total and the percentage-based milestones.
+            if (adjustedItems) {
+                const stored = selectedTakeoff.aiEstimateData ? JSON.parse(selectedTakeoff.aiEstimateData) : {};
+                const totalEstimate = rmc(adjustedItems.reduce((sum: number, i: any) => sum + numOr(i.total, 0), 0));
+                // Independently rounded percentages need not add up to the total, so the last
+                // milestone absorbs the remainder — the schedule must bill the whole estimate.
+                const storedMilestones: any[] = stored.paymentMilestones || [];
+                let allocated = 0;
+                const paymentMilestones = storedMilestones.map((m: any, idx: number) => {
+                    const isLast = idx === storedMilestones.length - 1;
+                    const amount = isLast
+                        ? rmc(totalEstimate - allocated)
+                        : rmc((numOr(m.percentage, 0) / 100) * totalEstimate);
+                    allocated = rmc(allocated + amount);
+                    return { ...m, amount: amount.toFixed(2) };
+                });
+                const aiEstimateData = JSON.stringify({ ...stored, items: adjustedItems, paymentMilestones, totalEstimate });
+                const saveRes = await fetch(`/api/takeoffs/${selectedTakeoff.id}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ aiEstimateData }),
+                });
+                if (!saveRes.ok) throw new Error("Could not save your markup adjustments — nothing was converted");
+                setSelectedTakeoff({ ...selectedTakeoff, aiEstimateData });
+            }
+
             const res = await fetch("/api/takeoffs/convert-to-estimate", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -660,13 +731,13 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                 const newMarkup = parseFloat(e.target.value) || 0;
                                                                 setGlobalMarkup(newMarkup);
                                                                 const items = adjustedItems || parsedAiData.items || [];
-                                                                setAdjustedItems(items.map((item: any) => {
-                                                                    const itemIsTax = /tax/i.test(item.costCode || '') || /tax/i.test(item.name || '');
-                                                                    if (itemIsTax) return item;
+                                                                const repriced = items.map((item: any) => {
+                                                                    if (isTaxRow(item)) return item;
                                                                     const base = item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100);
                                                                     const sell = base * (1 + newMarkup / 100);
-                                                                    return { ...item, markupPercent: newMarkup, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * item.quantity * 100) / 100 };
-                                                                }));
+                                                                    return { ...item, markupPercent: newMarkup, unitCost: rmc(sell), total: rmc(sell * item.quantity) };
+                                                                });
+                                                                setAdjustedItems(withTaxFollowingSubtotal(items, repriced));
                                                             }}
                                                             className="w-16 text-center text-sm font-bold border border-slate-300 rounded-md px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-400"
                                                             min={0} max={100} step={1}
@@ -689,8 +760,8 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
 
                                         {viewMode === "internal" && (() => {
                                             const items = adjustedItems || parsedAiData.items || [];
-                                            const totalCost = items.filter((i: any) => !/tax/i.test(i.costCode || '') && !/tax/i.test(i.name || '')).reduce((s: number, i: any) => s + ((i.baseCost || i.unitCost / (1 + (i.markupPercent || 25) / 100)) * (i.quantity || 1)), 0);
-                                            const totalSellExTax = items.filter((i: any) => !/tax/i.test(i.costCode || '') && !/tax/i.test(i.name || '')).reduce((s: number, i: any) => s + (i.total || 0), 0);
+                                            const totalCost = items.filter((i: any) => !isTaxRow(i)).reduce((s: number, i: any) => s + ((i.baseCost || i.unitCost / (1 + (i.markupPercent || 25) / 100)) * (i.quantity || 1)), 0);
+                                            const totalSellExTax = items.filter((i: any) => !isTaxRow(i)).reduce((s: number, i: any) => s + (i.total || 0), 0);
                                             const totalSell = items.reduce((s: number, i: any) => s + (i.total || 0), 0);
                                             const totalMarkup = totalSellExTax - totalCost;
                                             const marginPct = totalSellExTax > 0 ? (totalMarkup / totalSellExTax * 100) : 0;
@@ -739,14 +810,14 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                     {((adjustedItems || parsedAiData.items || []) as any[])
                                                         .slice()
                                                         .sort((a: any, b: any) => {
-                                                            const aIsTax = /tax/i.test(a.costCode || '') || /tax/i.test(a.name || '');
-                                                            const bIsTax = /tax/i.test(b.costCode || '') || /tax/i.test(b.name || '');
+                                                            const aIsTax = isTaxRow(a);
+                                                            const bIsTax = isTaxRow(b);
                                                             if (aIsTax && !bIsTax) return 1;
                                                             if (!aIsTax && bIsTax) return -1;
                                                             return 0;
                                                         })
                                                         .map((item: any, idx: number) => {
-                                                        const isTax = /tax/i.test(item.costCode || '') || /tax/i.test(item.name || '');
+                                                        const isTax = isTaxRow(item);
                                                         const baseCost = isTax ? item.unitCost : (item.baseCost || item.unitCost / (1 + (item.markupPercent || 25) / 100));
                                                         const mkp = isTax ? 0 : (item.markupPercent ?? 25);
                                                         return (
@@ -784,8 +855,8 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                                                                                     const newItems = [...sourceItems];
                                                                                     const base = newItems[origIdx].baseCost || newItems[origIdx].unitCost / (1 + (newItems[origIdx].markupPercent || 25) / 100);
                                                                                     const sell = base * (1 + newMkp / 100);
-                                                                                    newItems[origIdx] = { ...newItems[origIdx], markupPercent: newMkp, unitCost: Math.round(sell * 100) / 100, total: Math.round(sell * newItems[origIdx].quantity * 100) / 100 };
-                                                                                    setAdjustedItems(newItems);
+                                                                                    newItems[origIdx] = { ...newItems[origIdx], markupPercent: newMkp, unitCost: rmc(sell), total: rmc(sell * newItems[origIdx].quantity) };
+                                                                                    setAdjustedItems(withTaxFollowingSubtotal(sourceItems, newItems));
                                                                                 }}
                                                                                 className="w-14 text-center text-sm font-bold text-blue-700 border border-blue-300 rounded-md px-1 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-blue-400"
                                                                                 min={0} max={100} step={1}
