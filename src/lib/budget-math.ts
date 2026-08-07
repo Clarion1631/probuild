@@ -69,8 +69,8 @@ export const DEFAULT_MARGIN_PCT = 25;
 export type NormalizedMarginInput = {
   /** Value to persist to `markupPercent`; null clears the field. */
   stored: string | null;
-  /** Margin the budget rate must be derived from, or null when no rate should be derived. */
-  derivedFrom: number | null;
+  /** The margin the budget rate must be derived from. */
+  derivedFrom: number;
 };
 
 /**
@@ -82,16 +82,16 @@ export type NormalizedMarginInput = {
  * at >= 100, a stored 100 also collapsed downstream sell/cost math to zero.
  */
 export function normalizeMarginInput(raw: string): NormalizedMarginInput {
-  // Empty clears the stored value, but the input then displays the default — so a rate derived
-  // now must come from that default for the two to keep agreeing.
-  if (raw === "") return { stored: null, derivedFrom: DEFAULT_MARGIN_PCT };
-
   const parsed = parseFloat(raw);
-  // A fragment mid-typing ("-", ".") is not a margin yet: keep the keystroke, derive nothing.
-  // Substituting a default here would pin the cost to a margin the user never entered.
-  // Only NaN qualifies — an entry that overflows to Infinity ("1e309") is a real number and
-  // must clamp like any other out-of-range value rather than being stored as typed.
-  if (Number.isNaN(parsed)) return { stored: raw, derivedFrom: null };
+
+  // Empty, or a fragment that is not a number yet ("-", "."), clears the stored value. The
+  // input then displays the default, so the rate has to be derived from that same default to
+  // keep the two agreeing. Storing the fragment instead would be worse than useless:
+  // saveEstimate turns an unparseable markupPercent into the default anyway, so it would
+  // persist a margin that contradicts the cost sitting next to it.
+  // Only NaN counts as a fragment — an entry that overflows to Infinity ("1e309") is a real
+  // number and clamps like any other out-of-range value.
+  if (raw === "" || Number.isNaN(parsed)) return { stored: null, derivedFrom: DEFAULT_MARGIN_PCT };
 
   const clamped = clampMarginPct(parsed);
   // Preserve the raw text when it is already in range, so "25." and "25.0" survive typing.
@@ -100,13 +100,21 @@ export function normalizeMarginInput(raw: string): NormalizedMarginInput {
 }
 
 /**
- * Format a derived per-unit rate for storage. Two decimals for money, except where that would
- * round a real cost down to "0.00" — a zero rate reads as "no budget" (internalBudget returns
- * null, saveEstimate persists null), which would contradict the margin stored beside it.
+ * Format a derived per-unit rate for storage, at enough precision that the margin implied by
+ * the stored rate still matches the margin stored beside it.
+ *
+ * Cents are plenty for ordinary unit prices, but rounding to cents is not scale-free: a half
+ * cent is a rounding error of `0.5 / price` percent of margin. At a $1,500 sell that is
+ * invisible; at a $0.49 sell it moves the implied margin by a full point, and at $0.01 it can
+ * round a 50% margin to a rate implying 0%. `budgetRate`/`baseCost` are unconstrained Decimals,
+ * so the extra places persist. Kept to whatever keeps the implied margin accurate to 2dp.
  */
-export function formatDerivedRate(rate: number): string {
+export function formatDerivedRate(rate: number, price: number): string {
+  // A zero rate reads as "no budget" (internalBudget returns null, saveEstimate persists null),
+  // which would contradict any non-zero margin stored beside it.
   if (!Number.isFinite(rate) || rate <= 0) return "0.00";
-  return rate >= 0.005 ? rate.toFixed(2) : rate.toPrecision(2);
+  const needed = Number.isFinite(price) && price > 0 ? Math.ceil(4 - Math.log10(price)) : 2;
+  return rate.toFixed(Math.min(10, Math.max(2, needed)));
 }
 
 /**

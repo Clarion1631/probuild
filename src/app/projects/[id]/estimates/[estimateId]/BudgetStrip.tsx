@@ -147,8 +147,8 @@ export default function BudgetStrip({
                             const { stored, derivedFrom } = normalizeMarginInput(e.target.value);
                             const price = parseFloat(item.unitCost) || 0;
                             updateItem(index, "markupPercent", stored);
-                            if (derivedFrom !== null && price > 0) {
-                                const rateStr = formatDerivedRate(costFromMargin(price, derivedFrom));
+                            if (price > 0) {
+                                const rateStr = formatDerivedRate(costFromMargin(price, derivedFrom), price);
                                 updateItem(index, "budgetRate", rateStr);
                                 updateItem(index, "baseCost", rateStr);
                             }
