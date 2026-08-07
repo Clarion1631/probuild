@@ -221,6 +221,17 @@ export async function GET(
             y -= 6;
         }
 
+        // Next Steps
+        if (log.nextSteps) {
+            checkNewPage(60);
+            page.drawText("NEXT STEPS", {
+                x: margin + 4, y, size: 8, font: helveticaBold, color: colors.blue,
+            });
+            y -= 14;
+            y = drawWrappedText(log.nextSteps, margin + 4, y, contentWidth - 8, 9, helvetica, colors.textMain);
+            y -= 6;
+        }
+
         // Photos count
         if (log.photos.length > 0) {
             checkNewPage(40);

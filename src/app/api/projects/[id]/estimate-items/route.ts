@@ -35,6 +35,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             id: true,
             name: true,
             total: true,
+            costCodeId: true,
             costCode: { select: { code: true, name: true } },
         },
         orderBy: { order: 'asc' },

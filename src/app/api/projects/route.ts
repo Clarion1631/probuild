@@ -51,5 +51,8 @@ export async function GET(req: Request) {
         });
     }
 
-    return NextResponse.json(projects);
+    // chatWebhookUrl is a credential (Google Chat incoming webhook) — never
+    // serialize it to app clients; it's configured/read via manager-only routes.
+    const safe = projects.map(({ chatWebhookUrl: _chatWebhookUrl, ...rest }) => rest);
+    return NextResponse.json(safe);
 }

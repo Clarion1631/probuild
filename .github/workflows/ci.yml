@@ -115,6 +115,10 @@ jobs:
       # their deterministic mocks. Without it the specs hit the real Anthropic
       # API on every PR and the forced-failure test marker is inert prose.
       SELECTION_AI_MOCK: "1"
+      # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
+      # its deterministic keyword fallback instead of calling Gemini, so
+      # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
+      DAILY_LOG_MATCH_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
