@@ -34,17 +34,17 @@ export function roundMoney(value: number, decimals = 0): number {
 }
 
 /**
- * Default gross margin for items produced by paths that USED to apply a 25%
- * markup-on-cost (Room Studio furnish, AI takeoff). Equals that legacy markup
- * exactly (base * 1.25 === base / 0.8), which is what makes the conversion
- * price-neutral.
+ * The gross margin equal to the legacy 25% markup-on-cost, for the paths that
+ * used to apply one (Room Studio furnish). base * 1.25 === base / 0.8, which
+ * is what makes converting those writers to margin price-neutral.
  *
- * Deliberately NOT the same as the plain `25` default used by the schema and
- * by hand-added estimate items (EstimateItem.markupPercent @default(25),
- * saveEstimate's fallback). Those 25s were always a 25% MARGIN and are already
- * canonical, so they must stay 25 — do not "unify" them to this constant.
+ * Deliberately NOT `DEFAULT_MARGIN_PCT` (25) below. That one is what an empty
+ * margin input shows, and it matches EstimateItem.markupPercent @default(25) —
+ * those 25s always meant a 25% MARGIN and are already canonical. This constant
+ * exists only to reproduce old markup-on-cost prices exactly. Different
+ * numbers, different jobs — do not merge them.
  */
-export const DEFAULT_MARGIN_PCT = 20;
+export const LEGACY_MARKUP_MARGIN_PCT = 20;
 
 /**
  * Convert a legacy markup-on-cost percentage to the canonical gross-margin
