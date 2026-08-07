@@ -37,8 +37,25 @@ export function coLineCents(quantity: number, unitCost: number): number {
     return Math.round(Number(((quantity || 0) * unitCents).toPrecision(12)));
 }
 
-export function coItemsSubtotal(items: Array<{ quantity?: number | string | null; unitCost?: number | string | null }>): number {
-    return items.reduce((cents, item) => cents + coLineCents(
+/**
+ * The change-order rows that actually carry money.
+ *
+ * `ChangeOrderItem` is flat — no `parentId` — so a row copied from a sectioned estimate keeps
+ * `type: "Section"` and the section's *rolled-up* unitCost, which is the sum of the leaf rows
+ * sitting right beside it. Billing both double-counts the section. `createChangeOrder` now
+ * expands a section selection to its leaves so new COs never contain a header at all; this
+ * guard covers rows written before that fix and any connector payload that sends one.
+ *
+ * A CO whose rows are *all* headers passes through untouched: it carries no leaves to
+ * double-count, and filtering it would silently total the change order to zero.
+ */
+export function billableCoItems<T extends { type?: string | null }>(items: readonly T[]): readonly T[] {
+    const billable = items.filter(item => item.type !== "Section");
+    return billable.length === 0 ? items : billable;
+}
+
+export function coItemsSubtotal(items: Array<{ type?: string | null; quantity?: number | string | null; unitCost?: number | string | null }>): number {
+    return billableCoItems(items).reduce((cents, item) => cents + coLineCents(
         parseFloat(String(item.quantity)) || 0,
         parseFloat(String(item.unitCost)) || 0,
     ), 0) / 100;

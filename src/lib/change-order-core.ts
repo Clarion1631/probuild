@@ -1,6 +1,6 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { coLineCents } from "./co-tax";
+import { billableCoItems, coLineCents } from "./co-tax";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -74,8 +74,8 @@ function normalizeSchedules(
     });
 }
 
-function itemSubtotalCents(items: Array<{ quantity: number; unitCost: unknown }>): number {
-    return items.reduce((sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)), 0);
+function itemSubtotalCents(items: Array<{ type?: string | null; quantity: number; unitCost: unknown }>): number {
+    return billableCoItems(items).reduce((sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)), 0);
 }
 
 /**
@@ -192,13 +192,11 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             const existingIds = new Set(existing.map(i => i.id));
             const existingById = new Map(existing.map((item) => [item.id, item]));
 
-            let totalCents = 0;
             const rows = items.map((item, idx) => {
                 const quantity = parseFloat(String(item.quantity ?? "")) || 0;
                 const unitCost = parseFloat(String(item.unitCost ?? "")) || 0;
                 const unitCents = Math.round(unitCost * 100);
                 const lineCents = coLineCents(quantity, unitCost);
-                totalCents += lineCents;
                 // On a row that matches an existing item, an omitted (undefined)
                 // description/costCodeId/costTypeId keeps the stored value —
                 // resolved here, under the same row lock as the write, so a
@@ -219,6 +217,10 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                     costTypeId: item.costTypeId === undefined ? (prior?.costTypeId ?? null) : (item.costTypeId || null),
                 };
             });
+            // Persisted total must use the same billable-row rule the approval and send
+            // guards recompute with, or a payload carrying a section header would store a
+            // subtotal those guards then reject as "out of sync with its items".
+            const totalCents = itemSubtotalCents(rows);
             const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
             const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
             const itemRowsChanged = rows.length !== existing.length || rows.some((row) => {
@@ -369,7 +371,7 @@ export async function approveChangeOrderCore(
 
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId: id },
-            select: { quantity: true, unitCost: true },
+            select: { type: true, quantity: true, unitCost: true },
         });
         if (current.pricingType !== "COST_PLUS" && items.length === 0) {
             throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);

@@ -10,8 +10,10 @@ import {
     serializeEstimateItemsForSave,
     ESTIMATE_ITEM_SAVE_FIELDS,
     normalizeEstimateItemForSave,
+    selectedBillableRows,
 } from "../src/lib/estimate-item-payload";
 import { buildQBEstimateLines } from "../src/lib/quickbooks";
+import { billableCoItems, coItemsSubtotal } from "../src/lib/co-tax";
 
 type Row = {
     id: string;
@@ -471,4 +473,90 @@ test("saveEstimate and the editor both go through the shared projection", () => 
     const fn = body.slice(0, body.indexOf("\n    }") + 6);
     assert.match(fn, /setItems\(prev =>/);
     assert.doesNotMatch(fn, /\[\.\.\.items\]/);
+});
+
+// ─── Change-order section double-count (Codex review, 2026-08-07) ─────────────
+// ChangeOrderItem is flat — no parentId — so a section header copied into a CO keeps
+// type "Section" and its children's rolled-up unitCost. Billing both double-counts it.
+
+test("selectedBillableRows expands a selected section to its leaves", () => {
+    const rows: Row[] = [
+        { id: "sec", type: "Section", quantity: 1, unitCost: 1000 },
+        { id: "a", parentId: "sec", quantity: 1, unitCost: 300 },
+        { id: "b", parentId: "sec", quantity: 1, unitCost: 700 },
+    ];
+    const picked = selectedBillableRows(rows, ["sec", "a", "b"]);
+    assert.deepEqual(picked.map(r => r.id), ["a", "b"]);
+    // The header's mirrored 1000 is gone; the CO bills 300 + 700 once.
+    assert.equal(picked.reduce((s, r) => s + Number(r.unitCost), 0), 1000);
+});
+
+test("selectedBillableRows takes the whole phase when only the header is ticked", () => {
+    const rows: Row[] = [
+        { id: "sec", type: "Section", quantity: 1, unitCost: 1000 },
+        { id: "a", parentId: "sec", quantity: 1, unitCost: 300 },
+        { id: "b", parentId: "sec", quantity: 1, unitCost: 700 },
+        { id: "loose", quantity: 1, unitCost: 50 },
+    ];
+    assert.deepEqual(selectedBillableRows(rows, ["sec"]).map(r => r.id), ["a", "b"]);
+});
+
+test("selectedBillableRows recurses through nested sections and dedupes", () => {
+    const rows: Row[] = [
+        { id: "outer", type: "Section", quantity: 1, unitCost: 900 },
+        { id: "inner", parentId: "outer", type: "Section", quantity: 1, unitCost: 900 },
+        { id: "leaf", parentId: "inner", quantity: 3, unitCost: 300 },
+    ];
+    assert.deepEqual(selectedBillableRows(rows, ["outer", "inner", "leaf"]).map(r => r.id), ["leaf"]);
+});
+
+test("selectedBillableRows drops a legacy section detected only by its children", () => {
+    const rows: Row[] = [
+        { id: "sec", quantity: 1, unitCost: 400 },
+        { id: "a", parentId: "sec", quantity: 1, unitCost: 400 },
+    ];
+    assert.deepEqual(selectedBillableRows(rows, ["sec", "a"]).map(r => r.id), ["a"]);
+});
+
+test("selectedBillableRows drops an emptied section and preserves document order", () => {
+    const rows: Row[] = [
+        { id: "first", quantity: 1, unitCost: 10 },
+        { id: "empty", type: "Section", quantity: 1, unitCost: 999 },
+        { id: "last", quantity: 1, unitCost: 20 },
+    ];
+    assert.deepEqual(selectedBillableRows(rows, ["last", "empty", "first"]).map(r => r.id), ["first", "last"]);
+});
+
+test("selectedBillableRows terminates on cyclic parentId data", () => {
+    const rows: Row[] = [
+        { id: "x", parentId: "y", quantity: 1, unitCost: 5 },
+        { id: "y", parentId: "x", quantity: 1, unitCost: 5 },
+    ];
+    // Both are "sections" (each has a child), so the cycle resolves to no billable rows
+    // rather than recursing forever.
+    assert.deepEqual(selectedBillableRows(rows, ["x"]).map(r => r.id), []);
+});
+
+test("billableCoItems excludes section rows but never zeroes an all-header CO", () => {
+    const mixed = [
+        { type: "Section", quantity: 1, unitCost: 1000 },
+        { type: "Material", quantity: 1, unitCost: 300 },
+        { type: "Labor", quantity: 1, unitCost: 700 },
+    ];
+    assert.equal(coItemsSubtotal(mixed), 1000);
+
+    // A legitimate "bill this whole phase" CO whose every row is a header must still
+    // total its rows — filtering them all would silently bill $0.
+    const headersOnly = [
+        { type: "Section", quantity: 1, unitCost: 1000 },
+        { type: "Section", quantity: 1, unitCost: 2000 },
+    ];
+    assert.equal(coItemsSubtotal(headersOnly), 3000);
+    assert.equal(billableCoItems(headersOnly).length, 2);
+});
+
+test("createChangeOrder normalizes its selection through the shared helper", () => {
+    const actions = readFileSync(path.join(__dirname, "..", "src/lib/actions.ts"), "utf8");
+    const body = actions.slice(actions.indexOf("export async function createChangeOrder("));
+    assert.match(body.slice(0, body.indexOf("\n}")), /selectedBillableRows\(estimate\.items, itemIds\)/);
 });

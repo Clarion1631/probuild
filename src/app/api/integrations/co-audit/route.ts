@@ -65,7 +65,7 @@ export async function GET(req: Request) {
             approvedAt: true, sentAt: true,
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
-            items: { select: { quantity: true, unitCost: true, total: true } },
+            items: { select: { type: true, quantity: true, unitCost: true, total: true } },
         },
     });
 
@@ -82,7 +82,7 @@ export async function GET(req: Request) {
 
     const rows = cos.map(co => {
         const stored = rc(Number(co.totalAmount));
-        const subtotal = coItemsSubtotal(co.items.map(i => ({ quantity: i.quantity, unitCost: Number(i.unitCost) })));
+        const subtotal = coItemsSubtotal(co.items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
         const rate = coTaxRate(co.estimate);
         const tax = rc(subtotal * rate);
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
@@ -166,13 +166,13 @@ export async function POST(req: Request) {
         }
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId },
-            select: { quantity: true, unitCost: true },
+            select: { type: true, quantity: true, unitCost: true },
         });
         // Re-derive the verdict under the lock — the repair only applies to the
         // tax-inclusive-total bug. A drift row (total matches neither subtotal
         // nor subtotal+tax) may carry an intentional edit, so it needs an
         // explicit force from a human.
-        const subtotal = coItemsSubtotal(items.map(i => ({ quantity: i.quantity, unitCost: Number(i.unitCost) })));
+        const subtotal = coItemsSubtotal(items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
         const estimateTax = await tx.estimate.findUnique({
             where: { id: co.estimateId },
             select: { taxExempt: true, taxRatePercent: true, taxRateName: true },

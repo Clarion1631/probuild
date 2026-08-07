@@ -16,7 +16,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, billableCoItems } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
@@ -1874,10 +1874,10 @@ export async function sendChangeOrderToClientCore(
         // bills and locks, and a $0 approved CO can't be repaired.
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId },
-            select: { quantity: true, unitCost: true },
+            select: { type: true, quantity: true, unitCost: true },
         });
         const storedSubtotalCents = Math.round(Number(co.totalAmount) * 100);
-        const renderedSubtotalCents = items.reduce(
+        const renderedSubtotalCents = billableCoItems(items).reduce(
             (sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)),
             0,
         );

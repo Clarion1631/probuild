@@ -140,6 +140,56 @@ export function isEstimateSectionRow<T extends EstimateItemLike>(item: T, items:
 }
 
 /**
+ * Resolve a set of selected estimate rows to the billable leaves they stand for.
+ *
+ * A section header mirrors its children's rolled-up total, so copying a header *and* its
+ * children into a flat model — `ChangeOrderItem` has no `parentId`, so the hierarchy that
+ * `isEstimateSectionRow` needs cannot be reconstructed there — bills the section twice.
+ * Selecting a header is read as "everything under this phase": the header itself drops out
+ * and its descendant leaves come along, including ones the user did not tick individually.
+ *
+ * Document order is preserved and each leaf appears once no matter how many of its ancestors
+ * were selected. Cyclic `parentId` data is walked at most once per row, matching
+ * `computeEstimateItemTotals`' refusal to recurse forever.
+ */
+export function selectedBillableRows<T extends EstimateItemLike>(
+    items: readonly T[],
+    selectedIds: readonly string[],
+): T[] {
+    const childrenByParent = new Map<string, T[]>();
+    const byId = new Map<string, T>();
+    for (const item of items) {
+        const id = item.id ? String(item.id) : null;
+        if (id && !byId.has(id)) byId.set(id, item);
+        const parentId = item.parentId ? String(item.parentId) : null;
+        if (!parentId) continue;
+        const siblings = childrenByParent.get(parentId);
+        if (siblings) siblings.push(item);
+        else childrenByParent.set(parentId, [item]);
+    }
+
+    const visited = new Set<string>();
+    const leafIds = new Set<string>();
+    const visit = (item: T) => {
+        const id = item.id ? String(item.id) : null;
+        if (!id || visited.has(id)) return;
+        visited.add(id);
+        if (isEstimateSectionRow(item, items)) {
+            for (const child of childrenByParent.get(id) ?? []) visit(child);
+            return;
+        }
+        leafIds.add(id);
+    };
+
+    for (const selectedId of selectedIds) {
+        const item = byId.get(String(selectedId));
+        if (item) visit(item);
+    }
+
+    return items.filter(item => !!item.id && leafIds.has(String(item.id)));
+}
+
+/**
  * Tag every detected section with `type: "Section"`, leaving all other rows untouched.
  *
  * `serializeEstimateItemsForSave` normalizes the rows it *persists*, but it is deliberately

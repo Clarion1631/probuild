@@ -16,7 +16,7 @@ import { resolveSessionClientId } from "./portal-auth";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
-import { normalizeEstimateItemForSave } from "./estimate-item-payload";
+import { normalizeEstimateItemForSave, selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
@@ -8706,7 +8706,10 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
     await prisma.changeOrder.update({ where: { id: changeOrder.id }, data: { code: coCode } });
 
     if (itemIds && itemIds.length > 0) {
-        const selectedItems = estimate.items.filter(i => itemIds.includes(i.id));
+        // Section headers carry their children's rolled-up total, and ChangeOrderItem is flat,
+        // so copying a header alongside its children would bill the section twice. Selecting a
+        // header means "bill this whole phase" — it resolves to the leaves underneath it.
+        const selectedItems = selectedBillableRows(estimate.items, itemIds);
         for (const item of selectedItems) {
             await prisma.changeOrderItem.create({
                 data: {
