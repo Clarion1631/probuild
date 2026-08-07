@@ -151,21 +151,30 @@ export default function TimeClockPage() {
     }, [selectedProject]);
 
     // Phase-code-grouped picker: groups ordered by cost code; codeless items
-    // surface last, flagged — every estimate item is supposed to carry a phase code.
+    // surface last, flagged — every estimate item is supposed to carry a phase
+    // code. When the project has more than one eligible estimate, the estimate
+    // title joins the group label so identical phases can't be confused.
     const bucketGroups = useMemo(() => {
+        const estimateIds = new Set(budgetBuckets.map((b: any) => b.estimateId).filter(Boolean));
+        const multiEstimate = estimateIds.size > 1;
         const groups = new Map<string, { label: string; items: any[] }>();
         for (const bucket of budgetBuckets) {
-            const key = bucket.costCode ? bucket.costCode.code : "~none";
-            const label = bucket.costCode
+            const codeKey = bucket.costCode ? bucket.costCode.code : "~none";
+            const key = multiEstimate ? `${bucket.estimateId}|${codeKey}` : codeKey;
+            const baseLabel = bucket.costCode
                 ? `${bucket.costCode.code} — ${bucket.costCode.name}`
                 : "No phase code (fix in estimate)";
+            const label = multiEstimate && bucket.estimateTitle
+                ? `${bucket.estimateTitle}: ${baseLabel}`
+                : baseLabel;
             if (!groups.has(key)) groups.set(key, { label, items: [] });
             groups.get(key)!.items.push(bucket);
         }
         return [...groups.entries()]
             .sort(([a], [b]) => {
-                if (a === "~none") return 1;
-                if (b === "~none") return -1;
+                const aNone = a.endsWith("~none");
+                const bNone = b.endsWith("~none");
+                if (aNone !== bNone) return aNone ? 1 : -1;
                 return a.localeCompare(b, undefined, { numeric: true });
             })
             .map(([, group]) => group);

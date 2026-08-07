@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { resolveChargeableItems } from "@/lib/time-suggestion";
 
 // Daily-log post-back to the project's Google Chat team space, via a per-space
 // incoming webhook (Project.chatWebhookUrl — a credential, manager-configured).
@@ -64,15 +65,17 @@ export async function postDailyLogToChat(input: DailyLogPostBackInput): Promise<
         if (input.issues?.trim()) lines.push(`*Issues:* ${truncate(input.issues)}`);
         if (input.photoCount > 0) lines.push(`📷 ${input.photoCount} photo${input.photoCount === 1 ? "" : "s"}`);
         if (input.suggestedTask) {
-            const { costCodeLabel, taskName } = input.suggestedTask;
+            const costCodeLabel = input.suggestedTask.costCodeLabel.trim();
+            const taskName = input.suggestedTask.taskName.trim();
             // "04-ELEC — Electrical — Electrical" reads silly when the task is
-            // named after its trade; drop the redundant tail.
+            // named after its trade; drop the redundant tail (and never emit a
+            // dangling separator when either side is empty).
             const label = !costCodeLabel
                 ? taskName
-                : costCodeLabel.toLowerCase().endsWith(`— ${taskName.toLowerCase()}`)
+                : !taskName || costCodeLabel.toLowerCase().endsWith(`— ${taskName.toLowerCase()}`)
                     ? costCodeLabel
                     : `${costCodeLabel} — ${taskName}`;
-            lines.push(``, `👉 *Tomorrow's task: ${label}*`);
+            if (label) lines.push(``, `👉 *Tomorrow's task: ${label}*`);
         }
 
         const controller = new AbortController();
@@ -128,27 +131,14 @@ export async function postDailyLogSummary(dailyLogId: string): Promise<boolean> 
                 select: { name: true, estimateItemId: true },
             });
             if (task) {
-                // The charge lands on the TOP-LEVEL bucket, so the label must be
-                // that bucket's cost code — not the nearest coded ancestor.
-                // Same walk the suggestion mapper does (bounded hop count).
-                let costCode: { code: string; name: string } | null = null;
-                let itemId: string | null = task.estimateItemId;
-                for (let hops = 0; itemId && hops < 10; hops += 1) {
-                    const item: { parentId: string | null; costCode: { code: string; name: string } | null } | null =
-                        await prisma.estimateItem.findUnique({
-                            where: { id: itemId },
-                            select: { parentId: true, costCode: { select: { code: true, name: true } } },
-                        });
-                    if (!item) break;
-                    if (!item.parentId) {
-                        costCode = item.costCode;
-                        break;
-                    }
-                    itemId = item.parentId;
-                }
+                // The displayed code must be what a punch would actually charge —
+                // resolveChargeableItems is the one authority for that.
+                const target = task.estimateItemId
+                    ? (await resolveChargeableItems(log.projectId)).targetByItemId.get(task.estimateItemId)
+                    : undefined;
                 suggestedTask = {
                     taskName: task.name,
-                    costCodeLabel: costCode ? `${costCode.code} — ${costCode.name}` : "",
+                    costCodeLabel: target?.costCode ? `${target.costCode.code} — ${target.costCode.name}` : "",
                 };
             }
         }
