@@ -173,6 +173,7 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
+import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
 // Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
 // Mirrors the JSON shape that /api/ai-estimate/import + transformPhasesToItems expect.
@@ -3004,7 +3005,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                             Paid
                                                         </span>
                                                         {paidOn && (
-                                                            <span className="text-[10px] text-slate-400">{new Date(paidOn).toLocaleDateString()}</span>
+                                                            <span className="text-[10px] text-slate-400">{formatMoneyDate(paidOn, {})}</span>
                                                         )}
                                                         <button
                                                             onClick={async () => {
@@ -3710,7 +3711,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     <div className="min-w-0">
                                                         <p className="text-sm font-medium text-slate-800">{ev.title}</p>
                                                         {ev.detail && <p className="text-xs text-slate-500 truncate" title={ev.detail}>{ev.detail}</p>}
-                                                        <p className="text-xs text-slate-400">{new Date(ev.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+                                                        <p className="text-xs text-slate-400">
+                                                            {(() => {
+                                                                const evDate = new Date(ev.ts);
+                                                                const dateStr = formatMoneyDate(evDate, { month: 'short', day: 'numeric', year: 'numeric' });
+                                                                // Calendar-day values (e.g. paidAt-less settled payments) carry no real
+                                                                // time-of-day — showing "12:00 AM" would be misleading, so only append
+                                                                // a time for values that are genuine instants.
+                                                                if (isDateOnly(evDate)) return dateStr;
+                                                                return `${dateStr}, ${evDate.toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+                                                            })()}
+                                                        </p>
                                                     </div>
                                                 </div>
                                             );

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 interface UndoPaymentModalProps {
     milestoneName: string;
@@ -99,7 +100,7 @@ export default function UndoPaymentModal({
                         {paidDate && (
                             <>
                                 <span className="text-slate-300">|</span>
-                                <span>Paid {new Date(paidDate).toLocaleDateString()}</span>
+                                <span>Paid {formatMoneyDate(paidDate, {})}</span>
                             </>
                         )}
                     </div>

@@ -6,6 +6,7 @@ import Link from "next/link";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
 import OverheadEditor from "./OverheadEditor";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 export const dynamic = "force-dynamic";
 
@@ -111,7 +112,8 @@ export default async function ProfitabilityPage({ searchParams }: { searchParams
                 if (!inPeriod(date, from)) continue;
                 payments.push({
                     name: pay.name, invoiceCode: inv.code, amount: toNum(pay.amount),
-                    date: date ? new Date(date) : null, method: pay.paymentMethod, reference: pay.referenceNumber,
+                    date: date ? new Date(date) : null,
+                    method: pay.paymentMethod, reference: pay.referenceNumber,
                 });
             }
         }
@@ -254,7 +256,7 @@ export default async function ProfitabilityPage({ searchParams }: { searchParams
                                             {r.payments.map((p, i) => (
                                                 <div key={`p${i}`} className="flex justify-between gap-3 bg-green-50/60 border border-green-100 rounded-md px-3 py-1.5">
                                                     <span className="text-slate-600 truncate">
-                                                        <span className="text-green-700 font-semibold">IN</span> · {p.date ? p.date.toLocaleDateString() : "—"} · {p.invoiceCode} · {p.name}
+                                                        <span className="text-green-700 font-semibold">IN</span> · {p.date ? formatMoneyDate(p.date) : "—"} · {p.invoiceCode} · {p.name}
                                                         {p.method ? ` · ${p.method === "quickbooks" ? "QuickBooks" : p.method}` : ""}{p.reference ? ` #${p.reference}` : ""}
                                                     </span>
                                                     <span className="font-semibold text-green-700 shrink-0">+{formatCurrency(p.amount)}</span>

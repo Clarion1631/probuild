@@ -12,6 +12,7 @@ import UndoPaymentModal from "@/components/UndoPaymentModal";
 import DocumentComments from "@/components/DocumentComments";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 const METHOD_LABELS: Record<string, string> = {
     card: "Card",
@@ -892,7 +893,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                             </td>
                                             <td className="px-6 py-4 text-right text-hui-textMuted">
                                                 {payment.paymentDate
-                                                    ? new Date(payment.paymentDate).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+                                                    ? formatMoneyDate(payment.paymentDate, { year: 'numeric', month: 'short', day: 'numeric' })
                                                     : '—'}
                                             </td>
                                             <td className="px-6 py-4 text-right">

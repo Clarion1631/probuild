@@ -4,6 +4,7 @@ import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
+import { formatMoneyDate } from "@/lib/payment-date";
 import {
     groupRowsByMonth,
     parseSalesTaxFilters,
@@ -141,7 +142,7 @@ export default async function SalesTaxReportPage({
                                 {rows.map(r => (
                                     <tr key={r.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                         <td className="px-4 py-3 text-hui-textMuted whitespace-nowrap">
-                                            {r.date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                                            {formatMoneyDate(r.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                         </td>
                                         <td className="px-4 py-3 font-mono text-xs">
                                             <Link href={r.href} className="text-hui-primary hover:underline">
