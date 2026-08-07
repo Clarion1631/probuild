@@ -26,9 +26,7 @@
 `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`
 
 ## Stack
-- Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
-- Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
-- Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
+- Auto-deploy is **disabled**. Deploy manually via `vercel --prod` — see the `deploy-probuild` skill.
 
 ## Room Studio (3D room designer)
 - Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
@@ -60,71 +58,27 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 8. Mark items done in ProbuildTodo.md
 ```
 
-**Error diagnosis (Sentry)**
-```bash
-sentry-cli issues list --org golden-touch-remodeling --project <project> --output json
-```
-
-**Stripe webhook testing**
-```bash
-stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
-stripe trigger payment_intent.succeeded
-```
-
-## Deploying to Vercel (CLI only — auto-deploy is OFF)
-```powershell
-# Production deploy (from the main repo dir, not a worktree):
-vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
-```
-**Pre-deploy checklist (in order):**
-1. `npm run build` passes locally with 0 errors
-2. **Schema changed?** If the branch edits `prisma/schema.prisma` and ships a `scripts/apply-*.mjs`, run it against prod BEFORE deploying (`node scripts/apply-<name>.mjs`). These scripts are additive + idempotent (`IF NOT EXISTS`, guarded FKs) and safe while the old build is live — but the new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 "column does not exist" until the script runs. (2026-07-20: the company-schedule deploy went out before `apply-company-schedule-schema.mjs` ran; project pages hit the route error boundary until it was applied.)
-3. Deploy with the command above, then click through the affected pages on prod
-
-- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
-- `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
-- Only deploy when changes are verified locally via `npm run build`
-- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
+## Deploying to Vercel — hard rules
+Full procedure lives in the `deploy-probuild` skill. Non-negotiables:
+- Auto-deploy is OFF (disabled in `vercel.json` after a $250 runaway-build bill). Do **NOT** re-enable it in vercel.json or the Vercel dashboard.
+- **Schema changed?** If the branch edits `prisma/schema.prisma` and ships a `scripts/apply-*.mjs`, run it against prod **BEFORE** deploying. The new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 until the script runs.
+- Deploy from the main repo dir, never a worktree (worktrees lack the `.vercel` link).
 
 ## E2E testing — never against the live DB
-See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
-- CI runs e2e in a throwaway Postgres container (`.github/workflows/ci.yml`)
-- `e2e/data.setup.ts` refuses to run when DATABASE_URL looks like Supabase (override: `ALLOW_PROD_E2E=1`)
-- Specs that create data must tear it down in `afterAll` (see `qa-lead-estimate-invoice.spec.ts`)
-- History: QA runs against prod once filled /leads with "Master Bath Renovation - Henderson" junk (cleaned 2026-06-11)
+E2E creates real leads/estimates/invoices. Never point it at prod. Details and guard rails: **docs/TESTING.md**.
 
-## Dev server — clean start
-```bash
-kill -9 $(lsof -ti tcp:3000,3001,3002) 2>/dev/null; rm -f .next/dev/lock; sleep 2
-npm run dev > /tmp/devserver.log 2>&1 &
-sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
-```
-- Always use port 3000 — if it's taken, kill it, don't switch ports
-- If still failing, `rm -rf .next && npm run dev`
+## Dev server
+Always use port 3000 — if it's taken, kill it, don't switch ports. Clean-start recipe: `probuild-dev-server` skill.
 
 ## Schema migrations
 > `npx prisma db push` hangs interactively. `prisma migrate dev` fails (port 5432 blocked on free tier).
 
-**Working approach:**
-1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
-2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
-3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site'; node_modules\.bin\prisma generate"`
-4. Update `prisma/schema.prisma` to match the SQL changes
+Use the `probuild-schema-migration` skill for the working procedure.
 
 ## Critical database config
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this. Without it: `42P05 prepared statement already exists` and the site goes down.
 - Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - DIRECT_URL uses port 5432 on `db.ghzdbzdnwjxazvmcefbh.supabase.co` (for migrations only)
-
-## compare.py (optional — QA tool, not daily workflow)
-Legacy Houzz Pro visual comparison tool. Useful for quarterly sanity checks only.
-```bash
-python compare.py --force     # full production comparison
-python compare.py --local --page "Page Name"   # single page local test
-```
-- `config.py` has API keys (gitignored) — ANTHROPIC_API_KEY, GEMINI_API_KEY
-- Do not run compare.py as part of normal development — use ProbuildTodo.md as the roadmap instead
 
 ## Production data
 - Prod test project ("Shop"): `cmpd6xca1009x1iizdf4suln3` — the sanctioned job for clicking through prod
@@ -158,20 +112,16 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
 - **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
-- **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library
-- **Existing routes** — api, company, estimates, invoices, leads, login, manager, portal, projects, reports, settings, sub-portal, time-clock — don't duplicate
+- **Existing routes** — check `src/app/` before adding one; don't duplicate
 - **Money-path changes** (payments, signing, payment mirrors, notifications) — estimate/invoice milestones are mirrored pairs linked by `PaymentSchedule.sourceScheduleId`; settling or unsettling either side must update both. ALL paid-milestone side effects (team email, client receipt, activity log) flow through `notifyMilestonePaid()` in `lib/payment-notifications.ts` — never add a second writer for a lifecycle event (two duplicate loggers shipped that way before the June 2026 audit caught them). After touching these paths: run codex-peer-review on the diff and keep `e2e/money-pipeline.spec.ts` green (PR CI runs it — it guards the sign→convert→invoice chain, mirror links, undo restore, and exactly-once activity writers).
 
 ## Efficiency rules (token management)
 - **Full context, minimum tokens** — read the 4 reference docs (CLAUDE.md, VISION.md, DESIGN_SYSTEM.md, ProbuildTodo.md) for context, then build. Don't explore the codebase unless you're editing a file you haven't seen.
-- **Use CLIs with `--json` flags** — `gh --json`, `vercel --json`, `supabase` CLI. Not MCPs.
-- **Use Sonnet for implementation** — only use Opus for complex architecture/planning decisions
 - **Run parallel sub-agents** for independent work (e.g. building 3 report pages simultaneously in separate agents)
 - **Don't re-read large files** — if you already know the structure, reference it. GanttChart.tsx is 17k tokens — don't read it unless editing it.
 - **Batch tool calls** — make independent reads/greps/globs in parallel, not sequential
-- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails.
 
 ## Dead buttons / unlinked UI
 - While working on any page, audit all buttons, links, and nav items for dead ends
