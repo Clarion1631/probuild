@@ -4,7 +4,7 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
-import { coTaxRate, coTaxLabel } from './co-tax';
+import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 import { isEstimateSectionRow, rm } from './estimate-item-payload';
 
@@ -1163,7 +1163,11 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     };
     // Fully empty placeholder rows (no name, no description, $0) would render
     // as orphan "$0.00" lines — drop them. Anything with text or money stays.
-    const coVisibleItems = co.items.filter(it =>
+    // Section headers are excluded before the empty-row filter: a header mirrors the total
+    // of the lines beneath it, so printing it would make the visible lines out-sum the
+    // subtotal the customer signs. (The send guard refuses such a CO outright; this keeps an
+    // unsent draft's preview honest.)
+    const coVisibleItems = billableCoItems(co.items).filter(it =>
         (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
     // Reserve through the first item so neither the cost-plus terms block nor
     // the table header is left orphaned when the first row's preflight breaks.

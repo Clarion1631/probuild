@@ -1,6 +1,6 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { billableCoItems, coLineCents } from "./co-tax";
+import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -92,6 +92,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
     return prisma.$transaction(async (tx) => {
         // Serialize editors with send, approval, billing, and co-audit repair.
         const locked = await tx.$queryRaw<Array<{
+            code: string;
             status: string;
             title: string;
             description: string | null;
@@ -105,7 +106,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
         }>>`
-            SELECT "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
+            SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
                    "companySignedBy", "companySignedAt", "companySignatureUrl"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
@@ -204,11 +205,17 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                 // editor always sends explicit values (x || null), so this only
                 // affects connector callers. Empty string / null still clears.
                 const prior = item.id ? existingById.get(item.id) : undefined;
+                // `type` is keep-prior too (the MCP omits it whenever costType is omitted),
+                // and the *effective* type is what decides whether this row is billable. Read
+                // the stored value here or the subtotal computed below would disagree with the
+                // one the send and approval guards recompute after reload — a mismatch those
+                // guards treat as "out of sync with its items", permanently.
+                const effectiveType = item.type ?? prior?.type ?? undefined;
                 return {
                     id: item.id || undefined,
                     name: item.name || "",
                     description: item.description === undefined ? (prior?.description ?? null) : (item.description || null),
-                    ...(item.type ? { type: item.type } : {}),
+                    ...(effectiveType ? { type: effectiveType } : {}),
                     quantity,
                     unitCost: unitCents / 100,
                     total: lineCents / 100,
@@ -217,9 +224,11 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                     costTypeId: item.costTypeId === undefined ? (prior?.costTypeId ?? null) : (item.costTypeId || null),
                 };
             });
-            // Persisted total must use the same billable-row rule the approval and send
-            // guards recompute with, or a payload carrying a section header would store a
-            // subtotal those guards then reject as "out of sync with its items".
+            // Refuse a section header at the point it would enter the change order, rather
+            // than storing a row every downstream reader then has to second-guess.
+            const sectionRows = coSectionRowNames(rows);
+            if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
+
             const totalCents = itemSubtotalCents(rows);
             const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
             const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
@@ -371,8 +380,11 @@ export async function approveChangeOrderCore(
 
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId: id },
-            select: { type: true, quantity: true, unitCost: true },
+            select: { name: true, type: true, quantity: true, unitCost: true },
         });
+        // Legacy rows written before section headers were rejected at the write path.
+        const sectionRows = coSectionRowNames(items);
+        if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
         if (current.pricingType !== "COST_PLUS" && items.length === 0) {
             throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
         }

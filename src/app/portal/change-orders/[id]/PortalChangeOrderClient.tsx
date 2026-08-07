@@ -6,7 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -214,7 +214,9 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {items.map((item: any) => {
+                                {/* Line amounts must sum to the subtotal below, which excludes
+                                    section headers — a header mirrors the lines beneath it. */}
+                                {billableCoItems(items).map((item: any) => {
                                     const itemTotal = coLineCents(Number(item.quantity || 0), Number(item.unitCost || 0)) / 100;
                                     return (
                                         <tr key={item.id}>

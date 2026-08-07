@@ -56,7 +56,15 @@ function num(value: unknown): number {
  * be impossible, but is not enforced at the DB level) is treated as contributing 0 rather
  * than recursing forever.
  */
-export function computeEstimateItemTotals<T extends EstimateItemLike>(items: readonly T[]): EstimateItemTotal[] {
+const ROOTED = 1;
+const UNROOTED = 2;
+
+/**
+ * Parent/child indexes, section detection, and rootedness — the shared reading of the item
+ * tree. `computeEstimateItemTotals` and `selectedBillableRows` both walk it, and they must
+ * agree: a row the totals call values at 0 must not be a row the selection call bills.
+ */
+function buildItemGraph<T extends EstimateItemLike>(items: readonly T[]) {
     const childIndexesByParent = new Map<string, number[]>();
     const indexById = new Map<string, number>();
 
@@ -81,8 +89,6 @@ export function computeEstimateItemTotals<T extends EstimateItemLike>(items: rea
     // Rows whose parent chain loops instead of terminating at a root. Resolved up front so
     // the outcome does not depend on the order rows happen to appear in: every row in (or
     // hanging off) a cycle totals 0 and contributes 0, whichever end we start walking from.
-    const ROOTED = 1;
-    const UNROOTED = 2;
     const rootedness = new Array<number>(items.length).fill(0);
     for (let start = 0; start < items.length; start++) {
         if (rootedness[start] !== 0) continue;
@@ -100,6 +106,12 @@ export function computeEstimateItemTotals<T extends EstimateItemLike>(items: rea
         }
         for (const index of path) rootedness[index] = verdict;
     }
+
+    return { childIndexesByParent, indexById, isSectionAt, rootedness };
+}
+
+export function computeEstimateItemTotals<T extends EstimateItemLike>(items: readonly T[]): EstimateItemTotal[] {
+    const { childIndexesByParent, isSectionAt, rootedness } = buildItemGraph(items);
 
     const resolved = new Array<number | undefined>(items.length);
 
@@ -149,44 +161,36 @@ export function isEstimateSectionRow<T extends EstimateItemLike>(item: T, items:
  * and its descendant leaves come along, including ones the user did not tick individually.
  *
  * Document order is preserved and each leaf appears once no matter how many of its ancestors
- * were selected. Cyclic `parentId` data is walked at most once per row, matching
- * `computeEstimateItemTotals`' refusal to recurse forever.
+ * were selected. Rows in a cyclic `parentId` component are skipped entirely: the estimate
+ * values them at 0 (see `computeEstimateItemTotals`), so billing one would charge for work the
+ * estimate it came from prices at nothing.
  */
 export function selectedBillableRows<T extends EstimateItemLike>(
     items: readonly T[],
     selectedIds: readonly string[],
 ): T[] {
-    const childrenByParent = new Map<string, T[]>();
-    const byId = new Map<string, T>();
-    for (const item of items) {
-        const id = item.id ? String(item.id) : null;
-        if (id && !byId.has(id)) byId.set(id, item);
-        const parentId = item.parentId ? String(item.parentId) : null;
-        if (!parentId) continue;
-        const siblings = childrenByParent.get(parentId);
-        if (siblings) siblings.push(item);
-        else childrenByParent.set(parentId, [item]);
-    }
+    const { childIndexesByParent, indexById, isSectionAt, rootedness } = buildItemGraph(items);
 
-    const visited = new Set<string>();
-    const leafIds = new Set<string>();
-    const visit = (item: T) => {
-        const id = item.id ? String(item.id) : null;
-        if (!id || visited.has(id)) return;
-        visited.add(id);
-        if (isEstimateSectionRow(item, items)) {
-            for (const child of childrenByParent.get(id) ?? []) visit(child);
+    const visited = new Array<boolean>(items.length).fill(false);
+    const billable = new Array<boolean>(items.length).fill(false);
+    const visit = (index: number) => {
+        if (visited[index]) return;
+        visited[index] = true;
+        if (rootedness[index] === UNROOTED) return;
+        if (isSectionAt(index)) {
+            const id = items[index].id ? String(items[index].id) : null;
+            for (const childIndex of (id && childIndexesByParent.get(id)) || []) visit(childIndex);
             return;
         }
-        leafIds.add(id);
+        billable[index] = true;
     };
 
     for (const selectedId of selectedIds) {
-        const item = byId.get(String(selectedId));
-        if (item) visit(item);
+        const index = indexById.get(String(selectedId));
+        if (index !== undefined) visit(index);
     }
 
-    return items.filter(item => !!item.id && leafIds.has(String(item.id)));
+    return items.filter((_item, index) => billable[index]);
 }
 
 /**

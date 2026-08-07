@@ -38,20 +38,38 @@ export function coLineCents(quantity: number, unitCost: number): number {
 }
 
 /**
- * The change-order rows that actually carry money.
+ * A section header has no place in a change order.
  *
- * `ChangeOrderItem` is flat — no `parentId` — so a row copied from a sectioned estimate keeps
- * `type: "Section"` and the section's *rolled-up* unitCost, which is the sum of the leaf rows
- * sitting right beside it. Billing both double-counts the section. `createChangeOrder` now
- * expands a section selection to its leaves so new COs never contain a header at all; this
- * guard covers rows written before that fix and any connector payload that sends one.
+ * `ChangeOrderItem` is flat — no `parentId` — so a row copied out of a sectioned estimate
+ * keeps `type: "Section"` and the section's *rolled-up* unitCost, which is the sum of the leaf
+ * rows copied beside it. Billing both double-counts the section.
  *
- * A CO whose rows are *all* headers passes through untouched: it carries no leaves to
- * double-count, and filtering it would silently total the change order to zero.
+ * Nothing can legitimately produce such a row: the CO editor and the MCP both restrict `type`
+ * to Labor / Material / Allowance / Subcontractor / Equipment / Other, and `createChangeOrder`
+ * now resolves a section selection to its leaves. A header is therefore corrupt data, never a
+ * standalone "bill this whole phase" line — which is why the money paths (write, send,
+ * approve) reject it outright instead of guessing at what it was meant to charge. Flat rows
+ * cannot tell a duplicate header apart from a standalone one, and a wrong guess is a wrong
+ * invoice in either direction.
+ */
+export function coSectionRowNames<T extends { type?: string | null; name?: string | null }>(items: readonly T[]): string[] {
+    return items.filter(item => item.type === "Section").map(item => item.name?.trim() || "(unnamed)");
+}
+
+/** Error text shared by every money path that refuses a change order carrying section headers. */
+export function coSectionRowError(code: string, sectionNames: readonly string[]): string {
+    return `Change order ${code} contains estimate section headers (${sectionNames.join(", ")}). `
+        + `A header mirrors the total of the lines beneath it, so billing it would charge that work twice. `
+        + `Delete those rows, or rebuild the change order from the estimate, before continuing.`;
+}
+
+/**
+ * The change-order rows that carry money. Read paths (subtotals shown on screen, the budget
+ * roll-up) use this so a corrupt legacy row inflates nothing while a human sorts it out; the
+ * money paths refuse the change order entirely rather than render a number from it.
  */
 export function billableCoItems<T extends { type?: string | null }>(items: readonly T[]): readonly T[] {
-    const billable = items.filter(item => item.type !== "Section");
-    return billable.length === 0 ? items : billable;
+    return items.filter(item => item.type !== "Section");
 }
 
 export function coItemsSubtotal(items: Array<{ type?: string | null; quantity?: number | string | null; unitCost?: number | string | null }>): number {

@@ -280,8 +280,9 @@ export default function BudgetClient({ project, data }: { project: { id: string;
         // Change orders add to revised
         for (const co of changeOrders) {
             // Section headers mirror their children's rolled-up total, so counting both
-            // inflates revisedEst. billableCoItems passes an all-headers CO through
-            // untouched — dropping every row there would total that CO to zero.
+            // inflates revisedEst. Nothing can create such a row anymore and the money paths
+            // reject any that predate the guard; dropping it here just keeps the budget
+            // honest while a human sorts that change order out.
             for (const item of billableCoItems(co.items)) {
                 const gk = getGroupKey(item);
                 const row = getOrCreate(gk);

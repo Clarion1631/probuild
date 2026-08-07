@@ -13,7 +13,7 @@ import {
     selectedBillableRows,
 } from "../src/lib/estimate-item-payload";
 import { buildQBEstimateLines } from "../src/lib/quickbooks";
-import { billableCoItems, coItemsSubtotal } from "../src/lib/co-tax";
+import { billableCoItems, coItemsSubtotal, coSectionRowNames } from "../src/lib/co-tax";
 
 type Row = {
     id: string;
@@ -527,17 +527,20 @@ test("selectedBillableRows drops an emptied section and preserves document order
     assert.deepEqual(selectedBillableRows(rows, ["last", "empty", "first"]).map(r => r.id), ["first", "last"]);
 });
 
-test("selectedBillableRows terminates on cyclic parentId data", () => {
+test("selectedBillableRows skips a cyclic component instead of billing it", () => {
     const rows: Row[] = [
-        { id: "x", parentId: "y", quantity: 1, unitCost: 5 },
-        { id: "y", parentId: "x", quantity: 1, unitCost: 5 },
+        { id: "x", parentId: "y", type: "Section", quantity: 1, unitCost: 10 },
+        { id: "y", parentId: "x", type: "Section", quantity: 1, unitCost: 10 },
+        { id: "leaf", parentId: "x", quantity: 1, unitCost: 25 },
     ];
-    // Both are "sections" (each has a child), so the cycle resolves to no billable rows
-    // rather than recursing forever.
+    // computeEstimateItemTotals values every row in an unrooted component at 0, so billing
+    // the leaf would charge $25 for work the estimate it came from prices at nothing.
+    assert.deepEqual(computeEstimateItemTotals(rows).map(t => t.total), [0, 0, 0]);
     assert.deepEqual(selectedBillableRows(rows, ["x"]).map(r => r.id), []);
+    assert.deepEqual(selectedBillableRows(rows, ["leaf"]).map(r => r.id), []);
 });
 
-test("billableCoItems excludes section rows but never zeroes an all-header CO", () => {
+test("billableCoItems drops section rows without guessing at their meaning", () => {
     const mixed = [
         { type: "Section", quantity: 1, unitCost: 1000 },
         { type: "Material", quantity: 1, unitCost: 300 },
@@ -545,14 +548,43 @@ test("billableCoItems excludes section rows but never zeroes an all-header CO", 
     ];
     assert.equal(coItemsSubtotal(mixed), 1000);
 
-    // A legitimate "bill this whole phase" CO whose every row is a header must still
-    // total its rows — filtering them all would silently bill $0.
+    // No fallback for an all-headers CO. Flat rows cannot tell a header that duplicates the
+    // lines beside it from a standalone charge, and neither reading can be assumed: two
+    // nested headers would double-count, a standalone one would vanish. Nothing can create
+    // such a row (editor and MCP both reject type "Section"), so the money paths refuse the
+    // change order outright rather than render a number from it.
     const headersOnly = [
-        { type: "Section", quantity: 1, unitCost: 1000 },
-        { type: "Section", quantity: 1, unitCost: 2000 },
+        { type: "Section", name: "Phase 1", quantity: 1, unitCost: 1000 },
+        { type: "Section", name: "Phase 2", quantity: 1, unitCost: 2000 },
     ];
-    assert.equal(coItemsSubtotal(headersOnly), 3000);
-    assert.equal(billableCoItems(headersOnly).length, 2);
+    assert.equal(billableCoItems(headersOnly).length, 0);
+    assert.deepEqual(coSectionRowNames(headersOnly), ["Phase 1", "Phase 2"]);
+    assert.deepEqual(coSectionRowNames(mixed), ["(unnamed)"]);
+    assert.deepEqual(coSectionRowNames([{ type: "Material", name: "Tile" }]), []);
+});
+
+test("every money path refuses a change order carrying section headers", () => {
+    const root = path.join(__dirname, "..");
+    const guarded = {
+        "src/lib/change-order-core.ts": 2,   // write + approve
+        "src/lib/billing-core.ts": 2,        // send + bill
+    };
+    for (const [file, expected] of Object.entries(guarded)) {
+        const source = readFileSync(path.join(root, file), "utf8");
+        assert.equal(
+            source.split("coSectionRowNames(").length - 1, expected,
+            `${file} should guard ${expected} money paths against section rows`,
+        );
+    }
+});
+
+test("an omitted type keeps the stored one, so the persisted total stays reproducible", () => {
+    // The MCP omits `type` whenever costType is omitted. updateChangeOrderCore must read the
+    // prior type before totalling, or the stored subtotal disagrees forever with the one the
+    // send and approval guards recompute after reload.
+    const core = readFileSync(path.join(__dirname, "..", "src/lib/change-order-core.ts"), "utf8");
+    assert.match(core, /const effectiveType = item\.type \?\? prior\?\.type \?\? undefined;/);
+    assert.match(core, /\.\.\.\(effectiveType \? \{ type: effectiveType \} : \{\}\)/);
 });
 
 test("createChangeOrder normalizes its selection through the shared helper", () => {
