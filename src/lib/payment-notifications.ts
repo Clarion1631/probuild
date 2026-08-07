@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
-import { isBackdatedPayment } from "@/lib/payment-date";
+import { isBackdatedPayment, formatMoneyDate } from "@/lib/payment-date";
 
 function isToggleOn(settings: { notificationToggles?: string | null } | null, key: string): boolean {
     if (!settings?.notificationToggles) return true;
@@ -104,7 +104,8 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         const amount = formatCurrency(s.amount);
         const remaining = formatCurrency(s.invoice.balanceDue);
         const newBalanceNum = Number(s.invoice.balanceDue.toString());
-        const when = (s.paymentDate || s.paidAt || new Date()).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+        const whenOpts: Intl.DateTimeFormatOptions = { year: "numeric", month: "long", day: "numeric" };
+        const when = formatMoneyDate(s.paymentDate || s.paidAt || new Date(), whenOpts, "en-US");
         const link = s.invoice.project
             ? `https://probuild.goldentouchremodeling.com/projects/${s.invoice.project.id}/invoices/${s.invoice.id}`
             : "https://probuild.goldentouchremodeling.com/invoices";

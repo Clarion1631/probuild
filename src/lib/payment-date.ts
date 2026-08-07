@@ -58,3 +58,53 @@ export function isBackdatedPayment(
     }
     return todayDayNumber(now) - paymentDay > BACKDATED_RECEIPT_CUTOFF_DAYS;
 }
+
+const DEFAULT_DAY_OPTS: Intl.DateTimeFormatOptions = { year: "numeric", month: "short", day: "numeric" };
+
+/**
+ * True when the value carries no time-of-day (exactly 00:00:00.000 UTC) — i.e. it is a
+ * stored calendar day, not an instant. Manual payments (parsePaymentDateInput → local
+ * midnight, UTC on Vercel) land here; Stripe/QuickBooks writes, which store real
+ * instants in the same column, do not.
+ */
+export function isDateOnly(d: Date): boolean {
+    return d.getUTCHours() === 0 && d.getUTCMinutes() === 0
+        && d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0;
+}
+
+/**
+ * Render a money-record date for display. Calendar-day values (no time-of-day) render
+ * via UTC fields so the picked day survives in any viewer timezone; real instants render
+ * in the viewer's local zone. Display-only — never use for math, filtering, or sorting.
+ */
+export function formatMoneyDate(
+    value: Date | string | null | undefined,
+    opts: Intl.DateTimeFormatOptions = DEFAULT_DAY_OPTS,
+    locale?: string,
+): string {
+    if (!value) return "";
+    const d = typeof value === "string" ? new Date(value) : value;
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString(locale, isDateOnly(d) ? { ...opts, timeZone: "UTC" } : opts);
+}
+
+/** Same rule, for a month/year grouping label. */
+export function formatMoneyMonth(value: Date, locale = "en-US"): string {
+    const opts: Intl.DateTimeFormatOptions = { month: "long", year: "numeric" };
+    return value.toLocaleString(locale, isDateOnly(value) ? { ...opts, timeZone: "UTC" } : opts);
+}
+
+/** Month bucket key "YYYY-MM" under the same rule — must agree with formatMoneyMonth. */
+export function formatMoneyMonthKey(value: Date): string {
+    const y = isDateOnly(value) ? value.getUTCFullYear() : value.getFullYear();
+    const m = isDateOnly(value) ? value.getUTCMonth() : value.getMonth();
+    return `${y}-${String(m + 1).padStart(2, "0")}`;
+}
+
+/** "YYYY-MM-DD" for CSV export, same rule. */
+export function formatMoneyDateISO(value: Date): string {
+    const y = isDateOnly(value) ? value.getUTCFullYear() : value.getFullYear();
+    const m = isDateOnly(value) ? value.getUTCMonth() : value.getMonth();
+    const d = isDateOnly(value) ? value.getUTCDate() : value.getDate();
+    return `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
