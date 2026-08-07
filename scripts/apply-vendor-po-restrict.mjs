@@ -57,17 +57,19 @@ const FIND_FK = `
      WHERE c.contype = 'f'
        AND n.nspname = 'public' AND t.relname = 'PurchaseOrder'
        AND fn.nspname = 'public' AND f.relname = 'Vendor'
-       AND (SELECT array_agg(a.attname ORDER BY a.attname)
+       -- attname is of type name, not text — cast explicitly or the comparison
+       -- fails with 42883 "operator does not exist: name[] = text[]".
+       AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
               FROM unnest(c.conkey) AS k(attnum)
               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum)
-           = ARRAY['vendorId']
+           = ARRAY['vendorId']::text[]
        -- confkey too, not just conkey: without this, schema drift could match an
        -- FK pointing at some other unique Vendor column, which the rebuild below
        -- would then silently repoint at Vendor.id.
-       AND (SELECT array_agg(a.attname ORDER BY a.attname)
+       AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
               FROM unnest(c.confkey) AS k(attnum)
               JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum)
-           = ARRAY['id'];
+           = ARRAY['id']::text[];
 `;
 
 // pg_constraint stores the actions as single chars, not words.
