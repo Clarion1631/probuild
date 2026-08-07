@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
+import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 
 export const dynamic = 'force-dynamic';
 
@@ -52,6 +53,9 @@ export default async function VarianceReportPage() {
                     
                     for (const estimate of project.estimates) {
                         for (const item of estimate.items) {
+                            // Section headers roll up their children's totals — counting them
+                            // here would double the budget for every sectioned estimate.
+                            if (isEstimateSectionRow(item, estimate.items)) continue;
                             const ccId = item.costCodeId || '__uncategorized';
                             if (!costCodeBudgets[ccId]) {
                                 costCodeBudgets[ccId] = {
