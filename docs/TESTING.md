@@ -35,6 +35,15 @@ Three safeguards now exist — keep all three intact:
    `isE2eStorageMockEnabled()` in `src/lib/supabase.ts`), since it fakes
    successful writes and must never engage outside a test environment.
 
+   **QuickBooks is hermetic too (August 2026).** `E2E_QBO_MOCK=1` (same
+   three-condition gate as the storage mock — see `isE2eQboMockEnabled()` in
+   `src/lib/quickbooks-mock.ts`) routes `getFreshQBTokens` /
+   `buildQBPaymentRequest` / `sendQBPaymentCreateRequest` to a deterministic,
+   no-network mock, so `e2e/deposit-ingest.spec.ts`'s QBO-linked cases never
+   call the real Intuit API. `POST /api/payments/deposit-ingest` also needs
+   `DEPOSIT_INGEST_SECRET` set to the value the spec sends as its Bearer
+   token (any value — nothing external depends on it).
+
 2. **`e2e/data.setup.ts` refuses to run against the live DB.**
    It aborts if `DATABASE_URL` (env or `.env`) looks like Supabase, unless
    `ALLOW_PROD_E2E=1` is explicitly set. Local `.env` points at prod, so a
@@ -74,7 +83,10 @@ $env:DIRECT_URL   = "postgresql://postgres:probuild@localhost:5433/postgres"
 $env:PLAYWRIGHT_TEST_SECRET = "any-local-secret"
 $env:E2E_STORAGE_MOCK = "1"     # in-memory storage stub — never the live bucket
 $env:SELECTION_AI_MOCK = "1"    # deterministic AI mocks — no real Anthropic calls
+$env:E2E_QBO_MOCK = "1"         # deterministic QuickBooks mock — no real Intuit calls
+$env:DEPOSIT_INGEST_SECRET = "any-local-secret"   # Bearer auth for /api/payments/deposit-ingest
 npx prisma db push --skip-generate
+node scripts/apply-deposit-ingest-schema.mjs   # DepositIngest's partial reservation index — not expressible in Prisma
 npx playwright test
 ```
 

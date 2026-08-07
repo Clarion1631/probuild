@@ -28,6 +28,7 @@ import {
     getQBPayment,
     deleteQBInvoice,
 } from "./quickbooks";
+import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
 
 export class QBNotConnectedError extends Error {
@@ -39,6 +40,16 @@ export class QBNotConnectedError extends Error {
 
 /** Fresh tokens, persisting the rotated refresh token. Throws QBNotConnectedError. */
 export async function getFreshQBTokens(): Promise<QBTokens> {
+    // E2E_QBO_MOCK (deposit-ingest hermeticity) — see quickbooks-mock.ts. The mock
+    // replaces the NETWORK, not the CONNECTION STATE: with no connected settings row
+    // it still throws QBNotConnectedError, so fail-closed specs (e.g.
+    // milestone-payment-request) keep their "rail is down" premise; specs that need
+    // QuickBooks seed a connected row (see e2e/deposit-ingest.spec.ts beforeAll).
+    if (isE2eQboMockEnabled()) {
+        const qb = await getQBSettings();
+        if (!qb.connected) throw new QBNotConnectedError();
+        return MOCK_QB_TOKENS;
+    }
     const qb = await getQBSettings();
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
@@ -430,14 +441,32 @@ export async function settleProgressBillingPaidCore(
 }
 
 /**
- * Mark a milestone Paid from a QuickBooks settlement. Mirrors the Stripe
- * webhook's claim-then-recalculate transaction so balances never drift.
+ * Settle ONE milestone from a QuickBooks payment: claim it Paid, recompute
+ * the parent invoice, mirror the estimate copy, and enqueue the paid
+ * notification. Mirrors the Stripe webhook's claim-then-recalculate
+ * transaction so balances never drift.
+ *
+ * Exported (not just the hourly sync's private helper) so the deposit-ingest
+ * endpoint (src/app/api/payments/deposit-ingest/route.ts, Phase B1) can
+ * settle a milestone from a deposit-triggered QuickBooks Payment the exact
+ * same way the cron settles one it discovers on its own poll. Claim-once via
+ * `settleMilestonePaidInTx`'s `status: { not: "Paid" }` guard: a caller that
+ * loses the claim (the cron beat it to this schedule, or vice versa) gets
+ * `false` back and must NOT treat that as a generic failure — re-read the
+ * schedule and compare `qbPaymentId`. The same `qbPaymentId` means the OTHER
+ * caller settled it with OUR OWN QuickBooks payment (deposit-ingest raced the
+ * cron's poll of the payment it just created) and this is a success, not a
+ * conflict; a different or absent `qbPaymentId` is a genuine conflict the
+ * caller must route to manual reconciliation.
  */
-async function markMilestonePaidFromQB(
-    paymentScheduleId: string,
-    invoiceId: string,
-    payment: { paidAt: Date; referenceNumber: string | null; qbPaymentId: string | null }
-): Promise<boolean> {
+export async function settleMilestoneFromQBPayment(input: {
+    paymentScheduleId: string;
+    invoiceId: string;
+    qbPaymentId: string | null;
+    paidAt: Date;
+    referenceNumber: string | null;
+}): Promise<boolean> {
+    const { paymentScheduleId, invoiceId, ...payment } = input;
     return withTxRetry(() => prisma.$transaction(async (t) => {
         // Canonical lock order: Estimate → Invoice → schedules. This settle mirrors onto the
         // estimate copy, so read the estimate link (non-locking) and lock Estimate before Invoice,
@@ -464,7 +493,7 @@ async function markMilestonePaidFromQB(
  * drifts from the ProBuild milestone; this brings ProBuild back in line so the
  * books stay truthful before the invoice is (re)sent.
  *
- * Recalc/mirror logic is modeled on `markMilestonePaidFromQB` above — link-first
+ * Recalc/mirror logic is modeled on `settleMilestoneFromQBPayment` above — link-first
  * via `sourceScheduleId`, single-candidate name+amount fallback for pre-link
  * rows, claimed updates that never touch a settled row. Amounts are tax-inclusive
  * so we recompute the invoice/estimate totals from the milestone amounts and
@@ -515,7 +544,7 @@ export async function reconcileMilestoneToQbo(
             return { ok: true, oldAmount, newAmount, invoiceId: schedule.invoiceId, estimateTouched: false };
         }
 
-        // 1) Claimed update of the invoice-side amount — mirrors markMilestonePaidFromQB's
+        // 1) Claimed update of the invoice-side amount — mirrors settleMilestoneFromQBPayment's
         //    pattern so a concurrent settle (QB sync / Stripe) that marks the row Paid
         //    between the read above and this write can't have its amount overwritten.
         const claim = await t.paymentSchedule.updateMany({
@@ -526,7 +555,7 @@ export async function reconcileMilestoneToQbo(
             return { ok: false, error: "Milestone changed status (paid or canceled) — reload and try again." };
         }
 
-        // 2) Recompute the parent invoice (mirror markMilestonePaidFromQB's recalc,
+        // 2) Recompute the parent invoice (mirror settleMilestoneFromQBPayment's recalc,
         //    extended to also move totalAmount since an amount change moves the grand total).
         const invoice = await t.invoice.findUnique({ where: { id: schedule.invoiceId } });
         if (!invoice) return { ok: false, error: "Invoice not found" };
@@ -554,7 +583,7 @@ export async function reconcileMilestoneToQbo(
 
         // 3) Mirror onto the estimate-side copy (link-first via sourceScheduleId,
         //    name + OLD-amount fallback for pre-link rows; only touch an unpaid copy)
-        //    and recompute the estimate, matching markMilestonePaidFromQB's mirror block.
+        //    and recompute the estimate, matching settleMilestoneFromQBPayment's mirror block.
         let estimateTouched = false;
         if (invoice.estimateId) {
             let estCopy: { id: string } | null = null;
@@ -721,7 +750,9 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                     if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
                     referenceNumber = p?.referenceNumber || null;
                 }
-                const recorded = await markMilestonePaidFromQB(schedule.id, schedule.invoiceId, {
+                const recorded = await settleMilestoneFromQBPayment({
+                    paymentScheduleId: schedule.id,
+                    invoiceId: schedule.invoiceId,
                     paidAt,
                     referenceNumber,
                     qbPaymentId: paymentId,
