@@ -50,15 +50,32 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 
 ## Development workflow
 ```
-1. Pick next session from ProbuildTodo.md
-2. Make changes
-3. npm run build          # must pass 0 errors
-4. git push origin main
-5. Schema changed? Run the branch's scripts/apply-*.mjs against prod FIRST (see "Deploying to Vercel")
-6. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
-7. Click through affected pages on prod to verify
-8. Mark items done in ProbuildTodo.md
+1. git fetch origin && git log --oneline HEAD..origin/main   # ALWAYS FIRST — see below
+2. Pick next session from ProbuildTodo.md
+3. Make changes
+4. npm run build          # must pass 0 errors
+5. git push origin main
+6. Schema changed? Run the branch's scripts/apply-*.mjs against prod FIRST (see "Deploying to Vercel")
+7. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+8. Click through affected pages on prod to verify
+9. Mark items done in ProbuildTodo.md
 ```
+
+### Step 1 is not optional — check your base before you start AND before you ship
+Money-path PRs land on this repo several times a day, often from parallel worktree
+sessions working the same files. A branch cut this morning is a stale base by afternoon.
+
+Run the fetch/compare **twice**: once before writing code, and again before opening the PR.
+If `HEAD..origin/main` is non-empty, read those commits (`git show --stat <sha>`) and ask
+whether they already solved your problem or changed its shape — then rebase before continuing.
+
+Watch for parallel sessions on the same files: `gh pr list --json number,title,headRefName`.
+
+Skipping this has already cost real work. On 2026-08-07 a fix removing `purchaseOrderId`
+from `saveEstimate`'s payload was written, Codex-reviewed, and readied for deploy against a
+base five commits stale — the identical fix had already landed hours earlier in #308, whose
+multi-PO redesign also made the companion change (a hard server-side delete guard) actively
+harmful, since #308 had deliberately chosen confirm-plus-undo for PO-linked deletes.
 
 **Error diagnosis (Sentry)**
 ```bash
