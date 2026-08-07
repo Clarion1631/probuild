@@ -1,7 +1,12 @@
 "use client";
 
-/** Round to 2 decimal places to avoid IEEE 754 penny drift in money calculations */
-const rm = (n: number) => Math.round(n * 100) / 100;
+import {
+    computeEstimateItemTotals,
+    computeEstimateSubtotal,
+    normalizeSectionTypes,
+    rm,
+    serializeEstimateItemsForSave,
+} from "@/lib/estimate-item-payload";
 
 /** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
 function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
@@ -381,17 +386,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         const f = { ...fieldsRef.current, ...fieldsOverride };
         const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
 
-        const childTotals = new Map<string, number>();
-        for (const item of srcItems) {
-            if (item.parentId) {
-                childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-            }
-        }
+        const srcTotals = computeEstimateItemTotals(srcItems);
         const mappedItems = srcItems.map((item, index) => {
-            const isSection = !item.parentId && srcItems.some((i: any) => i.parentId === item.id);
-            const computedTotal = isSection
-                ? (childTotals.get(item.id) || 0)
-                : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
+            const computedTotal = srcTotals[index].total;
             return {
                 id: item.id || null,
                 parentId: item.parentId || null,
@@ -452,19 +449,18 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         lastSavedStateRef.current = JSON.stringify(getEstimateSnapshot());
     }, []);
 
-    // Derived: sum of children totals per section header
+    // Derived: rolled-up total per section header, aggregating through nested sections
     const sectionTotals = useMemo(() => {
+        const totals = computeEstimateItemTotals(items);
         const map = new Map<string, number>();
-        for (const item of items) {
-            if (item.parentId) {
-                map.set(item.parentId, (map.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-            }
-        }
+        items.forEach((item, index) => {
+            if (totals[index].isSection && item.id) map.set(item.id, totals[index].total);
+        });
         return map;
     }, [items]);
 
-    // A row is a section header if it has no parentId and at least one child references it
-    const sectionIds = useMemo(() => new Set(items.filter(i => i.parentId).map((i: any) => i.parentId)), [items]);
+    // A row is a section header if it is typed as one or at least one child references it
+    const sectionIds = useMemo(() => new Set(sectionTotals.keys()), [sectionTotals]);
 
     // Auto-expand textarea ref handler
     const autoExpand = useCallback((el: HTMLTextAreaElement | null) => {
@@ -853,12 +849,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             .catch((err) => console.error("[EstimateEditor] Failed to load cost codes:", err));
     }, []);
 
+    // Section flags / rolled-up totals, shared by the subtotal and the margin math below
+    const itemTotals = useMemo(() => computeEstimateItemTotals(items), [items]);
     // Subtotal from leaf items only (sections would double-count)
-    const subtotal = items.reduce((acc, item) => {
-        if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-        if (!items.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-        return acc;
-    }, 0);
+    const subtotal = computeEstimateSubtotal(items);
     const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
     const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
@@ -887,14 +881,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     // Internal margin calculations
     // Base cost from leaf items only (sections would double-count)
-    const totalBaseCost = items.reduce((acc, item) => {
+    const totalBaseCost = items.reduce((acc, item, index) => {
+        if (itemTotals[index].isSection) return acc;
         const rate = (item.budgetRate !== null && item.budgetRate !== undefined && item.budgetRate !== "")
             ? parseFloat(item.budgetRate)
             : (parseFloat(item.baseCost) || 0);
         const qty = item.budgetQuantity ?? (parseFloat(item.quantity) || 0);
-        if (item.parentId) return acc + (qty * rate);
-        if (!items.some((i: any) => i.parentId === item.id)) return acc + (qty * rate);
-        return acc;
+        return acc + (qty * rate);
     }, 0);
     const totalMarkup = subtotal - totalBaseCost;
     const profitMargin = subtotal > 0 ? ((totalMarkup / subtotal) * 100) : 0;
@@ -933,19 +926,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             if (!silent) setIsSaving(true);
             try {
                 // Recompute section header totals from children before saving
-                const childTotals = new Map<string, number>();
-                for (const item of sourceItems) {
-                    if (item.parentId) {
-                        childTotals.set(item.parentId, (childTotals.get(item.parentId) || 0) + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)));
-                    }
-                }
-                const mappedItems = sourceItems.map((item, index) => {
-                    const isSection = !item.parentId && sourceItems.some((i: any) => i.parentId === item.id);
-                    const computedTotal = isSection
-                        ? (childTotals.get(item.id) || 0)
-                        : rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                    return { ...item, order: index, total: computedTotal, ...(isSection ? { unitCost: computedTotal } : {}) };
-                });
+                const mappedItems = serializeEstimateItemsForSave(sourceItems);
                 const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
                     ...schedule,
                     order: index
@@ -954,11 +935,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 // Recompute the sell subtotal/total (and tax) from `sourceItems`/`f` rather than
                 // the render's `total`/`taxRate` consts, which are equally frozen to the stale
                 // render for a caller with a stale closure.
-                const sourceSubtotal = sourceItems.reduce((acc: number, item: any) => {
-                    if (item.parentId) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                    if (!sourceItems.some((i: any) => i.parentId === item.id)) return acc + rm((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0));
-                    return acc;
-                }, 0);
+                const sourceSubtotal = computeEstimateSubtotal(sourceItems);
                 const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
                 const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
                 const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
@@ -984,6 +961,14 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     taxRateName: f.taxExempt ? null : (activeTax?.name || null),
                     taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
                 }, mappedItems);
+
+                // Mirror the section tags we just persisted back into local state. Serialization
+                // is non-mutating, so without this a legacy section (detected only via its
+                // children) stays untagged in memory: delete its last child in this same session
+                // and it bills its mirrored unitCost again, and the next save overwrites the tag
+                // that was just written.
+                setItems(prev => normalizeSectionTypes(prev));
+                itemsRef.current = normalizeSectionTypes(itemsRef.current);
 
                 // Update the last saved state ref to the new state
                 lastSavedStateRef.current = currentSnapshotStr;
@@ -1910,10 +1895,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     async function handleAiAssignPhases() {
-        const eligibleItems = items.filter(item => {
-            const isSection = !item.parentId && items.some((i: any) => i.parentId === item.id);
-            return !isSection;
-        });
+        const eligibleItems = items.filter((_item, index) => !itemTotals[index].isSection);
 
         if (eligibleItems.length === 0) {
             toast.info("No items found to assign phases.");
@@ -2577,7 +2559,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                         <div {...provided.droppableProps} ref={provided.innerRef} className="divide-y divide-slate-100">
                                             {items.map((item, index) => {
                                                 const isSubItem = !!item.parentId;
-                                                const isSection = !item.parentId && sectionIds.has(item.id);
+                                                const isSection = sectionIds.has(item.id);
                                                 // Hide children of collapsed sections
                                                 if (isSubItem && collapsedSections.has(item.parentId)) return null;
                                                 const sectionTotal = isSection ? (sectionTotals.get(item.id) || 0) : 0;
