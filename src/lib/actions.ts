@@ -1549,6 +1549,12 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                         costCode: true,
                         costType: true,
                         purchaseOrder: { include: { vendor: true } },
+                        purchaseOrderLinks: {
+                            orderBy: { createdAt: "asc" },
+                            include: { purchaseOrder: { include: { vendor: true } } },
+                        },
+                        scheduleTask: { select: { id: true, name: true } },
+                        _count: { select: { timeEntries: true, expenses: true } },
                     },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
@@ -1581,6 +1587,15 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                         purchaseOrderId: true,
                         budgetQuantity: true, budgetUnit: true, budgetRate: true,
                         purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
+                        purchaseOrderLinks: {
+                            orderBy: { createdAt: "asc" },
+                            select: {
+                                purchaseOrderId: true,
+                                purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
+                            },
+                        },
+                        scheduleTask: { select: { id: true, name: true } },
+                        _count: { select: { timeEntries: true, expenses: true } },
                     },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
@@ -3076,7 +3091,8 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             parentId: item.parentId || null,
             costCodeId: item.costCodeId || null,
             costTypeId: item.costTypeId || null,
-            purchaseOrderId: item.purchaseOrderId || null,
+            // purchaseOrderId is intentionally NOT set here — links live in
+            // EstimateItemPurchaseOrder and are maintained exclusively by syncLegacyPoLink.
             budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
             budgetUnit: item.budgetUnit || null,
             budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
@@ -9521,43 +9537,91 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     const selectedItems = estimate.items.filter((item: any) => itemIds.includes(item.id));
     if (selectedItems.length === 0) throw new Error("No valid items found");
 
+    // itemIds must exactly match a validated in-estimate selection — never trust the raw
+    // argument for the PO-link step below, or a caller could link cross-estimate/cross-project
+    // items by passing arbitrary ids alongside valid ones.
+    const dedupedItemIds = Array.from(new Set(itemIds));
+    if (dedupedItemIds.length !== selectedItems.length) {
+        throw new Error("Selected items do not match a valid set of items on this estimate");
+    }
+
     const totalAmount = selectedItems.reduce((acc: number, item: any) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
 
-    // Get project PO count for the code
-    const count = await prisma.purchaseOrder.count({ where: { projectId } });
-    const nextNum = (count + 1).toString().padStart(3, '0');
-
-    // Create the PO
-    const newPo = await prisma.purchaseOrder.create({
-        data: {
-            projectId,
-            vendorId,
-            code: `PO-${nextNum}`,
-            status: "Draft",
-            totalAmount,
-            notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
-            memos: "",
-            terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
-            items: {
-                create: selectedItems.map((item: any, idx: number) => {
-                    // Preserve an explicit zero quantity (optional/alternate estimate
-                    // lines are shown at $0) — only a missing/unparseable quantity
-                    // falls back to 1. `|| 1` would reprice a $0 option into the PO.
-                    const parsedQty = parseFloat(item.quantity);
-                    const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
-                    return {
-                        description: item.name + (item.description ? ` - ${item.description}` : ""),
-                        quantity: qty,
-                        unitCost: parseFloat(item.unitCost) || 0,
-                        total: qty * (parseFloat(item.unitCost) || 0),
-                        order: idx,
-                        costCodeId: item.costCodeId,
-                        costTypeId: item.costTypeId
-                    };
-                })
-            }
+    // Create the PO, its PurchaseOrderItems, the PO<->item join rows, and the legacy mirror
+    // resync all inside ONE retried transaction (mirrors quickCreatePOAndLink's fix) — the PO
+    // used to commit in its own transaction before the link step ran separately, so a failure in
+    // the link step left an orphaned, unlinked PO behind, and a retry after the fact created a
+    // second one instead of resuming the first. The attempt loop keeps the same PO-code
+    // collision retry quickCreatePOAndLink uses: a P2002 on the code aborts that attempt's
+    // transaction cleanly (nothing committed), so the next attempt starts clean.
+    let newPo: any;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            newPo = await withTxRetry(() => prisma.$transaction(async (tx) => {
+                // Selected items are pre-validated against the in-estimate selection above —
+                // never the raw itemIds argument.
+                await lockEstimateItemLinks(tx, estimateId, selectedItems.map((item: any) => item.id));
+                const count = await tx.purchaseOrder.count({ where: { projectId } });
+                const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
+                const created = await tx.purchaseOrder.create({
+                    data: {
+                        projectId,
+                        vendorId,
+                        code,
+                        status: "Draft",
+                        totalAmount,
+                        notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
+                        memos: "",
+                        terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
+                        items: {
+                            create: selectedItems.map((item: any, idx: number) => {
+                                // Preserve an explicit zero quantity (optional/alternate estimate
+                                // lines are shown at $0) — only a missing/unparseable quantity
+                                // falls back to 1. `|| 1` would reprice a $0 option into the PO.
+                                const parsedQty = parseFloat(item.quantity);
+                                const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
+                                return {
+                                    description: item.name + (item.description ? ` - ${item.description}` : ""),
+                                    quantity: qty,
+                                    unitCost: parseFloat(item.unitCost) || 0,
+                                    total: qty * (parseFloat(item.unitCost) || 0),
+                                    order: idx,
+                                    costCodeId: item.costCodeId,
+                                    costTypeId: item.costTypeId
+                                };
+                            })
+                        }
+                    }
+                });
+                for (const item of selectedItems) {
+                    await migrateLegacyPoLink(tx, item.id);
+                }
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: selectedItems.map((item: any) => ({ estimateItemId: item.id, purchaseOrderId: created.id })),
+                    skipDuplicates: true,
+                });
+                for (const item of selectedItems) {
+                    await syncLegacyPoLink(tx, item.id);
+                }
+                return created;
+            }));
+            break;
+        } catch (e: any) {
+            // Unique constraint violation on code — retry with the next number. Any other
+            // error (including a deadlock withTxRetry already exhausted its own retries on)
+            // propagates immediately. Check e.meta?.target too, not just e.code, so a P2002 on
+            // some unrelated constraint inside this same transaction doesn't get mistaken for a
+            // code collision and silently retried instead of surfaced.
+            // NOTE: PurchaseOrder.code has no unique constraint in the schema yet (see
+            // prisma/schema.prisma ~1553), so this P2002 branch may never actually fire, and
+            // concurrent creates from different estimates can still produce duplicate codes —
+            // that gap needs its own migration + duplicate-cleanup plan, out of scope here.
+            const target = e?.meta?.target;
+            const isCodeCollision = e?.code === "P2002"
+                && (Array.isArray(target) ? target.includes("code") : typeof target === "string" && target.includes("code"));
+            if (!isCodeCollision || attempt === 4) throw e;
         }
-    });
+    }
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     return newPo;
@@ -9614,7 +9678,56 @@ export async function deletePurchaseOrder(id: string) {
     const po = await prisma.purchaseOrder.findUnique({ where: { id } });
     if (!po) return;
     assertFinancialProjectScope(user, po.projectId);
-    await prisma.purchaseOrder.delete({ where: { id } });
+
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Lock this PurchaseOrder row FIRST, before discovering which items are currently
+        // linked to it. Without this, the "affected" snapshot below is a bare read that races
+        // a concurrent link/quick-create/legacy-migrate: that operation could commit a brand
+        // new join row (or migrate the legacy scalar mirror onto this PO) in the gap between
+        // our snapshot and the delete, so our resync loop — built from the stale, possibly-empty
+        // snapshot — would never touch that item's legacy mirror, leaving it dangling once the
+        // PO it names has been deleted out from under it.
+        //
+        // Every PO-link writer (linkPOToEstimateItem, unlinkPOFromEstimateItem, and
+        // restoreEstimateItemAssociations) locks its target PurchaseOrder id(s) through
+        // lockEstimateItemLinks BEFORE the Estimate/EstimateItem locks — see that function's
+        // doc comment for why PurchaseOrder leads the order. Locking it here, first, keeps this
+        // path consistent with that same order (PurchaseOrder → Estimate → EstimateItem below).
+        await tx.$queryRaw`SELECT id FROM "PurchaseOrder" WHERE id = ${id} FOR UPDATE`;
+
+        // Collect affected items BEFORE the delete cascades their join rows away, so their
+        // legacy scalar mirrors can be resynced even when other links survive (the FK alone
+        // would only null out the mirror for items whose one-and-only link was this PO).
+        const affected = await tx.estimateItemPurchaseOrder.findMany({
+            where: { purchaseOrderId: id },
+            select: { estimateItemId: true },
+        });
+        if (affected.length > 0) {
+            const items = await tx.estimateItem.findMany({
+                where: { id: { in: affected.map((a) => a.estimateItemId) } },
+                select: { id: true, estimateId: true },
+            });
+            // Group by estimate and lock each group in sorted order so this commutes with
+            // every other path's Estimate → sorted-EstimateItem lock order instead of
+            // deadlocking against it. This PO is already locked above — passing it again here
+            // is a harmless re-lock (same transaction already holds it) that keeps every
+            // lockEstimateItemLinks call site symmetric.
+            const byEstimate = new Map<string, string[]>();
+            for (const it of items) {
+                const arr = byEstimate.get(it.estimateId) ?? [];
+                arr.push(it.id);
+                byEstimate.set(it.estimateId, arr);
+            }
+            for (const [estId, itemIds] of Array.from(byEstimate.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+                await lockEstimateItemLinks(tx, estId, itemIds, [id]);
+            }
+        }
+        await tx.purchaseOrder.delete({ where: { id } });
+        for (const link of affected) {
+            await syncLegacyPoLink(tx, link.estimateItemId);
+        }
+    }));
+
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
 }
 
@@ -13219,6 +13332,80 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
     return { success: true, count: itemIds.length }
 }
 
+// Keeps the deprecated EstimateItem.purchaseOrderId mirror pointing at the oldest surviving
+// link (or null) so a rollback to the pre-many-to-many build stays correct. Secondary `id`
+// ordering makes the pick deterministic when two rows share the identical `createdAt` (e.g. a
+// migrated legacy row and a brand-new link inserted in the same transaction both get the same
+// CURRENT_TIMESTAMP from Postgres) — without it, ordering by `createdAt` alone could pick the
+// NEW link as the mirror instead of the original.
+async function syncLegacyPoLink(tx: Prisma.TransactionClient, estimateItemId: string) {
+    const oldest = await tx.estimateItemPurchaseOrder.findFirst({
+        where: { estimateItemId },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        select: { purchaseOrderId: true },
+    });
+    await tx.estimateItem.update({
+        where: { id: estimateItemId },
+        data: { purchaseOrderId: oldest?.purchaseOrderId ?? null },
+    });
+}
+
+// If the item still carries a non-null legacy scalar link with no matching join row (predates
+// the join table, or the backfill hasn't run yet), create that join row first so it isn't
+// silently dropped when a new link is added. Safe to call unconditionally — no-ops otherwise.
+//
+// Uses createMany + skipDuplicates rather than a bare create with a P2002 catch: a unique
+// violation from a bare create aborts the whole surrounding Postgres transaction, so every
+// later statement in the same tx — including syncLegacyPoLink — would fail too, even though
+// "the row already exists" is exactly the no-op case this function exists to handle.
+//
+// Backdates the migrated row to the item's own `createdAt` (not "now") so it is genuinely the
+// oldest link and syncLegacyPoLink's findFirst deterministically picks it as the mirror.
+async function migrateLegacyPoLink(tx: Prisma.TransactionClient, estimateItemId: string) {
+    const item = await tx.estimateItem.findUnique({
+        where: { id: estimateItemId },
+        select: { purchaseOrderId: true, createdAt: true },
+    });
+    if (!item?.purchaseOrderId) return;
+    await tx.estimateItemPurchaseOrder.createMany({
+        data: [{ estimateItemId, purchaseOrderId: item.purchaseOrderId, createdAt: item.createdAt }],
+        skipDuplicates: true,
+    });
+}
+
+// Locks the affected PurchaseOrder row(s), then the parent Estimate, then the affected
+// EstimateItem row(s) FOR UPDATE — all in a stable (sorted) id order within each type — before
+// any read or write of purchaseOrderLinks / the legacy scalar mirror. Every path that mutates
+// PO<->item links takes these same locks in this same order so concurrent link/unlink/backfill
+// operations serialize instead of racing — without it, two concurrent unlinks on the same item
+// can each read the other's uncommitted delete and pick the wrong "oldest surviving link" in
+// syncLegacyPoLink, resurrecting a link the user just removed.
+//
+// PurchaseOrder leads (rather than following Estimate) because deletePurchaseOrder must lock its
+// own PO row before it can even discover which estimate(s)/item(s) are currently linked to it
+// (that discovery is itself a snapshot read racing against concurrent links) — putting
+// PurchaseOrder after Estimate would force deletePurchaseOrder to lock Estimate rows it hasn't
+// identified yet, which isn't possible without re-introducing that race. Every caller that knows
+// its target PurchaseOrder id(s) upfront (link/unlink/restore/delete) passes them here so this
+// stays the one global order; callers creating a brand-new PO (quickCreatePOAndLink,
+// createPurchaseOrderFromEstimate) have no existing row to lock and pass none.
+async function lockEstimateItemLinks(
+    tx: Prisma.TransactionClient,
+    estimateId: string,
+    estimateItemIds: string[],
+    purchaseOrderIds: string[] = [],
+) {
+    const sortedPoIds = Array.from(new Set(purchaseOrderIds)).sort();
+    for (const id of sortedPoIds) {
+        await tx.$queryRaw`SELECT id FROM "PurchaseOrder" WHERE id = ${id} FOR UPDATE`;
+    }
+    await lockMoneyParents(tx, { estimateId });
+    const sortedIds = Array.from(new Set(estimateItemIds)).sort();
+    for (const id of sortedIds) {
+        await tx.$queryRaw`SELECT id FROM "EstimateItem" WHERE id = ${id} FOR UPDATE`;
+    }
+}
+
 export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
     const user = await assertFinancialPermission();
 
@@ -13234,15 +13421,21 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     if (!po) throw new Error("Purchase order not found");
     if (po.projectId !== item.estimate.projectId) throw new Error("PO must belong to the same project");
 
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId },
-    });
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId], [purchaseOrderId]);
+        await migrateLegacyPoLink(tx, estimateItemId);
+        await tx.estimateItemPurchaseOrder.createMany({
+            data: [{ estimateItemId, purchaseOrderId }],
+            skipDuplicates: true,
+        });
+        await syncLegacyPoLink(tx, estimateItemId);
+    }));
+
     revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
     return po;
 }
 
-export async function unlinkPOFromEstimateItem(estimateItemId: string) {
+export async function unlinkPOFromEstimateItem(estimateItemId: string, purchaseOrderId: string) {
     const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
@@ -13252,10 +13445,15 @@ export async function unlinkPOFromEstimateItem(estimateItemId: string) {
     if (!item) throw new Error("Estimate item not found");
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
     assertFinancialProjectScope(user, item.estimate.projectId);
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId: null },
-    });
+
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId], [purchaseOrderId]);
+        await tx.estimateItemPurchaseOrder.deleteMany({
+            where: { estimateItemId, purchaseOrderId },
+        });
+        await syncLegacyPoLink(tx, estimateItemId);
+    }));
+
     if (item?.estimate.projectId) {
         revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
     }
@@ -13274,38 +13472,259 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     const projectId = item.estimate.projectId;
     assertFinancialProjectScope(user, projectId);
 
-    // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count
+    // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count.
+    // Each attempt is its own retried transaction that creates the PO AND its join row AND
+    // resyncs the legacy mirror atomically. A P2002 on the code aborts that attempt's
+    // transaction cleanly (nothing committed) so the next attempt retries clean — the PO was
+    // previously created in a separate transaction from its link, which meant a retry after
+    // the fact left an orphaned, unlinked PO behind and created a second one.
     let po: any;
     for (let attempt = 0; attempt < 5; attempt++) {
-        const count = await prisma.purchaseOrder.count({ where: { projectId } });
-        const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
         try {
-            po = await prisma.purchaseOrder.create({
-                data: {
-                    projectId,
-                    vendorId: data.vendorId,
-                    code,
-                    totalAmount: data.amount,
-                    notes: data.notes || null,
-                    status: "Draft",
-                },
-                include: { vendor: true },
-            });
+            po = await withTxRetry(() => prisma.$transaction(async (tx) => {
+                await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId]);
+                const count = await tx.purchaseOrder.count({ where: { projectId } });
+                const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
+                const created = await tx.purchaseOrder.create({
+                    data: {
+                        projectId,
+                        vendorId: data.vendorId,
+                        code,
+                        totalAmount: data.amount,
+                        notes: data.notes || null,
+                        status: "Draft",
+                    },
+                    include: { vendor: true },
+                });
+                await migrateLegacyPoLink(tx, estimateItemId);
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: [{ estimateItemId, purchaseOrderId: created.id }],
+                    skipDuplicates: true,
+                });
+                await syncLegacyPoLink(tx, estimateItemId);
+                return created;
+            }));
             break;
         } catch (e: any) {
-            // Unique constraint violation on code — retry with next number
-            if (attempt === 4) throw e;
+            // Unique constraint violation on code — retry with the next number. Any other
+            // error (including a deadlock withTxRetry already exhausted its own retries on)
+            // propagates immediately.
+            if (e?.code !== "P2002" || attempt === 4) throw e;
         }
     }
-
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId: po.id },
-    });
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     revalidatePath(`/projects/${projectId}/estimates`);
     return po;
+}
+
+// Result of restoreEstimateItemAssociations — reports exactly what was (and wasn't) restored
+// so the caller can distinguish "nothing left to do" from "nothing happened yet". Two skip
+// reasons are classified separately because they call for opposite caller behavior:
+//   - missing.itemIds is RETRYABLE: the EstimateItem itself doesn't exist yet (e.g. its
+//     row-recreation save hasn't landed, or hasn't happened at all). It may come back on a
+//     later save, so the caller should keep these entries pending and retry.
+//   - missing.purchaseOrderIds / missing.scheduleTaskIds are PERMANENT: the target itself is
+//     gone, out of this estimate's project scope, or (for a ScheduleTask) already owned by a
+//     different EstimateItem. Retrying can never fix these — the caller should drop them.
+export type RestoreEstimateItemAssociationsResult = {
+    restoredLinks: { estimateItemId: string; purchaseOrderId: string }[];
+    restoredScheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+    missing: {
+        itemIds: string[];
+        purchaseOrderIds: string[];
+        scheduleTaskIds: string[];
+    };
+};
+
+// Backs the durable delete-undo (Part B). Re-creates join rows and re-points schedule tasks
+// severed when an estimate item was deleted (both cascade/SetNull at the DB level), and
+// resyncs the legacy scalar mirror. Idempotent — skips ids that no longer exist rather than
+// throwing, so a partial restore (e.g. a PO deleted in the meantime) still succeeds. Reports
+// exactly what it restored vs. skipped (see RestoreEstimateItemAssociationsResult) instead of
+// a bare success — the caller cannot tell "restored everything" from "restored nothing" any
+// other way, and treating both as plain success risks clearing a still-needed retry payload.
+export async function restoreEstimateItemAssociations({
+    estimateId,
+    links,
+    scheduleTasks,
+}: {
+    estimateId: string;
+    links: { estimateItemId: string; purchaseOrderId: string; createdAt?: string | Date }[];
+    scheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+}): Promise<RestoreEstimateItemAssociationsResult> {
+    // This restores TWO independent kinds of association from an undo snapshot: PO<->item
+    // links (financial data) and estimateItemId<->ScheduleTask repoints (schedule data). They
+    // are authorized separately by payload — per permissions.ts, FINANCE has no "schedules"
+    // permission, so a FINANCE user must not be able to repoint ScheduleTask rows just because
+    // they're restoring PO links in the same undo call, and a schedule-only user must not need
+    // financial access just to restore a task link. A payload the caller isn't permitted to
+    // touch throws (rather than being silently skipped) — consistent with every other auth
+    // assertion in this file, and it keeps an undo from ever reporting "done" while quietly
+    // leaving part of the restore undone.
+    const user = await assertActiveStaff();
+
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    if (!estimate.projectId) throw new Error("Purchase orders require a project");
+    const projectId = estimate.projectId;
+
+    if (links.length > 0) {
+        if (!hasPermission(user, "financialReports")) throw new Error("Forbidden: restoring purchase-order links requires financial access");
+        assertFinancialProjectScope(user, projectId);
+    }
+    if (scheduleTasks.length > 0) {
+        if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) {
+            throw new Error("Forbidden: restoring schedule-task links requires schedule access");
+        }
+    }
+
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // PO-item ids are only those referenced by the `links` payload — the financial
+        // permission asserted above authorizes the legacy PO mirror ONLY for these items. An
+        // item that appears solely in `scheduleTasks` is authorized under the schedules
+        // permission and must never reach migrateLegacyPoLink/syncLegacyPoLink below, or a
+        // schedules-only caller could pass a valid EstimateItem id (paired with even a
+        // nonexistent ScheduleTask id) and clobber that item's financial PO link.
+        const poItemIds = new Set(links.map(l => l.estimateItemId));
+        const candidateItemIds = Array.from(new Set([
+            ...links.map(l => l.estimateItemId),
+            ...scheduleTasks.map(s => s.estimateItemId),
+        ]));
+        // Purchase-order ids are known upfront from the undo snapshot, so lock them now too —
+        // PurchaseOrder → Estimate → EstimateItem is the global order every PO-link path obeys
+        // (see lockEstimateItemLinks's doc comment). Lock the full candidate set (PO items AND
+        // schedule-only items) since both are read/written below and must serialize against
+        // concurrent link/delete operations — only the migrate/sync calls further down are
+        // restricted to PO items.
+        await lockEstimateItemLinks(tx, estimateId, candidateItemIds, links.map(l => l.purchaseOrderId));
+
+        const existingItems = candidateItemIds.length
+            ? await tx.estimateItem.findMany({
+                where: { id: { in: candidateItemIds }, estimateId },
+                select: { id: true },
+            })
+            : [];
+        const existingItemIds = new Set(existingItems.map(i => i.id));
+
+        // RETRYABLE: the EstimateItem itself isn't back yet. Collected from both payloads —
+        // an item id can appear in `links`, `scheduleTasks`, or both.
+        const missingItemIds = new Set<string>();
+        for (const l of links) if (!existingItemIds.has(l.estimateItemId)) missingItemIds.add(l.estimateItemId);
+        for (const st of scheduleTasks) if (!existingItemIds.has(st.estimateItemId)) missingItemIds.add(st.estimateItemId);
+
+        // Materialize any pre-existing legacy scalar link into the join table BEFORE creating
+        // the restored links below, so the final syncLegacyPoLink pass sees the full set of
+        // links (legacy + restored) instead of racing its own migration. PO items only.
+        for (const itemId of existingItemIds) {
+            if (poItemIds.has(itemId)) {
+                await migrateLegacyPoLink(tx, itemId);
+            }
+        }
+
+        const validLinks = links.filter(l => existingItemIds.has(l.estimateItemId));
+        const restoredLinks: { estimateItemId: string; purchaseOrderId: string }[] = [];
+        // PERMANENT: the PO itself is gone or out of this project — retrying can't fix it.
+        const missingPurchaseOrderIds = new Set<string>();
+        if (validLinks.length > 0) {
+            // A PO must belong to the SAME project as this estimate — otherwise a caller
+            // authorized for this estimate could pass an id belonging to another project's PO
+            // (or ScheduleTask, below) and have it linked here.
+            const existingPos = await tx.purchaseOrder.findMany({
+                where: { id: { in: validLinks.map(l => l.purchaseOrderId) }, projectId },
+                select: { id: true },
+            });
+            const existingPoIds = new Set(existingPos.map(p => p.id));
+            const linksToCreate = validLinks
+                .filter(l => existingPoIds.has(l.purchaseOrderId))
+                .map(l => ({
+                    estimateItemId: l.estimateItemId,
+                    purchaseOrderId: l.purchaseOrderId,
+                    // Preserve the original link's timestamp when the caller has it (e.g. an
+                    // undo snapshot), so syncLegacyPoLink's oldest-link ordering stays correct
+                    // instead of treating a restored link as brand new.
+                    ...(l.createdAt ? { createdAt: new Date(l.createdAt) } : {}),
+                }));
+            if (linksToCreate.length > 0) {
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: linksToCreate,
+                    skipDuplicates: true,
+                });
+            }
+            for (const l of validLinks) {
+                if (existingPoIds.has(l.purchaseOrderId)) {
+                    restoredLinks.push({ estimateItemId: l.estimateItemId, purchaseOrderId: l.purchaseOrderId });
+                } else {
+                    missingPurchaseOrderIds.add(l.purchaseOrderId);
+                }
+            }
+        }
+
+        if (scheduleTasks.length > 0) {
+            // Schedule-task repointing writes ScheduleTask rows, so it must take the Project
+            // row lock FIRST — the same order lockTaskAssignmentParent establishes for every
+            // other ScheduleTask writer in schedule-core.ts (Project → ScheduleTask; see its
+            // doc comment there). Taking it here — after the PurchaseOrder/Estimate/EstimateItem
+            // locks above, before any ScheduleTask lock below — makes this function's full lock
+            // chain (PurchaseOrder → Estimate → EstimateItem → Project → ScheduleTask) a strict
+            // extension of both established orders, so it can't invert against either family of
+            // writer. (schedule-core.ts itself never acquires a PurchaseOrder, Estimate, or
+            // EstimateItem lock, so there's no reciprocal ordering constraint on that side to
+            // reconcile — no follow-up change to schedule-core.ts is needed for this.)
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        }
+
+        // Sort so two concurrent restores lock ScheduleTask rows in the same global order.
+        const sortedScheduleTasks = [...scheduleTasks].sort((a, b) => a.scheduleTaskId.localeCompare(b.scheduleTaskId));
+        const restoredScheduleTasks: { scheduleTaskId: string; estimateItemId: string }[] = [];
+        // PERMANENT: the ScheduleTask is gone, out of project scope, or owned by a different
+        // item — retrying can't fix any of these (item-missing is tracked separately above).
+        const missingScheduleTaskIds = new Set<string>();
+        for (const st of sortedScheduleTasks) {
+            if (!existingItemIds.has(st.estimateItemId)) continue;
+            const rows = await tx.$queryRaw<{ id: string; projectId: string | null; estimateItemId: string | null }[]>`
+                SELECT id, "projectId", "estimateItemId" FROM "ScheduleTask" WHERE id = ${st.scheduleTaskId} FOR UPDATE
+            `;
+            const task = rows[0];
+            if (!task) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            // Same-project + no-theft guard: a ScheduleTask must belong to this estimate's
+            // project, and must be either unlinked or already pointing at the target item —
+            // never repoint a task that belongs to a different estimate item (schedule-task
+            // theft across items or projects).
+            if (task.projectId !== projectId) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            if (task.estimateItemId && task.estimateItemId !== st.estimateItemId) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            await tx.scheduleTask.update({
+                where: { id: st.scheduleTaskId },
+                data: { estimateItemId: st.estimateItemId },
+            });
+            restoredScheduleTasks.push({ scheduleTaskId: st.scheduleTaskId, estimateItemId: st.estimateItemId });
+        }
+
+        // Resync the legacy mirror only for PO items — never for schedule-only candidates (see
+        // poItemIds above); a schedules-only caller has no financial permission and must not be
+        // able to reach this write.
+        for (const itemId of existingItemIds) {
+            if (poItemIds.has(itemId)) {
+                await syncLegacyPoLink(tx, itemId);
+            }
+        }
+
+        return {
+            restoredLinks,
+            restoredScheduleTasks,
+            missing: {
+                itemIds: Array.from(missingItemIds),
+                purchaseOrderIds: Array.from(missingPurchaseOrderIds),
+                scheduleTaskIds: Array.from(missingScheduleTaskIds),
+            },
+        };
+    }));
+
+    revalidatePath(`/projects/${projectId}/estimates`);
+    return result;
 }
 
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {

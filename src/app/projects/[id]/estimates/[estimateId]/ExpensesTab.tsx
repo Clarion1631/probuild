@@ -6,6 +6,12 @@ import { formatCurrency } from "@/lib/utils";
 import { internalBudget, bufferPercent, bufferColor, bufferBgColor } from "@/lib/budget-math";
 
 export default function ExpensesTab({ estimateId, projectId, items }: { estimateId: string, projectId: string, items: any[] }) {
+    // `items` comes straight from EstimateEditor's live `items` state, which is already
+    // normalized once at load (see normalizeItemPoLinks in EstimateEditor.tsx) and kept
+    // normalized thereafter by the PO-link handlers — do not re-normalize here. Re-running
+    // normalizeItemPoLinks against already-normalized state would resurrect a stale legacy
+    // `item.purchaseOrder` scalar (never cleared on unlink) even after purchaseOrderLinks
+    // was emptied by unlinking the last PO, making an intentionally-unlinked PO reappear.
     const [expenses, setExpenses] = useState<any[]>(items.flatMap(item => item.expenses || []));
     const [isUploading, setIsUploading] = useState(false);
     const [uploadError, setUploadError] = useState("");
@@ -182,9 +188,19 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
             budgetRate: item.budgetRate,
             baseCost: item.baseCost,
         });
-        const poAmount = item.purchaseOrder ? Number(item.purchaseOrder.totalAmount) : null;
-        const poCode = item.purchaseOrder?.code || null;
-        const poVendor = item.purchaseOrder?.vendor?.name || null;
+        const poLinks = item.purchaseOrderLinks ?? [];
+        const poAmount = poLinks.length > 0
+            ? poLinks.reduce((sum: number, l: any) => sum + Number(l.purchaseOrder.totalAmount || 0), 0)
+            : null;
+        const poCode = poLinks.length > 0
+            ? poLinks.map((l: any) => l.purchaseOrder.code).join(", ")
+            : null;
+        const poVendor = (() => {
+            if (poLinks.length === 0) return null;
+            const vendorNames = Array.from(new Set(poLinks.map((l: any) => l.purchaseOrder.vendor?.name).filter(Boolean)));
+            if (vendorNames.length === 0) return null;
+            return vendorNames.length === 1 ? vendorNames[0] : `${vendorNames.length} vendors`;
+        })();
 
         acc.push({
             ...item,
@@ -203,6 +219,20 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
     const totalActual = varianceByItem.reduce((sum: number, item: any) => sum + item.actualCost, 0);
     const totalBudget = varianceByItem.reduce((sum: number, item: any) => sum + item.budgetedCost, 0);
     const totalVariance = totalBudget - totalActual;
+
+    // Distinct-PO total for the headline: a PO linked to two line items must count once,
+    // not once per row — summing item.poAmount (per-row display, left as-is) double-counts
+    // any PO shared across items.
+    const distinctPoCommittedTotal = (() => {
+        const seen = new Map<string, number>();
+        for (const item of varianceByItem) {
+            for (const link of item.purchaseOrderLinks ?? []) {
+                const po = link.purchaseOrder;
+                if (po?.id && !seen.has(po.id)) seen.set(po.id, Number(po.totalAmount || 0));
+            }
+        }
+        return Array.from(seen.values()).reduce((sum, v) => sum + v, 0);
+    })();
 
     // Graph Data
     const budgetUtilization = totalBudget > 0 ? (totalActual / totalBudget) * 100 : (totalActual > 0 ? 100 : 0);
@@ -251,7 +281,7 @@ export default function ExpensesTab({ estimateId, projectId, items }: { estimate
                     <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">
                         <p className="text-[11px] uppercase tracking-widest font-bold text-slate-400 mb-1">PO Committed</p>
                         <p className="text-3xl font-extrabold text-slate-800">
-                            {formatCurrency(varianceByItem.reduce((sum: number, item: any) => sum + (item.poAmount || 0), 0))}
+                            {formatCurrency(distinctPoCommittedTotal)}
                         </p>
                     </div>
                     <div className="bg-slate-50 p-6 rounded-xl border border-slate-100">

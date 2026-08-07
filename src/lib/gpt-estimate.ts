@@ -422,6 +422,7 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
                         estimateId: existing.id,
                         OR: [
                             { purchaseOrderId: { not: null } },
+                            { purchaseOrderLinks: { some: {} } },
                             { timeEntries: { some: {} } },
                             { expenses: { some: {} } },
                             { scheduleTask: { isNot: null } },
