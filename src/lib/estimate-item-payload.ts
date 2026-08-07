@@ -192,3 +192,64 @@ export function serializeEstimateItemsForSave<T extends EstimateItemLike>(
         ...(totals[index].isSection ? { type: "Section", unitCost: totals[index].total } : {}),
     }));
 }
+
+/** Parse to a number, falling back only when the value is absent or unparseable — an explicit 0 survives. */
+function numberOr(value: unknown, fallback: number): number {
+    if (value == null || value === "") return fallback;
+    const parsed = typeof value === "number" ? value : parseFloat(String(value));
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Same, for optional columns: absent or unparseable is null, an explicit 0 stays 0. */
+function nullableNumber(value: unknown): number | null {
+    if (value == null || value === "") return null;
+    const parsed = typeof value === "number" ? value : parseFloat(String(value));
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * The exact set of item fields `saveEstimate` persists (everything `toItemData` writes
+ * except `estimateId`). Exported so a test can assert the projection below stays in step.
+ */
+export const ESTIMATE_ITEM_SAVE_FIELDS = [
+    "id", "name", "description", "type", "quantity", "baseCost", "markupPercent",
+    "unitCost", "total", "order", "parentId", "costCodeId", "costTypeId",
+    "budgetQuantity", "budgetUnit", "budgetRate",
+] as const;
+
+/**
+ * Project a row down to exactly what gets written to the database.
+ *
+ * `saveEstimate`'s `toItemData` is this function, and the editor's change-detection
+ * snapshot runs its rows through it too. That shared projection is the point: the snapshot
+ * used to hand-roll a shorter list that omitted baseCost, markupPercent and the budget*
+ * columns, so an edit touching only those fields produced an identical snapshot and the
+ * save early-returned "no changes" — reporting success without ever writing.
+ *
+ * Fallbacks apply only to absent or unparseable values, never to an explicit 0. A zero
+ * margin is real (derivedMarginPct clamps to 0) and a zero budget is real — and for
+ * budgetQuantity, null does not mean zero, it means "fall back to the sell quantity".
+ *
+ * purchaseOrderId is deliberately absent: PO links live in EstimateItemPurchaseOrder and
+ * are maintained exclusively by syncLegacyPoLink.
+ */
+export function normalizeEstimateItemForSave(item: any, fallbackOrder: number) {
+    return {
+        id: item.id,
+        name: item.name,
+        description: item.description || "",
+        type: item.type,
+        quantity: numberOr(item.quantity, 0),
+        baseCost: item.baseCost != null && item.baseCost !== "" ? numberOr(item.baseCost, 0) : null,
+        markupPercent: numberOr(item.markupPercent, 25),
+        unitCost: numberOr(item.unitCost, 0),
+        total: numberOr(item.total, 0),
+        order: item.order ?? fallbackOrder,
+        parentId: item.parentId || null,
+        costCodeId: item.costCodeId || null,
+        costTypeId: item.costTypeId || null,
+        budgetQuantity: nullableNumber(item.budgetQuantity),
+        budgetUnit: item.budgetUnit || null,
+        budgetRate: nullableNumber(item.budgetRate),
+    };
+}
