@@ -1,6 +1,6 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { coLineCents } from "./co-tax";
+import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -74,8 +74,8 @@ function normalizeSchedules(
     });
 }
 
-function itemSubtotalCents(items: Array<{ quantity: number; unitCost: unknown }>): number {
-    return items.reduce((sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)), 0);
+function itemSubtotalCents(items: Array<{ type?: string | null; quantity: number; unitCost: unknown }>): number {
+    return billableCoItems(items).reduce((sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)), 0);
 }
 
 /**
@@ -92,6 +92,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
     return prisma.$transaction(async (tx) => {
         // Serialize editors with send, approval, billing, and co-audit repair.
         const locked = await tx.$queryRaw<Array<{
+            code: string;
             status: string;
             title: string;
             description: string | null;
@@ -105,7 +106,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
         }>>`
-            SELECT "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
+            SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
                    "companySignedBy", "companySignedAt", "companySignatureUrl"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
@@ -192,13 +193,11 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             const existingIds = new Set(existing.map(i => i.id));
             const existingById = new Map(existing.map((item) => [item.id, item]));
 
-            let totalCents = 0;
             const rows = items.map((item, idx) => {
                 const quantity = parseFloat(String(item.quantity ?? "")) || 0;
                 const unitCost = parseFloat(String(item.unitCost ?? "")) || 0;
                 const unitCents = Math.round(unitCost * 100);
                 const lineCents = coLineCents(quantity, unitCost);
-                totalCents += lineCents;
                 // On a row that matches an existing item, an omitted (undefined)
                 // description/costCodeId/costTypeId keeps the stored value —
                 // resolved here, under the same row lock as the write, so a
@@ -206,11 +205,24 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                 // editor always sends explicit values (x || null), so this only
                 // affects connector callers. Empty string / null still clears.
                 const prior = item.id ? existingById.get(item.id) : undefined;
+                // `type` is keep-prior too (the MCP omits it whenever costType is omitted),
+                // and the *effective* type is what decides whether this row is billable. Read
+                // the stored value here or the subtotal computed below would disagree with the
+                // one the send and approval guards recompute after reload — a mismatch those
+                // guards treat as "out of sync with its items", permanently.
+                //
+                // Blank counts as "not specified", not as "clear it": the column is NOT NULL
+                // with a default, so there is nothing to clear it to. Were a blank allowed to
+                // win, an incoming `type: ""` against a stored Section would drop `type` from
+                // both this row (hiding the header from the guard below) and the Prisma write
+                // (leaving Section in the database) — reintroducing the exact mismatch above.
+                const requestedType = typeof item.type === "string" ? item.type.trim() : undefined;
+                const effectiveType = requestedType || prior?.type || undefined;
                 return {
                     id: item.id || undefined,
                     name: item.name || "",
                     description: item.description === undefined ? (prior?.description ?? null) : (item.description || null),
-                    ...(item.type ? { type: item.type } : {}),
+                    ...(effectiveType ? { type: effectiveType } : {}),
                     quantity,
                     unitCost: unitCents / 100,
                     total: lineCents / 100,
@@ -219,6 +231,12 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                     costTypeId: item.costTypeId === undefined ? (prior?.costTypeId ?? null) : (item.costTypeId || null),
                 };
             });
+            // Refuse a section header at the point it would enter the change order, rather
+            // than storing a row every downstream reader then has to second-guess.
+            const sectionRows = coSectionRowNames(rows);
+            if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
+
+            const totalCents = itemSubtotalCents(rows);
             const incomingIds = new Set(rows.map(r => r.id).filter(Boolean));
             const toDelete = existing.filter(i => !incomingIds.has(i.id)).map(i => i.id);
             const itemRowsChanged = rows.length !== existing.length || rows.some((row) => {
@@ -369,8 +387,11 @@ export async function approveChangeOrderCore(
 
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId: id },
-            select: { quantity: true, unitCost: true },
+            select: { name: true, type: true, quantity: true, unitCost: true },
         });
+        // Legacy rows written before section headers were rejected at the write path.
+        const sectionRows = coSectionRowNames(items);
+        if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
         if (current.pricingType !== "COST_PLUS" && items.length === 0) {
             throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
         }

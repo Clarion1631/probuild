@@ -16,7 +16,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { coTaxRate, coTaxLabel, coLineCents } from "./co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
@@ -1550,6 +1550,18 @@ export async function billChangeOrderCore(
         if (co.pricingType === "COST_PLUS") {
             return { ok: false as const, error: `${co.code} is cost plus — use bill_cost_plus_change_order with a through date.` };
         }
+        // Billing invoices the stored totalAmount and never re-derives it from items, so the
+        // send and approval guards do not protect a CO that reached Approved before those
+        // guards existed. Re-check the one condition that makes the stored total untrustworthy
+        // rather than revalidating the whole subtotal — an Approved CO is a signed number, and
+        // failing it on ordinary drift would block legitimate billing.
+        const billItems = await tx.changeOrderItem.findMany({
+            where: { changeOrderId },
+            select: { name: true, type: true },
+        });
+        const sectionRows = coSectionRowNames(billItems);
+        if (sectionRows.length > 0) return { ok: false as const, error: coSectionRowError(co.code, sectionRows) };
+
         const subtotalCents = Math.round(Number(co.totalAmount) * 100);
         if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
         const estimateTax = await tx.estimate.findUnique({
@@ -1874,10 +1886,16 @@ export async function sendChangeOrderToClientCore(
         // bills and locks, and a $0 approved CO can't be repaired.
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId },
-            select: { quantity: true, unitCost: true },
+            select: { name: true, type: true, quantity: true, unitCost: true },
         });
+        // Legacy rows written before section headers were rejected at the write path. A header
+        // mirrors the total of the lines beneath it, so it must never reach a client signature.
+        const sectionRows = coSectionRowNames(items);
+        if (sectionRows.length > 0) {
+            return { kind: "error", error: coSectionRowError(co.code, sectionRows) };
+        }
         const storedSubtotalCents = Math.round(Number(co.totalAmount) * 100);
-        const renderedSubtotalCents = items.reduce(
+        const renderedSubtotalCents = billableCoItems(items).reduce(
             (sum, item) => sum + coLineCents(item.quantity, Number(item.unitCost)),
             0,
         );
@@ -2048,6 +2066,20 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
     const codeMap = new Map(costCodes.map(c => [c.code, c.id]));
     const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
     const warnings: string[] = [];
+
+    // "Section" is refused outright rather than coerced like other unknown types below. A
+    // typo is worth absorbing; a section header is not — it is the rolled-up total of other
+    // lines, so quietly filing it as Material would smuggle a double-count past every guard
+    // that looks for `type === "Section"`, with nothing downstream able to tell afterwards.
+    const sectionTyped = items.filter(item => item.costType?.trim().toLowerCase() === "section");
+    if (sectionTyped.length > 0) {
+        return {
+            ok: false as const,
+            error: `Cost type "Section" is not a change-order line (${sectionTyped.map(i => `"${i.name}"`).join(", ")}). `
+                + `A section header mirrors the total of the lines beneath it, so list those lines instead. `
+                + `Use one of: ${validTypes.join(", ")}.`,
+        };
+    }
 
     // Integer-cents math end to end so float artifacts (e.g. 1.005) can't
     // mis-round a line: unit costs become integer cents, line totals stay in
