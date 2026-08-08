@@ -17,7 +17,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { normalizeEstimateItemForSave } from "./estimate-item-payload";
-import { DEFAULT_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
+import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -13859,7 +13859,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             ? productById.get(asset.assetId.slice(5))
             : undefined;
         const def = getItemDef(asset.assetId);
-        const marginPercent = DEFAULT_MARGIN_PCT;
+        const marginPercent = LEGACY_MARKUP_MARGIN_PCT;
         const name = product?.name ?? def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
