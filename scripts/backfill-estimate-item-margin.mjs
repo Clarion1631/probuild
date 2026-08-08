@@ -24,7 +24,11 @@
 // the true margin is exactly 0 and IS corrected — that is not a loss.
 //
 // SAFE TO RE-RUN: idempotent — once a row's stored markupPercent matches the
-// derived value it drops out of the target set.
+// derived value it drops out of the target set. The predicate compares against
+// the CLAMPED, ROUNDED value, which is what actually gets written; comparing
+// against the raw margin instead meant a row whose true margin exceeds 99 was
+// written as 99, still differed from its raw value, and was rewritten on every
+// run — reported as "differing" forever despite already being correct.
 //
 // Usage:
 //   node scripts/backfill-estimate-item-margin.mjs            # dry run — report only, no writes
@@ -69,7 +73,7 @@ const TARGET_SQL = `
     AND "baseCost" > 0
     AND "unitCost" > 0
     AND "baseCost" <= "unitCost"
-    AND ABS("markupPercent" - (1 - "baseCost"::float8 / "unitCost"::float8) * 100) > 0.01
+    AND ABS("markupPercent" - LEAST(99, GREATEST(0, ROUND(((1 - "baseCost"::float8 / "unitCost"::float8) * 100)::numeric, 2)))::float8) > 0.01
   ORDER BY "id" ASC
 `;
 
@@ -86,6 +90,9 @@ const LOSS_SQL = `
     AND "baseCost" > 0
     AND "unitCost" > 0
     AND "baseCost" > "unitCost"
+    -- Compared against the UNCLAMPED true margin on purpose. These rows are never
+    -- written, so this is a report, not a convergence check: a loss row already
+    -- storing 0 still misrepresents a negative margin and must stay visible.
     AND ABS("markupPercent" - (1 - "baseCost"::float8 / "unitCost"::float8) * 100) > 0.01
   ORDER BY "id" ASC
 `;
@@ -147,7 +154,7 @@ const LOSS_SQL = `
       AND "baseCost" > 0
       AND "unitCost" > 0
       AND "baseCost" <= "unitCost"
-      AND ABS("markupPercent" - (1 - "baseCost"::float8 / "unitCost"::float8) * 100) > 0.01
+      AND ABS("markupPercent" - LEAST(99, GREATEST(0, ROUND(((1 - "baseCost"::float8 / "unitCost"::float8) * 100)::numeric, 2)))::float8) > 0.01
   `);
   console.log(`Updated ${updated} row(s).`);
 })()
