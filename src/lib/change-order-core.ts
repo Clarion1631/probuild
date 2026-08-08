@@ -210,7 +210,14 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
                 // the stored value here or the subtotal computed below would disagree with the
                 // one the send and approval guards recompute after reload — a mismatch those
                 // guards treat as "out of sync with its items", permanently.
-                const effectiveType = item.type ?? prior?.type ?? undefined;
+                //
+                // Blank counts as "not specified", not as "clear it": the column is NOT NULL
+                // with a default, so there is nothing to clear it to. Were a blank allowed to
+                // win, an incoming `type: ""` against a stored Section would drop `type` from
+                // both this row (hiding the header from the guard below) and the Prisma write
+                // (leaving Section in the database) — reintroducing the exact mismatch above.
+                const requestedType = typeof item.type === "string" ? item.type.trim() : undefined;
+                const effectiveType = requestedType || prior?.type || undefined;
                 return {
                     id: item.id || undefined,
                     name: item.name || "",

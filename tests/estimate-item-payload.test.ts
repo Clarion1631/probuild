@@ -578,12 +578,39 @@ test("every money path refuses a change order carrying section headers", () => {
     }
 });
 
+test("a blank type falls back to the stored one rather than erasing it", () => {
+    // `type: ""` against a stored Section must not resolve to "no type": that would hide the
+    // header from the write guard AND leave Section in the database, so the stored total
+    // would count a row the send/approve guards then exclude — permanently out of sync.
+    const core = readFileSync(path.join(__dirname, "..", "src/lib/change-order-core.ts"), "utf8");
+    assert.match(core, /const requestedType = typeof item\.type === "string" \? item\.type\.trim\(\) : undefined;/);
+    assert.match(core, /const effectiveType = requestedType \|\| prior\?\.type \|\| undefined;/);
+});
+
+test("the connector refuses a Section cost type instead of coercing it to Material", () => {
+    // Coercion would smuggle a rolled-up header past every `type === "Section"` guard,
+    // disguised as a billable line nothing downstream could identify.
+    const billing = readFileSync(path.join(__dirname, "..", "src/lib/billing-core.ts"), "utf8");
+    assert.match(billing, /costType\?\.trim\(\)\.toLowerCase\(\) === "section"/);
+    assert.match(billing, /Cost type "Section" is not a change-order line/);
+});
+
+test("the audit reports section rows and refuses to recompute past them", () => {
+    // Recomputing would write back a subtotal excluding the headers while leaving the rows
+    // in place, so a later GET reads "ok" while send and approve stay correctly blocked.
+    const audit = readFileSync(path.join(__dirname, "..", "src/app/api/integrations/co-audit/route.ts"), "utf8");
+    assert.match(audit, /if \(sectionCount > 0\) return "has-sections";/);
+    assert.match(audit, /if \(verdict === "has-sections"\)[\s\S]{0,120}?coSectionRowError\(co\.code, sectionNames\)/);
+    // The section verdict must be decided before the empty and tolerance branches.
+    assert.ok(audit.indexOf('return "has-sections"') < audit.indexOf('return "no-items"'));
+});
+
 test("an omitted type keeps the stored one, so the persisted total stays reproducible", () => {
     // The MCP omits `type` whenever costType is omitted. updateChangeOrderCore must read the
     // prior type before totalling, or the stored subtotal disagrees forever with the one the
     // send and approval guards recompute after reload.
     const core = readFileSync(path.join(__dirname, "..", "src/lib/change-order-core.ts"), "utf8");
-    assert.match(core, /const effectiveType = item\.type \?\? prior\?\.type \?\? undefined;/);
+    assert.match(core, /const effectiveType = requestedType \|\| prior\?\.type \|\| undefined;/);
     assert.match(core, /\.\.\.\(effectiveType \? \{ type: effectiveType \} : \{\}\)/);
 });
 

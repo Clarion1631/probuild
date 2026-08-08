@@ -2067,6 +2067,20 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
     const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
     const warnings: string[] = [];
 
+    // "Section" is refused outright rather than coerced like other unknown types below. A
+    // typo is worth absorbing; a section header is not — it is the rolled-up total of other
+    // lines, so quietly filing it as Material would smuggle a double-count past every guard
+    // that looks for `type === "Section"`, with nothing downstream able to tell afterwards.
+    const sectionTyped = items.filter(item => item.costType?.trim().toLowerCase() === "section");
+    if (sectionTyped.length > 0) {
+        return {
+            ok: false as const,
+            error: `Cost type "Section" is not a change-order line (${sectionTyped.map(i => `"${i.name}"`).join(", ")}). `
+                + `A section header mirrors the total of the lines beneath it, so list those lines instead. `
+                + `Use one of: ${validTypes.join(", ")}.`,
+        };
+    }
+
     // Integer-cents math end to end so float artifacts (e.g. 1.005) can't
     // mis-round a line: unit costs become integer cents, line totals stay in
     // cents, and dollars only reappear at persistence.

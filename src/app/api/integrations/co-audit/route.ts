@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { coTaxRate, coTaxLabel, coItemsSubtotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError } from "@/lib/co-tax";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -46,8 +46,12 @@ const rc = (n: number) => Math.round(n * 100) / 100;
 // row the audit reports as ok can never be mutated by a follow-up POST.
 const OK_TOLERANCE = 0.01;
 
-type Verdict = "ok" | "tax-inflated" | "drift" | "no-items";
-function classify(stored: number, subtotal: number, expectedBilled: number, itemCount: number): Verdict {
+type Verdict = "ok" | "tax-inflated" | "drift" | "no-items" | "has-sections";
+function classify(stored: number, subtotal: number, expectedBilled: number, itemCount: number, sectionCount: number): Verdict {
+    // A section header mirrors the total of the lines beneath it, so no subtotal derived from
+    // these rows is trustworthy — including the one POST would write back. Reported ahead of
+    // every other verdict so the row can never be recomputed to a number nobody can justify.
+    if (sectionCount > 0) return "has-sections";
     if (itemCount === 0) return "no-items";
     if (Math.abs(stored - subtotal) <= OK_TOLERANCE) return "ok";
     if (Math.abs(stored - expectedBilled) <= 0.02) return "tax-inflated";
@@ -65,7 +69,7 @@ export async function GET(req: Request) {
             approvedAt: true, sentAt: true,
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
-            items: { select: { type: true, quantity: true, unitCost: true, total: true } },
+            items: { select: { name: true, type: true, quantity: true, unitCost: true, total: true } },
         },
     });
 
@@ -87,7 +91,8 @@ export async function GET(req: Request) {
         const tax = rc(subtotal * rate);
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
         const inflated = rc(stored - subtotal);
-        const verdict = classify(stored, subtotal, expectedBilled, co.items.length);
+        const sectionNames = coSectionRowNames(co.items);
+        const verdict = classify(stored, subtotal, expectedBilled, co.items.length, sectionNames.length);
 
         const milestones = coMilestones
             .filter(m => m.invoice.projectId === co.project.id && m.name.startsWith(`${co.code} — `))
@@ -107,6 +112,7 @@ export async function GET(req: Request) {
             storedTotalAmount: stored,
             storedBalanceDue: rc(Number(co.balanceDue)),
             itemCount: co.items.length,
+            sectionRowNames: sectionNames,
             itemSubtotal: subtotal,
             storedLineTotalsSum: rc(co.items.reduce((s, i) => s + Number(i.total), 0)),
             taxTreatment: coTaxLabel(co.estimate),
@@ -127,6 +133,7 @@ export async function GET(req: Request) {
             taxInflated: rows.filter(r => r.verdict === "tax-inflated").length,
             drift: rows.filter(r => r.verdict === "drift").length,
             noItems: rows.filter(r => r.verdict === "no-items").length,
+            hasSections: rows.filter(r => r.verdict === "has-sections").length,
         },
         changeOrders: rows,
     });
@@ -166,7 +173,7 @@ export async function POST(req: Request) {
         }
         const items = await tx.changeOrderItem.findMany({
             where: { changeOrderId },
-            select: { type: true, quantity: true, unitCost: true },
+            select: { name: true, type: true, quantity: true, unitCost: true },
         });
         // Re-derive the verdict under the lock — the repair only applies to the
         // tax-inclusive-total bug. A drift row (total matches neither subtotal
@@ -178,7 +185,14 @@ export async function POST(req: Request) {
             select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
         });
         const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(estimateTax)));
-        const verdict = classify(stored, subtotal, expectedBilled, items.length);
+        const sectionNames = coSectionRowNames(items);
+        const verdict = classify(stored, subtotal, expectedBilled, items.length, sectionNames.length);
+        // Not repairable here: writing back a subtotal that excludes the headers would leave
+        // the rows in place and a total nobody can justify, and a later GET would call it
+        // "ok" while send and approve stay correctly blocked. Fix the items, not the total.
+        if (verdict === "has-sections") {
+            return { ok: false as const, error: coSectionRowError(co.code, sectionNames) };
+        }
         if (verdict === "no-items") {
             return { ok: false as const, error: `${co.code} has no line items — nothing to recompute from; review by hand.` };
         }
