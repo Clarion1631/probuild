@@ -329,6 +329,20 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const itemsRef = useRef(items);
     useEffect(() => { itemsRef.current = items; }, [items]);
 
+    // Optimistic-concurrency revision for the whole item collection — a single counter, not
+    // per-item. Kept in a ref rather than component state because it must survive across
+    // renders without itself triggering one, and because a save triggered from a stale render's
+    // closure (see fieldsRef/itemsRef above) must read whatever this session most recently saved
+    // at, not whatever was current when that closure was created. Seeded from the server-loaded
+    // estimate; updated after every successful save (see runSave) from the server's authoritative
+    // itemsRevision. See docs/specs/estimate-item-optimistic-concurrency.md REVISION 2.
+    const itemsRevisionRef = useRef<number>(initialEstimate.itemsRevision ?? 0);
+
+    // Set after a save is rejected for a stale version — suppresses further AUTOsaves (a manual
+    // save may still be attempted, and will fail the same way) so the editor doesn't retry the
+    // doomed payload on a timer. Cleared on reload only (the toast tells the user to reload).
+    const saveConflictRef = useRef(false);
+
     // Mirrors every estimate-level field that runSave persists alongside items (title, tax,
     // notes, payment schedules, etc.) — same reason as itemsRef: a save triggered from a
     // stale render's closure (e.g. the delete-undo toast's onClick, bound at delete time)
@@ -459,8 +473,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }, []);
 
     // AI description suggestion
-    async function suggestDescription(itemIndex: number) {
-        const item = items[itemIndex];
+    async function suggestDescription(itemId: string) {
+        // Capture the id up front, not an index — this awaits a fetch, and a reorder or delete
+        // mid-flight would leave a captured index pointing at the wrong row by the time the
+        // response comes back.
+        const item = items.find((i: any) => i.id === itemId);
         if (!item?.name?.trim() || aiSuggestingDesc === item.id) return;
         setAiSuggestingDesc(item.id);
         try {
@@ -479,7 +496,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             if (res.ok) {
                 const data = await res.json();
                 if (data.description) {
-                    updateItemById(item.id, "description", data.description);
+                    updateItem(itemId, { description: data.description });
                     toast.success("AI description added");
                 }
             }
@@ -491,8 +508,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     // AI sub-item suggestions
-    async function suggestSubitems(parentIndex: number) {
-        const parent = items[parentIndex];
+    async function suggestSubitems(parentId: string) {
+        // Capture id up front (not index), matching suggestDescription — this awaits a fetch.
+        const parent = items.find((i: any) => i.id === parentId);
         if (!parent?.name?.trim() || aiSuggestingSubitems === parent.id) return;
         setAiSuggestingSubitems(parent.id);
         try {
@@ -940,7 +958,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
                 const { activeTax, total: sourceTotal } = computeSellTotals(sourceItems, f);
 
-                await saveEstimate(initialEstimate.id, context.id, context.type, {
+                const saveResult = await saveEstimate(initialEstimate.id, context.id, context.type, {
                     title: f.title, code: f.code, status: f.status, totalAmount: sourceTotal, paymentSchedules: mappedSchedules,
                     processingFeeMarkup: f.processingFeeMarkup, hideProcessingFee: f.hideProcessingFee,
                     expirationDate: f.expirationDate ? new Date(f.expirationDate).toISOString() : null,
@@ -958,7 +976,35 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     taxExempt: f.taxExempt,
                     taxRateName: f.taxExempt ? null : (activeTax?.name || null),
                     taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
+                    itemsRevision: itemsRevisionRef.current,
                 }, mappedItems);
+
+                if (!saveResult?.success) {
+                    // Someone else's save landed on this estimate's item collection since we
+                    // loaded it (an add, delete, update, or wholesale rewrite — the CAS is
+                    // estimate-wide, not per-row). The whole save was rejected server-side
+                    // (nothing partially applied) — do not touch lastSavedStateRef (state stays
+                    // dirty), do not run the pending-association restore below, do not show the
+                    // success toast. Suppress further autosaves (see saveConflictRef) — a manual
+                    // save may still be attempted and will fail the same way. Reloading is the
+                    // only recovery this build offers; the toast says so.
+                    saveConflictRef.current = true;
+                    toast.error(
+                        "This estimate was changed by someone else since you opened it. Your changes were not saved. Reload to get the latest version.",
+                        {
+                            duration: Infinity,
+                            action: { label: "Reload", onClick: () => window.location.reload() },
+                        }
+                    );
+                    const conflictError: any = new Error("Estimate save conflict");
+                    conflictError.isSaveConflict = true;
+                    throw conflictError;
+                }
+
+                // Own this save's revision going forward — set BEFORE lastSavedStateRef so a
+                // second autosave from the same open editor reads the revision this save just
+                // wrote, not the pre-save one (which would conflict against its own write).
+                itemsRevisionRef.current = saveResult.itemsRevision;
 
                 // Mirror the section tags we just persisted back into local state. Serialization
                 // is non-mutating, so without this a legacy section (detected only via its
@@ -972,7 +1018,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 lastSavedStateRef.current = currentSnapshotStr;
             } catch (e: any) {
                 console.error("[EstimateEditor] Failed to save estimate:", e);
-                if (!silent) {
+                // The conflict toast above already said it better than the generic failure toast.
+                if (!silent && !e?.isSaveConflict) {
                     toast.error(e?.message || "Failed to save estimate. Please try again.");
                 }
                 throw e;
@@ -1560,27 +1607,27 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     /**
-     * Must use the functional setState form: several callers (BudgetStrip's rate and margin
-     * inputs) fire two or three updateItem calls from one event. Building from the
-     * render-closure `items` made each call overwrite the previous, so a rate edit persisted
-     * only markupPercent and a margin edit only baseCost — the rest were silently dropped.
+     * Keyed by stable item id (not index) + a patch object. Several callers (BudgetStrip's rate
+     * and margin inputs) fire two or three field updates from one event — the patch object is
+     * what makes that safe: building each field update from the render-closure `items` made
+     * each call overwrite the previous, so a rate edit persisted only markupPercent and a margin
+     * edit only baseCost, with the rest silently dropped.
+     *
+     * id-keying (not index) is also what survives reorder/delete mid-flight: callers that
+     * resolve their row BEFORE an await (AI description fill, approve/reject) can have rows
+     * reordered, added or deleted while the request is in flight, so a position captured
+     * beforehand may point at a different row — or past the end — by the time the updater runs.
+     * Matching on id is stable across all of those, matching applyPoLinkChange's reasoning.
+     *
+     * Functional updater + in-updater itemsRef sync so a save queued right behind this one sees
+     * the change immediately, not on the next render's effect.
      */
-    function updateItem(index: number, field: string, value: any) {
+    function updateItem(itemId: string, patch: Record<string, any>) {
         setItems(prev => {
-            const newItems = [...prev];
-            newItems[index] = { ...newItems[index], [field]: value };
-            return newItems;
+            const next = prev.map(it => (it.id === itemId ? { ...it, ...patch } : it));
+            itemsRef.current = next;
+            return next;
         });
-    }
-
-    /**
-     * Index-free variant for callers that resolve their row BEFORE an await (AI description
-     * fill, approve/reject). Rows can be reordered, added or deleted while the request is in
-     * flight, so a position captured beforehand may point at a different row — or past the
-     * end — by the time the updater runs. Matching on id is stable across all of those.
-     */
-    function updateItemById(itemId: string, field: string, value: any) {
-        setItems(prev => prev.map(item => item.id === itemId ? { ...item, [field]: value } : item));
     }
 
     // Re-inserts each removed row at its original index, for the case where other edits
@@ -2095,7 +2142,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving && !saveConflictRef.current) {
                     handleSave();
                 }
             }}
@@ -2628,7 +2675,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         />
                                                                     </div>
                                                                     <div className="flex-1 flex flex-col">
-                                                                        <input type="text" value={item.name} onChange={e => updateItem(index, "name", e.target.value)}
+                                                                        <input type="text" value={item.name} onChange={e => updateItem(item.id, { name: e.target.value })}
                                                                             placeholder="Category name"
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-0.5 font-semibold text-sm text-hui-textMain"
                                                                         />
@@ -2678,7 +2725,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     <input
                                                                         type="text"
                                                                         value={item.name}
-                                                                        onChange={e => updateItem(index, "name", e.target.value)}
+                                                                        onChange={e => updateItem(item.id, { name: e.target.value })}
                                                                         placeholder="Item name"
                                                                         className={`flex-1 min-w-0 bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-hui-border rounded px-2 py-1 transition text-sm ${isSubItem ? 'text-hui-textMuted' : 'font-medium text-hui-textMain'}`}
                                                                     />
@@ -2686,7 +2733,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         <input
                                                                             type="number"
                                                                             value={item.quantity}
-                                                                            onChange={e => updateItem(index, "quantity", e.target.value)}
+                                                                            onChange={e => updateItem(item.id, { quantity: e.target.value })}
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                                         />
                                                                     </div>
@@ -2696,7 +2743,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         <input
                                                                             type="number"
                                                                             value={item.unitCost}
-                                                                            onChange={e => updateItem(index, "unitCost", e.target.value)}
+                                                                            onChange={e => updateItem(item.id, { unitCost: e.target.value })}
                                                                             readOnly={isLocked}
                                                                             aria-label="Unit cost"
                                                                             className={`w-20 focus:outline-none rounded px-1 py-1 text-right transition text-sm font-medium ${isLocked ? "bg-transparent text-slate-400 cursor-default" : "bg-transparent focus:bg-white focus:ring-1 ring-slate-200 hover:bg-slate-50 text-slate-700"}`}
@@ -2708,21 +2755,21 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     </div>
                                                                     <div className="w-24 flex items-center justify-end gap-0.5 flex-shrink-0">
                                                                         {item.approvalStatus === "approved" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-50 text-green-700 border border-green-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(item.id, { approvalStatus: null }); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 Approved
                                                                             </span>
                                                                         ) : item.approvalStatus === "rejected" ? (
-                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItemById(item.id, "approvalStatus", null); }}>
+                                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-700 border border-red-200 cursor-pointer" onClick={async () => { await updateItemApproval(item.id, null); updateItem(item.id, { approvalStatus: null }); }}>
                                                                                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 Rejected
                                                                             </span>
                                                                         ) : (
                                                                             <span className="opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition flex gap-0.5 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItemById(item.id, "approvalStatus", "approved"); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "approved"); updateItem(item.id, { approvalStatus: "approved" }); toast.success("Item approved"); }} className="p-1 rounded hover:bg-green-50 text-slate-400 hover:text-green-600 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Approve">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
                                                                                 </button>
-                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItemById(item.id, "approvalStatus", "rejected"); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
+                                                                                <button onClick={async () => { await updateItemApproval(item.id, "rejected"); updateItem(item.id, { approvalStatus: "rejected" }); toast.success("Item rejected"); }} className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-500 transition focus-visible:opacity-100 focus-visible:pointer-events-auto" title="Reject">
                                                                                     <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                                                                                 </button>
                                                                             </span>
@@ -2739,7 +2786,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                             ref={el => autoExpand(el)}
                                                                             value={item.description || ""}
                                                                             onChange={e => {
-                                                                                updateItem(index, "description", e.target.value);
+                                                                                updateItem(item.id, { description: e.target.value });
                                                                                 autoExpand(e.target);
                                                                             }}
                                                                             onInput={e => autoExpand(e.target as HTMLTextAreaElement)}
@@ -2749,7 +2796,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         />
                                                                         {item.name?.trim() && (
                                                                             <button
-                                                                                onClick={() => suggestDescription(index)}
+                                                                                onClick={() => suggestDescription(item.id)}
                                                                                 disabled={aiSuggestingDesc === item.id}
                                                                                 title="AI: suggest description"
                                                                                 className="flex-shrink-0 mt-0.5 p-0.5 rounded text-amber-400 hover:text-amber-600 hover:bg-amber-50 transition disabled:opacity-50 disabled:animate-pulse opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto"
@@ -2762,7 +2809,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                         <select
                                                                             value={item.costCodeId || ""}
-                                                                            onChange={e => updateItem(index, "costCodeId", e.target.value || null)}
+                                                                            onChange={e => updateItem(item.id, { costCodeId: e.target.value || null })}
                                                                             className="bg-slate-100 hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-hui-textMuted text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition"
                                                                         >
                                                                             <option value="">Phase</option>
@@ -2807,7 +2854,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         )}
                                                                         {!isSubItem && item.name?.trim() && (
                                                                             <button
-                                                                                onClick={() => suggestSubitems(index)}
+                                                                                onClick={() => suggestSubitems(item.id)}
                                                                                 disabled={aiSuggestingSubitems === item.id}
                                                                                 className="text-[10px] text-amber-500 hover:text-amber-700 font-medium flex items-center gap-0.5 disabled:opacity-50 disabled:animate-pulse"
                                                                             >
@@ -2887,7 +2934,6 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                             {viewMode === "internal" && !isSection && (
                                                                 <BudgetStrip
                                                                     item={item}
-                                                                    index={index}
                                                                     updateItem={updateItem}
                                                                     contextType={context.type}
                                                                     onLinkPO={handleLinkPO}

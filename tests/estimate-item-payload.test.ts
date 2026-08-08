@@ -462,14 +462,16 @@ test("PO links are not part of the save projection", () => {
 });
 
 test("saveEstimate and the editor both go through the shared projection", () => {
-    // Guards the drift this module exists to prevent.
+    // Guards the drift this module exists to prevent. saveEstimate's item-upsert loop lives in
+    // src/lib/estimate-item-upsert.ts (upsertEstimateItems), not inline in actions.ts — but it
+    // must still call the shared projection rather than carrying its own copy of the field list.
     const root = path.join(__dirname, "..");
-    const actions = readFileSync(path.join(root, "src/lib/actions.ts"), "utf8");
-    assert.match(actions, /normalizeEstimateItemForSave\(item, fallbackOrder\)/);
+    const upsert = readFileSync(path.join(root, "src/lib/estimate-item-upsert.ts"), "utf8");
+    assert.match(upsert, /normalizeEstimateItemForSave\(item, idx\)/);
     const editor = readFileSync(path.join(root, "src/app/projects/[id]/estimates/[estimateId]/EstimateEditor.tsx"), "utf8");
     assert.match(editor, /normalizeEstimateItemForSave\(item, index\)/);
     // and updateItem must stay on the functional setState form
-    const body = editor.slice(editor.indexOf("function updateItem(index: number"));
+    const body = editor.slice(editor.indexOf("function updateItem(itemId: string"));
     const fn = body.slice(0, body.indexOf("\n    }") + 6);
     assert.match(fn, /setItems\(prev =>/);
     assert.doesNotMatch(fn, /\[\.\.\.items\]/);

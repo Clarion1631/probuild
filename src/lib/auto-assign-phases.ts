@@ -197,6 +197,13 @@ async function runAutoAssignPhasesForEstimate(estimateId: string): Promise<void>
     // it), and one item that's since been deleted/changed just no-ops instead of
     // rolling back every other assignment.
     const nameAtClassification = new Map(uncoded.map((i) => [i.id, i.name]));
+    // Deliberately does NOT bump Estimate.itemsRevision. This runs from after() on every
+    // saveEstimate, so bumping here would wedge the editor into a permanent conflict loop:
+    // save → after() bumps the revision → the very next save (even from the same tab)
+    // conflicts against a revision the editor never saw. It can still silently overwrite a
+    // stale costCodeId from a stale editor session losing this race — pre-existing behavior,
+    // unchanged by the itemsRevision work; see docs/specs/estimate-item-optimistic-concurrency.md
+    // REVISION 2, "Deliberate non-goals".
     const results = await Promise.allSettled(
       toApply.map((a) =>
         prisma.estimateItem.updateMany({
