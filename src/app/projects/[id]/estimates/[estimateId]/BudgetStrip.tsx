@@ -3,8 +3,9 @@
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
 import {
-    internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin, derivedMarginPct,
-    normalizeMarginInput, formatDerivedRate, DEFAULT_MARGIN_PCT, MAX_MARGIN_PCT,
+    internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin,
+    normalizeMarginInput, formatDerivedRate, marginPatchForRate, marginIsUnrepresentable,
+    marginIsStale, rawMarginPct, DEFAULT_MARGIN_PCT, MAX_MARGIN_PCT,
 } from "@/lib/budget-math";
 
 const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"];
@@ -46,8 +47,37 @@ export default function BudgetStrip({
     const isPoLocked = links.length > 0;
     const sellPrice = parseFloat(item.unitCost) || 0;
 
+    // The rate is whatever the user typed — we never rewrite it to make the margin true. When the
+    // pair can't be expressed as a storable margin, say so on the row instead of letting the
+    // clamped markupPercent quietly claim otherwise.
+    // `|| 0` would fold an unparseable stored rate into the exempt "no budget" value and hide it.
+    // Blank is genuinely no budget; anything else keeps whatever it parses to, NaN included.
+    const rateText = budgetRateVal == null ? "" : String(budgetRateVal).trim();
+    const currentRate = rateText === "" ? 0 : parseFloat(rateText);
+    const storedMargin = item.markupPercent == null ? null : parseFloat(item.markupPercent);
+    const unrepresentable = marginIsUnrepresentable(currentRate, sellPrice);
+    // A stale margin is one this editor can no longer create — it flags rows saved before the
+    // sell-price input started re-deriving. Editing either side of the row repairs it.
+    const stale = !unrepresentable && marginIsStale(storedMargin, currentRate, sellPrice);
+    const marginLies = unrepresentable || stale;
+    const marginWarning = !marginLies
+        ? null
+        : stale
+            ? `Saved margin (${storedMargin!.toFixed(2)}%) doesn't match this cost — ${formatCurrency(currentRate)} against ${formatCurrency(sellPrice)} is ${rawMarginPct(currentRate, sellPrice)!.toFixed(2)}%. Re-enter the rate or the margin to fix it.`
+            : currentRate < 0 || !Number.isFinite(currentRate)
+                ? "Budget cost isn't a valid amount — the margin can't be derived from it."
+                // Guard non-finite BEFORE the comparison branches: against an Infinity sell price
+                // both `<= 0` and `currentRate > sellPrice` read false, which used to fall through
+                // to the "under 1% of sell price" message.
+                : !Number.isFinite(sellPrice) || sellPrice <= 0
+                    ? "Budget cost is set but this line has no valid sell price — the margin below is meaningless."
+                    : currentRate > sellPrice
+                        ? `Cost exceeds sell price — this line loses ${formatCurrency(currentRate - sellPrice)}/unit. Margin can't go below 0%.`
+                        : `Cost is under 1% of the sell price — margin is capped at ${MAX_MARGIN_PCT}%.`;
+
     return (
-        <div className="flex items-center gap-3 px-4 py-2 ml-14 mr-2 mb-1 rounded-lg bg-indigo-50/60 border-l-3 border-indigo-300 text-xs">
+        <div className={`ml-14 mr-2 mb-1 rounded-lg bg-indigo-50/60 border-l-3 text-xs ${marginWarning ? "border-red-400" : "border-indigo-300"}`}>
+        <div className="flex items-center gap-3 px-4 py-2">
             {/* PO lock indicator — budget is committed, AI/Reset will skip this row */}
             {isPoLocked && (
                 <span
@@ -106,16 +136,23 @@ export default function BudgetStrip({
                         onChange={e => {
                             // Budget-side edit: update budget fields only. Customer price (unitCost)
                             // is the source of truth — we derive margin from it, never the reverse.
+                            // The rate is persisted EXACTLY as typed — clamping it here would
+                            // silently rewrite a cost the user entered. The margin always follows
+                            // the rate (marginPatchForRate), and when the pair can't be expressed
+                            // as a margin the row warns instead. Previously the `r > 0 && price > 0`
+                            // guard skipped the margin write entirely, stranding the old margin
+                            // next to a rate that no longer implied it.
                             const val = e.target.value === "" ? null : e.target.value;
                             const r = parseFloat(e.target.value) || 0;
                             const price = parseFloat(item.unitCost) || 0;
                             updateItem(item.id, {
                                 budgetRate: val,
                                 baseCost: r > 0 ? val : null,
-                                ...(r > 0 && price > 0 ? { markupPercent: derivedMarginPct(r, price).toFixed(2) } : {}),
+                                ...marginPatchForRate(r, price),
                             });
                         }}
-                        className="w-20 bg-white border border-indigo-200 rounded pl-4 pr-1.5 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none"
+                        aria-invalid={marginLies || undefined}
+                        className={`w-20 bg-white border rounded pl-4 pr-1.5 py-1 text-right text-xs focus:ring-1 focus:outline-none ${marginLies ? "border-red-400 ring-red-400" : "border-indigo-200 ring-indigo-400"}`}
                         placeholder="Rate"
                         step="any"
                     />
@@ -230,6 +267,19 @@ export default function BudgetStrip({
                     </div>
                 )}
             </div>
+        </div>
+
+            {/* Cost/sell incoherence. Shown, never silently corrected — the rate is a number the
+                user typed, and markupPercent floors at 0, so this row's stored margin does not
+                describe its stored cost. Plain text, not a tooltip: hover is unreliable here. */}
+            {marginWarning && (
+                <div role="alert" className="flex items-start gap-1.5 px-4 pb-2 -mt-0.5 text-[11px] font-medium text-red-600">
+                    <svg className="w-3.5 h-3.5 flex-shrink-0 mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                    </svg>
+                    <span>{marginWarning}</span>
+                </div>
+            )}
         </div>
     );
 }
