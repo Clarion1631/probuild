@@ -13,7 +13,7 @@ import {
     selectedBillableRows,
 } from "../src/lib/estimate-item-payload";
 import { buildQBEstimateLines } from "../src/lib/quickbooks";
-import { billableCoItems, coItemsSubtotal, coSectionRowNames } from "../src/lib/co-tax";
+import { billableCoItems, classifyCoTotal, coItemsSubtotal, coSectionRowNames } from "../src/lib/co-tax";
 
 type Row = {
     id: string;
@@ -601,10 +601,70 @@ test("the audit reports section rows and refuses to recompute past them", () => 
     // Recomputing would write back a subtotal excluding the headers while leaving the rows
     // in place, so a later GET reads "ok" while send and approve stay correctly blocked.
     const audit = readFileSync(path.join(__dirname, "..", "src/app/api/integrations/co-audit/route.ts"), "utf8");
-    assert.match(audit, /if \(sectionCount > 0\) return "has-sections";/);
     assert.match(audit, /if \(verdict === "has-sections"\)[\s\S]{0,120}?coSectionRowError\(co\.code, sectionNames\)/);
-    // The section verdict must be decided before the empty and tolerance branches.
-    assert.ok(audit.indexOf('return "has-sections"') < audit.indexOf('return "no-items"'));
+    // The section verdict must be decided before the empty and equality branches.
+    assert.equal(classifyCoTotal(100, 100, 108.8, 3, 1), "has-sections");
+    assert.equal(classifyCoTotal(100, 100, 108.8, 0, 1), "has-sections");
+});
+
+test("the audit's ok verdict is cents-exact, matching the send and approve guards", () => {
+    // Both guards compare `storedSubtotalCents !== renderedSubtotalCents` with no tolerance.
+    // While the audit tolerated a cent, a one-cent row was reported "ok", refused by the
+    // repair POST as already-correct, and hard-blocked from send and approve forever.
+    assert.equal(classifyCoTotal(1000, 1000, 1088, 4, 0), "ok");
+    assert.equal(classifyCoTotal(1000.01, 1000, 1088, 4, 0), "drift");
+    assert.equal(classifyCoTotal(999.99, 1000, 1088, 4, 0), "drift");
+    // Float dust must not decide the verdict: 0.1 + 0.2 stored against a 0.30 subtotal.
+    assert.equal(classifyCoTotal(0.1 + 0.2, 0.3, 0.33, 2, 0), "ok");
+});
+
+test("the audit still diagnoses the tax-inclusive totals it exists to repair", () => {
+    // The legacy editor wrote subtotal * (1 + rate) in one multiply, which lands at most one
+    // cent above the guards' round(subtotal) + round(subtotal * rate). One cent of slack, and
+    // only upward — the single multiply is never the smaller of the two.
+    assert.equal(classifyCoTotal(1088, 1000, 1088, 4, 0), "tax-inflated");
+    assert.equal(classifyCoTotal(1088.01, 1000, 1088, 4, 0), "tax-inflated");
+    assert.equal(classifyCoTotal(1088.02, 1000, 1088, 4, 0), "drift");
+});
+
+test("the tax-inflated slack cannot swallow a value below the subtotal", () => {
+    // A near-zero rate puts expectedBilled a cent above the subtotal, so a symmetric window
+    // would have let $999.99 — which no tax-inclusive formula can produce — auto-repair
+    // without the confirmation a drift row requires.
+    assert.equal(classifyCoTotal(999.99, 1000, 1000.01, 4, 0), "drift");
+    assert.equal(classifyCoTotal(1000.01, 1000, 1000.01, 4, 0), "tax-inflated");
+    // Nor a cent BELOW expectedBilled: the single multiply is never the smaller of the two,
+    // so $1087.99 against a $1088.00 expectation is not the legacy bug and needs force.
+    assert.equal(classifyCoTotal(1087.99, 1000, 1088, 4, 0), "drift");
+});
+
+test("a stray cent on a tax-exempt CO is drift, not a mislabelled tax inflation", () => {
+    // With no tax, expectedBilled *is* the subtotal, so the tax-inflated slack would otherwise
+    // swallow every rounding drift and auto-repair it without the human confirmation drift needs.
+    assert.equal(classifyCoTotal(1000.01, 1000, 1000, 4, 0), "drift");
+    assert.equal(classifyCoTotal(1000, 1000, 1000, 4, 0), "ok");
+});
+
+test("an item-less CO is never classified from an empty subtotal", () => {
+    assert.equal(classifyCoTotal(1000, 0, 0, 0, 0), "no-items");
+});
+
+test("a cost-plus CO is reported, never scored against its item subtotal", () => {
+    // Both guards skip the subtotal comparison for COST_PLUS, so its total legitimately
+    // differs from the items. Resetting it to the subtotal would destroy a real number.
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 0, "COST_PLUS"), "cost-plus");
+    assert.equal(classifyCoTotal(5000, 0, 0, 0, 0, "COST_PLUS"), "cost-plus");
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 0, "FIXED"), "drift");
+    // Corrupt section rows still outrank it — every money path refuses those first.
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 1, "COST_PLUS"), "has-sections");
+});
+
+test("a nonpositive total is unpriced, not ok — the guards reject it either way", () => {
+    // storedCents <= 0 || renderedCents <= 0 is its own rejection in both guards, so equality
+    // at zero is an "ok" that still cannot send, and writing the subtotal back fixes nothing.
+    assert.equal(classifyCoTotal(0, 0, 0, 3, 0), "unpriced");
+    assert.equal(classifyCoTotal(-50, -50, -50, 3, 0), "unpriced");
+    assert.equal(classifyCoTotal(1000, 0, 0, 3, 0), "unpriced");
 });
 
 test("an omitted type keeps the stored one, so the persisted total stays reproducible", () => {

@@ -79,6 +79,75 @@ export function coItemsSubtotal(items: Array<{ type?: string | null; quantity?: 
     ), 0) / 100;
 }
 
+export type CoTotalVerdict =
+    | "ok" | "tax-inflated" | "drift" | "no-items" | "has-sections" | "cost-plus" | "unpriced";
+
+/** Cents, rounded exactly the way the send and approve guards round before comparing. */
+const toCents = (n: number) => Math.round((Number(n) || 0) * 100);
+
+// The legacy editor wrote `subtotal * (1 + rate)` in one multiply, which can land a cent away
+// from the guards' `round(subtotal) + round(subtotal * rate)`. Brute-forcing both formulas
+// across every cent value at the rates this app uses puts the maximum divergence at exactly
+// one cent, and the single multiply is always the LARGER of the two — so the slack is one
+// cent and one-sided. It belongs to the tax-inflated *diagnosis* only, never to "ok".
+const TAX_INFLATED_SLACK_CENTS = 1;
+
+/**
+ * Classify a stored change-order totalAmount against the subtotal its items produce.
+ *
+ * Every branch here answers one question: would the send and approve guards let this row
+ * through? "ok" must mean yes and nothing weaker, so it is cents-exact —
+ * `approveChangeOrderCore` and the send guard compare `storedSubtotalCents !==
+ * renderedSubtotalCents` with no tolerance. While this tolerated a cent, a one-cent row was
+ * reported healthy, refused by the repair POST as already-correct, and hard-blocked from
+ * send and approve with no remediation path at all.
+ *
+ * The guards also skip the subtotal comparison entirely for COST_PLUS and reject nonpositive
+ * cents outright, so those get their own verdicts rather than being scored against a
+ * subtotal that means nothing for them.
+ */
+export function classifyCoTotal(
+    stored: number,
+    subtotal: number,
+    expectedBilled: number,
+    itemCount: number,
+    sectionCount: number,
+    pricingType: string = "FIXED",
+): CoTotalVerdict {
+    // A section header mirrors the total of the lines beneath it, so no subtotal derived from
+    // these rows is trustworthy — including the one a repair would write back. Reported ahead of
+    // every other verdict (as the money paths refuse it ahead of every other check) so the row
+    // can never be recomputed to a number nobody can justify.
+    if (sectionCount > 0) return "has-sections";
+    // A cost-plus change order bills from actuals; its totalAmount is not derived from these
+    // items and the guards exempt it. Resetting it to the item subtotal would destroy a
+    // legitimate number, so it is reported and never repaired.
+    if (pricingType === "COST_PLUS") return "cost-plus";
+    if (itemCount === 0) return "no-items";
+    const storedCents = toCents(stored);
+    const subtotalCents = toCents(subtotal);
+    // The guards reject nonpositive cents on their own ("no priced items yet"), so equality
+    // here would be an "ok" that still cannot send. Repair cannot help either — writing a
+    // zero subtotal back leaves the row just as unsendable.
+    if (storedCents <= 0 || subtotalCents <= 0) return "unpriced";
+    if (storedCents === subtotalCents) return "ok";
+    const billedCents = toCents(expectedBilled);
+    // Only meaningful when tax actually moves the number, and only above the subtotal. On a
+    // tax-exempt CO expectedBilled *is* the subtotal, and a symmetric window would let a
+    // stored value BELOW the subtotal — which the legacy tax-inclusive formula can never
+    // produce — claim the tax-inflated verdict and skip the confirmation a drift row needs.
+    // The window is [billed, billed + 1], not ±1: the single multiply is never SMALLER than
+    // the staged one, so a value below expectedBilled is something else and must earn its
+    // repair through force.
+    const overBilled = storedCents - billedCents;
+    if (billedCents > subtotalCents
+        && storedCents > subtotalCents
+        && overBilled >= 0 && overBilled <= TAX_INFLATED_SLACK_CENTS) {
+        return "tax-inflated";
+    }
+    return "drift";
+}
+
 export function coTaxLabel(estimate: EstimateTaxInfo): string {
     if (estimate?.taxExempt) return "Tax Exempt";
     const pctDisplay = (coTaxRate(estimate) * 100).toFixed(1).replace(/\.0$/, "");
