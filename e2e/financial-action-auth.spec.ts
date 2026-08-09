@@ -25,16 +25,99 @@ function expectGuardBeforeDatabase(source: string, actionName: string, guard: st
 test("all staff financial actions authorize inside the exported action", () => {
   const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
 
-  const estimates = [
-    "getEstimate", "getAllEstimates", "getEstimateActivity", "createDraftEstimate",
-    "createDraftLeadEstimate", "saveEstimate", "logEstimatePayment", "archiveEstimate",
-    "deleteEstimate", "duplicateEstimate", "saveEstimateAsTemplate", "getEstimateTemplates",
-    "createEstimateFromTemplate", "saveItemsAsAssembly", "deleteAssembly",
-    "getEstimateItemsForProject", "importEstimateToSchedule", "uploadEstimateFile",
-    "deleteEstimateFile", "getEstimateFiles", "updateItemApproval", "bulkUpdateItemApproval",
-    "addVoiceEstimateItem", "createEstimateFromRoomDesign",
+  // The `estimates` permission answers "may this user touch estimates at all",
+  // NOT "may this user touch THIS estimate". Every action addressed by an
+  // estimate / project / lead / item id must therefore use the SCOPED helper,
+  // which pairs the permission with canAccessProject (or `leadAccess` for
+  // lead-owned estimates). Only the genuinely company-wide actions — the
+  // template and assembly library — may keep the bare permission gate.
+  const estimateScopeGuards: Record<string, string> = {
+    getEstimate: "await assertEstimateAccess(",
+    getEstimateActivity: "await assertEstimateAccess(",
+    saveEstimate: "await assertEstimateAccess(",
+    logEstimatePayment: "await assertEstimateAccess(",
+    archiveEstimate: "await assertEstimateAccess(",
+    deleteEstimate: "await assertEstimateAccess(",
+    duplicateEstimate: "await assertEstimateAccess(",
+    saveEstimateAsTemplate: "await assertEstimateAccess(",
+    importEstimateToSchedule: "await assertEstimateAccess(",
+    uploadEstimateFile: "await assertEstimateAccess(",
+    getEstimateFiles: "await assertEstimateAccess(",
+    updateEstimateStatus: "await assertEstimateAccess(",
+    createDraftEstimate: "await assertEstimateProjectAccess(",
+    createEstimateFromTemplate: "await assertEstimateProjectAccess(",
+    getEstimateItemsForProject: "await assertEstimateProjectAccess(",
+    addVoiceEstimateItem: "await assertEstimateProjectAccess(",
+    createDraftLeadEstimate: "await assertEstimateLeadAccess(",
+    updateItemApproval: "await assertEstimateItemAccess(",
+    bulkUpdateItemApproval: "await assertEstimateItemAccess(",
+    sendEstimatePaymentReceipt: "await assertEstimatePaymentAccess(",
+  };
+  for (const [name, guard] of Object.entries(estimateScopeGuards)) {
+    expectGuardBeforeDatabase(source, name, guard);
+  }
+
+  // Two-id actions: the estimate is scoped, and the milestone must be resolved
+  // THROUGH that estimate — both before the mutating transaction opens, or the
+  // authorization is decorative.
+  for (const name of ["recordEstimatePayment", "unrecordEstimatePayment"]) {
+    const action = exportSource(source, name);
+    const scopeIndex = action.indexOf("await assertEstimateAccess(");
+    const pairIndex = action.indexOf("await assertPaymentBelongsToEstimate(");
+    const txIndex = action.indexOf("withTxRetry(");
+    expect(scopeIndex, `${name} must scope the estimate`).toBeGreaterThanOrEqual(0);
+    expect(pairIndex, `${name} must pair the milestone to the estimate`).toBeGreaterThanOrEqual(0);
+    expect(txIndex, `${name} must still open a transaction`).toBeGreaterThanOrEqual(0);
+    expect(scopeIndex, `${name} must authorize before the transaction`).toBeLessThan(txIndex);
+    expect(pairIndex, `${name} must pair before the transaction`).toBeLessThan(txIndex);
+  }
+
+  // The helpers themselves must keep doing the work. Without this, any caller
+  // assertion above still passes while the helper it names is gutted to a no-op.
+  const helperBodies: Record<string, string[]> = {
+    assertEstimateScope: ["canAccessProject(", 'hasPermission(user, "leadAccess")', "throw new Error"],
+    assertEstimateAccess: ["assertEstimatePermission(", "assertEstimateScope("],
+    assertEstimateProjectAccess: ["assertEstimatePermission(", "assertEstimateScope("],
+    assertEstimateLeadAccess: ["assertEstimatePermission(", "assertEstimateScope("],
+    assertEstimateItemAccess: ["assertEstimatePermission(", "assertEstimateScope("],
+    assertEstimatePaymentAccess: ["assertEstimatePermission(", "assertEstimateScope("],
+    assertPaymentBelongsToEstimate: ["where: { id: paymentId, estimateId }", "throw new Error"],
+    assertEstimateStaffOrPortalAccess: ["assertEstimateScope(", "resolveSessionClientId("],
+  };
+  for (const [helper, required] of Object.entries(helperBodies)) {
+    const start = source.indexOf(`function ${helper}(`);
+    expect(start, `${helper} must exist`).toBeGreaterThanOrEqual(0);
+    const nextFn = /\nasync function |\nfunction |\nexport /.exec(source.slice(start + helper.length));
+    const body = source.slice(start, nextFn ? start + helper.length + nextFn.index : undefined);
+    for (const needle of required) {
+      expect(body, `${helper} must still contain ${needle}`).toContain(needle);
+    }
+  }
+
+  // An ownerless estimate must fail closed, not be authorized by default.
+  expect(
+    source.slice(source.indexOf("function assertEstimateScope(")),
+    "assertEstimateScope must reject an estimate with neither project nor lead",
+  ).toMatch(/if \(!scope\.projectId && !scope\.leadId\)[\s\S]{0,200}throw new Error/);
+
+  // Addressed by a non-estimate id, so the owner is resolved first and the
+  // shared scope predicate applied to the loaded row.
+  for (const name of ["deleteEstimateFile", "createEstimateFromRoomDesign"]) {
+    expectGuardBeforeDatabase(source, name, "await assertEstimatePermission(");
+    expect(exportSource(source, name), `${name} must apply the estimate scope check`)
+      .toContain("assertEstimateScope(");
+  }
+
+  expectGuardBeforeDatabase(source, "createInvoiceFromEstimate", "await assertInvoicePermission(");
+  expect(exportSource(source, "createInvoiceFromEstimate")).toContain("assertEstimateScope(");
+
+  // Company-wide by design: the template/assembly library is not per-job.
+  const companyWideEstimateActions = [
+    "getAllEstimates", "getEstimateTemplates", "saveItemsAsAssembly", "deleteAssembly",
   ];
-  for (const name of estimates) expectGuardBeforeDatabase(source, name, "await assertEstimatePermission(");
+  for (const name of companyWideEstimateActions) {
+    expectGuardBeforeDatabase(source, name, "await assertEstimatePermission(");
+  }
 
   const invoices = [
     "deleteInvoice", "updateInvoiceNotes", "createInvoiceFromTimeEntries", "getInvoice",
@@ -45,6 +128,17 @@ test("all staff financial actions authorize inside the exported action", () => {
 
   const changeOrders = ["createChangeOrder", "getChangeOrders", "getChangeOrder", "deleteChangeOrder"];
   for (const name of changeOrders) expectGuardBeforeDatabase(source, name, "await assertChangeOrderPermission(");
+
+  // createChangeOrder copies a source estimate's priced items into a
+  // destination project. Both ends need scoping, and the two ids must be
+  // required to belong together.
+  {
+    const action = exportSource(source, "createChangeOrder");
+    expect(action, "createChangeOrder must scope the destination project")
+      .toContain("assertEstimateScope(user, { projectId })");
+    expect(action, "createChangeOrder must load the estimate scoped to that project")
+      .toContain("where: { id: estimateId, projectId }");
+  }
 
   const projectScopedFinancialReports = [
     "getPurchaseOrders", "createPurchaseOrder", "createPurchaseOrderFromEstimate",
