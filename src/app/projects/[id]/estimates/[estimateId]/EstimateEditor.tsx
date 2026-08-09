@@ -828,6 +828,30 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         setIsSyncingQB(true);
         setShowMoreMenu(false);
         try {
+            // The sync route reads the estimate from the database, so anything typed since the
+            // last save would be invisible to it and QuickBooks would receive stale prices or a
+            // stale section hierarchy. Save first, exactly as the Change Order and Purchase
+            // Order actions above do.
+            //
+            // Silent because this handler owns the messaging for the whole operation: a
+            // non-silent save toasts "Estimate saved successfully" immediately before the sync
+            // toast, and reports a save failure twice (once itself, once via the catch below).
+            // skipRefresh avoids a redundant RSC round-trip in the middle of the sync.
+            try {
+                await handleSave({ silent: true, skipRefresh: true });
+            } catch (e: any) {
+                // A CAS conflict already raised its own toast carrying the Reload action, so it
+                // must not be spoken over. Everything else has to say plainly that the push did
+                // not happen — otherwise a failed save reads as a failed sync.
+                if (!e?.isSaveConflict) {
+                    // The fixed sentence always leads: `e.message` is set for nearly every Error, so
+                    // using it as the whole message would drop the part the user actually needs.
+                    const detail = e?.message ? ` (${e.message})` : "";
+                    toast.error(`We couldn't confirm the save — QuickBooks was not updated.${detail}`);
+                }
+                return;
+            }
+
             const res = await fetch("/api/quickbooks/sync", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -2142,7 +2166,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         <div
             className="flex flex-col h-full bg-slate-50"
             onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving && !saveConflictRef.current) {
+                if (!e.currentTarget.contains(e.relatedTarget as Node) && !showTemplateModal && !showAiModal && !showImportModal && !showSendModal && !showMoreMenu && !isSaving && !isSyncingQB && !saveConflictRef.current) {
                     handleSave();
                 }
             }}
@@ -2404,9 +2428,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
                         {initialEstimate.sentAt ? "Resend" : "Send"}
                     </button>
+                    {/* isSyncingQB: the pre-sync save inside handleSyncQB runs silently, so isSaving
+                        stays false — without it this button would invite a second save that could
+                        land in the middle of the sync. */}
                     <button
                         onClick={() => handleSave()}
-                        disabled={isSaving}
+                        disabled={isSaving || isSyncingQB}
                         className="hui-btn hui-btn-primary disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save"}
