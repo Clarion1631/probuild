@@ -53,9 +53,10 @@ export async function GET(req: Request) {
     const cos = await prisma.changeOrder.findMany({
         orderBy: { number: "asc" },
         select: {
-            id: true, code: true, title: true, status: true,
+            id: true, code: true, title: true, status: true, pricingType: true,
             totalAmount: true, balanceDue: true, createdAt: true, updatedAt: true,
             approvedAt: true, sentAt: true,
+            paymentSchedules: { select: { amount: true } },
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { select: { name: true, type: true, quantity: true, unitCost: true, total: true } },
@@ -81,7 +82,11 @@ export async function GET(req: Request) {
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
         const inflated = rc(stored - subtotal);
         const sectionNames = coSectionRowNames(co.items);
-        const verdict = classify(stored, subtotal, expectedBilled, co.items.length, sectionNames.length);
+        const verdict = classify(stored, subtotal, expectedBilled, co.items.length, sectionNames.length, co.pricingType);
+        // billChangeOrderCore refuses a signed CO whose schedule rows do not sum to the
+        // subtotal, so a repair that moves totalAmount without them trades one stuck state
+        // for a later one. Surfaced here, refused by POST.
+        const scheduleCents = co.paymentSchedules.reduce((s, r) => s + Math.round(Number(r.amount) * 100), 0);
 
         const milestones = coMilestones
             .filter(m => m.invoice.projectId === co.project.id && m.name.startsWith(`${co.code} — `))
@@ -97,7 +102,11 @@ export async function GET(req: Request) {
             title: co.title,
             project: co.project.name,
             status: co.status,
+            pricingType: co.pricingType,
             verdict,
+            scheduleRowCount: co.paymentSchedules.length,
+            scheduleTotal: scheduleCents / 100,
+            scheduleMatchesSubtotal: co.paymentSchedules.length === 0 || scheduleCents === Math.round(subtotal * 100),
             storedTotalAmount: stored,
             storedBalanceDue: rc(Number(co.balanceDue)),
             itemCount: co.items.length,
@@ -123,6 +132,9 @@ export async function GET(req: Request) {
             drift: rows.filter(r => r.verdict === "drift").length,
             noItems: rows.filter(r => r.verdict === "no-items").length,
             hasSections: rows.filter(r => r.verdict === "has-sections").length,
+            costPlus: rows.filter(r => r.verdict === "cost-plus").length,
+            unpriced: rows.filter(r => r.verdict === "unpriced").length,
+            scheduleOutOfSync: rows.filter(r => !r.scheduleMatchesSubtotal).length,
         },
         changeOrders: rows,
     });
@@ -144,8 +156,8 @@ export async function POST(req: Request) {
 
     const result = await prisma.$transaction(async tx => {
         // Row lock so a concurrent approve/send/bill serializes against the fix.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string }>>`
-            SELECT "id", "code", "title", "status", "totalAmount", "balanceDue", "projectId", "estimateId"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; pricingType: string; totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
@@ -175,15 +187,24 @@ export async function POST(req: Request) {
         });
         const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(estimateTax)));
         const sectionNames = coSectionRowNames(items);
-        const verdict = classify(stored, subtotal, expectedBilled, items.length, sectionNames.length);
+        const verdict = classify(stored, subtotal, expectedBilled, items.length, sectionNames.length, co.pricingType);
         // Not repairable here: writing back a subtotal that excludes the headers would leave
         // the rows in place and a total nobody can justify, and a later GET would call it
         // "ok" while send and approve stay correctly blocked. Fix the items, not the total.
         if (verdict === "has-sections") {
             return { ok: false as const, error: coSectionRowError(co.code, sectionNames) };
         }
+        if (verdict === "cost-plus") {
+            // Its total comes from actuals, not these items, and the send/approve guards skip
+            // the subtotal comparison for it — so there is nothing here to be out of sync, and
+            // overwriting it with the item subtotal would destroy a legitimate number.
+            return { ok: false as const, error: `${co.code} is COST_PLUS — its total bills from actuals, not from the item subtotal, so there is nothing for this repair to reconcile.` };
+        }
         if (verdict === "no-items") {
             return { ok: false as const, error: `${co.code} has no line items — nothing to recompute from; review by hand.` };
+        }
+        if (verdict === "unpriced") {
+            return { ok: false as const, error: `${co.code} has a nonpositive total ($${stored.toFixed(2)}) or item subtotal ($${subtotal.toFixed(2)}) — send and approve reject it as unpriced, and writing the subtotal back would not change that. Price the items first.` };
         }
         if (verdict === "ok") {
             // Cents-exact, so this really is a no-op: send and approve compare the same
@@ -197,6 +218,21 @@ export async function POST(req: Request) {
                 ? ` It is off by a single cent, which send and approve reject outright, so force:true is the intended fix here.`
                 : "";
             return { ok: false as const, error: `${co.code} is a drift row (stored $${stored.toFixed(2)} matches neither the item subtotal $${subtotal.toFixed(2)} nor subtotal+tax $${expectedBilled.toFixed(2)}) — pass force:true only after a human confirms the items are canonical.${rounding}` };
+        }
+        // billChangeOrderCore refuses a signed CO whose schedule rows do not sum to the
+        // subtotal ("schedule amounts are out of sync with the signed subtotal"). Moving
+        // totalAmount out from under them would unstick send and approve only to wedge
+        // billing later, so refuse rather than guess how to redistribute the difference —
+        // which row absorbs it is a human's call, not this route's.
+        const schedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId },
+            select: { amount: true },
+        });
+        if (schedules.length) {
+            const scheduleCents = schedules.reduce((s, r) => s + Math.round(Number(r.amount) * 100), 0);
+            if (scheduleCents !== Math.round(subtotal * 100)) {
+                return { ok: false as const, error: `${co.code} has ${schedules.length} payment schedule row(s) summing to $${(scheduleCents / 100).toFixed(2)}, which is not the item subtotal $${subtotal.toFixed(2)}. Billing rejects that mismatch after signature, so rebalance the schedule in the editor instead of resetting the total here.` };
+            }
         }
         await tx.changeOrder.update({
             where: { id: changeOrderId },

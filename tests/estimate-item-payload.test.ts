@@ -619,11 +619,20 @@ test("the audit's ok verdict is cents-exact, matching the send and approve guard
 });
 
 test("the audit still diagnoses the tax-inclusive totals it exists to repair", () => {
-    // The legacy editor wrote subtotal * (1 + rate) in one multiply, which can land a cent
-    // off the guards' round(subtotal) + round(subtotal * rate). That slack stays.
+    // The legacy editor wrote subtotal * (1 + rate) in one multiply, which lands at most one
+    // cent above the guards' round(subtotal) + round(subtotal * rate). One cent of slack, and
+    // only upward — the single multiply is never the smaller of the two.
     assert.equal(classifyCoTotal(1088, 1000, 1088, 4, 0), "tax-inflated");
-    assert.equal(classifyCoTotal(1088.02, 1000, 1088, 4, 0), "tax-inflated");
-    assert.equal(classifyCoTotal(1088.03, 1000, 1088, 4, 0), "drift");
+    assert.equal(classifyCoTotal(1088.01, 1000, 1088, 4, 0), "tax-inflated");
+    assert.equal(classifyCoTotal(1088.02, 1000, 1088, 4, 0), "drift");
+});
+
+test("the tax-inflated slack cannot swallow a value below the subtotal", () => {
+    // A near-zero rate puts expectedBilled a cent above the subtotal, so a symmetric window
+    // would have let $999.99 — which no tax-inclusive formula can produce — auto-repair
+    // without the confirmation a drift row requires.
+    assert.equal(classifyCoTotal(999.99, 1000, 1000.01, 4, 0), "drift");
+    assert.equal(classifyCoTotal(1000.01, 1000, 1000.01, 4, 0), "tax-inflated");
 });
 
 test("a stray cent on a tax-exempt CO is drift, not a mislabelled tax inflation", () => {
@@ -635,6 +644,24 @@ test("a stray cent on a tax-exempt CO is drift, not a mislabelled tax inflation"
 
 test("an item-less CO is never classified from an empty subtotal", () => {
     assert.equal(classifyCoTotal(1000, 0, 0, 0, 0), "no-items");
+});
+
+test("a cost-plus CO is reported, never scored against its item subtotal", () => {
+    // Both guards skip the subtotal comparison for COST_PLUS, so its total legitimately
+    // differs from the items. Resetting it to the subtotal would destroy a real number.
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 0, "COST_PLUS"), "cost-plus");
+    assert.equal(classifyCoTotal(5000, 0, 0, 0, 0, "COST_PLUS"), "cost-plus");
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 0, "FIXED"), "drift");
+    // Corrupt section rows still outrank it — every money path refuses those first.
+    assert.equal(classifyCoTotal(5000, 1000, 1088, 4, 1, "COST_PLUS"), "has-sections");
+});
+
+test("a nonpositive total is unpriced, not ok — the guards reject it either way", () => {
+    // storedCents <= 0 || renderedCents <= 0 is its own rejection in both guards, so equality
+    // at zero is an "ok" that still cannot send, and writing the subtotal back fixes nothing.
+    assert.equal(classifyCoTotal(0, 0, 0, 3, 0), "unpriced");
+    assert.equal(classifyCoTotal(-50, -50, -50, 3, 0), "unpriced");
+    assert.equal(classifyCoTotal(1000, 0, 0, 3, 0), "unpriced");
 });
 
 test("an omitted type keeps the stored one, so the persisted total stays reproducible", () => {
