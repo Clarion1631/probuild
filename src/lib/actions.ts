@@ -3350,7 +3350,11 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
  */
 export async function getEstimateItemCostCodes(estimateId: string): Promise<{ id: string; costCodeId: string | null }[]> {
     "use server";
-    await assertEstimatePermission();
+    // Scoped, like every other estimate action addressed by an estimate id (#333). This action
+    // was written on a branch cut before that landed, so it originally carried the old bare
+    // `assertEstimatePermission()` — which merges without a git conflict and would have quietly
+    // reopened the hole #333 closed.
+    await assertEstimateAccess(estimateId);
     return prisma.estimateItem.findMany({
         where: { estimateId },
         select: { id: true, costCodeId: true },
