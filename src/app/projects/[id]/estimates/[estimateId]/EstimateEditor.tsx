@@ -3036,6 +3036,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     {/* Phase/Type pills + action buttons — hover only */}
                                                                     <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                         <select
+                                                                            // Stable hook for e2e/estimate-cost-code-catchup.spec.ts. Rows have no
+                                                                            // other reliable handle: a controlled input's live value isn't in the
+                                                                            // DOM attribute, so locating by the item name doesn't work.
+                                                                            data-testid={`item-cost-code-${item.id}`}
                                                                             value={item.costCodeId || ""}
                                                                             onChange={e => updateItem(item.id, { costCodeId: e.target.value || null })}
                                                                             className="bg-slate-100 hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-hui-textMuted text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition"

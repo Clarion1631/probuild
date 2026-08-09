@@ -156,21 +156,24 @@ test.describe("Estimate editor: auto-assigned cost code catch-up (real DB + brow
             }, { timeout: 15_000 })
             .toBe(TITLE_SAVE_1);
 
-        // Rows found by their input's live value (getByDisplayValue reads the DOM property, not
-        // the initial-render attribute, so it stays correct as the controlled value changes).
-        const item1Row = page.locator("div.group", { has: page.getByDisplayValue(ITEM1_NAME) });
-        const item2Row = page.locator("div.group", { has: page.getByDisplayValue(ITEM2_NAME) });
-        // The cost-code <select> is the first of the two hover-revealed selects in the row
-        // (see EstimateEditor.tsx around `value={item.costCodeId || ""}`); the second is item type.
-        const item1CostCodeSelect = item1Row.locator("select").first();
-        const item2CostCodeSelect = item2Row.locator("select").first();
+        // Located by the per-row `data-testid` on the cost-code <select> (EstimateEditor.tsx,
+        // around `value={item.costCodeId || ""}`). Finding the row by its item name does not work:
+        // a controlled input's live value lives on the DOM property, not the attribute, so there
+        // is nothing stable in the markup to match on.
+        const item1CostCodeSelect = page.getByTestId(`item-cost-code-${IDS.item1}`);
+        const item2CostCodeSelect = page.getByTestId(`item-cost-code-${IDS.item2}`);
 
         await expect(item1CostCodeSelect).toHaveValue("");
         await expect(item2CostCodeSelect).toHaveValue("");
 
         // ── Fill-only check: hand-pick a code on item2 locally (unsaved) BEFORE the poll's
         // first attempt lands, so its local costCodeId is no longer null when the merge runs. ──
-        await item2CostCodeSelect.selectOption(IDS.costCode2);
+        // `force` because this select lives in a hover-revealed container that is
+        // `opacity-0 pointer-events-none` until `:hover` (headless Chrome reports `hover: hover`,
+        // so the `[@media(hover:none)]` escape hatch does not apply). Playwright's actionability
+        // check would time out on the pointer-events rule. We are exercising the merge, not the
+        // hover affordance, and the assertions below read the DOM value either way.
+        await item2CostCodeSelect.selectOption(IDS.costCode2, { force: true });
         await expect(item2CostCodeSelect).toHaveValue(IDS.costCode2);
 
         // ── Step 4: simulate autoAssignPhasesForEstimate's after()-scheduled write. Both items
