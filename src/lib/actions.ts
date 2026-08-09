@@ -1322,7 +1322,7 @@ export async function createProject(data: {
 }
 
 export async function createDraftEstimate(projectId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     // WA is destination-based: default the rate from the job-site address,
     // falling back to the company default (null fields) when unresolvable.
     const taxDefault = await defaultTaxForNewEstimate({ projectId });
@@ -1348,7 +1348,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
-    await assertEstimatePermission();
+    await assertEstimateLeadAccess(leadId);
     const taxDefault = await defaultTaxForNewEstimate({ leadId });
     const estimate = await prisma.estimate.create({
         data: {
@@ -1541,7 +1541,7 @@ export async function listRoomsForLead(leadId: string) {
 }
 
 export const getEstimate = cache(async function getEstimate(id: string) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(id);
     try {
         // Full query — works when all schema columns exist in DB
         return await prisma.estimate.findUnique({
@@ -1620,9 +1620,9 @@ export const getEstimate = cache(async function getEstimate(id: string) {
 });
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Scoped on the estimate's own owner, not the caller-supplied leadId/projectId
+    // — those two are revalidatePath hints only and are attacker-controlled.
+    const { user } = await assertEstimateAccess(id);
 
     const VALID_STATUSES = ["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid", "Declined", "Expired", "Archived"];
     if (!VALID_STATUSES.includes(status)) throw new Error("Invalid status");
@@ -2120,7 +2120,7 @@ export type EstimateActivityEvent = {
  * so payment history is always complete without any extra logging.
  */
 export async function getEstimateActivity(estimateId: string): Promise<EstimateActivityEvent[]> {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const [estimate, logs, invoice] = await Promise.all([
         prisma.estimate.findUnique({
             where: { id: estimateId },
@@ -3017,7 +3017,19 @@ export async function emailInvoiceCopyToMe(
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
-    await assertEstimatePermission();
+    // Scope on the estimate's OWN project/lead, not on the caller-supplied
+    // contextId — every argument here is attacker-controlled, so trusting the
+    // context id would let a caller name a job it can access while writing to
+    // an estimate belonging to one it cannot.
+    const scope = await assertEstimateAccess(estimateId);
+    // ...and then require the context to MATCH that owner. contextId is not just
+    // a revalidatePath hint: the Budget row below is created with
+    // `projectId: contextId`, so an unchecked mismatch files an in-scope
+    // estimate's budget under an out-of-scope project.
+    const expectedContextId = contextType === "project" ? scope.projectId : scope.leadId;
+    if (!expectedContextId || contextId !== expectedContextId) {
+        throw new Error("Estimate does not belong to the supplied context");
+    }
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
@@ -3323,7 +3335,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
 
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
     // touches only the estimate). Without the lock two concurrent logs each read the same
     // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
@@ -3378,7 +3390,7 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
 
 export async function archiveEstimate(estimateId: string) {
     "use server";
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: safeEstimateSelect,
@@ -3435,7 +3447,10 @@ async function getDefaultSalesTaxRate(): Promise<number> {
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
-    await assertInvoicePermission();
+    // `invoices` says WHAT you may do, not WHICH job — the invoice this mints
+    // inherits the estimate's numbers, so the source estimate must be in scope.
+    const user = await assertInvoicePermission();
+    assertEstimateScope(user, await estimateOwnerOrThrow(estimateId));
     return createInvoiceFromEstimateInternal(estimateId);
 }
 
@@ -3798,9 +3813,13 @@ export async function recordEstimatePayment(
         amount?: number;
     },
 ) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Two ids, and the milestone is the one that actually gets settled. Scope
+    // the estimate, then resolve the milestone THROUGH it — pairing enforced by
+    // the query rather than by a follow-up comparison, so there is no second
+    // authorization to keep in sync and no way to settle another job's
+    // milestone by pairing it with an estimateId this caller can reach.
+    const { user } = await assertEstimateAccess(estimateId);
+    await assertPaymentBelongsToEstimate(paymentId, estimateId);
 
     const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
@@ -3980,9 +3999,8 @@ export async function sendPaymentReceipt(paymentScheduleId: string) {
 }
 
 export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Emails a client, so scope has to be settled before the send, not after.
+    await assertEstimatePaymentAccess(paymentScheduleId);
 
     const { sendEstimatePaymentReceiptOnly } = await import("./payment-notifications");
     const result = await sendEstimatePaymentReceiptOnly(paymentScheduleId);
@@ -4003,9 +4021,9 @@ export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
 }
 
 export async function unrecordEstimatePayment(paymentId: string, estimateId: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Same two-id pairing as recordEstimatePayment — see the note there.
+    const { user } = await assertEstimateAccess(estimateId);
+    await assertPaymentBelongsToEstimate(paymentId, estimateId);
 
     const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. This flow releases both the
@@ -4144,6 +4162,119 @@ async function assertChangeOrderPermission() {
     return assertStaffPermission("changeOrders");
 }
 
+/**
+ * Horizontal-access check for an estimate that has already been resolved to its
+ * owner. `assertEstimatePermission()` answers "may this user touch estimates at
+ * all", NOT "may this user touch THIS estimate" — and every action in this file
+ * is a remotely invokable Server Action, so without this any staff member
+ * holding `estimates` could read or rewrite another job's numbers by id alone.
+ *
+ * Same shape as assertSendScope: project-owned estimates go through
+ * canAccessProject (ADMIN/MANAGER pass unconditionally inside it); lead-owned
+ * ones fall back to `leadAccess`, the gate the /leads/[id] layout applies.
+ * FINANCE is deliberately NOT exempt the way assertFinancialProjectScope exempts
+ * it for reports — an estimate is a per-job document, not a company roll-up.
+ */
+function assertEstimateScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
+    // Fail CLOSED on an ownerless estimate. Both ownership columns are optional
+    // in the schema, so "no project and no lead" would otherwise fall straight
+    // through this function and be authorized by default.
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This estimate is not attached to a project or lead, so access cannot be checked");
+    }
+    if (scope.projectId) {
+        if (!canAccessProject(user, scope.projectId)) throw new Error("Forbidden");
+        return;
+    }
+    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+}
+
+/** Permission + scope for actions that reach estimates through a project id. */
+async function assertEstimateProjectAccess(projectId: string) {
+    const user = await assertEstimatePermission();
+    assertEstimateScope(user, { projectId });
+    return user;
+}
+
+/** Permission + scope for actions that reach estimates through a lead id. */
+async function assertEstimateLeadAccess(leadId: string) {
+    const user = await assertEstimatePermission();
+    assertEstimateScope(user, { leadId });
+    return user;
+}
+
+/** Resolve an estimate's owning project/lead, for callers that hold a user already. */
+async function estimateOwnerOrThrow(estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true, leadId: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    return estimate;
+}
+
+/**
+ * Permission + scope for a single estimate. Mirrors assertScheduleTaskAccess:
+ * resolve the row's owning project/lead, then apply the horizontal check.
+ * Permission is asserted BEFORE the lookup so the "Estimate not found" vs
+ * "Forbidden" difference cannot be used as an existence oracle by a caller who
+ * holds no estimate permission at all.
+ */
+async function assertEstimateAccess(estimateId: string) {
+    const user = await assertEstimatePermission();
+    const estimate = await estimateOwnerOrThrow(estimateId);
+    assertEstimateScope(user, estimate);
+    return { user, projectId: estimate.projectId, leadId: estimate.leadId };
+}
+
+/**
+ * Pairing check for the two-id payment actions. The caller has already been
+ * scoped against `estimateId`; this proves the milestone it is about to settle
+ * or release actually hangs off that estimate. Enforced by the WHERE clause, so
+ * there is no second authorization decision that can drift out of sync.
+ */
+async function assertPaymentBelongsToEstimate(paymentId: string, estimateId: string) {
+    const payment = await prisma.estimatePaymentSchedule.findFirst({
+        where: { id: paymentId, estimateId },
+        select: { id: true },
+    });
+    if (!payment) throw new Error("Payment not found");
+}
+
+/**
+ * Permission + scope for actions addressed by EstimatePaymentSchedule id alone.
+ * The milestone carries no ownership of its own, so it has to be walked back to
+ * its estimate before any side effect (a receipt email) happens.
+ */
+async function assertEstimatePaymentAccess(paymentScheduleId: string) {
+    const user = await assertEstimatePermission();
+    const schedule = await prisma.estimatePaymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { estimateId: true, estimate: { select: { projectId: true, leadId: true } } },
+    });
+    if (!schedule?.estimate) throw new Error("Payment not found");
+    assertEstimateScope(user, schedule.estimate);
+    return { user, estimateId: schedule.estimateId };
+}
+
+/**
+ * Permission + scope for actions addressed by EstimateItem id rather than by
+ * estimate id. Every id must resolve: a missing row is something the caller
+ * cannot be scoped against, so it is rejected rather than silently skipped.
+ */
+async function assertEstimateItemAccess(itemIds: string[]) {
+    const user = await assertEstimatePermission();
+    const unique = Array.from(new Set(itemIds));
+    if (unique.length === 0) return user;
+    const items = await prisma.estimateItem.findMany({
+        where: { id: { in: unique } },
+        select: { estimate: { select: { projectId: true, leadId: true } } },
+    });
+    if (items.length !== unique.length) throw new Error("Estimate item not found");
+    for (const item of items) assertEstimateScope(user, item.estimate);
+    return user;
+}
+
 async function assertScheduleProjectAccess(projectId: string) {
     const user = await assertActiveStaff();
     if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) throw new Error("Forbidden");
@@ -4231,6 +4362,16 @@ async function assertEstimateStaffOrPortalAccess(estimateId: string) {
         if (!hasPermission(user, "estimates") && !hasPermission(user, "invoices")) {
             throw new Error("Forbidden");
         }
+        // The portal branch below is already ownership-scoped; the staff branch
+        // was not. Same horizontal check as assertEstimateAccess so a staff
+        // caller cannot mint a PDF upload token (or a pay-in-full schedule) for
+        // a job they have no access to.
+        const estimate = await prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: { projectId: true, leadId: true },
+        });
+        if (!estimate) throw new Error("Estimate not found");
+        assertEstimateScope(user, estimate);
         return;
     }
     if (await canUseDevAuthFallback()) {
@@ -4793,7 +4934,7 @@ export async function saveCompanySettings(data: any) {
 }
 
 export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { projectId: true, leadId: true, status: true },
@@ -4851,7 +4992,10 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
 // =============================================
 
 export async function duplicateEstimate(estimateId: string, targetProjectId?: string, newTitle?: string) {
-    await assertEstimatePermission();
+    // Both ends are scoped: you must be able to read the source estimate AND to
+    // write into the destination job, or a duplicate becomes a copy-out channel.
+    await assertEstimateAccess(estimateId);
+    if (targetProjectId) await assertEstimateProjectAccess(targetProjectId);
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -4993,7 +5137,9 @@ export async function duplicateEstimates(
 // =============================================
 
 export async function saveEstimateAsTemplate(estimateId: string, templateName: string) {
-    await assertEstimatePermission();
+    // The template is company-wide, but it is BUILT from this estimate's line
+    // items — so reading the source still needs the source's scope.
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: { items: { orderBy: { order: "asc" } } },
@@ -5047,7 +5193,7 @@ export async function getEstimateTemplates() {
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const template = await prisma.estimateTemplate.findUnique({
         where: { id: templateId },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
@@ -7255,7 +7401,7 @@ export async function getDashboardTasks(projectId: string) {
 }
 
 export async function getEstimateItemsForProject(projectId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const items = await prisma.estimateItem.findMany({
         where: { estimate: { projectId }, type: { not: "Section" } },
         orderBy: { order: "asc" },
@@ -7445,7 +7591,10 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
-    await assertEstimatePermission();
+    // Two ids, two scopes: the estimate being read and the project whose
+    // schedule is written. They are independent arguments, so check both.
+    await assertEstimateAccess(estimateId);
+    await assertEstimateProjectAccess(projectId);
     // Rewired through the schedule-core generator (PB-pipeline-002): one
     // shared precondition/idempotency path for estimate — schedule.
     // Merge mode skips already task-linked items. Response shape preserved
@@ -8696,10 +8845,14 @@ export async function saveSubcontractorExplicitProjects(subId: string, projectId
 // =============================================
 
 export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
-    await assertChangeOrderPermission();
+    const user = await assertChangeOrderPermission();
+    // Scope the destination project, then require the source estimate to be
+    // that same project's. Unpaired, this copies an arbitrary estimate's priced
+    // items into an arbitrary project.
+    assertEstimateScope(user, { projectId });
 
     const estimate = await prisma.estimate.findUnique({
-        where: { id: estimateId },
+        where: { id: estimateId, projectId },
         include: { items: true }
     });
     if (!estimate) throw new Error("Estimate not found");
@@ -9915,7 +10068,7 @@ export async function uploadPurchaseOrderFileFromBuffer(
 }
 
 export async function uploadEstimateFile(estimateId: string, formData: FormData) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
 
@@ -9962,9 +10115,12 @@ export async function uploadEstimateFile(estimateId: string, formData: FormData)
 }
 
 export async function deleteEstimateFile(fileId: string) {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
     const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true, projectId: true, leadId: true } } } });
     if (!file) return;
+    // Addressed by file id, so the owning estimate has to be resolved before the
+    // horizontal check can run.
+    assertEstimateScope(user, file.estimate);
 
     await prisma.estimateFile.delete({ where: { id: fileId } });
     if (file.estimate.projectId) {
@@ -9973,7 +10129,7 @@ export async function deleteEstimateFile(fileId: string) {
 }
 
 export async function getEstimateFiles(estimateId: string) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     return prisma.estimateFile.findMany({
         where: { estimateId },
         orderBy: { createdAt: "desc" },
@@ -13349,7 +13505,7 @@ export async function deleteDocumentComment(commentId: string) {
 // ========== PER-ITEM APPROVAL ==========
 
 export async function updateItemApproval(itemId: string, status: "approved" | "rejected" | null, note?: string) {
-    await assertEstimatePermission();
+    await assertEstimateItemAccess([itemId]);
     try {
         return await prisma.estimateItem.update({
             where: { id: itemId },
@@ -13362,7 +13518,9 @@ export async function updateItemApproval(itemId: string, status: "approved" | "r
 }
 
 export async function bulkUpdateItemApproval(itemIds: string[], status: "approved" | "rejected" | null) {
-    await assertEstimatePermission();
+    // All-or-nothing: one out-of-scope id fails the whole batch rather than
+    // being quietly dropped from the updateMany.
+    await assertEstimateItemAccess(itemIds);
     try {
         await prisma.estimateItem.updateMany({
             where: { id: { in: itemIds } },
@@ -13781,13 +13939,16 @@ export async function getProjectPurchaseOrdersForLinking(projectId: string) {
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
 
     const room = await prisma.roomDesign.findUnique({
         where: { id: roomId },
         include: { assets: true },
     });
     if (!room) throw new Error("Room Design not found");
+    // The new estimate lands on the room's project/lead, so that owner is what
+    // has to be scoped — the room id alone says nothing about access.
+    assertEstimateScope(user, room);
 
     const isProject = !!room.projectId;
     const ownerId = isProject ? room.projectId : room.leadId;
@@ -13984,7 +14145,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
 }
 
 export async function addVoiceEstimateItem(projectId: string, name: string, quantity: number, unitCost: number) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const estimate = await prisma.estimate.findFirst({
         where: { projectId },
         orderBy: { createdAt: "desc" }
