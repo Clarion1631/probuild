@@ -172,7 +172,7 @@ import BudgetStrip from "./BudgetStrip";
 const POQuickCreateModal = dynamic(() => import("./POQuickCreateModal"), { ssr: false });
 const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), { ssr: false });
 
-import { internalBudget, derivedMarginPct, marginPatchForRate } from "@/lib/budget-math";
+import { internalBudget, derivedMarginPct, marginPatchForRate, marginIsSettable } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
 import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
@@ -232,6 +232,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [isImporting, setIsImporting] = useState(false);
     const [showMoreMenu, setShowMoreMenu] = useState(false);
     const [viewMode, setViewMode] = useState<"internal" | "client">("client");
+    // The row whose sell price is being repaired. In internal view the price normally locks once a
+    // budget rate exists, but a row with NO valid sell price has to be repairable or its disabled
+    // margin input tells the user to do something they can't. Unlocking on the price alone isn't
+    // enough: typing "100" emits "1" first, which is already valid and would relock the field
+    // mid-keystroke at $1. Repair mode is held for the whole focus and released on blur.
+    const [repairingSellPriceItemId, setRepairingSellPriceItemId] = useState<string | null>(null);
     const [showTemplateModal, setShowTemplateModal] = useState(false);
     const [templateName, setTemplateName] = useState("");
     const [isSavingTemplate, setIsSavingTemplate] = useState(false);
@@ -2764,7 +2770,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1 text-right hover:bg-slate-50 transition text-sm font-medium text-slate-700"
                                                                         />
                                                                     </div>
-                                                                    {(() => { const isLocked = viewMode === "internal" && !!(item.budgetRate ?? item.baseCost); return (
+                                                                    {/* In internal view the price follows from cost + margin, so a row with a
+                                                                        budget rate locks it. But a row with no valid sell price has a disabled
+                                                                        margin input telling the user to enter one — locking the price too would
+                                                                        make that instruction unfollowable and trap the row. Unlock exactly
+                                                                        those rows, and keep them unlocked for the whole repair (see
+                                                                        repairingSellPriceItemId) so a half-typed value can't relock the field. */}
+                                                                    {(() => { const isLocked = viewMode === "internal" && !!(item.budgetRate ?? item.baseCost) && marginIsSettable(parseFloat(item.unitCost) || 0) && repairingSellPriceItemId !== item.id; return (
                                                                     <div className="w-28 px-2 flex items-center justify-end flex-shrink-0">
                                                                         <span className={`text-sm flex-shrink-0 ${isLocked ? "text-slate-300" : "text-slate-400"}`}>$</span>
                                                                         <input
@@ -2784,6 +2796,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                                     ...(rate > 0 ? marginPatchForRate(rate, parseFloat(e.target.value) || 0) : {}),
                                                                                 });
                                                                             }}
+                                                                            onFocus={() => {
+                                                                                // Entering repair mode only matters for a row that is currently
+                                                                                // unlocked BECAUSE its sell price is invalid — a normally locked
+                                                                                // row is readOnly and never receives focus this way anyway.
+                                                                                if (!marginIsSettable(parseFloat(item.unitCost) || 0)) setRepairingSellPriceItemId(item.id);
+                                                                            }}
+                                                                            onBlur={() => setRepairingSellPriceItemId(prev => (prev === item.id ? null : prev))}
                                                                             readOnly={isLocked}
                                                                             aria-label="Unit cost"
                                                                             className={`w-20 focus:outline-none rounded px-1 py-1 text-right transition text-sm font-medium ${isLocked ? "bg-transparent text-slate-400 cursor-default" : "bg-transparent focus:bg-white focus:ring-1 ring-slate-200 hover:bg-slate-50 text-slate-700"}`}

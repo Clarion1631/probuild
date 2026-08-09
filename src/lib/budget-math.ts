@@ -163,7 +163,44 @@ export function formatDerivedRate(rate: number, price: number): string {
   // A zero rate reads as "no budget" (internalBudget returns null, saveEstimate persists null),
   // which would contradict any non-zero margin stored beside it.
   if (!Number.isFinite(rate) || rate <= 0) return "0.00";
-  return rate.toFixed(derivedRateDecimals(price));
+  const formatted = rate.toFixed(derivedRateDecimals(price));
+  if (roundedRateIsFaithful(parseFloat(formatted), rate, price)) return formatted;
+  // derivedRateDecimals caps at 10 places, which is not enough at extreme scales. Below roughly a
+  // 1e-9 sell price the rounding step stops being small next to the price itself: the cost rounds
+  // to zero (read as "no budget" beside a 99% margin — and marginIsStale exempts rate 0, so
+  // nothing warns), or it rounds UP past the sell price, or it simply lands on a rate implying a
+  // wildly different margin than the one stored next to it.
+  //
+  // Fall back to the exact value rather than to more decimal places: every fixed width has a
+  // scale where it fails (toFixed caps at 100 places, which dies around 5e-101). String()
+  // round-trips exactly through parseFloat and Prisma's Decimal, so the pair stays honest at any
+  // representable scale. Exponent notation ("9.49e-11") is expected here and is valid numeric
+  // input on both sides.
+  return String(rate);
+}
+
+/**
+ * Whether rounding a rate to the price's decimal scale kept it describing the same margin.
+ *
+ * The tolerance is the absolute MARGIN_STORAGE_HALF_STEP, deliberately NOT the price-scaled
+ * rateRoundingMarginDrift. That drift is what marginIsStale must ALLOW (it is the error the
+ * rounding legitimately introduces), so reusing it here would be circular — and at a 1e-11 price
+ * it permits 500 margin points, which is how a rounded rate implying 20% sat next to a persisted
+ * 25% with nothing noticing. derivedRateDecimals is built to keep the implied margin good to 2dp,
+ * so this bound is met with room to spare at every ordinary price; it only bites where the cap at
+ * 10 places stops that from being true.
+ */
+function roundedRateIsFaithful(rounded: number, exact: number, price: number): boolean {
+  if (!(rounded > 0)) return false; // a zero rate is "no budget", not a cost
+  if (!Number.isFinite(price) || price <= 0) return true; // no margin to be faithful to
+  // Rounding must not turn a real margin into a loss. A rate that ALREADY exceeded the price is a
+  // genuine loss-making row — #331's territory, warned about rather than reformatted — so it is
+  // judged on margin drift like any other rather than being pushed onto the exact path.
+  if (rounded > price && exact <= price) return false;
+  const roundedMargin = rawMarginPct(rounded, price);
+  const exactMargin = rawMarginPct(exact, price);
+  if (roundedMargin === null || exactMargin === null) return false;
+  return Math.abs(roundedMargin - exactMargin) <= MARGIN_STORAGE_HALF_STEP;
 }
 
 /** Decimal places formatDerivedRate stores a rate at, at this price scale. Exported shape of the
@@ -248,6 +285,48 @@ export function marginIsUnrepresentable(rate: number, price: number): boolean {
   const raw = rawMarginPct(rate, price);
   if (raw === null) return false;
   return raw < MIN_MARGIN_PCT || raw > MAX_MARGIN_PCT;
+}
+
+/**
+ * True when a margin can mean anything on this line — i.e. there is a sell price to earn it on.
+ *
+ * A margin is a share OF the sell price (cost = sell * (1 - m/100)), so with no sell price there
+ * is nothing for it to be a share of: costFromMargin returns 0 at every margin, the rate input's
+ * `price > 0` guard skips the rate write entirely, and whatever the user typed persists to
+ * markupPercent describing nothing. #331 made that state visible; this stops it being created.
+ *
+ * The margin input is disabled when this is false rather than the typed value being rewritten —
+ * same product call as #331 (2026-08-09): never silently move a number the user typed, and never
+ * store one that lies. Rows that already carry the contradiction keep warning; the fix for those
+ * is entering a sell price, which re-derives the pair.
+ */
+export function marginIsSettable(price: number): boolean {
+  return Number.isFinite(price) && price > 0;
+}
+
+/**
+ * The complete write a margin-input keystroke produces, or null when the margin cannot be set.
+ *
+ * The margin and the rate derived from it are ONE write — returning them together is what makes
+ * them impossible to half-apply. The defect this closes was exactly a half-apply: the margin was
+ * persisted unconditionally while the rate write sat behind its own `price > 0` check.
+ *
+ * Null means "no write at all" — the input is disabled in that state, so this is the belt to that
+ * suspenders, not a silent no-op the user can hit.
+ */
+export function marginPatchForInput(
+  raw: string,
+  price: number,
+): { markupPercent: string | null; budgetRate: string; baseCost: string } | null {
+  if (!marginIsSettable(price)) return null;
+  const { stored, derivedFrom } = normalizeMarginInput(raw);
+  const cost = costFromMargin(price, derivedFrom);
+  // A subnormal price can underflow to a zero cost before formatting ever sees it. A zero rate is
+  // "no budget", so writing it beside a margin would be the same lie from the other direction —
+  // refuse the write instead of storing a pair that contradicts itself.
+  if (!Number.isFinite(cost) || cost <= 0) return null;
+  const rate = formatDerivedRate(cost, price);
+  return { markupPercent: stored, budgetRate: rate, baseCost: rate };
 }
 
 /**
