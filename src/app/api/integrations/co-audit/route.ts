@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal } from "@/lib/co-tax";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -42,21 +42,10 @@ function authorized(req: Request): boolean {
 // exactly like billing does, not merely close to it.
 const rc = (n: number) => Math.round(n * 100) / 100;
 
-// GET's "ok" tolerance and POST's no-op tolerance are the SAME constant so a
-// row the audit reports as ok can never be mutated by a follow-up POST.
-const OK_TOLERANCE = 0.01;
-
-type Verdict = "ok" | "tax-inflated" | "drift" | "no-items" | "has-sections";
-function classify(stored: number, subtotal: number, expectedBilled: number, itemCount: number, sectionCount: number): Verdict {
-    // A section header mirrors the total of the lines beneath it, so no subtotal derived from
-    // these rows is trustworthy — including the one POST would write back. Reported ahead of
-    // every other verdict so the row can never be recomputed to a number nobody can justify.
-    if (sectionCount > 0) return "has-sections";
-    if (itemCount === 0) return "no-items";
-    if (Math.abs(stored - subtotal) <= OK_TOLERANCE) return "ok";
-    if (Math.abs(stored - expectedBilled) <= 0.02) return "tax-inflated";
-    return "drift";
-}
+// GET and POST share one verdict function (classifyCoTotal, beside the money math it must
+// agree with) so a row the audit reports as ok can never be mutated by a follow-up POST —
+// and, just as importantly, a row the send/approve guards block can never be reported ok.
+const classify = classifyCoTotal;
 
 export async function GET(req: Request) {
     if (!authorized(req)) return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
@@ -197,10 +186,17 @@ export async function POST(req: Request) {
             return { ok: false as const, error: `${co.code} has no line items — nothing to recompute from; review by hand.` };
         }
         if (verdict === "ok") {
+            // Cents-exact, so this really is a no-op: send and approve compare the same
+            // two integers and will let the row through.
             return { ok: true as const, changed: false, code: co.code, totalAmount: stored, note: "Already equals the item subtotal." };
         }
         if (verdict === "drift" && force !== true) {
-            return { ok: false as const, error: `${co.code} is a drift row (stored $${stored.toFixed(2)} matches neither the item subtotal $${subtotal.toFixed(2)} nor subtotal+tax $${expectedBilled.toFixed(2)}) — pass force:true only after a human confirms the items are canonical.` };
+            // Sub-cent drift is a rounding artifact, not an edit anyone made on purpose —
+            // say so, because that row is hard-blocked from send and approve until it is fixed.
+            const rounding = Math.abs(Math.round(stored * 100) - Math.round(subtotal * 100)) <= 1
+                ? ` It is off by a single cent, which send and approve reject outright, so force:true is the intended fix here.`
+                : "";
+            return { ok: false as const, error: `${co.code} is a drift row (stored $${stored.toFixed(2)} matches neither the item subtotal $${subtotal.toFixed(2)} nor subtotal+tax $${expectedBilled.toFixed(2)}) — pass force:true only after a human confirms the items are canonical.${rounding}` };
         }
         await tx.changeOrder.update({
             where: { id: changeOrderId },

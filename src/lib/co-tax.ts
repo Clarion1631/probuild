@@ -79,6 +79,50 @@ export function coItemsSubtotal(items: Array<{ type?: string | null; quantity?: 
     ), 0) / 100;
 }
 
+export type CoTotalVerdict = "ok" | "tax-inflated" | "drift" | "no-items" | "has-sections";
+
+/** Cents, rounded exactly the way the send and approve guards round before comparing. */
+const toCents = (n: number) => Math.round((Number(n) || 0) * 100);
+
+// The legacy editor wrote `subtotal * (1 + rate)` in one multiply, which can land a cent away
+// from the guards' `round(subtotal) + round(subtotal * rate)`. That slack belongs to the
+// tax-inflated *diagnosis* only — never to "ok".
+const TAX_INFLATED_SLACK_CENTS = 2;
+
+/**
+ * Classify a stored change-order totalAmount against the subtotal its items produce.
+ *
+ * "ok" is cents-exact on purpose. approveChangeOrderCore and the send guard both compare
+ * `storedSubtotalCents !== renderedSubtotalCents` with no tolerance, so a row one cent off
+ * is hard-blocked from send and approve. Reporting it "ok" made the audit POST decline to
+ * repair it too ("already correct"), leaving the change order stuck with no way out. A
+ * one-cent difference must therefore fall through to a repairable verdict.
+ */
+export function classifyCoTotal(
+    stored: number,
+    subtotal: number,
+    expectedBilled: number,
+    itemCount: number,
+    sectionCount: number,
+): CoTotalVerdict {
+    // A section header mirrors the total of the lines beneath it, so no subtotal derived from
+    // these rows is trustworthy — including the one a repair would write back. Reported ahead of
+    // every other verdict so the row can never be recomputed to a number nobody can justify.
+    if (sectionCount > 0) return "has-sections";
+    if (itemCount === 0) return "no-items";
+    const storedCents = toCents(stored);
+    const subtotalCents = toCents(subtotal);
+    if (storedCents === subtotalCents) return "ok";
+    const billedCents = toCents(expectedBilled);
+    // Only meaningful when tax actually moves the number. On a tax-exempt change order
+    // expectedBilled *is* the subtotal, and calling a stray cent "tax-inflated" would both
+    // misreport the cause and skip the human confirmation a drift row requires.
+    if (billedCents !== subtotalCents && Math.abs(storedCents - billedCents) <= TAX_INFLATED_SLACK_CENTS) {
+        return "tax-inflated";
+    }
+    return "drift";
+}
+
 export function coTaxLabel(estimate: EstimateTaxInfo): string {
     if (estimate?.taxExempt) return "Tax Exempt";
     const pctDisplay = (coTaxRate(estimate) * 100).toFixed(1).replace(/\.0$/, "");
