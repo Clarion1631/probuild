@@ -172,7 +172,7 @@ import BudgetStrip from "./BudgetStrip";
 const POQuickCreateModal = dynamic(() => import("./POQuickCreateModal"), { ssr: false });
 const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), { ssr: false });
 
-import { internalBudget, derivedMarginPct } from "@/lib/budget-math";
+import { internalBudget, derivedMarginPct, marginPatchForRate } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
 import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
@@ -2743,7 +2743,20 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                         <input
                                                                             type="number"
                                                                             value={item.unitCost}
-                                                                            onChange={e => updateItem(item.id, { unitCost: e.target.value })}
+                                                                            onChange={e => {
+                                                                                // Margin is derived from the cost/price pair, so moving the price
+                                                                                // has to move the margin with it. Without this, price 100 -> 200
+                                                                                // left rate 75 sitting next to a stored 25% while the line was
+                                                                                // really running 62.5%. The rate is NOT touched — the budget cost
+                                                                                // is unchanged by a price edit.
+                                                                                // No budget rate means there is no derived margin to keep in sync,
+                                                                                // and a price edit is not the place to clear one.
+                                                                                const rate = parseFloat(item.budgetRate ?? item.baseCost ?? "") || 0;
+                                                                                updateItem(item.id, {
+                                                                                    unitCost: e.target.value,
+                                                                                    ...(rate > 0 ? marginPatchForRate(rate, parseFloat(e.target.value) || 0) : {}),
+                                                                                });
+                                                                            }}
                                                                             readOnly={isLocked}
                                                                             aria-label="Unit cost"
                                                                             className={`w-20 focus:outline-none rounded px-1 py-1 text-right transition text-sm font-medium ${isLocked ? "bg-transparent text-slate-400 cursor-default" : "bg-transparent focus:bg-white focus:ring-1 ring-slate-200 hover:bg-slate-50 text-slate-700"}`}

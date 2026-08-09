@@ -163,8 +163,15 @@ export function formatDerivedRate(rate: number, price: number): string {
   // A zero rate reads as "no budget" (internalBudget returns null, saveEstimate persists null),
   // which would contradict any non-zero margin stored beside it.
   if (!Number.isFinite(rate) || rate <= 0) return "0.00";
+  return rate.toFixed(derivedRateDecimals(price));
+}
+
+/** Decimal places formatDerivedRate stores a rate at, at this price scale. Exported shape of the
+ *  rule so marginIsStale can size its tolerance from the SAME rounding — if these two ever
+ *  disagree, healthy rows start warning. */
+export function derivedRateDecimals(price: number): number {
   const needed = Number.isFinite(price) && price > 0 ? Math.ceil(4 - Math.log10(price)) : 2;
-  return rate.toFixed(Math.min(10, Math.max(2, needed)));
+  return Math.min(10, Math.max(2, needed));
 }
 
 /**
@@ -202,6 +209,99 @@ export function costFromMargin(sell: number, marginPct: number): number {
 export function derivedMarginPct(rate: number, price: number): number {
   if (!Number.isFinite(rate) || !Number.isFinite(price) || price <= 0) return 0;
   return clampMarginPct((1 - rate / price) * 100);
+}
+
+/**
+ * The margin a rate/price pair actually implies, UNCLAMPED — or null when no margin exists
+ * (non-finite input, or a sell price of zero, which has no margin to speak of).
+ *
+ * derivedMarginPct is this value clamped. The two only disagree when the pair cannot be
+ * expressed inside [MIN_MARGIN_PCT, MAX_MARGIN_PCT], which is exactly when the stored
+ * markupPercent stops describing the stored rate — see marginIsUnrepresentable.
+ */
+export function rawMarginPct(rate: number, price: number): number | null {
+  if (!Number.isFinite(rate) || !Number.isFinite(price) || price <= 0) return null;
+  return (1 - rate / price) * 100;
+}
+
+/**
+ * True when the budget rate sitting next to a sell price cannot be described by any storable
+ * margin, so the clamped markupPercent persisted beside it is a lie.
+ *
+ * Two ways in, and BOTH matter:
+ *  - rate > price  — the line loses money. Clamps to 0, which claims cost === price.
+ *  - rate < price/100 — margin over 99. Clamps to 99, which claims a cost 100x the real one.
+ *  - price <= 0 with a rate — no sell to earn a margin on, and any stored margin is meaningless.
+ *
+ * We deliberately do NOT rewrite the rate to make the margin true: the rate is a cost the user
+ * typed, and silently moving it is worse than showing a warning (product decision, 2026-08-09 —
+ * the alternative was lowering MIN_MARGIN_PCT below 0, which would have put a sign change
+ * through all 19 consumers of markupPercent).
+ */
+export function marginIsUnrepresentable(rate: number, price: number): boolean {
+  if (rate === 0) return false; // no budget rate at all — nothing to contradict
+  // A negative or non-finite rate is not "no budget", it is a bad budget: it still persists to
+  // budgetRate (and internalBudget will happily multiply it out), while marginPatchForRate
+  // clears the margin, which then displays as the default. Warn instead of reading it as absent.
+  if (!Number.isFinite(rate) || rate < 0) return true;
+  if (!Number.isFinite(price) || price <= 0) return true; // a cost with no sell price
+  const raw = rawMarginPct(rate, price);
+  if (raw === null) return false;
+  return raw < MIN_MARGIN_PCT || raw > MAX_MARGIN_PCT;
+}
+
+/**
+ * How far apart a stored and a derived margin may sit before they count as disagreeing.
+ *
+ * A row written by either writer can legitimately be off by BOTH of these at once, so the
+ * tolerance is their sum. Sizing it at just one of them makes ordinary saves warn — rate $2.95
+ * at price $8 stores 63.13 against a true 63.125, exactly one half-step out.
+ *
+ *  - marginPatchForRate persists the margin at 2dp: half a step is 0.005 of margin.
+ *  - normalizeMarginInput persists the typed margin verbatim and derives the RATE, which
+ *    formatDerivedRate rounds to derivedRateDecimals(price) places. Half a step of rate is
+ *    (0.5 * 10^-d / price) * 100 percent of margin — the term that scales with price.
+ *
+ * Both bounds are attained exactly, and floating-point subtraction lands a hair either side of
+ * them, so the comparison must have real headroom rather than sit on the boundary.
+ */
+const MARGIN_STORAGE_HALF_STEP = 0.005;
+
+function rateRoundingMarginDrift(price: number): number {
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  return ((0.5 * 10 ** -derivedRateDecimals(price)) / price) * 100;
+}
+
+/**
+ * True when a margin already stored on the item does not describe the rate/price pair stored
+ * beside it. Distinct from marginIsUnrepresentable: this catches rows where the derived margin
+ * IS representable but the persisted number is simply stale — the shape left behind by editing
+ * a sell price before that path re-derived the margin (price 100 -> 200 leaving rate 75 next to
+ * a stored 25 while the line really ran 62.5%). Edits self-heal such a row, so this only ever
+ * flags history.
+ */
+export function marginIsStale(storedPct: number | null, rate: number, price: number): boolean {
+  if (storedPct === null || !Number.isFinite(storedPct)) return false;
+  if (!Number.isFinite(rate) || rate <= 0) return false;
+  const raw = rawMarginPct(rate, price);
+  if (raw === null) return false;
+  // An unrepresentable pair is reported by marginIsUnrepresentable; don't double-flag it.
+  if (raw < MIN_MARGIN_PCT || raw > MAX_MARGIN_PCT) return false;
+  return Math.abs(raw - storedPct) > MARGIN_STORAGE_HALF_STEP + rateRoundingMarginDrift(price);
+}
+
+/**
+ * The patch that must be written whenever a budget rate and a sell price are paired up —
+ * from the rate input, and from the sell-price input that silently invalidated it before.
+ *
+ * Rate <= 0 (or blank) means "no budget", so the margin is cleared rather than left stale:
+ * saveEstimate reads a null markupPercent as the default, which is what an item with no
+ * budget looks like anyway. A margin left over from a deleted rate describes nothing.
+ */
+export function marginPatchForRate(rate: number, price: number): { markupPercent: string | null } {
+  if (!Number.isFinite(rate) || rate <= 0) return { markupPercent: null };
+  if (!Number.isFinite(price) || price <= 0) return { markupPercent: null };
+  return { markupPercent: derivedMarginPct(rate, price).toFixed(2) };
 }
 
 /**
