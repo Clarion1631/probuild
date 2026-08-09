@@ -633,6 +633,9 @@ test("the tax-inflated slack cannot swallow a value below the subtotal", () => {
     // without the confirmation a drift row requires.
     assert.equal(classifyCoTotal(999.99, 1000, 1000.01, 4, 0), "drift");
     assert.equal(classifyCoTotal(1000.01, 1000, 1000.01, 4, 0), "tax-inflated");
+    // Nor a cent BELOW expectedBilled: the single multiply is never the smaller of the two,
+    // so $1087.99 against a $1088.00 expectation is not the legacy bug and needs force.
+    assert.equal(classifyCoTotal(1087.99, 1000, 1088, 4, 0), "drift");
 });
 
 test("a stray cent on a tax-exempt CO is drift, not a mislabelled tax inflation", () => {

@@ -136,9 +136,13 @@ export function classifyCoTotal(
     // tax-exempt CO expectedBilled *is* the subtotal, and a symmetric window would let a
     // stored value BELOW the subtotal — which the legacy tax-inclusive formula can never
     // produce — claim the tax-inflated verdict and skip the confirmation a drift row needs.
+    // The window is [billed, billed + 1], not ±1: the single multiply is never SMALLER than
+    // the staged one, so a value below expectedBilled is something else and must earn its
+    // repair through force.
+    const overBilled = storedCents - billedCents;
     if (billedCents > subtotalCents
         && storedCents > subtotalCents
-        && Math.abs(storedCents - billedCents) <= TAX_INFLATED_SLACK_CENTS) {
+        && overBilled >= 0 && overBilled <= TAX_INFLATED_SLACK_CENTS) {
         return "tax-inflated";
     }
     return "drift";

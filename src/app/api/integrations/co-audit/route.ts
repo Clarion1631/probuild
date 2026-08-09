@@ -86,7 +86,8 @@ export async function GET(req: Request) {
         // billChangeOrderCore refuses a signed CO whose schedule rows do not sum to the
         // subtotal, so a repair that moves totalAmount without them trades one stuck state
         // for a later one. Surfaced here, refused by POST.
-        const scheduleCents = co.paymentSchedules.reduce((s, r) => s + Math.round(Number(r.amount) * 100), 0);
+        const scheduleRowCents = co.paymentSchedules.map(r => Math.round(Number(r.amount) * 100));
+        const scheduleCents = scheduleRowCents.reduce((s, c) => s + c, 0);
 
         const milestones = coMilestones
             .filter(m => m.invoice.projectId === co.project.id && m.name.startsWith(`${co.code} — `))
@@ -106,7 +107,8 @@ export async function GET(req: Request) {
             verdict,
             scheduleRowCount: co.paymentSchedules.length,
             scheduleTotal: scheduleCents / 100,
-            scheduleMatchesSubtotal: co.paymentSchedules.length === 0 || scheduleCents === Math.round(subtotal * 100),
+            scheduleMatchesSubtotal: co.paymentSchedules.length === 0
+                || (scheduleCents === Math.round(subtotal * 100) && scheduleRowCents.every(c => c > 0)),
             storedTotalAmount: stored,
             storedBalanceDue: rc(Number(co.balanceDue)),
             itemCount: co.items.length,
@@ -229,9 +231,16 @@ export async function POST(req: Request) {
             select: { amount: true },
         });
         if (schedules.length) {
-            const scheduleCents = schedules.reduce((s, r) => s + Math.round(Number(r.amount) * 100), 0);
+            const rowCents = schedules.map(r => Math.round(Number(r.amount) * 100));
+            const scheduleCents = rowCents.reduce((s, c) => s + c, 0);
             if (scheduleCents !== Math.round(subtotal * 100)) {
                 return { ok: false as const, error: `${co.code} has ${schedules.length} payment schedule row(s) summing to $${(scheduleCents / 100).toFixed(2)}, which is not the item subtotal $${subtotal.toFixed(2)}. Billing rejects that mismatch after signature, so rebalance the schedule in the editor instead of resetting the total here.` };
+            }
+            // Billing also refuses any nonpositive row ("schedule rows reach or exceed the
+            // subtotal before the final remainder"), so a sum check alone would still let a
+            // 0.00 or negative row through to fail after signature.
+            if (rowCents.some(c => c <= 0)) {
+                return { ok: false as const, error: `${co.code} has a payment schedule row of $0.00 or less. Billing refuses those after signature, so fix the schedule in the editor before resetting the total here.` };
             }
         }
         await tx.changeOrder.update({
