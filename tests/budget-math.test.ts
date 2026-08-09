@@ -25,6 +25,8 @@ import {
     marginIsUnrepresentable,
     marginIsStale,
     marginPatchForRate,
+    marginIsSettable,
+    marginPatchForInput,
 } from "../src/lib/budget-math";
 
 test("clampMarginPct holds the representable range", () => {
@@ -643,4 +645,175 @@ test("the price-edit defect shape reads as stale, not unrepresentable, and repai
     assert.equal(marginPatchForRate(75, 200).markupPercent, "62.50");
     // ...and once repaired it stops being flagged.
     assert.equal(marginIsStale(62.5, 75, 200), false);
+});
+
+/**
+ * The gap #331 surfaced but deliberately left open: with no sell price the margin input wrote
+ * `markupPercent` while the rate write was skipped by its own `price > 0` guard, so the row
+ * persisted a margin describing nothing. Product call 2026-08-09 (same precedent as #331 — never
+ * rewrite a number the user typed): disable the input instead. marginIsSettable is that gate.
+ */
+test("marginIsSettable is true exactly when a sell price exists to earn a margin on", () => {
+    assert.equal(marginIsSettable(100), true);
+    assert.equal(marginIsSettable(0.01), true);
+
+    // No sell price — every margin yields the same cost (0), so none of them mean anything.
+    assert.equal(marginIsSettable(0), false);
+    // A negative sell price is not a scale a share can be taken of either.
+    assert.equal(marginIsSettable(-100), false);
+    // Non-finite prices must gate the same way, or `1e999` in the price field re-opens the hole:
+    // Infinity passes a bare `price > 0` check while costFromMargin returns NaN/Infinity.
+    assert.equal(marginIsSettable(NaN), false);
+    assert.equal(marginIsSettable(Infinity), false);
+    assert.equal(marginIsSettable(-Infinity), false);
+});
+
+/**
+ * One-directional on purpose: every price the gate rejects is a price the #331 row warning
+ * already flags, so a disabled margin input is never a silently-broken row. The converse is NOT
+ * claimed — marginIsUnrepresentable also fires on rate-side reasons (rate > price, rate under
+ * price/100) for rows whose margin is perfectly settable, which is why an earlier equivalence
+ * assertion here was wrong.
+ */
+test("every price marginIsSettable rejects is a price the row already warns about", () => {
+    for (const price of [0, -100, NaN, Infinity, -Infinity]) {
+        assert.equal(marginIsSettable(price), false);
+        // Any real budget rate on such a row must warn — that is what makes the disable honest.
+        for (const rate of [0.01, 1, 100, 1e6]) {
+            assert.equal(
+                marginIsUnrepresentable(rate, price),
+                true,
+                `price ${price} with rate ${rate} is gated but not warned`,
+            );
+        }
+    }
+});
+
+/**
+ * marginPatchForInput IS the margin input's write — the component does nothing but apply what it
+ * returns. Null means no write at all, which is what makes the margin and its rate inseparable:
+ * the defect was persisting markupPercent while the rate write was skipped for want of a price.
+ */
+test("marginPatchForInput refuses to write anything without a sell price", () => {
+    for (const price of [0, -100, NaN, Infinity, -Infinity]) {
+        for (const typed of ["", "0", "25", "99", "100", "-10"]) {
+            assert.equal(
+                marginPatchForInput(typed, price),
+                null,
+                `price ${price}, typed ${typed}: expected no write`,
+            );
+        }
+    }
+});
+
+/**
+ * The other half: once a sell price exists the patch always carries ALL THREE fields, and the
+ * margin it persists is the one the rate it persists actually implies. A patch that set the
+ * margin without the rate (or vice versa) is the bug.
+ *
+ * The 1e-9 price is the case Codex round 1 caught: derivedRateDecimals caps at 10 places, so the
+ * derived cost used to format as "0.0000000000" — a zero rate reads as "no budget" while a 99%
+ * margin sits beside it, and marginIsStale exempts rate 0 so nothing warned.
+ */
+test("marginPatchForInput writes margin and rate together, and they agree", () => {
+    for (const price of [1e-9, 0.01, 0.49, 8, 100, 1500, 1e6]) {
+        for (const typed of ["", "0", "25", "63.125", "99", "100", "-10"]) {
+            const patch = marginPatchForInput(typed, price);
+            assert.ok(patch, `price ${price}, typed ${typed}: expected a write`);
+            // Rate and baseCost are one value written to two mirrored columns.
+            assert.equal(patch.budgetRate, patch.baseCost);
+
+            const rate = parseFloat(patch.budgetRate);
+            // A zero rate is "no budget", which would contradict any margin stored next to it.
+            assert.ok(rate > 0, `price ${price}, typed ${typed}: rate stored as ${patch.budgetRate}`);
+            assert.notEqual(internalBudget({ quantity: 1, budgetRate: patch.budgetRate }), null);
+
+            // The persisted margin (null renders as the default) must describe the persisted rate.
+            // marginIsStale is the project's own "do these disagree" predicate, tolerance included:
+            // a freshly written pair must never trip the warning the row renders.
+            const shown = patch.markupPercent === null ? DEFAULT_MARGIN_PCT : parseFloat(patch.markupPercent);
+            assert.equal(
+                marginIsStale(shown, rate, price),
+                false,
+                `price ${price}, typed ${typed}: rate ${patch.budgetRate} does not describe ${shown}%`,
+            );
+            assert.equal(
+                marginIsUnrepresentable(rate, price),
+                false,
+                `price ${price}, typed ${typed}: the write itself produced an unrepresentable pair`,
+            );
+        }
+    }
+});
+
+/**
+ * INVARIANT behind the blocker above, held directly on formatDerivedRate: a positive cost must
+ * never be stored as zero, at ANY price scale. The doc comment promises exactly this; the
+ * 10-decimal cap used to break it below about 1e-8.
+ */
+test("formatDerivedRate never stores a positive cost as zero, at any scale", () => {
+    for (const price of [1e-12, 1e-9, 1e-6, 0.01, 1, 1500]) {
+        for (const margin of [0, 25, 99]) {
+            const cost = costFromMargin(price, margin);
+            if (cost <= 0) continue;
+            const stored = formatDerivedRate(cost, price);
+            assert.ok(
+                parseFloat(stored) > 0,
+                `cost ${cost} at price ${price} (margin ${margin}%) stored as "${stored}"`,
+            );
+        }
+    }
+});
+
+/**
+ * The scales Codex round 2 named. Any FIXED number of decimal places has a price below which the
+ * derived cost rounds to zero (toFixed caps at 100 places, so even the padded fallback died around
+ * 5e-101), and a padded-but-inexact rate re-derives a margin hundreds of points off the one stored
+ * beside it — which marginIsStale's tolerance, sized from derivedRateDecimals, is far too generous
+ * to catch. The fix is exact serialization, so the assertion is exactness, not "enough digits".
+ */
+test("formatDerivedRate round-trips a positive rate exactly at any representable scale", () => {
+    for (const rate of [Number.MIN_VALUE, 4.9e-101, 5e-101, 1e-11, 9.49e-11, 1e-9, 0.0049, 75, 1e6]) {
+        for (const price of [Number.MIN_VALUE, 1e-11, 1e-9, 0.49, 100, 1500]) {
+            const stored = formatDerivedRate(rate, price);
+            assert.ok(parseFloat(stored) > 0, `rate ${rate} at price ${price} stored as "${stored}"`);
+            // Exact, not merely non-zero: an inexact rate is a margin that lies.
+            assert.equal(parseFloat(stored), rate, `rate ${rate} at price ${price} stored as "${stored}"`);
+        }
+    }
+});
+
+/**
+ * The patch-level consequence: at these scales the stored rate used to exceed the sell price
+ * outright (price 9.49e-11 at a 25% margin stored 1e-10) or imply 20% where 25% was persisted.
+ * Asserts the margin the stored rate implies EQUALS the margin stored beside it, rather than
+ * leaning on marginIsStale — whose tolerance is too loose to be a real check down here.
+ */
+test("marginPatchForInput stays exact at extreme sell-price scales", () => {
+    for (const price of [1e-11, 1.44e-11, 1.49e-11, 9.49e-11, 1e-9, 1e-6]) {
+        for (const typed of ["0", "25", "99", "100"]) {
+            const patch = marginPatchForInput(typed, price);
+            assert.ok(patch, `price ${price}, typed ${typed}: expected a write`);
+            const rate = parseFloat(patch.budgetRate);
+            assert.ok(rate > 0 && rate <= price, `price ${price}, typed ${typed}: rate ${rate} out of range`);
+            const shown = patch.markupPercent === null ? DEFAULT_MARGIN_PCT : parseFloat(patch.markupPercent);
+            assert.ok(
+                Math.abs(rawMarginPct(rate, price)! - shown) < 1e-9,
+                `price ${price}, typed ${typed}: rate implies ${rawMarginPct(rate, price)}%, stored ${shown}%`,
+            );
+            assert.equal(marginIsUnrepresentable(rate, price), false);
+        }
+    }
+});
+
+/**
+ * A subnormal price underflows costFromMargin to zero before formatting ever runs. A zero rate is
+ * "no budget", so pairing it with a margin is the same contradiction from the other side — the
+ * patch refuses rather than storing it.
+ */
+test("marginPatchForInput refuses to write when the derived cost underflows to zero", () => {
+    assert.equal(costFromMargin(Number.MIN_VALUE, 99), 0, "precondition: this price underflows");
+    assert.equal(marginPatchForInput("99", Number.MIN_VALUE), null);
+    // A margin of 0 leaves the cost equal to the price, which does not underflow — still writable.
+    assert.notEqual(marginPatchForInput("0", Number.MIN_VALUE), null);
 });

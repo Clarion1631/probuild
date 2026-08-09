@@ -3,9 +3,9 @@
 import { useState } from "react";
 import { formatCurrency } from "@/lib/utils";
 import {
-    internalBudget, bufferPercent, bufferColor, bufferBgColor, costFromMargin,
-    normalizeMarginInput, formatDerivedRate, marginPatchForRate, marginIsUnrepresentable,
-    marginIsStale, rawMarginPct, DEFAULT_MARGIN_PCT, MAX_MARGIN_PCT,
+    internalBudget, bufferPercent, bufferColor, bufferBgColor,
+    marginPatchForInput, marginPatchForRate, marginIsUnrepresentable,
+    marginIsStale, marginIsSettable, rawMarginPct, DEFAULT_MARGIN_PCT, MAX_MARGIN_PCT,
 } from "@/lib/budget-math";
 
 const UNIT_SUGGESTIONS = ["hrs", "sqft", "lf", "ea", "lump sum", "units", "days"];
@@ -46,6 +46,9 @@ export default function BudgetStrip({
     const isLead = contextType === "lead";
     const isPoLocked = links.length > 0;
     const sellPrice = parseFloat(item.unitCost) || 0;
+    // A margin with no sell price to be a share of can't be stored honestly — the rate write is
+    // skipped and markupPercent ends up describing nothing (the gap #331 surfaced but left open).
+    const marginInputDisabled = isPoLocked || !marginIsSettable(sellPrice);
 
     // The rate is whatever the user typed — we never rewrite it to make the margin true. When the
     // pair can't be expressed as a storable margin, say so on the row instead of letting the
@@ -180,15 +183,21 @@ export default function BudgetStrip({
                             // unitCost is never written — customer pricing stays locked.
                             // `stored` and `derivedFrom` come out of one normalization so the margin
                             // we persist is always the margin the rate was derived from.
-                            const { stored, derivedFrom } = normalizeMarginInput(e.target.value);
-                            const price = parseFloat(item.unitCost) || 0;
-                            const rateStr = price > 0 ? formatDerivedRate(costFromMargin(price, derivedFrom), price) : null;
-                            updateItem(item.id, {
-                                markupPercent: stored,
-                                ...(rateStr !== null ? { budgetRate: rateStr, baseCost: rateStr } : {}),
-                            });
+                            // One patch or none: the margin and the rate derived from it are never
+                            // written apart. Persisting the margin while the rate write was skipped
+                            // for want of a sell price is the defect this closes — null here means
+                            // the margin can't describe anything, and the input is disabled to match.
+                            const patch = marginPatchForInput(e.target.value, parseFloat(item.unitCost) || 0);
+                            if (patch) updateItem(item.id, patch);
                         }}
-                        disabled={isPoLocked}
+                        disabled={marginInputDisabled}
+                        title={
+                            isPoLocked
+                                ? undefined
+                                : marginInputDisabled
+                                    ? "Enter a sell price before setting a margin — a margin is a share of the sell price."
+                                    : undefined
+                        }
                         className="w-14 bg-white border border-indigo-200 rounded px-1.5 pr-4 py-1 text-right text-xs focus:ring-1 ring-indigo-400 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed"
                         step="any"
                     />
