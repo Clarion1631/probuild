@@ -7,6 +7,7 @@ import {
     rm,
     serializeEstimateItemsForSave,
     normalizeEstimateItemForSave,
+    isEstimateSectionRow,
 } from "@/lib/estimate-item-payload";
 
 /** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
@@ -130,7 +131,7 @@ function removePendingLinks(existing: PendingAssociationRestore | null, toRemove
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
-import { saveEstimate, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, restoreEstimateItemAssociations, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
+import { saveEstimate, getEstimateItemCostCodes, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, restoreEstimateItemAssociations, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
 import type { RestoreEstimateItemAssociationsResult } from "@/lib/actions";
 import RichTextEditor from "@/components/RichTextEditor";
 import { useRouter } from "next/navigation";
@@ -457,6 +458,177 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     useEffect(() => {
         lastSavedStateRef.current = JSON.stringify(getEstimateSnapshot());
     }, []);
+
+    // ─── Auto-assigned cost code catch-up ────────────────────────────────────────────────────
+    // The server auto-codes uncoded line items after every save (autoAssignPhasesForEstimate,
+    // scheduled post-response via after()) so crew clock-in isn't blocked on someone clicking
+    // "Auto-Assign Phases". Those writes deliberately do NOT bump Estimate.itemsRevision — they
+    // run after EVERY save, so bumping would make this editor's very next save fail the CAS and
+    // wedge it into a permanent "changed by someone else" conflict. The cost of that choice is
+    // that nothing tells us the codes were assigned: our rows still say costCodeId: null, and our
+    // next save writes that null straight back over them. So we go and ask.
+    //
+    // The AI classification takes seconds, and after() only starts once the response is already
+    // on the wire, so there is nothing to await — we poll on a backoff and stop as soon as every
+    // row we sent uncoded has come back with a code.
+    //
+    // KNOWN LIMIT: four attempts, then it gives up. If the classifier is still running past the
+    // last one (or a queued rerun fires later), those codes stay invisible to this tab and the
+    // next save reverts them exactly as it did before this catch-up existed. That degrades to the
+    // old behaviour, not worse than it — closing the gap properly needs a durable job status to
+    // poll rather than a fixed backoff, which is not worth building for this.
+    const RECONCILE_DELAYS_MS = [3000, 8000, 15000, 30000];
+    // Invalidates a run. Bumped when a NEW save starts (not when it finishes) and on unmount, so
+    // an in-flight poll whose answer was classified against a superseded version of the items
+    // drops its result instead of merging it.
+    const costCodeReconcileRunRef = useRef(0);
+    const costCodeReconcileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const cancelCostCodeReconcile = useCallback(() => {
+        costCodeReconcileRunRef.current++;
+        if (costCodeReconcileTimerRef.current) {
+            clearTimeout(costCodeReconcileTimerRef.current);
+            costCodeReconcileTimerRef.current = null;
+        }
+    }, []);
+    // Clearing the timer alone is not enough on unmount: a poll already past its await would come
+    // back, call setItems on a dead component and schedule the next attempt. Bumping the run token
+    // is what actually stops it.
+    useEffect(() => cancelCostCodeReconcile, [cancelCostCodeReconcile]);
+
+    // The rows the server's auto-assigner will consider, keyed by id and valued by the name AND
+    // description they currently carry. Both fields matter: the classifier reads both and the
+    // server guards its write with both, so the merge has to match on both too.
+    //
+    // Section headers are excluded via the SHARED `isEstimateSectionRow` predicate — the same one
+    // the server now uses. These two used to disagree (client: `type === "Section"`, server:
+    // parentless-with-children), which meant a nested or empty section could be coded server-side,
+    // be invisible to this filter, and get nulled straight back out by the next save.
+    const buildUncodedInputs = useCallback((rows: any[]) => {
+        const inputs = new Map<string, { name: string; description: string }>();
+        for (const item of rows) {
+            if (!item.id || item.costCodeId) continue;
+            if (isEstimateSectionRow(item, rows)) continue;
+            inputs.set(String(item.id), { name: item.name, description: item.description || "" });
+        }
+        return inputs;
+    }, []);
+
+    // Applies fetched codes to whatever the newest rows are.
+    //
+    // This is a PURE functional updater and nothing else — no snapshot read, no ref write, no
+    // clean/dirty bookkeeping. That is the whole point. Every earlier shape of this merge computed
+    // a `merged` array from some read of the rows (`itemsRef`, an updater's `prev`, committed
+    // `items`) and handed that whole array back to React, which meant a read that was even one
+    // update behind would REPLACE — and silently revert — a row the user had just added, edited or
+    // deleted. `prev.map(...)` inside `setItems` never has that problem: React always passes the
+    // latest queued state, and we transform it rather than replacing it.
+    //
+    // Consequences of keeping it pure, both deliberate:
+    //  - `itemsRef` is NOT written here. The existing mirroring effect catches it up after commit,
+    //    which is exactly the guarantee we want; writing it from here is what let a stale array
+    //    overwrite a newer synchronous one (updateItem, delete).
+    //  - `lastSavedStateRef` is NOT advanced, so the merge leaves the editor dirty and the next
+    //    save re-persists these codes. That write is a no-op against the database (the codes are
+    //    already there), and one redundant save is a cheap price for removing every path where
+    //    this could mark a user's genuinely unsaved edits as already saved.
+    const applyCostCodeMerge = useCallback((assigned: Map<string, string>, inputs: Map<string, { name: string; description: string }>) => {
+        setItems(prev => prev.map((item: any) => {
+            const id = item.id ? String(item.id) : null;
+            const code = id ? assigned.get(id) : undefined;
+            // Fill-only: a row the user has coded by hand since the save keeps their value, which
+            // mirrors the server's own `costCodeId: null` write guard.
+            if (!id || !code || item.costCodeId != null) return item;
+            // Input-matched, on both fields the classifier reads, mirroring the server's
+            // `name`+`description` write guard: a code classified for "Electrical" must not land on
+            // a row the user has since edited to read "Plumbing".
+            const at = inputs.get(id);
+            if (!at || item.name !== at.name || (item.description || "") !== at.description) return item;
+            return { ...item, costCodeId: code };
+        }));
+    }, []);
+
+    // `uncodedAtSave` maps item id -> the name and description that item was saved under. Both
+    // matter: the server classifies against both and guards its own write with both, so a row
+    // edited after the save never receives that stale classification. The merge applies the same
+    // guard locally.
+    const reconcileAutoAssignedCostCodes = useCallback((uncodedAtSave: Map<string, { name: string; description: string }>) => {
+        if (uncodedAtSave.size === 0) return;
+        const runId = ++costCodeReconcileRunRef.current;
+        if (costCodeReconcileTimerRef.current) clearTimeout(costCodeReconcileTimerRef.current);
+
+        const pending = new Map(uncodedAtSave);
+        let attempt = 0;
+
+        const scheduleNext = () => {
+            attempt++;
+            // Rows the classifier legitimately left uncoded never leave `pending`, so this always
+            // terminates on the attempt cap rather than on an empty map.
+            if (pending.size > 0 && attempt < RECONCILE_DELAYS_MS.length) {
+                costCodeReconcileTimerRef.current = setTimeout(poll, RECONCILE_DELAYS_MS[attempt]);
+            }
+        };
+
+        const poll = async () => {
+            // saveConflictRef: this session's view of the estimate is already known-stale and the
+            // user has been told to reload — merging server rows into it would only muddy that.
+            if (runId !== costCodeReconcileRunRef.current || saveConflictRef.current) return;
+            let serverItems: { id: string; costCodeId: string | null }[];
+            try {
+                serverItems = await getEstimateItemCostCodes(initialEstimate.id);
+            } catch (e) {
+                // Fail-soft, but not fail-once: a dropped connection or a redeploy mid-poll must
+                // not cost us the whole catch-up, so keep the backoff going. It is only when the
+                // attempts run out that we fall back to the old revert-on-next-save behaviour.
+                console.error("[EstimateEditor] cost-code reconcile failed:", e);
+                // Re-check first: a poll that was superseded WHILE the request was in flight must
+                // not schedule a follow-up. It would be harmless when it fired (the entry guard
+                // stops it), but it would still overwrite the live run's timer handle, so the
+                // cancel path would clear the wrong timeout.
+                if (runId === costCodeReconcileRunRef.current) scheduleNext();
+                return;
+            }
+            if (runId !== costCodeReconcileRunRef.current || saveConflictRef.current) return;
+
+            const assigned = new Map<string, string>();
+            for (const row of serverItems) {
+                if (row.costCodeId && pending.has(row.id)) assigned.set(row.id, row.costCodeId);
+            }
+
+            if (assigned.size > 0) {
+                // A COPY of `pending`, because the updater reads it after this function returns and
+                // the deletes below would otherwise empty it out from under the lookup.
+                applyCostCodeMerge(assigned, new Map(pending));
+                // Dropped from `pending` either way: the server has answered for these rows, and
+                // a row the merge skips (hand-coded or edited) is not going to become mergeable
+                // later.
+                for (const id of assigned.keys()) pending.delete(id);
+            }
+
+            scheduleNext();
+        };
+
+        costCodeReconcileTimerRef.current = setTimeout(poll, RECONCILE_DELAYS_MS[0]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- RECONCILE_DELAYS_MS is a constant literal
+    }, [initialEstimate.id, applyCostCodeMerge]);
+
+    // A save is not the only thing that auto-codes items: approveEstimate runs the same
+    // no-revision auto-assigner. A tab left open while the client signs elsewhere never saw those
+    // codes, so its next save wrote nulls over them — the original bug, just reached by a
+    // different door. Re-checking whenever the tab regains focus covers that and any other
+    // out-of-band assignment, and costs nothing when there is nothing uncoded (the reconcile
+    // returns immediately on an empty set).
+    useEffect(() => {
+        const recheck = () => {
+            if (document.visibilityState === "hidden" || saveConflictRef.current) return;
+            reconcileAutoAssignedCostCodes(buildUncodedInputs(itemsRef.current));
+        };
+        window.addEventListener("focus", recheck);
+        document.addEventListener("visibilitychange", recheck);
+        return () => {
+            window.removeEventListener("focus", recheck);
+            document.removeEventListener("visibilitychange", recheck);
+        };
+    }, [reconcileAutoAssignedCostCodes, buildUncodedInputs]);
 
     // Derived: rolled-up total per section header, aggregating through nested sections
     const sectionTotals = useMemo(() => {
@@ -981,6 +1153,15 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 // The rows the change check just compared — reusing them is what keeps the
                 // comparison and the write from ever describing different things.
                 const mappedItems = currentSnapshot.items;
+                // Built from the payload itself so the set can't drift from what was actually sent.
+                const uncodedAtSave = buildUncodedInputs(mappedItems);
+
+                // Any catch-up still running belongs to an earlier version of these rows, and this
+                // save is about to rewrite them. Cancel it BEFORE awaiting saveEstimate, not after:
+                // cancelling only on the way out would leave a stale poll free to land its merge
+                // during the round-trip, where fill-only would then block the newer classification
+                // from ever replacing it.
+                cancelCostCodeReconcile();
                 const mappedSchedules = f.paymentSchedules.map((schedule: any, index: number) => ({
                     ...schedule,
                     order: index
@@ -1046,6 +1227,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
                 // Update the last saved state ref to the new state
                 lastSavedStateRef.current = currentSnapshotStr;
+
+                // This save just handed the server rows with no cost code, so its post-response
+                // auto-assign is about to code them behind our back without bumping the revision.
+                // Go collect the result, or our next save writes these nulls back over it.
+                // Started last, after lastSavedStateRef is settled, so the poll's clean/dirty
+                // measurement reads a consistent baseline.
+                reconcileAutoAssignedCostCodes(uncodedAtSave);
             } catch (e: any) {
                 console.error("[EstimateEditor] Failed to save estimate:", e);
                 // The conflict toast above already said it better than the generic failure toast.
@@ -2867,6 +3055,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                                     {/* Phase/Type pills + action buttons — hover only */}
                                                                     <div className="flex items-center gap-2 mt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto transition-opacity duration-150 [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                                         <select
+                                                                            // Stable hook for e2e/estimate-cost-code-catchup.spec.ts. Rows have no
+                                                                            // other reliable handle: a controlled input's live value isn't in the
+                                                                            // DOM attribute, so locating by the item name doesn't work.
+                                                                            data-testid={`item-cost-code-${item.id}`}
                                                                             value={item.costCodeId || ""}
                                                                             onChange={e => updateItem(item.id, { costCodeId: e.target.value || null })}
                                                                             className="bg-slate-100 hover:bg-slate-200 focus:bg-white focus:ring-1 ring-hui-border text-hui-textMuted text-[11px] rounded-full px-2.5 py-0.5 border-0 focus:outline-none cursor-pointer transition"

@@ -138,6 +138,11 @@ jobs:
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
       DAILY_LOG_MATCH_AI_MOCK: "1"
+      # Disables the post-save cost-code auto-assigner (lib/auto-assign-phases.ts). ANTHROPIC_API_KEY
+      # IS supplied below, so without this the real classifier fires on every estimate save in the
+      # suite and races estimate-cost-code-catchup.spec.ts, which simulates the assignment with a
+      # direct DB write — flaky results plus real API spend on every PR.
+      AUTO_ASSIGN_PHASES_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
