@@ -86,13 +86,28 @@ An integer revision is preferred over an `updatedAt` precondition because:
   permanent conflict loop after each save. (It can still silently overwrite a stale `costCodeId`
   from the editor — pre-existing behavior, unchanged by this work, noted here so the next reader
   doesn't think it regressed.)
+  - **REVISION 3 follow-up.** Still true, and still the right call — but the flip side of it was
+    a live bug: because nothing told the editor about those writes, its rows kept
+    `costCodeId: null` and its *next* save wrote that null straight back, reverting every
+    auto-assignment. The fix keeps the no-bump rule and makes the editor learn instead: after a
+    save that carried uncoded non-section rows, `reconcileAutoAssignedCostCodes`
+    (`EstimateEditor.tsx`) polls the read-only `getEstimateItemCostCodes` server action on a
+    backoff and merges the codes into local state **fill-only** — a row the user has coded by
+    hand since the save is never overwritten, mirroring the server's own `costCodeId: null`
+    write guard. The merge deliberately does not touch `itemsRevisionRef`: it is a local
+    catch-up to writes that never bumped the revision, so the editor's revision is still valid
+    and the merge must not look like a conflict to its next save.
 - ~~**Server-side item creators** are untouched.~~ **Superseded by REVISION 2:** server-side
   creators that add rows to an *existing* estimate now bump `itemsRevision` inside the same
   transaction as the insert (`addVoiceEstimateItem`, `gpt-estimate`'s rewrite), so a stale editor
   save is rejected instead of deleting the new rows as "removed by the user". Creators that build
-  a brand-new estimate need no bump. Known remaining gap: `scripts/import-houzz.mjs` can append
-  items to an existing estimate without locking or bumping — it is an operator-run offline import,
-  not live traffic, and is deliberately left alone here rather than widening this PR.
+  a brand-new estimate need no bump. ~~Known remaining gap: `scripts/import-houzz.mjs` can append
+  items to an existing estimate without locking or bumping.~~ **Closed in REVISION 3:** the item
+  importer skips estimates that already have rows, but it will happily fill an *empty*
+  pre-existing estimate, so it now bumps `itemsRevision` in the same `estimate.update` that
+  rewrites the totals, and only when it actually created rows. It still takes no lock — it is an
+  operator-run offline import, not live traffic, and concurrent live saves are not a scenario it
+  runs in.
 
 ## Goal 1 — schema
 

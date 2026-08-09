@@ -3333,6 +3333,30 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     return result;
 }
 
+/**
+ * Read-only: the current `costCodeId` of every line item on an estimate.
+ *
+ * Exists for one job — letting an open editor learn what `autoAssignPhasesForEstimate` wrote.
+ * That helper runs post-response via `after()` on every save and fills `costCodeId` on uncoded
+ * rows directly, deliberately WITHOUT bumping `Estimate.itemsRevision` (bumping there would wedge
+ * the editor into a permanent conflict, see the comment in auto-assign-phases.ts). Nothing else
+ * tells the editor, so its rows keep `costCodeId: null` and its next save writes that null back,
+ * silently reverting the assignment. The editor polls this after a save that carried uncoded rows
+ * and merges the answer into local state, fill-only.
+ *
+ * Deliberately returns nothing but ids and codes — in particular NOT `itemsRevision`. The merge
+ * is a local catch-up to writes that never bumped the revision, so the editor's revision is still
+ * correct and this must not disturb it (or the merge would look like a conflict to its next save).
+ */
+export async function getEstimateItemCostCodes(estimateId: string): Promise<{ id: string; costCodeId: string | null }[]> {
+    "use server";
+    await assertEstimatePermission();
+    return prisma.estimateItem.findMany({
+        where: { estimateId },
+        select: { id: true, costCodeId: true },
+    });
+}
+
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
     await assertEstimateAccess(estimateId);

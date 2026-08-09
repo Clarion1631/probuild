@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { prisma } from "@/lib/prisma";
 import { extractJsonObject } from "./ai-json";
+import { isEstimateSectionRow } from "./estimate-item-payload";
 
 // AI phase (cost code) matching for estimate line items — shared by the manual
 // "Auto-Assign Phases" button (/api/ai-estimate/assign-phases) and the automatic
@@ -138,7 +139,20 @@ const rerunQueued = new Set<string>();
 // any AI/DB error — must never block the estimate save/approve it's hooked
 // into). No-op when there's nothing uncoded or no active cost codes to match
 // against.
-export async function autoAssignPhasesForEstimate(estimateId: string): Promise<void> {
+// Hard cap on how many times one after() invocation will chain a follow-up run. Sustained
+// editing repopulates rerunQueued on every pass, and because the chain is awaited inside the
+// tracked promise (see below) an unbounded chain would keep one serverless invocation alive
+// through an arbitrary number of AI calls until the platform's max duration killed it — losing
+// the final run anyway. Stopping deliberately is better: the NEXT save starts a fresh, tracked
+// run, so the work is picked up by a live invocation rather than a dying one.
+const MAX_RERUN_CHAIN = 3;
+
+export async function autoAssignPhasesForEstimate(estimateId: string, chainDepth = 0): Promise<void> {
+  // Deterministic off switch for tests. The e2e drill simulates the assignment with a direct DB
+  // write, so a real classifier running concurrently would race it (CI does supply
+  // ANTHROPIC_API_KEY). Mirrors the existing DAILY_LOG_MATCH_AI_MOCK pattern.
+  if (process.env.AUTO_ASSIGN_PHASES_AI_MOCK === "1") return;
+
   const existing = inFlight.get(estimateId);
   if (existing) {
     // A newer save arrived mid-run — its items may differ from what the running
@@ -148,12 +162,30 @@ export async function autoAssignPhasesForEstimate(estimateId: string): Promise<v
     return existing;
   }
 
-  const run = runAutoAssignPhasesForEstimate(estimateId).finally(() => {
-    inFlight.delete(estimateId);
-    if (rerunQueued.delete(estimateId)) {
-      void autoAssignPhasesForEstimate(estimateId);
+  const run = (async () => {
+    try {
+      await runAutoAssignPhasesForEstimate(estimateId);
+    } finally {
+      // Cleared BEFORE the rerun below, or the rerun would dedupe into the very run it is
+      // following and do nothing.
+      inFlight.delete(estimateId);
     }
-  });
+    // Awaited, not floated. This used to be `void autoAssignPhasesForEstimate(...)`, which
+    // detached the rerun from the promise the caller's after() is tracking — and serverless
+    // only keeps the invocation alive for the promise it was handed, so the rerun could be
+    // frozen mid-flight and the newer items never got coded. Awaiting keeps it inside the
+    // tracked promise, and MAX_RERUN_CHAIN keeps that promise from living forever.
+    if (rerunQueued.delete(estimateId)) {
+      if (chainDepth + 1 < MAX_RERUN_CHAIN) {
+        await autoAssignPhasesForEstimate(estimateId, chainDepth + 1);
+      } else {
+        // Not an error: the items are still uncoded, and the next save's own after() will run
+        // this again from a fresh invocation. Logged because a chain hitting the cap means
+        // someone is saving faster than the classifier returns.
+        console.warn("[auto-assign-phases] rerun chain cap reached, deferring to next save for estimate", estimateId);
+      }
+    }
+  })();
   inFlight.set(estimateId, run);
   return run;
 }
@@ -165,20 +197,28 @@ async function runAutoAssignPhasesForEstimate(estimateId: string): Promise<void>
     const [allItems, activeCostCodes] = await Promise.all([
       prisma.estimateItem.findMany({
         where: { estimateId },
-        select: { id: true, parentId: true, name: true, description: true, costCodeId: true },
+        // `type` is selected for the section check below — without it this side of the check
+        // disagreed with every other reader of the item tree.
+        select: { id: true, parentId: true, type: true, name: true, description: true, costCodeId: true },
       }),
       prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true, name: true } }),
     ]);
 
     if (activeCostCodes.length === 0) return;
 
-    // Exclude section/category header rows the same way the manual "Auto-Assign
-    // Phases" button does (EstimateEditor.handleAiAssignPhases) — a parent-less
-    // item that has children is a section, not a line item, and should never
-    // get a cost code.
-    const isSection = (item: { id: string; parentId: string | null }) =>
-      !item.parentId && allItems.some((i) => i.parentId === item.id);
-    const uncoded = allItems.filter((item) => item.costCodeId == null && !isSection(item));
+    // Exclude section/category header rows — a header's total is the roll-up of its children,
+    // so it is not a line item and must never get a cost code.
+    //
+    // Uses the SHARED predicate (`type === "Section"` OR has children) rather than the local
+    // "parentless AND has children" rule this used to carry. That old rule disagreed with every
+    // other reader of the item tree in two ways: a NESTED section (it has a parent) and an EMPTY
+    // named section (no children yet) both looked like ordinary line items, so the AI coded them.
+    // The editor's catch-up excludes them, so those codes were then invisible to it and its next
+    // save nulled them right back out — and in the meantime they surfaced as real project cost
+    // codes. One predicate, one answer.
+    const uncoded = allItems.filter(
+      (item) => item.costCodeId == null && !isEstimateSectionRow(item, allItems),
+    );
     if (uncoded.length === 0) return;
 
     const assignments = await matchItemsToCostCodes(
@@ -192,11 +232,15 @@ async function runAutoAssignPhasesForEstimate(estimateId: string): Promise<void>
     // Per-item conditional write, not an all-or-nothing transaction: between the
     // read above and here, the user may have set a code themselves, or edited/
     // deleted an item. The costCodeId: null guard means a filled-in code is never
-    // clobbered, the name guard means a classification for "Electrical" can't
-    // land on an item since renamed "Plumbing" (the queued rerun above re-codes
-    // it), and one item that's since been deleted/changed just no-ops instead of
-    // rolling back every other assignment.
-    const nameAtClassification = new Map(uncoded.map((i) => [i.id, i.name]));
+    // clobbered, the name+description guard means a classification for "Electrical"
+    // can't land on an item since edited to read "Plumbing" (the queued rerun above
+    // re-codes it), and one item that's since been deleted/changed just no-ops
+    // instead of rolling back every other assignment.
+    // Both fields, because the classifier reads both (see the matchItemsToCostCodes call above).
+    // Guarding on name alone let a description-only edit slip through: the row still matched, so a
+    // code classified against the OLD description landed on it, and because the row was no longer
+    // null the queued rerun skipped it — leaving the stale classification permanently in place.
+    const inputAtClassification = new Map(uncoded.map((i) => [i.id, { name: i.name, description: i.description }]));
     // Deliberately does NOT bump Estimate.itemsRevision. This runs from after() on every
     // saveEstimate, so bumping here would wedge the editor into a permanent conflict loop:
     // save → after() bumps the revision → the very next save (even from the same tab)
@@ -204,17 +248,26 @@ async function runAutoAssignPhasesForEstimate(estimateId: string): Promise<void>
     // stale costCodeId from a stale editor session losing this race — pre-existing behavior,
     // unchanged by the itemsRevision work; see docs/specs/estimate-item-optimistic-concurrency.md
     // REVISION 2, "Deliberate non-goals".
+    // Entries with no recorded classification input are dropped outright rather than written
+    // with a placeholder predicate: `{ id: "" }` is ordinary text equality, not a guaranteed
+    // match-none, so a row with an empty id would have been updated with NO estimate/name/
+    // description guard at all. Skipping is the only safe direction. (`at` should always be
+    // present — toApply derives from uncoded — but the matcher trims and caps ids, so a
+    // non-canonical id could in principle miss the raw-id map.)
+    const writable = toApply
+      .map((a) => ({ a, at: inputAtClassification.get(a.id) }))
+      .filter((entry): entry is { a: typeof entry.a; at: NonNullable<typeof entry.at> } => !!entry.at);
     const results = await Promise.allSettled(
-      toApply.map((a) =>
+      writable.map(({ a, at }) =>
         prisma.estimateItem.updateMany({
-          where: { id: a.id, estimateId, costCodeId: null, name: nameAtClassification.get(a.id) },
+          where: { id: a.id, estimateId, costCodeId: null, name: at.name, description: at.description },
           data: { costCodeId: a.costCodeId },
         }),
       ),
     );
     const failed = results.filter((r) => r.status === "rejected").length;
     if (failed > 0) {
-      console.error(`[auto-assign-phases] ${failed}/${toApply.length} assignment writes failed for estimate`, estimateId);
+      console.error(`[auto-assign-phases] ${failed}/${writable.length} assignment writes failed for estimate`, estimateId);
     }
   } catch (e) {
     console.error(
