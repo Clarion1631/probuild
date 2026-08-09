@@ -503,3 +503,144 @@ test("formatDerivedRate always uses exactly derivedRateDecimals(price) decimal p
         );
     }
 });
+
+/**
+ * The two invariants scripts/audit-stale-margins.mjs leans on when it buckets a row.
+ *
+ * The audit walks EstimateItem rows, asks marginIsUnrepresentable first and marginIsStale
+ * second, and reports the two counts as disjoint populations. Both properties below are
+ * properties of the helpers themselves, not of the script — but the script is the reason
+ * they need pinning, because a violation would silently mis-state a prod count.
+ */
+
+/**
+ * Prices spanning the scales where derivedRateDecimals changes, which is what makes the stale
+ * tolerance price-dependent. Bounded at 1e6 deliberately — see the convergence test below for
+ * why the invariant it pins is a claim about real prices, not about all of float64.
+ */
+const AUDIT_PRICE_SCALES = [0.01, 0.05, 0.49, 1, 2.5, 8, 12.5, 99.99, 100, 1500, 1e6];
+
+/** Representable pairs (0 < rate < price) across those scales. */
+const REPRESENTABLE_PAIRS = (() => {
+    const pairs: Array<[number, number]> = [];
+    for (const price of AUDIT_PRICE_SCALES) {
+        for (const frac of [0.011, 0.1, 0.25, 0.375, 0.5, 0.625, 0.8, 0.9, 0.98]) {
+            pairs.push([price * frac, price]);
+        }
+    }
+    return pairs;
+})();
+
+/**
+ * Pairs whose true margin lands EXACTLY on a 2dp rounding boundary (a .xx5), so
+ * marginPatchForRate's residual is the full half-step of 0.005 — the worst case the tolerance
+ * has to absorb. The fraction grid above never gets near this (its largest residual is ~1e-14),
+ * which would make the convergence test below vacuous on its own.
+ */
+const BOUNDARY_PAIRS = (() => {
+    const pairs: Array<[number, number]> = [];
+    for (const price of AUDIT_PRICE_SCALES) {
+        for (const marginPct of [8.375, 28.375, 55.375, 62.625, 90.125]) {
+            pairs.push([price * (1 - marginPct / 100), price]);
+        }
+    }
+    return pairs;
+})();
+
+/**
+ * INVARIANT: a pair is never both unrepresentable and stale. marginIsStale returns false for
+ * an out-of-range raw margin precisely so the two buckets stay disjoint ("don't double-flag
+ * it").
+ *
+ * Both callers happen to guard the overlap themselves — BudgetStrip.tsx tests
+ * `!unrepresentable && stale`, and the audit script `continue`s after the unrepresentable
+ * branch — so this is a contract on the helpers, not the last line of defence. It is worth
+ * pinning anyway: it is what lets a caller report the two counts as disjoint populations
+ * without re-deriving the exclusion, and a new caller that trusts the helpers would be the
+ * one to get bitten.
+ */
+test("marginIsStale and marginIsUnrepresentable never both fire on the same pair", () => {
+    const grid: Array<[number, number]> = [
+        ...REPRESENTABLE_PAIRS,
+        // Deliberately outside the representable range, plus the degenerate inputs.
+        [200, 100], [100, 100], [0.5, 100], [0.0001, 100], [-5, 100], [50, 0], [50, -1],
+        [NaN, 100], [Infinity, 100], [50, NaN], [50, Infinity], [0, 100],
+    ];
+    for (const [rate, price] of grid) {
+        for (const stored of [0, 25, 50, 62.5, 99, 100, -10]) {
+            const unrep = marginIsUnrepresentable(rate, price);
+            const stale = marginIsStale(stored, rate, price);
+            assert.ok(
+                !(unrep && stale),
+                `rate=${rate} price=${price} stored=${stored} was flagged BOTH unrepresentable and stale`,
+            );
+        }
+    }
+});
+
+/**
+ * INVARIANT: at real-world prices, the margin marginPatchForRate writes is never itself stale.
+ *
+ * This is what makes an ordinary save not warn, and it is the property any future repair pass
+ * would depend on to converge in a single run — a repair that wrote a value still outside the
+ * tolerance would re-flag the same rows forever (the failure mode the #329 backfill hit).
+ * The patch rounds to 2dp, so the residual is at most a half-step of 0.005, and the tolerance
+ * is 0.005 + a positive price-dependent term, which leaves exactly enough headroom.
+ *
+ * SCOPED TO PRICES UP TO 1e6 ON PURPOSE — this is NOT a universal claim about float64. The
+ * price-dependent term shrinks as price grows, and far above any real unit price it stops
+ * covering floating-point error in the subtraction: at price 1e16 with rate 9.1625e15 the true
+ * margin is exactly 8.375, the patch writes 8.38, and the residual computes as
+ * 0.005000000000000782 — a hair over the boundary, so it reads as stale. That is a property of
+ * the arithmetic at absurd scale, not a defect worth adding headroom for: a $10-quadrillion
+ * unit price is not a thing, and widening the tolerance would cost real sensitivity at the
+ * prices that exist. The bound is asserted below so it stays a deliberate choice.
+ */
+test("marginPatchForRate output is never stale at real-world prices — repairs converge in one pass", () => {
+    assert.ok(
+        Math.max(...AUDIT_PRICE_SCALES) <= 1e6,
+        "this invariant is only claimed up to 1e6 — see the note above before raising the grid",
+    );
+    for (const [rate, price] of [...REPRESENTABLE_PAIRS, ...BOUNDARY_PAIRS]) {
+        const written = marginPatchForRate(rate, price).markupPercent;
+        assert.notEqual(written, null, `expected a margin for rate=${rate} price=${price}`);
+        assert.equal(
+            marginIsStale(parseFloat(written!), rate, price),
+            false,
+            `rate=${rate} price=${price} wrote ${written}% which still reads as stale`,
+        );
+    }
+});
+
+/**
+ * Guards the test above from going vacuous. The convergence claim is only meaningful if the
+ * grid actually exercises the tolerance boundary — Codex found the original fraction-only grid
+ * peaked at a residual of ~1e-14, i.e. it proved nothing about the half-step case. This pins
+ * that BOUNDARY_PAIRS really does drive the residual to the full 0.005.
+ */
+test("the boundary grid actually exercises the full 0.005 rounding half-step", () => {
+    const worst = Math.max(
+        ...BOUNDARY_PAIRS.map(([rate, price]) => {
+            const written = parseFloat(marginPatchForRate(rate, price).markupPercent!);
+            return Math.abs(rawMarginPct(rate, price)! - written);
+        }),
+    );
+    assert.ok(
+        worst > 0.004_9,
+        `boundary grid only reached a residual of ${worst} — it no longer tests the half-step case`,
+    );
+});
+
+/**
+ * The canonical defect shape from PR #331, pinned end to end: a sell price edited from 100 to
+ * 200 left rate 75 next to a stored 25% while the line really ran 62.5%. This is the row the
+ * audit exists to count, and the control the prod run was checked against.
+ */
+test("the price-edit defect shape reads as stale, not unrepresentable, and repairs to the true margin", () => {
+    assert.equal(marginIsUnrepresentable(75, 200), false);
+    assert.equal(marginIsStale(25, 75, 200), true);
+    assert.equal(rawMarginPct(75, 200), 62.5);
+    assert.equal(marginPatchForRate(75, 200).markupPercent, "62.50");
+    // ...and once repaired it stops being flagged.
+    assert.equal(marginIsStale(62.5, 75, 200), false);
+});
