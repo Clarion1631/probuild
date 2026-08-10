@@ -27,6 +27,21 @@ const MOBILE_DAILYLOG_ID = "e2e-mob-dailylog";
 const MOBILE_DAILYLOG_PHOTO_ID = "e2e-mob-dailylog-photo";
 const MOBILE_TIME_ENTRY_HIST_ID = "e2e-mob-entry-hist";
 
+// --- Partial-scope fixtures (prefix e2e-scope-) ---
+// A staff reader who can see estimates and leads but only ONE project, plus a
+// SECOND project they cannot reach that carries an approved estimate. Together
+// these make every scoped aggregate in the app provably partial for this user
+// and provably complete for the ADMIN, which is what estimate-scope-labels.spec
+// asserts in a real browser. The ADMIN session can never exercise that branch —
+// accessibleProjectIds returns "ALL" for ADMIN — so this second user is the only
+// way to prove the label wiring at runtime rather than by grepping the source.
+const SCOPED_STAFF_EMAIL = "scoped-staff@test.local";
+const OOS_PROJECT_ID = "e2e-scope-oos-project";
+const OOS_PROJECT_NAME = "E2E Out-Of-Scope Project — DO NOT DELETE";
+const OOS_ESTIMATE_ID = "e2e-scope-oos-estimate";
+const OOS_LEAD_ID = "e2e-scope-oos-lead";
+const OOS_LEAD_ESTIMATE_ID = "e2e-scope-oos-lead-estimate";
+
 // Substrings that identify the LIVE database. The e2e suite creates leads,
 // estimates, and invoices — it must never do that against production data.
 // See docs/TESTING.md (the Henderson-lead incident, June 2026).
@@ -341,6 +356,145 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
             },
         });
         console.log("[data.setup] historical time entry upserted:", { id: MOBILE_TIME_ENTRY_HIST_ID });
+
+        // --- Partial-scope fixtures ---
+        // EMPLOYEE, not FIELD_CREW: the pages under test need `estimates` and
+        // `leadAccess`, and granting those to a role whose defaults withhold them
+        // keeps the fixture explicit about WHY this user can read the pages at all.
+        const scopedStaff = await prisma.user.upsert({
+            where: { email: SCOPED_STAFF_EMAIL },
+            update: { role: "EMPLOYEE", status: "ACTIVATED" },
+            create: {
+                email: SCOPED_STAFF_EMAIL,
+                name: "E2E Scoped Staff",
+                role: "EMPLOYEE",
+                status: "ACTIVATED",
+            },
+        });
+        const scopedPermissions = {
+            estimates: true,
+            leadAccess: true,
+            // Off deliberately: an auto-grant would hand this user every project
+            // and silently erase the partial scope the whole fixture exists for.
+            autoGrantNewProjects: false,
+        };
+        await prisma.userPermission.upsert({
+            where: { userId: scopedStaff.id },
+            update: scopedPermissions,
+            create: { userId: scopedStaff.id, ...scopedPermissions },
+        });
+        // Exactly one project. Access is granted via ProjectAccess only — the crew
+        // relation is left alone so a stray crew connect cannot widen the scope.
+        await prisma.projectAccess.upsert({
+            where: { userId_projectId: { userId: scopedStaff.id, projectId: PROJECT_ID } },
+            update: {},
+            create: { userId: scopedStaff.id, projectId: PROJECT_ID },
+        });
+        // ...and re-narrow on re-runs, in case an earlier run or another fixture
+        // granted more. Without this the spec would pass for the wrong reason
+        // (or fail confusingly) against a reused database.
+        await prisma.projectAccess.deleteMany({
+            where: { userId: scopedStaff.id, projectId: { not: PROJECT_ID } },
+        });
+        const scopedCrewProjects = await prisma.project.findMany({
+            where: { id: { not: PROJECT_ID }, crew: { some: { id: scopedStaff.id } } },
+            select: { id: true },
+        });
+        for (const p of scopedCrewProjects) {
+            await prisma.project.update({
+                where: { id: p.id },
+                data: { crew: { disconnect: { id: scopedStaff.id } } },
+            });
+        }
+        console.log("[data.setup] scoped staff user upserted:", { id: scopedStaff.id, email: scopedStaff.email });
+
+        // The lead must exist before the project that points at it (Project.leadId).
+        // Every `update` below restates the fields the fixture is DEFINED by,
+        // not just the ones that drift. On a reused database an earlier run (or
+        // a spec that reparents rows) can leave a closed project, a re-owned
+        // estimate, or a moved lead behind, and an empty `update` would adopt
+        // that state — the specs would then pass or fail for reasons unrelated
+        // to the labels under test.
+        await prisma.lead.upsert({
+            where: { id: OOS_LEAD_ID },
+            update: { clientId: TEST_CLIENT_ID, stage: "Won" },
+            create: {
+                id: OOS_LEAD_ID,
+                name: "E2E Out-Of-Scope Lead — DO NOT DELETE",
+                clientId: TEST_CLIENT_ID,
+                stage: "Won",
+            },
+        });
+        await prisma.project.upsert({
+            where: { id: OOS_PROJECT_ID },
+            update: {
+                name: OOS_PROJECT_NAME,
+                clientId: TEST_CLIENT_ID,
+                leadId: OOS_LEAD_ID,
+                // Not "Archived": the /projects list hides archived rows, and a
+                // hidden out-of-scope project makes the revenue sum complete.
+                status: "In Progress",
+            },
+            create: {
+                id: OOS_PROJECT_ID,
+                name: OOS_PROJECT_NAME,
+                clientId: TEST_CLIENT_ID,
+                leadId: OOS_LEAD_ID,
+                status: "In Progress",
+            },
+        });
+        // Approved, so it lands in the /projects revenue sum for a reader who can
+        // see it — that sum is the number whose label is under test.
+        await prisma.estimate.upsert({
+            where: { id: OOS_ESTIMATE_ID },
+            update: {
+                status: "Approved",
+                totalAmount: 5000,
+                balanceDue: 5000,
+                archivedAt: null,
+                // Ownership is the whole point of this row — restate it, or a
+                // reparented estimate quietly stops being out of scope.
+                projectId: OOS_PROJECT_ID,
+                leadId: null,
+            },
+            create: {
+                id: OOS_ESTIMATE_ID,
+                title: "E2E Out-Of-Scope Estimate — DO NOT DELETE",
+                code: "EST-E2E-OOS",
+                status: "Approved",
+                projectId: OOS_PROJECT_ID,
+                totalAmount: 5000,
+                balanceDue: 5000,
+            },
+        });
+        // A lead-owned estimate on the same lead: reachable via `leadAccess`, so
+        // the scoped reader sees a non-empty page whose totals are still partial.
+        await prisma.estimate.upsert({
+            where: { id: OOS_LEAD_ESTIMATE_ID },
+            update: {
+                status: "Approved",
+                totalAmount: 1000,
+                balanceDue: 1000,
+                archivedAt: null,
+                leadId: OOS_LEAD_ID,
+                // Must stay lead-OWNED: given a projectId it would resolve
+                // through project access instead of leadAccess and vanish for
+                // the scoped reader, emptying the page it is here to populate.
+                projectId: null,
+            },
+            create: {
+                id: OOS_LEAD_ESTIMATE_ID,
+                title: "E2E Out-Of-Scope Lead Estimate — DO NOT DELETE",
+                code: "EST-E2E-OOS-LEAD",
+                status: "Approved",
+                leadId: OOS_LEAD_ID,
+                totalAmount: 1000,
+                balanceDue: 1000,
+            },
+        });
+        console.log("[data.setup] partial-scope fixtures upserted:", {
+            project: OOS_PROJECT_ID, lead: OOS_LEAD_ID, estimates: [OOS_ESTIMATE_ID, OOS_LEAD_ESTIMATE_ID],
+        });
 
         const verify = await prisma.project.findUnique({ where: { id: PROJECT_ID }, select: { id: true, name: true } });
         console.log("[data.setup] verify project exists:", verify);
