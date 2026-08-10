@@ -210,10 +210,15 @@ test("estimate readers filter by the same scope the detail page asserts", () => 
 
   // Nested embeds are the same exposure by another route: a lead or project
   // getter that includes estimates hands back rows the caller may not open.
-  for (const name of ["getLeads", "getLead", "getProjects", "getProject", "getClients"]) {
+  for (const name of ["getLeads", "getLead", "getProjects", "getProject"]) {
     expect(exportSource(source, name), `${name} must scope the estimates it embeds`)
       .toContain("scopedEstimateRelation(");
   }
+  // getClients is the other way to satisfy the rule: it embeds no estimates at
+  // all. Nothing on the contacts page or the client picker ever read them, so
+  // the safest scope filter is not fetching the rows in the first place.
+  expect(exportSource(source, "getClients"), "getClients must not embed estimates")
+    .not.toMatch(/estimates:/);
   expect(source, "no estimates relation may be embedded without the scope filter")
     .not.toMatch(/estimates: safeEstimateInclude/);
 
