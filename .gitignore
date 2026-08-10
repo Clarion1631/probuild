@@ -76,7 +76,28 @@ scripts/vendor/*
 
 # Per-machine Claude Code + Supabase CLI artifacts (not source)
 .claude/settings.local.json
-.claude/skills/
+# .claude/skills/ is ignored BY DEFAULT, with the ProBuild-specific skills
+# allowlisted below. Those four are project docs describing how to deploy and
+# migrate THIS app, so they belong in version control: while they were ignored,
+# every git worktree kept its own drifting copy and 9 of them spent two weeks
+# telling agents that auto-deploy was off (it is ON) and that the token-rotation
+# snippet could use a bare Read-Host (it echoes the token to scrollback).
+#
+# The rest of the tree stays ignored on purpose, and this is NOT merely a
+# per-machine-artifact call:
+#   - bank-recon/ and email-triage/ carry live operational data (bank account
+#     suffix, Drive folder ids, staff and external-partner email addresses).
+#     Do not commit these; git history is forever.
+#   - 17 skills are vendored from ByBren, LLC / J. Scott Graham under MIT and
+#     require attribution via /LICENSE and /NOTICE, neither of which this repo
+#     carries. They also describe a different stack (master/Coolify/yarn/Clerk).
+# Adding a new skill here means opting it in deliberately, after checking both.
+.claude/skills/*
+!.claude/skills/deploy-probuild/
+!.claude/skills/probuild-dev-server/
+!.claude/skills/probuild-diagnostics/
+!.claude/skills/probuild-schema-migration/
+.claude/skills/*/state/
 docs/superpowers/
 supabase/.temp/
 
