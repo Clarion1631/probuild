@@ -23,7 +23,7 @@ import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-m
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
-import { upsertEstimateItems, EstimateStaleSaveError } from "./estimate-item-upsert";
+import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
 import { postDailyLogSummary } from "./chat-webhook";
@@ -3127,6 +3127,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         // 1. Differential Item Upsert
         const existingItems = await tx.estimateItem.findMany({ where: { estimateId } });
         const existingItemsMap = new Map(existingItems.map(item => [item.id, item]));
+
+        // Payload check, ahead of every item write (and ahead of the destructive delete pass
+        // below). Item ids are already scoped by existingItemsMap, but parentId used to be passed
+        // straight through, and EstimateItem's self-referencing FK does not require parent and
+        // child to share an estimateId — so a save could hang this estimate's rows off another
+        // estimate's tree, and the section roll-up would then compute this estimate's subtotal
+        // (and therefore its tax and payment milestones) over that other tree. Throwing here
+        // aborts the whole transaction, so the estimate-level update above never survives either.
+        assertEstimateItemParentsInScope(items, existingItemsMap.keys());
 
         const incomingItemIds = new Set(items.map(item => item.id).filter(Boolean));
         const deletedItems = existingItems.filter(item => !incomingItemIds.has(item.id));
