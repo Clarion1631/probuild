@@ -38,6 +38,7 @@ const linkDeps = read("src/lib/decision-schedule-link-dependencies.ts");
 const linkActionsCore = read("src/lib/decision-link-actions-core.ts");
 const aiSortCore = read("src/lib/selection-ai-sort-core.ts");
 const permissions = read("src/lib/permissions.ts");
+const accessRules = read("src/lib/access-rules.ts");
 const actions = read("src/lib/actions.ts");
 const proxy = read("src/proxy.ts");
 const teamDecisionsSection = read("src/app/projects/[id]/selections/TeamDecisionsSection.tsx");
@@ -65,7 +66,17 @@ assert.ok(!/CREATE POLICY[\s\S]*"DecisionTemplate/i.test(applyScript), "Decision
 
 // ── Authorization split: CRUD is ADMIN/MANAGER, apply is any project staff ──
 
-assert.match(permissions, /export function isAdminOrManager/, "permissions.ts must export isAdminOrManager");
+// The pure rules moved to access-rules.ts (no Prisma/next-auth imports, so they
+// can be unit-tested); permissions.ts re-exports them. What matters to this
+// contract is that `import { isAdminOrManager } from "@/lib/permissions"` still
+// resolves and that the role list behind it is the shared one, not a local copy.
+assert.match(accessRules, /export function isAdminOrManager/, "access-rules.ts must define isAdminOrManager");
+assert.match(accessRules, /ADMIN_ROLES\.includes\(user\.role\)/, "isAdminOrManager must use the shared ADMIN_ROLES list");
+assert.match(
+    permissions,
+    /export \{[\s\S]*?\bisAdminOrManager\b[\s\S]*?\} from "\.\/access-rules"/,
+    "permissions.ts must re-export isAdminOrManager so existing imports keep resolving",
+);
 assert.match(templateCrudCore, /isAdminOrManager/, "template CRUD must gate on isAdminOrManager");
 assert.match(templateCrudCore, /requireAdminOrManager/, "template CRUD must have an admin/manager requirement helper");
 assert.match(templateApplyCore, /canAccessProject/, "applyDecisionTemplate must gate on canAccessProject");
