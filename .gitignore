@@ -88,9 +88,13 @@ scripts/vendor/*
 #   - bank-recon/ and email-triage/ carry live operational data (bank account
 #     suffix, Drive folder ids, staff and external-partner email addresses).
 #     Do not commit these; git history is forever.
-#   - 17 skills are vendored from ByBren, LLC / J. Scott Graham under MIT and
-#     require attribution via /LICENSE and /NOTICE, neither of which this repo
-#     carries. They also describe a different stack (master/Coolify/yarn/Clerk).
+#   - 17 skills vendored from ByBren, LLC / J. Scott Graham used to sit here.
+#     They were deleted on 2026-08-10: nothing in tracked source referenced
+#     them, they described a different stack (master/Coolify/yarn/Clerk/RLS
+#     helpers) and so fed agents instructions that contradict CLAUDE.md, and
+#     their MIT terms wanted attribution via /LICENSE and /NOTICE that this
+#     repo does not carry. Deleting them retired that obligation outright.
+#     Do not re-vendor them; the four probuild-* skills are the real ones.
 # Adding a new skill here means opting it in deliberately, after checking both.
 .claude/skills/*
 !.claude/skills/deploy-probuild/
@@ -104,6 +108,19 @@ scripts/vendor/*
 # .gitattributes eol=lf rule to survive core.autocrlf=true on the dev machines.
 .claude/skills/*/*
 !.claude/skills/*/SKILL.md
+
+# .agents/skills/ is a SECOND skill tree, and the rules above never covered it.
+# It held its own untracked copies of bank-recon/ and email-triage/ - the same
+# live bank + staff-email data the block above exists to keep out of history -
+# sitting in `git status` as plain untracked dirs on a checkout that is usually
+# mid-WIP. One `git add -A` would have committed them. Ignore by default and
+# allowlist only the two Supabase skills, which are already fully tracked and
+# carry no operational data. Unlike .claude/skills above, these negations are
+# meant to reopen the whole directory: both skills track references/ and
+# assets/ subtrees, not just a bare SKILL.md.
+.agents/skills/*
+!.agents/skills/supabase/
+!.agents/skills/supabase-postgres-best-practices/
 
 docs/superpowers/
 supabase/.temp/
