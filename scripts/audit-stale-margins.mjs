@@ -73,20 +73,24 @@ if (limitArg >= 0) {
  * Read a key from the environment, then from the dotenv files in the order the Next.js
  * toolchain resolves them: `.env.local` OVERRIDES `.env`. Checking `.env` first would let a
  * committed default silently win over the local override and point a production audit at the
- * WRONG DATABASE. (The sibling backfill script has the older, reversed order — it happens not
- * to misfire because this repo has no bare `.env`, but do not copy it.)
+ * WRONG DATABASE. (Every `envFromFiles` helper under scripts/ now shares this exact order — if
+ * you add another, copy this one, not an older reversed variant. Note that many other scripts
+ * under scripts/ still resolve env under different helper names and STILL have the reversed
+ * order; those are tracked separately.)
  *
  * Parsing is delegated to `dotenv` rather than hand-rolled. A regex over the line looks fine
  * until it meets the cases that actually occur — quoted values containing `#`, `export`
  * prefixes, inline comments, CRLF, multiline values — and each one it gets wrong is a silent
  * wrong-database read, which is the one failure this script must not have.
  *
- * `key in parsed` rather than a truthiness check on purpose: a file that assigns the key an
- * EMPTY value has still spoken, and must win over the lower-precedence file instead of falling
- * through to it. The missing-URL check below then fails loudly, which is the correct outcome.
+ * `in` rather than a truthiness check on purpose, at BOTH levels: a source that assigns the key
+ * an EMPTY value has still spoken, and must win over every lower-precedence source instead of
+ * falling through to it. The missing-URL check below then fails loudly, which is the correct
+ * outcome. An exported `DATABASE_URL=""` falling through to a file is the same wrong-database
+ * read as the reversed file order, just one level up.
  */
 function envFromFiles(key) {
-  if (process.env[key]) return process.env[key];
+  if (key in process.env) return process.env[key];
   for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
     const parsed = dotenv.parse(fs.readFileSync(f));
