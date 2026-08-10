@@ -9,7 +9,11 @@ export default async function TemplatesHubPage() {
     const session = await getSessionOrDev();
     if (!session?.user) return redirect("/login");
 
-    const docTemplates = await getDocumentTemplates();
+    // Same fail-soft treatment as the selections count below: this hub is a nav
+    // page for any signed-in staffer, but reading document templates now needs
+    // estimates/contracts/companySettings — a field-crew visitor still gets the
+    // card, just without a count, instead of the route error boundary.
+    const docTemplates = await getDocumentTemplates().catch(() => [] as { id: string }[]);
     // Decision Templates are ADMIN/MANAGER-only (see /templates/selections'
     // own server gate) — a non-admin staffer viewing this hub still sees the
     // card (clicking it redirects them back here), just without a count.

@@ -133,3 +133,26 @@ export function estimateScopeWhere(user: ProjectScopedUser | null | undefined): 
     if (branches.length === 0) return MATCHES_NO_ESTIMATE;
     return { OR: branches };
 }
+
+/**
+ * Which document-template TYPES a caller may write.
+ *
+ * Document templates hold the terms, contract, lien-release, warranty and
+ * disclaimer language snapshotted onto client-facing documents when they are
+ * sent. `companySettings` owns the whole library. `estimates` is also accepted
+ * for writes, but only for the types an estimator's own screens author (the
+ * estimate editor's "save as template" and the /estimates Terms & Conditions
+ * tab) — /company/templates offers a full type selector, so an unscoped
+ * `estimates` grant would let an estimates-only user, which is the FINANCE
+ * default, rewrite contract and lien-release language.
+ */
+export const ESTIMATOR_WRITABLE_TEMPLATE_TYPES = ["terms", "overview", "notes"] as const;
+
+export function canWriteDocumentTemplateType(
+    user: { role: string; permissions?: any | null },
+    type: string | null | undefined
+): boolean {
+    if (hasPermission(user, "companySettings")) return true;
+    if (!hasPermission(user, "estimates")) return false;
+    return !!type && (ESTIMATOR_WRITABLE_TEMPLATE_TYPES as readonly string[]).includes(type);
+}
