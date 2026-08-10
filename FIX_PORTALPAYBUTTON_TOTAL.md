@@ -90,8 +90,8 @@ export const stripe = new Stripe(stripeKey, {
 **Also:** Sync the Preview `STRIPE_SECRET_KEY` with Production if the key was rotated:
 
 ```bash
-vercel env rm STRIPE_SECRET_KEY preview --token $VERCEL_TOKEN
-vercel env add STRIPE_SECRET_KEY preview --token $VERCEL_TOKEN
+vercel env rm STRIPE_SECRET_KEY preview
+vercel env add STRIPE_SECRET_KEY preview
 ```
 
 ## Verification
@@ -100,4 +100,4 @@ vercel env add STRIPE_SECRET_KEY preview --token $VERCEL_TOKEN
 2. `npm run build`
 3. Push to main
 4. Open estimate portal → Pay Now → should redirect to Stripe Checkout without connection error
-5. If error persists, check Vercel function logs: `vercel logs --token $VERCEL_TOKEN`
+5. If error persists, check Vercel function logs: `vercel logs` (never pass `--token` — the CLI echoes it back; see CLAUDE.md)

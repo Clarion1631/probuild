@@ -80,13 +80,14 @@ vercel --prod --yes --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-pro
 This builds a **new** production deployment. To make an existing staged deployment live instead, use `vercel promote <deployment-url>` — `--prod` does not re-promote.
 
 > **NEVER pass `--token` to any `vercel` command.** On success the CLI prints a "next steps"
-> block that replays your whole command line back, token value and all — straight into the
-> terminal and the session transcript. That has leaked the production token at least twice
-> (PR-209, and again 2026-08-09), each time forcing a rotation. The flag is unnecessary: the CLI
+> block that reconstructs follow-up commands for you, copying your global flags through verbatim —
+> so the token value lands straight in the terminal and the session transcript. That has leaked the
+> production token **three times** (PR-209, 2026-08-09, and again 2026-08-10), each time forcing a
+> rotation. The flag is unnecessary: the CLI
 > already authenticates on its own. Precedence is `--token` → a **non-empty** `VERCEL_TOKEN` in the
 > environment → the persisted login at `%APPDATA%\com.vercel.cli\Data\auth.json` (from
 > `vercel login`). The latter two are read silently and never echoed. This applies to every
-> subcommand (`deploy`, `env`, `logs`, `inspect`), not just `--prod`.
+> *authenticating* subcommand (`deploy`, `env`, `logs`, `inspect`), not just `--prod`.
 >
 > A stale `VERCEL_TOKEN` fails every *authenticated* command with *"The token provided via
 > VERCEL_TOKEN environment variable is not valid"* — an invalid explicit credential does **not**
@@ -97,8 +98,18 @@ This builds a **new** production deployment. To make an existing staged deployme
 > is the same leak class this rule exists to prevent: it lands the secret in argv, shell history,
 > and any agent transcript. Justin sets it himself, in his own terminal, one of these two ways:
 > - Windows GUI: Settings → *Edit environment variables for your account* → edit `VERCEL_TOKEN`.
-> - PowerShell, value read from a prompt rather than argv:
->   `[Environment]::SetEnvironmentVariable('VERCEL_TOKEN', (Read-Host 'Paste token'), 'User')`
+> - PowerShell, value read from a prompt rather than argv. It **must** be `-AsSecureString`: a bare
+>   `Read-Host` echoes the pasted token to the screen and into terminal scrollback, and PowerShell
+>   5.1 (this machine) has no `-MaskInput`.
+>   ```powershell
+>   $s = Read-Host 'Paste token' -AsSecureString
+>   $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
+>   try {
+>     [Environment]::SetEnvironmentVariable('VERCEL_TOKEN', [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b), 'User')
+>   } finally {
+>     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)
+>   }
+>   ```
 >
 > Either way it only affects **new** shells, and is Windows-only — WSL needs its own copy. Confirm
 > in a fresh shell with `vercel whoami`. Claude must never be given the token value.
@@ -202,7 +213,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Run parallel sub-agents** for independent work (e.g. building 3 report pages simultaneously in separate agents)
 - **Don't re-read large files** — if you already know the structure, reference it. GanttChart.tsx is 17k tokens — don't read it unless editing it.
 - **Batch tool calls** — make independent reads/greps/globs in parallel, not sequential
-- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails.
+- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails. **One exception:** run `vercel whoami` before a production deploy — a stale `VERCEL_TOKEN` fails mid-deploy and does not fall back to the persisted login, so checking first is cheaper than a half-shipped release.
 
 ## Dead buttons / unlinked UI
 - While working on any page, audit all buttons, links, and nav items for dead ends
