@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
     EstimateStaleSaveError,
+    assertEstimateItemParentsInScope,
     upsertEstimateItems,
     type EstimateItemTxClient,
     type ExistingEstimateItem,
@@ -111,6 +112,56 @@ test("parents are upserted before children (order matters for the parentId FK)",
     assert.deepEqual(updateOrder, ["parent", "child"]);
 });
 
+test("three new levels are written ancestors-first even when the payload is deepest-first", async () => {
+    // The old roots-then-everything-else split only guaranteed ONE level: with this payload it
+    // created the grandparent, then tried to create the grandchild before its parent existed and
+    // the parentId FK rejected it. Depth grouping holds at any nesting level.
+    const { tx, calls } = makeFakeTx();
+
+    await upsertEstimateItems(tx, {
+        estimateId: "est1",
+        items: [
+            { id: "grandchild", parentId: "child", name: "Leaf", quantity: 1, unitCost: 1 },
+            { id: "child", parentId: "root", name: "Sub-section", quantity: 1, unitCost: 1, type: "Section" },
+            { id: "root", name: "Section", quantity: 1, unitCost: 1, type: "Section" },
+        ],
+        existingItemsMap: new Map<string, ExistingEstimateItem>(),
+    });
+
+    assert.deepEqual(calls.map(c => c.args.data.id), ["root", "child", "grandchild"]);
+});
+
+test("upsertEstimateItems refuses a cyclic payload rather than writing part of it", async () => {
+    const { tx, calls } = makeFakeTx();
+
+    await assert.rejects(
+        () => upsertEstimateItems(tx, {
+            estimateId: "est1",
+            items: [
+                { id: "a", parentId: "b", name: "A", quantity: 1, unitCost: 1 },
+                { id: "b", parentId: "a", name: "B", quantity: 1, unitCost: 1 },
+            ],
+            existingItemsMap: new Map<string, ExistingEstimateItem>(),
+        }),
+        /cyclic/,
+    );
+    assert.equal(calls.length, 0, "nothing is written before the graph is known to be sound");
+});
+
+test("a row whose parent is persisted but absent from the payload writes in the first group", async () => {
+    const { tx, calls } = makeFakeTx();
+    // The parent already exists in the database, so its FK resolves without being rewritten here.
+    const existingItemsMap = new Map([["kid", existing({ id: "kid", name: "Sub-item" })]]);
+
+    await upsertEstimateItems(tx, {
+        estimateId: "est1",
+        items: [{ id: "kid", parentId: "already-persisted-section", name: "Sub-item", quantity: 1, unitCost: 1 }],
+        existingItemsMap,
+    });
+
+    assert.deepEqual(calls.map(c => c.method), ["update"]);
+});
+
 test("the `order` fallback is per-group (parents and children each restart from 0)", async () => {
     const { tx, calls } = makeFakeTx();
     const existingItemsMap = new Map<string, ExistingEstimateItem>();
@@ -209,6 +260,115 @@ test("persisted field set matches ESTIMATE_ITEM_SAVE_FIELDS (the shared normaliz
     assert.equal("approvalStatus" in data, false, "approval columns are owned solely by updateItemApproval");
     assert.equal("approvalNote" in data, false);
     assert.equal("id" in data, false, "create keeps id at the top level, not inside data twice");
+});
+
+/**
+ * parentId scope. EstimateItem's self-referencing FK does not require parent and child to share
+ * an estimateId, so without this guard a save can hang one estimate's rows off another
+ * estimate's tree — and the section roll-up that drives totalAmount -> tax -> milestones would
+ * then be computed across both.
+ */
+test("a parentId naming a row of THIS estimate is accepted (persisted parent)", () => {
+    assertEstimateItemParentsInScope(
+        [{ id: "child", parentId: "parent" }],
+        ["parent", "child"],
+    );
+});
+
+test("a parentId naming a brand-new section in the same payload is accepted", () => {
+    // Add Category then drag items under it, all before the first save: neither row is
+    // persisted yet, so the persisted-id set is empty and only the payload vouches for them.
+    assertEstimateItemParentsInScope(
+        [{ id: "new-section", parentId: null }, { id: "new-child", parentId: "new-section" }],
+        [],
+    );
+});
+
+test("a parentId belonging to a DIFFERENT estimate is rejected", () => {
+    assert.throws(
+        () => assertEstimateItemParentsInScope(
+            [{ id: "child", parentId: "other-estimates-section" }],
+            ["child"],
+        ),
+        /parent does not belong to this estimate/,
+    );
+});
+
+test("the foreign parentId is rejected even when the rest of the payload is in scope", () => {
+    assert.throws(
+        () => assertEstimateItemParentsInScope(
+            [
+                { id: "a", parentId: null },
+                { id: "b", parentId: "a" },
+                { id: "c", parentId: "foreign" },
+            ],
+            ["a", "b", "c"],
+        ),
+        /parent does not belong to this estimate/,
+    );
+});
+
+test("a row that is its own parent is rejected", () => {
+    assert.throws(
+        () => assertEstimateItemParentsInScope([{ id: "a", parentId: "a" }], ["a"]),
+        /cannot be its own parent/,
+    );
+});
+
+test("a multi-row parentId cycle is rejected, even though every id is in scope", () => {
+    // A -> B -> C -> A. Every parent names a real row of this estimate, so the scope check alone
+    // passes it. computeEstimateItemTotals then values every row in the cycle at 0, which would
+    // quietly zero the subtotal that drives totalAmount -> tax -> milestones.
+    assert.throws(
+        () => assertEstimateItemParentsInScope(
+            [
+                { id: "a", parentId: "c" },
+                { id: "b", parentId: "a" },
+                { id: "c", parentId: "b" },
+            ],
+            ["a", "b", "c"],
+        ),
+        /cyclic/,
+    );
+});
+
+test("a deep, acyclic chain is accepted", () => {
+    assertEstimateItemParentsInScope(
+        [
+            { id: "d", parentId: "c" },
+            { id: "c", parentId: "b" },
+            { id: "b", parentId: "a" },
+            { id: "a", parentId: null },
+        ],
+        [],
+    );
+});
+
+test("absent, null and empty-string parentId are all treated as root rows", () => {
+    assertEstimateItemParentsInScope(
+        [{ id: "a" }, { id: "b", parentId: null }, { id: "c", parentId: "" }],
+        [],
+    );
+});
+
+test("a payload id vouches for a parent only for parentId — it still routes to create", async () => {
+    // The in-scope set includes payload ids so a same-payload parent works. That cannot be used
+    // to smuggle another estimate's row in: an id absent from existingItemsMap routes to create,
+    // and a create under an id that already exists elsewhere fails the primary-key constraint.
+    const { tx, calls } = makeFakeTx();
+    assertEstimateItemParentsInScope(
+        [{ id: "sect", parentId: null }, { id: "kid", parentId: "sect" }],
+        [],
+    );
+    await upsertEstimateItems(tx, {
+        estimateId: "est1",
+        items: [
+            { id: "sect", name: "Section", quantity: 1, unitCost: 1, type: "Section" },
+            { id: "kid", parentId: "sect", name: "Sub-item", quantity: 1, unitCost: 1 },
+        ],
+        existingItemsMap: new Map<string, ExistingEstimateItem>(),
+    });
+    assert.deepEqual(calls.map(c => c.method), ["create", "create"]);
 });
 
 test("EstimateStaleSaveError is a plain, message-only sentinel", () => {
