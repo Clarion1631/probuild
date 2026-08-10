@@ -70,7 +70,8 @@ Top untested suspects (need the log to confirm — don't guess-build):
 - Refresh token in `CompanySettings.googleDriveRefreshToken`; lead media root = "ProBuild Leads" in that Drive
 
 **Vercel**
-- Project `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL`, scope `justins-projects-a2347a8d`, token `$VERCEL_TOKEN`
+- Project `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL`, scope `justins-projects-a2347a8d`
+- Auth: `VERCEL_TOKEN` in the environment, else the persisted `vercel login`. The CLI reads either one silently — never put the value on a command line (see the deploy section below).
 
 ---
 
@@ -84,10 +85,19 @@ npx eas-cli submit -p ios --latest --non-interactive              # ascAppId 677
 npx eas-cli update --channel production --message "..."           # OTA, seconds
 ```
 
-**Web deploy** (from `gtr-probuild-site`, auto-deploy is OFF by design):
+**Web deploy** (from `gtr-probuild-site`). Git auto-deploy is **ON** — merging to
+`main` ships to prod on its own; the CLI is only for shipping ahead of a merge:
 ```bash
-vercel deploy --prod --yes --scope justins-projects-a2347a8d --token $VERCEL_TOKEN --archive=tgz
+vercel deploy --prod --yes --scope justins-projects-a2347a8d
 ```
+> **Never pass `--token`.** On success the CLI prints a "next steps" block that
+> reconstructs follow-up commands and copies your global flags through verbatim,
+> putting the token in the terminal and in any agent transcript. That has forced
+> three rotations. The flag is unnecessary — the CLI reads a non-empty
+> `VERCEL_TOKEN` from the environment, else the persisted `vercel login`, and
+> neither is ever echoed. See the "Deploying to Vercel" section of `CLAUDE.md`.
+> `--archive=tgz` is also unneeded (~1,389 source files vs a 15,000 cap) and it
+> defeats per-file upload caching — add it only if an upload actually stalls.
 
 ---
 
