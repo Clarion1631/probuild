@@ -62,12 +62,14 @@ export interface SerializedJourney {
 
 /** Stable per-journey key — mirrors `journeyKey()` in `@/lib/automation-events`
  * (the server-side equivalent operating on `Date` instead of the serialized
- * ISO string here). Full driveFileId when confirmed; otherwise a composite
- * of the bare docNumber prefix + firstSeen so two journeys sharing that
- * prefix (a real collision) never collide onto the same key — used for both
- * the React list key and the fix-suggestion lookup below. */
-function journeyKey(j: Pick<SerializedJourney, "driveFileId" | "docNumber" | "firstSeen">): string {
-    return j.driveFileId ?? `${j.docNumber}:${j.firstSeen}`;
+ * ISO string here). Trust order: full driveFileId, then full qbPurchaseId,
+ * then a composite of the bare docNumber prefix + firstSeen. N4: this used
+ * to skip the qbPurchaseId tier and fall straight to docNumber+firstSeen —
+ * two QBO-only journeys sharing a prefix AND a firstSeen instant could
+ * collide onto the same key. Used for both the React list key and the
+ * fix-suggestion lookup below. */
+function journeyKey(j: Pick<SerializedJourney, "driveFileId" | "qbPurchaseId" | "docNumber" | "firstSeen">): string {
+    return j.driveFileId ?? (j.qbPurchaseId ? `qb:${j.qbPurchaseId}` : `${j.docNumber}:${j.firstSeen}`);
 }
 
 function EmptyState() {
@@ -160,7 +162,7 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
                 aria-expanded={isOpen}
                 className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-slate-50 transition"
             >
-                <StateChip state={journey.finalState} />
+                <StateChip state={journey.finalState} unconfirmed={!journey.keyConfirmed} />
                 <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-hui-textMain truncate">{primaryLabel}</p>
                     {subParts.length > 0 && (
@@ -187,15 +189,15 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
                     className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
                     title={new Date(journey.lastSeen).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Los_Angeles" })}
                 >
-                    {formatRelativeTime(new Date(journey.lastSeen))}
+                    {formatRelativeTime(new Date(journey.lastSeen), now)}
                 </span>
             </button>
 
             {isOpen && (
                 <div className="px-4 pb-4 space-y-4">
-                    <ValidationPanel journey={journey} />
+                    <ValidationPanel journey={journey} now={now} />
 
-                    <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} />
+                    <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} unconfirmed={!journey.keyConfirmed} now={now} />
 
                     {suggestion && <SuggestionCard suggestion={suggestion} />}
 
@@ -204,6 +206,18 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
             )}
         </div>
     );
+}
+
+/** "2026-08" bucket for a journey, from firstSeen (when the receipt entered
+ * the pipeline — stable, unlike lastSeen which moves on every later step) in
+ * the company's timezone. en-CA gives ISO-style YYYY-MM-DD to slice. */
+function monthKey(iso: string): string {
+    return new Date(iso).toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" }).slice(0, 7);
+}
+
+function monthLabel(key: string): string {
+    const [y, m] = key.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, 15)).toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
 }
 
 export default function JourneyList({
@@ -219,12 +233,62 @@ export default function JourneyList({
     now: number;
 }) {
     const [filter, setFilter] = useState<FilterKey>("all");
+    const [month, setMonth] = useState<string>("all");
+    const [search, setSearch] = useState<string>("");
 
-    const filtered = journeys.filter((j) => FILTERS.find((f) => f.key === filter)!.test(j, now));
+    const months = [...new Set(journeys.map((j) => monthKey(j.firstSeen)))].sort().reverse();
+
+    // Month + search narrow the dataset first; the status chips (and their
+    // counts) then operate on that scope, so the numbers always add up.
+    const query = search.trim().toLowerCase();
+    const scoped = journeys.filter(
+        (j) =>
+            (month === "all" || monthKey(j.firstSeen) === month) &&
+            (query === "" ||
+                (j.vendor ?? "").toLowerCase().includes(query) ||
+                (j.projectName ?? "").toLowerCase().includes(query) ||
+                (j.fileName ?? "").toLowerCase().includes(query)),
+    );
+    const filtered = scoped.filter((j) => FILTERS.find((f) => f.key === filter)!.test(j, now));
 
     return (
         <div className="space-y-3">
-            <ReceiptFilterBar journeys={journeys} filter={filter} onFilterChange={setFilter} now={now} />
+            <ReceiptFilterBar journeys={scoped} filter={filter} onFilterChange={setFilter} now={now} />
+            <div className="flex flex-wrap items-center gap-2">
+                <select
+                    value={month}
+                    onChange={(e) => setMonth(e.target.value)}
+                    aria-label="Filter by received month"
+                    className="text-xs font-medium text-hui-textMain bg-white border border-hui-border rounded-lg px-2 py-1.5"
+                >
+                    <option value="all">All months</option>
+                    {months.map((m) => (
+                        <option key={m} value={m}>
+                            {monthLabel(m)}
+                        </option>
+                    ))}
+                </select>
+                <input
+                    type="search"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search vendor, project, or file…"
+                    aria-label="Search receipts by vendor, project, or file name"
+                    className="text-xs text-hui-textMain bg-white border border-hui-border rounded-lg px-2.5 py-1.5 w-56 max-w-full"
+                />
+                {(month !== "all" || search !== "") && (
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setMonth("all");
+                            setSearch("");
+                        }}
+                        className="text-xs font-medium text-hui-primary hover:underline"
+                    >
+                        Clear filters
+                    </button>
+                )}
+            </div>
 
             {filtered.length === 0 ? (
                 <div className="hui-card">

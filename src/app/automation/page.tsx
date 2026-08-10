@@ -16,7 +16,8 @@ import {
     automationSummary,
     receiptDailyBuckets,
     recentAutomationEvents,
-    receiptJourneysAll,
+    receiptJourneys,
+    receiptJourneysForKeys,
     journeyKey,
     type ReceiptJourney,
     type AutomationSummary,
@@ -43,7 +44,7 @@ import { PipelineHealth } from "./components/pipeline-health";
 import { ExpandableRow } from "./components/register/expandable-row";
 import { LinksCell } from "./components/register/links-cell";
 import { RowDrilldown } from "./components/register/row-drilldown";
-import { matchReceiptJourney, type ReceiptJourneyMatch } from "./components/register/match-receipt-journey";
+import { matchReceiptJourney, type ReceiptJourneyMatch, type ReceiptJourneyIndex } from "./components/register/match-receipt-journey";
 import { toSerializedJourney } from "./components/register/serialize-journey";
 
 export const dynamic = "force-dynamic";
@@ -107,6 +108,20 @@ function sinceMsForRangeDays(days: number): number {
     return Date.now() - days * 86_400_000;
 }
 
+/** B3: a promise that never settles (a hung query) is not a rejection — an
+ * ordinary try/catch around it blocks the whole page forever waiting. Races
+ * it against a timeout so a stuck pipeline-health fetch degrades the same
+ * way an outright failure does, instead of holding the register (the data
+ * the user actually came for) hostage. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+            setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+        }),
+    ]);
+}
+
 function ConnectionErrorCard({ title, message }: { title: string; message: string }) {
     return (
         <div className="hui-card p-8 text-center">
@@ -135,7 +150,6 @@ export default async function AutomationPage(props: {
     // against), so capturing a single stable timestamp here is exactly what
     // prevents descendant client components from each calling Date.now()
     // independently during SSR vs. hydration.
-    // eslint-disable-next-line react-hooks/purity
     const nowMs = Date.now();
 
     function filterHref(overrides: { range?: string; type?: string; review?: string }) {
@@ -210,24 +224,32 @@ export default async function AutomationPage(props: {
     let mergedRows: MergedRegisterRow[] | null = null;
     let actionableOrphans: OrphanReceipt[] = [];
     let orphanProjectNameMap = new Map<string, string>();
-    let receiptJourneyList: ReceiptJourney[] = [];
+    let journeyIndex: ReceiptJourneyIndex = { byQbPurchaseId: new Map(), byDocNumber: new Map() };
     let expenseByPurchaseId = new Map<string, RawExpense>();
+    // Receipt journey PIPELINE LIST (plan §3) — a separate, display-capped
+    // fetch from the row drill-down's targeted lookup above; this one is a
+    // genuine "browse the most recent receipts" list, so a display cap is
+    // the right shape for it (see `receiptJourneys` in automation-events.ts).
+    let pipelineJourneyList: ReceiptJourney[] = [];
 
     try {
         const mergeInputs = await fetchRegisterMergeInputs(registerRows, sinceMsForRangeDays(rangeDays));
         const merged = mergeRegister(registerRows, mergeInputs.expenses, mergeInputs.receiptEvents, mergeInputs.classifications);
         const orphans = classifyOrphanReceipts(mergeInputs.receiptEvents, registerRows);
-        // Row drill-down inputs (plan §3/§5 step 9): same known dev-DB gap as
-        // mergeInputs above (AutomationEvent.qbPurchaseId/driveFileId), so
-        // fetched in the same try/catch — both degrade together.
-        //
-        // UNCAPPED on purpose: this same list also powers the row drill-down
-        // match below (`matchReceiptJourney`) — capping it here would let a
-        // genuinely-matching older journey fall past the cap and render "No
-        // audit record" even though it exists. Only the pipeline LIST DISPLAY
-        // (`pipelineJourneys` below) is capped.
-        receiptJourneyList = await receiptJourneysAll(rangeDays);
+        // Row drill-down journeys (plan §3/§5 step 9): N2 fix — instead of
+        // matching every row against a bulk, count-capped journey list (an
+        // R × J scan on the page that carries the money register, and one
+        // whose cap could silently drop a genuinely-matching older journey),
+        // fetch ONLY the journeys for the identifiers THIS register's rows
+        // actually carry, pre-indexed for an O(1) lookup per row below.
         expenseByPurchaseId = drilldownExpenseByPurchaseId(mergeInputs.rawExpenses);
+        [journeyIndex, pipelineJourneyList] = await Promise.all([
+            receiptJourneysForKeys(
+                merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
+                rangeDays,
+            ),
+            receiptJourneys(rangeDays, 200),
+        ]);
 
         mergedRows = merged.rows;
         documented = merged.counts.documented;
@@ -259,12 +281,10 @@ export default async function AutomationPage(props: {
         <OrphanReceipts orphans={actionableOrphans} projectNames={orphanProjectNameMap} />
     );
 
-    // Receipt journey PIPELINE LIST (plan §3) — display-capped (only this
-    // slice renders as list rows); the full receiptJourneyList above stays
-    // uncapped for the row drill-down match. Reuses the same
-    // toSerializedJourney used by row-drilldown.tsx, so driveFileId/
-    // qbPurchaseId/keyConfirmed carry through identically in both places.
-    const pipelineJourneys = receiptJourneyList.slice(0, 200);
+    // Reuses the same toSerializedJourney used by row-drilldown.tsx, so
+    // driveFileId/qbPurchaseId/keyConfirmed carry through identically in
+    // both places.
+    const pipelineJourneys = pipelineJourneyList;
     const serializedJourneys: SerializedJourney[] = pipelineJourneys.map(toSerializedJourney);
     // Keyed by the full driveFileId (falling back to a docNumber+firstSeen
     // composite) — NEVER the bare docNumber alone, which is a 21-char Drive
@@ -301,7 +321,7 @@ export default async function AutomationPage(props: {
             drilldown: {
                 row: r,
                 expense: r.qbTxnId ? expenseByPurchaseId.get(r.qbTxnId) ?? null : null,
-                journeyMatch: r.edges ? matchReceiptJourney(r, receiptJourneyList) : null,
+                journeyMatch: r.edges ? matchReceiptJourney(r, journeyIndex) : null,
             },
         }))
         : registerRows.map((r, i) => ({
@@ -354,12 +374,33 @@ export default async function AutomationPage(props: {
     // rather than presenting it as available.
     let pauses = { receiptPushPaused: true, qboSyncPaused: true };
     try {
-        [summary, buckets, events, pauses] = await Promise.all([
-            automationSummary(),
-            receiptDailyBuckets(30),
-            recentAutomationEvents(50),
-            pauseStates(),
-        ]);
+        // B3: 15s timeout so a hung query can't hold the register hostage
+        // (a promise that never settles isn't a rejection an ordinary catch
+        // would see), and the resolved shape is validated HERE, inside the
+        // protected block — consuming it unguarded outside the try (as
+        // before) meant a malformed result would throw past the catch and
+        // crash the render instead of degrading gracefully.
+        const [summaryResult, bucketsResult, eventsResult, pausesResult] = await withTimeout(
+            Promise.all([
+                automationSummary(),
+                receiptDailyBuckets(30),
+                recentAutomationEvents(50),
+                pauseStates(),
+            ]),
+            15_000,
+        );
+        const shapeOk =
+            summaryResult && typeof summaryResult === "object" &&
+            Array.isArray(bucketsResult) &&
+            Array.isArray(eventsResult) &&
+            pausesResult && typeof pausesResult.receiptPushPaused === "boolean" && typeof pausesResult.qboSyncPaused === "boolean";
+        if (!shapeOk) {
+            throw new Error("pipeline health inputs malformed");
+        }
+        summary = summaryResult;
+        buckets = bucketsResult;
+        events = eventsResult;
+        pauses = pausesResult;
     } catch (error) {
         console.error("pipeline health inputs failed", error instanceof Error ? error.message : "UnknownError");
         pipelineHealthUnavailable = true;
@@ -379,7 +420,7 @@ export default async function AutomationPage(props: {
                     <p className="text-sm text-hui-textMuted mt-1 max-w-3xl">
                         QuickBooks WTB account register — posted QuickBooks entries affecting account 154, fetched at{" "}
                         <span title={new Date(fetchedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
-                            {formatRelativeTime(new Date(fetchedAt))}
+                            {formatRelativeTime(new Date(fetchedAt), nowMs)}
                         </span>
                         . This view cannot see bank transactions that are pending, excluded, or missing from QuickBooks.
                         Bank-side completeness requires the monthly WTB CSV compare.
@@ -398,6 +439,9 @@ export default async function AutomationPage(props: {
                     <div className="flex gap-3 mt-2">
                         <a href="/automation/guide" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
                             How this pipeline works ↗
+                        </a>
+                        <a href="/automation/guide#running-it" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
+                            How to run this ↗
                         </a>
                         <a href={filterHref({})} className="text-xs font-medium text-hui-primary hover:underline">
                             Refresh ↻
@@ -627,6 +671,7 @@ export default async function AutomationPage(props: {
                     qboSyncPaused={pauses.qboSyncPaused}
                     isAdmin={isAdmin}
                     syncRuns={syncRuns}
+                    now={nowMs}
                 />
             )}
         </div>
