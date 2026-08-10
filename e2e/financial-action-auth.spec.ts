@@ -75,7 +75,10 @@ test("all staff financial actions authorize inside the exported action", () => {
   // The helpers themselves must keep doing the work. Without this, any caller
   // assertion above still passes while the helper it names is gutted to a no-op.
   const helperBodies: Record<string, string[]> = {
-    assertEstimateScope: ["canAccessProject(", 'hasPermission(user, "leadAccess")', "throw new Error"],
+    // The decision itself lives in access-rules.ts and is behaviourally tested
+    // by estimate-scope-rules.spec.ts; what must hold HERE is that the
+    // assertion still delegates to it rather than re-deciding locally.
+    assertEstimateScope: ["canAccessEstimate(", "throw new Error"],
     assertEstimateAccess: ["assertEstimatePermission(", "assertEstimateScope("],
     assertEstimateProjectAccess: ["assertEstimatePermission(", "assertEstimateScope("],
     assertEstimateLeadAccess: ["assertEstimatePermission(", "assertEstimateScope("],
@@ -112,8 +115,10 @@ test("all staff financial actions authorize inside the exported action", () => {
   expect(exportSource(source, "createInvoiceFromEstimate")).toContain("assertEstimateScope(");
 
   // Company-wide by design: the template/assembly library is not per-job.
+  // getAllEstimates is NOT in this list — it lists per-job documents, and is
+  // covered by the list-scoping test below.
   const companyWideEstimateActions = [
-    "getAllEstimates", "getEstimateTemplates", "saveItemsAsAssembly", "deleteAssembly",
+    "getEstimateTemplates", "saveItemsAsAssembly", "deleteAssembly",
   ];
   for (const name of companyWideEstimateActions) {
     expectGuardBeforeDatabase(source, name, "await assertEstimatePermission(");
@@ -172,6 +177,75 @@ test("all staff financial actions authorize inside the exported action", () => {
   for (const name of ["saveCompanySettings", "updateCompanyProjectStatuses", "saveCompanySubcontractorTrades"]) {
     expectGuardBeforeDatabase(source, name, "await assertCompanySettingsPermission(");
   }
+});
+
+test("estimate readers filter by the same scope the detail page asserts", () => {
+  const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+  const permissions = readFileSync(join(process.cwd(), "src/lib/permissions.ts"), "utf8");
+
+  // A list that returns rows whose detail page throws Forbidden is its own bug.
+  // Every reader that returns estimates must apply the filter form of the same
+  // rule assertEstimateScope applies to a single row.
+  {
+    const action = exportSource(source, "getAllEstimates");
+    const guardIndex = action.indexOf("await assertEstimatePermission(");
+    const filterIndex = action.indexOf("where: estimateScopeWhere(user)");
+    const databaseIndex = action.indexOf("prisma.");
+    expect(guardIndex, "getAllEstimates must assert the estimates permission").toBeGreaterThanOrEqual(0);
+    expect(filterIndex, "getAllEstimates must scope the list, not just gate the permission").toBeGreaterThanOrEqual(0);
+    expect(guardIndex, "getAllEstimates must authorize before database access").toBeLessThan(databaseIndex);
+  }
+
+  // The staff branch of the portal preview used to fetch any id by id alone.
+  {
+    const action = exportSource(source, "getEstimateForPortal");
+    expect(action, "the staff preview branch must be scoped")
+      .toContain("const staffFilter = { AND: [{ id }, estimateScopeWhere(staffUser)] }");
+    expect(action, "the staff preview must not fall back to an unscoped fetch by id")
+      .not.toMatch(/where: \{ id \},/);
+    // Both the primary query and its degraded fallback must use it — the
+    // fallback runs on exactly the error paths nobody exercises by hand.
+    expect(action.match(/where: staffFilter/g) ?? [], "both staff queries must use the scoped filter").toHaveLength(2);
+  }
+
+  // Nested embeds are the same exposure by another route: a lead or project
+  // getter that includes estimates hands back rows the caller may not open.
+  for (const name of ["getLeads", "getLead", "getProjects", "getProject", "getClients"]) {
+    expect(exportSource(source, name), `${name} must scope the estimates it embeds`)
+      .toContain("scopedEstimateRelation(");
+  }
+  expect(source, "no estimates relation may be embedded without the scope filter")
+    .not.toMatch(/estimates: safeEstimateInclude/);
+
+  // The relation wrapper must apply the predicate, not an empty where — every
+  // nested-embed assertion above would still pass if it returned `where: {}`.
+  const relationStart = source.indexOf("function scopedEstimateRelation");
+  expect(relationStart, "scopedEstimateRelation must exist").toBeGreaterThanOrEqual(0);
+  expect(
+    source.slice(relationStart, relationStart + 400),
+    "scopedEstimateRelation must apply estimateScopeWhere to the relation",
+  ).toContain("where: estimateScopeWhere(user)");
+
+  // Agreement is structural, not coincidental. Both forms of the rule are
+  // defined in access-rules.ts and are behaviourally verified against each
+  // other over a truth table in estimate-scope-rules.spec.ts; what must hold
+  // here is that actions.ts keeps delegating to them instead of re-deciding.
+  expect(
+    source.slice(source.indexOf("function assertEstimateScope(")),
+    "assertEstimateScope must delegate to the shared rule",
+  ).toContain("canAccessEstimate(user, scope)");
+  expect(permissions, "permissions.ts must re-export the shared rules, not redefine them")
+    .toMatch(/export \{[\s\S]{0,400}canAccessEstimate,[\s\S]{0,200}estimateScopeWhere,[\s\S]{0,200}\} from "\.\/access-rules"/);
+  expect(source, "actions.ts must not keep a private copy of the scope predicate")
+    .not.toMatch(/\nfunction estimateScopeWhere\(/);
+
+  // The reader that has no throwing assertion of its own must not swallow
+  // infrastructure failures — an outage rendered as "no estimates" is a page
+  // of plausible zeroes, not an error.
+  const resolverStart = source.indexOf("async function currentStaffUserOrNull(");
+  expect(resolverStart, "currentStaffUserOrNull must exist").toBeGreaterThanOrEqual(0);
+  const resolver = source.slice(resolverStart, source.indexOf("async function assertActiveStaff("));
+  expect(resolver, "currentStaffUserOrNull must not catch and flatten errors").not.toContain("catch");
 });
 
 test("dual-auth financial actions keep explicit portal or machine authorization", () => {

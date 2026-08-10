@@ -3,25 +3,21 @@ import { getServerSession } from "next-auth/next";
 import { cookies } from "next/headers";
 import { authOptions } from "@/lib/auth";
 
-export type PermissionKey =
-    // Administrative
-    | "manageTeamMembers" | "manageSubs" | "manageVendors"
-    | "companySettings" | "costCodesCategories"
-    // Project screens
-    | "schedules" | "estimates" | "invoices" | "contracts"
-    | "roomDesigner" | "changeOrders" | "financialReports"
-    | "timeClock" | "dailyLogs" | "files" | "takeoffs"
-    // Leads
-    | "createLead" | "clientCommunication" | "leadAccess";
+// The pure rules live in access-rules.ts (no Prisma / next-auth / next-headers
+// imports) so they can be unit-tested for real. Re-exported here so every
+// existing `from "./permissions"` import keeps working unchanged.
+export {
+    ADMIN_ROLES,
+    isAdminOrManager,
+    hasPermission,
+    accessibleProjectIds,
+    canAccessProject,
+    canAccessEstimate,
+    estimateScopeWhere,
+} from "./access-rules";
+export type { PermissionKey, ProjectScopedUser, EstimateOwner } from "./access-rules";
 
-const ADMIN_ROLES = ["ADMIN", "MANAGER"];
-
-/** ADMIN_ROLES above is module-private — this is the exported check for
- * callers outside permissions.ts (e.g. decision-template-crud-core.ts's
- * "GTR admin" CRUD/override gate) instead of duplicating the role list. */
-export function isAdminOrManager(user: { role: string }): boolean {
-    return ADMIN_ROLES.includes(user.role);
-}
+import { hasPermission, type PermissionKey } from "./access-rules";
 
 /** Typed marker for the "Unauthorized" errors thrown by the portal access
  * assertions in actions.ts, so callers can detect an auth failure with
@@ -73,22 +69,6 @@ export async function getUserWithPermissionsByEmail(email: string) {
     return user?.status === "DISABLED" ? null : user;
 }
 
-// Check if user has a specific permission
-export function hasPermission(
-    user: { role: string; permissions?: any | null },
-    key: PermissionKey
-): boolean {
-    // Admins and Managers always have full access
-    if (ADMIN_ROLES.includes(user.role)) return true;
-
-    // If no permissions record, use defaults based on role
-    if (!user.permissions) {
-        return getDefaultPermission(user.role, key);
-    }
-
-    return !!user.permissions[key];
-}
-
 // All permission keys (single source of truth)
 export const ALL_PERMISSION_KEYS: PermissionKey[] = [
     // Administrative
@@ -112,28 +92,6 @@ export function getEffectivePermissions(
         result[key] = hasPermission(user, key);
     }
     return result;
-}
-
-// Check if user can access a specific project
-export function canAccessProject(
-    user: { role: string; projectAccess?: { projectId: string }[]; assignedProjects?: { id: string }[] },
-    projectId: string
-): boolean {
-    if (ADMIN_ROLES.includes(user.role)) return true;
-    if (user.projectAccess?.some(pa => pa.projectId === projectId)) return true;
-    if (user.assignedProjects?.some(p => p.id === projectId)) return true;
-    return false;
-}
-
-// Default permissions by role (used when no UserPermission record exists)
-function getDefaultPermission(role: string, key: PermissionKey): boolean {
-    const defaults: Record<string, PermissionKey[]> = {
-        FIELD_CREW: ["schedules", "roomDesigner", "timeClock", "dailyLogs", "files", "costCodesCategories"],
-        FINANCE: ["estimates", "invoices", "financialReports", "timeClock", "changeOrders", "costCodesCategories"],
-        EMPLOYEE: ["schedules", "roomDesigner", "timeClock", "dailyLogs", "files", "costCodesCategories"],
-    };
-
-    return (defaults[role] || defaults.EMPLOYEE)?.includes(key) ?? false;
 }
 
 // Ensure a user has a permissions record (create with defaults if missing)
