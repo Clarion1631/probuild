@@ -103,7 +103,7 @@
 <div class="wrap">
   <h1>GTR Expense Pipeline</h1>
   <p class="sub">From a swipe of the Washington Trust debit card to job-cost visibility in ProBuild — who touches what, where the money data lives, and what runs by itself. Goal: answer "are we profitable, is cash flow good" daily.</p>
-  <p class="stamp">Updated July 31, 2026 · Every stage below is <b>live and verified end-to-end</b> (test receipt → QuickBooks purchase → ProBuild job cost, receipt attached the whole way).</p>
+  <p class="stamp">Updated August 10, 2026 · Every stage below is <b>live and verified end-to-end</b> (test receipt → QuickBooks purchase → ProBuild job cost, receipt attached the whole way).</p>
 
   <div class="glance" aria-label="The pipeline at a glance">
     <svg class="logo" viewBox="0 0 49.4 37.25" aria-label="Gmail"><path fill="#4285f4" d="M3.37 37.25h7.87V18.14L0 9.71v24.17c0 1.86 1.51 3.37 3.37 3.37z"/><path fill="#34a853" d="M38.16 37.25h7.87c1.86 0 3.37-1.51 3.37-3.37V9.71L38.16 18.14z"/><path fill="#fbbc04" d="M38.16 3.37v14.77L49.4 9.71V5.06c0-4.17-4.76-6.55-8.1-4.05z"/><path fill="#ea4335" d="M11.24 18.14V3.37L24.7 13.47 38.16 3.37v14.77L24.7 28.24z"/><path fill="#c5221f" d="M0 5.06v4.65l11.24 8.43V3.37L8.1 1.01C4.76-1.49 0 .89 0 5.06z"/></svg>
@@ -203,6 +203,7 @@
     <tr><td>Receipt scan + QBO booking</td><td>Every 10 minutes</td><td>Reads new receipts with AI, archives the original, creates the QuickBooks purchase (or emails the fallback)</td></tr>
     <tr><td>Folder reconciler</td><td>Daily</td><td>Creates intake folders for new In-Progress projects; emails Justin when a folder matches no project</td></tr>
     <tr><td>QBO → ProBuild sync</td><td>Every 4 hours <span class="pill on">on</span></td><td>Imports finalized purchases into job costs, copies receipts over, applies voids/edits/moves</td></tr>
+    <tr><td>Robot bookkeeper (stuck-receipt resolver)</td><td>Daily, 7:23&nbsp;AM</td><td>An AI bookkeeper (Claude Opus, on Justin's PC) works the <i>_Needs Review</i> pile: checks QuickBooks, splits multi-receipt scans, refiles duplicates, and writes a daily digest</td></tr>
   </table>
   </div>
 
@@ -216,6 +217,38 @@
     <tr><td>Richard / CJ / Justin</td><td>Read the numbers: project Financial Overview and Reports → Company Financials</td></tr>
     <tr><td>The system</td><td>Everything between the receipt and the report</td></tr>
   </table>
+  </div>
+
+  <h2>Running it — the 2-minute health check</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Question</th><th>Where to look</th></tr>
+    <tr><td>Is money flowing?</td><td>This Automation page — receipts booked this month, hands-free rate, "Booked" chips on recent receipts</td></tr>
+    <tr><td>What's actually stuck?</td><td>Drive: <code>Expenses → New Receipts &amp; Checks → _Needs Review</code>. <b>The folder is the truth</b> — the count on this page can run low, because files dropped straight into _Needs Review never reported themselves to ProBuild</td></tr>
+    <tr><td>What did the robot bookkeeper do?</td><td>Drive: <code>Claude → Bookeeping → resolver-digests</code> — one dated note per day: what it fixed, what needs a human, what it left alone and why</td></tr>
+    <tr><td>Are costs reaching ProBuild?</td><td>Project → Time &amp; Expenses → Expenses tab. If a matched QBO purchase isn't there yet, press <b>Run sync now</b> up top</td></tr>
+  </table>
+  </div>
+
+  <div class="stage a">
+    <span class="tag">Fixing a stuck receipt — the one rule</span>
+    <div class="h3row"><h3>Save a fixed copy as a NEW file. Never revive the old one.</h3></div>
+    <p>The bot keeps its notes <i>inside</i> each Drive file, and once a file is parked in <i>_Needs Review</i> it is frozen forever on purpose — that's what makes double-booking impossible. To unblock it:</p>
+    <ul>
+      <li><b>Multi-receipt scan?</b> Split it into one file per receipt, then drop each into the right job folder under <code>New Receipts &amp; Checks</code>. The bot picks it up within 10 minutes.</li>
+      <li><b>Unreadable total?</b> Save a clearer copy (or the same file under a new name) into the job folder.</li>
+      <li><b>True duplicate?</b> Nothing to do — the original already booked. Move the extra into <code>Processed Receipts → _Duplicates</code>.</li>
+      <li><b>Never</b> use Drive's "Make a copy" (the copy inherits the frozen notes) and <b>never</b> move the parked file back into a job folder. Upload fresh.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <h3>The robot bookkeeper (daily, 7:23 AM)</h3>
+    <p>An AI bookkeeper runs every morning from Justin's PC and works the <i>_Needs Review</i> pile the same way a careful human would: it reads each document, checks <b>full QuickBooks history</b> before deciding anything, splits multi-receipt scans, refiles true duplicates, routes payroll items out of the expense pipeline, and re-drops genuinely unbooked receipts as new files. Hard rules: it never deletes anything, never writes to QuickBooks, and caps itself at 25 files per day. Anything it isn't sure about goes in the daily digest for Justin instead of being guessed at.</p>
+    <ul>
+      <li><b>Know its limits:</b> it only runs while Justin's PC is logged in with Google Drive mounted. If a day's digest is missing, the run didn't happen — that day's pile simply waits.</li>
+      <li><b>Emergency stop:</b> Settings on this page can pause receipt-push and the QBO sync; the daily bookkeeper is a Windows scheduled task (<code>receipt-resolver-daily</code>) on Justin's PC.</li>
+    </ul>
   </div>
 
   <h2>What's next on the roadmap</h2>
