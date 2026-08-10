@@ -28,7 +28,7 @@
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
 - Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
-- Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
+- Auto-deploy is **ON** — pushes build previews, merges to `main` ship to prod. See "Deploying to Vercel"
 
 ## Room Studio (3D room designer)
 - Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
@@ -53,9 +53,9 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 1. Pick next session from ProbuildTodo.md
 2. Make changes
 3. npm run build          # must pass 0 errors
-4. git push origin main
-5. Schema changed? Run the branch's scripts/apply-*.mjs against prod FIRST (see "Deploying to Vercel")
-6. vercel --prod --token $env:VERCEL_TOKEN   # deploy only when ready
+4. Schema changed? Run the branch's scripts/apply-*.mjs against prod NOW, before main moves (see "Deploying to Vercel")
+5. git push origin main   # auto-deploy is ON — this ships to prod
+6. Shipping ahead of a merge? Use the command in "Deploying to Vercel" verbatim. NEVER pass --token.
 7. Click through affected pages on prod to verify
 8. Mark items done in ProbuildTodo.md
 ```
@@ -71,21 +71,63 @@ stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
 
-## Deploying to Vercel (CLI only — auto-deploy is OFF)
+## Deploying to Vercel (manual CLI deploy — note auto-deploy also ships `main`)
 ```powershell
 # Production deploy (from the main repo dir, not a worktree):
-vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
+vercel --prod --yes --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
+# add --archive=tgz only as a fallback if the source upload stalls (see notes below)
 ```
+This builds a **new** production deployment. To make an existing staged deployment live instead, use `vercel promote <deployment-url>` — `--prod` does not re-promote.
+
+> **NEVER pass `--token` to any `vercel` command.** On success the CLI prints a "next steps"
+> block that reconstructs follow-up commands for you, copying your global flags through verbatim —
+> so the token value lands straight in the terminal and the session transcript. That has leaked the
+> production token **three times** (PR-209, 2026-08-09, and again 2026-08-10), each time forcing a
+> rotation. The flag is unnecessary: the CLI
+> already authenticates on its own. Precedence is `--token` → a **non-empty** `VERCEL_TOKEN` in the
+> environment → the persisted login at `%APPDATA%\com.vercel.cli\Data\auth.json` (from
+> `vercel login`). The latter two are read silently and never echoed. This applies to every
+> *authenticating* subcommand (`deploy`, `env`, `logs`, `inspect`), not just `--prod`.
+>
+> A stale `VERCEL_TOKEN` fails every *authenticated* command with *"The token provided via
+> VERCEL_TOKEN environment variable is not valid"* — an invalid explicit credential does **not**
+> fall back to the persisted login. (Local-only commands like `vercel --version` still work, so
+> don't use those to test auth; use `vercel whoami`, which prints `jadkins-4713`.)
+>
+> **Rotating the token — never put the value on a command line.** `setx VERCEL_TOKEN "<value>"`
+> is the same leak class this rule exists to prevent: it lands the secret in argv, shell history,
+> and any agent transcript. Justin sets it himself, in his own terminal, one of these two ways:
+> - Windows GUI: Settings → *Edit environment variables for your account* → edit `VERCEL_TOKEN`.
+> - PowerShell, value read from a prompt rather than argv. It **must** be `-AsSecureString`: a bare
+>   `Read-Host` echoes the pasted token to the screen and into terminal scrollback, and PowerShell
+>   5.1 (this machine) has no `-MaskInput`.
+>   ```powershell
+>   $s = Read-Host 'Paste token' -AsSecureString
+>   $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
+>   try {
+>     [Environment]::SetEnvironmentVariable('VERCEL_TOKEN', [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b), 'User')
+>   } finally {
+>     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)
+>   }
+>   ```
+>
+> Either way it only affects **new** shells, and is Windows-only — WSL needs its own copy. Confirm
+> in a fresh shell with `vercel whoami`. Claude must never be given the token value.
+
 **Pre-deploy checklist (in order):**
 1. `npm run build` passes locally with 0 errors
 2. **Schema changed?** If the branch edits `prisma/schema.prisma` and ships a `scripts/apply-*.mjs`, run it against prod BEFORE deploying (`node scripts/apply-<name>.mjs`). These scripts are additive + idempotent (`IF NOT EXISTS`, guarded FKs) and safe while the old build is live — but the new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 "column does not exist" until the script runs. (2026-07-20: the company-schedule deploy went out before `apply-company-schedule-schema.mjs` ran; project pages hit the route error boundary until it was applied.)
 3. Deploy with the command above, then click through the affected pages on prod
 
-- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- **Git auto-deploy is ON, despite older notes here.** It is not disabled in `vercel.json` (that file holds only `crons` — there is no `git.deploymentEnabled` key), and the project carries no `deploymentEnabled` override, so Vercel's default `true` applies. Verified 2026-08-10: recent production deployments off `main` report `source: "git"`, `readySubstate: "PROMOTED"`, and hold `probuild.goldentouchremodeling.com`. Branch pushes build previews the same way
+- Consequence: **merging a PR ships it live.** Run the pre-deploy checklist before merging, not just before running the CLI
+- To turn it off, set it in the Vercel dashboard (Settings → Git) or add `git.deploymentEnabled` to `vercel.json` — it is not currently set in either. Note that disabling Git deploys still leaves dashboard redeploy/promote, Deploy Hooks, the REST API, and CI able to ship
+- No checked-in config throttles build volume (no `ignoreCommand`, no Ignored Build Step in the repo); dashboard/team spend controls were not checked. An older note attributes a ~$250 bill to frequent builds, so keep pushes deliberate
+- `--archive=tgz` is **optional, not required** — with the current `.vercelignore` the CLI source upload measures ~1,389 files (2026-08-10), far under Vercel's 15,000-file cap. That cap counts uploaded source files, not build output. Archive mode bundles everything into one tarball, which negates per-file upload caching and can make repeat deploys slower, so add it only if an upload actually stalls
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
-- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
+- A `PreToolUse` guard (`~/.claude/hooks/block-vercel-token.mjs`, wired in `~/.claude/settings.json`) blocks `vercel` commands carrying `--token`/`-t`/an inline `VERCEL_TOKEN=`. If you hit it, drop the flag — don't work around it. It is defence-in-depth, not enforcement: it only covers Claude's Bash/PowerShell calls **on this machine**, and does nothing for a manual terminal, CI, Codex, or another machine. The rule above is still the actual control
+- Other secrets-in-argv / secrets-on-disk paths this rule does **not** cover: `--env KEY=VALUE` and `--build-env KEY=VALUE` put values in argv; `vercel env pull` and `vercel pull` write every production env var in plaintext to `.env*` / `.vercel/.env.production.local` (gitignored, but readable by any tool or backup). Treat those files as live secrets
 
 ## E2E testing — never against the live DB
 See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
@@ -171,7 +213,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Run parallel sub-agents** for independent work (e.g. building 3 report pages simultaneously in separate agents)
 - **Don't re-read large files** — if you already know the structure, reference it. GanttChart.tsx is 17k tokens — don't read it unless editing it.
 - **Batch tool calls** — make independent reads/greps/globs in parallel, not sequential
-- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails.
+- **Auth is already configured** — gh (keyring), vercel ($VERCEL_TOKEN), supabase ($SUPABASE_ACCESS_TOKEN), stripe ($STRIPE_API_KEY), sentry ($SENTRY_AUTH_TOKEN). Don't re-authenticate or verify credentials unless something fails. **One exception:** run `vercel whoami` before a production deploy — a stale `VERCEL_TOKEN` fails mid-deploy and does not fall back to the persisted login, so checking first is cheaper than a half-shipped release.
 
 ## Dead buttons / unlinked UI
 - While working on any page, audit all buttons, links, and nav items for dead ends
