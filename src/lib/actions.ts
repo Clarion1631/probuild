@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, estimateScopeWhere, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, estimateScopeWhere, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -107,7 +107,7 @@ import {
     type CreateScheduleTaskInput,
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
-import { ensureStandardFolders } from "./project-folders";
+import { convertLeadToProjectCore } from "./lead-conversion-core";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 // Import the -core module, not the "server-only" wrapper: actions.ts is in the
@@ -1152,99 +1152,21 @@ export const getProject = cache(async function getProject(id: string) {
     return project ? JSON.parse(JSON.stringify(project)) : null;
 });
 
+// Staff entry point for lead → project conversion. The conversion itself moves
+// every estimate, contract, schedule task and file off the lead and onto a brand
+// new project, so as a remotely invokable Server Action it must not run for an
+// unauthenticated caller. Mirrors the /leads/[id] layout gate (`leadAccess`),
+// which is the only UI that offers "Convert to project".
+//
+// Callers that authorize the conversion themselves — the portal's
+// approveEstimate (client ownership via resolveSessionClientId) and
+// /api/manager/jobs (mobile token or session + assertLeadAccess) — call
+// convertLeadToProjectCore directly instead; a portal client is not staff and
+// would always fail this gate.
 export async function convertLeadToProject(leadId: string) {
-    const lead = await prisma.lead.findUnique({ 
-        where: { id: leadId },
-        include: { client: true }
-    });
-    if (!lead) throw new Error("Lead not found");
-
-    // Idempotency: if this lead was already converted, return existing project
-    const existingProject = await prisma.project.findUnique({ where: { leadId } });
-    if (existingProject) return { id: existingProject.id };
-
-    // Normalize the job-site address (outside the transaction — external call).
-    // Also catches legacy leads saved before geocode-on-save existed; a precise
-    // match seeds the project's time-clock geofence coordinates.
-    const geo = await geocodeJobSiteAddress(lead.location);
-
-    // Wrap entire conversion in a transaction for atomicity
-    const project = await prisma.$transaction(async (tx) => {
-        const project = await tx.project.create({
-            data: {
-                name: lead.name,
-                clientId: lead.clientId,
-                location: geo?.formattedAddress ?? lead.location,
-                ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "Waiting to Start",
-                startDate: lead.expectedStartDate ?? null,
-                type: lead.projectType || "Unknown",
-                managerId: lead.managerId || null,
-                tags: lead.tags || null,
-                leadId,
-            },
-        });
-
-        // Relink child records to the new project.
-        // Estimate has no onDelete:Cascade on its lead FK — keep leadId so it
-        // remains visible from both the lead view and the project view.
-        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
-        // RoomDesign has an owner-XOR CHECK constraint (projectId XOR leadId), so we must
-        // clear leadId when setting projectId in the same transaction.
-        await tx.roomDesign.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        // Contract.lead FK is onDelete:SetNull — keep leadId so contracts remain visible from
-        // both the lead view and the project view (same pattern as Estimate).
-        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id } });
-        // The remaining models still have onDelete:Cascade on their lead FK — clear leadId.
-        await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-
-        await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
-
-        return project;
-    });
-
-    // Auto-grant access to eligible team members
-    const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
-    await autoGrantProjectAccessToEligibleUsers(project.id);
-
-    // The ProBuild Files tab gets its own canonical scaffold. This is
-    // deliberately independent of Drive provisioning and never rolls back a
-    // successfully-created project.
-    try {
-        await ensureStandardFolders(project.id);
-    } catch (folderErr) {
-        console.error("[Project folders] Failed to create the standard scaffold:", folderErr);
-    }
-
-    // Provision Google Drive Folders in the background/async after project creation
-    try {
-        const { createProjectDriveFolder } = await import("./google-drive");
-        const driveResult = await createProjectDriveFolder(project.name, lead.client?.email);
-        
-        if (driveResult.success) {
-            // Create a FileFolder record in ProBuild representing this Google Drive folder
-            await prisma.fileFolder.create({
-                data: {
-                    name: `📁 Google Drive - Client Shared Folder`,
-                    projectId: project.id,
-                    visibility: "shared", // Shared with client
-                }
-            });
-            console.log(`[Google Drive] Successfully provisioned Google Drive for project: ${project.id}`);
-        }
-    } catch (driveErr) {
-        console.error("[Google Drive] Failed to provision Google Drive folder during conversion:", driveErr);
-    }
-
-    revalidatePath("/leads");
-    revalidatePath("/projects");
-    revalidatePath(`/leads/${leadId}`);
-
-    return { id: project.id };
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+    return convertLeadToProjectCore(leadId);
 }
 
 // Create a project directly (e.g. a repeat customer with another job).
@@ -1265,6 +1187,11 @@ export async function createProject(data: {
     projectType?: string;
     status?: string;
 }) {
+    // Same conversion path as convertLeadToProject, and it creates a Client and
+    // a Lead on the way — it cannot be left open to an unauthenticated caller.
+    // Gated on staff (not `leadAccess`) because the lead here is an internal
+    // implementation detail of "new project", offered on /projects.
+    await assertActiveStaff();
     if (!data.name?.trim()) throw new Error("Project name is required.");
 
     // Resolve the customer: prefer an existing client by id; otherwise find-or-create by name.
@@ -1310,7 +1237,9 @@ export async function createProject(data: {
         },
     });
 
-    const { id: projectId } = await convertLeadToProject(lead.id);
+    // Core, not the gated wrapper: this action already authorized the caller
+    // above, and it owns the lead it just created.
+    const { id: projectId } = await convertLeadToProjectCore(lead.id);
 
     // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
     // A provided status always applies — including "In Progress" for callers
@@ -2319,7 +2248,12 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     // 1) Ensure a project exists (idempotent — conversion returns the existing one).
     let projectId = estimate.projectId;
     if (!projectId && estimate.leadId) {
-        const converted = await convertLeadToProject(estimate.leadId);
+        // Core, not the gated wrapper: the caller here is approveEstimate, which
+        // has already proven the signed-in PORTAL CLIENT owns this estimate
+        // (resolveSessionClientId + project.clientId/lead.clientId). A portal
+        // client is not staff, so the staff gate would reject a legitimate
+        // client approval.
+        const converted = await convertLeadToProjectCore(estimate.leadId);
         projectId = converted.id;
     }
     if (!projectId) return null;
@@ -4414,6 +4348,48 @@ async function assertVendorPermission() {
     return assertStaffPermission("manageVendors");
 }
 
+// Document templates hold the terms & conditions, contract language and
+// disclaimers that get SNAPSHOTTED onto estimates and contracts when they are
+// sent — an unauthenticated write changes the legal text on future
+// client-facing documents. Company-wide, so there is no per-project scope to
+// apply; the split below follows the screens that actually use them.
+//
+// Reads: every consumer is an estimates or contracts surface (the estimate
+// editor's T&C picker, SendEstimateModal, the lead/project contracts tabs) plus
+// the company settings library itself.
+async function assertDocumentTemplateReadAccess() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "estimates") && !hasPermission(user, "contracts") && !hasPermission(user, "companySettings")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+// Writes: `companySettings` is the permission that owns the library at
+// /company/templates, and it alone may touch EVERY type. `estimates` is
+// accepted too, but only for the types an estimator actually authors — the
+// estimate editor's "save as template" and the /estimates Terms & Conditions
+// tab. Without the type scope below, an estimates-only user (which is the
+// FINANCE default) could rewrite contract, lien-release, warranty, addendum and
+// disclaimer language through /company/templates' full type selector, which is
+// a far bigger grant than the estimator surfaces justify.
+async function assertDocumentTemplateWritePermission() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "companySettings") && !hasPermission(user, "estimates")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+// Second half of the write gate: which TYPE this caller may write. Split from
+// the permission check so the permission still runs before any database access
+// — update/delete have to load the row to learn its type, and an edit that
+// changes `type` must clear the scope on BOTH the old and the new value or a
+// caller could launder a contract template out of its protected type.
+function assertDocumentTemplateTypeScope(user: any, type: string | null | undefined) {
+    if (!canWriteDocumentTemplateType(user, type)) throw new Error("Forbidden");
+}
+
 // Creating a vendor is also part of the PO flow — SelectVendorModal and
 // POQuickCreateModal let an estimator add one inline, and those screens gate on
 // financialReports (see quickCreatePOAndLink). So either permission is enough to
@@ -5377,6 +5353,7 @@ export async function deleteAssembly(templateId: string) {
 // =============================================
 
 export async function getDocumentTemplates(type?: string) {
+    await assertDocumentTemplateReadAccess();
     return await prisma.documentTemplate.findMany({
         where: type ? { type } : undefined,
         orderBy: { updatedAt: "desc" },
@@ -5384,10 +5361,13 @@ export async function getDocumentTemplates(type?: string) {
 }
 
 export async function getDocumentTemplate(id: string) {
+    await assertDocumentTemplateReadAccess();
     return await prisma.documentTemplate.findUnique({ where: { id } });
 }
 
 export async function createDocumentTemplate(data: { name: string; type: string; body: string; isDefault?: boolean }) {
+    const user = await assertDocumentTemplateWritePermission();
+    assertDocumentTemplateTypeScope(user, data.type);
     // If setting as default, unset all other defaults of same type
     if (data.isDefault) {
         await prisma.documentTemplate.updateMany({
@@ -5402,23 +5382,46 @@ export async function createDocumentTemplate(data: { name: string; type: string;
 }
 
 export async function updateDocumentTemplate(id: string, data: { name?: string; type?: string; body?: string; isDefault?: boolean }) {
-    if (data.isDefault) {
-        const existing = await prisma.documentTemplate.findUnique({ where: { id } });
-        if (existing) {
-            await prisma.documentTemplate.updateMany({
+    const user = await assertDocumentTemplateWritePermission();
+    const existing = await prisma.documentTemplate.findUnique({ where: { id } });
+    if (!existing) throw new Error("Template not found");
+    // Scope the type this row ALREADY has, and — when the edit retypes it — the
+    // one it is moving to, so neither end of a retype escapes the estimator set.
+    assertDocumentTemplateTypeScope(user, existing.type);
+    if (data.type !== undefined) assertDocumentTemplateTypeScope(user, data.type);
+    // The type was authorized from a separately-loaded row, so the write must
+    // re-assert it or a concurrent retype (by someone who IS allowed to retype)
+    // could hand an estimates-only caller a now-protected row. Pinning the
+    // observed type in the mutation's own filter closes that window; count 0
+    // means the row changed type underneath us, which is a refusal, not a 404.
+    const template = await prisma.$transaction(async (tx) => {
+        const claimed = await tx.documentTemplate.updateMany({
+            where: { id, type: existing.type },
+            data,
+        });
+        if (claimed.count === 0) throw new Error("Forbidden");
+        if (data.isDefault) {
+            await tx.documentTemplate.updateMany({
                 where: { type: data.type || existing.type, isDefault: true, NOT: { id } },
                 data: { isDefault: false }
             });
         }
-    }
-    const template = await prisma.documentTemplate.update({ where: { id }, data });
+        return tx.documentTemplate.findUnique({ where: { id } });
+    });
     revalidatePath("/company/templates");
     revalidatePath("/estimates");
     return template;
 }
 
 export async function deleteDocumentTemplate(id: string) {
-    await prisma.documentTemplate.delete({ where: { id } });
+    const user = await assertDocumentTemplateWritePermission();
+    const existing = await prisma.documentTemplate.findUnique({ where: { id }, select: { type: true } });
+    if (!existing) throw new Error("Template not found");
+    assertDocumentTemplateTypeScope(user, existing.type);
+    // Same TOCTOU pin as the update path: delete only the row whose type was
+    // actually authorized, never "whatever this id is now".
+    const removed = await prisma.documentTemplate.deleteMany({ where: { id, type: existing.type } });
+    if (removed.count === 0) throw new Error("Forbidden");
     revalidatePath("/company/templates");
     revalidatePath("/estimates");
     return { success: true };

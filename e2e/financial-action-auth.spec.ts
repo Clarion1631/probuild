@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { canWriteDocumentTemplateType } from "../src/lib/access-rules";
 
 function exportSource(source: string, name: string): string {
   const marker = new RegExp(`export\\s+(?:async function|const)\\s+${name}\\b`);
@@ -10,6 +11,17 @@ function exportSource(source: string, name: string): string {
   const remainder = source.slice(start + match![0].length);
   const next = /\nexport\s+(?:async function|const)\s+/.exec(remainder);
   return source.slice(start, next ? start + match![0].length + next.index : undefined);
+}
+
+// Comments are not code. `expectGuardBeforeDatabase` matches with indexOf, so a
+// guard that has been commented out — or a comment that merely quotes the guard
+// it is describing — would satisfy a textual assertion while authorizing
+// nobody. Blank the comments out (preserving newlines and length so any offset
+// comparison still lines up with the real source) before asserting.
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (m, lead) => lead + " ".repeat(m.length - lead.length));
 }
 
 function expectGuardBeforeDatabase(source: string, actionName: string, guard: string) {
@@ -246,6 +258,195 @@ test("estimate readers filter by the same scope the detail page asserts", () => 
   expect(resolverStart, "currentStaffUserOrNull must exist").toBeGreaterThanOrEqual(0);
   const resolver = source.slice(resolverStart, source.indexOf("async function assertActiveStaff("));
   expect(resolver, "currentStaffUserOrNull must not catch and flatten errors").not.toContain("catch");
+});
+test("document template CRUD authorizes reads and writes", () => {
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
+
+  // These templates hold the terms & conditions snapshotted onto estimates and
+  // contracts when they are sent, so an unauthenticated write edits the legal
+  // text on future client-facing documents. Company-wide, hence no per-project
+  // scope — but never open.
+  for (const name of ["getDocumentTemplates", "getDocumentTemplate"]) {
+    expectGuardBeforeDatabase(source, name, "await assertDocumentTemplateReadAccess(");
+  }
+  for (const name of ["createDocumentTemplate", "updateDocumentTemplate", "deleteDocumentTemplate"]) {
+    expectGuardBeforeDatabase(source, name, "await assertDocumentTemplateWritePermission(");
+  }
+
+  // The permission alone is not the whole write gate: `estimates` is accepted
+  // so estimators can author terms/overview/notes, so every write must ALSO
+  // scope the type or an estimates-only user (the FINANCE default) could
+  // rewrite contract and lien-release language.
+  for (const name of ["createDocumentTemplate", "updateDocumentTemplate", "deleteDocumentTemplate"]) {
+    expect(exportSource(source, name), `${name} must scope the template type`)
+      .toContain("assertDocumentTemplateTypeScope(");
+  }
+
+  // Ordering: EVERY scope call must precede the write, so the last one is the
+  // one to compare — checking only the first would let a retype check drift
+  // below the mutation and still pass.
+  {
+    const create = exportSource(source, "createDocumentTemplate");
+    expect(create.lastIndexOf("assertDocumentTemplateTypeScope("), "type scope must precede the create")
+      .toBeLessThan(create.indexOf("prisma.documentTemplate."));
+  }
+  {
+    const update = exportSource(source, "updateDocumentTemplate");
+    expect(update, "updateDocumentTemplate must scope the row's existing type")
+      .toContain("assertDocumentTemplateTypeScope(user, existing.type)");
+    expect(update, "updateDocumentTemplate must scope an incoming retype")
+      .toContain("assertDocumentTemplateTypeScope(user, data.type)");
+    expect(update.lastIndexOf("assertDocumentTemplateTypeScope("), "every type scope must precede the write")
+      .toBeLessThan(update.indexOf("tx.documentTemplate.updateMany("));
+    // The authorized type must be re-asserted by the write itself — a
+    // concurrent retype must not hand this caller a protected row.
+    expect(update, "the update must pin the authorized type in its own filter")
+      .toContain("where: { id, type: existing.type }");
+    expect(update, "a lost type pin must refuse, not silently no-op")
+      .toMatch(/claimed\.count === 0[\s\S]{0,80}throw new Error/);
+  }
+  {
+    const del = exportSource(source, "deleteDocumentTemplate");
+    expect(del.lastIndexOf("assertDocumentTemplateTypeScope("), "type scope must precede the delete")
+      .toBeLessThan(del.indexOf("prisma.documentTemplate.deleteMany("));
+    expect(del, "the delete must pin the authorized type in its own filter")
+      .toContain("where: { id, type: existing.type }");
+    expect(del, "a lost type pin must refuse, not silently no-op")
+      .toMatch(/removed\.count === 0[\s\S]{0,80}throw new Error/);
+  }
+
+  // The scope helper must actually delegate to the real predicate and throw.
+  const scopeStart = source.indexOf("function assertDocumentTemplateTypeScope(");
+  expect(scopeStart, "assertDocumentTemplateTypeScope must exist").toBeGreaterThanOrEqual(0);
+  const scopeBody = source.slice(scopeStart, scopeStart + 300);
+  expect(scopeBody).toContain("canWriteDocumentTemplateType(user, type)");
+  expect(scopeBody).toContain("throw new Error");
+
+  // The helpers must keep doing the work — otherwise the assertions above pass
+  // against a gutted no-op.
+  const helperBodies: Record<string, string[]> = {
+    assertDocumentTemplateReadAccess: [
+      "await assertActiveStaff()", 'hasPermission(user, "estimates")',
+      'hasPermission(user, "contracts")', 'hasPermission(user, "companySettings")', "throw new Error",
+    ],
+    assertDocumentTemplateWritePermission: [
+      "await assertActiveStaff()", 'hasPermission(user, "companySettings")',
+      'hasPermission(user, "estimates")', "throw new Error",
+    ],
+  };
+  for (const [helper, required] of Object.entries(helperBodies)) {
+    const start = source.indexOf(`function ${helper}(`);
+    expect(start, `${helper} must exist`).toBeGreaterThanOrEqual(0);
+    const nextFn = /\nasync function |\nfunction |\nexport /.exec(source.slice(start + helper.length));
+    const body = source.slice(start, nextFn ? start + helper.length + nextFn.index : undefined);
+    for (const needle of required) {
+      expect(body, `${helper} must still contain ${needle}`).toContain(needle);
+    }
+  }
+
+  // Field crew have none of the three permissions, and the /templates hub is a
+  // plain nav page for any staffer — its count read must stay fail-soft rather
+  // than throwing them into the route error boundary.
+  const hub = readFileSync(join(process.cwd(), "src/app/templates/page.tsx"), "utf8");
+  expect(hub, "the templates hub must tolerate a forbidden template read")
+    .toMatch(/getDocumentTemplates\(\)\.catch\(/);
+});
+
+// Most of this file can only assert that guard TEXT is present in the right
+// order — invert a condition inside a helper and every string match still
+// passes. The template type rule lives in access-rules.ts (pure, no Prisma or
+// next-auth) precisely so this one can be executed against real decisions.
+test("document template type scope is enforced, not merely present", () => {
+  const u = (role: string, permissions: any = null) => ({ role, permissions });
+  const ESTIMATOR_TYPES = ["terms", "overview", "notes"];
+  const PROTECTED_TYPES = ["contract", "lien_release", "warranty", "addendum", "disclaimer", "change_order", "draw_request", "punch_list"];
+
+  for (const type of [...ESTIMATOR_TYPES, ...PROTECTED_TYPES]) {
+    // companySettings owns the whole library; ADMIN/MANAGER hold every key.
+    expect(canWriteDocumentTemplateType(u("ADMIN"), type), `ADMIN must write ${type}`).toBe(true);
+    expect(canWriteDocumentTemplateType(u("MANAGER"), type), `MANAGER must write ${type}`).toBe(true);
+    expect(canWriteDocumentTemplateType(u("FINANCE", { companySettings: true }), type)).toBe(true);
+    // No relevant permission at all is always a refusal.
+    expect(canWriteDocumentTemplateType(u("FIELD_CREW"), type), `FIELD_CREW must not write ${type}`).toBe(false);
+    expect(canWriteDocumentTemplateType(u("EMPLOYEE"), type), `EMPLOYEE must not write ${type}`).toBe(false);
+  }
+
+  // FINANCE defaults to estimates-without-companySettings — the exact role this
+  // scope exists to contain, asserted against the real default table.
+  for (const type of ESTIMATOR_TYPES) {
+    expect(canWriteDocumentTemplateType(u("FINANCE"), type), `FINANCE may author ${type}`).toBe(true);
+  }
+  for (const type of PROTECTED_TYPES) {
+    expect(canWriteDocumentTemplateType(u("FINANCE"), type), `FINANCE must NOT rewrite ${type}`).toBe(false);
+  }
+
+  // An explicit grant behaves the same as the role default, in both directions.
+  expect(canWriteDocumentTemplateType(u("FIELD_CREW", { estimates: true }), "terms")).toBe(true);
+  expect(canWriteDocumentTemplateType(u("FIELD_CREW", { estimates: true }), "contract")).toBe(false);
+  expect(canWriteDocumentTemplateType(u("FINANCE", { estimates: false }), "terms")).toBe(false);
+
+  // Malformed and near-miss types fail closed rather than matching loosely.
+  for (const bad of [null, undefined, "", "TERMS", "terms ", "unknown_type"]) {
+    expect(canWriteDocumentTemplateType(u("FINANCE"), bad as any), `must fail closed on ${JSON.stringify(bad)}`).toBe(false);
+  }
+});
+
+test("lead → project conversion is gated for staff and session-free for pre-authorized callers", () => {
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
+  const core = stripComments(readFileSync(join(process.cwd(), "src/lib/lead-conversion-core.ts"), "utf8"));
+
+  // The conversion moves every estimate off a lead and onto a brand new
+  // project, so the exported Server Action must authorize before it runs, and
+  // the unguarded body must live in a module that is not itself a remotely
+  // invokable endpoint.
+  const action = exportSource(source, "convertLeadToProject");
+  const authIndex = action.indexOf("await assertActiveStaff()");
+  // The whole conditional, not just the call: a bare `hasPermission(...)` whose
+  // result is discarded reads like a guard and enforces nothing.
+  const permIndex = action.search(/if \(!hasPermission\(user, "leadAccess"\)\) throw new Error\(/);
+  const coreIndex = action.indexOf("convertLeadToProjectCore(leadId)");
+  expect(authIndex, "convertLeadToProject must authenticate").toBeGreaterThanOrEqual(0);
+  expect(permIndex, "convertLeadToProject must throw when leadAccess is missing").toBeGreaterThanOrEqual(0);
+  expect(coreIndex, "convertLeadToProject must delegate to the core").toBeGreaterThanOrEqual(0);
+  expect(authIndex, "authentication must precede the conversion").toBeLessThan(coreIndex);
+  expect(permIndex, "the permission check must precede the conversion").toBeLessThan(coreIndex);
+  expect(action, "the exported action must not carry the conversion body itself")
+    .not.toContain("prisma.$transaction");
+
+  expect(core, "the core must exist").toContain("export async function convertLeadToProjectCore(");
+  // Either quote spelling turns this file into a server-action module and would
+  // re-expose the unguarded body as a remote endpoint.
+  expect(core, "the core must not be a server-action module").not.toMatch(/^\s*(['"])use server\1/m);
+  expect(core, "the core must still perform the conversion").toContain("prisma.$transaction");
+
+  // Portal approval already proved client ownership via resolveSessionClientId,
+  // and a portal client is not staff — it must call the core, not the gate.
+  const postApproval = source.slice(source.indexOf("async function ensureProjectAndDepositInvoiceForEstimate("));
+  const postApprovalBody = postApproval.slice(0, postApproval.indexOf("\nexport "));
+  expect(postApprovalBody, "portal approval must use the session-free core")
+    .toContain("convertLeadToProjectCore(estimate.leadId)");
+
+  // approveEstimate's own ownership check must survive untouched.
+  const approve = exportSource(source, "approveEstimate");
+  expect(approve, "approveEstimate must still resolve the portal client").toContain("resolveSessionClientId(");
+
+  // createProject builds a Client and a Lead before converting — it cannot be
+  // left open either.
+  expectGuardBeforeDatabase(source, "createProject", "await assertActiveStaff(");
+
+  // /api/manager/jobs authenticates a mobile token OR a session and then runs
+  // assertLeadAccess; a mobile-token caller has no NextAuth staff session, so it
+  // must go through the core with its own gate intact.
+  const jobsRoute = stripComments(readFileSync(join(process.cwd(), "src/app/api/manager/jobs/route.ts"), "utf8"));
+  const routeAccess = jobsRoute.indexOf("await assertLeadAccess(user, leadId)");
+  const routeConvert = jobsRoute.indexOf("convertLeadToProjectCore(leadId)");
+  expect(routeConvert, "the manager jobs route must use the core").toBeGreaterThanOrEqual(0);
+  expect(routeAccess, "the manager jobs route must keep its own lead-access check").toBeGreaterThanOrEqual(0);
+  expect(routeAccess, "lead access must be checked before the conversion runs").toBeLessThan(routeConvert);
+  // assertLeadAccess RETURNS the denial rather than throwing, so ignoring the
+  // return value would leave the check decorative.
+  expect(jobsRoute, "the manager jobs route must return the lead-access denial")
+    .toMatch(/const accessError = await assertLeadAccess\(user, leadId\);[\s\S]{0,120}if \(accessError\) return accessError;/);
 });
 
 test("dual-auth financial actions keep explicit portal or machine authorization", () => {

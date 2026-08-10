@@ -14,6 +14,8 @@ export {
     canAccessProject,
     canAccessEstimate,
     estimateScopeWhere,
+    canWriteDocumentTemplateType,
+    ESTIMATOR_WRITABLE_TEMPLATE_TYPES,
 } from "./access-rules";
 export type { PermissionKey, ProjectScopedUser, EstimateOwner } from "./access-rules";
 
