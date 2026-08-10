@@ -59,7 +59,7 @@ Built: estimate gen, schedule gen, punchlist, daily-log enhance, mood boards, le
 ---
 
 ### Standing rules (unchanged)
-- Build must pass with 0 errors before push; deploy manually via `vercel --prod` from the canonical checkout
+- Build must pass with 0 errors before push — auto-deploy is ON, so pushing/merging `main` ships to prod (see CLAUDE.md "Deploying to Vercel"). `vercel --prod` from the canonical checkout is for shipping ahead of a merge
 - Schema changes via the PowerShell SQL script, then `prisma generate` from PowerShell
 - Money-path changes: codex review + `e2e/money-pipeline.spec.ts` green
 - Every feature answers: which remodeling role does this serve, and what can AI automate?
