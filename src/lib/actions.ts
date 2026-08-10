@@ -625,13 +625,13 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
-    const user = await currentStaffUserOrNull();
     const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
-            projects: {
-                include: { estimates: scopedEstimateRelation(safeEstimateInclude, user) }
-            },
+            // The contacts page only renders a project count and the combobox
+            // only needs id/name — no caller reads the project rows themselves,
+            // so keep this to ids instead of every column (and every estimate).
+            projects: { select: { id: true } },
             leads: true
         }
     });
