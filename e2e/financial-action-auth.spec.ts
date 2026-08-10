@@ -217,8 +217,20 @@ test("estimate readers filter by the same scope the detail page asserts", () => 
   // getClients is the other way to satisfy the rule: it embeds no estimates at
   // all. Nothing on the contacts page or the client picker ever read them, so
   // the safest scope filter is not fetching the rows in the first place.
-  expect(exportSource(source, "getClients"), "getClients must not embed estimates")
-    .not.toMatch(/estimates:/);
+  //
+  // Assert the positive shape as well as the absence. The negative alone is
+  // satisfied by any rewrite that stops naming the key — a nested `include`
+  // that pulls whole project rows would pass it while re-opening the
+  // over-fetch. Pinning the projects relation to an id-only select is what
+  // actually leaves no room for an estimates embed to come back.
+  {
+    const action = exportSource(source, "getClients");
+    // Tolerate reformatting: `estimates :`, `"estimates":`, newline-separated.
+    expect(action, "getClients must not embed estimates")
+      .not.toMatch(/["']?estimates["']?\s*:/);
+    expect(action, "getClients must select only project ids")
+      .toMatch(/projects\s*:\s*\{\s*select\s*:\s*\{\s*id\s*:\s*true\s*,?\s*\}\s*,?\s*\}/);
+  }
   expect(source, "no estimates relation may be embedded without the scope filter")
     .not.toMatch(/estimates: safeEstimateInclude/);
 
