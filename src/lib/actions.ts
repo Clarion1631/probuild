@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, accessibleProjectIds, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, estimateScopeWhere, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -4181,7 +4181,15 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     return { success: true };
 }
 
-async function assertActiveStaff(): Promise<any> {
+/**
+ * Resolve the acting staff user, or null if there genuinely isn't one.
+ *
+ * Deliberately has NO try/catch: a Prisma or session failure must propagate.
+ * Swallowing it would turn an outage into "no user", which the estimate scope
+ * filter reads as "show no estimates" — a page of zeroes that looks like real
+ * data. Only a real absence of a signed-in staff user returns null.
+ */
+async function currentStaffUserOrNull(): Promise<any | null> {
     const user = await getCurrentUserWithPermissions();
     if (user) return user;
 
@@ -4189,21 +4197,13 @@ async function assertActiveStaff(): Promise<any> {
         const devSession = await getSessionOrDev();
         if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
     }
-    throw new Error("Unauthorized");
+    return null;
 }
 
-/**
- * assertActiveStaff without the throw. For readers that are not themselves
- * estimate actions but embed estimates — they must not start rejecting callers
- * they used to serve, they just have nobody to scope the embedded estimates
- * against, which estimateScopeWhere() treats as "show none".
- */
-async function currentStaffUserOrNull(): Promise<any | null> {
-    try {
-        return await assertActiveStaff();
-    } catch {
-        return null;
-    }
+async function assertActiveStaff(): Promise<any> {
+    const user = await currentStaffUserOrNull();
+    if (!user) throw new Error("Unauthorized");
+    return user;
 }
 
 async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
@@ -4240,53 +4240,20 @@ async function assertChangeOrderPermission() {
 function assertEstimateScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
     // Fail CLOSED on an ownerless estimate. Both ownership columns are optional
     // in the schema, so "no project and no lead" would otherwise fall straight
-    // through this function and be authorized by default.
+    // through this function and be authorized by default. Reported distinctly
+    // from "Forbidden" because it is a data problem, not a permissions one.
     if (!scope.projectId && !scope.leadId) {
         throw new Error("This estimate is not attached to a project or lead, so access cannot be checked");
     }
-    if (scope.projectId) {
-        if (!canAccessProject(user, scope.projectId)) throw new Error("Forbidden");
-        return;
-    }
-    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+    // The decision itself lives in access-rules.ts, shared verbatim with the
+    // list filter (estimateScopeWhere) so the two can never disagree.
+    if (!canAccessEstimate(user, scope)) throw new Error("Forbidden");
 }
 
 /**
- * The filter form of assertEstimateScope. The assertion above answers "may this
- * user touch THIS estimate"; a list has to ask the same question of every row it
- * is about to return, and it has to get the same answer — a list that shows rows
- * whose detail page throws Forbidden is worse than either extreme.
- *
- * Every branch below is the mirror image of a branch in assertEstimateScope:
- *   - ADMIN/MANAGER pass unconditionally there, so they get an empty (no-op) where.
- *   - project-owned rows go through canAccessProject there, so here they are
- *     restricted to accessibleProjectIds() — the set form of that same function.
- *   - the leadAccess fallback is reached there ONLY when projectId is null, so
- *     the OR branch carries `projectId: null` too. Without it a user holding
- *     leadAccess would list another job's project-owned estimate and then be
- *     refused on click-through.
- *   - an ownerless estimate (no project, no lead) throws there, so it matches no
- *     branch here and is filtered out — both directions fail closed.
- * FINANCE is deliberately not exempt, same as in assertEstimateScope.
- */
-const MATCHES_NO_ESTIMATE = { id: { in: [] as string[] } };
-
-function estimateScopeWhere(user: any | null | undefined) {
-    if (!user?.role) return MATCHES_NO_ESTIMATE;
-    const projectIds = accessibleProjectIds(user);
-    if (projectIds === "ALL") return {};
-
-    const branches: any[] = [];
-    if (projectIds.length > 0) branches.push({ projectId: { in: projectIds } });
-    if (hasPermission(user, "leadAccess")) branches.push({ projectId: null, leadId: { not: null } });
-    if (branches.length === 0) return MATCHES_NO_ESTIMATE;
-    return { OR: branches };
-}
-
-/**
- * The nested-relation form. Prisma relation filters take the same where shape,
- * so a lead/project getter that embeds estimates can reuse the predicate rather
- * than growing its own copy of the rules.
+ * The nested-relation form of estimateScopeWhere. Prisma relation filters take
+ * the same where shape, so a lead/project getter that embeds estimates can
+ * reuse the predicate rather than growing its own copy of the rules.
  */
 function scopedEstimateRelation<T extends object>(relation: T, user: any | null | undefined): T & { where: any } {
     return { ...relation, where: estimateScopeWhere(user) };

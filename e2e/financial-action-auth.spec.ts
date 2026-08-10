@@ -75,7 +75,10 @@ test("all staff financial actions authorize inside the exported action", () => {
   // The helpers themselves must keep doing the work. Without this, any caller
   // assertion above still passes while the helper it names is gutted to a no-op.
   const helperBodies: Record<string, string[]> = {
-    assertEstimateScope: ["canAccessProject(", 'hasPermission(user, "leadAccess")', "throw new Error"],
+    // The decision itself lives in access-rules.ts and is behaviourally tested
+    // by estimate-scope-rules.spec.ts; what must hold HERE is that the
+    // assertion still delegates to it rather than re-deciding locally.
+    assertEstimateScope: ["canAccessEstimate(", "throw new Error"],
     assertEstimateAccess: ["assertEstimatePermission(", "assertEstimateScope("],
     assertEstimateProjectAccess: ["assertEstimatePermission(", "assertEstimateScope("],
     assertEstimateLeadAccess: ["assertEstimatePermission(", "assertEstimateScope("],
@@ -214,34 +217,35 @@ test("estimate readers filter by the same scope the detail page asserts", () => 
   expect(source, "no estimates relation may be embedded without the scope filter")
     .not.toMatch(/estimates: safeEstimateInclude/);
 
-  // The predicate itself must keep doing the work — without this every
-  // assertion above still passes while estimateScopeWhere is gutted to `{}`.
-  const predicateStart = source.indexOf("function estimateScopeWhere(");
-  expect(predicateStart, "estimateScopeWhere must exist").toBeGreaterThanOrEqual(0);
-  const predicateEnd = /\nasync function |\nfunction |\nexport /.exec(source.slice(predicateStart + 30));
-  const predicate = source.slice(
-    predicateStart,
-    predicateEnd ? predicateStart + 30 + predicateEnd.index : undefined,
-  );
-  for (const needle of [
-    "accessibleProjectIds(user)",           // project branch, shared with canAccessProject
-    'hasPermission(user, "leadAccess")',    // lead branch, same gate as assertEstimateScope
-    "projectId: null",                      // leadAccess must NOT rescue a project-owned row
-    "MATCHES_NO_ESTIMATE",                  // no accessible scope => no rows, not all rows
-  ]) {
-    expect(predicate, `estimateScopeWhere must still contain ${needle}`).toContain(needle);
-  }
+  // The relation wrapper must apply the predicate, not an empty where — every
+  // nested-embed assertion above would still pass if it returned `where: {}`.
+  const relationStart = source.indexOf("function scopedEstimateRelation");
+  expect(relationStart, "scopedEstimateRelation must exist").toBeGreaterThanOrEqual(0);
+  expect(
+    source.slice(relationStart, relationStart + 400),
+    "scopedEstimateRelation must apply estimateScopeWhere to the relation",
+  ).toContain("where: estimateScopeWhere(user)");
 
-  // Agreement is structural, not coincidental: assertEstimateScope's project
-  // branch is canAccessProject, estimateScopeWhere's is accessibleProjectIds,
-  // and canAccessProject is defined in terms of accessibleProjectIds. Break
-  // that chain and the assertion and the filter can disagree again.
-  expect(permissions, "canAccessProject must derive from accessibleProjectIds")
-    .toMatch(/export function canAccessProject\([\s\S]{0,400}accessibleProjectIds\(user\)/);
+  // Agreement is structural, not coincidental. Both forms of the rule are
+  // defined in access-rules.ts and are behaviourally verified against each
+  // other over a truth table in estimate-scope-rules.spec.ts; what must hold
+  // here is that actions.ts keeps delegating to them instead of re-deciding.
   expect(
     source.slice(source.indexOf("function assertEstimateScope(")),
-    "assertEstimateScope must still route project-owned estimates through canAccessProject",
-  ).toContain("canAccessProject(user, scope.projectId)");
+    "assertEstimateScope must delegate to the shared rule",
+  ).toContain("canAccessEstimate(user, scope)");
+  expect(permissions, "permissions.ts must re-export the shared rules, not redefine them")
+    .toMatch(/export \{[\s\S]{0,400}canAccessEstimate,[\s\S]{0,200}estimateScopeWhere,[\s\S]{0,200}\} from "\.\/access-rules"/);
+  expect(source, "actions.ts must not keep a private copy of the scope predicate")
+    .not.toMatch(/\nfunction estimateScopeWhere\(/);
+
+  // The reader that has no throwing assertion of its own must not swallow
+  // infrastructure failures — an outage rendered as "no estimates" is a page
+  // of plausible zeroes, not an error.
+  const resolverStart = source.indexOf("async function currentStaffUserOrNull(");
+  expect(resolverStart, "currentStaffUserOrNull must exist").toBeGreaterThanOrEqual(0);
+  const resolver = source.slice(resolverStart, source.indexOf("async function assertActiveStaff("));
+  expect(resolver, "currentStaffUserOrNull must not catch and flatten errors").not.toContain("catch");
 });
 
 test("dual-auth financial actions keep explicit portal or machine authorization", () => {
