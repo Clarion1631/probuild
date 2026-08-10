@@ -466,6 +466,52 @@ test("lead → project conversion is gated for staff and session-free for pre-au
     .toMatch(/const accessError = await assertLeadAccess\(user, leadId\);[\s\S]{0,120}if \(accessError\) return accessError;/);
 });
 
+test("pages that sum scoped estimates label the total by what the reader can see", () => {
+  const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+  const projectsPage = readFileSync(join(process.cwd(), "src/app/projects/page.tsx"), "utf8");
+  const projectsClient = readFileSync(join(process.cwd(), "src/app/projects/ProjectsClient.tsx"), "utf8");
+  const leadEstimates = readFileSync(join(process.cwd(), "src/app/leads/[id]/estimates/page.tsx"), "utf8");
+
+  // Estimate READS are scoped per caller; the project LIST is not. So a card
+  // summing embedded estimates can hold a partial number under a label that
+  // claims the whole company. The number stays scoped — the label must move.
+  // NOTE ON REACH: like the rest of this spec these are source assertions, so
+  // they prove the data PATH, not the runtime value — the decision itself is
+  // verified behaviourally in estimate-scope-rules.spec.ts. What they must
+  // therefore rule out is the hardcode: an action that authenticates and then
+  // returns a literal, or a page that computes the flag and passes a constant.
+  {
+    const action = exportSource(source, "estimateTotalsComplete");
+    expect(action, "the completeness reader must authenticate first")
+      .toContain("await assertActiveStaff()");
+    expect(action, "it must RETURN the shared rule's answer, not a literal")
+      .toMatch(/return estimateTotalsAreComplete\(user, owners\);/);
+    expect(action, "it must not short-circuit to a constant verdict")
+      .not.toMatch(/return (true|false)\b/);
+  }
+
+  // Both readers must ASK, naming the owners their aggregate actually covered.
+  expect(projectsPage, "the projects page must ask whether its revenue sum is complete")
+    .toMatch(/const revenueIsComplete = await estimateTotalsComplete\(projects\.map/);
+  expect(projectsPage, "the answer must reach the client, not a literal")
+    .toContain("revenueIsComplete={revenueIsComplete}");
+  expect(leadEstimates, "the lead estimates page must ask over its lead and its linked project")
+    .toMatch(/const totalsAreComplete = await estimateTotalsComplete\(/);
+  expect(leadEstimates, "the lead's own estimates must be asked about as a lead, not as a null project")
+    .toMatch(/\{ leadId: lead\.id \}/);
+
+  // ...and must USE the answer. A page could import it and still print the
+  // unconditional label, which is the exact bug this pair of assertions guards.
+  expect(projectsClient, "the revenue label must depend on completeness")
+    .toMatch(/revenueIsComplete \?[^\n]*Total Revenue/);
+  expect(projectsClient, "revenueIsComplete must be a required prop, so a caller cannot omit it")
+    .toMatch(/revenueIsComplete: boolean/);
+  for (const claim of ["Across all estimates", "Total created"]) {
+    expect(leadEstimates, `"${claim}" must be conditional on completeness`)
+      .toMatch(new RegExp(`totalsAreComplete \\?[^\\n]*${claim}`));
+  }
+});
+
 test("dual-auth financial actions keep explicit portal or machine authorization", () => {
   const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
   const billingCore = readFileSync(join(process.cwd(), "src/lib/billing-core.ts"), "utf8");

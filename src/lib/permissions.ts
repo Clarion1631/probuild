@@ -14,6 +14,7 @@ export {
     canAccessProject,
     canAccessEstimate,
     estimateScopeWhere,
+    estimateTotalsAreComplete,
     canWriteDocumentTemplateType,
     ESTIMATOR_WRITABLE_TEMPLATE_TYPES,
 } from "./access-rules";
