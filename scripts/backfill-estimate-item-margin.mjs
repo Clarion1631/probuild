@@ -54,12 +54,14 @@ const APPLY = process.argv.includes("--apply");
  * prefixes, inline comments, CRLF, multiline values — and each one it gets wrong is a silent
  * wrong-database write, which is the one failure this script must not have.
  *
- * `key in parsed` rather than a truthiness check on purpose: a file that assigns the key an
- * EMPTY value has still spoken, and must win over the lower-precedence file instead of falling
- * through to it. The missing-URL check below then fails loudly, which is the correct outcome.
+ * `in` rather than a truthiness check on purpose, at BOTH levels: a source that assigns the key
+ * an EMPTY value has still spoken, and must win over every lower-precedence source instead of
+ * falling through to it. The missing-URL check below then fails loudly, which is the correct
+ * outcome. An exported `DATABASE_URL=""` falling through to a file is the same wrong-database
+ * write as the reversed file order, just one level up.
  */
 function envFromFiles(key) {
-  if (process.env[key]) return process.env[key];
+  if (key in process.env) return process.env[key];
   for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
     const parsed = dotenv.parse(fs.readFileSync(f));

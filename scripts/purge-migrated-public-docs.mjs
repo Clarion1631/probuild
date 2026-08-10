@@ -65,12 +65,14 @@ const WILL_DELETE = HAS_APPLY && HAS_CONFIRM;
  *
  * Parsing is delegated to `dotenv` rather than hand-rolled: a regex over the line mishandles
  * quoted values containing `#`, `export` prefixes, inline comments, CRLF and multiline values,
- * and every one of those is a silent wrong-target read. `key in parsed` rather than a truthiness
- * check so a file that assigns an EMPTY value still wins over the lower-precedence file and the
- * missing-value check below fails loudly.
+ * and every one of those is a silent wrong-target read. `in` rather than a truthiness check at
+ * BOTH levels so a source that assigns an EMPTY value — an exported `DATABASE_URL=""` included —
+ * still wins over every lower-precedence source and the missing-value check below fails loudly.
+ * Resolving one key from the shell and another from a file is how this script ends up enumerating
+ * paths out of one project and deleting them out of another.
  */
 function envFromFiles(key) {
-  if (process.env[key]) return process.env[key];
+  if (key in process.env) return process.env[key];
   for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
     const parsed = dotenv.parse(fs.readFileSync(f));
