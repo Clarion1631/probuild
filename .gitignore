@@ -76,7 +76,35 @@ scripts/vendor/*
 
 # Per-machine Claude Code + Supabase CLI artifacts (not source)
 .claude/settings.local.json
-.claude/skills/
+# .claude/skills/ is ignored BY DEFAULT. Exactly four SKILL.md files are
+# allowlisted below, and nothing else in the tree is tracked. Those four are
+# project docs for deploying and migrating THIS app, so they belong in version
+# control: while ignored, every git worktree kept its own drifting copy, and 9
+# of them spent two weeks telling agents auto-deploy was off (it is ON) and that
+# the token-rotation snippet could use a bare Read-Host (it echoes the token).
+#
+# The rest of the tree stays ignored on purpose, and this is NOT merely a
+# per-machine-artifact call:
+#   - bank-recon/ and email-triage/ carry live operational data (bank account
+#     suffix, Drive folder ids, staff and external-partner email addresses).
+#     Do not commit these; git history is forever.
+#   - 17 skills are vendored from ByBren, LLC / J. Scott Graham under MIT and
+#     require attribution via /LICENSE and /NOTICE, neither of which this repo
+#     carries. They also describe a different stack (master/Coolify/yarn/Clerk).
+# Adding a new skill here means opting it in deliberately, after checking both.
+.claude/skills/*
+!.claude/skills/deploy-probuild/
+!.claude/skills/probuild-dev-server/
+!.claude/skills/probuild-diagnostics/
+!.claude/skills/probuild-schema-migration/
+# Re-ignore the CONTENTS of the four allowlisted dirs, then admit SKILL.md only.
+# Without these two lines the negations above reopen the whole directory, so a
+# future scripts/*.sh or nested doc dropped into an allowlisted skill would be
+# tracked silently, including shell scripts, which would then need a
+# .gitattributes eol=lf rule to survive core.autocrlf=true on the dev machines.
+.claude/skills/*/*
+!.claude/skills/*/SKILL.md
+
 docs/superpowers/
 supabase/.temp/
 

@@ -62,12 +62,12 @@ Sessions 1–2 + Gantt polish are complete. Each session lists specific files, a
 
 **Error diagnosis (Sentry)**
 ```bash
-sentry-cli issues list --org golden-touch-remodeling --project <project> --output json
+sentry-cli issues list --org golden-touch-remodeling --project <project> --query "is:unresolved"
 ```
 
 **Stripe webhook testing**
 ```bash
-stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
+stripe listen --forward-to localhost:3000/api/webhooks/stripe --format JSON
 stripe trigger payment_intent.succeeded
 ```
 
