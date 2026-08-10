@@ -153,6 +153,10 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
 
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
     const verdict = journeyVerdict(journey, suggestion, now);
+    // The dedupe stage records "duplicate-of:<driveFileId>" (or the
+    // possible-duplicate variant) — surface it as a link to the ORIGINAL so
+    // a reviewer can eyeball both without hand-searching Drive.
+    const duplicateOfFileId = journey.finalReason?.match(/^(?:possible-)?duplicate-of:([\w-]+)$/)?.[1] ?? null;
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -200,6 +204,17 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
                     <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} unconfirmed={!journey.keyConfirmed} now={now} />
 
                     {suggestion && <SuggestionCard suggestion={suggestion} />}
+
+                    {duplicateOfFileId && (
+                        <a
+                            href={`https://drive.google.com/file/d/${encodeURIComponent(duplicateOfFileId)}/view`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-medium text-hui-primary hover:underline"
+                        >
+                            Open the original it duplicates (Drive) ↗
+                        </a>
+                    )}
 
                     {journey.qbPurchaseId && <QbPurchaseLink qbPurchaseId={journey.qbPurchaseId} />}
                 </div>
