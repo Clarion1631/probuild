@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, accessibleProjectIds, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -243,12 +243,12 @@ export async function generatePdfUploadToken(estimateId: string): Promise<string
 }
 
 export async function getLeads() {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const leads = await prisma.lead.findMany({
         orderBy: { createdAt: "desc" },
         include: {
             client: true,
-            estimates: safeEstimateInclude,
+            estimates: scopedEstimateRelation(safeEstimateInclude, user),
             manager: true,
             project: { select: { id: true } },
             tasks: {
@@ -272,11 +272,12 @@ export async function getLeads() {
 }
 
 export const getLead = cache(async function getLead(id: string) {
+    const user = await currentStaffUserOrNull();
     const lead = await prisma.lead.findUnique({
         where: { id },
         include: {
             client: true,
-            estimates: safeEstimateInclude,
+            estimates: scopedEstimateRelation(safeEstimateInclude, user),
             contracts: true,
             manager: true,
             tasks: {
@@ -284,12 +285,13 @@ export const getLead = cache(async function getLead(id: string) {
             },
             roomDesigns: true,
             // Pull the linked project + its estimates so the lead estimates page
-            // can surface project estimates alongside lead-direct ones.
+            // can surface project estimates alongside lead-direct ones. These are
+            // project-owned, so they are scoped by project access, not leadAccess.
             project: {
                 select: {
                     id: true,
                     name: true,
-                    estimates: safeEstimateInclude,
+                    estimates: scopedEstimateRelation(safeEstimateInclude, user),
                 }
             }
         },
@@ -623,11 +625,12 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
+    const user = await currentStaffUserOrNull();
     const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
             projects: {
-                include: { estimates: safeEstimateInclude }
+                include: { estimates: scopedEstimateRelation(safeEstimateInclude, user) }
             },
             leads: true
         }
@@ -1096,12 +1099,12 @@ export async function deleteLeadMeeting(meetingId: string) {
 }
 
 export async function getProjects() {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },
         include: {
             client: true,
-            estimates: { select: { totalAmount: true, status: true } },
+            estimates: scopedEstimateRelation({ select: { totalAmount: true, status: true } }, user),
         },
     });
     return JSON.parse(JSON.stringify(projects.map((p: any) => ({
@@ -1110,10 +1113,10 @@ export async function getProjects() {
     }))));
 }
 export const getProject = cache(async function getProject(id: string) {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const include = {
         client: true,
-        estimates: {
+        estimates: scopedEstimateRelation({
             select: {
                 id: true,
                 number: true,
@@ -1134,8 +1137,8 @@ export const getProject = cache(async function getProject(id: string) {
                 contractId: true,
                 viewedAt: true,
             }
-        },
-    } as const;
+        }, user),
+    };
 
     // Support both CUID and friendly numeric ID in URL params
     const numericId = /^\d+$/.test(id) ? parseInt(id, 10) : null;
@@ -1657,10 +1660,13 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
 }
 
 export const getEstimateForPortal = cache(async function getEstimateForPortal(id: string) {
-    // Staff members (any user with a role on their session) can preview any estimate.
-    // Portal clients must pass the IDOR ownership check below.
+    // Staff members can preview an estimate they are scoped to; portal clients
+    // must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
     const isStaff = !!(staffSession?.user as any)?.role;
+    // The session carries a role but not projectAccess/assignedProjects, so the
+    // horizontal check needs the full user row.
+    const staffUser = isStaff ? await currentStaffUserOrNull() : null;
 
     if (!isStaff) {
         // IDOR #2 fix: require a resolvable portal session and gate the fetch by
@@ -1764,11 +1770,14 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         }));
     }
 
-    // Staff path: no ownership restriction — just fetch by id
+    // Staff path: fetch by id, narrowed to the estimates this staff user is
+    // scoped to. AND-composed rather than spread so a match-nothing predicate
+    // cannot overwrite the id it is meant to narrow.
+    const staffFilter = { AND: [{ id }, estimateScopeWhere(staffUser)] };
     let estimate: any;
     try {
         estimate = await prisma.estimate.findFirst({
-            where: { id },
+            where: staffFilter,
             include: {
                 project: { include: { client: true } },
                 lead: { include: { client: true } },
@@ -1796,7 +1805,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         console.error("[getEstimateForPortal] Primary query failed:", err);
         try {
             estimate = await prisma.estimate.findFirst({
-                where: { id },
+                where: staffFilter,
                 select: {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
@@ -1898,8 +1907,10 @@ export async function ensureEstimatePayInFullSchedule(estimateId: string): Promi
 }
 
 export const getAllEstimates = cache(async function getAllEstimates() {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
+    // Same rule the estimate detail page applies — see estimateScopeWhere.
     return await prisma.estimate.findMany({
+        where: estimateScopeWhere(user),
         orderBy: { createdAt: "desc" },
         select: {
             id: true,
@@ -4181,6 +4192,20 @@ async function assertActiveStaff(): Promise<any> {
     throw new Error("Unauthorized");
 }
 
+/**
+ * assertActiveStaff without the throw. For readers that are not themselves
+ * estimate actions but embed estimates — they must not start rejecting callers
+ * they used to serve, they just have nobody to scope the embedded estimates
+ * against, which estimateScopeWhere() treats as "show none".
+ */
+async function currentStaffUserOrNull(): Promise<any | null> {
+    try {
+        return await assertActiveStaff();
+    } catch {
+        return null;
+    }
+}
+
 async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
@@ -4224,6 +4249,47 @@ function assertEstimateScope(user: any, scope: { projectId?: string | null; lead
         return;
     }
     if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+}
+
+/**
+ * The filter form of assertEstimateScope. The assertion above answers "may this
+ * user touch THIS estimate"; a list has to ask the same question of every row it
+ * is about to return, and it has to get the same answer — a list that shows rows
+ * whose detail page throws Forbidden is worse than either extreme.
+ *
+ * Every branch below is the mirror image of a branch in assertEstimateScope:
+ *   - ADMIN/MANAGER pass unconditionally there, so they get an empty (no-op) where.
+ *   - project-owned rows go through canAccessProject there, so here they are
+ *     restricted to accessibleProjectIds() — the set form of that same function.
+ *   - the leadAccess fallback is reached there ONLY when projectId is null, so
+ *     the OR branch carries `projectId: null` too. Without it a user holding
+ *     leadAccess would list another job's project-owned estimate and then be
+ *     refused on click-through.
+ *   - an ownerless estimate (no project, no lead) throws there, so it matches no
+ *     branch here and is filtered out — both directions fail closed.
+ * FINANCE is deliberately not exempt, same as in assertEstimateScope.
+ */
+const MATCHES_NO_ESTIMATE = { id: { in: [] as string[] } };
+
+function estimateScopeWhere(user: any | null | undefined) {
+    if (!user?.role) return MATCHES_NO_ESTIMATE;
+    const projectIds = accessibleProjectIds(user);
+    if (projectIds === "ALL") return {};
+
+    const branches: any[] = [];
+    if (projectIds.length > 0) branches.push({ projectId: { in: projectIds } });
+    if (hasPermission(user, "leadAccess")) branches.push({ projectId: null, leadId: { not: null } });
+    if (branches.length === 0) return MATCHES_NO_ESTIMATE;
+    return { OR: branches };
+}
+
+/**
+ * The nested-relation form. Prisma relation filters take the same where shape,
+ * so a lead/project getter that embeds estimates can reuse the predicate rather
+ * than growing its own copy of the rules.
+ */
+function scopedEstimateRelation<T extends object>(relation: T, user: any | null | undefined): T & { where: any } {
+    return { ...relation, where: estimateScopeWhere(user) };
 }
 
 /** Permission + scope for actions that reach estimates through a project id. */

@@ -114,15 +114,27 @@ export function getEffectivePermissions(
     return result;
 }
 
+type ProjectScopedUser = { role: string; projectAccess?: { projectId: string }[]; assignedProjects?: { id: string }[] };
+
+/**
+ * The set form of canAccessProject: every project id this user may reach, or
+ * "ALL" for the roles that pass unconditionally. Exists so a list query can be
+ * filtered by exactly the same rule that canAccessProject() applies to a single
+ * id — a second hand-rolled predicate is how a list and its detail page drift
+ * apart. Invariant: canAccessProject(u, p) === (ids === "ALL" || ids.includes(p)).
+ */
+export function accessibleProjectIds(user: ProjectScopedUser): string[] | "ALL" {
+    if (ADMIN_ROLES.includes(user.role)) return "ALL";
+    return Array.from(new Set([
+        ...(user.projectAccess ?? []).map(pa => pa.projectId),
+        ...(user.assignedProjects ?? []).map(p => p.id),
+    ]));
+}
+
 // Check if user can access a specific project
-export function canAccessProject(
-    user: { role: string; projectAccess?: { projectId: string }[]; assignedProjects?: { id: string }[] },
-    projectId: string
-): boolean {
-    if (ADMIN_ROLES.includes(user.role)) return true;
-    if (user.projectAccess?.some(pa => pa.projectId === projectId)) return true;
-    if (user.assignedProjects?.some(p => p.id === projectId)) return true;
-    return false;
+export function canAccessProject(user: ProjectScopedUser, projectId: string): boolean {
+    const ids = accessibleProjectIds(user);
+    return ids === "ALL" || ids.includes(projectId);
 }
 
 // Default permissions by role (used when no UserPermission record exists)

@@ -112,8 +112,10 @@ test("all staff financial actions authorize inside the exported action", () => {
   expect(exportSource(source, "createInvoiceFromEstimate")).toContain("assertEstimateScope(");
 
   // Company-wide by design: the template/assembly library is not per-job.
+  // getAllEstimates is NOT in this list — it lists per-job documents, and is
+  // covered by the list-scoping test below.
   const companyWideEstimateActions = [
-    "getAllEstimates", "getEstimateTemplates", "saveItemsAsAssembly", "deleteAssembly",
+    "getEstimateTemplates", "saveItemsAsAssembly", "deleteAssembly",
   ];
   for (const name of companyWideEstimateActions) {
     expectGuardBeforeDatabase(source, name, "await assertEstimatePermission(");
@@ -172,6 +174,74 @@ test("all staff financial actions authorize inside the exported action", () => {
   for (const name of ["saveCompanySettings", "updateCompanyProjectStatuses", "saveCompanySubcontractorTrades"]) {
     expectGuardBeforeDatabase(source, name, "await assertCompanySettingsPermission(");
   }
+});
+
+test("estimate readers filter by the same scope the detail page asserts", () => {
+  const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+  const permissions = readFileSync(join(process.cwd(), "src/lib/permissions.ts"), "utf8");
+
+  // A list that returns rows whose detail page throws Forbidden is its own bug.
+  // Every reader that returns estimates must apply the filter form of the same
+  // rule assertEstimateScope applies to a single row.
+  {
+    const action = exportSource(source, "getAllEstimates");
+    const guardIndex = action.indexOf("await assertEstimatePermission(");
+    const filterIndex = action.indexOf("where: estimateScopeWhere(user)");
+    const databaseIndex = action.indexOf("prisma.");
+    expect(guardIndex, "getAllEstimates must assert the estimates permission").toBeGreaterThanOrEqual(0);
+    expect(filterIndex, "getAllEstimates must scope the list, not just gate the permission").toBeGreaterThanOrEqual(0);
+    expect(guardIndex, "getAllEstimates must authorize before database access").toBeLessThan(databaseIndex);
+  }
+
+  // The staff branch of the portal preview used to fetch any id by id alone.
+  {
+    const action = exportSource(source, "getEstimateForPortal");
+    expect(action, "the staff preview branch must be scoped")
+      .toContain("const staffFilter = { AND: [{ id }, estimateScopeWhere(staffUser)] }");
+    expect(action, "the staff preview must not fall back to an unscoped fetch by id")
+      .not.toMatch(/where: \{ id \},/);
+    // Both the primary query and its degraded fallback must use it — the
+    // fallback runs on exactly the error paths nobody exercises by hand.
+    expect(action.match(/where: staffFilter/g) ?? [], "both staff queries must use the scoped filter").toHaveLength(2);
+  }
+
+  // Nested embeds are the same exposure by another route: a lead or project
+  // getter that includes estimates hands back rows the caller may not open.
+  for (const name of ["getLeads", "getLead", "getProjects", "getProject", "getClients"]) {
+    expect(exportSource(source, name), `${name} must scope the estimates it embeds`)
+      .toContain("scopedEstimateRelation(");
+  }
+  expect(source, "no estimates relation may be embedded without the scope filter")
+    .not.toMatch(/estimates: safeEstimateInclude/);
+
+  // The predicate itself must keep doing the work — without this every
+  // assertion above still passes while estimateScopeWhere is gutted to `{}`.
+  const predicateStart = source.indexOf("function estimateScopeWhere(");
+  expect(predicateStart, "estimateScopeWhere must exist").toBeGreaterThanOrEqual(0);
+  const predicateEnd = /\nasync function |\nfunction |\nexport /.exec(source.slice(predicateStart + 30));
+  const predicate = source.slice(
+    predicateStart,
+    predicateEnd ? predicateStart + 30 + predicateEnd.index : undefined,
+  );
+  for (const needle of [
+    "accessibleProjectIds(user)",           // project branch, shared with canAccessProject
+    'hasPermission(user, "leadAccess")',    // lead branch, same gate as assertEstimateScope
+    "projectId: null",                      // leadAccess must NOT rescue a project-owned row
+    "MATCHES_NO_ESTIMATE",                  // no accessible scope => no rows, not all rows
+  ]) {
+    expect(predicate, `estimateScopeWhere must still contain ${needle}`).toContain(needle);
+  }
+
+  // Agreement is structural, not coincidental: assertEstimateScope's project
+  // branch is canAccessProject, estimateScopeWhere's is accessibleProjectIds,
+  // and canAccessProject is defined in terms of accessibleProjectIds. Break
+  // that chain and the assertion and the filter can disagree again.
+  expect(permissions, "canAccessProject must derive from accessibleProjectIds")
+    .toMatch(/export function canAccessProject\([\s\S]{0,400}accessibleProjectIds\(user\)/);
+  expect(
+    source.slice(source.indexOf("function assertEstimateScope(")),
+    "assertEstimateScope must still route project-owned estimates through canAccessProject",
+  ).toContain("canAccessProject(user, scope.projectId)");
 });
 
 test("dual-auth financial actions keep explicit portal or machine authorization", () => {
