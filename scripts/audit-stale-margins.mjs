@@ -73,8 +73,8 @@ if (limitArg >= 0) {
  * Read a key from the environment, then from the dotenv files in the order the Next.js
  * toolchain resolves them: `.env.local` OVERRIDES `.env`. Checking `.env` first would let a
  * committed default silently win over the local override and point a production audit at the
- * WRONG DATABASE. (The sibling backfill script has the older, reversed order — it happens not
- * to misfire because this repo has no bare `.env`, but do not copy it.)
+ * WRONG DATABASE. (Every sibling script under scripts/ that resolves env this way now shares
+ * this exact order — if you add another, copy this one, not an older reversed variant.)
  *
  * Parsing is delegated to `dotenv` rather than hand-rolled. A regex over the line looks fine
  * until it meets the cases that actually occur — quoted values containing `#`, `export`

@@ -46,6 +46,7 @@
 // This script does NOT create the `secure-docs` bucket — it must already exist.
 import { PrismaClient } from "@prisma/client";
 import { createClient } from "@supabase/supabase-js";
+import dotenv from "dotenv";
 import fs from "node:fs";
 
 const PUBLIC_BUCKET = "project-files";
@@ -54,12 +55,24 @@ const SECURE_SCHEME = "secure:";
 
 const APPLY = process.argv.includes("--apply");
 
+/**
+ * Read a key from the environment, then from the dotenv files in the order the Next.js
+ * toolchain resolves them: `.env.local` OVERRIDES `.env`. Checking `.env` first would let a
+ * committed default silently win over the local override and point this script's writes at the
+ * WRONG DATABASE or the WRONG STORAGE BUCKET.
+ *
+ * Parsing is delegated to `dotenv` rather than hand-rolled: a regex over the line mishandles
+ * quoted values containing `#`, `export` prefixes, inline comments, CRLF and multiline values,
+ * and every one of those is a silent wrong-target read. `key in parsed` rather than a truthiness
+ * check so a file that assigns an EMPTY value still wins over the lower-precedence file and the
+ * missing-value check below fails loudly.
+ */
 function envFromFiles(key) {
   if (process.env[key]) return process.env[key];
-  for (const f of [".env", ".env.local"]) {
+  for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
-    const m = fs.readFileSync(f, "utf8").match(new RegExp(`^${key}\\s*=\\s*"?([^"\\n]+)"?`, "m"));
-    if (m) return m[1];
+    const parsed = dotenv.parse(fs.readFileSync(f));
+    if (key in parsed) return parsed[key];
   }
   return undefined;
 }

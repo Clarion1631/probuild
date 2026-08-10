@@ -37,16 +37,33 @@
 // Requires (read from env or .env / .env.local):
 //   DATABASE_URL   Supabase transaction pooler URL (must include ?pgbouncer=true)
 import { PrismaClient } from "@prisma/client";
+import dotenv from "dotenv";
 import fs from "node:fs";
 
 const APPLY = process.argv.includes("--apply");
 
+/**
+ * Read a key from the environment, then from the dotenv files in the order the Next.js
+ * toolchain resolves them: `.env.local` OVERRIDES `.env`. Checking `.env` first would let a
+ * committed default silently win over the local override and point this script at the WRONG
+ * DATABASE — and unlike the sibling audit, this one has a real `--apply` write path that
+ * UPDATEs EstimateItem.markupPercent.
+ *
+ * Parsing is delegated to `dotenv` rather than hand-rolled. A regex over the line looks fine
+ * until it meets the cases that actually occur — quoted values containing `#`, `export`
+ * prefixes, inline comments, CRLF, multiline values — and each one it gets wrong is a silent
+ * wrong-database write, which is the one failure this script must not have.
+ *
+ * `key in parsed` rather than a truthiness check on purpose: a file that assigns the key an
+ * EMPTY value has still spoken, and must win over the lower-precedence file instead of falling
+ * through to it. The missing-URL check below then fails loudly, which is the correct outcome.
+ */
 function envFromFiles(key) {
   if (process.env[key]) return process.env[key];
-  for (const f of [".env", ".env.local"]) {
+  for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
-    const m = fs.readFileSync(f, "utf8").match(new RegExp(`^${key}\\s*=\\s*"?([^"\\n]+)"?`, "m"));
-    if (m) return m[1];
+    const parsed = dotenv.parse(fs.readFileSync(f));
+    if (key in parsed) return parsed[key];
   }
   return undefined;
 }
