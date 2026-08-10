@@ -28,7 +28,7 @@
 ## Stack
 - Next.js 16 (App Router, Server Components, Server Actions), npm, Prisma 5, Tailwind
 - Supabase (PostgreSQL, auth, storage) — project ref: `ghzdbzdnwjxazvmcefbh`
-- Auto-deploy is **disabled**. Deploy manually via `vercel --prod`
+- Auto-deploy is **ON** — pushes build previews, merges to `main` ship to prod. See "Deploying to Vercel"
 
 ## Room Studio (3D room designer)
 - Lives in `src/components/studio/` + `src/lib/studio/` (react-three-fiber). The legacy `room-designer` modules are gone — don't recreate them.
@@ -71,7 +71,7 @@ stripe listen --forward-to localhost:3000/api/webhooks/stripe --output json
 stripe trigger payment_intent.succeeded
 ```
 
-## Deploying to Vercel (CLI only — auto-deploy is OFF)
+## Deploying to Vercel (manual CLI deploy — note auto-deploy also ships `main`)
 ```powershell
 # Production deploy (from the main repo dir, not a worktree):
 vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
@@ -81,11 +81,12 @@ vercel --prod --token $env:VERCEL_TOKEN --yes --archive=tgz --cwd "C:\Users\jat0
 2. **Schema changed?** If the branch edits `prisma/schema.prisma` and ships a `scripts/apply-*.mjs`, run it against prod BEFORE deploying (`node scripts/apply-<name>.mjs`). These scripts are additive + idempotent (`IF NOT EXISTS`, guarded FKs) and safe while the old build is live — but the new build's Prisma client selects the new columns immediately, so any page querying them throws P2022 "column does not exist" until the script runs. (2026-07-20: the company-schedule deploy went out before `apply-company-schedule-schema.mjs` ran; project pages hit the route error boundary until it was applied.)
 3. Deploy with the command above, then click through the affected pages on prod
 
-- Auto-deploy was disabled in `vercel.json` to avoid runaway build costs ($250 bill from frequent pushes)
-- `--archive=tgz` is required — project exceeds Vercel's 15,000-file limit without it
+- **Git auto-deploy is ON, despite older notes here.** It is not disabled anywhere: `vercel.json` holds only `crons` (no `git.deploymentEnabled`), and the project has no `deploymentEnabled` override, so Vercel's default `true` applies. Verified 2026-08-10 against the project API — every branch push builds a preview and every `main` merge auto-promotes to production
+- Consequence: **merging a PR ships it.** Do the pre-deploy checklist before merging, not just before running the CLI. The manual deploy below is for shipping ahead of a merge, or re-promoting
+- The $250 runaway-build bill came from frequent pushes. Nothing structural prevents a repeat — keep pushes deliberate. If you do want it off, it has to be set in the Vercel dashboard (Settings → Git) or added to `vercel.json`; and even then, dashboard redeploy/promote, Deploy Hooks, the REST API, and CI can all still ship
+- `--archive=tgz` is optional, not required — the upload is ~1,389 files (measured 2026-08-10), far under Vercel's 15,000-file cap. It bundles everything into one tarball, which negates per-file upload caching and can make repeat deploys slower. Reach for it only if an upload actually stalls
 - `--cwd` points to the main repo — deploy from there, not from worktrees (worktrees lack the `.vercel` link)
 - Only deploy when changes are verified locally via `npm run build`
-- Do NOT re-enable auto-deploy in vercel.json or the Vercel dashboard
 
 ## E2E testing — never against the live DB
 See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
