@@ -146,7 +146,8 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 - If still failing, `rm -rf .next && npm run dev`
 
 ## Schema migrations
-> `npx prisma db push` hangs interactively. `prisma migrate dev` fails because it dials `DIRECT_URL`,
+> `npx prisma db push` does **not** hang — it fails for the same reason `migrate dev` does, because
+> `db push` also reads `directUrl` and never touches `DATABASE_URL`. Both dial `DIRECT_URL`,
 > whose host `db.ghzdbzdnwjxazvmcefbh.supabase.co` publishes an **AAAA record only** (IPv6-only without
 > Supabase's IPv4 add-on) and this machine has no IPv6 default route. **5432 is not a blocked port** and
 > the free tier is not the cause — the shared session pooler listens on 5432 too and completes a TCP
@@ -203,7 +204,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (its `DIRECT_URL` host is IPv6-only and unreachable here; 5432 itself is fine — see "Schema migrations"). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
+- **Schema changes** — do NOT use `npx prisma db push` or `prisma migrate dev`. Both dial `DIRECT_URL` (yes, `db push` too — it reads `directUrl` and ignores `DATABASE_URL`), whose host is IPv6-only and unreachable here; 5432 itself is fine, and neither command hangs — see "Schema migrations". Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library

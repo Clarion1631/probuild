@@ -8,7 +8,10 @@ allowed-tools: Read, Write, Edit, Bash, Grep, Glob
 
 ## Why the standard commands don't work
 
-- `npx prisma db push` hangs interactively.
+- `npx prisma db push` does **not** hang — that claim was never verified and is wrong. It fails for
+  the *same* reason `migrate dev` does: `db push` reads `directUrl` from the datasource block, so it
+  dials `DIRECT_URL` and never touches `DATABASE_URL`. It errors out in ~3 seconds with
+  `P1001: Can't reach database server at db.ghzdbzdnwjxazvmcefbh.supabase.co:5432`.
 - `prisma migrate dev` fails because it connects over `DIRECT_URL`, and this project's direct
   endpoint `db.ghzdbzdnwjxazvmcefbh.supabase.co` resolves to an **AAAA record only** — Supabase
   direct connections are IPv6-only unless the project buys the IPv4 add-on. This machine has no
@@ -27,6 +30,22 @@ just isn't what breaks the command.) Verified 2026-08-10 from this machine:
 
 Those handshakes prove reachability only — nobody has tested authenticated Postgres access on the
 session pooler.
+
+### `db push` evidence (verified 2026-08-10)
+
+Run against a throwaway `postgres:16` container, never prod, since `db push` mutates the database.
+Prisma CLI 5.22.0.
+
+| Test | Result |
+|---|---|
+| Both URLs → throwaway container | **Succeeds in 9s**, no prompt. So there is no inherent hang. |
+| `DATABASE_URL` → throwaway, `DIRECT_URL` → real direct host | Banner names **the direct host**, then `P1001` in 3.3s. Proves `db push` uses `directUrl` and ignores `DATABASE_URL`. |
+| Destructive change (drop a column holding data), stdin not a TTY | **Errors in 2.5s** with *"Use the --accept-data-loss flag"*. It does not block waiting for input. |
+
+The only prompt `db push` has is that destructive-change confirmation, and it only appears on a real
+TTY — under an agent or any non-TTY stdin it is an immediate error, not a hang. The IPv6 problem is
+also not WSL-specific: from WSL, `getent ahosts` on the direct host returns the same lone AAAA
+address and `ip -6 route show default` is empty, exactly as on Windows.
 
 Repointing `DIRECT_URL` at the session pooler is therefore **not** a tested workaround. `prisma
 migrate dev` also wants to create and drop a shadow database, which needs `CREATEDB` on the
