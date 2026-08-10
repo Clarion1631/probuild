@@ -1,25 +1,29 @@
 import type { ReactNode } from "react";
 import { formatCurrency } from "@/lib/utils";
 import { decimalToCents, type MergedRegisterRow } from "@/lib/register-merge";
-import type { RawExpense } from "../../register-data";
+import type { OpenReviewIssue, RawExpense } from "../../register-data";
 import { amountSign, friendlyType } from "../format";
 import CopyIdButton from "../copy-id-button";
 import { StateChip } from "../shared/state-chip";
 import { StepTimeline } from "../shared/step-timeline";
 import { isStaleBookedApi } from "../shared/stale-detection";
+import MarkReviewedButton from "./mark-reviewed-button";
 import type { ReceiptJourneyMatch } from "./match-receipt-journey";
 import { toSerializedJourney } from "./serialize-journey";
 
 /**
- * The register row drill-down — read-only half only (Unified Money Register
- * plan §3/§5 step 9). Four blocks, rendered only when they apply to this
- * row: QuickBooks · ProBuild job cost · Receipt provenance timeline ·
- * Actions (seam only, no write actions — those need the step 8 APIs).
+ * The register row drill-down (Unified Money Register plan §3/§5 step 9).
+ * Four blocks, rendered only when they apply to this row: QuickBooks ·
+ * ProBuild job cost · Receipt provenance timeline · Actions. "Mark reviewed"
+ * in the Actions block now writes, via step 8's mark-reviewed API and the
+ * `MarkReviewedButton` client-component extraction below — "Ask Marge to
+ * review" is still a seam, no API for it exists yet.
  *
- * Pure presentational: all data (the row, its richer Expense projection, and
- * its matched receipt journey) is fetched and matched by the caller
- * (`page.tsx`, via `register-data.ts` and `match-receipt-journey.ts`) so this
- * stays a plain server component with no I/O of its own.
+ * Otherwise pure presentational: all data (the row, its richer Expense
+ * projection, its matched receipt journey, and its open review issue) is
+ * fetched and matched by the caller (`page.tsx`, via `register-data.ts` and
+ * `match-receipt-journey.ts`) so this stays a plain server component with no
+ * I/O of its own.
  */
 
 function DrilldownSection({ title, children }: { title: string; children: ReactNode }) {
@@ -209,23 +213,24 @@ function ReceiptTimelineBlock({
     );
 }
 
-function ActionsBlock() {
+function ActionsBlock({ reviewIssue }: { reviewIssue: OpenReviewIssue | null }) {
     return (
         <DrilldownSection title="Actions">
             {/*
-             * Unified Money Register plan §5 step 8 wires the review-alert
-             * schema/outbox and its own financialReports/admin-gated APIs.
-             * Step 9 (this file) is read-only — "Ask Marge to review" and
-             * "Mark reviewed" get wired in HERE once those APIs exist. Do
-             * not add a write path in this block ahead of step 8.
+             * Unified Money Register plan §5 step 8 wired the review-alert
+             * schema/outbox and its own financialReports/admin-gated
+             * mark-reviewed API
+             * (src/app/api/automation/review-issues/mark-reviewed). "Mark
+             * reviewed" is wired to it below via MarkReviewedButton, a small
+             * client-component extraction so this file stays a plain server
+             * component. "Ask Marge to review" still has no API to call —
+             * stays disabled until that ships.
              */}
             <div className="flex items-center gap-2 flex-wrap">
                 <button type="button" disabled title="Coming soon" className="hui-btn hui-btn-secondary text-xs px-2 py-0.5 disabled:opacity-50">
                     Ask Marge to review
                 </button>
-                <button type="button" disabled title="Coming soon" className="hui-btn hui-btn-secondary text-xs px-2 py-0.5 disabled:opacity-50">
-                    Mark reviewed
-                </button>
+                <MarkReviewedButton issue={reviewIssue} />
             </div>
         </DrilldownSection>
     );
@@ -235,11 +240,13 @@ export function RowDrilldown({
     row,
     expense,
     journeyMatch,
+    reviewIssue,
     now,
 }: {
     row: MergedRegisterRow;
     expense: RawExpense | null;
     journeyMatch: ReceiptJourneyMatch | null;
+    reviewIssue: OpenReviewIssue | null;
     now: number;
 }) {
     return (
@@ -247,7 +254,7 @@ export function RowDrilldown({
             <QuickBooksBlock row={row} />
             <JobCostBlock row={row} expense={expense} />
             <ReceiptTimelineBlock row={row} journeyMatch={journeyMatch} receiptUrl={row.receiptUrl} now={now} />
-            {row.edges && <ActionsBlock />}
+            {row.edges && <ActionsBlock reviewIssue={reviewIssue} />}
         </div>
     );
 }

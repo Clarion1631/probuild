@@ -29,7 +29,9 @@ import {
     fetchRegisterMergeInputs,
     orphanProjectNames,
     drilldownExpenseByPurchaseId,
+    reviewIssueByPurchaseId,
     type RawExpense,
+    type OpenReviewIssue,
 } from "./register-data";
 import { applyRegisterFilters } from "./register-filters";
 import { amountSign, formatRelativeTime, friendlyType } from "./components/format";
@@ -101,7 +103,12 @@ interface DisplayRow {
     /** Present only when the merge succeeded — powers the row drill-down
      * (plan §3/§5 step 9). Null on the degraded raw-register fallback path,
      * where there's no edge/status data to drill into. */
-    drilldown: { row: MergedRegisterRow; expense: RawExpense | null; journeyMatch: ReceiptJourneyMatch | null } | null;
+    drilldown: {
+        row: MergedRegisterRow;
+        expense: RawExpense | null;
+        journeyMatch: ReceiptJourneyMatch | null;
+        reviewIssue: OpenReviewIssue | null;
+    } | null;
 }
 
 function sinceMsForRangeDays(days: number): number {
@@ -226,6 +233,7 @@ export default async function AutomationPage(props: {
     let orphanProjectNameMap = new Map<string, string>();
     let journeyIndex: ReceiptJourneyIndex = { byQbPurchaseId: new Map(), byDocNumber: new Map() };
     let expenseByPurchaseId = new Map<string, RawExpense>();
+    let reviewIssueMap = new Map<string, OpenReviewIssue>();
     // Receipt journey PIPELINE LIST (plan §3) — a separate, display-capped
     // fetch from the row drill-down's targeted lookup above; this one is a
     // genuine "browse the most recent receipts" list, so a display cap is
@@ -243,6 +251,7 @@ export default async function AutomationPage(props: {
         // fetch ONLY the journeys for the identifiers THIS register's rows
         // actually carry, pre-indexed for an O(1) lookup per row below.
         expenseByPurchaseId = drilldownExpenseByPurchaseId(mergeInputs.rawExpenses);
+        reviewIssueMap = reviewIssueByPurchaseId(mergeInputs.openReviewIssues);
         [journeyIndex, pipelineJourneyList] = await Promise.all([
             receiptJourneysForKeys(
                 merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
@@ -322,6 +331,7 @@ export default async function AutomationPage(props: {
                 row: r,
                 expense: r.qbTxnId ? expenseByPurchaseId.get(r.qbTxnId) ?? null : null,
                 journeyMatch: r.edges ? matchReceiptJourney(r, journeyIndex) : null,
+                reviewIssue: r.qbTxnId ? reviewIssueMap.get(r.qbTxnId) ?? null : null,
             },
         }))
         : registerRows.map((r, i) => ({
@@ -630,6 +640,7 @@ export default async function AutomationPage(props: {
                                                 row={row.drilldown.row}
                                                 expense={row.drilldown.expense}
                                                 journeyMatch={row.drilldown.journeyMatch}
+                                                reviewIssue={row.drilldown.reviewIssue}
                                                 now={nowMs}
                                             />
                                         </ExpandableRow>

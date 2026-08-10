@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { isPurchaseType } from "@/lib/register-types";
+import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import type { BankRegisterRow } from "@/lib/qbo-bank-register";
 import type {
     RegisterMergeExpense,
@@ -92,6 +93,39 @@ function fetchRawExpenses(purchaseIds: string[]) {
         : Promise.resolve([]);
 }
 
+/** Same `targetType` the review-alert evaluator writes under
+ * (review-alert-evaluator.ts's `TARGET_TYPE`) — not imported from there
+ * because that module lives under `src/lib/**` and this is the two-line
+ * duplicate that module's own header comment already accepts rather than
+ * add a cross-directory coupling (see its `asClassification` note). */
+const REVIEW_ISSUE_TARGET_TYPE = "qbo-purchase";
+
+/** Row drill-down's "Mark reviewed" button (plan §5 step 9) wants only the
+ * fields the mark-reviewed API's optimistic-concurrency check needs, plus
+ * enough to derive whether this issue is already acknowledged — never the
+ * full ReviewIssue row. */
+const REVIEW_ISSUE_SELECT = {
+    id: true,
+    targetKey: true,
+    version: true,
+    reasonHash: true,
+    reasonCodes: true,
+    acknowledgedCodes: true,
+} as const;
+
+export type RawReviewIssue = Awaited<ReturnType<typeof fetchOpenReviewIssues>>[number];
+
+/** OPEN review issues only (`clearedAt: null`) — a cleared issue has nothing
+ * left to review, same as having no issue at all. */
+function fetchOpenReviewIssues(purchaseIds: string[]) {
+    return purchaseIds.length
+        ? prisma.reviewIssue.findMany({
+            where: { targetType: REVIEW_ISSUE_TARGET_TYPE, targetKey: { in: purchaseIds }, clearedAt: null },
+            select: REVIEW_ISSUE_SELECT,
+        })
+        : Promise.resolve([]);
+}
+
 export interface RegisterMergeInputs {
     expenses: RegisterMergeExpense[];
     receiptEvents: RegisterMergeReceiptEvent[];
@@ -104,6 +138,9 @@ export interface RegisterMergeInputs {
      * kept separately for the row drill-down's ProBuild job cost block
      * (`drilldownExpenseByPurchaseId` below), display-only. */
     rawExpenses: RawExpense[];
+    /** OPEN review issues keyed later by `reviewIssueByPurchaseId` below —
+     * powers the row drill-down's "Mark reviewed" button. */
+    openReviewIssues: RawReviewIssue[];
 }
 
 /**
@@ -123,7 +160,7 @@ export async function fetchRegisterMergeInputs(
         .filter(r => isPurchaseType(r.qbType) && r.qbTxnId)
         .map(r => r.qbTxnId as string);
 
-    const [rawExpenses, rawReceiptEvents, classificationRows] = await Promise.all([
+    const [rawExpenses, rawReceiptEvents, classificationRows, openReviewIssues] = await Promise.all([
         // Widened select (vendor/date/estimate identity) reused as-is for
         // `mergeRegister()`'s narrower `RegisterMergeExpense` shape — extra
         // fields on the object are harmless to a caller that only reads the
@@ -137,6 +174,7 @@ export async function fetchRegisterMergeInputs(
                 select: { qbPurchaseId: true, classification: true, reason: true },
             })
             : Promise.resolve([]),
+        fetchOpenReviewIssues(purchaseIds),
     ]);
 
     return {
@@ -149,6 +187,7 @@ export async function fetchRegisterMergeInputs(
         })),
         rawReceiptEvents,
         rawExpenses,
+        openReviewIssues,
     };
 }
 
@@ -164,6 +203,35 @@ export function drilldownExpenseByPurchaseId(rawExpenses: RawExpense[]): Map<str
     const map = new Map<string, RawExpense>();
     for (const e of rawExpenses) {
         if (e.qbPurchaseId) map.set(e.qbPurchaseId, e);
+    }
+    return map;
+}
+
+/** Row drill-down's "Mark reviewed" button state, keyed by `qbPurchaseId`
+ * (the same `targetKey` the review-alert evaluator writes — its
+ * `targetKey: row.qbTxnId`, review-alert-evaluator.ts). `acknowledged`
+ * mirrors `decideLifecycle`'s step 4 test (review-alert-lifecycle.ts) —
+ * every one of the issue's current reason codes is already in its
+ * acknowledged set — WITHOUT importing that pure module's heavier
+ * evaluate-a-decision machinery for what is, here, just a display flag. */
+export interface OpenReviewIssue {
+    id: string;
+    version: number;
+    reasonHash: string;
+    acknowledged: boolean;
+}
+
+export function reviewIssueByPurchaseId(openReviewIssues: RawReviewIssue[]): Map<string, OpenReviewIssue> {
+    const map = new Map<string, OpenReviewIssue>();
+    for (const issue of openReviewIssues) {
+        const currentCodes = decodeReasonCodes(issue.reasonCodes);
+        const acknowledgedCodes = new Set(decodeReasonCodes(issue.acknowledgedCodes));
+        map.set(issue.targetKey, {
+            id: issue.id,
+            version: issue.version,
+            reasonHash: issue.reasonHash,
+            acknowledged: currentCodes.length > 0 && currentCodes.every(code => acknowledgedCodes.has(code)),
+        });
     }
     return map;
 }
