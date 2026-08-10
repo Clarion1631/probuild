@@ -137,16 +137,19 @@ See **docs/TESTING.md**. E2E creates leads/estimates/invoices, so:
 - History: QA runs against prod once filled /leads with "Master Bath Renovation - Henderson" junk (cleaned 2026-06-11)
 
 ## Dev server — clean start
-```bash
-kill -9 $(lsof -ti tcp:3000,3001,3002) 2>/dev/null; rm -f .next/dev/lock; sleep 2
-npm run dev > /tmp/devserver.log 2>&1 &
-sleep 15 && curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/
-```
-- Always use port 3000 — if it's taken, kill it, don't switch ports
+Prefer the Browser pane's `preview_start`. For a raw clean start, follow the
+`probuild-dev-server` skill (`.claude/skills/probuild-dev-server/SKILL.md`) — that is the
+canonical recipe, kept in one place so a second copy here can't drift from it.
+- Always use port 3000 — if it's taken, kill the holder, don't switch ports
+- Verify the new server actually answers (assert the kill worked, then match ProBuild's own markup) — a bare HTTP 200 can come from the surviving process while Next falls back to 3001
 - If still failing, `rm -rf .next && npm run dev`
 
 ## Schema migrations
-> `npx prisma db push` hangs interactively. `prisma migrate dev` fails (port 5432 blocked on free tier).
+> `npx prisma db push` hangs interactively. `prisma migrate dev` fails because it dials `DIRECT_URL`,
+> whose host `db.ghzdbzdnwjxazvmcefbh.supabase.co` publishes an **AAAA record only** (IPv6-only without
+> Supabase's IPv4 add-on) and this machine has no IPv6 default route. **5432 is not a blocked port** and
+> the free tier is not the cause — the shared session pooler listens on 5432 too and completes a TCP
+> handshake over IPv4. Full evidence table in the `probuild-schema-migration` skill.
 
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
@@ -199,7 +202,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (port 5432 blocked). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
+- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (its `DIRECT_URL` host is IPv6-only and unreachable here; 5432 itself is fine — see "Schema migrations"). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library
