@@ -35,7 +35,9 @@ function expectGuardBeforeDatabase(source: string, actionName: string, guard: st
 }
 
 test("all staff financial actions authorize inside the exported action", () => {
-  const source = readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8");
+  // Comments stripped for the same reason the later tests strip them: a guard
+  // quoted in a comment would satisfy every indexOf below while gating nobody.
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
 
   // The `estimates` permission answers "may this user touch estimates at all",
   // NOT "may this user touch THIS estimate". Every action addressed by an
@@ -179,7 +181,7 @@ test("all staff financial actions authorize inside the exported action", () => {
     expect(exportSource(source, name)).toContain("assertFinancialProjectScope(");
   }
 
-  for (const name of ["getLeads", "getProjects", "getProject"]) {
+  for (const name of ["getLeads", "getProjects", "getProject", "getClients"]) {
     expectGuardBeforeDatabase(source, name, "await assertActiveStaff(");
   }
 
@@ -188,6 +190,19 @@ test("all staff financial actions authorize inside the exported action", () => {
   }
   for (const name of ["saveCompanySettings", "updateCompanyProjectStatuses", "saveCompanySubcontractorTrades"]) {
     expectGuardBeforeDatabase(source, name, "await assertCompanySettingsPermission(");
+  }
+
+  // Every assertion above only proves the guard is CALLED. A guard whose body
+  // stopped throwing would satisfy all of them while authorizing nobody, so pin
+  // the helper itself: resolve the staff user, and throw when there is none.
+  {
+    const start = source.indexOf("async function assertActiveStaff");
+    expect(start, "assertActiveStaff must exist").toBeGreaterThanOrEqual(0);
+    const body = source.slice(start, start + 300);
+    expect(body, "assertActiveStaff must resolve the current staff user")
+      .toContain("await currentStaffUserOrNull()");
+    expect(body, "assertActiveStaff must throw when there is no staff user")
+      .toMatch(/if\s*\(!user\)\s*throw new Error\("Unauthorized"\)/);
   }
 });
 
