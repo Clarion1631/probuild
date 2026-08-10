@@ -104,6 +104,37 @@ export function canAccessEstimate(user: ProjectScopedUser, scope: EstimateOwner)
     return hasPermission(user, "leadAccess");
 }
 
+/**
+ * The completeness companion to estimateScopeWhere: given the owners an
+ * aggregate was computed over, would the scope filter have dropped any of them?
+ *
+ * Estimate reads are scoped per caller, but the pages that sum them are not
+ * necessarily scoped the same way (the project LIST is company-wide), so a
+ * "Total Revenue" card can otherwise sit a partial number under a label that
+ * claims completeness. Readers ask this and label themselves honestly instead.
+ *
+ * Takes OWNERS, not project ids. A bare id list cannot express the difference
+ * between "lead-owned" and "attached to nothing", so a null in it would have to
+ * mean both — and those two answer differently (leadAccess vs fail-closed).
+ * Asking canAccessEstimate per owner makes the invariant hold by construction:
+ * complete === "the filter admits every one of these".
+ *
+ * Deliberately CONSERVATIVE about WHAT the caller passes: a page names the
+ * owners its aggregate could have drawn from, not the rows that actually
+ * existed. So an inaccessible project holding no matching row still reads as
+ * partial. It under-claims, never over-claims — a hedged label on a complete
+ * number misleads nobody, the reverse is the bug this exists to prevent.
+ */
+export function estimateTotalsAreComplete(
+    user: ProjectScopedUser | null | undefined,
+    owners: readonly EstimateOwner[]
+): boolean {
+    // No user means the scope filter matched nothing at all, so any non-empty
+    // total is partial by definition — and an empty one is not worth claiming.
+    if (!user?.role) return false;
+    return owners.every(owner => canAccessEstimate(user, owner));
+}
+
 /** Matches no estimate at all. Used where the caller has no accessible scope. */
 const MATCHES_NO_ESTIMATE = { id: { in: [] as string[] } };
 

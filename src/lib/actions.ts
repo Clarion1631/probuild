@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, estimateScopeWhere, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -4191,6 +4191,21 @@ function assertEstimateScope(user: any, scope: { projectId?: string | null; lead
  */
 function scopedEstimateRelation<T extends object>(relation: T, user: any | null | undefined): T & { where: any } {
     return { ...relation, where: estimateScopeWhere(user) };
+}
+
+/**
+ * Session-bound form of estimateTotalsAreComplete, for pages that sum estimates
+ * embedded in an UNSCOPED parent list (the project list is company-wide, so its
+ * revenue card would otherwise label a scoped sum as company-wide truth).
+ *
+ * Pass the OWNERS the aggregate could have drawn from — `{ projectId }` for a
+ * project's estimates, `{ leadId }` for a lead's. Not a bare id list: null in
+ * one cannot distinguish lead-owned from attached-to-nothing, and those two
+ * answer differently.
+ */
+export async function estimateTotalsComplete(owners: { projectId?: string | null; leadId?: string | null }[]): Promise<boolean> {
+    const user = await assertActiveStaff();
+    return estimateTotalsAreComplete(user, owners);
 }
 
 /** Permission + scope for actions that reach estimates through a project id. */

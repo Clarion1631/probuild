@@ -4,6 +4,7 @@ import {
     estimateScopeWhere,
     canAccessProject,
     accessibleProjectIds,
+    estimateTotalsAreComplete,
     type EstimateOwner,
     type ProjectScopedUser,
 } from "../src/lib/access-rules";
@@ -126,6 +127,72 @@ test("a missing user is treated as no access, never as full access", () => {
         for (const [label, row] of ROWS) {
             expect(whereAdmits(where, row), `absent user must not see ${label}`).toBe(false);
         }
+    }
+});
+
+/**
+ * estimateTotalsAreComplete decides whether a card may label its number as
+ * company-wide. It must say "complete" exactly when the scope filter would have
+ * dropped nothing from the projects the aggregate covered — a label that
+ * overstates a partial sum is the bug it exists to prevent.
+ */
+test("a total is complete exactly when the filter admits every owner it covered", () => {
+    // THE invariant, over the whole table. Includes the ownerless row (which
+    // the filter rejects for everyone, admins included) and the dual-owned ones,
+    // so a rule that special-cases "no project" as a free pass fails here.
+    for (const [userLabel, user] of USERS) {
+        const where = estimateScopeWhere(user);
+        for (const [rowLabel, row] of ROWS) {
+            expect(
+                estimateTotalsAreComplete(user, [row]),
+                `${userLabel} / ${rowLabel}: completeness must match what the filter admits`,
+            ).toBe(whereAdmits(where, row));
+        }
+    }
+});
+
+test("one dropped owner makes the whole total partial", () => {
+    // Completeness is over the SET: it only survives if every owner survives.
+    for (const [userLabel, user] of USERS) {
+        const where = estimateScopeWhere(user);
+        const rows = ROWS.map(([, row]) => row);
+        for (const size of [2, 3, rows.length]) {
+            const subset = rows.slice(0, size);
+            const allAdmitted = subset.every(row => whereAdmits(where, row));
+            expect(
+                estimateTotalsAreComplete(user, subset),
+                `${userLabel} / first ${size} rows`,
+            ).toBe(allAdmitted);
+        }
+    }
+});
+
+test("an unattached owner is never complete, and neither is an absent user", () => {
+    // `{}` is the ownerless case the schema permits. canAccessEstimate fails it
+    // closed for every role, so a total drawn from it can never claim to be all.
+    for (const [label, user] of USERS) {
+        expect(estimateTotalsAreComplete(user, [{}]), `${label} / unattached`).toBe(false);
+        expect(estimateTotalsAreComplete(user, [{ projectId: null, leadId: null }]), `${label} / explicit nulls`).toBe(false);
+    }
+    // Spelt out for the shapes the UI actually hands this.
+    expect(estimateTotalsAreComplete(LEADS_ONLY, [{ leadId: "l1" }])).toBe(true);
+    expect(estimateTotalsAreComplete(ESTIMATOR_LEADS, [{ leadId: "l1" }, { projectId: "p1" }])).toBe(true);
+    expect(estimateTotalsAreComplete(ESTIMATOR_LEADS, [{ leadId: "l1" }, { projectId: "p9" }])).toBe(false);
+    // FINANCE / crew / nobody hold no leadAccess, so a lead total is partial.
+    for (const user of [FINANCE_NO_ACCESS, CREW_ON_P2, NOBODY]) {
+        expect(estimateTotalsAreComplete(user, [{ leadId: "l1" }])).toBe(false);
+    }
+    // Fail closed: no user means the filter matched nothing, so claim nothing.
+    for (const noUser of [null, undefined, {} as any]) {
+        expect(estimateTotalsAreComplete(noUser, [])).toBe(false);
+        expect(estimateTotalsAreComplete(noUser, [{ projectId: "p1" }])).toBe(false);
+    }
+});
+
+test("only ADMIN and MANAGER may claim a company-wide total over arbitrary projects", () => {
+    for (const [label, user] of USERS) {
+        const claimsAll = estimateTotalsAreComplete(user, [{ projectId: "p1" }, { projectId: "p2" }, { projectId: "p9" }]);
+        expect(claimsAll, `${label}`).toBe(accessibleProjectIds(user) === "ALL");
     }
 });
 
