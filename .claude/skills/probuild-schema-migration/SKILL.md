@@ -9,7 +9,31 @@ allowed-tools: Read, Write, Edit, Bash, Grep, Glob
 ## Why the standard commands don't work
 
 - `npx prisma db push` hangs interactively.
-- `prisma migrate dev` fails — port 5432 is blocked on the free tier.
+- `prisma migrate dev` fails because it connects over `DIRECT_URL`, and this project's direct
+  endpoint `db.ghzdbzdnwjxazvmcefbh.supabase.co` resolves to an **AAAA record only** — Supabase
+  direct connections are IPv6-only unless the project buys the IPv4 add-on. This machine has no
+  IPv6 default route, so the TCP connection to that host fails.
+
+**It is not a blocked port, and not a free-tier port block.** There is no host-wide outbound block
+on 5432: Supabase's shared **session** pooler also listens on 5432 and completes a TCP handshake
+over IPv4 from this machine. (Plan tier does affect whether the IPv4 add-on is *purchasable* — it
+just isn't what breaks the command.) Verified 2026-08-10 from this machine:
+
+| Endpoint | DNS | TCP handshake |
+|---|---|---|
+| `db.ghzdbzdnwjxazvmcefbh.supabase.co:5432` (direct) | AAAA only, no A record | fails |
+| `aws-0-us-west-2.pooler.supabase.com:5432` (session pooler) | A records | succeeds |
+| `aws-0-us-west-2.pooler.supabase.com:6543` (transaction pooler) | A records | succeeds |
+
+Those handshakes prove reachability only — nobody has tested authenticated Postgres access on the
+session pooler.
+
+Repointing `DIRECT_URL` at the session pooler is therefore **not** a tested workaround. `prisma
+migrate dev` also wants to create and drop a shadow database, which needs `CREATEDB` on the
+database role used through the pooler. Untested here. Use the PowerShell script below instead.
+
+See <https://supabase.com/docs/guides/database/connecting-to-postgres> and
+<https://supabase.com/docs/guides/platform/ipv4-address>.
 
 ## Working approach
 
