@@ -625,6 +625,13 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
+    // Server Actions are remotely invokable, so the getSessionOrDev() check in
+    // /settings/contacts guards the page render, not this getter. Without a gate
+    // here anyone who can reach the app could read every client's internalNotes
+    // and QuickBooks fields plus the full leads relation. The contacts page and
+    // its settings nav entry are gated on "logged in" only — no permission key —
+    // so the matching rule is active staff, not a per-role scope.
+    await assertActiveStaff();
     const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
