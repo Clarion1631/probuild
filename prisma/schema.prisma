@@ -1378,6 +1378,7 @@ model PortalVisibility {
   showChangeOrders Boolean @default(true)
   showSelections   Boolean @default(true)
   showMoodBoards   Boolean @default(true)
+  showPermits      Boolean @default(true)
 
   isPortalEnabled      Boolean   @default(true)
   lastSharedAt         DateTime?

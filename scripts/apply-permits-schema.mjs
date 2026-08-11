@@ -56,6 +56,8 @@ const statements = [
   // database owner through the server-only pooler and is not subject to RLS
   // unless FORCE ROW LEVEL SECURITY is enabled (this script does not force it).
   `ALTER TABLE "Permit" ENABLE ROW LEVEL SECURITY`,
+
+  `ALTER TABLE "PortalVisibility" ADD COLUMN IF NOT EXISTS "showPermits" BOOLEAN NOT NULL DEFAULT true`,
 ];
 
 try {

@@ -8562,9 +8562,34 @@ export async function updateProjectColor(projectId: string, color: string) {
 }
 
 export async function updateProjectTags(projectId: string, tags: string) {
+    await assertActiveStaff();
     await prisma.project.update({
         where: { id: projectId },
         data: { tags }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectType(projectId: string, type: string) {
+    await assertActiveStaff();
+    const trimmed = type.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { type: trimmed || null }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectCode(projectId: string, code: string) {
+    await assertActiveStaff();
+    const trimmed = code.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { code: trimmed || null }
     });
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
@@ -8708,6 +8733,7 @@ export async function getPortalVisibility(projectId: string) {
             showChangeOrders: true,
             showSelections: true,
             showMoodBoards: true,
+            showPermits: true,
             isPortalEnabled: true,
             lastSharedAt: null,
             lastShareEmailId: null,
@@ -8727,6 +8753,7 @@ export async function savePortalVisibility(projectId: string, data: {
     showMessages: boolean;
     showSelections?: boolean;
     showMoodBoards?: boolean;
+    showPermits?: boolean;
     isPortalEnabled: boolean;
 }) {
     const record = await prisma.portalVisibility.upsert({
@@ -8741,6 +8768,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
         create: {
@@ -8754,6 +8782,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
     });

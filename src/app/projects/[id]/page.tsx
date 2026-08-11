@@ -4,10 +4,33 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
 import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
+import JobInfoCard from "./JobInfoCard";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
 
 export const dynamic = "force-dynamic";
+
+const PERMIT_STATUS_LABELS: Record<string, string> = {
+    applied: "applied",
+    issued: "issued",
+    inspections: "in inspections",
+    closed: "closed",
+    expired: "expired",
+};
+const PERMIT_STATUS_ORDER = ["applied", "issued", "inspections", "closed", "expired"];
+
+function buildPermitSummary(statuses: string[]) {
+    const total = statuses.length;
+    if (total === 0) return "";
+    const counts = new Map<string, number>();
+    for (const s of statuses) counts.set(s, (counts.get(s) || 0) + 1);
+    const orderedKeys = [
+        ...PERMIT_STATUS_ORDER.filter(k => counts.has(k)),
+        ...[...counts.keys()].filter(k => !PERMIT_STATUS_ORDER.includes(k)),
+    ];
+    const parts = orderedKeys.map(k => `${counts.get(k)} ${PERMIT_STATUS_LABELS[k] || k.toLowerCase()}`);
+    return `${total} permit${total === 1 ? "" : "s"} · ${parts.join(" · ")}`;
+}
 
 function timeAgo(d: Date, now: number) {
     const sec = Math.floor((now - d.getTime()) / 1000);
@@ -62,18 +85,30 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         return Promise.all(rows.map(async (f) => ({ ...f, url: await resolveDocUrl(f.url) })));
     });
 
-    const [project, tasks, portalVisibility, recentActivity, recentFiles] = await Promise.all([
+    console.time("[DASHBOARD] permits");
+    const permitsPromise = prisma.permit.findMany({
+        where: { projectId: id },
+        select: { status: true },
+    }).then(rows => {
+        console.timeEnd("[DASHBOARD] permits");
+        return rows.map(r => r.status);
+    });
+
+    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
         recentActivityPromise,
-        filesPromise
+        filesPromise,
+        permitsPromise
     ]);
 
     console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
 
     if (!project) notFound();
     const estimates = project.estimates || [];
+    const permitCount = permitStatuses.length;
+    const permitSummary = buildPermitSummary(permitStatuses);
 
     // Real stats
     const today = new Date();
@@ -260,8 +295,20 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                     </div>
                 </div>
 
-                {/* Col 3 — Dashboards + Recent Files */}
+                {/* Col 3 — Job Info + Dashboards + Recent Files */}
                 <div className="space-y-5">
+                    <JobInfoCard
+                        projectId={id}
+                        code={project.code}
+                        type={project.type}
+                        startDate={project.startDate}
+                        endDate={project.endDate}
+                        tags={project.tags}
+                        location={project.location}
+                        permitCount={permitCount}
+                        permitSummary={permitSummary}
+                    />
+
                     <ProjectDashboardsWidget
                         projectId={id}
                         initialPortalVisibility={portalVisibility}
