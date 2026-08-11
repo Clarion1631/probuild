@@ -153,10 +153,13 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
 
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
     const verdict = journeyVerdict(journey, suggestion, now);
-    // The dedupe stage records "duplicate-of:<driveFileId>" (or the
-    // possible-duplicate variant) — surface it as a link to the ORIGINAL so
-    // a reviewer can eyeball both without hand-searching Drive.
-    const duplicateOfFileId = journey.finalReason?.match(/^(?:possible-)?duplicate-of:([\w-]+)$/)?.[1] ?? null;
+    // The dedupe stage records "duplicate-of:<driveFileId>" (confirmed) or
+    // "possible-duplicate-of:<driveFileId>" (totals disagreed — tentative).
+    // Surface a link to the other file so a reviewer can eyeball both without
+    // hand-searching Drive, labeled by how sure the bot actually was.
+    const dupMatch = journey.finalReason?.match(/^(possible-)?duplicate-of:([\w-]+)$/) ?? null;
+    const duplicateOfFileId = dupMatch?.[2] ?? null;
+    const duplicateTentative = Boolean(dupMatch?.[1]);
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -212,7 +215,9 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
                             rel="noopener noreferrer"
                             className="text-xs font-medium text-hui-primary hover:underline"
                         >
-                            Open the original it duplicates (Drive) ↗
+                            {duplicateTentative
+                                ? "Open the possible match — totals disagreed (Drive) ↗"
+                                : "Open the original it duplicates (Drive) ↗"}
                         </a>
                     )}
 
@@ -297,6 +302,7 @@ export default function JourneyList({
                         onClick={() => {
                             setMonth("all");
                             setSearch("");
+                            setFilter("all");
                         }}
                         className="text-xs font-medium text-hui-primary hover:underline"
                     >

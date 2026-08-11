@@ -19,7 +19,11 @@ export default function MarkReviewedButton({ issue }: { issue: OpenReviewIssue |
     const [acknowledged, setAcknowledged] = useState(issue?.acknowledged ?? false);
     const [pending, setPending] = useState(false);
 
-    const nothingToReview = !issue || acknowledged;
+    // Three honest states: no open issue at all ("No review needed" — never
+    // claim a human reviewed something nobody looked at), acknowledged
+    // ("Reviewed ✓"), or open and actionable.
+    const noIssue = !issue;
+    const nothingToReview = noIssue || acknowledged;
 
     async function markReviewed() {
         if (!issue) return;
@@ -50,10 +54,10 @@ export default function MarkReviewedButton({ issue }: { issue: OpenReviewIssue |
             type="button"
             onClick={markReviewed}
             disabled={nothingToReview || pending}
-            title={nothingToReview ? "Nothing awaiting review" : undefined}
+            title={noIssue ? "Nothing awaiting review" : acknowledged ? "Already acknowledged" : undefined}
             className="hui-btn hui-btn-secondary text-xs px-2 py-0.5 disabled:opacity-50"
         >
-            {nothingToReview ? "Reviewed ✓" : "Mark reviewed"}
+            {noIssue ? "No review needed" : acknowledged ? "Reviewed ✓" : "Mark reviewed"}
         </button>
     );
 }

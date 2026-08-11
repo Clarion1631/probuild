@@ -4,6 +4,7 @@ import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
 import { mergeRegister } from "@/lib/register-merge";
 import { fetchRegisterMergeInputs } from "../../../automation/register-data";
+import { applyRegisterFilters } from "../../../automation/register-filters";
 
 export const dynamic = "force-dynamic";
 
@@ -16,10 +17,20 @@ export const dynamic = "force-dynamic";
 
 const ALLOWED_RANGES = new Set(["30", "60", "90"]);
 
-function csvField(value: string | number | null | undefined): string {
+/** Quote/escape one TEXT cell, defusing spreadsheet-formula injection: a
+ * vendor or doc number starting with = + - @ (or control whitespace) would
+ * otherwise execute as a formula when the file opens in Excel/Sheets. */
+function csvText(value: string | null | undefined): string {
     if (value === null || value === undefined) return "";
-    const s = String(value);
+    let s = String(value);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** Numeric cells (amounts) must NOT get the formula-defusing apostrophe —
+ * a leading minus sign is a sign here, not an injection vector. */
+function csvNumber(value: number): string {
+    return value.toFixed(2);
 }
 
 function sinceMsForRangeDays(rangeDays: number): number {
@@ -36,6 +47,9 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const range = ALLOWED_RANGES.has(url.searchParams.get("range") ?? "") ? url.searchParams.get("range")! : "30";
     const rangeDays = Number(range);
+    const typeParam = url.searchParams.get("type");
+    const type = typeParam === "in" || typeParam === "out" ? typeParam : "all";
+    const reviewOnly = url.searchParams.get("review") === "1";
 
     const endDate = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
     const startDateObj = new Date(`${endDate}T00:00:00Z`);
@@ -47,27 +61,34 @@ export async function GET(request: Request) {
         const inputs = await fetchRegisterMergeInputs(register.rows, sinceMsForRangeDays(rangeDays));
         const merged = mergeRegister(register.rows, inputs.expenses, inputs.receiptEvents, inputs.classifications);
 
+        // Mirror the page's own filters so the file never contains MORE ledger
+        // than the view the bookkeeper exported it from.
+        const rows = applyRegisterFilters(
+            merged.rows.map((r) => ({ ...r, needsReview: r.status === "needs-review" })),
+            { type, reviewOnly, mergeUnavailable: false },
+        );
+
         const header = [
             "Date", "Type", "Name", "Doc #", "Amount", "Status", "Status detail",
             "Receipt on file", "In ProBuild job costs", "Amount match", "Project",
             "QuickBooks txn id", "Receipt link",
         ].join(",");
 
-        const lines = merged.rows.map((r) =>
+        const lines = rows.map((r) =>
             [
-                csvField(r.date),
-                csvField(r.qbType),
-                csvField(r.name),
-                csvField(r.docNum),
-                csvField((r.amountCents / 100).toFixed(2)),
-                csvField(r.status),
-                csvField(r.label),
-                csvField(r.edges ? (r.edges.receipt === "pass" ? (r.edges.receiptUnconfirmed ? "unconfirmed" : "yes") : "no") : ""),
-                csvField(r.edges ? (r.edges.jobCost === "pass" ? "yes" : "no") : ""),
-                csvField(r.edges ? r.edges.amount : ""),
-                csvField(r.projectName),
-                csvField(r.qbTxnId),
-                csvField(r.receiptUrl),
+                csvText(r.date),
+                csvText(r.qbType),
+                csvText(r.name),
+                csvText(r.docNum),
+                csvNumber(r.amountCents / 100),
+                csvText(r.status),
+                csvText(r.label),
+                csvText(r.edges ? (r.edges.receipt === "pass" ? (r.edges.receiptUnconfirmed ? "unconfirmed" : "yes") : "no") : ""),
+                csvText(r.edges ? (r.edges.jobCost === "pass" ? "yes" : "no") : ""),
+                csvText(r.edges ? r.edges.amount : ""),
+                csvText(r.projectName),
+                csvText(r.qbTxnId),
+                csvText(r.receiptUrl),
             ].join(","),
         );
 

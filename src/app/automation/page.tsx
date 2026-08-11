@@ -456,7 +456,10 @@ export default async function AutomationPage(props: {
                         <a href={filterHref({})} className="text-xs font-medium text-hui-primary hover:underline">
                             Refresh ↻
                         </a>
-                        <a href={`/api/automation/export?range=${range}`} className="text-xs font-medium text-hui-primary hover:underline">
+                        <a
+                            href={`/api/automation/export?range=${range}&type=${type}${reviewOnly ? "&review=1" : ""}`}
+                            className="text-xs font-medium text-hui-primary hover:underline"
+                        >
                             Download CSV ⤓
                         </a>
                     </div>
