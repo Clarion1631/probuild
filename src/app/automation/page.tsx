@@ -252,14 +252,12 @@ export default async function AutomationPage(props: {
         // actually carry, pre-indexed for an O(1) lookup per row below.
         expenseByPurchaseId = drilldownExpenseByPurchaseId(mergeInputs.rawExpenses);
         reviewIssueMap = reviewIssueByPurchaseId(mergeInputs.openReviewIssues);
-        [journeyIndex, pipelineJourneyList] = await Promise.all([
-            receiptJourneysForKeys(
-                merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
-                rangeDays,
-            ),
-            receiptJourneys(rangeDays, 200),
-        ]);
 
+        // Commit the merge results BEFORE the journey fetches below: journeys
+        // are ancillary drill-down/pipeline display data, and their failure
+        // must not throw away a register merge that already succeeded (it
+        // previously flipped the page-wide `mergeUnavailable` degrade AND
+        // made this page disagree with the CSV export's filter semantics).
         mergedRows = merged.rows;
         documented = merged.counts.documented;
         receiptProvenanceUnverified = merged.counts.receiptProvenanceUnverified;
@@ -269,6 +267,20 @@ export default async function AutomationPage(props: {
         denominator = merged.counts.denominator;
         actionableOrphans = actionableOrphanReceipts(orphans);
         orphanProjectNameMap = orphanProjectNames(mergeInputs.rawReceiptEvents);
+
+        try {
+            [journeyIndex, pipelineJourneyList] = await Promise.all([
+                receiptJourneysForKeys(
+                    merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
+                    rangeDays,
+                ),
+                receiptJourneys(rangeDays, 200),
+            ]);
+        } catch (journeyError) {
+            // Drill-downs/pipeline list degrade to empty; the register itself
+            // (rows, counts, filters) stays fully live.
+            console.error("journey fetch failed", journeyError instanceof Error ? journeyError.message : "UnknownError");
+        }
     } catch (error) {
         console.error("register merge inputs failed", error instanceof Error ? error.message : "UnknownError");
         mergeUnavailable = true;

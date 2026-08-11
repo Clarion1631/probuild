@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { fetchBankRegister } from "@/lib/qbo-bank-register";
-import { mergeRegister } from "@/lib/register-merge";
+import { mergeRegister, type MergedRegisterRow } from "@/lib/register-merge";
 import { fetchRegisterMergeInputs } from "../../../automation/register-data";
 import { applyRegisterFilters } from "../../../automation/register-filters";
 
@@ -58,15 +58,39 @@ export async function GET(request: Request) {
 
     try {
         const register = await fetchBankRegister(getFreshQBTokens, startDate, endDate);
-        const inputs = await fetchRegisterMergeInputs(register.rows, sinceMsForRangeDays(rangeDays));
-        const merged = mergeRegister(register.rows, inputs.expenses, inputs.receiptEvents, inputs.classifications);
+
+        // Degrade exactly like the page does: if the merge inputs can't be
+        // fetched, emit the raw register with blank documentation columns and
+        // let every row pass the review filter (mergeUnavailable semantics in
+        // register-filters.ts) — never a 500 while the page still renders.
+        type CsvRow = Pick<MergedRegisterRow, "date" | "qbType" | "name" | "docNum" | "amountCents" | "edges" | "projectName" | "qbTxnId" | "receiptUrl"> & {
+            status: string;
+            label: string;
+            needsReview: boolean;
+        };
+        let mergedRowsForCsv: CsvRow[];
+        let mergeUnavailable = false;
+        try {
+            const inputs = await fetchRegisterMergeInputs(register.rows, sinceMsForRangeDays(rangeDays));
+            const merged = mergeRegister(register.rows, inputs.expenses, inputs.receiptEvents, inputs.classifications);
+            mergedRowsForCsv = merged.rows.map((r) => ({ ...r, needsReview: r.status === "needs-review" }));
+        } catch (mergeError) {
+            console.error("export merge inputs failed", mergeError instanceof Error ? mergeError.message : "UnknownError");
+            mergeUnavailable = true;
+            mergedRowsForCsv = register.rows.map((r) => ({
+                ...r,
+                status: "unavailable",
+                label: "documentation status unavailable",
+                edges: null,
+                projectName: null,
+                receiptUrl: null,
+                needsReview: false,
+            }));
+        }
 
         // Mirror the page's own filters so the file never contains MORE ledger
         // than the view the bookkeeper exported it from.
-        const rows = applyRegisterFilters(
-            merged.rows.map((r) => ({ ...r, needsReview: r.status === "needs-review" })),
-            { type, reviewOnly, mergeUnavailable: false },
-        );
+        const rows = applyRegisterFilters(mergedRowsForCsv, { type, reviewOnly, mergeUnavailable });
 
         const header = [
             "Date", "Type", "Name", "Doc #", "Amount", "Status", "Status detail",

@@ -186,14 +186,14 @@ function ReceiptTimelineBlock({
                 </div>
             )}
             <div className="flex items-center gap-2 mb-3">
-                <StateChip state={journey.finalState} />
+                <StateChip state={journey.finalState} unconfirmed={journeyMatch.unconfirmed} />
                 {journey.backfilled && (
                     <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500">
                         Imported history
                     </span>
                 )}
             </div>
-            <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} />
+            <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} unconfirmed={journeyMatch.unconfirmed} now={now} />
             {stale && (
                 <p className="text-xs font-medium text-red-700 mt-2">
                     Booked but not yet in ProBuild — worth a look.
@@ -230,7 +230,14 @@ function ActionsBlock({ reviewIssue }: { reviewIssue: OpenReviewIssue | null }) 
                 <button type="button" disabled title="Coming soon" className="hui-btn hui-btn-secondary text-xs px-2 py-0.5 disabled:opacity-50">
                     Ask Marge to review
                 </button>
-                <MarkReviewedButton issue={reviewIssue} />
+                {/* Keyed by the issue's full identity so a router.refresh()
+                  * that changes the issue (new generation, externally
+                  * acknowledged) remounts the button instead of leaving stale
+                  * client state claiming the wrong review status. */}
+                <MarkReviewedButton
+                    key={reviewIssue ? `${reviewIssue.id}:${reviewIssue.version}:${reviewIssue.reasonHash}:${reviewIssue.acknowledged}` : "no-issue"}
+                    issue={reviewIssue}
+                />
             </div>
         </DrilldownSection>
     );
