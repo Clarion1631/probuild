@@ -14636,3 +14636,124 @@ export async function restoreOfficeTask(id: string) {
     revalidatePath("/tasks");
     return task;
 }
+
+// ============ Permits CRUD ============
+
+const PERMIT_STATUSES = ["applied", "issued", "inspections", "closed", "expired"] as const;
+
+async function assertPermitAccess(projectId: string) {
+    const session = await getSessionOrDev();
+    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
+    if (!sessionUserId) throw new Error("Unauthorized");
+
+    const user = await prisma.user.findUnique({
+        where: { id: sessionUserId },
+        include: {
+            permissions: true,
+            projectAccess: { select: { projectId: true } },
+            assignedProjects: { select: { id: true } },
+        },
+    });
+    if (!user || user.status === "DISABLED") throw new Error("Unauthorized");
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+function parsePermitDate(value: string | undefined): Date | null | undefined {
+    if (value === undefined) return undefined;
+    if (!value) return null;
+    const parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export async function getPermits(projectId: string) {
+    await assertPermitAccess(projectId);
+    return prisma.permit.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+export async function createPermit(projectId: string, data: {
+    permitNumber: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    await assertPermitAccess(projectId);
+
+    const permitNumber = data.permitNumber?.trim();
+    if (!permitNumber) throw new Error("Permit number is required");
+
+    const status = data.status && (PERMIT_STATUSES as readonly string[]).includes(data.status)
+        ? data.status
+        : "applied";
+
+    const permit = await prisma.permit.create({
+        data: {
+            projectId,
+            permitNumber,
+            type: data.type || null,
+            status,
+            issuingAuthority: data.issuingAuthority || null,
+            issueDate: parsePermitDate(data.issueDate) ?? null,
+            expirationDate: parsePermitDate(data.expirationDate) ?? null,
+            notes: data.notes || null,
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/permits`);
+    return permit;
+}
+
+export async function updatePermit(permitId: string, data: {
+    permitNumber?: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    const updateData: any = {};
+    if (data.permitNumber !== undefined) {
+        const permitNumber = data.permitNumber.trim();
+        if (!permitNumber) throw new Error("Permit number is required");
+        updateData.permitNumber = permitNumber;
+    }
+    if (data.type !== undefined) updateData.type = data.type || null;
+    if (data.status !== undefined) {
+        updateData.status = (PERMIT_STATUSES as readonly string[]).includes(data.status)
+            ? data.status
+            : "applied";
+    }
+    if (data.issuingAuthority !== undefined) updateData.issuingAuthority = data.issuingAuthority || null;
+    if (data.issueDate !== undefined) updateData.issueDate = parsePermitDate(data.issueDate);
+    if (data.expirationDate !== undefined) updateData.expirationDate = parsePermitDate(data.expirationDate);
+    if (data.notes !== undefined) updateData.notes = data.notes || null;
+
+    const permit = await prisma.permit.update({
+        where: { id: permitId },
+        data: updateData,
+    });
+
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return permit;
+}
+
+export async function deletePermit(permitId: string) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    await prisma.permit.delete({ where: { id: permitId } });
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return { success: true };
+}

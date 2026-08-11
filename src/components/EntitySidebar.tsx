@@ -82,6 +82,7 @@ export default function EntitySidebar({
                     { label: "Tasks & Punchlist", href: `/projects/${id}/tasks` },
                     { label: "Client Dashboard", href: `/projects/${id}/client-portal` },
                     { label: "Daily Logs", href: `/projects/${id}/dailylogs`, permission: "dailyLogs" },
+                    { label: "Permits", href: `/projects/${id}/permits` },
                     { label: "Time & Expenses", href: `/projects/${id}/time-expenses`, permission: "timeClock" },
                     { label: "Project Settings", href: `/projects/${id}/settings` },
                 ],
