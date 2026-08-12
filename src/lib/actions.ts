@@ -38,6 +38,9 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import { getQBPurchaseSyncToken } from "./quickbooks";
+import { getFreshQBTokens, QBNotConnectedError } from "./quickbooks-payments";
+import { markPurchaseReviewedCore, type MarkPurchaseReviewedResult } from "./purchase-review";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -14050,6 +14053,40 @@ export async function restoreEstimateItemAssociations({
     }));
 
     revalidatePath(`/projects/${projectId}/estimates`);
+    return result;
+}
+
+// ── Vanessa review loop (docs/plans/vanessa-review-loop-plan.md, Goal 2b) ──
+// Core SyncToken-fencing + no-op-on-duplicate logic lives in
+// src/lib/purchase-review.ts (unit-tested there) — this wrapper owns only
+// what a server action must own itself: the financialReports permission gate
+// and deriving the reviewer's identity from the session (never the client
+// payload).
+
+export async function markPurchaseReviewed(
+    qboPurchaseId: string,
+    expectedSyncToken: string,
+): Promise<MarkPurchaseReviewedResult> {
+    const user = await assertStaffPermission("financialReports");
+
+    let tokens;
+    try {
+        tokens = await getFreshQBTokens();
+    } catch (error) {
+        if (error instanceof QBNotConnectedError) throw error;
+        throw new Error("Could not reach QuickBooks to verify this purchase — try again");
+    }
+
+    const result = await markPurchaseReviewedCore(
+        {
+            client: prisma.purchaseReview,
+            getCurrentSyncToken: (id) => getQBPurchaseSyncToken(tokens, id),
+        },
+        { id: user.id, name: user.name?.trim() || user.email },
+        qboPurchaseId,
+        expectedSyncToken,
+    );
+    if (result.ok) revalidatePath("/automation");
     return result;
 }
 

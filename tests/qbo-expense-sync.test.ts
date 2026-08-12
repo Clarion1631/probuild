@@ -64,7 +64,9 @@ test("normalizes a posted QBO purchase into stable import fields", () => {
 
     assert.deepEqual(result, {
         kind: "purchase",
-        purchase: { ...PURCHASE, syncToken: "3" },
+        // MetaData.CreateTime wasn't in the raw fixture above, so it normalizes
+        // to null — never fabricated.
+        purchase: { ...PURCHASE, syncToken: "3", createTime: null },
     });
 });
 

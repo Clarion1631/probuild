@@ -683,6 +683,45 @@ export async function getQBPurchasesSince(tokens: QBTokens, since: Date, until?:
 }
 
 /**
+ * Read QBO Purchase rows POSTED within [startUtc, endUtc] by MetaData.CreateTime
+ * — not TxnDate. Powers the Vanessa digest (Goal 1): a backdated paper receipt
+ * can carry an earlier transaction date but must still show up in the digest
+ * for the day it was actually booked. Same STARTPOSITION-only pagination as
+ * scripts/backfill-automation-events.mjs, which already relies on this exact
+ * filter working against QBO.
+ */
+export async function getQBPurchasesCreatedBetween(tokens: QBTokens, startUtc: Date, endUtc: Date): Promise<any[]> {
+    if (!Number.isFinite(startUtc.getTime()) || !Number.isFinite(endUtc.getTime())) {
+        throw new Error("QBO purchase CreateTime query requires valid start/end dates");
+    }
+    const startIso = startUtc.toISOString();
+    const endIso = endUtc.toISOString();
+    const pageSize = 1000;
+    const purchases: any[] = [];
+
+    for (let startPosition = 1; ; startPosition += pageSize) {
+        const page = await qbQuery<any>(
+            tokens,
+            `SELECT * FROM Purchase WHERE MetaData.CreateTime >= '${startIso}' AND MetaData.CreateTime <= '${endIso}' STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`,
+        );
+        purchases.push(...page);
+        if (page.length < pageSize) break;
+    }
+
+    return purchases;
+}
+
+/** Current SyncToken for one Purchase, or null if it no longer exists — used
+ * by markPurchaseReviewed to reject a review against a stale rendered version. */
+export async function getQBPurchaseSyncToken(tokens: QBTokens, qbPurchaseId: string): Promise<string | null> {
+    const rows = await qbQuery<{ Id: string; SyncToken?: string }>(
+        tokens,
+        `SELECT Id, SyncToken FROM Purchase WHERE Id = '${escapeQBString(qbPurchaseId)}'`,
+    );
+    return rows[0]?.SyncToken ?? null;
+}
+
+/**
  * Read Purchase rows changed since a timestamp using QBO Change Data Capture.
  * Unlike a TxnDate query, CDC catches newly entered backdated purchases,
  * corrections, voids, refunds, and deletion tombstones. QBO caps CDC lookback

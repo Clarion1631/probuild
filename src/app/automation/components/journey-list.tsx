@@ -1,9 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import type { FixSuggestion } from "@/lib/automation-suggestions";
+import { markPurchaseReviewed } from "@/lib/actions";
 import { formatRelativeTime } from "./format";
 
 /** Same shape as `JourneyStep` in @/lib/automation-events, but with `at`
@@ -47,6 +49,20 @@ export interface SerializedJourney {
         vendor: string | null;
         receiptUrl: string | null;
         syncedAt: string;
+        /** Last-known SyncToken — what a "Mark reviewed" click is stamped against. */
+        qbSyncToken: string | null;
+        /** QBO's own MetaData.CreateTime — null until the sync or the backfill
+         * script fills it in ("not captured" in the timeline, never fabricated). */
+        qboCreateTime: string | null;
+    } | null;
+    /** Latest human review stamp (Goal 2b) — separate from AI/ai-review and
+     * from the older ReviewIssue acknowledgements, which only cover flagged
+     * problems. Null when nobody has reviewed this purchase yet. */
+    review: {
+        reviewerName: string;
+        reviewedAt: string;
+        /** True when the purchase changed in QBO after this review was stamped. */
+        staleSyncToken: boolean;
     } | null;
 }
 
@@ -722,6 +738,138 @@ function QbPurchaseLink({ qbPurchaseId }: { qbPurchaseId: string }) {
     );
 }
 
+// ── Audit timeline (Goal 2) ──────────────────────────────────────────────
+// Four honestly-labeled steps built from data that already exists — never a
+// fabricated timestamp. "not captured" when the underlying event/column is
+// absent, exactly per docs/plans/vanessa-review-loop-plan.md. There is
+// deliberately no bank-feed matched/pending step: the current GL-based
+// source can't observe that state (src/lib/qbo-bank-register.ts) — the ops
+// guide tells Vanessa to check the bank feed in QBO directly.
+
+function driveFileUrl(fileId: string): string {
+    return `https://drive.google.com/file/d/${fileId}/view`;
+}
+
+function TimelineStep({ label, when, children }: { label: string; when: string | null; children: ReactNode }) {
+    return (
+        <div className="flex items-start gap-3">
+            <span className="w-5 h-5 rounded-full bg-slate-100 text-slate-500 flex items-center justify-center text-xs shrink-0">
+                •
+            </span>
+            <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-hui-textMain">{label}</p>
+                <div className="text-sm text-hui-textMuted mt-0.5">{children}</div>
+            </div>
+            <span
+                className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
+                title={when ? new Date(when).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }) : undefined}
+            >
+                {when ? formatRelativeTime(new Date(when)) : "not captured"}
+            </span>
+        </div>
+    );
+}
+
+function MarkReviewedButton({ qbPurchaseId, expectedSyncToken }: { qbPurchaseId: string; expectedSyncToken: string }) {
+    const [pending, setPending] = useState(false);
+    const router = useRouter();
+
+    async function handleClick() {
+        setPending(true);
+        try {
+            const result = await markPurchaseReviewed(qbPurchaseId, expectedSyncToken);
+            if (result.ok) {
+                toast.success(`Marked reviewed by ${result.reviewerName}`);
+                router.refresh();
+            } else if (result.reason === "stale-sync-token") {
+                toast.error("This purchase changed in QuickBooks since it was shown here — refresh the page and re-review.");
+            } else {
+                toast.error("This purchase no longer exists in QuickBooks.");
+            }
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "Couldn't mark reviewed — try again");
+        } finally {
+            setPending(false);
+        }
+    }
+
+    return (
+        <button
+            type="button"
+            onClick={handleClick}
+            disabled={pending}
+            className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
+        >
+            {pending ? "Marking…" : "Mark reviewed"}
+        </button>
+    );
+}
+
+function AuditTimeline({ journey }: { journey: SerializedJourney }) {
+    const intakeStep = journey.steps.find((s) => s.stage === "intake") ?? null;
+    const readStep = journey.steps.find((s) => s.stage === "read") ?? null;
+    const canReview = Boolean(journey.qbPurchaseId && journey.synced?.qbSyncToken);
+
+    return (
+        <div className="space-y-3 pl-1">
+            <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Audit timeline</p>
+
+            <TimelineStep label="Drive intake" when={intakeStep?.at ?? null}>
+                {journey.fileName || journey.driveFileId ? (
+                    <>
+                        {journey.fileName ?? "Receipt file"}
+                        {journey.driveFileId && (
+                            <>
+                                {" · "}
+                                <a
+                                    href={driveFileUrl(journey.driveFileId)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-hui-primary hover:underline"
+                                >
+                                    Open in Drive
+                                </a>
+                            </>
+                        )}
+                    </>
+                ) : (
+                    "not captured"
+                )}
+            </TimelineStep>
+
+            <TimelineStep label="Bot read" when={readStep?.at ?? null}>
+                {readStep ? (
+                    <>
+                        {journey.vendor ?? "—"} · {journey.amountCents != null ? formatCurrency(journey.amountCents / 100) : "—"} ·{" "}
+                        {journey.projectName ?? "—"}
+                    </>
+                ) : (
+                    "not captured"
+                )}
+            </TimelineStep>
+
+            <TimelineStep label="QBO Purchase" when={journey.synced?.qboCreateTime ?? null}>
+                {journey.qbPurchaseId ? <QbPurchaseLink qbPurchaseId={journey.qbPurchaseId} /> : "not captured"}
+            </TimelineStep>
+
+            <TimelineStep label="Reviewed" when={journey.review?.reviewedAt ?? null}>
+                {journey.review ? (
+                    <>
+                        {journey.review.reviewerName}
+                        {journey.review.staleSyncToken && (
+                            <span className="ml-1.5 text-amber-700 font-medium">— changed after review</span>
+                        )}
+                    </>
+                ) : canReview ? (
+                    <MarkReviewedButton qbPurchaseId={journey.qbPurchaseId!} expectedSyncToken={journey.synced!.qbSyncToken!} />
+                ) : (
+                    "Not yet reviewable — waiting on the next QuickBooks sync"
+                )}
+            </TimelineStep>
+        </div>
+    );
+}
+
 function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; suggestion: FixSuggestion | null }) {
     const [isOpen, setIsOpen] = useState(false);
 
@@ -770,42 +918,45 @@ function JourneyRow({ journey, suggestion }: { journey: SerializedJourney; sugge
                 <div className="px-4 pb-4 space-y-4">
                     <ValidationPanel journey={journey} />
 
-                    <div className="space-y-2 pl-1">
-                        {journey.steps.map((step, i) => (
-                            <div key={i} className="flex items-start gap-3">
-                                <StepIcon status={step.status} />
-                                <div className="flex-1 min-w-0">
-                                    <p className="text-sm text-hui-textMain">
-                                        <span className="font-medium">{humanizeStage(step.stage)}</span>
-                                        {" — "}
-                                        {step.status}
-                                        {step.reason ? ` — ${step.reason}` : ""}
-                                    </p>
+                    <AuditTimeline journey={journey} />
+
+                    <div>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider mb-2">Full activity log</p>
+                        <div className="space-y-2 pl-1">
+                            {journey.steps.map((step, i) => (
+                                <div key={i} className="flex items-start gap-3">
+                                    <StepIcon status={step.status} />
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm text-hui-textMain">
+                                            <span className="font-medium">{humanizeStage(step.stage)}</span>
+                                            {" — "}
+                                            {step.status}
+                                            {step.reason ? ` — ${step.reason}` : ""}
+                                        </p>
+                                    </div>
+                                    <span
+                                        className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
+                                        title={new Date(step.at).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                                    >
+                                        {formatRelativeTime(new Date(step.at))}
+                                    </span>
                                 </div>
-                                <span
-                                    className="text-xs text-hui-textMuted whitespace-nowrap shrink-0"
-                                    title={new Date(step.at).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
-                                >
-                                    {formatRelativeTime(new Date(step.at))}
-                                </span>
-                            </div>
-                        ))}
-                        {showPendingSync && (
-                            <div className="flex items-start gap-3 opacity-50">
-                                <span className="w-5 h-5 rounded-full bg-slate-200 flex items-center justify-center text-xs shrink-0">
-                                    ○
-                                </span>
-                                <div className="flex-1 min-w-0">
-                                    <p className="text-sm text-hui-textMain">Waiting for the 4-hour sync</p>
+                            ))}
+                            {showPendingSync && (
+                                <div className="flex items-start gap-3 opacity-50">
+                                    <span className="w-5 h-5 rounded-full bg-slate-200 flex items-center justify-center text-xs shrink-0">
+                                        ○
+                                    </span>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm text-hui-textMain">Waiting for the 4-hour sync</p>
+                                    </div>
+                                    <span className="text-xs text-hui-textMuted whitespace-nowrap shrink-0">pending</span>
                                 </div>
-                                <span className="text-xs text-hui-textMuted whitespace-nowrap shrink-0">pending</span>
-                            </div>
-                        )}
+                            )}
+                        </div>
                     </div>
 
                     {suggestion && <SuggestionCard suggestion={suggestion} />}
-
-                    {journey.qbPurchaseId && <QbPurchaseLink qbPurchaseId={journey.qbPurchaseId} />}
                 </div>
             )}
         </div>

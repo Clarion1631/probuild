@@ -20,6 +20,11 @@ export interface QboPurchaseForImport {
     customerId: string | null;
     accountName: string | null;
     memo: string | null;
+    /** QBO's MetaData.CreateTime (ISO string) — when the Purchase was actually
+     * posted in QuickBooks. Null/omitted when QBO didn't return it (shouldn't
+     * happen in practice, but never fabricated). Optional so existing test
+     * fixtures built before this field existed keep compiling. */
+    createTime?: string | null;
     /** Expense line detail so imports carry "what was bought", not just a total. */
     lines?: QboPurchaseLineDetail[];
     /** True when every monetary line is an equity/distribution account — an owner draw, not a business expense. */
@@ -95,6 +100,7 @@ type RawQboPurchase = {
     Line?: unknown;
     Credit?: unknown;
     status?: unknown;
+    MetaData?: { CreateTime?: unknown };
 };
 
 function optionalString(value: unknown): string | null {
@@ -318,6 +324,7 @@ export function normalizeQboPurchase(raw: unknown): QboPurchaseNormalizationResu
             customerId: optionalString(customerReference?.value),
             accountName: optionalString(purchase.AccountRef?.name),
             memo: optionalString(purchase.PrivateNote),
+            createTime: optionalString(purchase.MetaData?.CreateTime),
             lines: lineDetails,
             isEquityDraw: monetaryLineCount > 0 && equityLineCount === monetaryLineCount,
         },
@@ -492,6 +499,12 @@ export interface QboExpenseWrite {
     date: Date | null;
     description: string;
     status: "Reviewed";
+    // Optional (not `| undefined` in the DB, just in this write shape): tests
+    // and other callers that predate qboCreateTime can omit it — Prisma
+    // leaves the column untouched on update, and defaults to null on create.
+    // Real sync callers always provide it (possibly null when QBO didn't
+    // return MetaData.CreateTime).
+    qboCreateTime?: Date | null;
 }
 
 type ExpenseTransaction = {
@@ -509,6 +522,10 @@ type ExpenseTransaction = {
             date: Date | null;
             description: string | null;
             status: string;
+            // Optional: fake ExpenseTransaction clients built before this column
+            // existed (existing tests) don't return it — treated as "unknown",
+            // never as a mismatch against a write that also omits it.
+            qboCreateTime?: Date | null;
         } | null>;
         create(args: {
             data: QboExpenseWrite;
@@ -537,7 +554,7 @@ function isIncomingQboSyncTokenCurrent(current: string | null, incoming: string)
     return true;
 }
 
-function datesEqual(left: Date | null, right: Date | null): boolean {
+function datesEqual(left: Date | null | undefined, right: Date | null | undefined): boolean {
     return left?.getTime() === right?.getTime();
 }
 
@@ -546,6 +563,12 @@ function expenseMatchesQboWrite(
     write: QboExpenseWrite,
 ): boolean {
     if (!existing) return false;
+    // qboCreateTime is compared only when the caller actually provides it —
+    // callers/tests that predate the column (write.qboCreateTime undefined)
+    // must not be treated as "changed" forever just because the DB column
+    // reads null.
+    const createTimeMatches =
+        write.qboCreateTime === undefined || datesEqual(existing.qboCreateTime, write.qboCreateTime);
     return (
         existing.qbSyncToken === write.qbSyncToken &&
         existing.estimateId === write.estimateId &&
@@ -553,7 +576,8 @@ function expenseMatchesQboWrite(
         existing.vendor === write.vendor &&
         datesEqual(existing.date, write.date) &&
         existing.description === write.description &&
-        existing.status === write.status
+        existing.status === write.status &&
+        createTimeMatches
     );
 }
 
@@ -591,6 +615,7 @@ export async function upsertQboExpense(
                 date: true,
                 description: true,
                 status: true,
+                qboCreateTime: true,
             },
         });
         if (
@@ -789,6 +814,13 @@ function qboTransactionDate(txnDate: string | null): Date | null {
     return Number.isFinite(parsed.getTime()) ? parsed : null;
 }
 
+/** QBO's MetaData.CreateTime, parsed and validated — never a fabricated fallback. */
+function qboCreateTimeDate(createTime: string | null | undefined): Date | null {
+    if (!createTime) return null;
+    const parsed = new Date(createTime);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
 /**
  * Import finalized QBO money-out transactions for currently in-progress jobs.
  * External QBO reads and project loading happen before the short per-row
@@ -883,6 +915,7 @@ export async function syncQboExpenses(
                     date: qboTransactionDate(purchase.txnDate),
                     description: qboExpenseDescription(purchase, "[Overhead]"),
                     status: "Reviewed",
+                    qboCreateTime: qboCreateTimeDate(purchase.createTime),
                 });
                 if (outcome === "imported") result.imported += 1;
                 if (outcome === "updated") result.updated += 1;
@@ -929,6 +962,7 @@ export async function syncQboExpenses(
             date: qboTransactionDate(purchase.txnDate),
             description: qboExpenseDescription(purchase),
             status: "Reviewed",
+            qboCreateTime: qboCreateTimeDate(purchase.createTime),
         });
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;

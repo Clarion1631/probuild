@@ -7,6 +7,7 @@ import {
     receiptDailyBuckets,
     recentAutomationEvents,
     receiptJourneys,
+    findLatestPurchaseReviews,
     type ReceiptJourney,
 } from "@/lib/automation-events";
 import { suggestFix, type FixSuggestion } from "@/lib/automation-suggestions";
@@ -152,7 +153,10 @@ function SyncStatusPill({ status }: { status: string }) {
 
 // ── Journey serialization ───────────────────────────────────────────────────
 
-function serializeJourney(j: ReceiptJourney): SerializedJourney {
+function serializeJourney(
+    j: ReceiptJourney,
+    review: { reviewerName: string; reviewedAt: Date; qboSyncToken: string } | null,
+): SerializedJourney {
     return {
         docNumber: j.docNumber,
         fileName: j.fileName,
@@ -185,6 +189,18 @@ function serializeJourney(j: ReceiptJourney): SerializedJourney {
                   vendor: j.synced.vendor,
                   receiptUrl: j.synced.receiptUrl,
                   syncedAt: j.synced.syncedAt.toISOString(),
+                  qbSyncToken: j.synced.qbSyncToken,
+                  qboCreateTime: j.synced.qboCreateTime ? j.synced.qboCreateTime.toISOString() : null,
+              }
+            : null,
+        review: review
+            ? {
+                  reviewerName: review.reviewerName,
+                  reviewedAt: review.reviewedAt.toISOString(),
+                  // Honest per the plan: if the version we last synced from QBO no
+                  // longer matches what was stamped, the purchase changed after
+                  // review — never silently show a stale review as current.
+                  staleSyncToken: j.synced?.qbSyncToken != null && review.qboSyncToken !== j.synced.qbSyncToken,
               }
             : null,
     };
@@ -208,6 +224,9 @@ export default async function AutomationPage() {
         pauseStates(),
     ]);
 
+    const reviewedPurchaseIds = journeys.map((j) => j.qbPurchaseId).filter((id): id is string => !!id);
+    const reviews = await findLatestPurchaseReviews(reviewedPurchaseIds);
+
     const chartEmpty = buckets.every((b) => b.created === 0 && b.fallback === 0 && b.error === 0);
 
     // "≈4 minutes of manual entry" per receipt is a rough, admittedly-fuzzy
@@ -221,7 +240,7 @@ export default async function AutomationPage() {
 
     const lastSyncCounts = summary.lastSync ? parseSyncCounts(summary.lastSync.detail) : null;
 
-    const serializedJourneys = journeys.map(serializeJourney);
+    const serializedJourneys = journeys.map((j) => serializeJourney(j, (j.qbPurchaseId && reviews.get(j.qbPurchaseId)) || null));
     const suggestions: Record<string, FixSuggestion | null> = {};
     for (const j of journeys) {
         const suggestion = suggestFix(j);

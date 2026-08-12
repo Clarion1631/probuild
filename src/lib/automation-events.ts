@@ -227,6 +227,12 @@ export interface ReceiptJourney {
         vendor: string | null;
         receiptUrl: string | null;
         syncedAt: Date;
+        /** Last-known SyncToken from the sync — the version the audit timeline's
+         * "QBO Purchase" step renders, and what a review is stamped against. */
+        qbSyncToken: string | null;
+        /** QBO's own MetaData.CreateTime for the Purchase — null until the sync
+         * or the backfill script (scripts/backfill-qbo-create-time.mjs) fills it in. */
+        qboCreateTime: Date | null;
     } | null;
 }
 
@@ -342,6 +348,8 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 vendor: true,
                 receiptUrl: true,
                 qbSyncedAt: true,
+                qbSyncToken: true,
+                qboCreateTime: true,
                 createdAt: true,
                 // Expense hangs off the ESTIMATE, not the project directly.
                 estimate: { select: { project: { select: { id: true, name: true } } } },
@@ -366,6 +374,8 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                     vendor: exp.vendor ?? null,
                     receiptUrl: exp.receiptUrl ?? null,
                     syncedAt,
+                    qbSyncToken: exp.qbSyncToken ?? null,
+                    qboCreateTime: exp.qboCreateTime ?? null,
                 };
                 // The expense records when the sync actually landed it — never
                 // fabricate the step time from unrelated event timestamps.
@@ -377,4 +387,38 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
     return [...byDoc.values()]
         .sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime())
         .slice(0, Math.min(Math.max(maxReceipts, 1), 200));
+}
+
+// ── Review stamps (Goal 2b — src/lib/actions.ts's markPurchaseReviewed) ─────
+
+export interface LatestPurchaseReview {
+    reviewerName: string;
+    reviewedAt: Date;
+    /** The SyncToken this review was stamped against — compare against the
+     * purchase's current known SyncToken to detect "changed after review". */
+    qboSyncToken: string;
+}
+
+/** Most recent review per QBO Purchase id, for the audit timeline's
+ * "Reviewed" step. A purchase can have several rows (re-reviewed after QBO
+ * changed it) — only the latest is shown; older rows stay in the table. */
+export async function findLatestPurchaseReviews(
+    qbPurchaseIds: string[],
+): Promise<Map<string, LatestPurchaseReview>> {
+    if (qbPurchaseIds.length === 0) return new Map();
+    const rows = await prisma.purchaseReview.findMany({
+        where: { qboPurchaseId: { in: qbPurchaseIds } },
+        orderBy: { reviewedAt: "asc" },
+        select: { qboPurchaseId: true, qboSyncToken: true, reviewerName: true, reviewedAt: true },
+    });
+    const byPurchase = new Map<string, LatestPurchaseReview>();
+    for (const row of rows) {
+        // Ascending order + overwrite means the LAST write per key is the newest.
+        byPurchase.set(row.qboPurchaseId, {
+            reviewerName: row.reviewerName,
+            reviewedAt: row.reviewedAt,
+            qboSyncToken: row.qboSyncToken,
+        });
+    }
+    return byPurchase;
 }
