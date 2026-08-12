@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GET } from "../src/app/api/automation/digest/route";
+import { GET, digestResultResponse } from "../src/app/api/automation/digest/route";
+import type { DigestTickResult } from "../src/lib/automation-digest";
 
 /** Snapshot + restore the env vars this route reads, so tests never leak
  * state into each other or the rest of the suite. */
@@ -91,4 +92,26 @@ test("GET never returns a silent 200 when recipients are misconfigured, even in 
             assert.equal(response.status, 500);
         },
     );
+});
+
+// ── digestResultResponse: never a silent 200 on a genuine delivery failure ──
+
+test("digestResultResponse returns 500 for an ok:false result (delivery genuinely failed this tick)", async () => {
+    const result: DigestTickResult = { ok: false, digestDate: "2026-08-10", attempts: 3, error: "Resend reported failure sending the digest" };
+    const response = digestResultResponse(result);
+    assert.equal(response.status, 500);
+    assert.deepEqual(await response.json(), result);
+});
+
+test("digestResultResponse returns 200 for an ok:true sent result", async () => {
+    const result: DigestTickResult = { ok: true, sent: true, digestDate: "2026-08-10", rowCount: 2 };
+    const response = digestResultResponse(result);
+    assert.equal(response.status, 200);
+});
+
+test("digestResultResponse returns 200 for a benign skip (before-send-window / already-sent / in-flight)", async () => {
+    for (const skipped of ["before-send-window", "already-sent", "in-flight", "terminal-failed"] as const) {
+        const response = digestResultResponse({ ok: true, skipped });
+        assert.equal(response.status, 200);
+    }
 });

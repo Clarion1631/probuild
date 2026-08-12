@@ -16,6 +16,11 @@ export interface SerializedJourneyStep {
     status: string;
     reason: string | null;
     detail: string | null;
+    /** This event's OWN vendor/amount/project — not the journey-wide value,
+     * which later events overwrite. */
+    vendor: string | null;
+    amountCents: number | null;
+    projectName: string | null;
 }
 
 /** Same shape as `ReceiptJourney`, with all Date fields serialized to ISO
@@ -770,7 +775,16 @@ function TimelineStep({ label, when, children }: { label: string; when: string |
     );
 }
 
-function MarkReviewedButton({ qbPurchaseId, expectedSyncToken }: { qbPurchaseId: string; expectedSyncToken: string }) {
+function MarkReviewedButton({
+    qbPurchaseId,
+    expectedSyncToken,
+    label = "Mark reviewed",
+}: {
+    qbPurchaseId: string;
+    expectedSyncToken: string;
+    /** "Re-review" when re-stamping a purchase that changed after an earlier review. */
+    label?: string;
+}) {
     const [pending, setPending] = useState(false);
     const router = useRouter();
 
@@ -800,12 +814,15 @@ function MarkReviewedButton({ qbPurchaseId, expectedSyncToken }: { qbPurchaseId:
             disabled={pending}
             className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
         >
-            {pending ? "Marking…" : "Mark reviewed"}
+            {pending ? "Marking…" : label}
         </button>
     );
 }
 
-function AuditTimeline({ journey }: { journey: SerializedJourney }) {
+/** Exported (in addition to being used inline by JourneyRow) so it can be
+ * unit-tested directly — JourneyRow only renders it once a row is expanded,
+ * which a static server render can't simulate. */
+export function AuditTimeline({ journey }: { journey: SerializedJourney }) {
     const intakeStep = journey.steps.find((s) => s.stage === "intake") ?? null;
     const readStep = journey.steps.find((s) => s.stage === "read") ?? null;
     const canReview = Boolean(journey.qbPurchaseId && journey.synced?.qbSyncToken);
@@ -840,8 +857,8 @@ function AuditTimeline({ journey }: { journey: SerializedJourney }) {
             <TimelineStep label="Bot read" when={readStep?.at ?? null}>
                 {readStep ? (
                     <>
-                        {journey.vendor ?? "—"} · {journey.amountCents != null ? formatCurrency(journey.amountCents / 100) : "—"} ·{" "}
-                        {journey.projectName ?? "—"}
+                        {readStep.vendor ?? "—"} · {readStep.amountCents != null ? formatCurrency(readStep.amountCents / 100) : "—"} ·{" "}
+                        {readStep.projectName ?? "—"}
                     </>
                 ) : (
                     "not captured"
@@ -854,12 +871,21 @@ function AuditTimeline({ journey }: { journey: SerializedJourney }) {
 
             <TimelineStep label="Reviewed" when={journey.review?.reviewedAt ?? null}>
                 {journey.review ? (
-                    <>
-                        {journey.review.reviewerName}
-                        {journey.review.staleSyncToken && (
-                            <span className="ml-1.5 text-amber-700 font-medium">— changed after review</span>
+                    <div className="space-y-1.5">
+                        <p>
+                            {journey.review.reviewerName}
+                            {journey.review.staleSyncToken && (
+                                <span className="ml-1.5 text-amber-700 font-medium">— changed after review</span>
+                            )}
+                        </p>
+                        {journey.review.staleSyncToken && canReview && (
+                            <MarkReviewedButton
+                                qbPurchaseId={journey.qbPurchaseId!}
+                                expectedSyncToken={journey.synced!.qbSyncToken!}
+                                label="Re-review"
+                            />
                         )}
-                    </>
+                    </div>
                 ) : canReview ? (
                     <MarkReviewedButton qbPurchaseId={journey.qbPurchaseId!} expectedSyncToken={journey.synced!.qbSyncToken!} />
                 ) : (

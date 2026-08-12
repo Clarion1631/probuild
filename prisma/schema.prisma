@@ -2309,6 +2309,14 @@ model DigestRun {
   attempts       Int      @default(0)
   claimToken     String // fencing token for the current/last claim
   leaseExpiresAt DateTime // PROCESSING claims past this are considered stale and stealable
+  // Once status="FAILED" and attempts hit MAX_DIGEST_ATTEMPTS the date is
+  // terminal (claimDigestRun refuses further claims) — alertSent tracks
+  // whether the terminal-failure alert itself was actually delivered, so a
+  // rejected Resend call for the ALERT keeps retrying on later hourly ticks
+  // instead of being sent at most once. lastError is persisted so a later
+  // retry tick can still report a meaningful message.
+  alertSent      Boolean  @default(false)
+  lastError      String?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 }

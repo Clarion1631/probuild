@@ -187,6 +187,13 @@ export interface JourneyStep {
     status: string;
     reason: string | null;
     detail: string | null;
+    /** This EVENT's own vendor/amount/project, as logged at the time — NOT
+     * the journey-wide value below, which later events overwrite. The "Bot
+     * read" audit-timeline step needs what was actually read at read time,
+     * not whatever the LAST event (e.g. the QBO push) happened to carry. */
+    vendor: string | null;
+    amountCents: number | null;
+    projectName: string | null;
 }
 
 export interface ReceiptJourney {
@@ -322,6 +329,9 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
             status: e.status,
             reason: e.reason,
             detail: e.detail,
+            vendor: e.vendor,
+            amountCents: e.amountCents,
+            projectName: e.projectName,
         });
     }
 
@@ -379,7 +389,10 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
                 };
                 // The expense records when the sync actually landed it — never
                 // fabricate the step time from unrelated event timestamps.
-                j.steps.push({ at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null });
+                j.steps.push({
+                    at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null,
+                    vendor: exp.vendor ?? null, amountCents: j.synced.amountCents, projectName: j.synced.projectName,
+                });
             }
         }
     }

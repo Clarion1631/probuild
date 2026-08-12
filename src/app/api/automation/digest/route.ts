@@ -1,8 +1,19 @@
 import { NextResponse } from "next/server";
-import { runDigestTick, createDefaultDigestDeps } from "@/lib/automation-digest";
+import { runDigestTick, createDefaultDigestDeps, type DigestTickResult } from "@/lib/automation-digest";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
+
+/**
+ * Maps a digest tick's outcome to the HTTP response — pulled out as its own
+ * function so the "never a silent 200 on failure" rule is unit-testable
+ * without exercising the real QBO/DB-backed deps. ok:true (sent, or a benign
+ * skip like before-send-window/already-sent/in-flight) is 200; ok:false
+ * (delivery genuinely failed this tick) is 500.
+ */
+export function digestResultResponse(result: DigestTickResult): Response {
+    return NextResponse.json(result, { status: result.ok ? 200 : 500 });
+}
 
 /**
  * Hourly cron: sends Vanessa the "posted yesterday" QuickBooks expense digest
@@ -35,5 +46,5 @@ export async function GET(request: Request) {
     } else if ("sent" in result) {
         console.log("[cron/automation-digest]", JSON.stringify(result));
     }
-    return NextResponse.json(result);
+    return digestResultResponse(result);
 }

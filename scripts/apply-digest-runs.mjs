@@ -31,10 +31,15 @@ const statements = [
      "attempts"       INTEGER NOT NULL DEFAULT 0,
      "claimToken"     TEXT NOT NULL,
      "leaseExpiresAt" TIMESTAMP(3) NOT NULL,
+     "alertSent"      BOOLEAN NOT NULL DEFAULT false,
+     "lastError"      TEXT,
      "createdAt"      TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
      "updatedAt"      TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
      CONSTRAINT "DigestRun_pkey" PRIMARY KEY ("id")
    )`,
+  // Re-runnable on a table created by an earlier version of this script.
+  `ALTER TABLE "DigestRun" ADD COLUMN IF NOT EXISTS "alertSent" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "DigestRun" ADD COLUMN IF NOT EXISTS "lastError" TEXT`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "DigestRun_digestDate_key" ON "DigestRun"("digestDate")`,
   // Server-only table accessed exclusively through Prisma with the service
   // role (which bypasses RLS) — same treatment as AutomationEvent.

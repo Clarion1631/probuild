@@ -119,12 +119,21 @@ export interface DigestRunRow {
     attempts: number;
     claimToken: string;
     leaseExpiresAt: Date;
+    /** Whether the terminal-failure alert (distinct from the digest itself)
+     * has actually been delivered — only flips true after a real send success. */
+    alertSent: boolean;
+    /** Persisted so a LATER retry tick can still report a meaningful message,
+     * even though the original in-memory error is long gone. */
+    lastError: string | null;
 }
 
 /** Minimal shape of the Prisma DigestRun delegate this module needs — lets
  * tests inject an in-memory fake instead of a live database. */
 export interface DigestRunClient {
     findUnique(args: { where: { digestDate: string } }): Promise<DigestRunRow | null>;
+    /** Used to find a terminally-FAILED date whose alert hasn't landed yet —
+     * that date may not be "yesterday" anymore by the time a later tick runs. */
+    findFirst(args: { where: Record<string, unknown> }): Promise<DigestRunRow | null>;
     create(args: { data: { digestDate: string; status: string; attempts: number; claimToken: string; leaseExpiresAt: Date } }): Promise<DigestRunRow>;
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
 }
@@ -190,18 +199,50 @@ export async function claimDigestRun(
 
 /** Fenced write of the terminal outcome. Returns false (no-op) when this
  * worker's claimToken no longer matches — its lease was taken over and it
- * must not stomp on the new worker's result. */
+ * must not stomp on the new worker's result. `lastError` is persisted on a
+ * FAILED write so a LATER tick's terminal-alert retry can still report a
+ * meaningful message once the in-memory error from this attempt is gone. */
 export async function finalizeDigestRun(
     client: DigestRunClient,
     digestDate: string,
     claimToken: string,
     status: "SENT" | "FAILED",
+    lastError?: string,
 ): Promise<boolean> {
+    const data: Record<string, unknown> = { status };
+    if (status === "FAILED" && lastError !== undefined) data.lastError = lastError;
     const result = await client.updateMany({
         where: { digestDate, status: "PROCESSING", claimToken },
-        data: { status },
+        data,
     });
     return result.count === 1;
+}
+
+/**
+ * Send the terminal-failure alert for one already-FAILED, already-terminal
+ * DigestRun row, and durably record success — never fire-and-forget. Safe to
+ * call every hour: the fenced update only flips alertSent when it's still
+ * false, and the Resend call itself carries the SAME idempotency key
+ * (gtr-digest-alert-<date>) on every retry, so a redelivered alert after a
+ * lost response can't double-send either.
+ */
+async function attemptTerminalAlert(
+    deps: AutomationDigestDeps,
+    row: { digestDate: string; attempts: number; lastError: string | null },
+    digestCcEmail: string,
+): Promise<boolean> {
+    const sendResult = await deps.sendTerminalAlert({
+        cc: digestCcEmail,
+        digestDate: row.digestDate,
+        attempts: row.attempts,
+        lastError: row.lastError ?? "unknown error",
+    });
+    if (!sendResult.success) return false;
+    await deps.digestRunClient.updateMany({
+        where: { digestDate: row.digestDate, status: "FAILED", alertSent: false },
+        data: { alertSent: true },
+    });
+    return true;
 }
 
 // ── QBO purchases → digest rows ─────────────────────────────────────────────
@@ -217,13 +258,36 @@ export interface DigestPurchaseRow {
     driveUrl: string | null;
 }
 
+type DigestRawLine = {
+    AccountBasedExpenseLineDetail?: { CustomerRef?: { name?: unknown } };
+    ItemBasedExpenseLineDetail?: { CustomerRef?: { name?: unknown } };
+};
+
+/**
+ * The project the bot books a receipt against is NEVER on the top-level
+ * Purchase.CustomerRef — createQBReceiptPurchase (src/lib/qbo-receipt-push.ts)
+ * sets no top-level CustomerRef at all, only a per-LINE
+ * AccountBasedExpenseLineDetail.CustomerRef on each expense line. Collect the
+ * unique line-level names (QBO echoes the resolved display name back even
+ * though only the id was sent) and join a genuinely mixed set with ", " —
+ * this mirrors collectCustomerReferences in qbo-expense-sync.ts.
+ */
+function extractLineProjectNames(lines: unknown): string | null {
+    if (!Array.isArray(lines)) return null;
+    const names = new Set<string>();
+    for (const raw of lines) {
+        if (!raw || typeof raw !== "object") continue;
+        const line = raw as DigestRawLine;
+        const ref = line.AccountBasedExpenseLineDetail?.CustomerRef ?? line.ItemBasedExpenseLineDetail?.CustomerRef;
+        const name = typeof ref?.name === "string" ? ref.name.trim() : "";
+        if (name) names.add(name);
+    }
+    return names.size > 0 ? [...names].join(", ") : null;
+}
+
 /**
  * Filter raw QBO Purchase rows to automation-created ones (the [gtr-file:...]
- * marker in PrivateNote) and de-duplicate by Purchase Id. Project name comes
- * straight from the QBO row's CustomerRef — createQBReceiptPurchase always
- * resolves that to an EXACT project-name match at booking time
- * (src/lib/qbo-receipt-push.ts), so it's already the source-of-truth value,
- * not something that needs local enrichment.
+ * marker in PrivateNote) and de-duplicate by Purchase Id.
  */
 export function buildDigestRows(rawPurchases: unknown[]): DigestPurchaseRow[] {
     const byId = new Map<string, DigestPurchaseRow>();
@@ -231,7 +295,7 @@ export function buildDigestRows(rawPurchases: unknown[]): DigestPurchaseRow[] {
         if (!raw || typeof raw !== "object") continue;
         const p = raw as {
             Id?: unknown; PrivateNote?: unknown; TxnDate?: unknown; TotalAmt?: unknown;
-            EntityRef?: { name?: unknown }; CustomerRef?: { name?: unknown };
+            EntityRef?: { name?: unknown }; Line?: unknown;
         };
         const qbPurchaseId = p.Id != null ? String(p.Id) : null;
         if (!qbPurchaseId) continue;
@@ -247,7 +311,7 @@ export function buildDigestRows(rawPurchases: unknown[]): DigestPurchaseRow[] {
             date: typeof p.TxnDate === "string" ? p.TxnDate : null,
             vendor: typeof p.EntityRef?.name === "string" ? p.EntityRef.name : null,
             amountCents: Number.isFinite(total) ? Math.round(total * 100) : 0,
-            projectName: typeof p.CustomerRef?.name === "string" ? p.CustomerRef.name : null,
+            projectName: extractLineProjectNames(p.Line),
             driveUrl: null,
         });
     }
@@ -354,15 +418,26 @@ export type DigestTickResult =
     | { ok: true; sent: true; digestDate: string; rowCount: number }
     | { ok: false; digestDate: string; attempts: number; error: string };
 
-/** One hourly cron tick. Computes yesterday's Pacific date, claims it, and —
- * if claimed — queries QBO, renders, and sends. Never throws: every failure
- * path is caught, recorded as FAILED (fenced), and returned as ok:false so
- * the route can log it without crashing the cron. */
+/** One hourly cron tick. First retries any terminally-FAILED date whose
+ * alert never landed (independent of the window/date below — that date may
+ * no longer be "yesterday" by the time this runs). Then, within the send
+ * window, computes yesterday's Pacific date, claims it, and — if claimed —
+ * queries QBO, renders, and sends. Never throws: every failure path is
+ * caught, recorded as FAILED (fenced), and returned as ok:false so the route
+ * can log it (and 500) without crashing the cron. */
 export async function runDigestTick(
     deps: AutomationDigestDeps,
     recipients: { vanessaEmail: string; digestCcEmail: string },
 ): Promise<DigestTickResult> {
     const now = deps.now();
+
+    const pendingAlert = await deps.digestRunClient.findFirst({
+        where: { status: "FAILED", attempts: { gte: MAX_DIGEST_ATTEMPTS }, alertSent: false },
+    });
+    if (pendingAlert) {
+        await attemptTerminalAlert(deps, pendingAlert, recipients.digestCcEmail);
+    }
+
     if (!isWithinSendWindow(now)) return { ok: true, skipped: "before-send-window" };
 
     const { pacificDate } = getPacificDateAndHour(now);
@@ -403,14 +478,13 @@ export async function runDigestTick(
         return { ok: true, sent: true, digestDate, rowCount: withLinks.length };
     } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
-        await finalizeDigestRun(deps.digestRunClient, digestDate, claim.claimToken, "FAILED");
+        await finalizeDigestRun(deps.digestRunClient, digestDate, claim.claimToken, "FAILED", message);
         if (claim.attempts >= MAX_DIGEST_ATTEMPTS) {
-            await deps.sendTerminalAlert({
-                cc: recipients.digestCcEmail,
-                digestDate,
-                attempts: claim.attempts,
-                lastError: message,
-            });
+            // Best-effort immediate attempt for speed. If Resend rejects THIS
+            // call, the row stays alertSent:false and the pendingAlert check
+            // at the top of the next hourly tick (any tick, not just this
+            // date's) retries it with the same idempotency key until accepted.
+            await attemptTerminalAlert(deps, { digestDate, attempts: claim.attempts, lastError: message }, recipients.digestCcEmail);
         }
         return { ok: false, digestDate, attempts: claim.attempts, error: message };
     }

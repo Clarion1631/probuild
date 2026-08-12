@@ -72,6 +72,11 @@ test("pacificDayWindowUtc handles the fall-back DST transition (2026-11-01, PDT-
 // ── buildDigestRows: marker filter + de-dupe ────────────────────────────
 
 test("buildDigestRows keeps only automation-marked purchases and de-dupes by Purchase Id", () => {
+    // The bot never sets a top-level Purchase.CustomerRef — only a per-LINE
+    // AccountBasedExpenseLineDetail.CustomerRef (qbo-receipt-push.ts) — so
+    // this fixture (and the real data it stands in for) carries the project
+    // on the line, not at the top level.
+    const shopLine = { DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: { CustomerRef: { value: "shop-1", name: "Shop" } } };
     const rows = buildDigestRows([
         {
             Id: "101",
@@ -79,7 +84,7 @@ test("buildDigestRows keeps only automation-marked purchases and de-dupes by Pur
             TxnDate: "2026-08-10",
             TotalAmt: 42.1,
             EntityRef: { name: "Lowe's" },
-            CustomerRef: { name: "Shop" },
+            Line: [shopLine],
         },
         // Hand-booked via the QBO receipts inbox — no marker, must be excluded.
         { Id: "102", PrivateNote: "Manual entry", TxnDate: "2026-08-10", TotalAmt: 9.99 },
@@ -90,7 +95,7 @@ test("buildDigestRows keeps only automation-marked purchases and de-dupes by Pur
             TxnDate: "2026-08-10",
             TotalAmt: 42.1,
             EntityRef: { name: "Lowe's" },
-            CustomerRef: { name: "Shop" },
+            Line: [shopLine],
         },
     ]);
 
@@ -102,16 +107,85 @@ test("buildDigestRows keeps only automation-marked purchases and de-dupes by Pur
     assert.equal(rows[0].projectName, "Shop");
 });
 
+test("buildDigestRows reads the project from the LINE-level CustomerRef, not the top-level Purchase.CustomerRef", () => {
+    // createQBReceiptPurchase (qbo-receipt-push.ts) never sets a top-level
+    // CustomerRef at all — only AccountBasedExpenseLineDetail.CustomerRef per
+    // line. A top-level CustomerRef (if QBO ever echoed one) must be ignored.
+    const rows = buildDigestRows([{
+        Id: "201",
+        PrivateNote: "Mueller Bathroom - Contractor Supply ($125.50) [gtr-file:linefileid1234567890xyz]",
+        TxnDate: "2026-08-10",
+        TotalAmt: 125.5,
+        EntityRef: { name: "Contractor Supply" },
+        CustomerRef: { name: "Some Other Name Should Be Ignored" },
+        Line: [
+            {
+                DetailType: "AccountBasedExpenseLineDetail",
+                AccountBasedExpenseLineDetail: { CustomerRef: { value: "job-1", name: "Mueller Bathroom" } },
+            },
+        ],
+    }]);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].projectName, "Mueller Bathroom");
+});
+
+test("buildDigestRows joins genuinely mixed line-level project names with ', '", () => {
+    const rows = buildDigestRows([{
+        Id: "202",
+        PrivateNote: "Shop - Vendor ($50.00) [gtr-file:mixedfileid1234567890xy]",
+        TxnDate: "2026-08-10",
+        TotalAmt: 50,
+        EntityRef: { name: "Vendor" },
+        Line: [
+            { DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: { CustomerRef: { value: "job-1", name: "Mueller Bathroom" } } },
+            { DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: { CustomerRef: { value: "job-2", name: "Berg ADU" } } },
+            // A duplicate of an existing name must not be double-counted.
+            { DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: { CustomerRef: { value: "job-1", name: "Mueller Bathroom" } } },
+        ],
+    }]);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].projectName, "Mueller Bathroom, Berg ADU");
+});
+
+test("buildDigestRows reports no project when no line carries a CustomerRef", () => {
+    const rows = buildDigestRows([{
+        Id: "203",
+        PrivateNote: "Overhead purchase [gtr-file:nolinerefid1234567890xy]",
+        TxnDate: "2026-08-10",
+        TotalAmt: 15,
+        EntityRef: { name: "Vendor" },
+        Line: [{ DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: {} }],
+    }]);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].projectName, null);
+});
+
 // ── DigestRun claim (fenced CAS) ─────────────────────────────────────────
 
 /** In-memory fake matching the minimal DigestRunClient shape — mirrors the
  * fake ExpenseTransaction pattern in tests/qbo-expense-sync.test.ts. */
-function createFakeDigestRunClient(initial: DigestRunRow[] = []): DigestRunClient & { rows: Map<string, DigestRunRow> } {
-    const rows = new Map(initial.map((r) => [r.digestDate, r]));
+function createFakeDigestRunClient(initial: Partial<DigestRunRow>[] = []): DigestRunClient & { rows: Map<string, DigestRunRow> } {
+    const rows = new Map(initial.map((r) => [
+        r.digestDate!,
+        { alertSent: false, lastError: null, ...r } as DigestRunRow,
+    ]));
     return {
         rows,
         async findUnique({ where }) {
             return rows.get(where.digestDate) ?? null;
+        },
+        async findFirst({ where }) {
+            for (const row of rows.values()) {
+                if (where.status !== undefined && row.status !== where.status) continue;
+                if (where.alertSent !== undefined && row.alertSent !== where.alertSent) continue;
+                const attemptsFilter = where.attempts as { gte?: number } | undefined;
+                if (attemptsFilter?.gte !== undefined && row.attempts < attemptsFilter.gte) continue;
+                return row;
+            }
+            return null;
         },
         async create({ data }) {
             if (rows.has(data.digestDate)) {
@@ -119,7 +193,7 @@ function createFakeDigestRunClient(initial: DigestRunRow[] = []): DigestRunClien
                 err.code = "P2002";
                 throw err;
             }
-            const row: DigestRunRow = { ...data };
+            const row: DigestRunRow = { alertSent: false, lastError: null, ...data };
             rows.set(data.digestDate, row);
             return row;
         },
@@ -128,6 +202,7 @@ function createFakeDigestRunClient(initial: DigestRunRow[] = []): DigestRunClien
             if (!row) return { count: 0 };
             if (where.status !== undefined && row.status !== where.status) return { count: 0 };
             if (where.claimToken !== undefined && row.claimToken !== where.claimToken) return { count: 0 };
+            if (where.alertSent !== undefined && row.alertSent !== where.alertSent) return { count: 0 };
             Object.assign(row, data);
             return { count: 1 };
         },
@@ -304,6 +379,91 @@ test("runDigestTick sends the terminal-failure alert once attempts reach the cap
     const row = await digestRunClient.findUnique({ where: { digestDate: "2026-08-10" } });
     assert.equal(row?.status, "FAILED");
     assert.equal(row?.attempts, MAX_DIGEST_ATTEMPTS);
+    // Delivery of the ALERT itself is durably recorded, not fire-and-forget.
+    assert.equal(row?.alertSent, true);
+});
+
+test("runDigestTick retries the terminal-failure alert on a LATER tick when the first alert attempt itself fails", async () => {
+    let alertAttempts = 0;
+    let alertShouldSucceed = false;
+    const digestRunClient = createFakeDigestRunClient([
+        {
+            digestDate: "2026-08-10",
+            status: "FAILED",
+            attempts: MAX_DIGEST_ATTEMPTS - 1,
+            claimToken: "prev",
+            leaseExpiresAt: new Date("2026-08-11T12:00:00.000Z"),
+        },
+    ]);
+    const deps = baseDeps({
+        digestRunClient,
+        sendDigest: async () => ({ success: false }),
+        sendTerminalAlert: async () => {
+            alertAttempts += 1;
+            return { success: alertShouldSucceed };
+        },
+    });
+
+    // Tick 1: hits the attempt cap, tries to alert immediately — Resend
+    // rejects the ALERT itself this time.
+    const first = await runDigestTick(deps, { vanessaEmail: "v@x.com", digestCcEmail: "cc@x.com" });
+    assert.equal(first.ok, false);
+    assert.equal(alertAttempts, 1);
+    let row = await digestRunClient.findUnique({ where: { digestDate: "2026-08-10" } });
+    assert.equal(row?.status, "FAILED");
+    assert.equal(row?.alertSent, false);
+    assert.equal(row?.lastError, "Resend reported failure sending the digest");
+
+    // Tick 2 (an hour later): the digest date itself is terminal and
+    // unclaimable, but the pending-alert retry must still fire — and this
+    // time Resend accepts it.
+    alertShouldSucceed = true;
+    const second = await runDigestTick(deps, { vanessaEmail: "v@x.com", digestCcEmail: "cc@x.com" });
+    assert.equal(alertAttempts, 2);
+    row = await digestRunClient.findUnique({ where: { digestDate: "2026-08-10" } });
+    assert.equal(row?.alertSent, true);
+    // The digest date itself is still terminally FAILED — only the alert changed.
+    assert.equal(row?.status, "FAILED");
+    void second;
+
+    // Tick 3: alert already delivered — must not be retried again.
+    const third = await runDigestTick(deps, { vanessaEmail: "v@x.com", digestCcEmail: "cc@x.com" });
+    assert.equal(alertAttempts, 2);
+    void third;
+});
+
+test("runDigestTick's pending-alert retry runs even outside the send window, and even for a date that is no longer 'yesterday'", async () => {
+    let alertAttempts = 0;
+    const digestRunClient = createFakeDigestRunClient([
+        {
+            // A date well in the past relative to `now` below — no longer
+            // "yesterday" for any digestDate this tick would itself compute.
+            digestDate: "2026-08-01",
+            status: "FAILED",
+            attempts: MAX_DIGEST_ATTEMPTS,
+            claimToken: "prev",
+            leaseExpiresAt: new Date("2026-08-01T12:00:00.000Z"),
+            alertSent: false,
+            lastError: "boom",
+        },
+    ]);
+    const deps = baseDeps({
+        digestRunClient,
+        now: () => new Date("2026-08-11T10:00:00.000Z"), // 03:00 PDT — BEFORE the send window
+        sendTerminalAlert: async ({ digestDate, attempts, lastError }) => {
+            alertAttempts += 1;
+            assert.equal(digestDate, "2026-08-01");
+            assert.equal(attempts, MAX_DIGEST_ATTEMPTS);
+            assert.equal(lastError, "boom");
+            return { success: true };
+        },
+    });
+
+    const result = await runDigestTick(deps, { vanessaEmail: "v@x.com", digestCcEmail: "cc@x.com" });
+    assert.equal(alertAttempts, 1);
+    assert.deepEqual(result, { ok: true, skipped: "before-send-window" }); // the CURRENT digestDate's own outcome is unaffected
+    const row = await digestRunClient.findUnique({ where: { digestDate: "2026-08-01" } });
+    assert.equal(row?.alertSent, true);
 });
 
 test("runDigestTick is a no-op on an already-SENT date — Resend is never called again", async () => {
