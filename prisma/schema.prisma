@@ -537,6 +537,11 @@ model Expense {
   qbPurchaseId String?   @unique(map: "Expense_qbPurchaseId_key")
   qbSyncToken  String?
   qbSyncedAt   DateTime?
+  // QBO's own MetaData.CreateTime for the Purchase — when it was actually
+  // posted in QuickBooks, distinct from qbSyncedAt (when ProBuild imported
+  // it). Nullable: written going forward by the sync, backfilled for older
+  // rows by scripts/backfill-qbo-create-time.mjs. Null renders "not captured".
+  qboCreateTime DateTime?
   changeOrderId String?
   changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
   isBillable    Boolean      @default(false)
@@ -2289,6 +2294,39 @@ model AutomationEvent {
   @@index([kind, createdAt])
   @@index([createdAt])
   @@index([docNumber, createdAt])
+}
+
+// One row per Pacific calendar date the "posted yesterday" digest (Goal 1,
+// docs/plans/vanessa-review-loop-plan.md) has attempted. Claimed via
+// compare-and-swap on `claimToken` so an hourly cron tick can never
+// double-send: a worker may only write SENT/FAILED while its own claimToken
+// still matches — a prior worker whose lease expired and got taken over
+// loses the race silently instead of overwriting the new worker's result.
+model DigestRun {
+  id             String   @id @default(cuid())
+  digestDate     String   @unique // YYYY-MM-DD, America/Los_Angeles calendar date this digest covers
+  status         String // "PROCESSING" | "SENT" | "FAILED"
+  attempts       Int      @default(0)
+  claimToken     String // fencing token for the current/last claim
+  leaseExpiresAt DateTime // PROCESSING claims past this are considered stale and stealable
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+// Append-only human review stamp on a posted QBO Purchase (Goal 2b). Never
+// updated or deleted — a re-review after QBO changes the purchase inserts a
+// NEW row keyed to the new SyncToken. No FK to Expense/AutomationEvent: those
+// rows can be re-imported or are audit-only, and a review must survive that.
+model PurchaseReview {
+  id           String   @id @default(cuid())
+  qboPurchaseId String
+  qboSyncToken String // the SyncToken the reviewer actually saw rendered
+  reviewerId   String
+  reviewerName String
+  reviewedAt   DateTime @default(now())
+
+  @@unique([qboPurchaseId, qboSyncToken])
+  @@index([qboPurchaseId])
 }
 
 model StripeEvent {
