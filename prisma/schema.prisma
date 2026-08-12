@@ -269,6 +269,7 @@ model Project {
   productFavorites    ProjectProductFavorite[]
   selectionProposals  SelectionProposal[]
   decisions           Decision[]
+  permits             Permit[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -1377,6 +1378,7 @@ model PortalVisibility {
   showChangeOrders Boolean @default(true)
   showSelections   Boolean @default(true)
   showMoodBoards   Boolean @default(true)
+  showPermits      Boolean @default(true)
 
   isPortalEnabled      Boolean   @default(true)
   lastSharedAt         DateTime?
@@ -2012,6 +2014,23 @@ model DailyLogPhoto {
   caption    String?
   sharedToPortal Boolean @default(false)
   createdAt  DateTime @default(now())
+}
+
+model Permit {
+  id               String    @id @default(cuid())
+  projectId        String
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  permitNumber     String
+  type             String?   // e.g. Building, Electrical, Plumbing, Mechanical
+  status           String    @default("applied") // applied | issued | inspections | closed | expired
+  issuingAuthority String?
+  issueDate        DateTime?
+  expirationDate   DateTime?
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([projectId])
 }
 
 model Retainer {
