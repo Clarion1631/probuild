@@ -29,6 +29,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import { resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -113,6 +114,13 @@ import {
 import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
+
+// Server runs in UTC; "Viewed at" timestamps in notification emails must render
+// in the company's timezone, not the server's.
+async function formatViewedAt(): Promise<string> {
+    const timeZone = await resolveCompanyTimeZone();
+    return new Date().toLocaleString("en-US", { timeZone });
+}
 
 function isNotificationEnabled(settings: { notificationToggles?: string | null } | null, key: NotificationToggleKey): boolean {
     if (!settings?.notificationToggles) return true;
@@ -2047,7 +2055,7 @@ export async function markEstimateViewed(estimateId: string) {
                     <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #0369a1;">Estimate Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened estimate <strong>${estimate.title || estimate.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -2222,7 +2230,7 @@ export async function markContractViewed(contractId: string, accessToken?: strin
                     <div style="background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #854d0e;">Contract Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened contract <strong>${contract.title}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -2882,7 +2890,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
                             <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
                             ${focusedLine}
-                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                            <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                             <div style="text-align: center; margin: 16px 0;">
                                 <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
                                     View Invoice
