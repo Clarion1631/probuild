@@ -24,9 +24,31 @@ import {
 
 const ALLOWED_TABS = [
     "overview", "estimates", "schedule", "invoices",
-    "updates", "files", "selections", "designs", "change-orders"
+    "updates", "files", "selections", "designs", "change-orders", "permits"
 ] as const;
 type TabId = (typeof ALLOWED_TABS)[number];
+
+// Mirrors the status pill styling in src/app/projects/[id]/permits/PermitsClient.tsx
+// so the portal reads consistently with the staff view.
+const PERMIT_STATUS_STYLES: Record<string, { bg: string; text: string; dot: string }> = {
+    applied: { bg: "bg-amber-50", text: "text-amber-800", dot: "bg-amber-500" },
+    issued: { bg: "bg-green-50", text: "text-green-800", dot: "bg-green-500" },
+    inspections: { bg: "bg-blue-50", text: "text-blue-800", dot: "bg-blue-500" },
+    closed: { bg: "bg-slate-100", text: "text-slate-600", dot: "bg-slate-400" },
+    expired: { bg: "bg-red-50", text: "text-red-800", dot: "bg-red-500" },
+};
+const PERMIT_STATUS_LABELS: Record<string, string> = {
+    applied: "Applied",
+    issued: "Issued",
+    inspections: "In Inspections",
+    closed: "Closed",
+    expired: "Expired",
+};
+function formatPermitDate(date: Date | string | null) {
+    if (!date) return "—";
+    // Date-only values are stored at midnight UTC — format in UTC or they render a day early.
+    return new Date(date).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+}
 
 export default async function PortalProjectDetail(props: {
     params: Promise<{ id: string }>;
@@ -92,7 +114,7 @@ export default async function PortalProjectDetail(props: {
     if (!project) return notFound();
 
     const visibility = await getPortalVisibility(projectId);
-    const [settings, trackerData, updatesFeed, sharedRooms, unreadSelectionThreadCount] = await Promise.all([
+    const [settings, trackerData, updatesFeed, sharedRooms, unreadSelectionThreadCount, permits] = await Promise.all([
         prisma.companySettings.findUnique({ where: { id: "singleton" } }),
         visibility.showSchedule
             ? getPortalProjectTracker(projectId)
@@ -108,6 +130,16 @@ export default async function PortalProjectDetail(props: {
         visibility.showSelections
             ? getUnreadSelectionThreadCountForPortal(projectId)
             : Promise.resolve(0),
+        visibility.showPermits
+            ? prisma.permit.findMany({
+                where: { projectId },
+                orderBy: { createdAt: "desc" },
+                select: {
+                    id: true, permitNumber: true, type: true, status: true,
+                    issuingAuthority: true, issueDate: true, expirationDate: true,
+                },
+            })
+            : Promise.resolve([]),
     ]);
 
     if (!visibility.isPortalEnabled) {
@@ -169,6 +201,7 @@ export default async function PortalProjectDetail(props: {
         { id: "selections", label: "Selections", count: unreadSelectionThreadCount || undefined, visible: visibility.showSelections },
         { id: "designs", label: "Designs", visible: visibility.showMoodBoards || sharedRooms.length > 0 },
         { id: "change-orders", label: "Change Orders", count: changeOrderCount, visible: showChangeOrders && changeOrderCount > 0 },
+        { id: "permits", label: "Permits", visible: visibility.showPermits },
     ];
 
     const visibleTabs = tabsConfig.filter(t => t.visible);
@@ -560,6 +593,54 @@ export default async function PortalProjectDetail(props: {
                             </Link>
                         ))}
                     </div>
+                )}
+
+                {activeTab === "permits" && (
+                    permits.length === 0 ? (
+                        <div className="hui-card p-8 text-center text-sm text-hui-textMuted">
+                            <h3 className="font-semibold text-hui-textMain mb-1">No permits yet</h3>
+                            <p>Your contractor will list permit numbers and status here once they&apos;re filed.</p>
+                        </div>
+                    ) : (
+                        <div className="hui-card overflow-hidden">
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr className="bg-slate-50 border-b border-hui-border text-xs font-semibold text-hui-textMuted uppercase tracking-wider">
+                                            <th className="px-6 py-4 font-medium">Permit #</th>
+                                            <th className="px-6 py-4 font-medium">Type</th>
+                                            <th className="px-6 py-4 font-medium">Status</th>
+                                            <th className="px-6 py-4 font-medium">Authority</th>
+                                            <th className="px-6 py-4 font-medium">Issued</th>
+                                            <th className="px-6 py-4 font-medium">Expires</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-hui-border text-sm">
+                                        {permits.map((permit: any) => {
+                                            const styles = PERMIT_STATUS_STYLES[permit.status] || PERMIT_STATUS_STYLES.applied;
+                                            return (
+                                                <tr key={permit.id} className="hover:bg-slate-50 transition-colors">
+                                                    <td className="px-6 py-4 font-mono font-bold text-hui-textMain whitespace-nowrap">
+                                                        {permit.permitNumber}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-hui-textMain">{permit.type || "—"}</td>
+                                                    <td className="px-6 py-4">
+                                                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${styles.bg} ${styles.text}`}>
+                                                            <span className={`w-1.5 h-1.5 rounded-full ${styles.dot}`}></span>
+                                                            {PERMIT_STATUS_LABELS[permit.status] || permit.status}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-hui-textMain">{permit.issuingAuthority || "—"}</td>
+                                                    <td className="px-6 py-4 text-hui-textMuted whitespace-nowrap">{formatPermitDate(permit.issueDate)}</td>
+                                                    <td className="px-6 py-4 text-hui-textMuted whitespace-nowrap">{formatPermitDate(permit.expirationDate)}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )
                 )}
             </div>
         </div>

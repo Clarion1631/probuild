@@ -8562,9 +8562,34 @@ export async function updateProjectColor(projectId: string, color: string) {
 }
 
 export async function updateProjectTags(projectId: string, tags: string) {
+    await assertProjectMemberStaff(projectId);
     await prisma.project.update({
         where: { id: projectId },
         data: { tags }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectType(projectId: string, type: string) {
+    await assertProjectMemberStaff(projectId);
+    const trimmed = type.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { type: trimmed || null }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectCode(projectId: string, code: string) {
+    await assertProjectMemberStaff(projectId);
+    const trimmed = code.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { code: trimmed || null }
     });
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
@@ -8708,6 +8733,7 @@ export async function getPortalVisibility(projectId: string) {
             showChangeOrders: true,
             showSelections: true,
             showMoodBoards: true,
+            showPermits: true,
             isPortalEnabled: true,
             lastSharedAt: null,
             lastShareEmailId: null,
@@ -8727,8 +8753,10 @@ export async function savePortalVisibility(projectId: string, data: {
     showMessages: boolean;
     showSelections?: boolean;
     showMoodBoards?: boolean;
+    showPermits?: boolean;
     isPortalEnabled: boolean;
 }) {
+    await assertProjectMemberStaff(projectId);
     const record = await prisma.portalVisibility.upsert({
         where: { projectId },
         update: {
@@ -8741,6 +8769,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
         create: {
@@ -8754,6 +8783,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
     });
@@ -14635,4 +14665,125 @@ export async function restoreOfficeTask(id: string) {
 
     revalidatePath("/tasks");
     return task;
+}
+
+// ============ Permits CRUD ============
+
+const PERMIT_STATUSES = ["applied", "issued", "inspections", "closed", "expired"] as const;
+
+// Shared staff-membership gate: caller must be a signed-in, non-disabled
+// staff user with access to this specific project (canAccessProject covers
+// ADMIN/MANAGER auto-pass plus per-user projectAccess/assignedProjects
+// scoping). Used anywhere a mutation is scoped to one project and the
+// weaker assertActiveStaff (any signed-in staff, any project) would be
+// too permissive.
+async function assertProjectMemberStaff(projectId: string) {
+    // assertActiveStaff already handles the ID-less dev-auth fallback and
+    // disabled-user rejection; its user carries projectAccess/assignedProjects.
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+async function assertPermitAccess(projectId: string) {
+    return assertProjectMemberStaff(projectId);
+}
+
+function parsePermitDate(value: string | undefined): Date | null | undefined {
+    if (value === undefined) return undefined;
+    if (!value) return null;
+    const parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export async function getPermits(projectId: string) {
+    await assertPermitAccess(projectId);
+    return prisma.permit.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+export async function createPermit(projectId: string, data: {
+    permitNumber: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    await assertPermitAccess(projectId);
+
+    const permitNumber = data.permitNumber?.trim();
+    if (!permitNumber) throw new Error("Permit number is required");
+
+    const status = data.status && (PERMIT_STATUSES as readonly string[]).includes(data.status)
+        ? data.status
+        : "applied";
+
+    const permit = await prisma.permit.create({
+        data: {
+            projectId,
+            permitNumber,
+            type: data.type || null,
+            status,
+            issuingAuthority: data.issuingAuthority || null,
+            issueDate: parsePermitDate(data.issueDate) ?? null,
+            expirationDate: parsePermitDate(data.expirationDate) ?? null,
+            notes: data.notes || null,
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/permits`);
+    return permit;
+}
+
+export async function updatePermit(permitId: string, data: {
+    permitNumber?: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    const updateData: any = {};
+    if (data.permitNumber !== undefined) {
+        const permitNumber = data.permitNumber.trim();
+        if (!permitNumber) throw new Error("Permit number is required");
+        updateData.permitNumber = permitNumber;
+    }
+    if (data.type !== undefined) updateData.type = data.type.trim() || null;
+    if (data.status !== undefined) {
+        updateData.status = (PERMIT_STATUSES as readonly string[]).includes(data.status)
+            ? data.status
+            : "applied";
+    }
+    if (data.issuingAuthority !== undefined) updateData.issuingAuthority = data.issuingAuthority.trim() || null;
+    if (data.issueDate !== undefined) updateData.issueDate = parsePermitDate(data.issueDate);
+    if (data.expirationDate !== undefined) updateData.expirationDate = parsePermitDate(data.expirationDate);
+    if (data.notes !== undefined) updateData.notes = data.notes.trim() || null;
+
+    const permit = await prisma.permit.update({
+        where: { id: permitId },
+        data: updateData,
+    });
+
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return permit;
+}
+
+export async function deletePermit(permitId: string) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    await prisma.permit.delete({ where: { id: permitId } });
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return { success: true };
 }
