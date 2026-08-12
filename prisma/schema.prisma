@@ -2296,31 +2296,6 @@ model AutomationEvent {
   @@index([docNumber, createdAt])
 }
 
-// One row per Pacific calendar date the "posted yesterday" digest (Goal 1,
-// docs/plans/vanessa-review-loop-plan.md) has attempted. Claimed via
-// compare-and-swap on `claimToken` so an hourly cron tick can never
-// double-send: a worker may only write SENT/FAILED while its own claimToken
-// still matches — a prior worker whose lease expired and got taken over
-// loses the race silently instead of overwriting the new worker's result.
-model DigestRun {
-  id             String   @id @default(cuid())
-  digestDate     String   @unique // YYYY-MM-DD, America/Los_Angeles calendar date this digest covers
-  status         String // "PROCESSING" | "SENT" | "FAILED"
-  attempts       Int      @default(0)
-  claimToken     String // fencing token for the current/last claim
-  leaseExpiresAt DateTime // PROCESSING claims past this are considered stale and stealable
-  // Once status="FAILED" and attempts hit MAX_DIGEST_ATTEMPTS the date is
-  // terminal (claimDigestRun refuses further claims) — alertSent tracks
-  // whether the terminal-failure alert itself was actually delivered, so a
-  // rejected Resend call for the ALERT keeps retrying on later hourly ticks
-  // instead of being sent at most once. lastError is persisted so a later
-  // retry tick can still report a meaningful message.
-  alertSent      Boolean  @default(false)
-  lastError      String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-}
-
 // Append-only human review stamp on a posted QBO Purchase (Goal 2b). Never
 // updated or deleted — a re-review after QBO changes the purchase inserts a
 // NEW row keyed to the new SyncToken. No FK to Expense/AutomationEvent: those

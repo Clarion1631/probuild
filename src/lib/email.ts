@@ -14,13 +14,7 @@ export async function sendNotification(
     subject: string,
     htmlContent: string,
     attachments?: { filename: string, content: Buffer }[],
-    options?: {
-        fromName?: string; replyTo?: string; cc?: string[]; bcc?: string[]; copyToInternal?: boolean;
-        // Resend's own idempotency key (Idempotency-Key header): a retry with the
-        // SAME key after an ambiguous send (e.g. the response was lost but Resend
-        // already accepted it) is deduped server-side instead of double-sending.
-        idempotencyKey?: string;
-    }
+    options?: { fromName?: string; replyTo?: string; cc?: string[]; bcc?: string[]; copyToInternal?: boolean }
 ): Promise<{ success: boolean; id?: string }> {
     // The "to" can be comma-separated (e.g. the System Notification Email setting
     // holding several team addresses) — split into a proper recipient list.
@@ -74,20 +68,17 @@ export async function sendNotification(
     const bccList = bccByKey.size > 0 ? [...bccByKey.values()] : undefined;
 
     try {
-        const data = await resend.emails.send(
-            {
-                from: `${displayName} <notifications@goldentouchremodeling.com>`,
-                to: toList,
-                replyTo: options?.replyTo || 'jadkins@goldentouchremodeling.com',
-                subject: subject,
-                html: htmlContent,
-                text: textContent,
-                attachments: attachments,
-                cc: options?.cc,
-                bcc: bccList
-            },
-            options?.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : undefined
-        );
+        const data = await resend.emails.send({
+            from: `${displayName} <notifications@goldentouchremodeling.com>`,
+            to: toList,
+            replyTo: options?.replyTo || 'jadkins@goldentouchremodeling.com',
+            subject: subject,
+            html: htmlContent,
+            text: textContent,
+            attachments: attachments,
+            cc: options?.cc,
+            bcc: bccList
+        });
         if (data.error) {
             console.error("Resend API returned error:", data.error);
             return { success: false };
