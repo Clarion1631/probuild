@@ -418,26 +418,19 @@ export type DigestTickResult =
     | { ok: true; sent: true; digestDate: string; rowCount: number }
     | { ok: false; digestDate: string; attempts: number; error: string };
 
-/** One hourly cron tick. First retries any terminally-FAILED date whose
- * alert never landed (independent of the window/date below — that date may
- * no longer be "yesterday" by the time this runs). Then, within the send
- * window, computes yesterday's Pacific date, claims it, and — if claimed —
- * queries QBO, renders, and sends. Never throws: every failure path is
- * caught, recorded as FAILED (fenced), and returned as ok:false so the route
- * can log it (and 500) without crashing the cron. */
-export async function runDigestTick(
+/**
+ * Today's own digest work: within the send window, computes yesterday's
+ * Pacific date, claims it, and — if claimed — queries QBO, renders, and
+ * sends. Never throws: every failure path is caught, recorded as FAILED
+ * (fenced), and returned as ok:false. Split out of runDigestTick so the
+ * pending-alert retry (a DIFFERENT, possibly older date) can run first
+ * without gating whether today's work happens.
+ */
+async function runTodaysDigestWork(
     deps: AutomationDigestDeps,
     recipients: { vanessaEmail: string; digestCcEmail: string },
+    now: Date,
 ): Promise<DigestTickResult> {
-    const now = deps.now();
-
-    const pendingAlert = await deps.digestRunClient.findFirst({
-        where: { status: "FAILED", attempts: { gte: MAX_DIGEST_ATTEMPTS }, alertSent: false },
-    });
-    if (pendingAlert) {
-        await attemptTerminalAlert(deps, pendingAlert, recipients.digestCcEmail);
-    }
-
     if (!isWithinSendWindow(now)) return { ok: true, skipped: "before-send-window" };
 
     const { pacificDate } = getPacificDateAndHour(now);
@@ -482,12 +475,49 @@ export async function runDigestTick(
         if (claim.attempts >= MAX_DIGEST_ATTEMPTS) {
             // Best-effort immediate attempt for speed. If Resend rejects THIS
             // call, the row stays alertSent:false and the pendingAlert check
-            // at the top of the next hourly tick (any tick, not just this
-            // date's) retries it with the same idempotency key until accepted.
+            // in runDigestTick (any tick, not just this date's) retries it
+            // with the same idempotency key until accepted.
             await attemptTerminalAlert(deps, { digestDate, attempts: claim.attempts, lastError: message }, recipients.digestCcEmail);
         }
         return { ok: false, digestDate, attempts: claim.attempts, error: message };
     }
+}
+
+/** One hourly cron tick. First retries any terminally-FAILED date whose
+ * alert never landed (independent of today's date/window below — that date
+ * may no longer be "yesterday" by the time this runs). Today's own digest
+ * work always still runs this same tick regardless of that retry's outcome —
+ * but if the pending-alert retry itself fails, the TICK's overall result is
+ * ok:false (the route maps that to a 500) so a stuck alert keeps surfacing
+ * as a real failure instead of silently reporting 200 forever. */
+export async function runDigestTick(
+    deps: AutomationDigestDeps,
+    recipients: { vanessaEmail: string; digestCcEmail: string },
+): Promise<DigestTickResult> {
+    const now = deps.now();
+
+    const pendingAlert = await deps.digestRunClient.findFirst({
+        where: { status: "FAILED", attempts: { gte: MAX_DIGEST_ATTEMPTS }, alertSent: false },
+    });
+    let alertRetryFailure: { digestDate: string; attempts: number } | null = null;
+    if (pendingAlert) {
+        const delivered = await attemptTerminalAlert(deps, pendingAlert, recipients.digestCcEmail);
+        if (!delivered) {
+            alertRetryFailure = { digestDate: pendingAlert.digestDate, attempts: pendingAlert.attempts };
+        }
+    }
+
+    const todaysResult = await runTodaysDigestWork(deps, recipients, now);
+
+    if (alertRetryFailure) {
+        return {
+            ok: false,
+            digestDate: alertRetryFailure.digestDate,
+            attempts: alertRetryFailure.attempts,
+            error: `terminal-failure alert delivery is still failing for ${alertRetryFailure.digestDate}`,
+        };
+    }
+    return todaysResult;
 }
 
 export function createDefaultDigestDeps(): AutomationDigestDeps {

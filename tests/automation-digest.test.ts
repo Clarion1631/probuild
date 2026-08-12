@@ -466,6 +466,48 @@ test("runDigestTick's pending-alert retry runs even outside the send window, and
     assert.equal(row?.alertSent, true);
 });
 
+test("runDigestTick surfaces ok:false (-> 500) when the pending-alert retry itself fails, even though today's own digest sends fine", async () => {
+    let sendDigestCalls = 0;
+    const digestRunClient = createFakeDigestRunClient([
+        {
+            // An OLDER, unrelated terminally-FAILED date whose alert keeps failing.
+            digestDate: "2026-08-01",
+            status: "FAILED",
+            attempts: MAX_DIGEST_ATTEMPTS,
+            claimToken: "prev",
+            leaseExpiresAt: new Date("2026-08-01T12:00:00.000Z"),
+            alertSent: false,
+            lastError: "boom",
+        },
+    ]);
+    const deps = baseDeps({
+        digestRunClient, // baseDeps' now() is within the send window; computes digestDate "2026-08-10"
+        sendDigest: async () => { sendDigestCalls += 1; return { success: true }; },
+        sendTerminalAlert: async () => ({ success: false }), // the ALERT itself keeps being rejected
+    });
+
+    const result = await runDigestTick(deps, { vanessaEmail: "v@x.com", digestCcEmail: "cc@x.com" });
+
+    // The tick's overall result must be ok:false — digestResultResponse maps
+    // that to HTTP 500 — reporting the ALERT failure, not silently 200.
+    assert.deepEqual(result, {
+        ok: false,
+        digestDate: "2026-08-01",
+        attempts: MAX_DIGEST_ATTEMPTS,
+        error: "terminal-failure alert delivery is still failing for 2026-08-01",
+    });
+
+    // Today's own digest (an unrelated date) must still have run in the SAME
+    // tick — not skipped just because the alert retry failed.
+    assert.equal(sendDigestCalls, 1);
+    const todayRow = await digestRunClient.findUnique({ where: { digestDate: "2026-08-10" } });
+    assert.equal(todayRow?.status, "SENT");
+
+    // The stuck alert's row is untouched (still unsent) — no false "delivered".
+    const alertRow = await digestRunClient.findUnique({ where: { digestDate: "2026-08-01" } });
+    assert.equal(alertRow?.alertSent, false);
+});
+
 test("runDigestTick is a no-op on an already-SENT date — Resend is never called again", async () => {
     let sendCalls = 0;
     const digestRunClient = createFakeDigestRunClient([
