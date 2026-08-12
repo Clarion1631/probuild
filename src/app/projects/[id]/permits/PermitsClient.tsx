@@ -110,15 +110,29 @@ export default function PermitsClient({ projectId, projectName, initialPermits }
             return;
         }
 
-        const payload = {
-            permitNumber: form.permitNumber,
-            type: form.type || undefined,
-            status: form.status || undefined,
-            issuingAuthority: form.issuingAuthority || undefined,
-            issueDate: form.issueDate || undefined,
-            expirationDate: form.expirationDate || undefined,
-            notes: form.notes || undefined,
-        };
+        // When editing an existing permit, pass raw strings (including "")
+        // for optional fields so clearing a field reaches the server as an
+        // explicit clear rather than "unchanged" (undefined). For create,
+        // "" and undefined behave the same server-side.
+        const payload = editingId
+            ? {
+                permitNumber: form.permitNumber,
+                type: form.type,
+                status: form.status || undefined,
+                issuingAuthority: form.issuingAuthority,
+                issueDate: form.issueDate,
+                expirationDate: form.expirationDate,
+                notes: form.notes,
+            }
+            : {
+                permitNumber: form.permitNumber,
+                type: form.type || undefined,
+                status: form.status || undefined,
+                issuingAuthority: form.issuingAuthority || undefined,
+                issueDate: form.issueDate || undefined,
+                expirationDate: form.expirationDate || undefined,
+                notes: form.notes || undefined,
+            };
 
         startTransition(async () => {
             try {

@@ -17,14 +17,15 @@ export default function ProjectDashboardsWidget({
     // If portal visibility is null, maybe defaults are all false, meaning "Not Shared"
     // But since it's created automatically, it's usually defined.
     // Let's just create a shared heuristic (if anything is shared)
-    const isShared = initialPortalVisibility && (
+    const isShared = initialPortalVisibility && initialPortalVisibility.isPortalEnabled !== false && (
         initialPortalVisibility.showSchedule ||
         initialPortalVisibility.showFiles ||
         initialPortalVisibility.showDailyLogs ||
         initialPortalVisibility.showEstimates ||
         initialPortalVisibility.showInvoices ||
         initialPortalVisibility.showContracts ||
-        initialPortalVisibility.showMessages
+        initialPortalVisibility.showMessages ||
+        initialPortalVisibility.showPermits
     );
 
     const defaultState = {
@@ -35,6 +36,7 @@ export default function ProjectDashboardsWidget({
         showInvoices: true,
         showContracts: true,
         showMessages: true,
+        showPermits: true,
     };
 
     return (

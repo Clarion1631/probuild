@@ -82,32 +82,50 @@ export default function JobInfoCard({
 
     const handleSave = () => {
         startTransition(async () => {
-            try {
-                const ops: Promise<any>[] = [];
+            // Sequential, not Promise.all: each mutation is independently
+            // permission-checked (assertProjectMemberStaff), so a parallel
+            // fan-out where one field is forbidden would still silently
+            // persist the others while throwing away which one failed.
+            // Run in order, collect failures instead of throwing on the
+            // first, and always refresh so any fields that DID persist show up.
+            const ops: { field: string; run: () => Promise<any> }[] = [];
 
-                const trimmedCode = codeValue.trim();
-                if (trimmedCode !== (code || "")) ops.push(updateProjectCode(projectId, trimmedCode));
+            const trimmedCode = codeValue.trim();
+            if (trimmedCode !== (code || "")) ops.push({ field: "Job Code", run: () => updateProjectCode(projectId, trimmedCode) });
 
-                const trimmedType = typeValue.trim();
-                if (trimmedType !== (type || "")) ops.push(updateProjectType(projectId, trimmedType));
+            const trimmedType = typeValue.trim();
+            if (trimmedType !== (type || "")) ops.push({ field: "Type", run: () => updateProjectType(projectId, trimmedType) });
 
-                const normalizedStart = toDateInputValue(startDate);
-                if (startDateValue !== normalizedStart) ops.push(updateProjectStartDateAction(projectId, startDateValue || null, false));
+            const normalizedStart = toDateInputValue(startDate);
+            if (startDateValue !== normalizedStart) ops.push({ field: "Start Date", run: () => updateProjectStartDateAction(projectId, startDateValue || null, false) });
 
-                const normalizedEnd = toDateInputValue(endDate);
-                if (endDateValue !== normalizedEnd) ops.push(updateProjectEndDateAction(projectId, endDateValue || null));
+            const normalizedEnd = toDateInputValue(endDate);
+            if (endDateValue !== normalizedEnd) ops.push({ field: "End Date", run: () => updateProjectEndDateAction(projectId, endDateValue || null) });
 
-                const trimmedTags = tagsValue.trim();
-                if (trimmedTags !== (tags || "")) ops.push(updateProjectTags(projectId, trimmedTags));
+            const trimmedTags = tagsValue.trim();
+            if (trimmedTags !== (tags || "")) ops.push({ field: "Tags", run: () => updateProjectTags(projectId, trimmedTags) });
 
-                if (ops.length > 0) {
-                    await Promise.all(ops);
-                    toast.success("Job info updated");
-                    router.refresh();
-                }
+            if (ops.length === 0) {
                 setEditing(false);
-            } catch (err: any) {
-                toast.error(err.message || "Failed to update job info");
+                return;
+            }
+
+            const failures: { field: string; error: string }[] = [];
+            for (const op of ops) {
+                try {
+                    await op.run();
+                } catch (err: any) {
+                    failures.push({ field: op.field, error: err?.message || "Failed" });
+                }
+            }
+
+            router.refresh();
+
+            if (failures.length === 0) {
+                toast.success("Job info updated");
+                setEditing(false);
+            } else {
+                toast.error(`Couldn't save ${failures.map(f => `${f.field} (${f.error})`).join(", ")}`);
             }
         });
     };

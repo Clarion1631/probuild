@@ -8562,7 +8562,7 @@ export async function updateProjectColor(projectId: string, color: string) {
 }
 
 export async function updateProjectTags(projectId: string, tags: string) {
-    await assertActiveStaff();
+    await assertProjectMemberStaff(projectId);
     await prisma.project.update({
         where: { id: projectId },
         data: { tags }
@@ -8573,7 +8573,7 @@ export async function updateProjectTags(projectId: string, tags: string) {
 }
 
 export async function updateProjectType(projectId: string, type: string) {
-    await assertActiveStaff();
+    await assertProjectMemberStaff(projectId);
     const trimmed = type.trim();
     await prisma.project.update({
         where: { id: projectId },
@@ -8585,7 +8585,7 @@ export async function updateProjectType(projectId: string, type: string) {
 }
 
 export async function updateProjectCode(projectId: string, code: string) {
-    await assertActiveStaff();
+    await assertProjectMemberStaff(projectId);
     const trimmed = code.trim();
     await prisma.project.update({
         where: { id: projectId },
@@ -8756,6 +8756,7 @@ export async function savePortalVisibility(projectId: string, data: {
     showPermits?: boolean;
     isPortalEnabled: boolean;
 }) {
+    await assertProjectMemberStaff(projectId);
     const record = await prisma.portalVisibility.upsert({
         where: { projectId },
         update: {
@@ -14670,22 +14671,22 @@ export async function restoreOfficeTask(id: string) {
 
 const PERMIT_STATUSES = ["applied", "issued", "inspections", "closed", "expired"] as const;
 
-async function assertPermitAccess(projectId: string) {
-    const session = await getSessionOrDev();
-    const sessionUserId = (session?.user as any)?.id as string | null | undefined;
-    if (!sessionUserId) throw new Error("Unauthorized");
-
-    const user = await prisma.user.findUnique({
-        where: { id: sessionUserId },
-        include: {
-            permissions: true,
-            projectAccess: { select: { projectId: true } },
-            assignedProjects: { select: { id: true } },
-        },
-    });
-    if (!user || user.status === "DISABLED") throw new Error("Unauthorized");
+// Shared staff-membership gate: caller must be a signed-in, non-disabled
+// staff user with access to this specific project (canAccessProject covers
+// ADMIN/MANAGER auto-pass plus per-user projectAccess/assignedProjects
+// scoping). Used anywhere a mutation is scoped to one project and the
+// weaker assertActiveStaff (any signed-in staff, any project) would be
+// too permissive.
+async function assertProjectMemberStaff(projectId: string) {
+    // assertActiveStaff already handles the ID-less dev-auth fallback and
+    // disabled-user rejection; its user carries projectAccess/assignedProjects.
+    const user = await assertActiveStaff();
     if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
     return user;
+}
+
+async function assertPermitAccess(projectId: string) {
+    return assertProjectMemberStaff(projectId);
 }
 
 function parsePermitDate(value: string | undefined): Date | null | undefined {
@@ -14757,16 +14758,16 @@ export async function updatePermit(permitId: string, data: {
         if (!permitNumber) throw new Error("Permit number is required");
         updateData.permitNumber = permitNumber;
     }
-    if (data.type !== undefined) updateData.type = data.type || null;
+    if (data.type !== undefined) updateData.type = data.type.trim() || null;
     if (data.status !== undefined) {
         updateData.status = (PERMIT_STATUSES as readonly string[]).includes(data.status)
             ? data.status
             : "applied";
     }
-    if (data.issuingAuthority !== undefined) updateData.issuingAuthority = data.issuingAuthority || null;
+    if (data.issuingAuthority !== undefined) updateData.issuingAuthority = data.issuingAuthority.trim() || null;
     if (data.issueDate !== undefined) updateData.issueDate = parsePermitDate(data.issueDate);
     if (data.expirationDate !== undefined) updateData.expirationDate = parsePermitDate(data.expirationDate);
-    if (data.notes !== undefined) updateData.notes = data.notes || null;
+    if (data.notes !== undefined) updateData.notes = data.notes.trim() || null;
 
     const permit = await prisma.permit.update({
         where: { id: permitId },
