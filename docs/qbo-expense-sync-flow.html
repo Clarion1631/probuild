@@ -218,6 +218,18 @@
   </table>
   </div>
 
+  <h2 id="validate-qbo">Validate it in QuickBooks</h2>
+  <div class="callout">
+    <h3>End-to-end checklist</h3>
+    <ul>
+      <li><b>Drive intake folders are flowing</b> — check the intake chart on <a href="/automation">Automation</a>. A flat line the last day or two means receipts have stopped landing.</li>
+      <li><b>QBO Receipts "For review" queue is near-zero</b> — open <a href="https://qbo.intuit.com/app/docs" target="_blank" rel="noopener noreferrer">Receipts</a> in QuickBooks. A growing pile means more work is falling to the email-fallback path than it should.</li>
+      <li><b>QBO Expenses list, filtered by today</b> — open <a href="https://qbo.intuit.com/app/expense" target="_blank" rel="noopener noreferrer">Expenses</a> and filter to today. Every automated purchase should carry a receipt attachment and the right job.</li>
+      <li><b>QBO bank feed has no unmatched items</b> — open <a href="https://qbo.intuit.com/app/banking" target="_blank" rel="noopener noreferrer">Banking</a>. This one stays a manual check by design: the current sync reads the general ledger, not the bank feed, so it can't see pending/unmatched bank-feed state on its own.</li>
+      <li><b>/automation register: proof dots green, rows carry review stamps</b> — open <a href="/automation">Automation</a> and expand a few rows. Each shows the four-step audit timeline (Drive intake → Bot read → QBO Purchase → Reviewed) with real timestamps, or an honest "not captured" — and a "Mark reviewed" stamp once someone has actually checked it.</li>
+    </ul>
+  </div>
+
   <h2>What's next on the roadmap</h2>
   <div class="tablewrap">
   <table>
