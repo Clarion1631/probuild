@@ -5341,10 +5341,13 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 
 export async function getEstimateTemplates() {
     await assertEstimatePermission();
-    return await prisma.estimateTemplate.findMany({
+    const templates = await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
+    // Item baseCost/unitCost are Prisma Decimals, which can't cross the server->client
+    // boundary; consumers already coerce with Number(...).
+    return JSON.parse(JSON.stringify(templates));
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
@@ -9880,7 +9883,8 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     }
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return newPo;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(newPo));
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
@@ -13693,7 +13697,8 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     }));
 
     revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string, purchaseOrderId: string) {
@@ -13776,7 +13781,8 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     revalidatePath(`/projects/${projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 // Result of restoreEstimateItemAssociations — reports exactly what was (and wasn't) restored
@@ -13991,11 +13997,13 @@ export async function restoreEstimateItemAssociations({
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
     await assertFinancialProjectAccess(projectId);
 
-    return prisma.purchaseOrder.findMany({
+    const pos = await prisma.purchaseOrder.findMany({
         where: { projectId },
         select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },
         orderBy: { createdAt: "desc" },
     });
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pos));
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {
