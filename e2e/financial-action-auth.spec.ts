@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { canWriteDocumentTemplateType, canCreateContractFor, canAccessJobScope } from "../src/lib/access-rules";
+import { canWriteDocumentTemplateType, canCreateContractFor, canAccessJobScope, canAccessContract, contractScopeWhere } from "../src/lib/access-rules";
 
 function exportSource(source: string, name: string): string {
   const marker = new RegExp(`export\\s+(?:async function|const)\\s+${name}\\b`);
@@ -548,6 +548,180 @@ test("contract creation is gated for staff and session-free for the shared-secre
     .toContain('await import("@/lib/contract-creation-core")');
   expect(mcp, "the MCP tool must not call the session-gated action")
     .not.toMatch(/\bcreateContractFromTemplate\(|\bcreateContractBlank\(/);
+});
+
+// PR #360 gated contract CREATION. The rest of the family stayed open: every
+// action below was an individually invokable POST endpoint with no session
+// check at all, addressed by contract id. Reading one hands over the legal
+// body, the approval IP/user-agent trail, the signature storage paths and the
+// portal accessToken — which by itself authorizes a client to view AND SIGN —
+// and writing one could clear a contractor signature or delete the document.
+test("every exported contract action authorizes and scopes by contract id", () => {
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
+
+  // getContracts is the list, so it takes the where-fragment form of the same
+  // rule rather than the single-row assertion; everything else is by id.
+  const byId = [
+    "getContract",
+    "getExecutedContractPdf",
+    "updateContract",
+    "deleteContract",
+    "getContractSigningHistory",
+    "getContractSendDefaults",
+  ];
+  for (const name of byId) {
+    const action = exportSource(source, name);
+    const guardIndex = action.indexOf("await assertContractAccess(");
+    expect(guardIndex, `${name} must call assertContractAccess`).toBeGreaterThanOrEqual(0);
+
+    const databaseIndex = action.indexOf("prisma.");
+    if (databaseIndex >= 0) {
+      expect(guardIndex, `${name} must authorize before database access`).toBeLessThan(databaseIndex);
+    }
+
+    // Order alone is not enough: an early `return {} as any` ahead of the guard
+    // satisfies every ordering assertion above while leaving the guard dead.
+    expect(action.slice(0, guardIndex), `${name} must not return before authorizing`)
+      .not.toMatch(/\breturn\b/);
+  }
+
+  // The list must be filtered by the scope rule, not merely authenticated — an
+  // argument-less call previously returned EVERY contract in the database.
+  const list = exportSource(source, "getContracts");
+  const permissionIndex = list.indexOf('await assertStaffPermission("contracts")');
+  const filterIndex = list.indexOf("contractScopeWhere(user)");
+  expect(permissionIndex, "getContracts must require the contracts permission").toBeGreaterThanOrEqual(0);
+  expect(filterIndex, "getContracts must apply the contract scope filter").toBeGreaterThanOrEqual(0);
+  expect(permissionIndex, "getContracts must authenticate before querying")
+    .toBeLessThan(list.indexOf("prisma."));
+  expect(list.slice(0, permissionIndex), "getContracts must not return before authorizing")
+    .not.toMatch(/\breturn\b/);
+
+  // getExecutedContractPdf used to trust a caller-supplied {projectId, leadId,
+  // title} descriptor, so naming another job's ids returned that job's file.
+  // Only the id may be read off the argument now; the rest comes from the row.
+  const pdf = exportSource(source, "getExecutedContractPdf");
+  for (const trusted of ["contract.projectId", "contract.leadId", "contract.title"]) {
+    expect(pdf, `getExecutedContractPdf must not trust the caller's ${trusted}`).not.toContain(trusted);
+  }
+  expect(pdf, "getExecutedContractPdf must delegate the lookup to the core")
+    .toContain("executedContractPdfFor(");
+});
+
+test("the contract gate pairs the contracts permission with the job-scope rule", () => {
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
+
+  // Fixed windows rather than brace-matched ones: actions.ts is mixed-EOL, so a
+  // "\n}\n" sentinel silently matches nothing on the CRLF side and leaves an
+  // empty string that every assertion below would fail against for the wrong
+  // reason.
+  const gateStart = source.indexOf("async function assertContractAccess(");
+  expect(gateStart, "the contract gate helper must exist").toBeGreaterThanOrEqual(0);
+  const gate = source.slice(gateStart, gateStart + 800);
+  expect(gate, "the gate must require the contracts permission")
+    .toContain('await assertStaffPermission("contracts")');
+  expect(gate, "the gate must resolve the owner from the database, not the caller")
+    .toContain("await contractOwnerOrThrow(contractId)");
+  expect(gate, "the gate must apply the scope check").toContain("assertContractScope(user, contract)");
+
+  // Permission BEFORE the lookup, so "Contract not found" vs "Forbidden" cannot
+  // be used as an existence oracle by a caller holding no contract permission.
+  expect(gate.indexOf('await assertStaffPermission("contracts")'))
+    .toBeLessThan(gate.indexOf("await contractOwnerOrThrow(contractId)"));
+
+  // Nothing may short-circuit ahead of the scope check.
+  expect(gate.slice(0, gate.indexOf("assertContractScope(user, contract)")),
+    "the gate must not return before the scope check").not.toMatch(/\breturn\b/);
+
+  const scopeStart = source.indexOf("function assertContractScope(");
+  expect(scopeStart, "the scope helper must exist").toBeGreaterThanOrEqual(0);
+  const scope = source.slice(scopeStart, scopeStart + 800);
+  expect(scope, "the scope check must fail closed on an ownerless contract")
+    .toMatch(/if \(!scope\.projectId && !scope\.leadId\) \{\s*throw new Error\(/);
+  expect(scope, "the scope check must throw on a failed decision")
+    .toMatch(/if \(!canAccessContract\(user, scope\)\) throw new Error\(/);
+  expect(scope.slice(0, scope.indexOf("canAccessContract")),
+    "the scope check must not return before deciding").not.toMatch(/\breturn\b/);
+
+  // The client portal has no staff session — it proves access with the emailed
+  // accessToken or a portal session resolving to the owning Client — so it must
+  // reach the session-free core. Routing it through the gated action would
+  // break the client's download of their own executed contract outright.
+  const core = stripComments(readFileSync(join(process.cwd(), "src/lib/contract-files-core.ts"), "utf8"));
+  expect(core, "the core must exist").toContain("export async function executedContractPdfFor(");
+  expect(core, "the core must not be a server-action module").not.toMatch(/^\s*(['"])use server\1/m);
+  expect(core, "the core must still perform the lookup").toContain("prisma.projectFile.findFirst(");
+
+  const portal = stripComments(readFileSync(join(process.cwd(), "src/app/portal/contracts/[id]/page.tsx"), "utf8"));
+  expect(portal, "the portal must prove ownership first").toContain("getContractForPortal(");
+  expect(portal, "the portal must use the session-free core")
+    .toContain('from "@/lib/contract-files-core"');
+  expect(portal, "the portal must not call the staff-gated action")
+    .not.toMatch(/\bgetExecutedContractPdf\(/);
+});
+
+// Same reasoning as the creation truth table above: the tests either side of
+// this one can only assert that guard TEXT appears in the right order, and
+// inverting a condition inside canAccessContract would leave every one of them
+// passing. contractScopeWhere is checked against the same decisions so the list
+// and the detail page cannot drift apart.
+test("contract read/write scope is enforced, not merely present", () => {
+  const admin = { role: "ADMIN", permissions: null };
+  const contractsOnly = { role: "EMPLOYEE", permissions: { contracts: true } };
+  const projectOnly = { role: "EMPLOYEE", permissions: { contracts: false }, projectAccess: [{ projectId: "p1" }] };
+  const contractsAndProject = { role: "EMPLOYEE", permissions: { contracts: true }, projectAccess: [{ projectId: "p1" }] };
+  const contractsAndLead = { role: "EMPLOYEE", permissions: { contracts: true, leadAccess: true } };
+  const finance = { role: "FINANCE", permissions: null }; // default: estimates, not contracts
+
+  expect(canAccessContract(admin, { projectId: "p1" })).toBe(true);
+  expect(canAccessContract(admin, { leadId: "l1" })).toBe(true);
+
+  // Both halves of the AND are load-bearing, exactly as for creation.
+  expect(canAccessContract(contractsOnly, { projectId: "p1" })).toBe(false);
+  expect(canAccessContract(projectOnly, { projectId: "p1" })).toBe(false);
+  expect(canAccessContract(contractsAndProject, { projectId: "p1" })).toBe(true);
+  expect(canAccessContract(contractsAndProject, { projectId: "p2" })).toBe(false);
+
+  // The getContractSendDefaults fix in one line: FINANCE used to pass a
+  // hard-coded role list and read any job's client + manager emails.
+  expect(canAccessContract(finance, { projectId: "p1" })).toBe(false);
+  expect(canAccessContract({ ...finance, projectAccess: [{ projectId: "p1" }] }, { projectId: "p1" })).toBe(false);
+
+  expect(canAccessContract(contractsAndLead, { leadId: "l1" })).toBe(true);
+  expect(canAccessContract(contractsOnly, { leadId: "l1" })).toBe(false);
+  expect(canAccessContract({ role: "EMPLOYEE", permissions: { leadAccess: true } }, { leadId: "l1" })).toBe(false);
+
+  // Ownerless fails closed for everyone, ADMIN included.
+  expect(canAccessContract(admin, {})).toBe(false);
+  expect(canAccessContract(contractsAndProject, {})).toBe(false);
+
+  // Reading is gated exactly as tightly as creating — the accessToken a read
+  // returns authorizes signing, so a looser read rule would be the bigger hole.
+  for (const user of [admin, contractsOnly, projectOnly, contractsAndProject, contractsAndLead, finance]) {
+    for (const scope of [{ projectId: "p1" }, { projectId: "p2" }, { leadId: "l1" }, {}]) {
+      expect(canAccessContract(user as any, scope), `${user.role} vs ${JSON.stringify(scope)}`)
+        .toBe(canCreateContractFor(user as any, scope));
+    }
+  }
+
+  // The list filter must mirror the single-row rule branch for branch.
+  const matchesNothing = { id: { in: [] as string[] } };
+  expect(contractScopeWhere(null)).toEqual(matchesNothing);
+  expect(contractScopeWhere(undefined)).toEqual(matchesNothing);
+  // Authenticated but without `contracts`: matches nothing, not everything.
+  expect(contractScopeWhere(projectOnly)).toEqual(matchesNothing);
+  expect(contractScopeWhere(finance)).toEqual(matchesNothing);
+  expect(contractScopeWhere(contractsOnly)).toEqual(matchesNothing); // permission, no scope
+
+  // ADMIN sees every ATTACHED contract — never the ownerless ones, because
+  // canAccessContract rejects those for every role.
+  expect(contractScopeWhere(admin)).toEqual({
+    OR: [{ projectId: { not: null } }, { leadId: { not: null } }],
+  });
+  expect(contractScopeWhere(contractsAndProject)).toEqual({ OR: [{ projectId: { in: ["p1"] } }] });
+  expect(contractScopeWhere(contractsAndLead)).toEqual({
+    OR: [{ projectId: null, leadId: { not: null } }],
+  });
 });
 
 test("lead → project conversion is gated for staff and session-free for pre-authorized callers", () => {

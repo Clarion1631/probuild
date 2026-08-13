@@ -15,6 +15,8 @@ export {
     canAccessJobScope,
     canAccessEstimate,
     canCreateContractFor,
+    canAccessContract,
+    contractScopeWhere,
     estimateScopeWhere,
     estimateTotalsAreComplete,
     canWriteDocumentTemplateType,
