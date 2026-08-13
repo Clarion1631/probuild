@@ -2080,10 +2080,10 @@ function createHandler(actor: RouteMcpActor) {
                     : await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
                 if (!exists) return { ...textResult({ error: `${context.type} not found: ${context.id}` }), isError: true };
 
-                const { createContractFromTemplate, createContractBlank } = await import("@/lib/actions");
+                const { createContractFromTemplateCore, createContractBlankCore } = await import("@/lib/contract-creation-core");
                 const contract = templateId
-                    ? await createContractFromTemplate(templateId, context, title)
-                    : await createContractBlank(context, title!, bodyHtml!);
+                    ? await createContractFromTemplateCore(templateId, context, title)
+                    : await createContractBlankCore(context, title!, bodyHtml!);
 
                 const warnings: string[] = [];
                 if (!CLIENT_SIGN_BLOCK_RE.test(contract.body || "")) {

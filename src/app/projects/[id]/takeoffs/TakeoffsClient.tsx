@@ -6,6 +6,22 @@ import { isTaxRow, numOr, rmc } from "@/lib/takeoff-costing";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
+/**
+ * MARKUP SEMANTIC — read before "fixing" the pricing math below.
+ *
+ * The rows on this screen are AI takeoff rows, not EstimateItem rows, and their `markupPercent`
+ * is a TRUE MARKUP ON COST (`sell = baseCost * (1 + m/100)`) — that is what the takeoff prompt in
+ * `api/takeoffs/ai-estimate` asks the model for, so the preview must reprice the same way or the
+ * numbers shown here would disagree with the ones the model returned.
+ *
+ * `EstimateItem.markupPercent` holds the opposite semantic — GROSS MARGIN ON SELL
+ * (`sell = baseCost / (1 - m/100)`, see `lib/budget-math.ts`). The translation happens once, at
+ * `api/takeoffs/convert-to-estimate`. Do not "unify" the `(1 + m/100)` formulas in this file: they
+ * are correct for pre-conversion takeoff rows. Switching them to margin math would reinterpret the
+ * percentage the model returned and change the sell price shown here, and the conversion route would
+ * then derive its margin from that altered cost/price pair — a mispricing, not a double conversion.
+ */
+
 interface TakeoffFile {
     id: string;
     name: string;

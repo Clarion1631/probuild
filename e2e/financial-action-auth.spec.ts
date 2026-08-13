@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { canWriteDocumentTemplateType } from "../src/lib/access-rules";
+import { canWriteDocumentTemplateType, canCreateContractFor, canAccessJobScope } from "../src/lib/access-rules";
 
 function exportSource(source: string, name: string): string {
   const marker = new RegExp(`export\\s+(?:async function|const)\\s+${name}\\b`);
@@ -179,6 +179,14 @@ test("all staff financial actions authorize inside the exported action", () => {
   for (const name of entityScopedFinancialReports) {
     expectGuardBeforeDatabase(source, name, "await assertFinancialPermission(");
     expect(exportSource(source, name)).toContain("assertFinancialProjectScope(");
+  }
+
+  // Contract creation is addressed by a project/lead id alone, so it must
+  // authorize before it touches either the template library or the Contract
+  // table itself — not just gate "is this staff", which any anonymous caller
+  // to a server action can never satisfy on its own.
+  for (const name of ["createContractFromTemplate", "createContractBlank"]) {
+    expectGuardBeforeDatabase(source, name, "await assertContractContextAccess(");
   }
 
   for (const name of ["getLeads", "getProjects", "getProject", "getClients"]) {
@@ -421,6 +429,125 @@ test("document template type scope is enforced, not merely present", () => {
   for (const bad of [null, undefined, "", "TERMS", "terms ", "unknown_type"]) {
     expect(canWriteDocumentTemplateType(u("FINANCE"), bad as any), `must fail closed on ${JSON.stringify(bad)}`).toBe(false);
   }
+});
+
+// Most of this file can only assert that guard TEXT is present in the right
+// order — invert a condition inside a helper and every string match still
+// passes. canCreateContractFor / canAccessJobScope live in access-rules.ts
+// (pure, no Prisma or next-auth) precisely so this test can exercise real
+// decisions instead of grepping for them.
+test("contract creation scope is enforced, not merely present", () => {
+  const admin = { role: "ADMIN", permissions: null };
+  const contractsOnly = { role: "EMPLOYEE", permissions: { contracts: true } };
+  const projectOnly = { role: "EMPLOYEE", permissions: { contracts: false }, projectAccess: [{ projectId: "p1" }] };
+  const contractsAndProject = { role: "EMPLOYEE", permissions: { contracts: true }, projectAccess: [{ projectId: "p1" }] };
+  const contractsAndLead = { role: "EMPLOYEE", permissions: { contracts: true, leadAccess: true } };
+  const finance = { role: "FINANCE", permissions: null }; // default: estimates, not contracts
+
+  // ADMIN passes for both a project scope and a lead scope — ADMIN_ROLES pass
+  // canAccessProject unconditionally, and hasPermission grants every key.
+  expect(canCreateContractFor(admin, { projectId: "p1" })).toBe(true);
+  expect(canCreateContractFor(admin, { leadId: "l1" })).toBe(true);
+
+  // Has `contracts` but no access to THIS project: permission alone must not
+  // be enough, or any staffer holding `contracts` could target any job.
+  expect(canCreateContractFor(contractsOnly, { projectId: "p1" })).toBe(false);
+
+  // Has project access but not `contracts`: scope alone must not be enough
+  // either — both halves of the AND are load-bearing.
+  expect(canCreateContractFor(projectOnly, { projectId: "p1" })).toBe(false);
+
+  // Has both: passes.
+  expect(canCreateContractFor(contractsAndProject, { projectId: "p1" })).toBe(true);
+  // ...but not for a DIFFERENT project it was never granted access to.
+  expect(canCreateContractFor(contractsAndProject, { projectId: "p2" })).toBe(false);
+
+  // FINANCE's role default is `estimates`, not `contracts` — exactly the
+  // mislabeling this gate exists to avoid falling into.
+  expect(canCreateContractFor(finance, { projectId: "p1" })).toBe(false);
+  expect(canCreateContractFor({ ...finance, projectAccess: [{ projectId: "p1" }] }, { projectId: "p1" })).toBe(false);
+
+  // Lead scope passes only with BOTH `leadAccess` and `contracts`.
+  expect(canCreateContractFor(contractsAndLead, { leadId: "l1" })).toBe(true);
+  expect(canCreateContractFor(contractsOnly, { leadId: "l1" })).toBe(false); // no leadAccess
+  expect(canCreateContractFor({ role: "EMPLOYEE", permissions: { leadAccess: true } }, { leadId: "l1" })).toBe(false); // no contracts
+
+  // Both ids null fails closed for EVERYONE, including ADMIN — there is
+  // nothing to check access against.
+  expect(canCreateContractFor(admin, {})).toBe(false);
+  expect(canCreateContractFor(contractsAndProject, {})).toBe(false);
+
+  // canAccessJobScope is the shared ownership predicate underneath — same
+  // truth table, minus the `contracts` permission requirement.
+  expect(canAccessJobScope(admin, { projectId: "p1" })).toBe(true);
+  expect(canAccessJobScope(projectOnly, { projectId: "p1" })).toBe(true);
+  expect(canAccessJobScope(projectOnly, { projectId: "p2" })).toBe(false);
+  expect(canAccessJobScope({ role: "EMPLOYEE", permissions: { leadAccess: true } }, { leadId: "l1" })).toBe(true);
+  expect(canAccessJobScope({ role: "EMPLOYEE", permissions: null }, { leadId: "l1" })).toBe(false);
+  expect(canAccessJobScope(admin, {})).toBe(false);
+});
+
+test("contract creation is gated for staff and session-free for the shared-secret MCP caller", () => {
+  const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
+  const core = stripComments(readFileSync(join(process.cwd(), "src/lib/contract-creation-core.ts"), "utf8"));
+
+  // The unguarded creation body must live in a module that is not itself a
+  // remotely invokable endpoint, or extracting it would simply move the hole.
+  expect(core, "the core must exist").toContain("export async function createContractFromTemplateCore(");
+  expect(core, "the core must exist").toContain("export async function createContractBlankCore(");
+  expect(core, "the core must not be a server-action module").not.toMatch(/^\s*(['"])use server\1/m);
+  expect(core, "the core must still create the contract").toContain("prisma.contract.create(");
+
+  // Both exported actions must delegate rather than carry the body, so there is
+  // exactly one creation path and it cannot drift out from under the gate.
+  for (const [action, coreCall] of [
+    ["createContractFromTemplate", "createContractFromTemplateCore("],
+    ["createContractBlank", "createContractBlankCore("],
+  ]) {
+    const body = exportSource(source, action);
+    const guardIndex = body.indexOf("await assertContractContextAccess(context)");
+    const coreIndex = body.indexOf(coreCall);
+    expect(guardIndex, `${action} must authorize the target job`).toBeGreaterThanOrEqual(0);
+    expect(coreIndex, `${action} must delegate to the core`).toBeGreaterThanOrEqual(0);
+    expect(guardIndex, `${action} must authorize before creating`).toBeLessThan(coreIndex);
+    expect(body, `${action} must not carry the creation body itself`).not.toContain("prisma.contract.create(");
+    // Same short-circuit class as the gate helper below: an early return ahead
+    // of the guard leaves every ordering assertion above true and the guard
+    // itself dead code.
+    expect(body.slice(0, guardIndex), `${action} must not return before authorizing`)
+      .not.toMatch(/\breturn\b/);
+  }
+
+  // The gate itself must pair authentication with the pure scope rule — an
+  // assertActiveStaff() alone would let any staffer target any job.
+  // A fixed window rather than a brace-matched one: actions.ts is mixed-EOL, so
+  // a "\n}\n" sentinel silently matches nothing on the CRLF side and leaves an
+  // empty string that every toContain below would fail against for the wrong
+  // reason. The helper is a handful of lines; 800 chars comfortably covers it.
+  const gateStart = source.indexOf("async function assertContractContextAccess(");
+  expect(gateStart, "the contract gate helper must exist").toBeGreaterThanOrEqual(0);
+  const gateBody = source.slice(gateStart, gateStart + 800);
+  expect(gateBody, "the gate must authenticate").toContain("await assertActiveStaff()");
+  expect(gateBody, "the gate must throw on a failed scope check")
+    .toMatch(/if \(!canCreateContractFor\(user, scope\)\) throw new Error\(/);
+
+  // Presence and order are not enough on their own: an early `return {} as any`
+  // ahead of the checks satisfies every assertion above while authorizing
+  // everybody, because the checks below it are simply never reached. Assert
+  // that nothing returns before the scope check does its work — the gate's only
+  // legitimate return is the trailing `return user`.
+  const gateToCheck = gateBody.slice(0, gateBody.indexOf("canCreateContractFor"));
+  expect(gateToCheck, "the gate must not short-circuit before the scope check")
+    .not.toMatch(/\breturn\b/);
+
+  // The MCP create_contract tool authenticates by shared secret and has no
+  // NextAuth staff session, so it must reach the core directly — routing it
+  // through the guarded action would break it outright.
+  const mcp = stripComments(readFileSync(join(process.cwd(), "src/app/api/mcp/[transport]/route.ts"), "utf8"));
+  expect(mcp, "the MCP tool must use the session-free core")
+    .toContain('await import("@/lib/contract-creation-core")');
+  expect(mcp, "the MCP tool must not call the session-gated action")
+    .not.toMatch(/\bcreateContractFromTemplate\(|\bcreateContractBlank\(/);
 });
 
 test("lead → project conversion is gated for staff and session-free for pre-authorized callers", () => {

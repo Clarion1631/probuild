@@ -87,21 +87,49 @@ export function canAccessProject(user: ProjectScopedUser, projectId: string): bo
 export type EstimateOwner = { projectId?: string | null; leadId?: string | null };
 
 /**
+ * The horizontal job-scope rule: given a job's owner (a project or a lead) and
+ * a user, does this user's access reach that job? Extracted out of
+ * canAccessEstimate because it is not really an estimate rule — it is the
+ * ownership check every per-job document (estimates, contracts) is gated by,
+ * and canCreateContractFor below needs the exact same decision.
+ *
+ * Fail CLOSED on an ownerless scope. "No project and no lead" means there is
+ * nothing to check access against, so nobody passes — not even an admin.
+ * Project ownership wins when both are present: a converted estimate carries
+ * BOTH ids, and `leadAccess` must not rescue a document on a job the user
+ * can't otherwise reach.
+ */
+export function canAccessJobScope(user: ProjectScopedUser, scope: EstimateOwner): boolean {
+    if (!scope.projectId && !scope.leadId) return false;
+    if (scope.projectId) return canAccessProject(user, scope.projectId);
+    return hasPermission(user, "leadAccess");
+}
+
+/**
  * THE estimate scope rule. Both the assertion (assertEstimateScope in
  * actions.ts) and the list filter (estimateScopeWhere below) are defined in
  * terms of this one function, so they cannot answer differently.
  *
  * FINANCE is deliberately NOT exempt the way assertFinancialProjectScope
  * exempts it for company-wide reports — an estimate is a per-job document.
+ * (The ownership decision itself is canAccessJobScope; this is that name kept
+ * stable for the estimate call sites that already depend on it.)
  */
 export function canAccessEstimate(user: ProjectScopedUser, scope: EstimateOwner): boolean {
-    // Fail CLOSED on an ownerless estimate. "No project and no lead" means there
-    // is nothing to check access against, so nobody passes — not even an admin.
-    if (!scope.projectId && !scope.leadId) return false;
-    // Project ownership wins: a converted estimate carries BOTH ids, and
-    // `leadAccess` must not rescue an estimate on a job the user can't reach.
-    if (scope.projectId) return canAccessProject(user, scope.projectId);
-    return hasPermission(user, "leadAccess");
+    return canAccessJobScope(user, scope);
+}
+
+/**
+ * Whether this user may create a contract on the given job.
+ *
+ * Gated on the `contracts` permission, not `estimates` — authoring a binding
+ * contract is a distinct capability from estimating a job. Using `estimates`
+ * here would both over-grant (FINANCE's role default is `estimates`, not
+ * `contracts`) and mislabel the gate: someone who can only estimate a job
+ * should not thereby be able to generate its contract.
+ */
+export function canCreateContractFor(user: ProjectScopedUser, scope: EstimateOwner): boolean {
+    return hasPermission(user, "contracts") && canAccessJobScope(user, scope);
 }
 
 /**
