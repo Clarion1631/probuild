@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { parsePaymentsFilters, queryPaymentsData } from "@/lib/payments-report";
 import { formatLocalDateString } from "@/lib/report-utils";
+import { formatMoneyDate, formatMoneyMonth } from "@/lib/payment-date";
 import PaymentsFiltersForm from "./PaymentsFiltersForm";
 
 export default async function PaymentsReportPage({
@@ -26,7 +27,7 @@ export default async function PaymentsReportPage({
 
     const byMonth: Record<string, typeof rows> = {};
     for (const r of rows) {
-        const key = new Date(r.date).toLocaleString("en-US", { month: "long", year: "numeric" });
+        const key = formatMoneyMonth(new Date(r.date));
         if (!byMonth[key]) byMonth[key] = [];
         byMonth[key].push(r);
     }
@@ -101,7 +102,7 @@ export default async function PaymentsReportPage({
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMuted">{r.clientName}</td>
                                         <td className="px-4 py-3 text-hui-textMuted">
-                                            {new Date(r.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                                            {formatMoneyDate(r.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMuted capitalize">{r.paymentMethod ?? "—"}</td>
                                         <td className="px-4 py-3 text-right font-semibold text-hui-textMain">{fmt(r.amount)}</td>

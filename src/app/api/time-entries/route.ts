@@ -26,7 +26,15 @@ export async function GET(req: Request) {
         where: whereClause,
         include: {
             user: true,
-            project: true,
+            // Explicit select — a full Project row would serialize
+            // chatWebhookUrl (a credential) to field crew.
+            project: {
+                select: {
+                    id: true, name: true, status: true, location: true,
+                    locationLat: true, locationLng: true, geofenceRadiusMeters: true,
+                    color: true, code: true, clientId: true,
+                },
+            },
             costCode: true
         },
         orderBy: {
@@ -43,7 +51,11 @@ export async function POST(req: Request) {
     const { user } = auth;
 
     const body = await req.json();
-    const { projectId, costCodeId, estimateItemId, startTime, latitude, longitude } = body;
+    const {
+        projectId, costCodeId, estimateItemId, startTime, latitude, longitude,
+        // Suggestion audit (newer clients only — older app versions omit all of these)
+        suggestedScheduleTaskId, suggestedCostCodeId, suggestionSource, suggestionOverridden,
+    } = body;
 
     if (!projectId) {
         return NextResponse.json({ error: "Project ID is required" }, { status: 400 });
@@ -52,24 +64,77 @@ export async function POST(req: Request) {
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
 
+    // Cost attribution: the estimate item is what actually gets charged, so it
+    // must belong to this project (on an eligible estimate) and its cost code
+    // wins over whatever the client sent. Mobile historically sent
+    // costCodeId: null, which is exactly how wrong/missing cost codes happened.
+    let resolvedEstimateItemId: string | null = null;
+    let resolvedCostCodeId: string | null = null;
+    if (estimateItemId) {
+        const item = await prisma.estimateItem.findFirst({
+            where: {
+                id: estimateItemId,
+                estimate: {
+                    projectId,
+                    status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
+                    archivedAt: null,
+                },
+            },
+            select: { id: true, costCodeId: true },
+        });
+        if (!item) {
+            return NextResponse.json({ error: "Estimate item does not belong to an eligible estimate on this project" }, { status: 400 });
+        }
+        resolvedEstimateItemId = item.id;
+        // The item alone decides the charge — a client-sent costCodeId must not
+        // fill in for a codeless item, or crew can charge any code they like.
+        resolvedCostCodeId = item.costCodeId ?? null;
+    } else if (costCodeId && typeof costCodeId === "string") {
+        // True legacy path (no estimate item): keep the client's code, but only
+        // if it actually exists.
+        const code = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
+        resolvedCostCodeId = code?.id ?? null;
+    }
+
+    // Suggestion audit fields: trust nothing about the suggested task without
+    // re-checking it lives on this project (it feeds manager review, not cost).
+    let auditSuggestedTaskId: string | null = null;
+    let auditSuggestedTaskName: string | null = null;
+    if (suggestedScheduleTaskId && typeof suggestedScheduleTaskId === "string") {
+        const suggestedTask = await prisma.scheduleTask.findFirst({
+            where: { id: suggestedScheduleTaskId, projectId },
+            select: { id: true, name: true },
+        });
+        if (suggestedTask) {
+            auditSuggestedTaskId = suggestedTask.id;
+            auditSuggestedTaskName = suggestedTask.name;
+        }
+    }
+    const validSources = ["daily_log", "today_schedule", "user_history"];
+
     const entryStartTime = startTime ? new Date(startTime) : new Date();
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
         dayKey: toCompanyDayKey(entryStartTime),
-        estimateItemId,
+        estimateItemId: resolvedEstimateItemId,
     });
 
     const timeEntry = await prisma.timeEntry.create({
         data: {
             userId: user.id,
             projectId,
-            costCodeId: costCodeId || null,
-            estimateItemId: estimateItemId || null,
+            costCodeId: resolvedCostCodeId,
+            estimateItemId: resolvedEstimateItemId,
             startTime: entryStartTime,
             latitude,
             longitude,
             scheduleTaskId,
+            suggestedScheduleTaskId: auditSuggestedTaskId,
+            suggestedTaskName: auditSuggestedTaskName,
+            suggestedCostCodeId: typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
+            suggestionSource: validSources.includes(suggestionSource) ? suggestionSource : null,
+            suggestionOverridden: suggestionOverridden === true,
         }
     });
 

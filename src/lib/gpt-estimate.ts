@@ -396,6 +396,9 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
     const newMilestones = rewriteMilestones ? recomputeMilestones(newTotal, milestoneSource) : [];
 
     const changed: string[] = [];
+    // Set inside the item-rewrite branch below, applied to the estimate.update() `data` object
+    // once it exists — see the itemsRevision bump comment at the deleteMany/createMany site.
+    let bumpItemsRevision = false;
     try {
         await prisma.$transaction(async tx => {
             // Lock the estimate row, then re-check editability against the freshest
@@ -422,6 +425,7 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
                         estimateId: existing.id,
                         OR: [
                             { purchaseOrderId: { not: null } },
+                            { purchaseOrderLinks: { some: {} } },
                             { timeEntries: { some: {} } },
                             { expenses: { some: {} } },
                             { scheduleTask: { isNot: null } },
@@ -461,6 +465,12 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
                     });
                 }
                 changed.push(`line items (${transformed.items.length})`);
+                // This wholesale-rewrites the item collection of an EXISTING estimate outside
+                // the editor's own CAS'd save — a stale editor session open on this estimate
+                // must be rejected the next time it saves, or it would silently revert this
+                // rewrite (the incident this spec's REVISION 2 exists to close). See
+                // docs/specs/estimate-item-optimistic-concurrency.md.
+                bumpItemsRevision = true;
             }
 
             if (rewriteMilestones) {
@@ -492,6 +502,7 @@ export async function updateEstimateFromPhases(input: UpdateEstimateInput): Prom
             // guarantees no payment has been applied, so there is nothing to net out.
             if (recomputeTotal && totalChanged) { data.totalAmount = newTotal; data.balanceDue = newTotal; changed.push("total"); }
             else if (recomputeTotal) { data.totalAmount = newTotal; data.balanceDue = newTotal; }
+            if (bumpItemsRevision) data.itemsRevision = { increment: 1 };
             if (Object.keys(data).length > 0) await tx.estimate.update({ where: { id: existing.id }, data });
         });
     } catch (err) {

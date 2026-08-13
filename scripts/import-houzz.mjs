@@ -852,6 +852,9 @@ async function importDocumentItems(section) {
     }
 
     let order = 0;
+    // Per-estimate count, so the itemsRevision bump below fires only when rows were really
+    // added — a doc whose rows all had blank names must not invalidate an open editor.
+    let createdForDoc = 0;
     for (const row of items) {
       try {
         const name = (row.NAME || '').trim();
@@ -894,10 +897,13 @@ async function importDocumentItems(section) {
             total: totalPayment,
             order: order++,
             baseCost: materialCost > 0 ? (quantity > 0 ? materialCost / quantity : materialCost) : null,
+            // Houzz PROFIT_PERCENTAGE is already a gross-margin-on-sell value, matching
+            // the canonical markupPercent semantic (see src/lib/budget-math.ts) — no conversion needed.
             markupPercent: parseMoney(row.PROFIT_PERCENTAGE) || 0,
           },
         });
         stats.items.created++;
+        createdForDoc++;
       } catch (err) {
         stats.items.errors.push({ docNum, name: row.NAME, error: err.message });
       }
@@ -912,9 +918,32 @@ async function importDocumentItems(section) {
       const total = Number(itemsSum._sum.total || 0);
       await prisma.estimate.update({
         where: { id: estimateId },
-        data: { totalAmount: total, balanceDue: total },
+        data: {
+          totalAmount: total,
+          balanceDue: total,
+          // The loop above appended items to an estimate that already existed (it only skips
+          // when the estimate already HAS items, so an empty pre-existing estimate gets filled
+          // here). Anyone with that estimate open in the editor is now holding a stale item
+          // collection; bumping itemsRevision makes their next save fail the optimistic-
+          // concurrency check and tell them to reload, instead of silently deleting every row
+          // this import just created. See docs/specs/estimate-item-optimistic-concurrency.md.
+          // This is an operator-run offline import, so no lock is taken — a concurrent live
+          // save is not a scenario this script is run in.
+          ...(createdForDoc > 0 ? { itemsRevision: { increment: 1 } } : {}),
+        },
       });
-    } catch { /* non-critical */ }
+    } catch (err) {
+      // Was a silent swallow. It can't stay silent now that the itemsRevision bump rides along
+      // in this same update: if it fails, the rows are already committed but the estimate keeps
+      // stale totals AND a stale revision, and a rerun won't repair it (the loop above skips any
+      // estimate that already has items). The operator has to know to fix it by hand.
+      //
+      // Recorded in stats.items.errors, not just logged: the run summary and the process exit
+      // code are both driven off the stats, so a log-only failure would print "Errors 0" and
+      // exit 0 over an unrecoverable partial import.
+      console.error(`[Items] Totals/revision update FAILED for estimate ${estimateId} after creating ${createdForDoc} item(s) — fix by hand:`, err.message);
+      stats.items.errors.push({ docNum, name: `(totals/revision update for estimate ${estimateId})`, error: err.message });
+    }
   }
 
   console.log(`[Items] Created ${stats.items.created}, Skipped ${stats.items.skipped}, Errors ${stats.items.errors.length}`);

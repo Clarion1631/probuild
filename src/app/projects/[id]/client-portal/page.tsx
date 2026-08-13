@@ -42,6 +42,7 @@ export default async function ClientPortalPage({ params }: Props) {
         showContracts: visibility?.showContracts ?? true,
         showSelections: visibility?.showSelections ?? false,
         showMoodBoards: visibility?.showMoodBoards ?? false,
+        showPermits: visibility?.showPermits ?? true,
         showSchedule: visibility?.showSchedule ?? false,
         showFiles: visibility?.showFiles ?? false,
         showDailyLogs: visibility?.showDailyLogs ?? false,

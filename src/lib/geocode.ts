@@ -26,6 +26,30 @@ export type GeocodedAddress = {
 
 let warnedDenied = false;
 
+// Exported for tests. Positive recognition, not a label denylist: a 5-digit
+// group counts as a zip only when it directly follows US-address zip context —
+// a two-letter token (state abbreviation, "WA 98665") or a comma ("Vancouver,
+// 98661"). Labelled numbers ("PO Box 98665", "Unit 20500", "Site: 12345") and
+// 5-digit house numbers never qualify. The last qualifying group wins, so a
+// trailing unit ("…, WA 98661, Unit 205") still yields the zip. Zip+4 keeps
+// the first five digits. US-only by design, matching region=us below.
+const ZIP_CONTEXT_RE = /(?:\b[A-Za-z]{2}[.,]?|,)\s*(\d{5})(?:-\d{4})?\b/g;
+
+export function extractZip(text: string): string | null {
+    let zip: string | null = null;
+    for (const m of text.matchAll(ZIP_CONTEXT_RE)) zip = m[1];
+    return zip;
+}
+
+function googlePostalCode(result: any): string | null {
+    if (!Array.isArray(result?.address_components)) return null;
+    const comp = result.address_components.find(
+        (c: any) => Array.isArray(c?.types) && c.types.includes("postal_code")
+    );
+    const code = comp?.short_name || comp?.long_name;
+    return typeof code === "string" && /^\d{5}/.test(code) ? code.slice(0, 5) : null;
+}
+
 export async function geocodeJobSiteAddress(raw: string | null | undefined): Promise<GeocodedAddress | null> {
     const address = raw?.trim();
     if (!address) return null;
@@ -67,7 +91,15 @@ export async function geocodeJobSiteAddress(raw: string | null | undefined): Pro
             lat = geometry.location.lat;
             lng = geometry.location.lng;
         }
-        return { formattedAddress, lat, lng };
+        // Google silently "corrects" a zip it disagrees with — without setting
+        // partial_match — which reverted hand-fixed zips on every save (EST-00508,
+        // Aug 2026). A zip the user typed wins over Google's (or over a result
+        // that dropped it); the coordinates still apply since the street itself
+        // resolved. Google's zip comes from address_components, not string parsing.
+        const inputZip = extractZip(address);
+        const googleZip = googlePostalCode(result) ?? extractZip(formattedAddress);
+        const zipOverridden = inputZip != null && inputZip !== googleZip;
+        return { formattedAddress: zipOverridden ? address : formattedAddress, lat, lng };
     } catch {
         return null;
     }

@@ -112,7 +112,7 @@ async function main() {
     // Static registry, security, migration, and no-Phase-2 contracts.
     assert.match(routeSource, /MCP_SECRET_RICHARD/);
     assert.match(routeSource, /timingSafeEqual/);
-    assert.match(routeSource, /serverInfo:\s*\{\s*name:\s*"probuild",\s*version:\s*"1\.14\.0"\s*\}/);
+    assert.match(routeSource, /serverInfo:\s*\{\s*name:\s*"probuild",\s*version:\s*"1\.16\.0"\s*\}/);
     for (const toolName of [
         "upload_file",
         "upload_files",

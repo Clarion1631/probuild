@@ -1,6 +1,7 @@
 "use server";
 
 import { prisma } from "@/lib/prisma";
+import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 import { toNum } from "@/lib/prisma-helpers";
 import { canAccessProject, canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 
@@ -67,7 +68,9 @@ export async function getBudgetData(projectId: string) {
             balanceDue: toNum(estimate.balanceDue),
             items: estimate.items.map((item) => ({
                 ...item,
-                isSection: "isSection" in item ? Boolean((item as { isSection?: boolean }).isSection) : false,
+                // EstimateItem has no `isSection` column — derive it with the shared predicate
+                // (type === "Section" OR has children), the same rule the editor and PDF use.
+                isSection: isEstimateSectionRow(item, estimate.items),
                 quantity: toNum(item.quantity),
                 baseCost: item.baseCost === null ? null : toNum(item.baseCost),
                 markupPercent: toNum(item.markupPercent),

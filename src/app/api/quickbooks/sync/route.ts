@@ -43,7 +43,13 @@ export async function POST(req: NextRequest) {
                 select: {
                     id: true, code: true, title: true, status: true,
                     totalAmount: true, balanceDue: true, createdAt: true, projectId: true,
-                    items: { select: { name: true, quantity: true, unitCost: true, total: true, type: true } },
+                    // id/parentId feed the section-header detection in `buildQBEstimateLines`.
+                    // orderBy keeps QB LineNum in the estimate's own row order rather than
+                    // whatever order Postgres happens to return.
+                    items: {
+                        orderBy: [{ order: "asc" }, { id: "asc" }],
+                        select: { id: true, parentId: true, name: true, quantity: true, unitCost: true, total: true, type: true },
+                    },
                     project: { include: { client: true } },
                 },
             });
@@ -61,7 +67,11 @@ export async function POST(req: NextRequest) {
                 code: estimate.code,
                 title: estimate.title,
                 totalAmount: toNum(estimate.totalAmount),
+                // Passed through whole — `syncEstimateToQB` drops section headers itself, so the
+                // hierarchy fields have to survive this mapping.
                 items: estimate.items.map(i => ({
+                    id: i.id,
+                    parentId: i.parentId,
                     name: i.name,
                     quantity: i.quantity,
                     unitCost: toNum(i.unitCost),

@@ -5,6 +5,7 @@ import { useState } from "react";
 import Link from "next/link";
 import type { TransactionsFilters, TransactionType } from "@/lib/transactions-report";
 import { formatLocalDateString } from "@/lib/report-utils";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 type Option = { id: string; name: string };
 
@@ -177,7 +178,7 @@ export default function TransactionsFiltersForm({
                                 {rows.map(row => (
                                     <tr key={row.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                         <td className="px-4 py-3 text-hui-textMuted">
-                                            {new Date(row.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                                            {formatMoneyDate(row.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMain">{row.description}</td>
                                         <td className="px-4 py-3">
@@ -239,7 +240,7 @@ export default function TransactionsFiltersForm({
                                     {group.rows.map(row => (
                                         <tr key={row.id} className="border-b border-hui-border last:border-0 hover:bg-hui-surface/50">
                                             <td className="px-4 py-3 text-hui-textMuted">
-                                                {new Date(row.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                                                {formatMoneyDate(row.date, { month: "short", day: "numeric", year: "numeric" }, "en-US")}
                                             </td>
                                             <td className="px-4 py-3 text-hui-textMain">{row.description}</td>
                                             <td className="px-4 py-3">

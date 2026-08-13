@@ -1,10 +1,7 @@
-import { getServerSession } from "next-auth";
 import { NextRequest, NextResponse } from "next/server";
-import { authOptions } from "@/lib/auth";
-import { verifyClientPortalToken } from "@/lib/client-portal-auth";
 import { generateChangeOrderBillingPdf } from "@/lib/pdf";
+import { getPortalClientId, isStaffRequest } from "@/lib/pdf-route-auth";
 import { prisma } from "@/lib/prisma";
-import { isStaffAccountEnabled } from "@/lib/staff-status";
 
 function notFound() {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
@@ -29,17 +26,15 @@ export async function GET(
     });
     if (!billing?.paymentSchedule) return notFound();
 
-    const session = await getServerSession(authOptions);
-    const staffEmail = session?.user?.email;
-    const staffAuthorized = Boolean(staffEmail && await isStaffAccountEnabled(staffEmail));
-
-    const token = req.nextUrl.searchParams.get("token") || req.cookies.get("client_portal_token")?.value;
-    const tokenPayload = token ? await verifyClientPortalToken(token) : null;
-    const invoiceClientId = billing.paymentSchedule.invoice.clientId
-        || billing.paymentSchedule.invoice.project?.clientId
-        || null;
-    const portalAuthorized = Boolean(tokenPayload && invoiceClientId && tokenPayload.clientId === invoiceClientId);
-    if (!staffAuthorized && !portalAuthorized) return notFound();
+    if (!await isStaffRequest()) {
+        // OR entitlement, mirroring getInvoiceForPortal: the invoice's own
+        // client or the project's client may fetch the billing backup.
+        const portalClientId = await getPortalClientId(req);
+        const invoice = billing.paymentSchedule.invoice;
+        const portalAuthorized = Boolean(portalClientId
+            && (portalClientId === invoice.clientId || portalClientId === invoice.project?.clientId));
+        if (!portalAuthorized) return notFound();
+    }
 
     try {
         const pdf = await generateChangeOrderBillingPdf(id, billingId);

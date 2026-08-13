@@ -32,7 +32,7 @@ function getStatusDot(status: string, statuses: ProjectStatus[]) {
     return statuses.find(s => s.value === status)?.dot || "bg-slate-400";
 }
 
-export default function ProjectsClient({ projects: initialProjects, initialStatuses }: { projects: any[], initialStatuses?: ProjectStatus[] | null }) {
+export default function ProjectsClient({ projects: initialProjects, initialStatuses, revenueIsComplete }: { projects: any[], initialStatuses?: ProjectStatus[] | null, revenueIsComplete: boolean }) {
     const router = useRouter();
     const [projects, setProjects] = useState(initialProjects);
     const [statuses, setStatuses] = useState<ProjectStatus[]>(initialStatuses || DEFAULT_PROJECT_STATUSES);
@@ -220,8 +220,13 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                     <p className="text-3xl font-bold text-amber-600 mt-1">{substantialCount}</p>
                 </div>
                 <div className="hui-card p-4">
-                    <p className="text-xs text-hui-textMuted font-medium">Total Revenue</p>
+                    {/* Estimates are scoped to the caller while this project list is
+                        not, so an unscoped label here would overstate a partial sum. */}
+                    <p className="text-xs text-hui-textMuted font-medium">{revenueIsComplete ? "Total Revenue" : "Revenue (your projects)"}</p>
                     <p className="text-3xl font-bold text-hui-textMain mt-1">{totalRevenue.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 0 })}</p>
+                    {!revenueIsComplete && (
+                        <p className="text-[10px] text-hui-textMuted mt-1">Excludes projects you don&apos;t have access to</p>
+                    )}
                 </div>
             </div>
 

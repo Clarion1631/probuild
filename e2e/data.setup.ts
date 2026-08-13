@@ -1,5 +1,6 @@
 import { test as setup } from "@playwright/test";
 import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -9,6 +10,37 @@ const TEST_CLIENT_ID = "test-client-do-not-delete";
 const ADMIN_EMAIL = "jadkins@goldentouchremodeling.com";
 const DEV_ADMIN_EMAIL = "gtrsupport@goldentouchremodeling.com";
 const SENTINEL_PATH = resolve(__dirname, ".anthropic-status");
+
+// Mobile-app + suggestion spec fixtures — stable hardcoded IDs (prefix e2e-mob-)
+// attached to the PROJECT_ID test project above.
+const FIELD_CREW_EMAIL = "field-crew@test.local";
+const FIELD_CREW_PIN = "246810";
+const MANAGER_EMAIL = "manager@test.local";
+const MANAGER_PIN = "135790";
+const COST_CODE_DEMO_ID = "e2e-mob-cc-demo";
+const COST_CODE_DRYW_ID = "e2e-mob-cc-dryw";
+const MOBILE_ESTIMATE_ID = "e2e-mob-estimate";
+const MOBILE_ITEM_DEMO_ID = "e2e-mob-item-demo";
+const MOBILE_ITEM_DRYW_ID = "e2e-mob-item-dryw";
+const MOBILE_TASK_DRYW_ID = "e2e-mob-task-dryw";
+const MOBILE_DAILYLOG_ID = "e2e-mob-dailylog";
+const MOBILE_DAILYLOG_PHOTO_ID = "e2e-mob-dailylog-photo";
+const MOBILE_TIME_ENTRY_HIST_ID = "e2e-mob-entry-hist";
+
+// --- Partial-scope fixtures (prefix e2e-scope-) ---
+// A staff reader who can see estimates and leads but only ONE project, plus a
+// SECOND project they cannot reach that carries an approved estimate. Together
+// these make every scoped aggregate in the app provably partial for this user
+// and provably complete for the ADMIN, which is what estimate-scope-labels.spec
+// asserts in a real browser. The ADMIN session can never exercise that branch —
+// accessibleProjectIds returns "ALL" for ADMIN — so this second user is the only
+// way to prove the label wiring at runtime rather than by grepping the source.
+const SCOPED_STAFF_EMAIL = "scoped-staff@test.local";
+const OOS_PROJECT_ID = "e2e-scope-oos-project";
+const OOS_PROJECT_NAME = "E2E Out-Of-Scope Project — DO NOT DELETE";
+const OOS_ESTIMATE_ID = "e2e-scope-oos-estimate";
+const OOS_LEAD_ID = "e2e-scope-oos-lead";
+const OOS_LEAD_ESTIMATE_ID = "e2e-scope-oos-lead-estimate";
 
 // Substrings that identify the LIVE database. The e2e suite creates leads,
 // estimates, and invoices — it must never do that against production data.
@@ -119,6 +151,350 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
             },
         });
         console.log("[data.setup] estimate upserted:", { id: estimate.id, title: estimate.title });
+
+        // --- Mobile-app + suggestion spec fixtures ---
+        // Field-crew + manager users, a PIN-loginable pair whose hash matches
+        // /api/mobile/login's bcrypt.compare(pinCode, user.pinCode) check.
+        const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+        const daysFromNow = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
+        const atHour = (date: Date, hour: number) => {
+            const d = new Date(date);
+            d.setHours(hour, 0, 0, 0);
+            return d;
+        };
+
+        const fieldCrewPinHash = await bcrypt.hash(FIELD_CREW_PIN, 10);
+        const fieldCrew = await prisma.user.upsert({
+            where: { email: FIELD_CREW_EMAIL },
+            update: {
+                role: "FIELD_CREW",
+                status: "ACTIVATED",
+                pinCode: fieldCrewPinHash,
+                hourlyRate: 50,
+                burdenRate: 10,
+            },
+            create: {
+                email: FIELD_CREW_EMAIL,
+                name: "E2E Field Crew",
+                role: "FIELD_CREW",
+                status: "ACTIVATED",
+                pinCode: fieldCrewPinHash,
+                hourlyRate: 50,
+                burdenRate: 10,
+            },
+        });
+        console.log("[data.setup] field-crew user upserted:", { id: fieldCrew.id, email: fieldCrew.email });
+
+        const managerPinHash = await bcrypt.hash(MANAGER_PIN, 10);
+        const manager = await prisma.user.upsert({
+            where: { email: MANAGER_EMAIL },
+            update: {
+                role: "MANAGER",
+                status: "ACTIVATED",
+                pinCode: managerPinHash,
+                hourlyRate: 60,
+            },
+            create: {
+                email: MANAGER_EMAIL,
+                name: "E2E Manager",
+                role: "MANAGER",
+                status: "ACTIVATED",
+                pinCode: managerPinHash,
+                hourlyRate: 60,
+            },
+        });
+        console.log("[data.setup] manager user upserted:", { id: manager.id, email: manager.email });
+
+        // Grant project access both ways userCanAccessProject checks (ProjectAccess row
+        // OR the crew relation) — seeding both keeps the fixture valid regardless of
+        // which path a given spec exercises.
+        await prisma.projectAccess.upsert({
+            where: { userId_projectId: { userId: fieldCrew.id, projectId: PROJECT_ID } },
+            update: {},
+            create: { userId: fieldCrew.id, projectId: PROJECT_ID },
+        });
+        await prisma.project.update({
+            where: { id: PROJECT_ID },
+            data: { crew: { connect: { id: fieldCrew.id } } },
+        });
+
+        const costCodeDemo = await prisma.costCode.upsert({
+            where: { id: COST_CODE_DEMO_ID },
+            update: {},
+            create: { id: COST_CODE_DEMO_ID, code: "01-DEMO", name: "Demolition" },
+        });
+        const costCodeDryw = await prisma.costCode.upsert({
+            where: { id: COST_CODE_DRYW_ID },
+            update: {},
+            create: { id: COST_CODE_DRYW_ID, code: "05-DRYW", name: "Drywall" },
+        });
+        console.log("[data.setup] cost codes upserted:", { demo: costCodeDemo.id, dryw: costCodeDryw.id });
+
+        const mobileEstimate = await prisma.estimate.upsert({
+            where: { id: MOBILE_ESTIMATE_ID },
+            update: { status: "Approved", archivedAt: null },
+            create: {
+                id: MOBILE_ESTIMATE_ID,
+                title: "E2E Mobile Estimate — DO NOT DELETE",
+                code: "EST-E2E-MOB",
+                status: "Approved",
+                projectId: PROJECT_ID,
+                totalAmount: 2000,
+                balanceDue: 2000,
+                archivedAt: null,
+            },
+        });
+        console.log("[data.setup] mobile estimate upserted:", { id: mobileEstimate.id, status: mobileEstimate.status });
+
+        await prisma.estimateItem.upsert({
+            where: { id: MOBILE_ITEM_DEMO_ID },
+            update: {},
+            create: {
+                id: MOBILE_ITEM_DEMO_ID,
+                estimateId: MOBILE_ESTIMATE_ID,
+                name: "Demolition phase",
+                parentId: null,
+                costCodeId: COST_CODE_DEMO_ID,
+                quantity: 1,
+                unitCost: 1000,
+                total: 1000,
+            },
+        });
+        await prisma.estimateItem.upsert({
+            where: { id: MOBILE_ITEM_DRYW_ID },
+            update: {},
+            create: {
+                id: MOBILE_ITEM_DRYW_ID,
+                estimateId: MOBILE_ESTIMATE_ID,
+                name: "Drywall phase",
+                parentId: null,
+                costCodeId: COST_CODE_DRYW_ID,
+                quantity: 1,
+                unitCost: 1000,
+                total: 1000,
+            },
+        });
+        console.log("[data.setup] mobile estimate items upserted:", { demo: MOBILE_ITEM_DEMO_ID, dryw: MOBILE_ITEM_DRYW_ID });
+
+        // Active "today" whenever the suite runs — recomputed on every run (including
+        // update) so a stale first-run window doesn't age out of the active range.
+        const scheduleStart = daysAgo(3);
+        const scheduleEnd = daysFromNow(4);
+        await prisma.scheduleTask.upsert({
+            where: { id: MOBILE_TASK_DRYW_ID },
+            update: { startDate: scheduleStart, endDate: scheduleEnd, status: "In Progress" },
+            create: {
+                id: MOBILE_TASK_DRYW_ID,
+                projectId: PROJECT_ID,
+                name: "Hang drywall in hall bath",
+                type: "task",
+                status: "In Progress",
+                startDate: scheduleStart,
+                endDate: scheduleEnd,
+                // @unique — must stay 1:1 with MOBILE_ITEM_DRYW_ID across re-runs.
+                estimateItemId: MOBILE_ITEM_DRYW_ID,
+            },
+        });
+        await prisma.taskAssignment.upsert({
+            where: { taskId_userId: { taskId: MOBILE_TASK_DRYW_ID, userId: fieldCrew.id } },
+            update: {},
+            create: { taskId: MOBILE_TASK_DRYW_ID, userId: fieldCrew.id },
+        });
+        console.log("[data.setup] schedule task + assignment upserted:", { id: MOBILE_TASK_DRYW_ID, assignee: fieldCrew.id });
+
+        // DailyLog.date convention: every real writer stores UTC MIDNIGHT of the
+        // intended company-local (America/Los_Angeles) calendar day, never a raw
+        // timestamp — the suggestion engine reads the ISO date part as the day.
+        // A raw timestamp here sorts above date-only rows from the same day and
+        // flips "latest log" ordering depending on the wall clock (bit CI once).
+        const companyDayUtcMidnight = (offsetDays: number) => {
+            const parts = new Intl.DateTimeFormat("en-CA", {
+                timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+            }).formatToParts(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000));
+            const get = (type: string) => parts.find(p => p.type === type)?.value ?? "";
+            return new Date(`${get("year")}-${get("month")}-${get("day")}T00:00:00.000Z`);
+        };
+        const dailyLogDate = companyDayUtcMidnight(-1);
+        await prisma.dailyLog.upsert({
+            where: { id: MOBILE_DAILYLOG_ID },
+            update: { date: dailyLogDate },
+            create: {
+                id: MOBILE_DAILYLOG_ID,
+                projectId: PROJECT_ID,
+                createdById: fieldCrew.id,
+                date: dailyLogDate,
+                workPerformed: "Demo complete in hall bath, hauled debris",
+                nextSteps: "Start hanging drywall in the hall bath",
+            },
+        });
+        await prisma.dailyLogPhoto.upsert({
+            where: { id: MOBILE_DAILYLOG_PHOTO_ID },
+            update: {},
+            create: {
+                id: MOBILE_DAILYLOG_PHOTO_ID,
+                dailyLogId: MOBILE_DAILYLOG_ID,
+                url: "https://example.test/e2e/drywall.jpg",
+                caption: "drywall stacked in hallway",
+            },
+        });
+        console.log("[data.setup] daily log + photo upserted:", { id: MOBILE_DAILYLOG_ID, photo: MOBILE_DAILYLOG_PHOTO_ID });
+
+        const histStart = atHour(daysAgo(1), 8);
+        const histEnd = atHour(daysAgo(1), 12);
+        await prisma.timeEntry.upsert({
+            where: { id: MOBILE_TIME_ENTRY_HIST_ID },
+            update: { startTime: histStart, endTime: histEnd },
+            create: {
+                id: MOBILE_TIME_ENTRY_HIST_ID,
+                userId: fieldCrew.id,
+                projectId: PROJECT_ID,
+                costCodeId: COST_CODE_DEMO_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: histStart,
+                endTime: histEnd,
+                durationHours: 4,
+            },
+        });
+        console.log("[data.setup] historical time entry upserted:", { id: MOBILE_TIME_ENTRY_HIST_ID });
+
+        // --- Partial-scope fixtures ---
+        // EMPLOYEE, not FIELD_CREW: the pages under test need `estimates` and
+        // `leadAccess`, and granting those to a role whose defaults withhold them
+        // keeps the fixture explicit about WHY this user can read the pages at all.
+        const scopedStaff = await prisma.user.upsert({
+            where: { email: SCOPED_STAFF_EMAIL },
+            update: { role: "EMPLOYEE", status: "ACTIVATED" },
+            create: {
+                email: SCOPED_STAFF_EMAIL,
+                name: "E2E Scoped Staff",
+                role: "EMPLOYEE",
+                status: "ACTIVATED",
+            },
+        });
+        const scopedPermissions = {
+            estimates: true,
+            leadAccess: true,
+            // Off deliberately: an auto-grant would hand this user every project
+            // and silently erase the partial scope the whole fixture exists for.
+            autoGrantNewProjects: false,
+        };
+        await prisma.userPermission.upsert({
+            where: { userId: scopedStaff.id },
+            update: scopedPermissions,
+            create: { userId: scopedStaff.id, ...scopedPermissions },
+        });
+        // Exactly one project. Access is granted via ProjectAccess only — the crew
+        // relation is left alone so a stray crew connect cannot widen the scope.
+        await prisma.projectAccess.upsert({
+            where: { userId_projectId: { userId: scopedStaff.id, projectId: PROJECT_ID } },
+            update: {},
+            create: { userId: scopedStaff.id, projectId: PROJECT_ID },
+        });
+        // ...and re-narrow on re-runs, in case an earlier run or another fixture
+        // granted more. Without this the spec would pass for the wrong reason
+        // (or fail confusingly) against a reused database.
+        await prisma.projectAccess.deleteMany({
+            where: { userId: scopedStaff.id, projectId: { not: PROJECT_ID } },
+        });
+        const scopedCrewProjects = await prisma.project.findMany({
+            where: { id: { not: PROJECT_ID }, crew: { some: { id: scopedStaff.id } } },
+            select: { id: true },
+        });
+        for (const p of scopedCrewProjects) {
+            await prisma.project.update({
+                where: { id: p.id },
+                data: { crew: { disconnect: { id: scopedStaff.id } } },
+            });
+        }
+        console.log("[data.setup] scoped staff user upserted:", { id: scopedStaff.id, email: scopedStaff.email });
+
+        // The lead must exist before the project that points at it (Project.leadId).
+        // Every `update` below restates the fields the fixture is DEFINED by,
+        // not just the ones that drift. On a reused database an earlier run (or
+        // a spec that reparents rows) can leave a closed project, a re-owned
+        // estimate, or a moved lead behind, and an empty `update` would adopt
+        // that state — the specs would then pass or fail for reasons unrelated
+        // to the labels under test.
+        await prisma.lead.upsert({
+            where: { id: OOS_LEAD_ID },
+            update: { clientId: TEST_CLIENT_ID, stage: "Won" },
+            create: {
+                id: OOS_LEAD_ID,
+                name: "E2E Out-Of-Scope Lead — DO NOT DELETE",
+                clientId: TEST_CLIENT_ID,
+                stage: "Won",
+            },
+        });
+        await prisma.project.upsert({
+            where: { id: OOS_PROJECT_ID },
+            update: {
+                name: OOS_PROJECT_NAME,
+                clientId: TEST_CLIENT_ID,
+                leadId: OOS_LEAD_ID,
+                // Not "Archived": the /projects list hides archived rows, and a
+                // hidden out-of-scope project makes the revenue sum complete.
+                status: "In Progress",
+            },
+            create: {
+                id: OOS_PROJECT_ID,
+                name: OOS_PROJECT_NAME,
+                clientId: TEST_CLIENT_ID,
+                leadId: OOS_LEAD_ID,
+                status: "In Progress",
+            },
+        });
+        // Approved, so it lands in the /projects revenue sum for a reader who can
+        // see it — that sum is the number whose label is under test.
+        await prisma.estimate.upsert({
+            where: { id: OOS_ESTIMATE_ID },
+            update: {
+                status: "Approved",
+                totalAmount: 5000,
+                balanceDue: 5000,
+                archivedAt: null,
+                // Ownership is the whole point of this row — restate it, or a
+                // reparented estimate quietly stops being out of scope.
+                projectId: OOS_PROJECT_ID,
+                leadId: null,
+            },
+            create: {
+                id: OOS_ESTIMATE_ID,
+                title: "E2E Out-Of-Scope Estimate — DO NOT DELETE",
+                code: "EST-E2E-OOS",
+                status: "Approved",
+                projectId: OOS_PROJECT_ID,
+                totalAmount: 5000,
+                balanceDue: 5000,
+            },
+        });
+        // A lead-owned estimate on the same lead: reachable via `leadAccess`, so
+        // the scoped reader sees a non-empty page whose totals are still partial.
+        await prisma.estimate.upsert({
+            where: { id: OOS_LEAD_ESTIMATE_ID },
+            update: {
+                status: "Approved",
+                totalAmount: 1000,
+                balanceDue: 1000,
+                archivedAt: null,
+                leadId: OOS_LEAD_ID,
+                // Must stay lead-OWNED: given a projectId it would resolve
+                // through project access instead of leadAccess and vanish for
+                // the scoped reader, emptying the page it is here to populate.
+                projectId: null,
+            },
+            create: {
+                id: OOS_LEAD_ESTIMATE_ID,
+                title: "E2E Out-Of-Scope Lead Estimate — DO NOT DELETE",
+                code: "EST-E2E-OOS-LEAD",
+                status: "Approved",
+                leadId: OOS_LEAD_ID,
+                totalAmount: 1000,
+                balanceDue: 1000,
+            },
+        });
+        console.log("[data.setup] partial-scope fixtures upserted:", {
+            project: OOS_PROJECT_ID, lead: OOS_LEAD_ID, estimates: [OOS_ESTIMATE_ID, OOS_LEAD_ESTIMATE_ID],
+        });
 
         const verify = await prisma.project.findUnique({ where: { id: PROJECT_ID }, select: { id: true, name: true } });
         console.log("[data.setup] verify project exists:", verify);

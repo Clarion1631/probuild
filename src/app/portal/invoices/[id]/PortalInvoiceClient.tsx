@@ -6,6 +6,7 @@ import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -288,7 +289,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                         ? `Due: ${new Date(payment.dueDate).toLocaleDateString()}`
                                                         : 'Due upon receipt'}
                                                     {isPaidItem && payment.paymentDate && (
-                                                        <span className="ml-2">• Paid {new Date(payment.paymentDate).toLocaleDateString()}</span>
+                                                        <span className="ml-2">• Paid {formatMoneyDate(payment.paymentDate, {})}</span>
                                                     )}
                                                 </p>
                                                 {payment.coBilling && (

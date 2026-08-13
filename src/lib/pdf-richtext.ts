@@ -237,6 +237,75 @@ function drawTokens(
 }
 
 /**
+ * Flow PLAIN text (not HTML) onto the pdf-lib context with word wrapping and
+ * pagination, preserving typed line breaks. Used for fields users enter as
+ * free text (e.g. change-order descriptions) where "<" or "&" must render
+ * literally rather than being parsed as markup. Mutates ctx.page/ctx.y.
+ */
+export function drawWrappedText(
+    text: string,
+    ctx: RichTextCtx,
+    opts: { x: number; maxWidth: number; size: number; color: RGB; lineHeight: number },
+): { page: PDFPage; y: number } {
+    const src = stripUnencodable(text || "").replace(/\r\n?/g, "\n");
+    if (!src.trim()) return { page: ctx.page, y: ctx.y };
+
+    const tokens: Token[] = [];
+    const lines = src.split("\n");
+    lines.forEach((line, i) => {
+        if (i > 0) tokens.push({ type: "br" });
+        if (line) tokens.push({ type: "run", run: { text: line, bold: false, italic: false } });
+    });
+
+    drawTokens(ctx, tokens, opts);
+    return { page: ctx.page, y: ctx.y };
+}
+
+/**
+ * Number of wrapped lines drawWrappedText would emit for the given text/width —
+ * lets callers estimate block height for page-break decisions without drawing.
+ */
+export function measureWrappedLines(text: string, font: PDFFont, size: number, maxWidth: number): number {
+    const src = stripUnencodable(text || "").replace(/\r\n?/g, "\n");
+    if (!src.trim()) return 0;
+    // Mirrors drawTokens exactly (a line per newline() call, +1 for the first
+    // row of each source line) so preflight height estimates match what draws.
+    const spaceW = font.widthOfTextAtSize(" ", size);
+    let lines = 0;
+    for (const line of src.split("\n")) {
+        lines += 1;
+        if (!line.trim()) continue;
+        let curW = 0;
+        let drewOnLine = false;
+        for (const part of line.split(/(\s+)/)) {
+            if (part === "") continue;
+            if (/^\s+$/.test(part)) { if (drewOnLine) curW += spaceW; continue; }
+            const wordW = font.widthOfTextAtSize(part, size);
+            if (wordW <= maxWidth) {
+                if (drewOnLine && curW + wordW > maxWidth) { lines += 1; curW = 0; }
+                curW += wordW;
+                drewOnLine = true;
+            } else {
+                // Over-long word: same character-greedy hard-break as drawTokens.
+                if (drewOnLine) { lines += 1; curW = 0; }
+                let chunk = "";
+                for (const ch of part) {
+                    if (chunk && font.widthOfTextAtSize(chunk + ch, size) > maxWidth) {
+                        lines += 1;
+                        chunk = ch;
+                    } else {
+                        chunk += ch;
+                    }
+                }
+                curW = font.widthOfTextAtSize(chunk, size);
+                drewOnLine = true;
+            }
+        }
+    }
+    return lines;
+}
+
+/**
  * Render a sanitized HTML fragment onto the pdf-lib context, mutating ctx.page/ctx.y
  * as it flows and paginates. Returns the final { page, y } so the caller can continue.
  */

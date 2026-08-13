@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
+import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
@@ -166,7 +167,7 @@ function formatBytes(bytes: number): string {
 const WRITE_TOOLS = new Set([
     "create_estimate", "update_estimate", "send_estimate",
     "send_milestone_invoice", "resend_invoice", "create_invoice_from_estimate",
-    "create_change_order", "send_change_order", "bill_change_order",
+    "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
     "create_lead", "log_time", "log_expense",
     "upload_file", "upload_files", "create_folder", "move_file",
     "create_daily_log", "add_punch_items",
@@ -186,7 +187,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     create_contract: "contract", update_contract: "contract", send_contract: "contract",
     create_estimate: "estimate", update_estimate: "estimate", send_estimate: "estimate",
     create_invoice_from_estimate: "invoice", send_milestone_invoice: "invoice", resend_invoice: "invoice",
-    create_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
+    create_change_order: "change_order", update_change_order: "change_order", send_change_order: "change_order", bill_change_order: "change_order",
     apply_change_order_to_schedule: "change_order",
     create_lead: "lead",
     plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
@@ -851,6 +852,152 @@ function createHandler(actor: RouteMcpActor) {
         );
 
         server.registerTool(
+            "update_change_order",
+            {
+                title: "Edit an unsigned change order",
+                // destructiveHint: replacement lists DELETE rows that are left out.
+                // Not idempotent: retrying a call whose new rows carry no id
+                // deletes and recreates those rows under fresh ids.
+                annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Edits an unsigned Draft or Sent change order: title, description, pricing, line items, payment schedule. Omitted fields are unchanged. " +
+                    "items and paymentSchedules are FULL REPLACEMENT lists — call list_change_orders first and resend every row you want to keep (with its id); rows left out are DELETED. " +
+                    "On a row with an existing id, omitted description/costCode/dueDate keep their stored values. Item edits recompute the subtotal server-side. " +
+                    "A scope edit to a Sent change order returns it to Draft (re-send with send_change_order before the customer can sign). " +
+                    "Approved/signed change orders are locked; status cannot be changed here.",
+                inputSchema: {
+                    changeOrderId: z.string().max(50).describe("Change order id from list_change_orders or list_project_billing"),
+                    title: z.string().min(1).max(300).optional(),
+                    description: z.string().max(2000).optional().describe("Empty string clears the description"),
+                    pricingType: z.enum(["FIXED", "COST_PLUS"]).optional(),
+                    markupPercent: z.number().min(0).max(1000).nullable().optional(),
+                    items: z.array(z.object({
+                        id: z.string().max(50).optional().describe("Existing item id (from list_change_orders) to update that row in place; omit for a new item"),
+                        name: z.string().min(1).max(300),
+                        description: z.string().max(2000).optional().describe("Omitted on an existing row = keep its current description; empty string clears it"),
+                        costCode: z.string().max(50).optional().describe("Omitted on an existing row = keep its current cost code; empty string clears it"),
+                        costType: z.string().max(50).optional(),
+                        quantity: z.number().min(0).max(10_000),
+                        unitCost: z.number().min(0).max(1_000_000),
+                    })).min(1).max(100).optional().describe("Full replacement list of ALL line items (to clear every item, edit in ProBuild instead)"),
+                    paymentSchedules: z.array(z.object({
+                        id: z.string().max(50).optional().describe("Existing schedule id to update that row in place; omit for a new payment"),
+                        name: z.string().min(1).max(300),
+                        amount: z.number().positive().max(10_000_000),
+                        dueDate: z.string().optional().describe("Omitted on an existing row = keep its current due date; empty string clears it"),
+                        order: z.number().int().min(0).optional(),
+                    })).max(20).optional().describe("Full replacement: two or more payments, or an empty array to remove the schedule. The final payment is adjusted so the schedule sums to the subtotal."),
+                },
+            },
+            async ({ changeOrderId, ...args }) => {
+                // Advisory prefetch: existence check, id-strip warnings, and the
+                // reverted-to-Draft note. All authoritative merge decisions
+                // (keep-prior fields, signed-scope lock, status) happen inside
+                // updateChangeOrderCore's FOR UPDATE transaction, so a concurrent
+                // edit between this read and the core can at worst mislabel a
+                // warning — never corrupt the row.
+                const before = await prisma.changeOrder.findUnique({
+                    where: { id: changeOrderId },
+                    select: {
+                        code: true, status: true, projectId: true,
+                        items: { select: { id: true } },
+                    },
+                });
+                if (!before) return { ...textResult({ error: "Change order not found" }), isError: true };
+
+                const warnings: string[] = [];
+                const data: ChangeOrderUpdateInput = {};
+                if (args.title !== undefined) data.title = args.title;
+                if (args.description !== undefined) data.description = args.description;
+                if (args.pricingType !== undefined) data.pricingType = args.pricingType;
+                if (args.markupPercent !== undefined) data.markupPercent = args.markupPercent;
+
+                if (args.items) {
+                    // Same code-string → id mapping and type validation as create_change_order.
+                    // Keep-prior for omitted description/costCode/costType on existing rows is
+                    // resolved inside updateChangeOrderCore's locked transaction — this layer
+                    // only translates strings to ids (undefined passes through as "keep").
+                    const costCodes = await prisma.costCode.findMany({ where: { isActive: true }, select: { id: true, code: true } });
+                    const codeMap = new Map(costCodes.map(c => [c.code, c.id]));
+                    const validTypes = ["Labor", "Material", "Allowance", "Subcontractor", "Equipment", "Other"];
+                    // An explicit costType must set BOTH the scalar `type` and the
+                    // costTypeId relation (scheduling prefers the relation) — a
+                    // keep-prior costTypeId under a changed `type` would leave the
+                    // item contradicting itself.
+                    const costTypes = await prisma.costType.findMany({ where: { isActive: true }, select: { id: true, name: true } });
+                    const typeMap = new Map(costTypes.map(t => [t.name, t.id]));
+                    const priorItemIds = new Set(before.items.map(item => item.id));
+                    data.items = args.items.map((item, idx) => {
+                        const knownId = item.id !== undefined && priorItemIds.has(item.id);
+                        if (item.id && !knownId) {
+                            // Don't forward a foreign/stale id into the create path — it
+                            // could collide with an item on another change order.
+                            warnings.push(`Item id "${item.id}" is not on this change order — added as a new row instead.`);
+                        }
+                        let costCodeId: string | null | undefined;
+                        if (item.costCode === undefined) {
+                            costCodeId = undefined; // keep-prior in the core
+                        } else if (item.costCode === "") {
+                            costCodeId = null;
+                        } else if (codeMap.has(item.costCode)) {
+                            costCodeId = codeMap.get(item.costCode)!;
+                        } else {
+                            costCodeId = undefined; // keep-prior; uncoded for a new row
+                            warnings.push(`Unknown cost code "${item.costCode}" on item "${item.name}" — ${knownId ? "kept its current code" : "left uncoded"}.`);
+                        }
+                        if (item.costType && !validTypes.includes(item.costType)) {
+                            warnings.push(`Unknown cost type "${item.costType}" on item "${item.name}" — use one of: ${validTypes.join(", ")}.`);
+                        }
+                        return {
+                            id: knownId ? item.id : undefined,
+                            name: item.name,
+                            description: item.description,
+                            ...(item.costType && validTypes.includes(item.costType)
+                                ? { type: item.costType, costTypeId: typeMap.get(item.costType) ?? null }
+                                : {}),
+                            quantity: item.quantity,
+                            unitCost: item.unitCost,
+                            order: idx,
+                            costCodeId,
+                        };
+                    });
+                }
+                if (args.paymentSchedules) {
+                    data.paymentSchedules = args.paymentSchedules.map((row, idx) => ({
+                        id: row.id,
+                        name: row.name,
+                        amount: row.amount,
+                        // undefined passes through: the core keeps the stored due
+                        // date on a matching row; "" or null clears it.
+                        dueDate: row.dueDate,
+                        order: row.order ?? idx,
+                    }));
+                }
+
+                let updated;
+                try {
+                    updated = await updateChangeOrderCore(changeOrderId, data);
+                } catch (error: any) {
+                    return { ...textResult({ error: error?.message || "Failed to update change order" }), isError: true };
+                }
+                revalidatePath(`/projects/${updated.projectId}/change-orders/${changeOrderId}`);
+                revalidatePath(`/projects/${updated.projectId}/change-orders`);
+                const revertedToDraft = before.status === "Sent" && updated.status === "Draft";
+                return textResult({
+                    changeOrderId,
+                    code: updated.code,
+                    status: updated.status,
+                    pricingType: updated.pricingType,
+                    markupPercent: updated.markupPercent,
+                    subtotal: Number(updated.totalAmount),
+                    warnings,
+                    ...(revertedToDraft ? { note: "Scope changed on a Sent change order — it is back in Draft and must be re-sent (send_change_order) before the customer can sign." } : {}),
+                    url: `https://probuild.goldentouchremodeling.com/projects/${updated.projectId}/change-orders/${changeOrderId}`,
+                });
+            },
+        );
+
+        server.registerTool(
             "send_change_order",
             {
                 title: "Send a change order to the customer for signature",
@@ -1107,7 +1254,7 @@ function createHandler(actor: RouteMcpActor) {
             {
                 title: "List project change orders and actuals",
                 annotations: { readOnlyHint: true },
-                description: "Lists change orders with pricing type, signature state, unbilled billable actuals, hours, and billed-to-date. Use this before logging or billing cost-plus work.",
+                description: "Lists change orders with line items, pricing type, signature state, unbilled billable actuals, hours, and billed-to-date. Use this before logging or billing cost-plus work, and to fetch current items (with ids) before update_change_order.",
                 inputSchema: { projectId: z.string().max(50) },
             },
             async ({ projectId }) => {
@@ -1115,6 +1262,7 @@ function createHandler(actor: RouteMcpActor) {
                     where: { projectId },
                     orderBy: { createdAt: "desc" },
                     include: {
+                        items: { orderBy: { order: "asc" }, select: { id: true, name: true, description: true, type: true, quantity: true, unitCost: true, total: true, costCode: { select: { code: true } } } },
                         timeEntries: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { durationHours: true, laborCost: true, burdenCost: true } },
                         expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
                         billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
@@ -1126,6 +1274,16 @@ function createHandler(actor: RouteMcpActor) {
                     code: co.code,
                     title: co.title,
                     status: co.status,
+                    items: co.items.map((item) => ({
+                        id: item.id,
+                        name: item.name,
+                        description: item.description,
+                        type: item.type,
+                        quantity: item.quantity,
+                        unitCost: Number(item.unitCost),
+                        total: Number(item.total),
+                        costCode: item.costCode?.code ?? null,
+                    })),
                     pricingType: co.pricingType,
                     markupPercent: co.markupPercent,
                     subtotal: Number(co.totalAmount),
@@ -1683,6 +1841,9 @@ function createHandler(actor: RouteMcpActor) {
                     workPerformed: z.string().trim().min(1).max(20_000),
                     materialsDelivered: z.string().max(20_000).optional(),
                     issues: z.string().max(20_000).optional(),
+                    nextSteps: z.string().max(20_000).optional().describe(
+                        "What's planned next / for tomorrow, if the chat mentions it—pull this from the conversation's \"next steps\" or \"tomorrow\" content."
+                    ),
                     photos: z.array(z.object({
                         fileId: z.string().max(50),
                         caption: z.string().max(500).optional(),
@@ -1919,10 +2080,10 @@ function createHandler(actor: RouteMcpActor) {
                     : await prisma.lead.findUnique({ where: { id: leadId! }, select: { id: true } });
                 if (!exists) return { ...textResult({ error: `${context.type} not found: ${context.id}` }), isError: true };
 
-                const { createContractFromTemplate, createContractBlank } = await import("@/lib/actions");
+                const { createContractFromTemplateCore, createContractBlankCore } = await import("@/lib/contract-creation-core");
                 const contract = templateId
-                    ? await createContractFromTemplate(templateId, context, title)
-                    : await createContractBlank(context, title!, bodyHtml!);
+                    ? await createContractFromTemplateCore(templateId, context, title)
+                    : await createContractBlankCore(context, title!, bodyHtml!);
 
                 const warnings: string[] = [];
                 if (!CLIENT_SIGN_BLOCK_RE.test(contract.body || "")) {
@@ -2448,7 +2609,7 @@ function createHandler(actor: RouteMcpActor) {
         );
     },
     {
-        serverInfo: { name: "probuild", version: "1.14.0" },
+        serverInfo: { name: "probuild", version: "1.16.0" },
         capabilities: { tools: {} },
         instructions:
             "ProBuild is Golden Touch Remodeling's construction management system. " +

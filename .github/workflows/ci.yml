@@ -33,6 +33,12 @@ jobs:
         run: npx prettier --check . --ignore-unknown
         continue-on-error: true
 
+      # Hermetic pure-logic suites — no DB, no network, so they belong in this job rather
+      # than the Postgres one. CI ran neither of these before: tests/ was never wired up at
+      # all, so the estimate money-math coverage added with PR #315 was gating nothing.
+      - name: Unit tests
+        run: npm run test:unit
+
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
         env:
@@ -115,6 +121,28 @@ jobs:
       # their deterministic mocks. Without it the specs hit the real Anthropic
       # API on every PR and the forced-failure test marker is inert prose.
       SELECTION_AI_MOCK: "1"
+      # Routes getFreshQBTokens/buildQBPaymentRequest/sendQBPaymentCreateRequest
+      # (src/lib/quickbooks.ts, quickbooks-payments.ts) to the deterministic,
+      # no-network mock in src/lib/quickbooks-mock.ts. Real Intuit calls are
+      # forbidden in CI; without this e2e/deposit-ingest.spec.ts's QBO-linked
+      # cases would either hit the live API or fail with QBNotConnectedError
+      # (no Integration row exists in the throwaway DB).
+      E2E_QBO_MOCK: "1"
+      # Shared secret for POST /api/payments/deposit-ingest's Bearer auth
+      # (src/app/api/payments/deposit-ingest/route.ts). No external system
+      # depends on this value — it only gates e2e/deposit-ingest.spec.ts
+      # against the throwaway DB — so unlike the provider secrets above it's a
+      # literal here rather than a repo secret (there's nothing to rotate).
+      DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+      # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
+      # its deterministic keyword fallback instead of calling Gemini, so
+      # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
+      DAILY_LOG_MATCH_AI_MOCK: "1"
+      # Disables the post-save cost-code auto-assigner (lib/auto-assign-phases.ts). ANTHROPIC_API_KEY
+      # IS supplied below, so without this the real classifier fires on every estimate save in the
+      # suite and races estimate-cost-code-catchup.spec.ts, which simulates the assignment with a
+      # direct DB write — flaky results plus real API spend on every PR.
+      AUTO_ASSIGN_PHASES_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
@@ -147,6 +175,16 @@ jobs:
 
       - name: Create schema in throwaway Postgres
         run: npx prisma db push --skip-generate
+
+      # DepositIngest's reservation index (stops two deposit files from
+      # claiming the same pending milestone — see the model's doc comment in
+      # prisma/schema.prisma) is a partial unique index, which Prisma cannot
+      # express and `db push` therefore never creates. e2e/deposit-ingest.spec.ts's
+      # reservation-blocking cases need it for real, so apply it here exactly
+      # like a prod deploy would (scripts/apply-deposit-ingest-schema.mjs is
+      # additive/idempotent — safe to run against the fresh throwaway DB).
+      - name: Apply DepositIngest reservation index
+        run: node scripts/apply-deposit-ingest-schema.mjs
 
       - name: Build application
         run: npm run build

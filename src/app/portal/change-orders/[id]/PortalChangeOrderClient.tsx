@@ -6,7 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -214,16 +214,21 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {items.map((item: any) => {
+                                {/* Line amounts must sum to the subtotal below, which excludes
+                                    section headers — a header mirrors the lines beneath it. */}
+                                {billableCoItems(items).map((item: any) => {
                                     const itemTotal = coLineCents(Number(item.quantity || 0), Number(item.unitCost || 0)) / 100;
                                     return (
                                         <tr key={item.id}>
-                                            <td className="py-3">
+                                            <td className="py-3 align-top">
                                                 <div className="font-medium text-slate-800">{item.name}</div>
+                                                {item.description && (
+                                                    <div className="mt-1 text-xs text-slate-500 leading-relaxed whitespace-pre-wrap">{item.description}</div>
+                                                )}
                                             </td>
-                                            <td className="py-3 text-center text-slate-600">{item.quantity}</td>
-                                            <td className="hidden sm:table-cell py-3 text-right text-slate-600">{formatCurrency(item.unitCost)}</td>
-                                            <td className="py-3 text-right font-medium text-slate-800">{formatCurrency(itemTotal)}</td>
+                                            <td className="py-3 text-center text-slate-600 align-top">{item.quantity}</td>
+                                            <td className="hidden sm:table-cell py-3 text-right text-slate-600 align-top">{formatCurrency(item.unitCost)}</td>
+                                            <td className="py-3 text-right font-medium text-slate-800 align-top">{formatCurrency(itemTotal)}</td>
                                         </tr>
                                     );
                                 })}

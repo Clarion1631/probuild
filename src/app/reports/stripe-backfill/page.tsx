@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 interface BackfillDetail {
     sessionId: string;
@@ -52,7 +53,9 @@ function formatCurrency(n?: number) {
 
 function formatDate(iso?: string) {
     if (!iso) return "—";
-    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    // session.created from Stripe is a real instant — formatMoneyDate renders it in the
+    // viewer's local zone (it only forces UTC for stored calendar-day values).
+    return formatMoneyDate(iso, { month: "short", day: "numeric", year: "numeric" }, "en-US");
 }
 
 function formatMethod(m?: string) {

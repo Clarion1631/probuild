@@ -1,9 +1,13 @@
 export const dynamic = 'force-dynamic';
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
+import { resolveChargeableItems } from "@/lib/time-suggestion";
 
-// Returns top-level estimate items (budget buckets) for a project
+// Returns the CHARGEABLE estimate items for a project's clock-in picker —
+// resolveChargeableItems is the single authority (leaves resolved to their
+// nearest coded same-estimate ancestor, deduped; per-estimate legacy fallback
+// when an estimate has no coded items). Rows carry estimateId/estimateTitle so
+// clients can group when a project has more than one eligible estimate.
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
@@ -15,30 +19,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const { searchParams } = new URL(req.url);
     const estimateId = searchParams.get("estimateId");
 
-    const estimateFilter: any = {
-        projectId,
-        status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
-        archivedAt: null,
-    };
+    const { items } = await resolveChargeableItems(projectId);
+    const filtered = estimateId ? items.filter(item => item.estimateId === estimateId) : items;
 
-    if (estimateId) {
-        estimateFilter.id = estimateId;
-    }
-
-    // Top-level items only (parentId null) from active and approved estimates on this project
-    const items = await prisma.estimateItem.findMany({
-        where: {
-            estimate: estimateFilter,
-            parentId: null,
-        },
-        select: {
-            id: true,
-            name: true,
-            total: true,
-            costCode: { select: { code: true, name: true } },
-        },
-        orderBy: { order: 'asc' },
-    });
-
-    return NextResponse.json(items);
+    return NextResponse.json(filtered);
 }

@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // Expo-web specs need the mobile checkout + its static export — they run
+  // via playwright.config.mobile.ts (npm run test:mobile-e2e), never here/CI.
+  testIgnore: "**/mobile-app/**",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -26,12 +29,24 @@ export default defineConfig({
       dependencies: ["data"],
     },
     {
+      // A SECOND session: staff with partial project scope. The admin can never
+      // exercise the scoped branches (accessibleProjectIds returns "ALL"), so
+      // estimate-scope-labels.spec.ts needs its own storage state.
+      name: "setup-scoped",
+      testMatch: /(^|[\\/])auth-scoped\.setup\.ts$/,
+      dependencies: ["data"],
+    },
+    {
       name: "chromium",
+      // The setup files are run by the setup projects above. Without this they
+      // would ALSO run here as ordinary tests and rewrite the storage-state
+      // files underneath the specs currently reading them.
+      testIgnore: ["**/mobile-app/**", "**/*.setup.ts"],
       use: {
         ...devices["Desktop Chrome"],
         storageState: "e2e/.auth/user.json",
       },
-      dependencies: ["data", "setup"],
+      dependencies: ["data", "setup", "setup-scoped"],
     },
   ],
   webServer: {
