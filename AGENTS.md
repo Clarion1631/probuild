@@ -12,8 +12,8 @@ Next.js 16 (App Router, Server Components, Server Actions) · Prisma 5 · Supaba
 Application auth is **NextAuth** with Google as the only real provider and Prisma-backed
 users — see `src/lib/auth.ts`. (A credentials provider exists but is test-only; it is
 installed only when `PLAYWRIGHT_TEST_SECRET` is set.) Supabase hosts Postgres and
-Storage; the Supabase client
-(`src/lib/supabase.ts`) is used for Storage only and there are no `supabase.auth` calls.
+Storage; the Supabase client (`src/lib/supabase.ts`) is used for Storage only, and there
+are no `supabase.auth` calls anywhere in `src/`.
 
 There is no Clerk, PostHog, Coolify, yarn, Linear, Docker deploy, or Postgres
 RLS-context helper layer in this project. If a suggestion depends on one of those, it
@@ -40,7 +40,7 @@ and the shared components, not stock shadcn.
   "next steps" output, which has leaked the production token three times. The CLI
   authenticates on its own.
 - **Data access goes through Prisma** (`src/lib/prisma.ts`), not the Supabase client.
-  Supabase is auth and storage only.
+  The Supabase client is for Storage only.
 - **Routine E2E must never run against the production database.** CI provisions a
   throwaway `postgres:16` container; a local run uses whatever `DATABASE_URL` your env
   supplies, so you must point it at a disposable database yourself. `e2e/data.setup.ts`
