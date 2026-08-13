@@ -131,6 +131,7 @@ function removePendingLinks(existing: PendingAssociationRestore | null, toRemove
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { saveEstimate, getEstimateItemCostCodes, createInvoiceFromEstimate, deleteEstimate, duplicateEstimate, saveEstimateAsTemplate, uploadEstimateFile, deleteEstimateFile, getEstimateFiles, saveItemsAsAssembly, getEstimateTemplates, deleteAssembly, updateItemApproval, bulkUpdateItemApproval, linkPOToEstimateItem, unlinkPOFromEstimateItem, restoreEstimateItemAssociations, getProjectPurchaseOrdersForLinking, recordEstimatePayment, sendEstimatePaymentReceipt, unrecordEstimatePayment, getDocumentTemplates, createDocumentTemplate } from "@/lib/actions";
 import type { RestoreEstimateItemAssociationsResult } from "@/lib/actions";
 import RichTextEditor from "@/components/RichTextEditor";
@@ -214,9 +215,44 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [items, setItems] = useState<any[]>(() => (initialEstimate.items || []).map(normalizeItemPoLinks));
     const [paymentSchedules, setPaymentSchedules] = useState<any[]>(initialEstimate.paymentSchedules || []);
     // Invoice generated from this estimate (if any) — milestone edits here do not
-    // cascade to it, so the schedule UI warns when one exists.
-    const linkedInvoice: { id: string; code: string; status: string } | null =
+    // cascade to it, so the schedule UI warns when one exists. Once the invoice has
+    // payment rows, the client portal renders THOSE, not this estimate's schedule.
+    type LinkedInvoicePayment = { id: string; name: string; amount: string | number; status: string; dueDate?: string | null; sourceScheduleId?: string | null };
+    const linkedInvoice: { id: string; code: string; status: string; projectId?: string | null; payments?: LinkedInvoicePayment[] } | null =
         initialEstimate.invoices?.[0] || null;
+    // Which mirrored rows disagree with the client-visible invoice schedule.
+    // Compared against the live edit state on purpose: unsaved edits diverge too.
+    const scheduleDivergence = useMemo(() => {
+        // Match the portal's render exactly: it lists every invoice payment row
+        // (Canceled included) and only hides the auto-created "Payment in Full" row.
+        const invoicePayments = (linkedInvoice?.payments || []).filter(p => p.name !== "Payment in Full");
+        if (invoicePayments.length === 0) return null;
+        const estById = new Map(paymentSchedules.filter(s => s.id).map(s => [s.id, s] as const));
+        const cents = (v: unknown) => Math.round((parseFloat(String(v)) || 0) * 100);
+        const mismatched: { name: string; estimateAmount: number; invoiceAmount: number }[] = [];
+        const mirroredEstimateIds = new Set<string>();
+        let removedHere = 0;
+        for (const p of invoicePayments) {
+            if (!p.sourceScheduleId) continue; // invoice-only extras (e.g. CO milestones) have no mirror
+            const src = estById.get(p.sourceScheduleId);
+            if (!src) { removedHere++; continue; }
+            mirroredEstimateIds.add(src.id);
+            if (cents(src.amount) !== cents(p.amount)) {
+                mismatched.push({
+                    name: src.name || p.name || "Milestone",
+                    estimateAmount: (parseFloat(String(src.amount)) || 0),
+                    invoiceAmount: (parseFloat(String(p.amount)) || 0),
+                });
+            }
+        }
+        const unmirrored = paymentSchedules.filter(s => !s.id || !mirroredEstimateIds.has(s.id)).length;
+        if (mismatched.length === 0 && unmirrored === 0 && removedHere === 0) return null;
+        return { mismatched, unmirrored, removedHere };
+    }, [linkedInvoice, paymentSchedules]);
+    const linkedInvoiceProjectId = linkedInvoice?.projectId || (context.type === "project" ? context.id : null);
+    const linkedInvoiceHref = linkedInvoice && linkedInvoiceProjectId
+        ? `/projects/${linkedInvoiceProjectId}/invoices/${linkedInvoice.id}`
+        : null;
     const [isSaving, setIsSaving] = useState(false);
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -3226,14 +3262,54 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
                                 </div>
                                 {linkedInvoice && (
-                                    <div className="flex items-start gap-2.5 bg-amber-50 border-b border-amber-200 px-8 py-3">
-                                        <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-                                        </svg>
-                                        <p className="text-xs text-amber-800">
-                                            <span className="font-semibold">This estimate has been invoiced ({linkedInvoice.code}).</span>{" "}
-                                            Adding, editing, or deleting milestones here does <strong>not</strong> update the invoice — align the invoice&apos;s payment schedule separately.
-                                        </p>
+                                    <div className="bg-amber-50 border-b border-amber-200 px-8 py-3">
+                                        <div className="flex items-start gap-2.5">
+                                            <svg className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                                            </svg>
+                                            <p className="text-xs text-amber-800">
+                                                <span className="font-semibold">This estimate has been invoiced ({linkedInvoice.code}).</span>{" "}
+                                                {linkedInvoice.payments?.length
+                                                    ? <>The client portal shows the <strong>invoice&apos;s</strong> payment schedule — edits here are not visible to the client and do not change what they owe.</>
+                                                    : <>Adding, editing, or deleting milestones here does <strong>not</strong> update the invoice — align the invoice&apos;s payment schedule separately.</>}
+                                                {linkedInvoiceHref && (
+                                                    <>{" "}
+                                                        <Link href={linkedInvoiceHref} className="font-semibold text-amber-900 underline underline-offset-2 hover:text-amber-700 whitespace-nowrap">
+                                                            Edit the invoice schedule →
+                                                        </Link>
+                                                    </>
+                                                )}
+                                            </p>
+                                        </div>
+                                        {scheduleDivergence && (
+                                            <div className="mt-2 ml-[26px] rounded-md border border-amber-200 bg-white/70 px-3 py-2" data-testid="schedule-divergence">
+                                                <p className="text-[11px] font-bold text-amber-900 uppercase tracking-wide mb-1">
+                                                    This schedule differs from what the client sees
+                                                </p>
+                                                <ul className="space-y-0.5">
+                                                    {scheduleDivergence.mismatched.map((m, i) => (
+                                                        <li key={i} className="text-xs text-amber-800">
+                                                            <span className="font-semibold">{m.name}:</span>{" "}
+                                                            {formatCurrency(m.estimateAmount)} here · client sees <span className="font-semibold">{formatCurrency(m.invoiceAmount)}</span>
+                                                        </li>
+                                                    ))}
+                                                    {scheduleDivergence.unmirrored > 0 && (
+                                                        <li className="text-xs text-amber-800">
+                                                            {scheduleDivergence.unmirrored === 1
+                                                                ? "1 milestone here has no matching invoice row — the client can't see it."
+                                                                : `${scheduleDivergence.unmirrored} milestones here have no matching invoice row — the client can't see them.`}
+                                                        </li>
+                                                    )}
+                                                    {scheduleDivergence.removedHere > 0 && (
+                                                        <li className="text-xs text-amber-800">
+                                                            {scheduleDivergence.removedHere === 1
+                                                                ? "1 invoice milestone was removed here but still shows to the client."
+                                                                : `${scheduleDivergence.removedHere} invoice milestones were removed here but still show to the client.`}
+                                                        </li>
+                                                    )}
+                                                </ul>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">

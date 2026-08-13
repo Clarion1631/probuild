@@ -1552,7 +1552,21 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
-                invoices: { select: { id: true, code: true, status: true } },
+                invoices: {
+                    select: {
+                        id: true, code: true, status: true, projectId: true,
+                        // Invoice-side milestones so the editor can diff mirrored rows
+                        // (via sourceScheduleId) against this estimate's schedule — the
+                        // portal renders the invoice's rows once one exists.
+                        payments: {
+                            select: { id: true, name: true, amount: true, status: true, dueDate: true, sourceScheduleId: true },
+                            orderBy: { createdAt: "asc" },
+                        },
+                    },
+                    // Same pick as getEstimateForPortal (oldest invoice first), so the
+                    // editor warns about the invoice the client actually sees.
+                    orderBy: { createdAt: "asc" },
+                },
             },
         });
     }
