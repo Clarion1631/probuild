@@ -42,25 +42,32 @@ import {
  * "Forbidden" vs "Unauthorized" vs data — and the actions already surface both
  * strings to any caller who triggers them through the UI.
  *
- * FOUR INDEPENDENT GATES, so a single mistake does not expose it:
- *  1. PLAYWRIGHT_TEST_SECRET must be set. Production does not set it (it is
+ * THREE INDEPENDENT ENVIRONMENT/CREDENTIAL GATES, plus an allowlist:
+ *  1. E2E_TEST_ROUTES must be exactly "1" — an explicit, positive opt-in whose
+ *     ONLY purpose is enabling test routes. Codex's point: deriving "test
+ *     routes are on" from an auth secret makes the route a side effect of a
+ *     credential rather than a decision, so a secret that leaked into an
+ *     environment would silently switch it on. This flag is set nowhere but
+ *     the CI Playwright job.
+ *  2. PLAYWRIGHT_TEST_SECRET must be set. Production does not set it (it is
  *     also what registers the test-only CredentialsProvider in lib/auth.ts —
- *     see CLAUDE.md), so in production this module answers 404 and nothing
- *     below it ever runs.
- *  2. VERCEL_ENV must not be "production", belt-and-braces against the secret
- *     ever being added to the prod environment by accident.
- *  3. The request must present that same secret in `x-e2e-secret`, compared in
- *     constant time.
- *  4. Only the eight allowlisted action names dispatch at all.
+ *     see CLAUDE.md).
+ *  3. VERCEL_ENV must not be "production". Note this one FAILS OPEN when
+ *     VERCEL_ENV is undefined (self-hosted, or a promoted artifact), which is
+ *     exactly why it is the belt and gate 1 is the braces — never rely on it
+ *     alone.
+ *  4. Then: the request must present that secret in `x-e2e-secret`, compared in
+ *     constant time, and name one of the eight allowlisted actions.
  *
  * Every rejection is a bare 404, not a 401/403: an enabled-but-unauthorized
- * caller learns nothing about whether the route exists.
+ * caller learns nothing about whether the route exists. Thrown errors are
+ * mapped through a known-message allowlist rather than returned raw, so a
+ * malformed argument cannot surface Prisma model names or source paths the way
+ * an unsanitized `Error.message` would.
  *
- * The proxy bypass this route needs (src/proxy.ts) is gated on the SAME
- * PLAYWRIGHT_TEST_SECRET, so it too is dead code in production. The bypass is
- * required only so an UNAUTHENTICATED request reaches the action and is
- * refused by the action's own gate, rather than being bounced to /login by the
- * proxy — the proxy redirect would prove nothing about assertContractAccess.
+ * The proxy bypass this route needs (src/proxy.ts) repeats gates 1–3 verbatim
+ * and additionally refuses anything carrying a `next-action` header, so
+ * bypassing the proxy can never also mean bypassing the Server Action boundary.
  */
 
 export const dynamic = "force-dynamic";
@@ -77,8 +84,32 @@ const ACTIONS: Record<string, (...args: any[]) => Promise<any>> = {
     getExecutedContractPdf,
     getContractSigningHistory,
     getContractSendDefaults,
-    getLead,
+    // Projected down to the id and the contracts relation. getLead otherwise
+    // returns the client record, tasks, manager, room designs and the linked
+    // project — none of which this route is here to expose, and all of which
+    // would make the dispatcher a strictly wider door than the assertion it
+    // supports. The test only ever reads `.contracts`.
+    getLead: async (id: string) => {
+        const lead: any = await getLead(id);
+        if (!lead) return null;
+        return { id: lead.id, contracts: lead.contracts ?? [] };
+    },
 };
+
+/**
+ * Errors are reported by an allowlist of the messages the guards themselves
+ * raise — the ones a caller can already read off the UI, and the only ones the
+ * tests distinguish. Anything else collapses to a generic string rather than
+ * echoing a raw `Error.message`, which on a malformed argument can carry Prisma
+ * model names, column names and absolute source paths.
+ */
+const REPORTABLE_ERRORS = new Set([
+    "Unauthorized",
+    "Forbidden",
+    "Contract not found",
+    "Lead not found",
+    "This contract is not attached to a project or lead, so access cannot be checked",
+]);
 
 function secretMatches(provided: string | null): boolean {
     const expected = process.env.PLAYWRIGHT_TEST_SECRET;
@@ -92,14 +123,24 @@ function secretMatches(provided: string | null): boolean {
     return timingSafeEqual(a, b);
 }
 
-function enabled(): boolean {
-    return !!process.env.PLAYWRIGHT_TEST_SECRET && process.env.VERCEL_ENV !== "production";
+/**
+ * Keep IDENTICAL to the matching condition in src/proxy.ts. Two gates that are
+ * meant to agree and quietly don't is the exact defect Codex found in the first
+ * version of this pair.
+ */
+// NOT exported: a route module may only export the framework's own names.
+function testOnlyRoutesEnabled(): boolean {
+    return (
+        process.env.E2E_TEST_ROUTES === "1"
+        && !!process.env.PLAYWRIGHT_TEST_SECRET
+        && process.env.VERCEL_ENV !== "production"
+    );
 }
 
 const NOT_FOUND = () => new NextResponse("Not Found", { status: 404 });
 
 export async function POST(req: Request) {
-    if (!enabled()) return NOT_FOUND();
+    if (!testOnlyRoutesEnabled()) return NOT_FOUND();
     if (!secretMatches(req.headers.get("x-e2e-secret"))) return NOT_FOUND();
 
     const body = await req.json().catch(() => null);
@@ -118,6 +159,10 @@ export async function POST(req: Request) {
         // 200 with ok:false, deliberately: the test asserts on WHICH error the
         // action threw, and an HTTP error status would be indistinguishable
         // from the proxy or the framework rejecting the request first.
-        return NextResponse.json({ ok: false, error: (e as Error).message });
+        const message = (e as Error)?.message ?? "";
+        return NextResponse.json({
+            ok: false,
+            error: REPORTABLE_ERRORS.has(message) ? message : "Internal error",
+        });
     }
 }

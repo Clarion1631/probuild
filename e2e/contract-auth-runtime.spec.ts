@@ -40,6 +40,7 @@ const CONTRACT_LEADONLY_TOKEN = "e2e-contract-token-leadonly";
 const CONTRACT_LEADONLY_BODY = "E2E LEAD-ONLY CONTRACT BODY — DO NOT DELETE";
 
 const SCRATCH_CONTRACT_ID = "e2e-contract-scratch";
+const SCRATCH_CONTRACT_DEL_ID = "e2e-contract-scratch-del";
 
 async function callAction(
     request: APIRequestContext,
@@ -181,6 +182,24 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         expect(result.data.id).toBe(CONTRACT_LEADONLY_ID);
     });
 
+    // contractOwnerOrThrow exists specifically so ownership is read from the DB
+    // by contract id, NOT from the caller-supplied descriptor — but nothing
+    // else in this file pins that, because every other call passes truthful
+    // ownership. Here the descriptor LIES: it claims CONTRACT_CONVERTED_ID
+    // (which actually lives on OOS_PROJECT_ID, unreachable to this user) is
+    // lead-only on OOS_LEAD_ID, which this user CAN reach via leadAccess. If
+    // getExecutedContractPdf ever regressed to trusting the supplied
+    // projectId/leadId instead of re-reading them from the DB row, this is the
+    // only test in the file that would catch it — every other test here passes
+    // truthful descriptors and would keep passing under that regression.
+    test("forged descriptor cannot smuggle access to a contract this user cannot reach", async ({ request }) => {
+        const result = await callAction(request, "getExecutedContractPdf", [
+            { id: CONTRACT_CONVERTED_ID, title: "irrelevant", projectId: null, leadId: OOS_LEAD_ID },
+        ]);
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe("Forbidden");
+    });
+
     test("positive control: getContracts lists the lead-only contract", async ({ request }) => {
         const result = await callAction(request, "getContracts", []);
         expect(result.ok).toBe(true);
@@ -200,6 +219,12 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
             { id: CONTRACT_LEADONLY_ID, title: CONTRACT_LEADONLY_TITLE, projectId: null, leadId: OOS_LEAD_ID },
         ]);
         expect(pdf.ok).toBe(true);
+        // A guard that denies everyone would ALSO fail this assertion — but a
+        // lookup that resolves to `null` on every call (never actually reading
+        // the seeded ProjectFile) would still pass `ok: true`. Assert the real
+        // file came back, not just that the call didn't throw.
+        expect(pdf.data).not.toBeNull();
+        expect(pdf.raw).toContain("example.test/e2e/executed-contract.pdf");
     });
 
     // It carries BOTH ids and canAccessJobScope lets projectId win, so
@@ -240,6 +265,41 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         expect(result.raw).not.toContain(CONTRACT_CONVERTED_BODY);
     });
 
+    // Without this, the unauthenticated block's "getLead never throws, but its
+    // embedded contracts relation stays empty" assertion is vacuous — an empty
+    // array is exactly what a `contracts: []` relation that NEVER resolves
+    // would also return. This user holds leadAccess + the `contracts`
+    // permission and reaches OOS_LEAD_ID, so the relation must actually
+    // populate for them, which is what makes the anonymous-caller empty-array
+    // assertion mean something.
+    test("positive control: getLead's contracts relation resolves for an authorized reader", async ({ request }) => {
+        const result = await callAction(request, "getLead", [OOS_LEAD_ID]);
+        expect(result.ok).toBe(true);
+        const ids = (result.data.contracts as any[]).map((c) => c.id);
+        expect(ids).toContain(CONTRACT_LEADONLY_ID);
+    });
+
+    test("project contracts page shows the in-scope contract, not the empty state", async ({ page }) => {
+        const response = await page.goto(`/projects/${PROJECT_ID}/contracts`);
+        expect(response?.ok()).toBeTruthy();
+        await expect(page).not.toHaveURL(/.*login.*/);
+        await expect(page.getByText("E2E In-Scope Contract", { exact: false })).toBeVisible();
+        await expect(page.getByText("No contracts yet")).not.toBeVisible();
+    });
+
+    test("lead contracts page shows the lead-only contract, not the empty state, and hides the converted contract", async ({ page }) => {
+        const response = await page.goto(`/leads/${OOS_LEAD_ID}/contracts`);
+        expect(response?.ok()).toBeTruthy();
+        await expect(page).not.toHaveURL(/.*login.*/);
+        await expect(page.getByText(CONTRACT_LEADONLY_TITLE)).toBeVisible();
+        await expect(page.getByText("No contracts yet")).not.toBeVisible();
+        // The converted contract carries this same leadId, but canAccessJobScope
+        // lets its projectId (OOS_PROJECT_ID, unreachable to this user) win —
+        // the lead page's union is bidirectional, so without this assertion a
+        // regression that let leadId alone admit it would go unnoticed.
+        await expect(page.getByText("E2E Converted Contract")).not.toBeVisible();
+    });
+
     test.describe.serial("scratch contract write control", () => {
         const prisma = new PrismaClient();
 
@@ -264,11 +324,35 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
                     accessToken: "e2e-contract-token-scratch",
                 },
             });
+            // A SEPARATE row for the delete control, so the two write tests never
+            // interfere with each other's fixture.
+            await prisma.contract.upsert({
+                where: { id: SCRATCH_CONTRACT_DEL_ID },
+                update: {
+                    leadId: OOS_LEAD_ID,
+                    projectId: null,
+                    title: "E2E Scratch Contract (delete control)",
+                    body: "scratch body",
+                    status: "Draft",
+                    accessToken: "e2e-contract-token-scratch-del",
+                },
+                create: {
+                    id: SCRATCH_CONTRACT_DEL_ID,
+                    leadId: OOS_LEAD_ID,
+                    projectId: null,
+                    title: "E2E Scratch Contract (delete control)",
+                    body: "scratch body",
+                    status: "Draft",
+                    accessToken: "e2e-contract-token-scratch-del",
+                },
+            });
         });
 
         test.afterAll(async () => {
             try {
-                await prisma.contract.deleteMany({ where: { id: SCRATCH_CONTRACT_ID } });
+                // Idempotent regardless of whether the delete test already removed
+                // SCRATCH_CONTRACT_DEL_ID — deleteMany on a missing id is a no-op.
+                await prisma.contract.deleteMany({ where: { id: { in: [SCRATCH_CONTRACT_ID, SCRATCH_CONTRACT_DEL_ID] } } });
             } finally {
                 await prisma.$disconnect();
             }
@@ -286,6 +370,22 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
                 select: { title: true },
             });
             expect(row?.title).toBe("updated by e2e");
+        });
+
+        // Runs after the update test above, on a SEPARATE id, so the two write
+        // controls never interfere. A guard that denies every delete would fail
+        // this test's `ok: true` assertion, and a guard that reports success
+        // without actually deleting would fail the follow-up findUnique check —
+        // without this, no test in the file proves an AUTHORIZED delete actually
+        // removes the row.
+        test("deleteContract actually removes the row, not just returns ok", async ({ request }) => {
+            const result = await callAction(request, "deleteContract", [SCRATCH_CONTRACT_DEL_ID]);
+            expect(result.ok).toBe(true);
+
+            const row = await prisma.contract.findUnique({
+                where: { id: SCRATCH_CONTRACT_DEL_ID },
+            });
+            expect(row).toBeNull();
         });
     });
 });

@@ -654,8 +654,11 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
         // The POSITIVE control, reachable by contract-staff via leadAccess. Also
         // the contract the portal tests use (lead-owned, so /portal/contracts/[id]
         // skips the getPortalVisibility(projectId) branch). Signed + approvedBy/At
-        // set (and requiresCountersign left at its default false) so the portal
-        // treats it as executed and renders the archived-PDF banner.
+        // set, with requiresCountersign explicitly false, so the portal treats it
+        // as executed (isExecuted = isSigned && !awaitingCountersign) and renders
+        // the archived-PDF banner. A default only applies on `create` — restated
+        // here in `update` too, or a pre-existing `true` on a reused database
+        // would survive and silently flip the portal's executed/awaiting state.
         await prisma.contract.upsert({
             where: { id: CONTRACT_LEADONLY_ID },
             update: {
@@ -667,6 +670,7 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
                 accessToken: "e2e-contract-token-leadonly",
                 approvedBy: "Test Client",
                 approvedAt: new Date(),
+                requiresCountersign: false,
             },
             create: {
                 id: CONTRACT_LEADONLY_ID,
@@ -678,6 +682,7 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
                 accessToken: "e2e-contract-token-leadonly",
                 approvedBy: "Test Client",
                 approvedAt: new Date(),
+                requiresCountersign: false,
             },
         });
         console.log("[data.setup] contracts upserted:", {
