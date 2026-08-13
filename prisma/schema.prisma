@@ -1354,8 +1354,8 @@ model EstimateTemplateItem {
   type          String           @default("Material")
   quantity      Float            @default(1)
   baseCost      Decimal?
-  markupPercent Float            @default(25)
-  unitCost      Decimal            @default(0)
+  markupPercent Float            @default(25) // Same semantic as EstimateItem.markupPercent: gross margin % on sell price, NOT markup on cost. saveEstimateAsTemplate/createEstimateFromTemplate copy it verbatim both ways; the MCP templateToPhases path drops it and rebuilds rows with baseCost null + the default 25.
+  unitCost      Decimal            @default(0) // Sell price. Where baseCost is present it is baseCost / (1 - markupPercent/100); seeded templates often carry a null baseCost, so that is not an invariant.
   order         Int              @default(0)
   parentId      String?
   costCodeId    String?
@@ -1470,6 +1470,8 @@ model ChangeOrder {
   totalAmount Decimal    @default(0)
   balanceDue  Decimal    @default(0)
   pricingType String     @default("FIXED")
+  // COST_PLUS only: a TRUE markup on actuals — billing = (labor + expenses) * (1 + markupPercent/100), see lib/billing-core.ts.
+  // Deliberately a different semantic from ChangeOrderItem.markupPercent / EstimateItem.markupPercent, which hold gross margin on sell.
   markupPercent Float?
 
   termsAndConditions String?
@@ -1512,9 +1514,14 @@ model ChangeOrderItem {
   description   String?
   type          String      @default("Material")
   quantity      Float       @default(1)
+  // baseCost + markupPercent below:
+  // Legacy/copied estimate costing metadata. When a CO is generated from estimate lines these carry the
+  // estimate's gross-margin-on-sell values, but the CO editor and billing paths neither maintain nor read
+  // them (MCP-created rows leave baseCost null and take the default 25). Don't derive CO margin from here.
+  // Not the same field as ChangeOrder.markupPercent, which IS live: a true cost-plus markup on actuals.
   baseCost      Decimal?
   markupPercent Float       @default(25)
-  unitCost      Decimal       @default(0)
+  unitCost      Decimal       @default(0) // Authoritative per-line sell price; `total` below is its quantity-derived mirror (line cents = quantity * unitCost).
   total         Decimal       @default(0)
   order         Int         @default(0)
   costCodeId    String?
