@@ -9,8 +9,10 @@ particular) read `AGENTS.md` automatically and would otherwise start with no con
 Next.js 16 (App Router, Server Components, Server Actions) · Prisma 5 · Supabase
 (Postgres + Storage) · NextAuth · Tailwind · **npm** · deployed on Vercel.
 
-Application auth is **NextAuth** (Google + credentials, Prisma-backed users) — see
-`src/lib/auth.ts`. Supabase hosts Postgres and Storage; the Supabase client
+Application auth is **NextAuth** with Google as the only real provider and Prisma-backed
+users — see `src/lib/auth.ts`. (A credentials provider exists but is test-only; it is
+installed only when `PLAYWRIGHT_TEST_SECRET` is set.) Supabase hosts Postgres and
+Storage; the Supabase client
 (`src/lib/supabase.ts`) is used for Storage only and there are no `supabase.auth` calls.
 
 There is no Clerk, PostHog, Coolify, yarn, Linear, Docker deploy, or Postgres
@@ -39,8 +41,11 @@ and the shared components, not stock shadcn.
   authenticates on its own.
 - **Data access goes through Prisma** (`src/lib/prisma.ts`), not the Supabase client.
   Supabase is auth and storage only.
-- **Routine E2E never runs against the production database.** The normal suite runs on
-  disposable Postgres and `e2e/data.setup.ts` refuses a Supabase-looking `DATABASE_URL`.
+- **Routine E2E must never run against the production database.** CI provisions a
+  throwaway `postgres:16` container; a local run uses whatever `DATABASE_URL` your env
+  supplies, so you must point it at a disposable database yourself. `e2e/data.setup.ts`
+  refuses a Supabase-looking `DATABASE_URL` — but that guard is bypassable by setting
+  `ALLOW_PROD_E2E=1`, so treat it as a backstop, not a guarantee.
   The one exception is deliberate and manual: `playwright.config.prod.ts` runs the
   `e2e/qa-*.spec.ts` specs against the live deployment, and some of them create real
   records — those specs must clean up after themselves. Never point the ordinary config
