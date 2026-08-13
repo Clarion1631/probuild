@@ -1123,6 +1123,10 @@ const S = {
   estAmbigB: "mp3-e2e-eps-ambig-b",
   estAmbigDecoy: "mp3-e2e-eps-ambig-decoy",
   invAmbig: "mp3-e2e-ps-ambig",
+  // S5/S6 live on their OWN estimate+invoice pair so their paid milestone
+  // can't move the balances S1-S4 assert on.
+  estimate2: "mp3-e2e-estimate-2",
+  invoice2: "mp3-e2e-invoice-2",
   estOther: "mp3-e2e-eps-other",
   invOtherCharge: "mp3-e2e-ps-other-charge",
 };
@@ -1193,21 +1197,40 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
       update: { status: "Pending", paidAt: null, paymentDate: null },
       create: { id: S.invAmbig, invoiceId: S.invoice, name: "MP3 Ambiguous", amount: 200, status: "Pending" },
     });
-    // An estimate milestone whose ONLY linked invoice clone was paid through a
-    // DIFFERENT charge — refunding this milestone's charge must not release it.
+    // Second pair, fully paid by a single charge. Its ONLY linked invoice clone
+    // starts out settled through a DIFFERENT charge — refunding this milestone's
+    // charge must not release it (S5), and once the clone does belong to this
+    // charge the refund must unwind it (S6).
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate2 },
+      update: { status: "Invoiced", totalAmount: 200, balanceDue: 0, statusBeforePayment: null },
+      create: {
+        id: S.estimate2, title: `${S_NAME} 2`, code: "EST-MP3TEST-2", projectId: S.project,
+        status: "Invoiced", taxExempt: true, totalAmount: 200, balanceDue: 0,
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice2 },
+      update: { status: "Paid", totalAmount: 200, balanceDue: 0 },
+      create: {
+        id: S.invoice2, code: "INV-MP3TEST-2", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate2, status: "Paid", totalAmount: 200, balanceDue: 0,
+        issueDate: new Date(),
+      },
+    });
     await sPrisma.estimatePaymentSchedule.upsert({
       where: { id: S.estOther },
       update: { status: "Paid", stripePaymentIntentId: INTENT },
       create: {
-        id: S.estOther, estimateId: S.estimate, name: "MP3 Other", amount: 200,
-        status: "Paid", order: 4, stripePaymentIntentId: INTENT,
+        id: S.estOther, estimateId: S.estimate2, name: "MP3 Other", amount: 200,
+        status: "Paid", order: 1, stripePaymentIntentId: INTENT,
       },
     });
     await sPrisma.paymentSchedule.upsert({
       where: { id: S.invOtherCharge },
       update: { status: "Paid", stripePaymentIntentId: OTHER_INTENT },
       create: {
-        id: S.invOtherCharge, invoiceId: S.invoice, name: "MP3 Other", amount: 200,
+        id: S.invOtherCharge, invoiceId: S.invoice2, name: "MP3 Other", amount: 200,
         status: "Paid", sourceScheduleId: S.estOther, stripePaymentIntentId: OTHER_INTENT,
       },
     });
@@ -1215,10 +1238,10 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
 
   test.afterAll(async () => {
     try {
-      await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: S.invoice } });
-      await sPrisma.invoice.deleteMany({ where: { id: S.invoice } });
-      await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: S.estimate } });
-      await sPrisma.estimate.deleteMany({ where: { id: S.estimate } });
+      await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: [S.invoice, S.invoice2] } } });
+      await sPrisma.invoice.deleteMany({ where: { id: { in: [S.invoice, S.invoice2] } } });
+      await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: [S.estimate, S.estimate2] } } });
+      await sPrisma.estimate.deleteMany({ where: { id: { in: [S.estimate, S.estimate2] } } });
       await sPrisma.project.deleteMany({ where: { id: S.project } });
       await sPrisma.client.deleteMany({ where: { id: S.client } });
     } finally {
@@ -1338,10 +1361,6 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
       where: { id: S.invOtherCharge },
       data: { stripePaymentIntentId: INTENT, status: "Paid" },
     });
-    await sPrisma.invoice.update({
-      where: { id: S.invoice },
-      data: { balanceDue: 800, status: "Partially Paid" },
-    });
     const schedule = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estOther } });
 
     const unwound = await sPrisma.$transaction(async (tx) => {
@@ -1353,8 +1372,8 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(unwound, "the invoice clone was released").toBe(true);
     const clone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invOtherCharge } });
     expect(clone.status).toBe("Pending");
-    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice } });
-    expect(Number(invoice.balanceDue), "invoice balance restored by the refunded amount").toBe(1000);
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice2 } });
+    expect(Number(invoice.balanceDue), "invoice balance restored by the refunded amount").toBe(200);
     expect(invoice.status).toBe("Issued");
   });
 });
