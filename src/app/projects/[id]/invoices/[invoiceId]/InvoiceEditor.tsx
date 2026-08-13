@@ -399,9 +399,9 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                         Preview
                     </button>
 
-                    {/* Download PDF */}
+                    {/* View PDF */}
                     <a
-                        href={`/api/pdf/invoices/${initialInvoice.id}`}
+                        href={`/api/pdf/invoices/${initialInvoice.id}?inline=true`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="hui-btn hui-btn-secondary flex items-center gap-2"
@@ -411,7 +411,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                             <polyline points="7 10 12 15 17 10" />
                             <line x1="12" y1="15" x2="12" y2="3" />
                         </svg>
-                        Download PDF
+                        View PDF
                     </a>
 
                     {/* Email me a copy */}

@@ -151,6 +151,65 @@ function formatCurrency(amount: number): string {
     return n < 0 ? `-$${abs}` : `$${abs}`;
 }
 
+/** Word-wrap plain (non-HTML) text to maxWidth, collapsing any run of blank lines to a single one
+ *  (whitespace-only lines count as blank for this rule), trimming leading/trailing blank lines,
+ *  and hard-breaking any single word wider than maxWidth by character. Used for table cells and
+ *  the letterhead, which need the wrapped lines themselves (for manual per-line column alignment)
+ *  rather than pdf-richtext's flow-and-paginate drawWrappedText/measureWrappedLines. */
+function wrapPlainText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
+    const normalized = (text ?? '').replace(/\r\n/g, '\n');
+    const lines: string[] = [];
+    for (const rawLine of normalized.split('\n')) {
+        if (rawLine.trim() === '') { lines.push(''); continue; }
+        const words = rawLine.split(/\s+/).filter(Boolean);
+        let current = '';
+        for (const word of words) {
+            if (font.widthOfTextAtSize(word, size) > maxWidth) {
+                if (current) { lines.push(current); current = ''; }
+                let chunk = '';
+                for (const ch of word) {
+                    if (chunk && font.widthOfTextAtSize(chunk + ch, size) > maxWidth) {
+                        lines.push(chunk);
+                        chunk = ch;
+                    } else {
+                        chunk += ch;
+                    }
+                }
+                current = chunk;
+                continue;
+            }
+            const candidate = current ? `${current} ${word}` : word;
+            if (current && font.widthOfTextAtSize(candidate, size) > maxWidth) {
+                lines.push(current);
+                current = word;
+            } else {
+                current = candidate;
+            }
+        }
+        lines.push(current);
+    }
+
+    // Collapse any run of blank lines to a single blank line.
+    const collapsed: string[] = [];
+    let blankRun = 0;
+    for (const line of lines) {
+        if (line === '') {
+            blankRun++;
+            if (blankRun <= 1) collapsed.push(line);
+        } else {
+            blankRun = 0;
+            collapsed.push(line);
+        }
+    }
+
+    // Trim leading/trailing blank lines.
+    let start = 0;
+    let end = collapsed.length;
+    while (start < end && collapsed[start] === '') start++;
+    while (end > start && collapsed[end - 1] === '') end--;
+    return collapsed.slice(start, end);
+}
+
 async function drawLetterhead(
     doc: PDFDocument,
     page: PDFPage,
@@ -197,6 +256,7 @@ function drawBuiltInHeader(
     fonts: { regular: PDFFont; bold: PDFFont },
 ): number {
     const { pageWidth, pageHeight, margin } = opts;
+    const contentWidth = pageWidth - margin * 2;
     let y: number;
 
     if (config.showDivider) {
@@ -219,17 +279,18 @@ function drawBuiltInHeader(
         if (v) fieldValues.push(v);
     }
 
+    // The header can never be allowed to consume the whole page — stop drawing further
+    // lines once y would cross margin + 250, leaving room for each document's intro
+    // block and first table header, whose draws run unguarded until the first row.
+    outer:
     for (let i = 0; i < fieldValues.length; i++) {
-        if (i === 0) {
-            page.drawText(fieldValues[i].toUpperCase(), {
-                x: margin, y, size: 11, font: fonts.regular, color: colors.textMuted,
-            });
-        } else {
-            page.drawText(fieldValues[i], {
-                x: margin, y, size: 9, font: fonts.regular, color: colors.textMuted,
-            });
+        const size = i === 0 ? 11 : 9;
+        const value = i === 0 ? fieldValues[i].toUpperCase() : fieldValues[i];
+        for (const line of wrapPlainText(value, fonts.regular, size, contentWidth)) {
+            if (y < margin + 250) break outer;
+            page.drawText(line, { x: margin, y, size, font: fonts.regular, color: colors.textMuted });
+            y -= 14;
         }
-        y -= 14;
     }
 
     y -= 6;
@@ -411,9 +472,8 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     drawTableHeader();
 
     // --- Table Rows ---
+    const rowLeading = 12;
     for (const item of estimate.items) {
-        checkNewPage(100);
-
         // Shared with serializeEstimateItemsForSave: a row is a section if it is typed as one
         // or has children. Keying off children alone rendered an emptied section (and any
         // nested section) as a billable line with qty/unit-cost columns, even though its
@@ -423,37 +483,48 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         const nameX = isSubItem ? cols.name + 16 : cols.name;
         const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
 
+        // Wrap the name/description to the column width instead of truncating it.
+        const displayName = item.name || '';
+        const maxNameWidth = contentWidth * 0.5;
+        const wrappedName = wrapPlainText(displayName, nameFont, 10, maxNameWidth);
+        const lineCount = Math.max(wrappedName.length, 1);
+        const rowHeight = lineCount * rowLeading + 8;
+
+        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
+        // re-drawing the table header on the new page.
+        if (y - rowHeight < margin) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+            drawTableHeader();
+        }
+
         if (isSection) {
-            // Draw a subtle slate background banner for the section header
+            // Draw a subtle slate background banner for the section header, sized to
+            // the (possibly multi-line) row height.
             page.drawRectangle({
                 x: margin - 6,
-                y: y - 4,
+                y: y - rowHeight + 16,
                 width: contentWidth + 12,
-                height: 18,
+                height: rowHeight - 2,
                 color: colors.bgLight,
             });
         }
 
-        // Truncate long names
-        let displayName = item.name || '';
-        const maxNameWidth = contentWidth * 0.5;
-        while (nameFont.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) {
-            displayName = displayName.slice(0, -1);
-        }
-
-        page.drawText(displayName, {
-            x: nameX, y, size: 10, font: nameFont, color: colors.textMain,
+        wrappedName.forEach((line, idx) => {
+            page.drawText(line, {
+                x: nameX, y: y - idx * rowLeading, size: 10, font: nameFont, color: colors.textMain,
+            });
         });
 
         if (!isSection) {
-            // Qty
+            // Qty — aligned with the first line of the wrapped name
             const qtyStr = String(item.quantity || 0);
             const qtyWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
             page.drawText(qtyStr, {
                 x: cols.qty - qtyWidth, y, size: 10, font: helvetica, color: colors.textMuted,
             });
 
-            // Unit cost
+            // Unit cost — aligned with the first line of the wrapped name
             const ucStr = formatCurrency(toNum(item.unitCost));
             const ucWidth = helvetica.widthOfTextAtSize(ucStr, 10);
             page.drawText(ucStr, {
@@ -461,19 +532,22 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
             });
         }
 
-        // Total
+        // Total — aligned with the first line of the wrapped name
         const totalStr = formatCurrency(toNum(item.total));
         const totalWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalWidth, y, size: 10, font: helveticaBold, color: isSection ? colors.primary : colors.textMain,
         });
 
-        y -= 20;
+        y -= rowHeight;
     }
 
     // --- Totals Section ---
     y -= 10;
-    checkNewPage(120);
+    // 135 (not 120): the Total row below draws at y-8, and with Subtotal/Tax/Fee all
+    // shown that chain can eat 74pt — keep the offset Total-row draw comfortably clear
+    // of the footer rather than relying on the footer's own guard.
+    checkNewPage(135);
     page.drawLine({
         start: { x: margin + contentWidth * 0.5, y },
         end: { x: pageWidth - margin, y },
@@ -655,6 +729,9 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     }
 
     // --- Footer ---
+    // No pre-footer page-break guard here: every content path above already page-breaks
+    // (or is bounded, see the checkNewPage(135) totals guard) well clear of the footer's
+    // y=30, so this can't collide — and a guard here would emit a footer-only blank page.
     const footerY = 30;
     const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
     page.drawText(footerText, {
@@ -701,6 +778,20 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
             page = doc.addPage([pageWidth, pageHeight]);
             y = pageHeight - margin;
         }
+    }
+
+    // Flow wrapped multi-line plain text (notes/terms can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const poFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: poFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
     }
 
     // --- Letterhead ---
@@ -776,69 +867,82 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         total: pageWidth - margin,
     };
 
-    page.drawText('DESCRIPTION', {
-        x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
-    });
-    const qtyLabel = 'QTY';
-    const qtyWidth = helveticaBold.widthOfTextAtSize(qtyLabel, 8);
-    page.drawText(qtyLabel, {
-        x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-    });
-    const ucLabel = 'UNIT COST';
-    const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
-    page.drawText(ucLabel, {
-        x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-    });
-    const totalLabel = 'TOTAL';
-    const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
-    page.drawText(totalLabel, {
-        x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
-    });
-
-    y -= 8;
-    page.drawLine({
-        start: { x: margin, y }, end: { x: pageWidth - margin, y },
-        thickness: 0.5, color: colors.border,
-    });
-    y -= 14;
-
-    // --- Table Rows ---
-    for (const item of po.items) {
-        checkNewPage(100);
-
-        // Truncate long descriptions
-        let displayName = item.description || '';
-        const maxNameWidth = contentWidth * 0.5;
-        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) {
-            displayName = displayName.slice(0, -1);
-        }
-
-        page.drawText(displayName, {
-            x: cols.name, y, size: 10, font: helvetica, color: colors.textMain,
+    function drawPOTableHeader() {
+        page.drawText('DESCRIPTION', {
+            x: cols.name, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const qtyLabel = 'QTY';
+        const qtyWidth = helveticaBold.widthOfTextAtSize(qtyLabel, 8);
+        page.drawText(qtyLabel, {
+            x: cols.qty - qtyWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const ucLabel = 'UNIT COST';
+        const ucWidth = helveticaBold.widthOfTextAtSize(ucLabel, 8);
+        page.drawText(ucLabel, {
+            x: cols.unitCost - ucWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
+        });
+        const totalLabel = 'TOTAL';
+        const totalWidth = helveticaBold.widthOfTextAtSize(totalLabel, 8);
+        page.drawText(totalLabel, {
+            x: cols.total - totalWidth, y, size: 8, font: helveticaBold, color: colors.textMuted,
         });
 
-        // Qty
+        y -= 8;
+        page.drawLine({
+            start: { x: margin, y }, end: { x: pageWidth - margin, y },
+            thickness: 0.5, color: colors.border,
+        });
+        y -= 14;
+    }
+
+    drawPOTableHeader();
+
+    // --- Table Rows ---
+    const rowLeading = 12;
+    for (const item of po.items) {
+        // Wrap the description to the column width instead of truncating it.
+        const displayName = item.description || '';
+        const maxNameWidth = contentWidth * 0.5;
+        const wrappedName = wrapPlainText(displayName, helvetica, 10, maxNameWidth);
+        const lineCount = Math.max(wrappedName.length, 1);
+        const rowHeight = lineCount * rowLeading + 8;
+
+        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
+        // re-drawing the table header on the new page.
+        if (y - rowHeight < margin) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+            drawPOTableHeader();
+        }
+
+        wrappedName.forEach((line, idx) => {
+            page.drawText(line, {
+                x: cols.name, y: y - idx * rowLeading, size: 10, font: helvetica, color: colors.textMain,
+            });
+        });
+
+        // Qty — aligned with the first line of the wrapped description
         const qtyStr = String(item.quantity || 0);
         const qtyStrWidth = helvetica.widthOfTextAtSize(qtyStr, 10);
         page.drawText(qtyStr, {
             x: cols.qty - qtyStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
-        // Unit cost
+        // Unit cost — aligned with the first line of the wrapped description
         const ucStr = formatCurrency(toNum(item.unitCost));
         const ucStrWidth = helvetica.widthOfTextAtSize(ucStr, 10);
         page.drawText(ucStr, {
             x: cols.unitCost - ucStrWidth, y, size: 10, font: helvetica, color: colors.textMuted,
         });
 
-        // Total
+        // Total — aligned with the first line of the wrapped description
         const totalStr = formatCurrency(toNum(item.total));
         const totalStrWidth = helveticaBold.widthOfTextAtSize(totalStr, 10);
         page.drawText(totalStr, {
             x: cols.total - totalStrWidth, y, size: 10, font: helveticaBold, color: colors.textMain,
         });
 
-        y -= 20;
+        y -= rowHeight;
     }
 
     // --- Totals Section ---
@@ -870,15 +974,15 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         checkNewPage(80);
         page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        page.drawText(po.notes, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+        flowText(po.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
-    
+
     if (po.terms) {
-        y -= 30;
+        y -= 16;
         checkNewPage(80);
         page.drawText('Terms & Conditions:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        page.drawText(po.terms, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+        flowText(po.terms, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
 
     const pdfBytes = await doc.save();
@@ -931,6 +1035,20 @@ export async function generateInvoicePdf(
         }
     }
 
+    // Flow wrapped multi-line plain text (notes can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const invFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: invFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
+    }
+
     // --- Letterhead ---
     const lhConfig = buildLetterheadConfig(company);
     y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
@@ -969,26 +1087,42 @@ export async function generateInvoicePdf(
     // Payment schedule table
     const invCols = { name: margin, status: margin + contentWidth * 0.45, dueDate: margin + contentWidth * 0.65, amount: pageWidth - margin };
 
-    page.drawText('PAYMENT', { x: invCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const sLabel = 'STATUS'; const sW = helveticaBold.widthOfTextAtSize(sLabel, 8);
-    page.drawText(sLabel, { x: invCols.status - sW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const dLabel = 'DUE DATE'; const dW = helveticaBold.widthOfTextAtSize(dLabel, 8);
-    page.drawText(dLabel, { x: invCols.dueDate - dW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-    const aLabel = 'AMOUNT'; const aW = helveticaBold.widthOfTextAtSize(aLabel, 8);
-    page.drawText(aLabel, { x: invCols.amount - aW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    function drawInvoiceTableHeader() {
+        page.drawText('PAYMENT', { x: invCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
+        const sLabel = 'STATUS'; const sW = helveticaBold.widthOfTextAtSize(sLabel, 8);
+        page.drawText(sLabel, { x: invCols.status - sW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+        const dLabel = 'DUE DATE'; const dW = helveticaBold.widthOfTextAtSize(dLabel, 8);
+        page.drawText(dLabel, { x: invCols.dueDate - dW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+        const aLabel = 'AMOUNT'; const aW = helveticaBold.widthOfTextAtSize(aLabel, 8);
+        page.drawText(aLabel, { x: invCols.amount - aW, y, size: 8, font: helveticaBold, color: colors.textMuted });
 
-    y -= 8;
-    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
-    y -= 14;
+        y -= 8;
+        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+        y -= 14;
+    }
 
+    drawInvoiceTableHeader();
+
+    const rowLeading = 12;
     for (const payment of invoice.payments) {
-        checkNewPage(60);
-
-        let displayName = payment.name || '';
+        // Wrap the payment label to the column width instead of truncating it.
+        const displayName = payment.name || '';
         const maxNameWidth = contentWidth * 0.4;
-        while (helvetica.widthOfTextAtSize(displayName, 10) > maxNameWidth && displayName.length > 0) displayName = displayName.slice(0, -1);
+        const wrappedName = wrapPlainText(displayName, helvetica, 10, maxNameWidth);
+        const lineCount = Math.max(wrappedName.length, 1);
+        const rowHeight = lineCount * rowLeading + 8;
 
-        page.drawText(displayName, { x: invCols.name, y, size: 10, font: helvetica, color: colors.textMain });
+        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
+        // re-drawing the table header on the new page.
+        if (y - rowHeight < margin) {
+            page = doc.addPage([pageWidth, pageHeight]);
+            y = pageHeight - margin;
+            drawInvoiceTableHeader();
+        }
+
+        wrappedName.forEach((line, idx) => {
+            page.drawText(line, { x: invCols.name, y: y - idx * rowLeading, size: 10, font: helvetica, color: colors.textMain });
+        });
 
         const isRequested = requestedIds.has(payment.id) && payment.status === 'Pending';
         const statusStr = isRequested ? 'Requested' : (payment.status || 'Pending');
@@ -1004,12 +1138,15 @@ export async function generateInvoicePdf(
         const amtW = helveticaBold.widthOfTextAtSize(amtStr, 10);
         page.drawText(amtStr, { x: invCols.amount - amtW, y, size: 10, font: helveticaBold, color: colors.textMain });
 
-        y -= 20;
+        y -= rowHeight;
     }
 
     // Totals
     y -= 10;
-    checkNewPage(80);
+    // 110 (not 80): the headline (Balance Due / Amount Requested) row below draws at
+    // plain y after two more 20-ish-pt decrements — keep it comfortably clear of the
+    // footer rather than relying on the footer's own guard.
+    checkNewPage(110);
     page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 25;
 
@@ -1038,9 +1175,12 @@ export async function generateInvoicePdf(
         checkNewPage(80);
         page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        page.drawText(invoice.notes, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
+        flowText(invoice.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
 
+    // No pre-footer page-break guard here: every content path above already page-breaks
+    // (or is bounded, see the checkNewPage(110) totals guard) well clear of the footer's
+    // y=30, so this can't collide — and a guard here would emit a footer-only blank page.
     const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
     page.drawText(footerText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
 
