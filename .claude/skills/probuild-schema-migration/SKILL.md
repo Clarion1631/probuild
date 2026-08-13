@@ -30,8 +30,9 @@ just isn't what breaks the command.) Verified 2026-08-10 from this machine:
 | `aws-0-us-west-2.pooler.supabase.com:5432` (session pooler) | A records | succeeds |
 | `aws-0-us-west-2.pooler.supabase.com:6543` (transaction pooler) | A records | succeeds |
 
-Those handshakes prove reachability only — nobody has tested authenticated Postgres access on the
-session pooler.
+Authenticated access over the session pooler **was** tested on 2026-08-13 — see
+"Repointing `DIRECT_URL` at the session pooler" below. It works. It still does not make the normal
+migration commands usable, for a completely different reason.
 
 ### `db push` evidence (verified 2026-08-10)
 
@@ -52,9 +53,83 @@ the tested one errors immediately instead of blocking. The IPv6 problem is
 also not WSL-specific: from WSL, `getent ahosts` on the direct host returns the same lone AAAA
 address and `ip -6 route show default` is empty, exactly as on Windows.
 
-Repointing `DIRECT_URL` at the session pooler is therefore **not** a tested workaround. `prisma
-migrate dev` also wants to create and drop a shadow database, which needs `CREATEDB` on the
-database role used through the pooler. Untested here. Use the PowerShell script below instead.
+## Repointing `DIRECT_URL` at the session pooler (tested 2026-08-13)
+
+**It fixes the connection. It does not fix the migration commands.** Do not spend time retrying
+this — the blocker moved, it did not go away.
+
+Test URL: the `DATABASE_URL` value with the port changed `6543` → `5432` and the `?pgbouncer=true`
+query string dropped. Same tenant-qualified user (`postgres.ghzdbzdnwjxazvmcefbh`), same password.
+
+### What works
+
+Authenticated Postgres over the session pooler succeeds from this machine. Verified with a
+read-only `PrismaClient` (`datasourceUrl` override, catalog `SELECT`s only) and with two read-only
+Prisma CLI commands:
+
+| Probe | Result |
+|---|---|
+| `SELECT current_user` | `postgres` |
+| `SHOW server_version` | `17.6` |
+| `rolcreatedb` on that role | **true** — so a shadow database is not blocked by role privilege |
+| `rolsuper` | false |
+| Connect with `/template1` instead of `/postgres` | **succeeds** — the pooler is not pinned to one database, so a shadow DB is reachable in principle |
+| `prisma migrate diff --from-schema-datasource` | connects, introspects, emits a diff |
+| `prisma migrate status` | connects, reads `_prisma_migrations` |
+
+So the IPv6 problem is genuinely solved by the pooler, and the shadow-database concern flagged in
+earlier versions of this file is **not** what stops `migrate dev`.
+
+### What stops it anyway: prod has diverged from the repo
+
+Both mutating commands are unusable against `ghzdbzdnwjxazvmcefbh` regardless of how you connect,
+because years of applying SQL by hand (the script below) without updating `prisma/schema.prisma` in
+lockstep have left the live database ahead of the checked-in schema.
+
+`prisma migrate diff --from-schema-datasource --to-schema-datamodel` against **`main`** returns 240
+lines of DDL. Read in the direction `db push` would apply it, that is:
+
+- **10 `DROP TABLE`** — `AuditLog`, `McpKey`, `Notification`, `HelpRequest`, `RolloutGate`,
+  `QboPurchaseClassification`, `ReviewAlertBatch`, `ReviewAlertEpisode`, `ReviewIssue`,
+  `_SelectionProposalStatusBackup`
+- **41 `DROP COLUMN`** across 24 tables — including the whole soft-delete set
+  (`deletedAt` / `deletedById` / `deleteBatchId` on `Client`, `Lead`, `Estimate`, `EstimateItem`,
+  `EstimatePaymentSchedule`, `Project`), `Invoice.qbInvoiceId` + `qbSyncedAt`,
+  `Estimate.qbEstimateId` + `qbSyncedAt`, `Project.googleChatSpaceId` + `qbProjectId`, and six
+  `TimeEntry` columns
+- 13 `DROP INDEX`, plus assorted `DECIMAL(65,30)` and `TIMESTAMP(3)` retypes
+
+So **`prisma db push` would connect fine and then destroy production data.** Never run it here.
+
+`prisma migrate dev` fails earlier still. `migrate status` over the pooler reports:
+
+```
+The last common migration is: null
+The migration have not yet been applied: sprint5_baseline
+The migration from the database are not found locally in prisma/migrations: 20260307033916_init
+```
+
+With no common ancestor, `migrate dev`'s first move is to ask for a full database **reset**. Neither
+`--shadow-database-url` nor `migrate resolve` helps — those address shadow-DB and applied-state
+bookkeeping, not a schema that the datamodel no longer describes.
+
+**Watch the branch you diff from.** The canonical checkout usually sits on dirty WIP (it was on
+`feat/unified-money-register` during this test), and its `schema.prisma` predates `Estimate.itemsRevision`
+among other things. Diffing against that branch inflates the drift with ~30 lines of pure artifact.
+Diff from a clean `main` worktree, or the numbers are meaningless.
+
+### What it would take to retire `apply_schema.ps1`
+
+Not a connection change — a **baseline reconciliation**, which is its own project:
+
+1. `prisma db pull` into a scratch schema and reconcile it against `main`'s `schema.prisma`, deciding
+   per object whether prod is right (adopt it) or the table/column is dead (drop it deliberately).
+2. Squash `prisma/migrations` to a single baseline matching reconciled prod, and
+   `prisma migrate resolve --applied` it so local history and `_prisma_migrations` agree.
+3. Only then point `DIRECT_URL` at the session pooler and let `migrate dev` take over.
+
+Until step 2 lands, use the PowerShell script below — and keep `schema.prisma` in sync with every
+SQL change you apply, which is the discipline whose absence created this drift.
 
 See <https://supabase.com/docs/guides/database/connecting-to-postgres> and
 <https://supabase.com/docs/guides/platform/ipv4-address>.
