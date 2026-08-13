@@ -45,7 +45,7 @@ function fakeJourney(overrides: Partial<ReceiptJourney>): ReceiptJourney {
 }
 
 function indexOf(journeys: ReceiptJourney[]): ReceiptJourneyIndex {
-    return indexJourneysByKeys(journeys);
+    return { ...indexJourneysByKeys(journeys), truncated: false };
 }
 
 test("a journey present ONLY because receiptJourneysForKeys fetched it for this exact qbPurchaseId is found via the index, confirmed", () => {

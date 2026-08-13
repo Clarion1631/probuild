@@ -44,6 +44,12 @@ export interface ReceiptJourneyMatch {
 export interface ReceiptJourneyIndex {
     byQbPurchaseId: Map<string, ReceiptJourney>;
     byDocNumber: Map<string, ReceiptJourney>;
+    /** True when `receiptJourneysForKeys`'s underlying event query hit its
+     * hard cap — this index may be missing journeys/events for some of the
+     * keys it was asked about. The caller (page.tsx) surfaces this as the
+     * same degraded-data warning style used elsewhere on the page, rather
+     * than letting a drill-down look complete when it might not be. */
+    truncated: boolean;
 }
 
 export function matchReceiptJourney(

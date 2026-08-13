@@ -20,12 +20,22 @@ export function friendlyType(qbType: string, docNum: string | null): string {
  * account, so "-$0.00" would misrepresent it. B7: decide the sign from the
  * ROUNDED-to-the-cent value, same rounding `formatCurrency` applies to the
  * amount shown right next to it — otherwise a sub-cent value like -0.001
- * prints as "-$0.00" (a sign the displayed digits don't back up). */
+ * prints as "-$0.00" (a sign the displayed digits don't back up).
+ *
+ * Codex round 1 finding 10: round the MAGNITUDE (`Math.round(Math.abs(x))`),
+ * then reapply the ORIGINAL sign — never `Math.round(x)` directly.
+ * `Math.round` rounds a halfway value toward +Infinity, not away from zero,
+ * so `Math.round(-0.5) === -0`, which is NOT `< 0` (negative zero compares
+ * equal to positive zero) — a genuine negative half-cent would silently
+ * fall through to the empty-sign branch instead of "-", asymmetrically vs.
+ * the equivalent positive case (`Math.round(0.5) === 1`, correctly "+").
+ * Rounding the magnitude first sidesteps both: -0 never appears, and the
+ * sign is never toward-zero-biased for a credit. */
 export function amountSign(amountCents: number): "+" | "-" | "" {
-    const rounded = Math.round(amountCents);
-    if (rounded > 0) return "+";
-    if (rounded < 0) return "-";
-    return "";
+    if (amountCents === 0) return "";
+    const roundedMagnitude = Math.round(Math.abs(amountCents));
+    if (roundedMagnitude === 0) return "";
+    return amountCents > 0 ? "+" : "-";
 }
 
 /**

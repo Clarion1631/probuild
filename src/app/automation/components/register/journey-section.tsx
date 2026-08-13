@@ -16,10 +16,14 @@ export function JourneySection({
     journeys,
     suggestions,
     now,
+    truncated,
 }: {
     journeys: SerializedJourney[];
     suggestions: Record<string, FixSuggestion | null>;
     now: number;
+    /** True when the underlying journey fetch had to cap its event query —
+     * see `JourneyList`'s doc comment for what this suppresses. */
+    truncated: boolean;
 }) {
     return (
         <details className="hui-card group" open>
@@ -35,7 +39,7 @@ export function JourneySection({
                     Every receipt the automation processed, including ones that never became a register row above.
                     Verify a receipt live against QuickBooks or run an AI review from here.
                 </p>
-                <JourneyList journeys={journeys} suggestions={suggestions} now={now} />
+                <JourneyList journeys={journeys} suggestions={suggestions} now={now} truncated={truncated} />
             </div>
         </details>
     );

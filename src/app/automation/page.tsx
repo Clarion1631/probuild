@@ -231,7 +231,7 @@ export default async function AutomationPage(props: {
     let mergedRows: MergedRegisterRow[] | null = null;
     let actionableOrphans: OrphanReceipt[] = [];
     let orphanProjectNameMap = new Map<string, string>();
-    let journeyIndex: ReceiptJourneyIndex = { byQbPurchaseId: new Map(), byDocNumber: new Map() };
+    let journeyIndex: ReceiptJourneyIndex = { byQbPurchaseId: new Map(), byDocNumber: new Map(), truncated: false };
     let expenseByPurchaseId = new Map<string, RawExpense>();
     let reviewIssueMap = new Map<string, OpenReviewIssue>();
     // Receipt journey PIPELINE LIST (plan §3) — a separate, display-capped
@@ -239,6 +239,13 @@ export default async function AutomationPage(props: {
     // genuine "browse the most recent receipts" list, so a display cap is
     // the right shape for it (see `receiptJourneys` in automation-events.ts).
     let pipelineJourneyList: ReceiptJourney[] = [];
+    // Findings 6/7: true when either journey fetch above had to cap its
+    // underlying event query — drill-downs/the pipeline list may be built
+    // from partial history. Surfaced as the page's existing degraded-data
+    // warning style, and threaded to JourneySection to suppress
+    // suggestion-cards/"stuck" conclusions that assume complete history.
+    let journeyIndexTruncated = false;
+    let pipelineJourneysTruncated = false;
 
     try {
         const mergeInputs = await fetchRegisterMergeInputs(registerRows, sinceMsForRangeDays(rangeDays));
@@ -269,13 +276,17 @@ export default async function AutomationPage(props: {
         orphanProjectNameMap = orphanProjectNames(mergeInputs.rawReceiptEvents);
 
         try {
-            [journeyIndex, pipelineJourneyList] = await Promise.all([
+            const [journeyIndexResult, pipelineResult] = await Promise.all([
                 receiptJourneysForKeys(
                     merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
                     rangeDays,
                 ),
                 receiptJourneys(rangeDays, 200),
             ]);
+            journeyIndex = journeyIndexResult;
+            journeyIndexTruncated = journeyIndexResult.truncated;
+            pipelineJourneyList = pipelineResult.journeys;
+            pipelineJourneysTruncated = pipelineResult.truncated;
         } catch (journeyError) {
             // Drill-downs/pipeline list degrade to empty; the register itself
             // (rows, counts, filters) stays fully live.
@@ -321,7 +332,12 @@ export default async function AutomationPage(props: {
             Receipt pipeline view unavailable right now — documentation data couldn&apos;t be loaded.
         </div>
     ) : (
-        <JourneySection journeys={serializedJourneys} suggestions={journeySuggestions} now={nowMs} />
+        <JourneySection
+            journeys={serializedJourneys}
+            suggestions={journeySuggestions}
+            now={nowMs}
+            truncated={pipelineJourneysTruncated}
+        />
     );
 
     const displayRows: DisplayRow[] = mergedRows
@@ -456,6 +472,12 @@ export default async function AutomationPage(props: {
                         <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                             Documentation status (receipt / job cost / amount) couldn&apos;t be loaded right now — the register
                             itself below is still current.
+                        </div>
+                    )}
+                    {journeyIndexTruncated && (
+                        <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                            Receipt journey history is incomplete for this range — some row drill-downs below may show
+                            partial results.
                         </div>
                     )}
                     <div className="flex gap-3 mt-2">

@@ -364,9 +364,16 @@ export interface JourneyEventInput {
  * cluster describing the same receipt. An id-less event (e.g. an "intake"
  * stage beacon logged before the bot had booked anything) is then bridged
  * into whichever id-confirmed cluster is the SOLE one sharing its docNumber
- * — that's the actual N1 scenario above, and is safe because docNumber is
- * derived from the same fileId at logging time for every event in one
- * receipt's real timeline. When a docNumber has more than one distinct
+ * — that's the actual N1 scenario above, and docNumber being derived from
+ * the same fileId at logging time makes this overwhelmingly the SAME
+ * receipt. "Overwhelmingly", not certainly, though: a genuinely different
+ * receipt whose OWN id-confirmed evidence hasn't arrived yet could still
+ * collide on that prefix, and there is no data at this point to rule that
+ * out. Codex round 1 finding 5: because of that, a journey built from a
+ * cluster that includes even one member joined ONLY via this heuristic
+ * never reports `keyConfirmed: true`, regardless of how much real
+ * driveFileId/qbPurchaseId evidence the OTHER members carry — see
+ * `weaklyBridgedIndices` below. When a docNumber has more than one distinct
  * id-confirmed cluster (a genuine collision), id-less events sharing it are
  * never guessed onto either — they fall back to their own per-docNumber-
  * prefix bucket instead (still `keyConfirmed: false`; a prefix collision
@@ -444,10 +451,22 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
         roots.add(find(i));
         idRootsByDoc.set(doc, roots);
     });
+    // Codex round 1 finding 5: this bridge is a HEURISTIC, not proof — it
+    // cannot actually distinguish "this id-less event really is this
+    // receipt" from "this id-less event is a genuinely DIFFERENT receipt
+    // that merely collides on the same docNumber prefix" (there is no data
+    // to tell the two apart, per the doc comment above). Track every index
+    // unioned in via this step so the journey it lands in never inherits
+    // `keyConfirmed: true` on the strength of a guess — see where
+    // `weaklyBridgedIndices` is read below.
+    const weaklyBridgedIndices = new Set<number>();
     sorted.forEach((e, i) => {
         if (resolveEventFileId(e) || resolveEventQbPurchaseId(e)) return;
         const roots = idRootsByDoc.get(e.docNumber as string);
-        if (roots && roots.size === 1) union(i, [...roots][0]);
+        if (roots && roots.size === 1) {
+            union(i, [...roots][0]);
+            weaklyBridgedIndices.add(i);
+        }
     });
 
     // Any id-less events NOT bridged above (no id-confirmed cluster shares
@@ -487,6 +506,14 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
         const doc = groupEvents[0].docNumber as string;
         const key = driveFileId ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : `prefix:${doc}`);
 
+        // Finding 5: real id evidence (driveFileId/qbPurchaseId) on the
+        // group is necessary but not sufficient — if ANY member only joined
+        // via the doc-prefix bridge heuristic above, that member (and
+        // therefore this whole reconciliation) is still a guess, so the
+        // journey must never present as confirmed on the strength of the
+        // OTHER members' real ids.
+        const hasWeakBridgeMember = indices.some((i) => weaklyBridgedIndices.has(i));
+
         const j: ReceiptJourney = {
             docNumber: doc,
             fileName: null, vendor: null, projectName: null,
@@ -496,7 +523,7 @@ export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string
             steps: [], finalState: "in-flight", finalReason: null,
             syncedExpenseId: null, syncedProjectName: null,
             driveFileId, qbPurchaseId, synced: null, backfilled: false,
-            keyConfirmed: Boolean(driveFileId) || Boolean(qbPurchaseId),
+            keyConfirmed: (Boolean(driveFileId) || Boolean(qbPurchaseId)) && !hasWeakBridgeMember,
         };
         for (const e of groupEvents) {
             if (e.source === "backfill") j.backfilled = true;
@@ -539,8 +566,23 @@ interface SyncedExpenseInput {
  * Mark the journeys the 4-hour sync already landed in ProBuild job costs,
  * matched via the [gtr-file:<fileId>] marker the sync copies into the
  * Expense description. Mutates `journeys` in place.
+ *
+ * Codex round 1 finding 8: more than one Expense can carry a marker that
+ * resolves to the SAME journey (a resync, a duplicate Expense row, a rare
+ * marker collision). The old code applied whichever one it happened to
+ * iterate last — silently overwriting an earlier match and depending on
+ * `expenses`' incidental array order rather than which one is actually
+ * newest. Fixed by collecting every match per journey FIRST, then: the
+ * NEWEST (by `syncedAt`, compared explicitly) wins the journey's `synced`
+ * fields; if more than one Expense matched, a single "ambiguous" step is
+ * appended instead of one "synced" step per match, so the ambiguity is
+ * visible rather than silently resolved; and `j.steps` is re-sorted by `at`
+ * afterward, since an appended sync-landing timestamp is not guaranteed to
+ * fall after every existing step (it comes from the sync run, not the
+ * receipt-push event stream this journey's other steps were built from).
  */
 function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: SyncedExpenseInput[]): void {
+    const matchesByJourney = new Map<ReceiptJourney, { exp: SyncedExpenseInput; fullId: string }[]>();
     for (const exp of expenses) {
         const m = exp.description?.match(/\[gtr-file:([^\]]+)\]/);
         if (!m) continue;
@@ -559,25 +601,47 @@ function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: S
             j = journeys.get(`prefix:${fullId.slice(0, 21)}`);
             if (j) j.keyConfirmed = false;
         }
-        if (j) {
-            const syncedAt = exp.qbSyncedAt ?? exp.createdAt;
-            j.syncedExpenseId = exp.id;
-            j.syncedProjectName = exp.estimate?.project?.name ?? null;
-            j.driveFileId = j.driveFileId ?? fullId;
-            j.synced = {
-                expenseId: exp.id,
-                projectId: exp.estimate?.project?.id ?? null,
-                projectName: exp.estimate?.project?.name ?? null,
-                // Prisma Decimal → cents; guard the conversion, this is display data.
-                amountCents: exp.amount != null ? Math.round(Number(exp.amount) * 100) : null,
-                vendor: exp.vendor ?? null,
-                receiptUrl: exp.receiptUrl ?? null,
-                syncedAt,
-            };
+        if (!j) continue;
+        const entry = { exp, fullId };
+        const existing = matchesByJourney.get(j);
+        if (existing) existing.push(entry);
+        else matchesByJourney.set(j, [entry]);
+    }
+
+    for (const [j, matches] of matchesByJourney) {
+        const withSyncedAt = matches
+            .map((m) => ({ ...m, syncedAt: m.exp.qbSyncedAt ?? m.exp.createdAt }))
+            .sort((a, b) => b.syncedAt.getTime() - a.syncedAt.getTime());
+        const { exp: newest, fullId, syncedAt } = withSyncedAt[0];
+
+        j.syncedExpenseId = newest.id;
+        j.syncedProjectName = newest.estimate?.project?.name ?? null;
+        j.driveFileId = j.driveFileId ?? fullId;
+        j.synced = {
+            expenseId: newest.id,
+            projectId: newest.estimate?.project?.id ?? null,
+            projectName: newest.estimate?.project?.name ?? null,
+            // Prisma Decimal → cents; guard the conversion, this is display data.
+            amountCents: newest.amount != null ? Math.round(Number(newest.amount) * 100) : null,
+            vendor: newest.vendor ?? null,
+            receiptUrl: newest.receiptUrl ?? null,
+            syncedAt,
+        };
+
+        if (withSyncedAt.length > 1) {
+            j.steps.push({
+                at: syncedAt,
+                stage: "synced",
+                status: "ambiguous",
+                reason: `${withSyncedAt.length} synced Expense records matched this receipt — showing the most recent`,
+                detail: null,
+            });
+        } else {
             // The expense records when the sync actually landed it — never
             // fabricate the step time from unrelated event timestamps.
             j.steps.push({ at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null });
         }
+        j.steps.sort((a, b) => a.at.getTime() - b.at.getTime());
     }
 }
 
@@ -617,16 +681,30 @@ async function fetchSyncedExpensesSince(since: Date): Promise<SyncedExpenseInput
     return expenses;
 }
 
+/** `receiptJourneysAll`'s return, now that it can no longer promise a
+ * COMPLETE list (see `truncated` below and Codex round 1 finding 7's fix to
+ * this function's old, inaccurate doc comment). */
+export interface ReceiptJourneysResult {
+    journeys: ReceiptJourney[];
+    /** True when the underlying event query hit its row cap — this window's
+     * events (and therefore its journeys/steps) may be missing older audit
+     * evidence. Callers that draw conclusions from a journey's COMPLETE
+     * history (suggestion cards, "stuck"/stale diagnoses) must suppress
+     * those when this is true, since they'd be judging partial data. */
+    truncated: boolean;
+}
+
 /**
- * Returns the COMPLETE list for the trailing `days` window — uncapped.
- * Callers that need a display-size-limited list (the pipeline view) must cap
- * it themselves (see `receiptJourneys` below); anything that keys/looks up a
- * SPECIFIC journey (e.g. the register row drill-down) should prefer
+ * Returns journeys for the trailing `days` window. Finding 7: despite the
+ * name and the old doc comment here, this was NEVER actually uncapped — the
+ * event query below has always had a 5000-row cap (see `cap`). Callers that
+ * need a display-size-limited list (the pipeline view) cap it themselves
+ * (see `receiptJourneys` below); anything that keys/looks up a SPECIFIC
+ * journey (e.g. the register row drill-down) should prefer
  * `receiptJourneysForKeys` instead, which fetches exactly the events for the
- * identifiers it's asked about rather than depending on this function's
- * event-count cap.
+ * identifiers it's asked about rather than depending on this function's cap.
  */
-export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]> {
+export async function receiptJourneysAll(days: number): Promise<ReceiptJourneysResult> {
     const since = new Date(Date.now() - days * 86_400_000);
     const cap = 5000;
     const events = await prisma.automationEvent.findMany({
@@ -640,7 +718,8 @@ export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]
         orderBy: { createdAt: "desc" },
         take: cap,
     });
-    if (events.length === cap) {
+    const truncated = events.length === cap;
+    if (truncated) {
         console.error(`receiptJourneysAll: event query hit its ${cap}-row cap — some older audit evidence may be missing from this render`);
     }
 
@@ -652,7 +731,10 @@ export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]
         attachSyncedExpenses(journeys, expenses);
     }
 
-    return [...journeys.values()].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime());
+    return {
+        journeys: [...journeys.values()].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime()),
+        truncated,
+    };
 }
 
 /**
@@ -662,10 +744,15 @@ export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]
  * register row drill-down) — an older, genuinely-matching journey can sit
  * just past the cap and read as "no audit record" even though it exists;
  * use `receiptJourneysAll` or `receiptJourneysForKeys` for that instead.
+ * `truncated` propagates from `receiptJourneysAll` unchanged — slicing the
+ * DISPLAY list down doesn't make the underlying event read any less partial.
  */
-export async function receiptJourneys(days: number, maxReceipts: number): Promise<ReceiptJourney[]> {
+export async function receiptJourneys(days: number, maxReceipts: number): Promise<ReceiptJourneysResult> {
     const all = await receiptJourneysAll(days);
-    return all.slice(0, Math.min(Math.max(maxReceipts, 1), 200));
+    return {
+        journeys: all.journeys.slice(0, Math.min(Math.max(maxReceipts, 1), 200)),
+        truncated: all.truncated,
+    };
 }
 
 /**
@@ -673,9 +760,10 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
  * matching every register row against a bulk, count-capped journey list
  * (an R × J scan on the page that carries the money register, and one whose
  * cap could silently drop a genuinely-matching older journey), this fetches
- * ONLY the events that could belong to the receipts named by `keys` — bounded
- * by the register's own row count, not by an arbitrary cap — and returns them
- * pre-indexed by both lookup tiers `matchReceiptJourney` needs.
+ * ONLY the events that could belong to the receipts named by `keys` —
+ * expected to stay well within the hard cap below given the register's own
+ * row count — and returns them pre-indexed by both lookup tiers
+ * `matchReceiptJourney` needs.
  *
  * `byQbPurchaseId` covers the confirmed match path (`journey.qbPurchaseId ===
  * row.qbTxnId`); `byDocNumber` covers the always-unconfirmed prefix-fallback
@@ -683,18 +771,27 @@ export async function receiptJourneys(days: number, maxReceipts: number): Promis
  * collision), the journey with the most recent `lastSeen` wins the map slot —
  * the same tie-break `matchReceiptJourney`'s old `.find()` against a
  * newest-first list produced.
+ *
+ * Codex round 1 finding 6: the event query used to have no `take` at all,
+ * trusting the id lists above to keep it bounded — true in the common case,
+ * but a register page covering many months/rows could still hand this a
+ * large enough id list to pull an unbounded number of events. Now capped at
+ * `EVENTS_CAP`, with `truncated` surfaced so a caller can show the SAME
+ * degraded-data warning it already shows for other partial reads (page.tsx),
+ * rather than silently rendering some drill-downs from a partial event set.
  */
 export async function receiptJourneysForKeys(
     keys: { qbPurchaseId: string | null; docNumber: string | null }[],
     days: number,
-): Promise<{ byQbPurchaseId: Map<string, ReceiptJourney>; byDocNumber: Map<string, ReceiptJourney> }> {
+): Promise<{ byQbPurchaseId: Map<string, ReceiptJourney>; byDocNumber: Map<string, ReceiptJourney>; truncated: boolean }> {
+    const EVENTS_CAP = 2000;
     const docNumbers = [...new Set(keys.map((k) => k.docNumber).filter((v): v is string => Boolean(v)))];
     const qbPurchaseIds = [...new Set(keys.map((k) => k.qbPurchaseId).filter((v): v is string => Boolean(v)))];
 
     const byQbPurchaseId = new Map<string, ReceiptJourney>();
     const byDocNumber = new Map<string, ReceiptJourney>();
     if (docNumbers.length === 0 && qbPurchaseIds.length === 0) {
-        return { byQbPurchaseId, byDocNumber };
+        return { byQbPurchaseId, byDocNumber, truncated: false };
     }
 
     const since = new Date(Date.now() - days * 86_400_000);
@@ -708,9 +805,16 @@ export async function receiptJourneysForKeys(
                 ...(qbPurchaseIds.length ? [{ qbPurchaseId: { in: qbPurchaseIds } }] : []),
             ],
         },
-        // Bounded by the explicit id lists above, not by a display cap — no
-        // `take` needed, so there is nothing here for B2 to silently drop.
+        // DESC + cap, same convention as receiptJourneysAll's — keeps the
+        // NEWEST events for each matched identifier when the hard cap below
+        // is actually hit.
+        orderBy: { createdAt: "desc" },
+        take: EVENTS_CAP,
     });
+    const truncated = events.length === EVENTS_CAP;
+    if (truncated) {
+        console.error(`receiptJourneysForKeys: event query hit its ${EVENTS_CAP}-row cap — some drill-downs may be built from partial journey history`);
+    }
 
     const journeys = groupEventsIntoJourneys(events);
 
@@ -724,7 +828,7 @@ export async function receiptJourneysForKeys(
         attachSyncedExpenses(journeys, expenses);
     }
 
-    return indexJourneysByKeys([...journeys.values()]);
+    return { ...indexJourneysByKeys([...journeys.values()]), truncated };
 }
 
 /**
