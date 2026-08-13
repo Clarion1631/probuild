@@ -5511,23 +5511,12 @@ export async function sendEstimateToClient(
         const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
         const balanceDue = rc(estimateTotal - paidSum);
 
-        const otherUnpaidSum = unpaidSchedules.slice(0, -1).reduce((sum, s) => sum + toNum(s.amount), 0);
-        const lastMilestone = unpaidSchedules[unpaidSchedules.length - 1];
-        const correctLastAmount = rc(balanceDue - otherUnpaidSum);
-
-        if (correctLastAmount >= 0 && Math.abs(correctLastAmount - toNum(lastMilestone.amount)) > 0.001) {
-            await prisma.$transaction([
-                prisma.estimatePaymentSchedule.update({
-                    where: { id: lastMilestone.id },
-                    data: { amount: correctLastAmount }
-                })
-            ]);
-            const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
-            schedules.splice(0, schedules.length, ...refreshed);
-        }
-
-        const unpaidSum = schedules.reduce((sum, s) => sum + toNum(s.amount), 0) - paidSum;
-        const unpaidRounded = rc(unpaidSum);
+        // No silent repair: this used to UPDATE the last unpaid milestone to
+        // balanceDue − others before emailing, which is one of the writers that
+        // kept reverting hand-corrected amounts (Mesplay EST-4226-3, Aug 2026).
+        // A mismatched schedule now blocks the send with the explicit error
+        // below — the editor's distribute-remainder button is the fix.
+        const unpaidRounded = rc(unpaidSchedules.reduce((sum, s) => sum + toNum(s.amount), 0));
         if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
             const diff = Math.abs(unpaidRounded - balanceDue);
