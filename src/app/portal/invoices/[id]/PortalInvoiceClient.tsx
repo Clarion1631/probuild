@@ -6,6 +6,7 @@ import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
+import { buildPdf } from "@/lib/build-pdf";
 import { formatMoneyDate } from "@/lib/payment-date";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
@@ -40,6 +41,7 @@ function parseFocusIds(param: string | null | undefined): string[] {
 
 export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess, focusMilestoneParam }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean, focusMilestoneParam?: string | null }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
+    const [isDownloading, setIsDownloading] = useState(false);
 
     useEffect(() => {
         // Pass the focused milestone ids so the internal "Invoice Viewed"
@@ -86,6 +88,28 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
     const companyLicense = companySettings?.licenseNumber || "";
+    const invoiceBannerText = `${companyName} • Invoice ${initialInvoice.code} (continued)`;
+
+    async function handleDownload() {
+        const element = document.getElementById("invoice-document-wrapper");
+        if (!element) return;
+        setIsDownloading(true);
+        try {
+            const prevShadow = element.style.boxShadow;
+            const prevBorder = element.style.border;
+            element.style.boxShadow = "none";
+            element.style.border = "none";
+            const pdf = await buildPdf(element, { bannerText: invoiceBannerText });
+            element.style.boxShadow = prevShadow;
+            element.style.border = prevBorder;
+            pdf.save(`Invoice_${initialInvoice.code || initialInvoice.id}.pdf`);
+        } catch (err) {
+            console.error("Download failed:", err);
+        } finally {
+            setIsDownloading(false);
+        }
+    }
+
     const isPaid = initialInvoice.status === "Paid";
     const totalPaid = Number(initialInvoice.totalAmount || 0) - Number(initialInvoice.balanceDue || 0);
 
@@ -131,6 +155,19 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     )}
                     <span className="text-sm text-slate-500">Invoice Portal</span>
                 </div>
+                <button
+                    data-pdf-skip="true"
+                    onClick={handleDownload}
+                    disabled={isDownloading}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition disabled:opacity-50"
+                >
+                    {isDownloading ? (
+                        <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                    ) : (
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    )}
+                    {isDownloading ? "Generating..." : "Download PDF"}
+                </button>
                 {isPaid && (
                     <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Paid in Full</span>
                 )}
@@ -138,7 +175,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="invoice-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
                     <DocumentLetterhead
@@ -175,7 +212,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     />
 
                     {/* Bill To */}
-                    <div className="px-5 sm:px-10 pt-6 pb-0">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 pt-6 pb-0">
                         <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 sm:gap-8">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Bill To</p>
@@ -191,7 +228,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                     {/* Focused payment request — the amount the client is being asked to pay right now */}
                     {hasFocus && (
-                        <div className="px-5 sm:px-10 py-8 bg-emerald-50 border-b border-emerald-200">
+                        <div data-pdf-row="true" className="px-5 sm:px-10 py-8 bg-emerald-50 border-b border-emerald-200">
                             <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider mb-1">Payment Requested</p>
                             <p className="text-sm text-emerald-900 mb-3">{focusedPayments.map((p: any) => p.name).join(" · ")}</p>
                             <div className="flex items-center justify-between flex-wrap gap-4">
@@ -214,7 +251,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         payment request shows just the requested amount above; the full
                         balance stays out of the client's view until it's asked for. */}
                     {!hasFocus && (
-                    <div className="px-5 sm:px-10 py-8 bg-slate-50 border-b border-slate-200">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 py-8 bg-slate-50 border-b border-slate-200">
                         <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-center">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Total Amount</p>
@@ -239,7 +276,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                     {/* Notes */}
                     {initialInvoice.notes && (
-                        <div className="px-5 sm:px-10 py-6 border-b border-slate-200">
+                        <div data-pdf-row="true" className="px-5 sm:px-10 py-6 border-b border-slate-200">
                             <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Notes</p>
                             <p className="text-sm text-slate-600 whitespace-pre-wrap">{initialInvoice.notes}</p>
                         </div>
@@ -260,6 +297,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                                     return (
                                         <div
+                                            data-pdf-row="true"
                                             key={payment.id}
                                             className={`flex flex-wrap items-center justify-between gap-y-3 px-4 sm:px-5 py-4 rounded-lg border ${
                                                 isPaidItem
@@ -340,7 +378,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`} {companyLicense && `License # ${companyLicense}.`}
                         </p>
