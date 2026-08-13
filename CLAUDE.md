@@ -157,9 +157,10 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 > pooler authenticates fine and read-only Prisma CLI commands work over it, but prod's schema and
 > migration history have drifted from the repo: `migrate diff` shows `db push` would propose 10
 > `DROP TABLE` and 41 `DROP COLUMN` against production, and `migrate status` reports no common
-> migration, which leaves `migrate dev` nothing to do but demand a database reset. Neither mutating
-> command was run. Retiring the script below needs a baseline reconciliation, not a connection
-> change — see the `probuild-schema-migration` skill before retrying this.
+> migration, which leaves `migrate dev` no useful work either. Neither mutating command was run
+> against prod, so those are the diffs they would face, not observed outcomes. Retiring the script
+> below needs a baseline reconciliation on top of the connection fix — see the
+> `probuild-schema-migration` skill before retrying this.
 
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`

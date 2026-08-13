@@ -83,21 +83,34 @@ So the IPv6 problem is genuinely solved by the pooler.
 advertises `CREATEDB`, and Supavisor will route to a database other than `postgres` — but the actual
 shadow lifecycle (`CREATE DATABASE` through the pooler, connecting to the freshly created random
 database, `DROP DATABASE`) was **not** attempted, because doing so mutates the production server.
-Do not read the table as proof that shadow databases work here. It is just no longer the *first*
-thing that would fail.
+Do not read the table as proof that shadow databases work here — only that the *privilege* objection
+raised by earlier versions of this file is not the obstacle. In Prisma 5.22 the shadow work runs
+early in `migrate dev`, so it remains the likeliest first failure whenever someone does try it.
 
 ### What stops it anyway: prod has diverged from the repo
 
 Both mutating commands are unusable against `ghzdbzdnwjxazvmcefbh` regardless of how you connect,
 because the live database holds a large set of tables and columns that the checked-in
-`prisma/schema.prisma` does not model. (Neither mutating command was run, here or anywhere — every
-statement below is read from `migrate diff` / `migrate status` output.) The likeliest cause is SQL
+`prisma/schema.prisma` does not model. (Neither mutating command was run **against production** —
+every statement below is read from `migrate diff` / `migrate status` output. The `db push` runs in
+the evidence table above were against a throwaway container.) The likeliest cause is SQL
 applied by hand via the script below without updating `schema.prisma` in lockstep, but the probes
 show only the divergence, not its cause — deleted migration files or deliberately-kept legacy
 objects would look the same.
 
-`prisma migrate diff --from-schema-datasource --to-schema-datamodel` against **`main`** returns 240
-lines of DDL. Read in the direction `db push` would apply it, that is:
+This diff, run with a clean **`main`** worktree's schema on both sides (`--from-schema-datasource`
+introspects the live database named by that file's datasource; `--to-schema-datamodel` reads its
+models), returns 240 lines of DDL:
+
+```
+prisma migrate diff \
+  --from-schema-datasource <clean-main>/prisma/schema.prisma \
+  --to-schema-datamodel   <clean-main>/prisma/schema.prisma \
+  --script
+```
+
+Both options need an explicit path, and without `--script` Prisma 5.22 prints a human-readable
+summary instead of DDL. Read in the direction `db push` would apply it, that is:
 
 - **10 `DROP TABLE`** — `AuditLog`, `McpKey`, `Notification`, `HelpRequest`, `RolloutGate`,
   `QboPurchaseClassification`, `ReviewAlertBatch`, `ReviewAlertEpisode`, `ReviewIssue`,
@@ -110,14 +123,16 @@ lines of DDL. Read in the direction `db push` would apply it, that is:
 - 13 `DROP INDEX`, plus assorted `DECIMAL(65,30)` and `TIMESTAMP(3)` retypes
 
 That is the synchronization `db push` would **propose**, not something it was observed doing — it was
-never run against prod. It would not execute those drops silently: Prisma stops on data-loss
-warnings, and with stdin not a TTY (how CI and Claude Code's Bash tool invoke it) it errors asking
-for `--accept-data-loss`, as the "`db push` evidence" table above records. So a bare `db push` should fail
-safe. **Do not run it here anyway** — the guardrail is one flag deep, and anyone who adds
-`--accept-data-loss` to "get past the error" drops 10 production tables.
+never run against prod. **Do not run it here to find out.**
 
-`prisma migrate dev` is blocked earlier still — by history, before the schema diff or the shadow
-database ever matter. `migrate status` over the pooler reports:
+Do not lean on the `--accept-data-loss` guardrail either. Prisma 5.22 only aborts when the engine
+returns a nonempty `migration.warnings`, and it raises those per *object that actually holds rows* —
+which the diff above does not tell us. So it is unknown how many of those 10 tables and 41 columns
+would even trigger a warning; the rest would just go. And the drops that do warn are one flag away
+from anyone trying to "get past the error".
+
+`prisma migrate dev` is also blocked, by divergent history. `migrate status` over the pooler
+reports:
 
 ```
 The last common migration is: null
@@ -127,8 +142,10 @@ The migration from the database are not found locally in prisma/migrations: 2026
 
 With no common ancestor, the expected outcome is that `migrate dev` demands a full database
 **reset** — but `migrate dev` was not run, so treat that as inference from `migrate status`, not an
-observation. (It could also fail earlier on the untested shadow-database step, or error rather than
-prompt when stdin is not a TTY.) Either way it does not do useful work here.
+observation. Note the ordering: in Prisma 5.22 the dev diagnostic does its shadow-database drift and
+validation work *before* it returns the reset decision, so the untested shadow lifecycle would
+actually be hit **first**, and could fail before history is ever the reported problem. It could also
+error rather than prompt when stdin is not a TTY. Either way it does not do useful work here.
 
 Neither knob rescues it, for different reasons:
 
@@ -146,7 +163,8 @@ real drift. Diff from clean `main`, or the numbers are meaningless.
 
 ### What it would take to retire `apply_schema.ps1`
 
-Not a connection change — a **baseline reconciliation**, which is its own project:
+Not a connection change **alone** — the connection fix is necessary but nowhere near sufficient. The
+missing piece is a **baseline reconciliation**, which is its own project:
 
 1. `prisma db pull` into a scratch schema and reconcile it against `main`'s `schema.prisma`, deciding
    per object whether prod is right (adopt it) or the table/column is dead (drop it deliberately).
@@ -161,9 +179,13 @@ Not a connection change — a **baseline reconciliation**, which is its own proj
    database**, never against prod, and ship the generated migrations to prod with `migrate deploy`.
    `migrate dev` is development-only by design — pointing it at `DIRECT_URL` is pointing it at the
    live database.
+5. Keep `DIRECT_URL` on the session pooler for step 4 to work at all. `migrate deploy` dials
+   `directUrl` like every other migration command, so from this machine it needs the pooler (or an
+   IPv6-capable runner) exactly as much as the rest do. This is where the pooler finding pays off —
+   it is a precondition of the end state, just not a fix on its own.
 
 Until steps 2–3 land, use the PowerShell script below — and keep `schema.prisma` in sync with every
-SQL change you apply, which is the discipline whose absence created this drift.
+SQL change you apply. Whatever caused the existing drift, that habit is what stops it growing.
 
 See <https://supabase.com/docs/guides/database/connecting-to-postgres> and
 <https://supabase.com/docs/guides/platform/ipv4-address>.
