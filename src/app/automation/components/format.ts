@@ -78,8 +78,8 @@ export function friendlyRowLabel(label: string): string {
     return LABEL_REWRITES[label] ?? label;
 }
 
-export function formatRelativeTime(date: Date): string {
-    const diffMs = Date.now() - date.getTime();
+export function formatRelativeTime(date: Date, now?: number): string {
+    const diffMs = (now ?? Date.now()) - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
     if (diffMins < 1) return "just now";
     if (diffMins < 60) return `${diffMins} min ago`;
