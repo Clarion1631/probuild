@@ -146,7 +146,8 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 - If still failing, `rm -rf .next && npm run dev`
 
 ## Schema migrations
-> `npx prisma db push` hangs interactively. `prisma migrate dev` fails because it dials `DIRECT_URL`,
+> `npx prisma db push` does **not** hang — it fails for the same reason `migrate dev` does, because
+> when the datasource sets `directUrl` that is the URL `db push` connects over too. Both dial `DIRECT_URL`,
 > whose host `db.ghzdbzdnwjxazvmcefbh.supabase.co` publishes an **AAAA record only** (IPv6-only without
 > Supabase's IPv4 add-on) and this machine has no IPv6 default route. **5432 is not a blocked port** and
 > the free tier is not the cause — the shared session pooler listens on 5432 too and completes a TCP
@@ -161,7 +162,7 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 ## Critical database config
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this. Without it: `42P05 prepared statement already exists` and the site goes down.
 - Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
-- DIRECT_URL uses port 5432 on `db.ghzdbzdnwjxazvmcefbh.supabase.co` (for migrations only)
+- DIRECT_URL uses port 5432 on `db.ghzdbzdnwjxazvmcefbh.supabase.co` (used by the Prisma CLI operations needing a direct connection — `migrate`, `db push`, Studio — not the app at runtime)
 
 ## compare.py (optional — QA tool, not daily workflow)
 Legacy Houzz Pro visual comparison tool. Useful for quarterly sanity checks only.
@@ -203,11 +204,16 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not direct Supabase client, for data access; Supabase is auth/storage only
-- **Schema changes** — do NOT use `npx prisma db push` (hangs in WSL) or `prisma migrate dev` (its `DIRECT_URL` host is IPv6-only and unreachable here; 5432 itself is fine — see "Schema migrations"). Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
+- **Schema changes** — do NOT use `npx prisma db push` or `prisma migrate dev`. Both connect over `DIRECT_URL` (yes, `db push` too — a datasource `directUrl` overrides `url` as the connection target), whose host is IPv6-only and unreachable here; 5432 itself is fine, and neither command hangs on this machine — see "Schema migrations". Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library
 - **Existing routes** — api, company, estimates, invoices, leads, login, manager, portal, projects, reports, settings, sub-portal, time-clock — don't duplicate
+- **Money-path invariants** (canonical — reviewers and plan reviews read these here, not just in `.claude/skills/codex-code-review/checklist.md`):
+  - **`markupPercent` is GROSS MARGIN ON SELL PRICE, not markup on cost.** `sell = baseCost / (1 - markupPercent/100)`; `cost = sell * (1 - markupPercent/100)`. The field name is legacy and misleading. Helpers live in `src/lib/budget-math.ts` (`sellFromMargin`, `costFromMargin`, `derivedMarginPct`) — use them, don't hand-roll the formula. `baseCost` + `unitCost` are authoritative; `markupPercent` is derived from them. `EstimateItem` is the field this describes and the one canonicalized in #324 (with #328/#329 as follow-ups: a constant collision and its backfill). `EstimateTemplateItem` copies the value verbatim to and from estimate lines, so it carries the same semantic. `ChangeOrderItem` may hold costing metadata copied from an estimate, but the current CO editor and billing paths neither maintain nor read it — fixed-price CO totals come from `unitCost`/`total`. Don't reason about CO margin from that column.
+    - Two deliberate exceptions, both already documented in place: `ChangeOrder.markupPercent` (COST_PLUS) is a **true markup on actuals**; and the AI takeoff prompt/preview (`api/takeoffs/ai-estimate`, `takeoffs/TakeoffsClient.tsx`) speaks **true markup**, converted to margin at `api/takeoffs/convert-to-estimate`. Don't "unify" either one.
+  - **`Estimate.totalAmount` is not a bare subtotal — check the tax mode before reconciling against it.** Editor saves compute `totalAmount = subtotal + tax + processingFee`. Once a rate is chosen the stored total is tax-INCLUSIVE. A null `taxRatePercent` does NOT reliably mean "no tax in the total": legacy and MCP paths store a bare subtotal there and approval grosses it up once by the default rate (`lib/gpt-estimate.ts`, `ensureProjectAndDepositInvoiceForEstimate`), but a takeoff-converted estimate can carry tax inside the total as a `99-TAX` line while still leaving `taxRatePercent` null, so approval can apply default tax on top of it. Read the items before assuming the mode. Any recomputation must preserve the current tax mode and the processing fee, or milestones and variance will not tie out. QBO is the deliberate exception: `lib/quickbooks.ts` sends pre-tax lines and lets QBO compute its own tax (its processing-fee handling is a known open gap).
+  - **Section headers are not billable.** Roll children up; never add a header's own amount on top of its children (see the Aug 2026 double-count sweep, #315/#320/#321/#325/#326).
 - **Money-path changes** (payments, signing, payment mirrors, notifications) — estimate/invoice milestones are mirrored pairs linked by `PaymentSchedule.sourceScheduleId`; settling or unsettling either side must update both. ALL paid-milestone side effects (team email, client receipt, activity log) flow through `notifyMilestonePaid()` in `lib/payment-notifications.ts` — never add a second writer for a lifecycle event (two duplicate loggers shipped that way before the June 2026 audit caught them). After touching these paths: run codex-peer-review on the diff and keep `e2e/money-pipeline.spec.ts` green (PR CI runs it — it guards the sign→convert→invoice chain, mirror links, undo restore, and exactly-once activity writers).
 
 ## Efficiency rules (token management)
