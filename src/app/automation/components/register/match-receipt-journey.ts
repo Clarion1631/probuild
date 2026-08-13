@@ -37,16 +37,25 @@ export interface ReceiptJourneyMatch {
     unconfirmed: boolean;
 }
 
+/** Pre-indexed journeys, keyed the way `receiptJourneysForKeys`
+ * (automation-events.ts) builds them — O(1) lookups instead of a `.find()`
+ * scan of every journey per register row (N2: that scan ran R × J times on
+ * the page that carries the money register). */
+export interface ReceiptJourneyIndex {
+    byQbPurchaseId: Map<string, ReceiptJourney>;
+    byDocNumber: Map<string, ReceiptJourney>;
+}
+
 export function matchReceiptJourney(
     row: { qbTxnId: string | null; docNum: string | null },
-    journeys: ReceiptJourney[],
+    journeys: ReceiptJourneyIndex,
 ): ReceiptJourneyMatch | null {
     if (row.qbTxnId) {
-        const direct = journeys.find((j) => j.qbPurchaseId === row.qbTxnId);
+        const direct = journeys.byQbPurchaseId.get(row.qbTxnId);
         if (direct) return { journey: direct, unconfirmed: !direct.keyConfirmed };
     }
     if (row.docNum) {
-        const byPrefix = journeys.find((j) => j.docNumber === row.docNum);
+        const byPrefix = journeys.byDocNumber.get(row.docNum);
         if (byPrefix) return { journey: byPrefix, unconfirmed: true };
     }
     return null;

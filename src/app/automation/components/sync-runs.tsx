@@ -119,8 +119,10 @@ export interface LastSync {
 }
 
 /** The "Last sync ... N imported, M skipped" summary line + skip breakdown,
- * unchanged from the old page's pipeline status card. */
-export function LastSyncSummary({ lastSync }: { lastSync: LastSync | null }) {
+ * unchanged from the old page's pipeline status card. `now` is the single
+ * timestamp `page.tsx` captures once, server-side (see `formatRelativeTime`'s
+ * doc comment for why). */
+export function LastSyncSummary({ lastSync, now }: { lastSync: LastSync | null; now: number }) {
     if (!lastSync) {
         return <p className="text-xs text-hui-textMuted">No sync has run yet.</p>;
     }
@@ -128,7 +130,7 @@ export function LastSyncSummary({ lastSync }: { lastSync: LastSync | null }) {
     return (
         <>
             <p className="text-xs text-hui-textMuted" title={lastSync.at.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
-                {formatRelativeTime(lastSync.at)} · {lastSync.status} · {describeSource(lastSync.source)}
+                {formatRelativeTime(lastSync.at, now)} · {lastSync.status} · {describeSource(lastSync.source)}
                 {counts && (
                     <>
                         {" · "}
@@ -162,8 +164,9 @@ export interface SyncRunEvent {
     detail: string | null;
 }
 
-/** The collapsed-by-default sync-runs history table, unchanged from the old page. */
-export function SyncRunsTable({ runs }: { runs: SyncRunEvent[] }) {
+/** The collapsed-by-default sync-runs history table, unchanged from the old
+ * page. `now` — see `LastSyncSummary` above. */
+export function SyncRunsTable({ runs, now }: { runs: SyncRunEvent[]; now: number }) {
     return (
         <details className="hui-card group">
             <summary className="cursor-pointer list-none px-5 py-4 flex items-center justify-between text-base font-semibold text-hui-textMain select-none">
@@ -189,7 +192,7 @@ export function SyncRunsTable({ runs }: { runs: SyncRunEvent[] }) {
                                 return (
                                     <tr key={e.id} className="hover:bg-slate-50 transition">
                                         <td className="px-4 py-3 text-hui-textMuted whitespace-nowrap" title={e.createdAt.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
-                                            {formatRelativeTime(e.createdAt)}
+                                            {formatRelativeTime(e.createdAt, now)}
                                         </td>
                                         <td className="px-4 py-3 text-hui-textMain">
                                             <div className="flex items-center gap-2">

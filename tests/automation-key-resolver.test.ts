@@ -7,6 +7,7 @@ import {
     readIdentifier,
     resolveReceiptPushEvent,
     trustedQbPurchaseId,
+    MAX_DOC_NUMBER_CANDIDATES,
     type ReceiptPushEventStore,
 } from "../src/lib/automation-key-resolver";
 import { resolveEventFileId, resolveEventQbPurchaseId } from "../src/lib/automation-events";
@@ -33,6 +34,34 @@ test("resolveEventQbPurchaseId prefers typed column, falls back to detail JSON",
     assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: "typed-qb", detail: JSON.stringify({ qbPurchaseId: "json-qb" }) }), "typed-qb");
     assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: JSON.stringify({ qbPurchaseId: "json-qb" }) }), "json-qb");
     assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: null }), null);
+});
+
+// ── Malformed-detail / blank / wrong-type negatives — both resolvers must
+// fail closed (null), never throw or coerce a bad value into a usable id ────
+
+test("resolveEventFileId: malformed JSON in detail never throws, resolves null", () => {
+    assert.equal(resolveEventFileId({ driveFileId: null, detail: "{not valid json" }), null);
+    assert.equal(resolveEventFileId({ driveFileId: null, detail: "" }), null);
+});
+
+test("resolveEventFileId: a blank typed column falls through to detail JSON, not an empty string id", () => {
+    assert.equal(resolveEventFileId({ driveFileId: "", detail: JSON.stringify({ fileId: "json-id" }) }), "json-id");
+    assert.equal(resolveEventFileId({ driveFileId: "", detail: null }), null);
+});
+
+test("resolveEventQbPurchaseId: malformed JSON in detail never throws, resolves null", () => {
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: "{not valid json" }), null);
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: "" }), null);
+});
+
+test("resolveEventQbPurchaseId: a blank typed column falls through to detail JSON, not an empty string id", () => {
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: "", detail: JSON.stringify({ qbPurchaseId: "json-qb" }) }), "json-qb");
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: "", detail: null }), null);
+});
+
+test("resolveEventQbPurchaseId: a non-string qbPurchaseId in detail JSON never coerces (e.g. a number) — resolves null, not a stringified value", () => {
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: JSON.stringify({ qbPurchaseId: 12345 }) }), null);
+    assert.equal(resolveEventQbPurchaseId({ qbPurchaseId: null, detail: JSON.stringify({ qbPurchaseId: null }) }), null);
 });
 
 // ── pickPushEvent ────────────────────────────────────────────────────────
@@ -228,6 +257,31 @@ test("A6: docNumber tier counts first — over the cap fails closed as ambiguous
     assert.equal(findByDocNumberCalled, false);
 });
 
+test("A6: docNumber tier boundary — exactly AT the production cap (MAX_DOC_NUMBER_CANDIDATES) still resolves normally, only ABOVE it fails closed", async () => {
+    // The earlier test only proved cap+1 (51) fails closed; it never proved
+    // the boundary itself is where production says it is. Exercised against
+    // the EXPORTED constant, not a hardcoded copy of it, so a change to the
+    // production threshold can't silently drift out of sync with this test.
+    const atCap = fakeEvent({ id: "at-cap", docNumber: "ABC123", driveFileId: "file-at-cap" });
+    const store = emptyStore({
+        countByDocNumber: async () => MAX_DOC_NUMBER_CANDIDATES,
+        findByDocNumber: async () => [atCap],
+    });
+    const result = await resolveReceiptPushEvent({ docNumber: "ABC123", driveFileId: null, qbPurchaseId: null }, store);
+    assert.equal(result.outcome, "resolved");
+    if (result.outcome === "resolved") assert.equal(result.confirmed, false);
+});
+
+test("A6: docNumber tier boundary — one row OVER the production cap fails closed as ambiguous", async () => {
+    const store = emptyStore({
+        countByDocNumber: async () => MAX_DOC_NUMBER_CANDIDATES + 1,
+        findByDocNumber: async () => { throw new Error("must not fetch when over the cap"); },
+    });
+    const result = await resolveReceiptPushEvent({ docNumber: "ABC123", driveFileId: null, qbPurchaseId: null }, store);
+    assert.equal(result.outcome, "ambiguous");
+    if (result.outcome === "ambiguous") assert.equal(result.candidateCount, MAX_DOC_NUMBER_CANDIDATES + 1);
+});
+
 test("A6: docNumber tier detects a genuine collision when under the cap, using the COMPLETE candidate set", async () => {
     const one = fakeEvent({ id: "one", docNumber: "ABC123", driveFileId: "1AbCdEfGhIjKlMnOpQrStONE", status: "created" });
     const two = fakeEvent({ id: "two", docNumber: "ABC123", driveFileId: "1AbCdEfGhIjKlMnOpQrStTWO", status: "created" });
@@ -281,4 +335,22 @@ test("A2/A3: a conflicting client-supplied qbPurchaseId cannot influence the res
 
 test("trustedQbPurchaseId returns null when the resolved event carries no qbPurchaseId anywhere", () => {
     assert.equal(trustedQbPurchaseId({ qbPurchaseId: null, detail: null }), null);
+});
+
+test("A2: a driveFileId-tier resolution (identity CONFIRMED) can still have no trusted qbPurchaseId on the resolved event — the exact branch the ai-review route's query-tightening depends on", async () => {
+    // Before A2 was fixed, ai-review/route.ts widened its Expense lookup to
+    // `qbPurchaseId: { not: null }` whenever `trustedQbPurchaseId` returned
+    // null — which happens here even though the MATCH ITSELF is confirmed
+    // (the driveFileId matched exactly). This proves the branch exists: a
+    // resolved+confirmed event with no qbPurchaseId of its own, so a caller
+    // reading `confirmed: true` cannot assume `trustedQbPurchaseId` is
+    // non-null too — those are independent facts.
+    const fileOnlyEvent = fakeEvent({ id: "file-only", driveFileId: "file-only-full-id", qbPurchaseId: null, status: "created" });
+    const store = emptyStore({ findByDriveFileId: async () => [fileOnlyEvent] });
+    const result = await resolveReceiptPushEvent({ docNumber: null, driveFileId: "file-only-full-id", qbPurchaseId: null }, store);
+    assert.equal(result.outcome, "resolved");
+    if (result.outcome === "resolved") {
+        assert.equal(result.confirmed, true);
+        assert.equal(trustedQbPurchaseId(result.event), null);
+    }
 });

@@ -17,10 +17,14 @@ export function friendlyType(qbType: string, docNum: string | null): string {
 
 /** "+" for money in, "-" for money out, and nothing for exactly zero — a
  * zero-value row is unclassifiable/non-spend, not money that "left" the
- * account, so "-$0.00" would misrepresent it. */
+ * account, so "-$0.00" would misrepresent it. B7: decide the sign from the
+ * ROUNDED-to-the-cent value, same rounding `formatCurrency` applies to the
+ * amount shown right next to it — otherwise a sub-cent value like -0.001
+ * prints as "-$0.00" (a sign the displayed digits don't back up). */
 export function amountSign(amountCents: number): "+" | "-" | "" {
-    if (amountCents > 0) return "+";
-    if (amountCents < 0) return "-";
+    const rounded = Math.round(amountCents);
+    if (rounded > 0) return "+";
+    if (rounded < 0) return "-";
     return "";
 }
 
@@ -78,8 +82,22 @@ export function friendlyRowLabel(label: string): string {
     return LABEL_REWRITES[label] ?? label;
 }
 
-export function formatRelativeTime(date: Date, now?: number): string {
-    const diffMs = (now ?? Date.now()) - date.getTime();
+/**
+ * B6: `nowMs` is REQUIRED, not read from `Date.now()` in here — same reason
+ * `isStaleBookedApi` (shared/stale-detection.ts) takes it as a parameter
+ * instead: this runs inside components that render on the server (initial
+ * SSR pass) and again on the client (hydration), and calling `Date.now()` in
+ * each pass reads two different clock values, which can flip the rendered
+ * text between passes and produce a hydration mismatch. Callers thread a
+ * single timestamp captured once, server-side (see `page.tsx`'s `nowMs`),
+ * through both render paths. The day-or-more fallback is pinned to Pacific
+ * time, same as every other date display on this page (`step-timeline.tsx`,
+ * `page.tsx`'s "fetched at" title) — a bare `toLocaleDateString` without a
+ * `timeZone` reads the server/browser's local zone instead, which can print
+ * a different calendar day than the rest of the page for the same instant.
+ */
+export function formatRelativeTime(date: Date, nowMs: number): string {
+    const diffMs = nowMs - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
     if (diffMins < 1) return "just now";
     if (diffMins < 60) return `${diffMins} min ago`;
@@ -87,5 +105,5 @@ export function formatRelativeTime(date: Date, now?: number): string {
     if (diffHours < 24) return `${diffHours} hr${diffHours === 1 ? "" : "s"} ago`;
     const diffDays = Math.floor(diffHours / 24);
     if (diffDays < 7) return `${diffDays} day${diffDays === 1 ? "" : "s"} ago`;
-    return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    return date.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "America/Los_Angeles" });
 }

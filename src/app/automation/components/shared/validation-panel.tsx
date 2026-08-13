@@ -153,8 +153,9 @@ function ReceiptPreview({ journey }: { journey: SerializedJourney }) {
 /** The per-receipt drill-down: extracted vs. booked vs. in-ProBuild vs. live
  * QuickBooks comparison table, the "Verify in QuickBooks" live-check action,
  * and the on-demand AI review. Extracted so the merged register page reuses
- * this exact panel instead of reimplementing it. */
-export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
+ * this exact panel instead of reimplementing it. `now` — see
+ * `formatRelativeTime`'s doc comment (components/format.ts). */
+export function ValidationPanel({ journey, now }: { journey: SerializedJourney; now: number }) {
     const [verifying, setVerifying] = useState(false);
     const [result, setResult] = useState<VerifySuccess | null>(null);
     const { aiReviewing, aiResult, runAiReview } = useAiReview({
@@ -385,12 +386,12 @@ export function ValidationPanel({ journey }: { journey: SerializedJourney }) {
                     {result && (
                         <span
                             className="text-xs text-hui-textMuted"
-                            title={new Date(result.verifiedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}
+                            title={new Date(result.verifiedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Los_Angeles" })}
                         >
                             {/* "Verified" implies confirmed identity — when the match
                                 itself is a guess, say what actually happened: we
                                 checked, not that we verified this receipt. */}
-                            {matchUnconfirmed ? "Checked" : "Verified"} {formatRelativeTime(new Date(result.verifiedAt))}
+                            {matchUnconfirmed ? "Checked" : "Verified"} {formatRelativeTime(new Date(result.verifiedAt), now)}
                         </span>
                     )}
                 </div>

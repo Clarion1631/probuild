@@ -104,8 +104,10 @@ const PUSH_EVENT_STATUSES = ["created", "already-exists"];
 
 /** Above this many rows sharing a bare docNumber prefix, refuse to guess
  * rather than risk sampling only one side of a real collision — see
- * `ReceiptPushEventStore.countByDocNumber` below. */
-const MAX_DOC_NUMBER_CANDIDATES = 50;
+ * `ReceiptPushEventStore.countByDocNumber` below. Exported so the exact
+ * production threshold (not a hardcoded copy of it) is what the boundary
+ * test in automation-key-resolver.test.ts exercises. */
+export const MAX_DOC_NUMBER_CANDIDATES = 50;
 
 /**
  * DB access this resolver needs, factored out so `resolveReceiptPushEvent`

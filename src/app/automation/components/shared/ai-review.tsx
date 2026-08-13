@@ -65,8 +65,10 @@ export function AiFieldChip({
      * collision) — a green "agree" checkmark here would read as confirmation
      * of the WRONG receipt's data, so it must downgrade to the same neutral
      * "?" chip as an unknown verdict. Flags stay red either way: a
-     * disagreement is worth surfacing regardless of match confidence. */
-    unconfirmed?: boolean;
+     * disagreement is worth surfacing regardless of match confidence.
+     * REQUIRED (A4) — an omitted prop must never silently default to
+     * "confirmed" and let a guess render green. */
+    unconfirmed: boolean;
 }) {
     const label = field.charAt(0).toUpperCase() + field.slice(1);
     const state = verdict?.state ?? "unknown";

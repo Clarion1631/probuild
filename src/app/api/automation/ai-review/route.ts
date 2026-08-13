@@ -243,9 +243,19 @@ export async function POST(request: Request) {
 
     // The reviewable image is the ProBuild-stored copy (public Supabase URL,
     // fetchable server-side). It exists once the 4-hour sync has landed.
+    //
+    // A2: when `resolvedQbPurchaseId` is unavailable, this used to widen the
+    // qbPurchaseId filter to `{ not: null }` — which adds no real
+    // restriction (every synced Expense has SOME qbPurchaseId) and, paired
+    // with a possibly-truncated marker (the prefix-fallback `markerToken`
+    // above is deliberately unclosed), could select an unrelated Expense.
+    // Only ADD the qbPurchaseId filter when we actually have a trusted one
+    // to narrow with; otherwise rely on the marker match alone (still
+    // reported `unconfirmedMatch: true` below when it is the prefix
+    // fallback) rather than a widen that cannot help match precision.
     const expense = await prisma.expense.findFirst({
         where: {
-            qbPurchaseId: resolvedQbPurchaseId ?? { not: null },
+            ...(resolvedQbPurchaseId ? { qbPurchaseId: resolvedQbPurchaseId } : {}),
             description: { contains: markerToken },
             receiptUrl: { not: null },
         },

@@ -46,6 +46,7 @@ export function PipelineHealth({
     qboSyncPaused,
     isAdmin,
     syncRuns,
+    now,
 }: {
     pushedThisMonth: number;
     handsFreeRate30d: number | null;
@@ -61,6 +62,9 @@ export function PipelineHealth({
     qboSyncPaused: boolean;
     isAdmin: boolean;
     syncRuns: SyncRunEvent[];
+    /** Single timestamp captured once, server-side — see `formatRelativeTime`'s
+     * doc comment (components/format.ts). */
+    now: number;
 }) {
     const chartEmpty = buckets.every((b) => b.created === 0 && b.fallback === 0 && b.error === 0);
 
@@ -110,7 +114,7 @@ export function PipelineHealth({
                         <div className="flex items-center justify-between py-2">
                             <div>
                                 <p className="text-sm font-medium text-hui-textMain">Last sync</p>
-                                <LastSyncSummary lastSync={lastSync} />
+                                <LastSyncSummary lastSync={lastSync} now={now} />
                             </div>
                         </div>
                     </div>
@@ -119,7 +123,7 @@ export function PipelineHealth({
                     </p>
                 </div>
 
-                <SyncRunsTable runs={syncRuns} />
+                <SyncRunsTable runs={syncRuns} now={now} />
             </div>
         </details>
     );
