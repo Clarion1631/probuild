@@ -5958,11 +5958,15 @@ export async function getResolvedMergePreview(
 
 // `getContracts` was deleted here. It had no callers anywhere — the live staff
 // screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
-// directly with contractScopeWhere(viewer) — but in a "use server" module every
-// export is an individually invokable POST endpoint regardless, so a caller-less
-// export is live attack surface rather than inert code. #367 gated it; this
-// removes it. The scope rule it used, contractScopeWhere, is NOT orphaned: the
-// two pages above and getLead's contracts relation are its consumers.
+// directly with contractScopeWhere(viewer). Having no callers did NOT make it
+// inert: as this module actually builds (Next 16.2.11), the server-reference
+// manifest registers all 360 of its exports as individually invokable POST
+// endpoints, 37 of them unreferenced anywhere in src/ — so a caller-less export
+// here is live attack surface whose gate nothing exercises. Next documents that
+// unused actions MAY be eliminated, so that is a measurement of this build, not
+// a universal rule; see docs/CONTRACTS.md. #367 gated it; this removes it. The
+// scope rule it used, contractScopeWhere, is NOT orphaned: the two pages above
+// and getLead's contracts relation are its consumers.
 
 export async function getContract(id: string) {
     // Staff-only, scoped to the owning job. The docstring on getContractForPortal
@@ -6035,8 +6039,8 @@ export async function getContractForPortal(id: string, token?: string | null) {
 }
 
 // `getExecutedContractPdf` was deleted here, for the same reason as
-// `getContracts` above: no callers, but a "use server" export is a POST
-// endpoint whether or not anything imports it. Every real caller already uses
+// `getContracts` above: no callers, but on this build every export of this
+// module is registered as a POST endpoint anyway. Every real caller already uses
 // the session-free core `executedContractPdfFor` in contract-files-core.ts —
 // the client portal proves access by accessToken/portal session, and
 // countersignContractAsCompany calls it after its own gate.

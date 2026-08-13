@@ -623,11 +623,14 @@ test("every exported contract action authorizes and scopes by contract id", () =
 
 // #367 GATED `getContracts` and `getExecutedContractPdf`. A caller survey then
 // found neither had a single call site — not in src/, e2e/, scripts/, not via
-// `await import(...)`, not from the MCP route, not from the mobile app. In a
-// "use server" module that does not make an export inert: Next.js registers
-// every export as an individually invokable POST endpoint whether or not any
-// component imports it, so a caller-less export is live attack surface whose
-// gate nothing exercises. Both were deleted; this test keeps them deleted.
+// `await import(...)`, not from the MCP route, not from the mobile app. That
+// did not make them inert. Measured on this build (Next 16.2.11), not assumed:
+// .next/server/server-reference-manifest.json registers all 360 exports of
+// actions.ts as individually invokable POST endpoints, 37 of them unreferenced
+// anywhere in src/. Next documents that unused actions MAY be eliminated, so
+// this is a property of how ProBuild actually builds rather than a universal
+// rule — and while it holds, a caller-less export here is live attack surface
+// whose gate nothing exercises. Both were deleted; this test keeps them so.
 //
 // Asserting on the source text, not on behaviour, for the same reason the
 // tests around it do: there is no request-level harness here.
@@ -639,9 +642,16 @@ test("every exported contract action authorizes and scopes by contract id", () =
 // blanked the real export out of the text and passed. `export let`,
 // `export const { getContracts } = holder` (destructuring) and `export * from`
 // all slipped past the pattern too, and `export { getContracts as other }`
-// false-POSITIVED. The AST has no such gaps: it reports what the module
-// actually exports, under every syntax, with comments and strings already
-// handled by the parser.
+// false-POSITIVED. The AST closes every one of those, with comments and string
+// literals already handled by the parser.
+//
+// Scope, stated precisely (Codex round 2): this collects top-level NAMED
+// exports, which is what can reinstate an endpoint under either forbidden name.
+// It deliberately does not model `export default` / `export =` — a default
+// export's exported name is "default", not `getContracts`, so it cannot
+// reinstate either name — and `export *` throws rather than passing silently.
+// Type-only exports are skipped: they erase at compile time and register no
+// endpoint, so counting them would be a false positive.
 function exportedNames(filePath: string): Set<string> {
   const file = ts.createSourceFile(
     filePath,
@@ -673,6 +683,7 @@ function exportedNames(filePath: string): Set<string> {
       // Covers `export const`, `export let` and `export var` alike.
       for (const declaration of statement.declarationList.declarations) addBinding(declaration.name);
     } else if (ts.isExportDeclaration(statement)) {
+      if (statement.isTypeOnly) continue;
       if (!statement.exportClause) {
         // `export * from "./elsewhere"` re-exports an unknown set of names, so
         // it could reinstate either endpoint invisibly. Fail loudly instead of
@@ -684,7 +695,10 @@ function exportedNames(filePath: string): Set<string> {
       if (ts.isNamedExports(statement.exportClause)) {
         // The EXPORTED name is what registers the endpoint, so read the alias
         // (`export { foo as getContracts }` exports getContracts), not the local.
-        for (const element of statement.exportClause.elements) names.add(element.name.text);
+        for (const element of statement.exportClause.elements) {
+          if (element.isTypeOnly) continue;
+          names.add(element.name.text);
+        }
       } else {
         names.add(statement.exportClause.name.text);
       }

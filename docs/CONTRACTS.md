@@ -81,8 +81,9 @@ Blast radius of removing them was effectively nil: both were only ever called fr
 Components (server-render calls), never imported into a Client Component or bound to a
 `<form action>`, so no shipped browser bundle carries their action ids and no stale tab can
 call them. Deleting an action that *had* been serialized to clients is a different matter — stale
-tabs get "Failed to find Server Action" unless Vercel Skew Protection is on, which is a project
-setting and is not configured in `next.config.ts`.
+tabs get "Failed to find Server Action" unless Vercel Skew Protection is on. That is a Vercel
+project setting rather than repo config, so `next.config.ts` says nothing either way about it —
+its dashboard state has not been checked.
 
 `e2e/financial-action-auth.spec.ts` keeps both deleted, reading the export list off the
 TypeScript AST rather than by regex.
