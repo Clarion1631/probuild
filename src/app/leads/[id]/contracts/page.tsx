@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import EntityContractsClient from "@/components/EntityContractsClient";
 import { resolveDocUrl } from "@/lib/secure-storage";
-import { getCurrentUserWithPermissions, contractScopeWhere } from "@/lib/permissions";
+import { currentStaffUserOrNull, contractScopeWhere } from "@/lib/permissions";
 
 export const dynamic = "force-dynamic";
 
@@ -29,7 +29,7 @@ export default async function LeadContractsPage({ params, searchParams }: {
     // the linked-project union below would otherwise surface converted
     // contracts (which carry BOTH ids, and canAccessJobScope lets the project
     // win) whose edit / delete / history buttons throw Forbidden.
-    const viewer = await getCurrentUserWithPermissions();
+    const viewer = await currentStaffUserOrNull();
     const contracts = await prisma.contract.findMany({
         where: {
             AND: [

@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { cookies } from "next/headers";
-import { authOptions } from "@/lib/auth";
+import { authOptions, getSessionOrDev } from "@/lib/auth";
 
 // The pure rules live in access-rules.ts (no Prisma / next-auth / next-headers
 // imports) so they can be unit-tested for real. Re-exported here so every
@@ -46,6 +46,30 @@ export async function getCurrentUserWithPermissions() {
     if (!session?.user?.email) return null;
 
     return getUserWithPermissionsByEmail(session.user.email);
+}
+
+/**
+ * getCurrentUserWithPermissions plus the development ADMIN fallback that the
+ * project/lead layouts and every server action already honour. Lives here
+ * rather than in actions.ts because actions.ts is a "use server" module, where
+ * exporting it would publish another endpoint; the copy in actions.ts
+ * (currentStaffUserOrNull) delegates to this one so the two cannot drift.
+ *
+ * Server components that scope a query themselves should use THIS, not the
+ * bare getCurrentUserWithPermissions — otherwise sessionless local development
+ * silently renders an empty list while every surrounding gate lets the dev
+ * ADMIN through. Production is unaffected: canUseDevAuthFallback returns false
+ * outside NODE_ENV=development.
+ */
+export async function currentStaffUserOrNull(): Promise<any | null> {
+    const user = await getCurrentUserWithPermissions();
+    if (user) return user;
+
+    if (await canUseDevAuthFallback()) {
+        const devSession = await getSessionOrDev();
+        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
+    }
+    return null;
 }
 
 export async function canUseDevAuthFallback() {

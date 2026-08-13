@@ -584,15 +584,27 @@ test("every exported contract action authorizes and scopes by contract id", () =
     const beforeGuard = action.slice(0, guardIndex);
     expect(beforeGuard, `${name} must not return before authorizing`).not.toMatch(/\breturn\b/);
 
-    // Nor is "the guard is called" enough. `try { await assertContractAccess(id) }
-    // catch {}` satisfies every assertion above and reopens the hole in full,
-    // so the guard must not sit inside a caught block (Codex round-1).
+    // Nor is "the guard is called" enough. Both of these satisfy every
+    // assertion above and reopen the hole in full, so both are named:
+    //   try { await assertContractAccess(id) } catch {}
+    //   await assertContractAccess(id).catch(() => {})
+    // (Codex rounds 1 and 2.)
     expect(beforeGuard, `${name} must not swallow the authorization failure`)
       .not.toMatch(/\btry\b/);
+    expect(action, `${name} must not catch the authorization failure`)
+      .not.toMatch(/assertContractAccess\([^)]*\)\s*\.\s*catch/);
 
     // And the action must still DO something after authorizing — otherwise a
-    // body gutted to `return null as any` passes as "secure".
-    expect(action.slice(guardIndex), `${name} must still do its work after authorizing`)
+    // body gutted to `return null as any` passes as "secure". Checked against
+    // the FIRST statement after the guard, not merely "somewhere below it", so
+    // an early return with unreachable prisma text underneath cannot satisfy
+    // it (Codex round 2). This is still a source-pattern check: it raises the
+    // cost of a plausible-looking regression, it does not prove behaviour.
+    // Behavioural coverage would need a disposable-database request test.
+    const afterGuard = action.slice(guardIndex).replace(/^[^;]*;/, "");
+    expect(afterGuard.trimStart(), `${name} must still do its work after authorizing`)
+      .not.toMatch(/^return\s+(null|undefined|\{\}|\[\])/);
+    expect(afterGuard, `${name} must still reach the data layer`)
       .toMatch(/prisma\.|executedContractPdfFor\(/);
   }
 
@@ -640,7 +652,11 @@ test("the staff contract pages filter by the same scope rule the actions assert"
     "src/app/leads/[id]/contracts/page.tsx",
   ]) {
     const source = stripComments(readFileSync(join(process.cwd(), page), "utf8"));
-    expect(source, `${page} must resolve the viewer`).toContain("await getCurrentUserWithPermissions()");
+    // currentStaffUserOrNull, NOT the bare getCurrentUserWithPermissions: the
+    // surrounding layouts and actions honour the development ADMIN fallback,
+    // so the bare form would render an empty contract list in sessionless
+    // local development while everything around it worked (Codex round 2).
+    expect(source, `${page} must resolve the viewer`).toContain("await currentStaffUserOrNull()");
     expect(source, `${page} must apply the contract scope filter`).toContain("contractScopeWhere(viewer)");
 
     // The filter must gate the contract query itself, not sit unused beside it.

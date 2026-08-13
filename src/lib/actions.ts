@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -4161,14 +4161,9 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
  * data. Only a real absence of a signed-in staff user returns null.
  */
 async function currentStaffUserOrNull(): Promise<any | null> {
-    const user = await getCurrentUserWithPermissions();
-    if (user) return user;
-
-    if (await canUseDevAuthFallback()) {
-        const devSession = await getSessionOrDev();
-        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
-    }
-    return null;
+    // Body moved to permissions.ts so server components that scope a query
+    // themselves can share it without actions.ts publishing another endpoint.
+    return currentStaffViewerOrNull();
 }
 
 async function assertActiveStaff(): Promise<any> {
