@@ -2274,9 +2274,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
     /** The % / $ fields are text inputs (see the milestone row), so "$1,000.50"
      *  can arrive verbatim — parseFloat would read that as 1. Keep digits and the
-     *  decimal point only, so what's stored is what parseFloat will see. */
+     *  first decimal point only (later dots are dropped like a number input would),
+     *  so what's stored is exactly what parseFloat will see. */
     function sanitizeMoneyInput(value: string): string {
-        return String(value).replace(/[^0-9.]/g, "");
+        const cleaned = String(value).replace(/[^0-9.]/g, "");
+        const firstDot = cleaned.indexOf(".");
+        if (firstDot === -1) return cleaned;
+        return cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, "");
     }
 
     function updatePaymentSchedule(index: number, field: string, value: any) {
@@ -4194,6 +4198,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     estimateId={initialEstimate.id}
                     clientEmail={context.clientEmail}
                     onClose={() => setShowSendModal(false)}
+                    onBeforeSend={() => handleSave({ silent: true, skipRefresh: true })}
                 />
             )}
 
