@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import EntityContractsClient from "@/components/EntityContractsClient";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { currentStaffUserOrNull, contractScopeWhere } from "@/lib/permissions";
 
 export const dynamic = "force-dynamic";
 
@@ -21,11 +22,24 @@ export default async function LeadContractsPage({ params, searchParams }: {
     // Fetch all contracts visible to this lead: those directly attached (leadId = X)
     // and those on the linked converted project (projectId = linked-project-id).
     // OR returns unique rows; no manual dedup needed.
+    // Scoped by the SAME rule the contract server actions assert — see the
+    // matching comment on the project contracts page. The lead layout checks
+    // only `leadAccess`, so without this a staffer with no `contracts`
+    // permission read the body, signatures and signing accessToken here; and
+    // the linked-project union below would otherwise surface converted
+    // contracts (which carry BOTH ids, and canAccessJobScope lets the project
+    // win) whose edit / delete / history buttons throw Forbidden.
+    const viewer = await currentStaffUserOrNull();
     const contracts = await prisma.contract.findMany({
         where: {
-            OR: [
-                { leadId: lead.id },
-                ...(linkedProjectId ? [{ projectId: linkedProjectId }] : []),
+            AND: [
+                contractScopeWhere(viewer),
+                {
+                    OR: [
+                        { leadId: lead.id },
+                        ...(linkedProjectId ? [{ projectId: linkedProjectId }] : []),
+                    ],
+                },
             ],
         },
         // Only the record COUNT is rendered here; the Signing History modal loads full
