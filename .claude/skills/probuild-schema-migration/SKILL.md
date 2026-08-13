@@ -41,7 +41,7 @@ Prisma CLI 5.22.0.
 | Test | Result |
 |---|---|
 | Both URLs → throwaway container | **Succeeds in 9s**, no prompt. So there is no inherent hang. |
-| `DATABASE_URL` → throwaway, `DIRECT_URL` → real direct host | Banner names **the direct host**, then `P1001` in 3.3s. Proves `db push` uses `directUrl` and ignores `DATABASE_URL`. |
+| `DATABASE_URL` → throwaway, `DIRECT_URL` → real direct host | Banner names **the direct host**, then `P1001` in 3.3s. Proves `db push` connects over `directUrl`, ignoring `DATABASE_URL` **as the connection target**. |
 | `DIRECT_URL` set, `DATABASE_URL` unset | `P1012: Environment variable not found: DATABASE_URL`. So `url` is still *validated* — `directUrl` only overrides which one is dialled. |
 | Destructive change (drop a column holding data), stdin not a TTY | **Errors in 2.5s** with *"Use the --accept-data-loss flag"*. It does not block waiting for input. |
 
