@@ -1479,6 +1479,25 @@ export async function listRoomsForLead(leadId: string) {
     return JSON.parse(JSON.stringify(rooms));
 }
 
+// Linked-invoice shape shared by BOTH getEstimate query branches (the fallback
+// must stay in sync or the editor silently loses this data on a healthy DB).
+// Includes the invoice-side payment rows so the editor can diff mirrored rows
+// (via sourceScheduleId) against the estimate's schedule — the portal renders
+// the invoice's rows once one exists. Oldest-first + take 1 matches
+// getEstimateForPortal's pick, so the editor warns about the invoice the
+// client actually sees.
+const ESTIMATE_LINKED_INVOICE_QUERY = {
+    select: {
+        id: true, code: true, status: true, projectId: true,
+        payments: {
+            select: { id: true, name: true, amount: true, sourceScheduleId: true },
+            orderBy: { createdAt: "asc" as const },
+        },
+    },
+    orderBy: { createdAt: "asc" as const },
+    take: 1,
+};
+
 export const getEstimate = cache(async function getEstimate(id: string) {
     await assertEstimateAccess(id);
     try {
@@ -1504,7 +1523,7 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
                 files: { orderBy: { createdAt: "desc" } },
-                invoices: { select: { id: true, code: true, status: true } },
+                invoices: ESTIMATE_LINKED_INVOICE_QUERY,
             },
         });
     } catch {
@@ -1552,21 +1571,7 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
-                invoices: {
-                    select: {
-                        id: true, code: true, status: true, projectId: true,
-                        // Invoice-side milestones so the editor can diff mirrored rows
-                        // (via sourceScheduleId) against this estimate's schedule — the
-                        // portal renders the invoice's rows once one exists.
-                        payments: {
-                            select: { id: true, name: true, amount: true, status: true, dueDate: true, sourceScheduleId: true },
-                            orderBy: { createdAt: "asc" },
-                        },
-                    },
-                    // Same pick as getEstimateForPortal (oldest invoice first), so the
-                    // editor warns about the invoice the client actually sees.
-                    orderBy: { createdAt: "asc" },
-                },
+                invoices: ESTIMATE_LINKED_INVOICE_QUERY,
             },
         });
     }

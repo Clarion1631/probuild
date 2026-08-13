@@ -217,18 +217,23 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     // Invoice generated from this estimate (if any) — milestone edits here do not
     // cascade to it, so the schedule UI warns when one exists. Once the invoice has
     // payment rows, the client portal renders THOSE, not this estimate's schedule.
-    type LinkedInvoicePayment = { id: string; name: string; amount: string | number; status: string; dueDate?: string | null; sourceScheduleId?: string | null };
+    type LinkedInvoicePayment = { id: string; name: string; amount: string | number; sourceScheduleId?: string | null };
     const linkedInvoice: { id: string; code: string; status: string; projectId?: string | null; payments?: LinkedInvoicePayment[] } | null =
         initialEstimate.invoices?.[0] || null;
     // Which mirrored rows disagree with the client-visible invoice schedule.
     // Compared against the live edit state on purpose: unsaved edits diverge too.
     const scheduleDivergence = useMemo(() => {
-        // Match the portal's render exactly: it lists every invoice payment row
-        // (Canceled included) and only hides the auto-created "Payment in Full" row.
-        const invoicePayments = (linkedInvoice?.payments || []).filter(p => p.name !== "Payment in Full");
-        if (invoicePayments.length === 0) return null;
+        // The portal switches to invoice rows on the RAW payments length, then hides
+        // "Payment in Full" rows (on either side) from the rendered list — gate and
+        // filter here in that same order or the two views disagree about visibility.
+        const allInvoicePayments = linkedInvoice?.payments || [];
+        if (allInvoicePayments.length === 0) return null;
+        const invoicePayments = allInvoicePayments.filter(p => p.name !== "Payment in Full");
         const estById = new Map(paymentSchedules.filter(s => s.id).map(s => [s.id, s] as const));
-        const cents = (v: unknown) => Math.round((parseFloat(String(v)) || 0) * 100);
+        // Compare the DISPLAYED amounts, not float cents: sub-cent inputs like 1.005
+        // round differently through Math.round(x*100) than through currency
+        // formatting, and a difference the client can't see isn't actionable anyway.
+        const shown = (v: unknown) => formatCurrency(parseFloat(String(v)) || 0);
         const mismatched: { name: string; estimateAmount: number; invoiceAmount: number }[] = [];
         const mirroredEstimateIds = new Set<string>();
         let removedHere = 0;
@@ -237,7 +242,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             const src = estById.get(p.sourceScheduleId);
             if (!src) { removedHere++; continue; }
             mirroredEstimateIds.add(src.id);
-            if (cents(src.amount) !== cents(p.amount)) {
+            if (shown(src.amount) !== shown(p.amount)) {
                 mismatched.push({
                     name: src.name || p.name || "Milestone",
                     estimateAmount: (parseFloat(String(src.amount)) || 0),
@@ -245,7 +250,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                 });
             }
         }
-        const unmirrored = paymentSchedules.filter(s => !s.id || !mirroredEstimateIds.has(s.id)).length;
+        // Estimate-side "Payment in Full" rows are never client-visible, so they
+        // can't be "missing" from what the client sees.
+        const unmirrored = paymentSchedules.filter(s =>
+            s.name !== "Payment in Full" && (!s.id || !mirroredEstimateIds.has(s.id))
+        ).length;
         if (mismatched.length === 0 && unmirrored === 0 && removedHere === 0) return null;
         return { mismatched, unmirrored, removedHere };
     }, [linkedInvoice, paymentSchedules]);
@@ -3255,8 +3264,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             </div>
                         </div>
 
-                        {/* Progress Payments Section */}
-                        {paymentSchedules.length > 0 && (
+                        {/* Progress Payments Section — also rendered with zero estimate rows
+                            when the linked invoice still has payment rows, so deleting every
+                            milestone here can't hide the "client still sees the invoice's
+                            schedule" warning. */}
+                        {(paymentSchedules.length > 0 || (linkedInvoice?.payments?.length ?? 0) > 0) && (
                             <div className="bg-white border-t border-slate-200 mt-8">
                                 <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
@@ -3312,6 +3324,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                         )}
                                     </div>
                                 )}
+                                {paymentSchedules.length > 0 && (<>
                                 <div className="flex text-[11px] font-bold text-slate-400 bg-white border-b border-slate-100 px-8 py-3 uppercase tracking-wider">
                                     <div className="flex-1">Payment Name</div>
                                     <div className="w-32">Percentage</div>
@@ -3472,6 +3485,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                         </div>
                                     );
                                 })()}
+                                </>)}
                             </div>
                         )}
 
