@@ -511,6 +511,11 @@ test("contract creation is gated for staff and session-free for the shared-secre
     expect(coreIndex, `${action} must delegate to the core`).toBeGreaterThanOrEqual(0);
     expect(guardIndex, `${action} must authorize before creating`).toBeLessThan(coreIndex);
     expect(body, `${action} must not carry the creation body itself`).not.toContain("prisma.contract.create(");
+    // Same short-circuit class as the gate helper below: an early return ahead
+    // of the guard leaves every ordering assertion above true and the guard
+    // itself dead code.
+    expect(body.slice(0, guardIndex), `${action} must not return before authorizing`)
+      .not.toMatch(/\breturn\b/);
   }
 
   // The gate itself must pair authentication with the pure scope rule — an
@@ -525,6 +530,15 @@ test("contract creation is gated for staff and session-free for the shared-secre
   expect(gateBody, "the gate must authenticate").toContain("await assertActiveStaff()");
   expect(gateBody, "the gate must throw on a failed scope check")
     .toMatch(/if \(!canCreateContractFor\(user, scope\)\) throw new Error\(/);
+
+  // Presence and order are not enough on their own: an early `return {} as any`
+  // ahead of the checks satisfies every assertion above while authorizing
+  // everybody, because the checks below it are simply never reached. Assert
+  // that nothing returns before the scope check does its work — the gate's only
+  // legitimate return is the trailing `return user`.
+  const gateToCheck = gateBody.slice(0, gateBody.indexOf("canCreateContractFor"));
+  expect(gateToCheck, "the gate must not short-circuit before the scope check")
+    .not.toMatch(/\breturn\b/);
 
   // The MCP create_contract tool authenticates by shared secret and has no
   // NextAuth staff session, so it must reach the core directly — routing it

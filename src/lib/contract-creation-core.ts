@@ -12,8 +12,10 @@ import { prisma } from "@/lib/prisma";
 // carries no server-action directive.)
 //
 // The bodies of createContractFromTemplateCore and createContractBlankCore are
-// moved verbatim from actions.ts; behavior is unchanged for every existing
-// path.
+// moved from actions.ts with ONE deliberate behavior change: revalidatePath
+// failures are now caught rather than propagated (see below). Everything else —
+// merge resolution, countersign defaulting, the recurring-doc rules, the row
+// written — is byte-for-byte the pre-extraction logic.
 
 // Cache revalidation is best-effort: it throws outside a Next request context
 // (e.g. the MCP route's dynamic import path can run outside a render), and a
