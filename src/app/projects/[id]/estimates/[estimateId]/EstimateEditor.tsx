@@ -233,8 +233,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // Compare the DISPLAYED amounts, not float cents: sub-cent inputs like 1.005
         // round differently through Math.round(x*100) than through currency
         // formatting, and a difference the client can't see isn't actionable anyway.
-        const shown = (v: unknown) => formatCurrency(parseFloat(String(v)) || 0);
-        const mismatched: { name: string; estimateAmount: number; invoiceAmount: number }[] = [];
+        // Raw values go straight to formatCurrency — the portal formats p.amount the
+        // same way, so any preprocessing here (parseFloat etc.) can only disagree.
+        const mismatched: { name: string; estimateAmount: string | number; invoiceAmount: string | number }[] = [];
         const mirroredEstimateIds = new Set<string>();
         let removedHere = 0;
         for (const p of invoicePayments) {
@@ -242,11 +243,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             const src = estById.get(p.sourceScheduleId);
             if (!src) { removedHere++; continue; }
             mirroredEstimateIds.add(src.id);
-            if (shown(src.amount) !== shown(p.amount)) {
+            if (formatCurrency(src.amount) !== formatCurrency(p.amount)) {
                 mismatched.push({
                     name: src.name || p.name || "Milestone",
-                    estimateAmount: (parseFloat(String(src.amount)) || 0),
-                    invoiceAmount: (parseFloat(String(p.amount)) || 0),
+                    estimateAmount: src.amount,
+                    invoiceAmount: p.amount,
                 });
             }
         }
