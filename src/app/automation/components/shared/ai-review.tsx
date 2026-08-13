@@ -25,6 +25,17 @@ export interface AiReviewModelResult {
     verdicts: AiReviewVerdict[];
 }
 
+/** "Does this look like a reasonable purchase" — an independent verdict from
+ * the receipt-vs-booking comparison above (vendor/amount/category/coded
+ * project sanity, not receipt image agreement). Server fails closed to
+ * `{ verdict: "unknown", rationale: "could not evaluate" }` on any error,
+ * timeout, or unparseable model output — this UI never has to guard for a
+ * missing/malformed value beyond the field being optional. */
+export interface AiReviewReasonableness {
+    verdict: "reasonable" | "question" | "flag" | "unknown";
+    rationale: string;
+}
+
 export interface AiReviewSuccess {
     ok: true;
     reviewedAt: string;
@@ -36,6 +47,9 @@ export interface AiReviewSuccess {
      * prefix (no full driveFileId on record) — never present this review as
      * tied to a confirmed receipt when set. */
     unconfirmedMatch?: boolean;
+    /** Optional so responses cached/served before this field shipped still
+     * type-check — see `AiReviewReasonableness` above. */
+    reasonableness?: AiReviewReasonableness;
 }
 
 export interface AiReviewFailure {
@@ -93,6 +107,42 @@ export function AiFieldChip({
             title={state === "agree" && unconfirmed ? "Match unconfirmed — see warning above" : verdict?.note}
         >
             {label} <span className="font-bold">?</span>
+        </span>
+    );
+}
+
+/** Chip for the "reasonable purchase" verdict — same visual language as
+ * `AiFieldChip` above (rounded-full, colored by state), with its own four
+ * states and the rationale shown inline for "question"/"flag" (the two
+ * states worth reading past the color alone). */
+export function ReasonablenessChip({ reasonableness }: { reasonableness: AiReviewReasonableness }) {
+    if (reasonableness.verdict === "flag") {
+        return (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700">
+                Flag <span className="font-bold">!</span> {reasonableness.rationale}
+            </span>
+        );
+    }
+    if (reasonableness.verdict === "question") {
+        return (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                Question <span className="font-bold">?</span> {reasonableness.rationale}
+            </span>
+        );
+    }
+    if (reasonableness.verdict === "reasonable") {
+        return (
+            <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-700">
+                Looks reasonable <span className="font-bold">✓</span>
+            </span>
+        );
+    }
+    return (
+        <span
+            className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500"
+            title={reasonableness.rationale}
+        >
+            Unknown <span className="font-bold">?</span>
         </span>
     );
 }
