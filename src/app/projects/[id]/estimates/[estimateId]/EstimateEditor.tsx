@@ -10,38 +10,37 @@ import {
     isEstimateSectionRow,
 } from "@/lib/estimate-item-payload";
 
-/** Recalculate milestone amounts: percentage-driven get amounts from %, fixed keep theirs, last absorbs residual */
+/** Refresh percentage-driven milestone amounts from the current total.
+ *  Fixed-amount rows (empty percentage) are NEVER touched — a hand-typed dollar
+ *  amount must stick until the user changes it. (The old "last unpaid absorbs the
+ *  residual" rewrite kept reverting hand-corrected amounts on blur and autosaving
+ *  the revert — Mesplay EST-4226-3, Aug 2026.) Any gap between the schedule sum
+ *  and the total is surfaced by the Schedule Total row and resolved explicitly
+ *  via distributeRemainder. Per-row cent rounding among percentage rows is
+ *  settled into the last percentage-driven row so a pure-percentage plan still
+ *  sums exactly. */
 function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     const cloned = schedules.map(s => ({ ...s }));
-    const unpaid = cloned.filter(s => s.status !== "Paid");
-    if (unpaid.length === 0) return cloned;
+    const pctRows = cloned.filter(s => s.status !== "Paid" && (parseFloat(s.percentage) || 0) > 0);
+    if (pctRows.length === 0) return cloned;
 
-    const paidSum = cloned.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
-    const available = rm(total - paidSum);
-    const lastUnpaid = unpaid[unpaid.length - 1];
-
-    if (unpaid.length === 1) {
-        lastUnpaid.amount = String(Math.max(0, available));
-        const pct = parseFloat(lastUnpaid.percentage) || 0;
-        if (pct > 0 && Math.abs(available - rm(total * (pct / 100))) > 0.01) {
-            lastUnpaid.percentage = "";
-        }
-        return cloned;
+    for (const s of pctRows) {
+        s.amount = String(rm(total * ((parseFloat(s.percentage) || 0) / 100)));
     }
 
-    for (const s of unpaid) {
-        if (s === lastUnpaid) continue;
-        const pct = parseFloat(s.percentage) || 0;
-        if (pct > 0) s.amount = String(rm(total * (pct / 100)));
-    }
-
-    const othersSum = unpaid.filter(s => s !== lastUnpaid).reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
-    const residual = rm(available - othersSum);
-    lastUnpaid.amount = String(Math.max(0, residual));
-
-    const lastPct = parseFloat(lastUnpaid.percentage) || 0;
-    if (lastPct > 0 && Math.abs(residual - rm(total * (lastPct / 100))) > 0.01) {
-        lastUnpaid.percentage = "";
+    // Rounding each row individually can drift a fraction of a cent per row from
+    // what the combined percentage says these rows should sum to. Settle only
+    // that drift — never a plan-design gap — into the last percentage row.
+    const combinedPct = pctRows.reduce((sum, s) => sum + (parseFloat(s.percentage) || 0), 0);
+    const target = rm(total * (combinedPct / 100));
+    const roundedSum = rm(pctRows.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0));
+    const drift = rm(target - roundedSum);
+    if (drift !== 0 && Math.abs(drift) <= 0.01 * pctRows.length) {
+        const last = pctRows[pctRows.length - 1];
+        const settled = rm((parseFloat(last.amount) || 0) + drift);
+        // Negative drift on a tiny last row could push it below zero (e.g. $1 split
+        // 0.6% / 0.6% / 0.1%) — leave the drift unsettled rather than go negative.
+        if (settled >= 0) last.amount = String(settled);
     }
 
     return cloned;
@@ -2260,26 +2259,41 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function addPaymentSchedule() {
+        // Creation-time convenience only: prefill with whatever the schedule is
+        // currently short of the total. Never rewritten after this point.
+        const scheduleSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
+        const remainder = Math.max(0, rm(total - scheduleSum));
         setPaymentSchedules([...paymentSchedules, {
             id: generateId(),
             name: "Progress Payment",
             percentage: "",
-            amount: 0,
+            amount: String(remainder),
             dueDate: ""
         }]);
+    }
+
+    /** The % / $ fields are text inputs (see the milestone row), so "$1,000.50"
+     *  can arrive verbatim — parseFloat would read that as 1. Keep digits and the
+     *  first decimal point only (later dots are dropped like a number input would),
+     *  so what's stored is exactly what parseFloat will see. */
+    function sanitizeMoneyInput(value: string): string {
+        const cleaned = String(value).replace(/[^0-9.]/g, "");
+        const firstDot = cleaned.indexOf(".");
+        if (firstDot === -1) return cleaned;
+        return cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, "");
     }
 
     function updatePaymentSchedule(index: number, field: string, value: any) {
         const newSchedules = [...paymentSchedules];
         if (field === "percentage") {
-            newSchedules[index] = { ...newSchedules[index], percentage: value };
+            newSchedules[index] = { ...newSchedules[index], percentage: sanitizeMoneyInput(value) };
             const recalced = recalcMilestoneAmounts(newSchedules, total);
             setPaymentSchedules(recalced);
             return;
         } else if (field === "amount") {
             newSchedules[index] = {
                 ...newSchedules[index],
-                amount: value,
+                amount: sanitizeMoneyInput(value),
                 percentage: ""
             };
         } else {
@@ -2291,12 +2305,28 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         setPaymentSchedules(newSchedules);
     }
 
-    function handleAmountBlur() {
-        setPaymentSchedules(prev => {
-            const recalced = recalcMilestoneAmounts(prev, total);
-            const changed = recalced.some((s, i) => s.amount !== prev[i].amount);
-            return changed ? recalced : prev;
-        });
+    /** Explicitly fold the schedule-vs-total difference into the last unpaid
+     *  milestone. User-triggered replacement for the old silent "last row absorbs
+     *  the residual" behavior that kept reverting hand-typed amounts. */
+    function distributeRemainder() {
+        const scheduleSum = rm(paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0));
+        const diff = rm(total - scheduleSum);
+        if (Math.abs(diff) < 0.01) return;
+        const lastUnpaidIndex = paymentSchedules.map(s => s.status !== "Paid").lastIndexOf(true);
+        if (lastUnpaidIndex === -1) {
+            toast.error("All milestones are paid — add a new milestone to cover the difference.");
+            return;
+        }
+        const next = paymentSchedules.map(s => ({ ...s }));
+        const row = next[lastUnpaidIndex];
+        const newAmount = rm((parseFloat(row.amount) || 0) + diff);
+        if (newAmount < 0) {
+            toast.error("The last unpaid milestone is smaller than the overage — reduce another milestone instead.");
+            return;
+        }
+        row.amount = String(newAmount);
+        row.percentage = ""; // it now holds an explicit dollar amount
+        setPaymentSchedules(next);
     }
 
     function removePaymentSchedule(index: number) {
@@ -2603,17 +2633,32 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
                     {/* Primary Actions */}
                     <button
-                        onClick={() => {
+                        onClick={async () => {
                             const unpaidSchedules = paymentSchedules.filter(s => s.status !== "Paid");
                             if (unpaidSchedules.length > 0) {
                                 const paidSum = paymentSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
                                 const milestoneSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
                                 const remaining = rm(total - paidSum);
                                 const unpaidSum = rm(milestoneSum - paidSum);
-                                if (Math.abs(unpaidSum - remaining) > 0.01) {
+                                // Integer-cent compare: float subtraction can turn an exactly-1¢
+                                // (tolerated) difference into 0.010000000000005 > 0.01.
+                                if (Math.abs(Math.round(unpaidSum * 100) - Math.round(remaining * 100)) > 1) {
                                     toast.error(`Payment milestones total $${milestoneSum.toFixed(2)} but estimate total is $${total.toFixed(2)}. Please adjust milestones.`);
                                     return;
                                 }
+                            }
+                            // sendEstimateToClient reads milestones from the database, so
+                            // corrections typed since the last save would be invisible to it —
+                            // the server would validate (and email) stale rows. Save first,
+                            // silently, exactly as handleSyncQB does before its push.
+                            try {
+                                await handleSave({ silent: true, skipRefresh: true });
+                            } catch (e: any) {
+                                if (!e?.isSaveConflict) {
+                                    const detail = e?.message ? ` (${e.message})` : "";
+                                    toast.error(`We couldn't confirm the save — the estimate was not sent.${detail}`);
+                                }
+                                return;
                             }
                             setShowSendModal(true);
                         }}
@@ -3266,8 +3311,13 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                 )}
                                             </div>
                                             <div className="w-32 px-4 relative">
+                                                {/* type="text": a number input converts scroll-wheel/arrow-key events into
+                                                    onChange, silently promoting the derived (italic) percentage into a stored
+                                                    one — turning a fixed-dollar milestone into a percentage-driven row. Text
+                                                    inputs only fire onChange on deliberate typing. */}
                                                 <input
-                                                    type="number"
+                                                    type="text"
+                                                    inputMode="decimal"
                                                     value={schedule.percentage || (total > 0 && schedule.amount ? String(rm(((parseFloat(schedule.amount) || 0) / total) * 100)) : "")}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
@@ -3283,10 +3333,10 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     <>
                                                         <span className="absolute left-6 top-1.5 text-slate-400 text-sm">$</span>
                                                         <input
-                                                            type="number"
+                                                            type="text"
+                                                            inputMode="decimal"
                                                             value={schedule.amount}
                                                             onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                            onBlur={handleAmountBlur}
                                                             className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
                                                         />
                                                     </>
@@ -3388,9 +3438,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                         <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                                                     </svg>
                                                 ) : (
-                                                    <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${diff > 0 ? 'text-amber-700 bg-amber-100' : 'text-red-700 bg-red-100'}`}>
-                                                        {diff > 0 ? `${formatCurrency(diff)} under` : `${formatCurrency(Math.abs(diff))} over`}
-                                                    </span>
+                                                    <>
+                                                        <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${diff > 0 ? 'text-amber-700 bg-amber-100' : 'text-red-700 bg-red-100'}`}>
+                                                            {diff > 0 ? `${formatCurrency(diff)} under` : `${formatCurrency(Math.abs(diff))} over`}
+                                                        </span>
+                                                        <button
+                                                            onClick={distributeRemainder}
+                                                            className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 underline underline-offset-2"
+                                                        >
+                                                            {diff > 0 ? "Add remainder to last milestone" : "Deduct overage from last milestone"}
+                                                        </button>
+                                                    </>
                                                 )}
                                             </div>
                                         </div>
@@ -4140,6 +4198,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     estimateId={initialEstimate.id}
                     clientEmail={context.clientEmail}
                     onClose={() => setShowSendModal(false)}
+                    onBeforeSend={() => handleSave({ silent: true, skipRefresh: true })}
                 />
             )}
 
