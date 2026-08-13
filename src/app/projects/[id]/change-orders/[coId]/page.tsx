@@ -19,11 +19,13 @@ export default async function ChangeOrderPage({
         notFound();
     }
 
-    const initialData = {
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the
+    // server->client boundary (the portal twin already JSON-serializes the same shape).
+    const initialData = JSON.parse(JSON.stringify({
         ...co,
         clientSignatureUrl: await resolveDocUrl((co as any).clientSignatureUrl),
         companySignatureUrl: await resolveDocUrl((co as any).companySignatureUrl),
-    };
+    }));
 
     return (
         <div className="flex h-[calc(100%+48px)] -m-6 overflow-hidden">
