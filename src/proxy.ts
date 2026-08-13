@@ -90,6 +90,22 @@ export default async function proxy(req: any, event: any) {
         }
     }
 
+    // Test-only contract-action dispatcher (src/app/api/test-only/contract-actions).
+    // Gated on the SAME env var that enables the route itself and the test-only
+    // CredentialsProvider, so in production PLAYWRIGHT_TEST_SECRET is unset and
+    // this branch never runs. It exists so an UNAUTHENTICATED request reaches
+    // the action and is refused by assertContractAccess — a proxy redirect to
+    // /login would prove nothing about the action's own gate, which is exactly
+    // what e2e/contract-auth-runtime.spec.ts has to pin. The route still
+    // demands the secret in a header and answers 404 without it.
+    if (
+        process.env.PLAYWRIGHT_TEST_SECRET
+        && typeof pathname === "string"
+        && pathname === "/api/test-only/contract-actions"
+    ) {
+        return NextResponse.next();
+    }
+
     // Legal pages are readable by anyone but are not an action endpoint.
     if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
         return new NextResponse("Forbidden", { status: 403 });

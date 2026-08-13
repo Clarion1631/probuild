@@ -37,6 +37,22 @@ export default defineConfig({
       dependencies: ["data"],
     },
     {
+      // A THIRD session: FINANCE staff with project access but no `contracts`
+      // permission. See auth-finance.setup.ts and
+      // e2e/contract-auth-runtime.spec.ts.
+      name: "setup-finance",
+      testMatch: /(^|[\\/])auth-finance\.setup\.ts$/,
+      dependencies: ["data"],
+    },
+    {
+      // A FOURTH session: EMPLOYEE staff with `contracts` + `leadAccess` but
+      // scope reaching only one project. See auth-contract.setup.ts and
+      // e2e/contract-auth-runtime.spec.ts.
+      name: "setup-contract",
+      testMatch: /(^|[\\/])auth-contract\.setup\.ts$/,
+      dependencies: ["data"],
+    },
+    {
       name: "chromium",
       // The setup files are run by the setup projects above. Without this they
       // would ALSO run here as ordinary tests and rewrite the storage-state
@@ -46,7 +62,7 @@ export default defineConfig({
         ...devices["Desktop Chrome"],
         storageState: "e2e/.auth/user.json",
       },
-      dependencies: ["data", "setup", "setup-scoped"],
+      dependencies: ["data", "setup", "setup-scoped", "setup-finance", "setup-contract"],
     },
   ],
   webServer: {
