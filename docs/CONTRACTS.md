@@ -1,6 +1,6 @@
 # Contracts — System Status
 
-_Last updated: 2026-06-23. Snapshot of the whole contract system: what works, where it lives, what's deployed, and what's still open._
+_Last updated: 2026-08-13 (auth/dead-surface pass — #360, #367 and the caller-less-export deletion below). The capability, verification and deployment sections further down are still the 2026-06-23 snapshot and have NOT been re-verified since._
 
 ## TL;DR
 
@@ -53,7 +53,8 @@ Draft ──send──▶ Sent ──client opens──▶ Viewed ──client s
 
 | File | Role |
 |---|---|
-| `src/lib/actions.ts` | `createContract*`, `updateContract`, `sendContractToClient`, `getContractSendDefaults`, `signContractAsContractor`, `approveContract`, **`countersignContractAsCompany`**, `getExecutedContractPdf` |
+| `src/lib/actions.ts` | `createContract*`, `updateContract`, `sendContractToClient`, `getContractSendDefaults`, `signContractAsContractor`, `approveContract`, **`countersignContractAsCompany`** |
+| `src/lib/contract-files-core.ts` | `executedContractPdfFor` — session-free executed-PDF lookup, called directly by the client portal and by `countersignContractAsCompany`. The staff `getExecutedContractPdf` wrapper was deleted as caller-less dead surface (see note below) |
 | `src/lib/contract-finalize.ts` | shared `archiveExecutedContractPdf` + `sendExecutedContractEmails` (one writer for archive/email) |
 | `src/lib/pdf.ts` | `appendContractCountersignaturePage` (pdf-lib cert page), `embedSignatureImage` |
 | `src/lib/signature-storage.ts` | `persistSignature` (data-URL → Storage URL, graceful fallback) |
@@ -61,6 +62,30 @@ Draft ──send──▶ Sent ──client opens──▶ Viewed ──client s
 | `src/components/EntityContractsClient.tsx` | internal UI (shared by leads + projects) |
 | `src/app/portal/contracts/[id]/PortalContractClient.tsx` | customer signing UI + awaiting-countersign state |
 | `prisma/schema.prisma` | `Contract` (+ `requiresCountersign`, `companySigned*`, `signedPdfPath`), `ContractSigningRecord`, `CompanySettings.requireContractCountersign` |
+
+## Caller-less server actions are still endpoints (2026-08-13)
+
+`getContracts` and `getExecutedContractPdf` were gated by #367 and then deleted, because a
+caller survey found neither had a single call site — no static import, no `await import(...)`,
+nothing in the MCP route, `e2e/`, `scripts/`, or the mobile app.
+
+That does not make such an export inert. Next.js documents that unused actions *may* be
+eliminated, so this is stated as **measured ProBuild behaviour, not a universal rule**: on
+Next 16.2.11, `.next/server/server-reference-manifest.json` from a clean `npm run build`
+registered **360** server-action endpoints from `src/lib/actions.ts`, including 37 exports with
+no reference anywhere in `src/`. `getContracts` appears in that manifest before the deletion and
+is absent after it. A caller-less export is therefore live POST surface whose auth gate nothing
+exercises — worse than dead code, because it looks covered.
+
+Blast radius of removing them was effectively nil: both were only ever called from Server
+Components (server-render calls), never imported into a Client Component or bound to a
+`<form action>`, so no shipped browser bundle carries their action ids and no stale tab can
+call them. Deleting an action that *had* been serialized to clients is a different matter — stale
+tabs get "Failed to find Server Action" unless Vercel Skew Protection is on, which is a project
+setting and is not configured in `next.config.ts`.
+
+`e2e/financial-action-auth.spec.ts` keeps both deleted, reading the export list off the
+TypeScript AST rather than by regex.
 
 ## Related: Change Orders (dual-signature)
 

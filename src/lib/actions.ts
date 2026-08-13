@@ -5956,30 +5956,13 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
-export async function getContracts(projectId?: string, leadId?: string) {
-    // Called with no arguments this returned EVERY contract with all scalar
-    // fields — legal body, approval IP/user-agent, signature paths and the
-    // portal accessToken that authorizes signing — to any anonymous caller.
-    // The scope filter is the list form of the same rule assertContractAccess
-    // applies to one row, so the list and the detail page cannot disagree.
-    const user = await assertStaffPermission("contracts");
-    return prisma.contract.findMany({
-        where: {
-            AND: [
-                contractScopeWhere(user),
-                {
-                    ...(projectId ? { projectId } : {}),
-                    ...(leadId ? { leadId } : {}),
-                },
-            ],
-        },
-        orderBy: { createdAt: "desc" },
-        include: {
-            project: { select: { name: true, client: { select: { name: true } } } },
-            lead: { select: { name: true, client: { select: { name: true } } } },
-        }
-    });
-}
+// `getContracts` was deleted here. It had no callers anywhere — the live staff
+// screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
+// directly with contractScopeWhere(viewer) — but in a "use server" module every
+// export is an individually invokable POST endpoint regardless, so a caller-less
+// export is live attack surface rather than inert code. #367 gated it; this
+// removes it. The scope rule it used, contractScopeWhere, is NOT orphaned: the
+// two pages above and getLead's contracts relation are its consumers.
 
 export async function getContract(id: string) {
     // Staff-only, scoped to the owning job. The docstring on getContractForPortal
@@ -6051,22 +6034,12 @@ export async function getContractForPortal(id: string, token?: string | null) {
     return contract;
 }
 
-/**
- * Staff-facing executed-contract file lookup. The lookup itself lives in
- * src/lib/contract-files-core.ts (session-free, shared with the client portal,
- * which proves access by accessToken or portal session instead).
- *
- * ONLY the contract `id` in the argument is trusted. The owning project/lead
- * and the title are re-read from the database, because the whole descriptor
- * used to be caller-supplied: naming another job's projectId returned that
- * job's executed PDF, and a crafted `title` steered the legacy prefix match.
- * The parameter keeps its old shape so existing callers are unchanged; the
- * extra fields are now ignored.
- */
-export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const { projectId, leadId, title } = await assertContractAccess(contract.id);
-    return executedContractPdfFor({ id: contract.id, title, projectId, leadId });
-}
+// `getExecutedContractPdf` was deleted here, for the same reason as
+// `getContracts` above: no callers, but a "use server" export is a POST
+// endpoint whether or not anything imports it. Every real caller already uses
+// the session-free core `executedContractPdfFor` in contract-files-core.ts —
+// the client portal proves access by accessToken/portal session, and
+// countersignContractAsCompany calls it after its own gate.
 
 export async function createContractFromTemplate(
     templateId: string,

@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 import { canWriteDocumentTemplateType, canCreateContractFor, canAccessJobScope, canAccessContract, contractScopeWhere } from "../src/lib/access-rules";
 
 function exportSource(source: string, name: string): string {
@@ -559,11 +560,10 @@ test("contract creation is gated for staff and session-free for the shared-secre
 test("every exported contract action authorizes and scopes by contract id", () => {
   const source = stripComments(readFileSync(join(process.cwd(), "src/lib/actions.ts"), "utf8"));
 
-  // getContracts is the list, so it takes the where-fragment form of the same
-  // rule rather than the single-row assertion; everything else is by id.
+  // getContracts and getExecutedContractPdf used to be in this sweep. Both are
+  // now DELETED rather than gated — see the dead-surface test below.
   const byId = [
     "getContract",
-    "getExecutedContractPdf",
     "updateContract",
     "deleteContract",
     "getContractSigningHistory",
@@ -605,30 +605,8 @@ test("every exported contract action authorizes and scopes by contract id", () =
     expect(afterGuard.trimStart(), `${name} must still do its work after authorizing`)
       .not.toMatch(/^return\s+(null|undefined|\{\}|\[\])/);
     expect(afterGuard, `${name} must still reach the data layer`)
-      .toMatch(/prisma\.|executedContractPdfFor\(/);
+      .toMatch(/prisma\./);
   }
-
-  // The list must be filtered by the scope rule, not merely authenticated — an
-  // argument-less call previously returned EVERY contract in the database.
-  const list = exportSource(source, "getContracts");
-  const permissionIndex = list.indexOf('await assertStaffPermission("contracts")');
-  const filterIndex = list.indexOf("contractScopeWhere(user)");
-  expect(permissionIndex, "getContracts must require the contracts permission").toBeGreaterThanOrEqual(0);
-  expect(filterIndex, "getContracts must apply the contract scope filter").toBeGreaterThanOrEqual(0);
-  expect(permissionIndex, "getContracts must authenticate before querying")
-    .toBeLessThan(list.indexOf("prisma."));
-  expect(list.slice(0, permissionIndex), "getContracts must not return before authorizing")
-    .not.toMatch(/\breturn\b/);
-
-  // getExecutedContractPdf used to trust a caller-supplied {projectId, leadId,
-  // title} descriptor, so naming another job's ids returned that job's file.
-  // Only the id may be read off the argument now; the rest comes from the row.
-  const pdf = exportSource(source, "getExecutedContractPdf");
-  for (const trusted of ["contract.projectId", "contract.leadId", "contract.title"]) {
-    expect(pdf, `getExecutedContractPdf must not trust the caller's ${trusted}`).not.toContain(trusted);
-  }
-  expect(pdf, "getExecutedContractPdf must delegate the lookup to the core")
-    .toContain("executedContractPdfFor(");
 
   // Gating the by-id actions is not enough while a differently named action
   // returns the same rows. getLead embeds the lead's contracts and resolves its
@@ -641,6 +619,111 @@ test("every exported contract action authorizes and scopes by contract id", () =
   expect(lead, "getLead must scope the contracts it embeds")
     .toMatch(/contracts: \{ where: contractScopeWhere\(user\) \}/);
   expect(lead, "getLead must not embed contracts unscoped").not.toMatch(/contracts: true/);
+});
+
+// #367 GATED `getContracts` and `getExecutedContractPdf`. A caller survey then
+// found neither had a single call site — not in src/, e2e/, scripts/, not via
+// `await import(...)`, not from the MCP route, not from the mobile app. In a
+// "use server" module that does not make an export inert: Next.js registers
+// every export as an individually invokable POST endpoint whether or not any
+// component imports it, so a caller-less export is live attack surface whose
+// gate nothing exercises. Both were deleted; this test keeps them deleted.
+//
+// Asserting on the source text, not on behaviour, for the same reason the
+// tests around it do: there is no request-level harness here.
+//
+// This one resolves the export list through the TypeScript AST rather than by
+// regex. Every regex form was defeatable (Codex round 1): `stripComments` treats
+// a `//` inside a string literal as a comment opener, so
+//   const marker = "//"; export async function getContracts() { return [] }
+// blanked the real export out of the text and passed. `export let`,
+// `export const { getContracts } = holder` (destructuring) and `export * from`
+// all slipped past the pattern too, and `export { getContracts as other }`
+// false-POSITIVED. The AST has no such gaps: it reports what the module
+// actually exports, under every syntax, with comments and strings already
+// handled by the parser.
+function exportedNames(filePath: string): Set<string> {
+  const file = ts.createSourceFile(
+    filePath,
+    readFileSync(filePath, "utf8"),
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    ts.ScriptKind.TS,
+  );
+
+  const names = new Set<string>();
+  const isExported = (node: ts.Node) =>
+    ts.canHaveModifiers(node) &&
+    (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+
+  // Destructuring and array patterns can export several names at once
+  // (`export const { getContracts } = holder`), so bindings are walked
+  // recursively rather than assumed to be plain identifiers.
+  const addBinding = (name: ts.BindingName) => {
+    if (ts.isIdentifier(name)) return void names.add(name.text);
+    for (const element of name.elements) {
+      if (ts.isBindingElement(element)) addBinding(element.name);
+    }
+  };
+
+  for (const statement of file.statements) {
+    if (ts.isFunctionDeclaration(statement) && isExported(statement) && statement.name) {
+      names.add(statement.name.text);
+    } else if (ts.isVariableStatement(statement) && isExported(statement)) {
+      // Covers `export const`, `export let` and `export var` alike.
+      for (const declaration of statement.declarationList.declarations) addBinding(declaration.name);
+    } else if (ts.isExportDeclaration(statement)) {
+      if (!statement.exportClause) {
+        // `export * from "./elsewhere"` re-exports an unknown set of names, so
+        // it could reinstate either endpoint invisibly. Fail loudly instead of
+        // silently passing — actions.ts has none today.
+        throw new Error(
+          `src/lib/actions.ts uses 'export *', which can re-export a deleted action invisibly: ${statement.getText(file)}`,
+        );
+      }
+      if (ts.isNamedExports(statement.exportClause)) {
+        // The EXPORTED name is what registers the endpoint, so read the alias
+        // (`export { foo as getContracts }` exports getContracts), not the local.
+        for (const element of statement.exportClause.elements) names.add(element.name.text);
+      } else {
+        names.add(statement.exportClause.name.text);
+      }
+    }
+  }
+  return names;
+}
+
+test("the caller-less contract exports stay deleted", () => {
+  const actionsPath = join(process.cwd(), "src/lib/actions.ts");
+  const exported = exportedNames(actionsPath);
+
+  // Sanity check the extractor itself before trusting its negatives: a parser
+  // that silently returned an empty set would pass every assertion below while
+  // proving nothing (the same "prove the control works before trusting a zero"
+  // reasoning the estimate audits use).
+  expect(exported.size, "the AST export extractor must actually find exports").toBeGreaterThan(100);
+  expect(exported, "the extractor must see a known-live action").toContain("getContract");
+
+  for (const name of ["getContracts", "getExecutedContractPdf"]) {
+    expect(exported, `${name} must not be exported from the server-action module`).not.toContain(name);
+  }
+
+  // Deleting them must not have orphaned the scope rule: contractScopeWhere is
+  // still what getLead's embedded contracts relation uses, and what both staff
+  // contract pages use (asserted in the test below). Scoped to getLead, not
+  // searched module-wide, or the rule could move out of getLead entirely and
+  // this would still pass (Codex round 1).
+  const source = stripComments(readFileSync(actionsPath, "utf8"));
+  expect(exportSource(source, "getLead"), "contractScopeWhere must still scope getLead's contracts")
+    .toContain("contracts: { where: contractScopeWhere(user) }");
+
+  // And the core the deleted PDF action wrapped must still exist and still be
+  // reached directly by its real caller — deleting the wrapper must not have
+  // taken the countersign path's file lookup with it. Also scoped, for the same
+  // reason: a module-wide match would pass on any other use of the core.
+  expect(exportSource(source, "countersignContractAsCompany"),
+    "countersign must still resolve the executed PDF through the core")
+    .toContain("executedContractPdfFor(");
 });
 
 // The live staff contract screens do NOT go through getContracts — they query
@@ -716,7 +799,10 @@ test("the contract gate pairs the contracts permission with the job-scope rule",
   expect(portal, "the portal must prove ownership first").toContain("getContractForPortal(");
   expect(portal, "the portal must use the session-free core")
     .toContain('from "@/lib/contract-files-core"');
-  expect(portal, "the portal must not call the staff-gated action")
+  // The staff wrapper this once guarded against is now deleted outright, so
+  // this assertion is belt-and-braces: it stops the portal reaching for a
+  // resurrected staff action instead of the core it is supposed to use.
+  expect(portal, "the portal must not call a staff-gated wrapper")
     .not.toMatch(/\bgetExecutedContractPdf\(/);
 });
 

@@ -1,11 +1,14 @@
 import { prisma } from "@/lib/prisma";
 
-// Session-free core of the executed-contract file lookup, shared by the
-// permission-gated `getExecutedContractPdf` server action in actions.ts and by
-// the client portal page (src/app/portal/contracts/[id]/page.tsx), which has no
-// staff session at all — it proves access with the contract's `accessToken`
-// magic link or a portal session resolving to the owning Client, upstream via
-// getContractForPortal.
+// Session-free core of the executed-contract file lookup, shared by
+// `countersignContractAsCompany` in actions.ts (which runs its own staff gate
+// first) and by the client portal page (src/app/portal/contracts/[id]/page.tsx),
+// which has no staff session at all — it proves access with the contract's
+// `accessToken` magic link or a portal session resolving to the owning Client,
+// upstream via getContractForPortal.
+//
+// There was also a thin staff wrapper here, `getExecutedContractPdf`. It was
+// deleted once a survey found it had no callers at all; see docs/CONTRACTS.md.
 //
 // actions.ts is a server-action module, so every export there is an
 // individually invokable POST endpoint. Auth-free logic must live HERE, not
@@ -14,12 +17,10 @@ import { prisma } from "@/lib/prisma";
 // and src/lib/lead-conversion-core.ts. (This file deliberately carries no
 // server-action directive.)
 //
-// The body below is moved verbatim from actions.ts. The one behavioural change
-// lives at the CALLER: the exported action now resolves the owner and title
-// from the database by contract id instead of trusting the descriptor it was
-// handed, so a caller can no longer name another job's scope. This core still
-// takes a descriptor because its two callers have each already established, by
-// different means, which contract they are allowed to be looking at.
+// The body below is moved verbatim from actions.ts. This core takes a
+// descriptor rather than an id because both of its callers have already
+// established, by different means, which contract they are allowed to be
+// looking at, and each already holds the loaded row.
 
 /** What the lookup needs to know about a contract. */
 export type ExecutedContractDescriptor = {
