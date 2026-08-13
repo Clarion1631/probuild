@@ -7,6 +7,7 @@ import CopyIdButton from "../copy-id-button";
 import { StateChip } from "../shared/state-chip";
 import { StepTimeline } from "../shared/step-timeline";
 import { isStaleBookedApi } from "../shared/stale-detection";
+import { ReceiptThumb } from "../shared/receipt-thumb";
 import MarkReviewedButton from "./mark-reviewed-button";
 import type { ReceiptJourneyMatch } from "./match-receipt-journey";
 import { toSerializedJourney } from "./serialize-journey";
@@ -200,14 +201,9 @@ function ReceiptTimelineBlock({
                 </p>
             )}
             {openReceiptHref && (
-                <a
-                    href={openReceiptHref}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-block mt-3 text-xs font-medium text-hui-primary hover:underline"
-                >
-                    Open receipt ↗
-                </a>
+                <div className="mt-3">
+                    <ReceiptThumb url={openReceiptHref} fileName={journey.fileName ?? journey.docNumber} />
+                </div>
             )}
         </DrilldownSection>
     );

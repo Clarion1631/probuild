@@ -8,6 +8,7 @@ import { formatRelativeTime } from "./format";
 import { StateChip, FINAL_STATE_STYLE } from "./shared/state-chip";
 import { StepTimeline } from "./shared/step-timeline";
 import { isStaleBookedApi } from "./shared/stale-detection";
+import { ReceiptThumb } from "./shared/receipt-thumb";
 import { type FilterKey, FILTERS, ReceiptFilterBar } from "./shared/receipt-filters";
 import { SuggestionCard } from "./shared/suggestion-card";
 import { ValidationPanel } from "./shared/validation-panel";
@@ -160,6 +161,11 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
     const dupMatch = journey.finalReason?.match(/^(possible-)?duplicate-of:([\w-]+)$/) ?? null;
     const duplicateOfFileId = dupMatch?.[2] ?? null;
     const duplicateTentative = Boolean(dupMatch?.[1]);
+    // Best available receipt link — the ProBuild-stored copy once synced,
+    // else the Drive original. Same fallback order row-drilldown.tsx uses
+    // for its own `openReceiptHref`.
+    const receiptHref =
+        journey.synced?.receiptUrl ?? (journey.driveFileId ? `https://drive.google.com/file/d/${journey.driveFileId}/view` : null);
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -202,6 +208,8 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
 
             {isOpen && (
                 <div className="px-4 pb-4 space-y-4">
+                    {receiptHref && <ReceiptThumb url={receiptHref} fileName={journey.fileName ?? journey.docNumber} />}
+
                     <ValidationPanel journey={journey} now={now} />
 
                     <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} unconfirmed={!journey.keyConfirmed} now={now} />
