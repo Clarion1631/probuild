@@ -20,7 +20,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
@@ -109,6 +109,7 @@ import {
 } from "./schedule-task-core";
 import { convertLeadToProjectCore } from "./lead-conversion-core";
 import { buildContractMergeData, normalizeContractBody, resolveMergeFields, createContractFromTemplateCore, createContractBlankCore } from "./contract-creation-core";
+import { executedContractPdfFor } from "./contract-files-core";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 // Import the -core module, not the "server-only" wrapper: actions.ts is in the
@@ -279,7 +280,16 @@ export const getLead = cache(async function getLead(id: string) {
         include: {
             client: true,
             estimates: scopedEstimateRelation(safeEstimateInclude, user),
-            contracts: true,
+            // Scoped for the same reason the estimates relation above is, and
+            // it mattered more here: currentStaffUserOrNull() returns null
+            // rather than throwing, so `contracts: true` handed an ANONYMOUS
+            // caller who knew a lead id every contract field — legal body,
+            // signatures, audit metadata and the accessToken that is by itself
+            // sufficient to view and sign. That defeated the per-action gates
+            // through a differently named action. contractScopeWhere matches
+            // nothing for a null user or one without the `contracts`
+            // permission. (Codex round-1 blocker.)
+            contracts: { where: contractScopeWhere(user) },
             manager: true,
             tasks: {
                 orderBy: { createdAt: "desc" }
@@ -4151,14 +4161,9 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
  * data. Only a real absence of a signed-in staff user returns null.
  */
 async function currentStaffUserOrNull(): Promise<any | null> {
-    const user = await getCurrentUserWithPermissions();
-    if (user) return user;
-
-    if (await canUseDevAuthFallback()) {
-        const devSession = await getSessionOrDev();
-        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
-    }
-    return null;
+    // Body moved to permissions.ts so server components that scope a query
+    // themselves can share it without actions.ts publishing another endpoint.
+    return currentStaffViewerOrNull();
 }
 
 async function assertActiveStaff(): Promise<any> {
@@ -4261,6 +4266,54 @@ async function assertContractContextAccess(context: { type: "project" | "lead"; 
     const scope = context.type === "project" ? { projectId: context.id } : { leadId: context.id };
     if (!canCreateContractFor(user, scope)) throw new Error("Forbidden");
     return user;
+}
+
+/**
+ * Resolve a contract's owning project/lead. Deliberately reads the owner from
+ * the DATABASE by id: every contract action is addressed by contract id, and
+ * the descriptor a caller hands us is exactly the thing an attacker controls.
+ */
+async function contractOwnerOrThrow(contractId: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { projectId: true, leadId: true, title: true },
+    });
+    if (!contract) throw new Error("Contract not found");
+    return contract;
+}
+
+/**
+ * Horizontal-access check for a contract already resolved to its owner.
+ * Same shape as assertEstimateScope, and fails CLOSED on an ownerless contract
+ * for the same reason: both ownership columns are optional in the schema, so
+ * "no project and no lead" would otherwise be authorized by default.
+ */
+function assertContractScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This contract is not attached to a project or lead, so access cannot be checked");
+    }
+    if (!canAccessContract(user, scope)) throw new Error("Forbidden");
+}
+
+/**
+ * Permission + scope for a single EXISTING contract, addressed by contract id.
+ *
+ * The contract-family actions in this file are exported Server Actions, i.e.
+ * individually invokable POST endpoints — "only imported by a staff page" is
+ * not an enforced boundary. Reading a contract exposes its legal body, the
+ * approval IP/user-agent trail, the signature storage paths and the portal
+ * `accessToken`, which by itself authorizes a client to view AND SIGN; writing
+ * one can clear a contractor signature. Both therefore need the same gate.
+ *
+ * Permission is asserted BEFORE the lookup so the "Contract not found" vs
+ * "Forbidden" difference cannot be used as an existence oracle by a caller who
+ * holds no contract permission at all.
+ */
+async function assertContractAccess(contractId: string) {
+    const user = await assertStaffPermission("contracts");
+    const contract = await contractOwnerOrThrow(contractId);
+    assertContractScope(user, contract);
+    return { user, projectId: contract.projectId, leadId: contract.leadId, title: contract.title };
 }
 
 /** Resolve an estimate's owning project/lead, for callers that hold a user already. */
@@ -5900,10 +5953,21 @@ export async function getResolvedMergePreview(
 }
 
 export async function getContracts(projectId?: string, leadId?: string) {
+    // Called with no arguments this returned EVERY contract with all scalar
+    // fields — legal body, approval IP/user-agent, signature paths and the
+    // portal accessToken that authorizes signing — to any anonymous caller.
+    // The scope filter is the list form of the same rule assertContractAccess
+    // applies to one row, so the list and the detail page cannot disagree.
+    const user = await assertStaffPermission("contracts");
     return prisma.contract.findMany({
         where: {
-            ...(projectId ? { projectId } : {}),
-            ...(leadId ? { leadId } : {}),
+            AND: [
+                contractScopeWhere(user),
+                {
+                    ...(projectId ? { projectId } : {}),
+                    ...(leadId ? { leadId } : {}),
+                },
+            ],
         },
         orderBy: { createdAt: "desc" },
         include: {
@@ -5914,6 +5978,11 @@ export async function getContracts(projectId?: string, leadId?: string) {
 }
 
 export async function getContract(id: string) {
+    // Staff-only, scoped to the owning job. The docstring on getContractForPortal
+    // below always CLAIMED this one was "admin-only"; nothing enforced it, so an
+    // anonymous caller could read any contract — including its accessToken — plus
+    // the full related client record, by id alone.
+    await assertContractAccess(id);
     return prisma.contract.findUnique({
         where: { id },
         include: {
@@ -5979,49 +6048,20 @@ export async function getContractForPortal(id: string, token?: string | null) {
 }
 
 /**
- * Returns the executed PDF ProjectFile for a specific contract.
+ * Staff-facing executed-contract file lookup. The lookup itself lives in
+ * src/lib/contract-files-core.ts (session-free, shared with the client portal,
+ * which proves access by accessToken or portal session instead).
  *
- * Files written by the finalize route set `ProjectFile.name` to the exact string
- * `Executed_Contract_{contractId}.pdf` (no timestamp prefix — the timestamp only
- * appears in the storage path, not the DB `name` column). We use exact equality
- * for airtight lookup.
- *
- * Legacy fallback: files written before the contractId naming convention used
- * `Executed_Contract_{safeTitle}.pdf`. If exact-match returns nothing we retry
- * with the title-based prefix as a best-effort courtesy for old data. Same-title
- * collisions on legacy data are accepted as a known limitation — new data is
- * unambiguous.
+ * ONLY the contract `id` in the argument is trusted. The owning project/lead
+ * and the title are re-read from the database, because the whole descriptor
+ * used to be caller-supplied: naming another job's projectId returned that
+ * job's executed PDF, and a crafted `title` steered the legacy prefix match.
+ * The parameter keeps its old shape so existing callers are unchanged; the
+ * extra fields are now ignored.
  */
 export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const where: any = contract.projectId
-        ? { projectId: contract.projectId }
-        : contract.leadId
-            ? { leadId: contract.leadId }
-            : null;
-    if (!where) return null;
-
-    // Preferred: exact-match on the contract-id-embedded filename.
-    const exactName = `Executed_Contract_${contract.id}.pdf`;
-    const byContractId = await prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: exactName,
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
-    if (byContractId) return byContractId;
-
-    // Legacy fallback — title-prefixed files from before the contractId naming change.
-    const legacyPrefix = `Executed_Contract_${contract.title.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-    return prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: { startsWith: legacyPrefix },
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
+    const { projectId, leadId, title } = await assertContractAccess(contract.id);
+    return executedContractPdfFor({ id: contract.id, title, projectId, leadId });
 }
 
 export async function createContractFromTemplate(
@@ -6084,6 +6124,11 @@ export async function createContractFromPdf(
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    // Unauthenticated before this gate: an anonymous caller could rewrite any
+    // contract's title/body/status/requiresCountersign by id — and because a
+    // text edit clears the contractor signature (see below), a plain edit was
+    // enough to strip a signature off a live legal document.
+    await assertContractAccess(id);
     const existing = await prisma.contract.findUnique({
         where: { id },
         select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
@@ -6155,6 +6200,9 @@ export async function updateContract(id: string, data: { title?: string; body?: 
 }
 
 export async function deleteContract(id: string) {
+    // Unauthenticated before this gate: an anonymous caller could permanently
+    // delete any contract — signed ones included — by id alone.
+    await assertContractAccess(id);
     const contract = await prisma.contract.findUnique({ where: { id } });
     await prisma.contract.delete({ where: { id } });
     if (contract?.projectId) revalidatePath(`/projects/${contract.projectId}`);
@@ -6332,11 +6380,13 @@ export async function sendContractToClient(
 // Prefill for the "Send contract" dialog: the primary recipient + the default CC set
 // (additional client email + assigned manager) that the user can edit before sending.
 export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
-    const session = await getServerSession(authOptions);
-    const caller = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
-        : null;
-    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+    // Was authenticated but neither permission-checked nor scoped: a hard-coded
+    // role list let any FINANCE user pass an arbitrary contract id and read the
+    // client's primary/additional email plus the assigned manager's. FINANCE's
+    // role default is `estimates`, not `contracts`, and this prefills a dialog
+    // whose send path (assertContractSendPermission) already demands `contracts`
+    // — so the old list granted a preview of data it could never act on.
+    await assertContractAccess(contractId);
 
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
@@ -6854,6 +6904,10 @@ export async function approveContract(contractId: string, signatureName: string,
 }
 
 export async function getContractSigningHistory(contractId: string) {
+    // Unauthenticated before this gate: signer names, IP addresses, user agents,
+    // notes and — because this action resolves `secure:` refs into loadable URLs
+    // — the signature IMAGES themselves, for any contract id.
+    await assertContractAccess(contractId);
     const records = await prisma.contractSigningRecord.findMany({
         where: { contractId },
         orderBy: { signedAt: "desc" },
@@ -6900,7 +6954,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
     // than returning a false success with no file.
     if (contract.status === "Finalized") {
-        const existing = await getExecutedContractPdf(contract);
+        const existing = await executedContractPdfFor(contract);
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
@@ -6984,7 +7038,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     });
     if (!after) throw new Error("Contract not found");
     if (after.status === "Finalized") {
-        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+        return { success: true, file: await executedContractPdfFor(after), alreadyFinalized: true };
     }
     if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
         throw new Error("Contract is not in a countersignable state.");
@@ -7000,7 +7054,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         // the winner is still archiving (or rolled back), so tell the admin to retry rather than
         // returning a false success with no file.
         const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
-        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        const existing = fresh?.status === "Finalized" ? await executedContractPdfFor(fresh) : null;
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
