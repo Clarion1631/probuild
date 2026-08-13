@@ -8,6 +8,12 @@ import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
 import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
+import {
+    mirrorInvoiceSettleToEstimate,
+    mirrorInvoiceUnsettleToEstimate,
+    mirrorEstimateUnsettleToInvoice,
+    findInvoiceMirrorOfEstimateSchedule,
+} from "@/lib/payment-mirror";
 
 // Helper function to process a single event by eventId asynchronously
 async function processEvent(eventId: string) {
@@ -65,12 +71,15 @@ async function processEvent(eventId: string) {
                     const scheduleId = metadata.paymentScheduleId;
                     const invoiceId = metadata.invoiceId;
                     const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-                        // Lock the parent invoice FIRST (canonical Estimate → Invoice → schedules
-                        // order; this branch touches only the invoice). Two concurrent webhooks
-                        // settling different milestones of the same invoice would otherwise each
-                        // read a stale sibling set and overwrite each other's balanceDue — the lock
-                        // serializes the recompute so the second waits and reads fresh state.
-                        await lockMoneyParents(t, { invoiceId });
+                        // Lock the parents in canonical Estimate → Invoice → schedules order.
+                        // Two concurrent webhooks settling different milestones of the same
+                        // invoice would otherwise each read a stale sibling set and overwrite
+                        // each other's balanceDue — the lock serializes the recompute so the
+                        // second waits and reads fresh state. The estimate is locked too because
+                        // this branch mirrors onto the estimate-side milestone copy below; the
+                        // link is read non-locking first so the order can never invert.
+                        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+                        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
                         const claim = await t.paymentSchedule.updateMany({
                             where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
@@ -95,11 +104,28 @@ async function processEvent(eventId: string) {
                             where: { id: invoiceId },
                             data: { balanceDue: newBalance, status: newStatus },
                         });
+                        const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
+                        // Mirror onto the estimate-side copy so the estimate editor and the
+                        // client portal don't keep showing this milestone as unpaid.
+                        if (!alreadyPaid && paidSchedule) {
+                            await mirrorInvoiceSettleToEstimate(t, {
+                                estimateId: invLink?.estimateId,
+                                payment: paidSchedule,
+                                data: {
+                                    paymentDate: paidSchedule.paymentDate ?? new Date(),
+                                    paidAt: paidSchedule.paidAt ?? new Date(),
+                                    paymentMethod,
+                                    // Same metadata the portal fallback writes, so the mirror
+                                    // looks identical whichever rail wins the settle claim.
+                                    stripeSessionId: session.id,
+                                    stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
+                                },
+                            });
+                        }
                         // Durable notification enqueued in-tx (delivered by the drainer below).
                         if (!alreadyPaid) {
                             await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
                         }
-                        const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
                         return { alreadyPaid, invoice, paidSchedule, newBalance };
                     }));
                     if (!tx.alreadyPaid) {
@@ -184,29 +210,54 @@ async function processEvent(eventId: string) {
                 const isFullyRefunded = chargeAmount > 0
                     && Math.abs(chargeAmount - refundedAmount) < 0.005;
 
-                // Try invoice payment schedule first
-                const invoiceSchedule = await prisma.paymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { invoice: true },
-                });
+                // Try invoice payment schedule first. `stripePaymentIntentId` is NOT unique —
+                // invoice creation copies it onto every clone of an already-paid estimate
+                // milestone — so prefer a row that is actually Paid (the one a refund is
+                // about) and pick deterministically among ties instead of taking whatever
+                // the planner returns first.
+                const invoiceSchedule =
+                    (await prisma.paymentSchedule.findFirst({
+                        where: { stripePaymentIntentId: paymentIntentId, status: "Paid" },
+                        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                        include: { invoice: true },
+                    }))
+                    ?? (await prisma.paymentSchedule.findFirst({
+                        where: { stripePaymentIntentId: paymentIntentId },
+                        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                        include: { invoice: true },
+                    }));
 
                 if (invoiceSchedule) {
+                    // Whether THIS delivery actually reset the schedule — the office email
+                    // must not claim a reset the claim guard refused.
+                    let didReset = false;
                     if (isFullyRefunded) {
                         // Full refund: reset the schedule and recompute the invoice in one transaction
                         // so we don't race with a concurrent payment settlement on a sibling schedule.
-                        await withTxRetry(() => prisma.$transaction(async (t) => {
-                            // Canonical Estimate → Invoice → schedules order; this branch touches
-                            // only the invoice. Lock it first so a concurrent settle on a sibling
-                            // milestone can't have its balanceDue effect lost to this recompute.
-                            await lockMoneyParents(t, { invoiceId: invoiceSchedule.invoiceId });
+                        const outcome = await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order. Lock the parents
+                            // first so a concurrent settle on a sibling milestone can't have its
+                            // balanceDue effect lost to this recompute. The estimate is locked
+                            // too because the estimate-side mirror is unwound below.
+                            await lockMoneyParents(t, {
+                                estimateId: invoiceSchedule.invoice.estimateId,
+                                invoiceId: invoiceSchedule.invoiceId,
+                            });
                             // Re-read the parent AFTER the lock — the outer query's snapshot of
                             // totalAmount/status may be stale if a concurrent flow changed it.
                             const invoice = await t.invoice.findUnique({ where: { id: invoiceSchedule.invoiceId } });
                             if (invoice) {
-                                await t.paymentSchedule.update({
-                                    where: { id: invoiceSchedule.id },
+                                // CLAIMED reset: the schedule row was read before the locks were
+                                // taken, so a settlement that landed while this worker waited may
+                                // have re-pointed it at a NEWER charge. Guarding on both the Paid
+                                // status and this refund's PaymentIntent means a stale refund can
+                                // never reset a payment it isn't about. The Stripe ids stay on the
+                                // row: they are how a redelivered refund re-finds it.
+                                const reset = await t.paymentSchedule.updateMany({
+                                    where: { id: invoiceSchedule.id, status: "Paid", stripePaymentIntentId: paymentIntentId },
                                     data: { status: "Pending", paidAt: null, paymentDate: null },
                                 });
+                                if (reset.count === 0) return { claimed: false };
                                 const siblings = await t.paymentSchedule.findMany({
                                     where: { invoiceId: invoiceSchedule.invoiceId },
                                 });
@@ -220,17 +271,28 @@ async function processEvent(eventId: string) {
                                     where: { id: invoice.id },
                                     data: { balanceDue: newBalance, status: newStatus },
                                 });
+                                // Unwind the estimate-side mirror too, or the estimate keeps
+                                // claiming money the invoice no longer shows as received.
+                                await mirrorInvoiceUnsettleToEstimate(t, {
+                                    estimateId: invoice.estimateId,
+                                    payment: invoiceSchedule,
+                                });
+                                return { claimed: true };
                             }
+                            return { claimed: false };
                         }));
+                        didReset = outcome.claimed;
                     }
 
                     const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
                     if (refundSettings?.notificationEmail) {
                         // `charge.amount_refunded` is the CUMULATIVE refund total, so this message reflects
                         // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
-                        const summary = isFullyRefunded
+                        const summary = !isFullyRefunded
+                            ? `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile the invoice balance manually in the Stripe dashboard.`
+                            : didReset
                             ? `The schedule has been reset to Pending and the invoice balance restored.`
-                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile the invoice balance manually in the Stripe dashboard.`;
+                            : `This milestone was <strong>not</strong> reset automatically — it no longer matched this charge when the refund was processed. Please reconcile the invoice balance manually in the Stripe dashboard.`;
                         await sendNotification(
                             refundSettings.notificationEmail,
                             `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Invoice ${invoiceSchedule.invoice.code}`,
@@ -245,26 +307,47 @@ async function processEvent(eventId: string) {
                 }
 
                 // Try estimate payment schedule
-                const estSchedule = await prisma.estimatePaymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { estimate: true },
-                });
+                const estSchedule =
+                    (await prisma.estimatePaymentSchedule.findFirst({
+                        where: { stripePaymentIntentId: paymentIntentId, status: "Paid" },
+                        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                        include: { estimate: true },
+                    }))
+                    ?? (await prisma.estimatePaymentSchedule.findFirst({
+                        where: { stripePaymentIntentId: paymentIntentId },
+                        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+                        include: { estimate: true },
+                    }));
 
                 if (estSchedule) {
+                    let didReset = false;
                     if (isFullyRefunded) {
-                        await withTxRetry(() => prisma.$transaction(async (t) => {
-                            // Canonical Estimate → Invoice → schedules order; this branch touches
-                            // only the estimate. Lock it first so a concurrent settle on a sibling
-                            // milestone can't have its balanceDue effect lost to this recompute.
+                        const outcome = await withTxRetry(() => prisma.$transaction(async (t) => {
+                            // Canonical Estimate → Invoice → schedules order. Lock the estimate
+                            // first so a concurrent settle on a sibling milestone can't have its
+                            // balanceDue effect lost to this recompute; the invoice-side mirror
+                            // (unwound below) is located and then locked in that same order.
                             await lockMoneyParents(t, { estimateId: estSchedule.estimateId });
+                            let invoiceMirror = await findInvoiceMirrorOfEstimateSchedule(t, estSchedule);
+                            if (invoiceMirror) {
+                                await lockMoneyParents(t, { invoiceId: invoiceMirror.invoiceId });
+                                // The candidate was chosen BEFORE its Invoice row was locked, so
+                                // re-resolve under the lock and only keep it if it still resolves
+                                // to the same row. Anything else means the mirror group moved and
+                                // this refund should not touch it.
+                                const confirmed = await findInvoiceMirrorOfEstimateSchedule(t, estSchedule);
+                                invoiceMirror = confirmed && confirmed.id === invoiceMirror.id ? confirmed : null;
+                            }
                             // Re-read the parent AFTER the lock — the outer query's snapshot of
                             // totalAmount/status may be stale if a concurrent flow changed it.
                             const estimate = await t.estimate.findUnique({ where: { id: estSchedule.estimateId } });
                             if (estimate) {
-                                await t.estimatePaymentSchedule.update({
-                                    where: { id: estSchedule.id },
+                                // CLAIMED reset — same reasoning as the invoice branch above.
+                                const reset = await t.estimatePaymentSchedule.updateMany({
+                                    where: { id: estSchedule.id, status: "Paid", stripePaymentIntentId: paymentIntentId },
                                     data: { status: "Pending", paidAt: null, paymentDate: null },
                                 });
+                                if (reset.count === 0) return { claimed: false };
                                 const siblings = await t.estimatePaymentSchedule.findMany({
                                     where: { estimateId: estSchedule.estimateId },
                                 });
@@ -283,15 +366,25 @@ async function processEvent(eventId: string) {
                                         ...(totalPaid === 0 && { statusBeforePayment: null }),
                                     },
                                 });
+                                // Unwind the invoice-side mirror too, or the invoice keeps
+                                // showing a milestone the estimate no longer counts as paid.
+                                if (invoiceMirror) {
+                                    await mirrorEstimateUnsettleToInvoice(t, invoiceMirror);
+                                }
+                                return { claimed: true };
                             }
+                            return { claimed: false };
                         }));
+                        didReset = outcome.claimed;
                     }
 
                     const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
                     if (refundSettings?.notificationEmail) {
-                        const summary = isFullyRefunded
+                        const summary = !isFullyRefunded
+                            ? `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile manually.`
+                            : didReset
                             ? `The schedule has been reset to Pending and the estimate balance restored.`
-                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile manually.`;
+                            : `This milestone was <strong>not</strong> reset automatically — it no longer matched this charge when the refund was processed. Please reconcile manually.`;
                         await sendNotification(
                             refundSettings.notificationEmail,
                             `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Estimate ${estSchedule.estimate.code}`,
