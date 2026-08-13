@@ -5517,7 +5517,9 @@ export async function sendEstimateToClient(
         // A mismatched schedule now blocks the send with the explicit error
         // below — the editor's distribute-remainder button is the fix.
         const unpaidRounded = rc(unpaidSchedules.reduce((sum, s) => sum + toNum(s.amount), 0));
-        if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
+        // Integer-cent compare: |99.99 − 100| in floats is 0.010000000000005116,
+        // which would reject an exactly-one-cent difference the tolerance means to allow.
+        if (Math.abs(Math.round(unpaidRounded * 100) - Math.round(balanceDue * 100)) > 1) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
             const diff = Math.abs(unpaidRounded - balanceDue);
             return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(balanceDue)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };

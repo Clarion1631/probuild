@@ -37,7 +37,10 @@ function recalcMilestoneAmounts(schedules: any[], total: number): any[] {
     const drift = rm(target - roundedSum);
     if (drift !== 0 && Math.abs(drift) <= 0.01 * pctRows.length) {
         const last = pctRows[pctRows.length - 1];
-        last.amount = String(rm((parseFloat(last.amount) || 0) + drift));
+        const settled = rm((parseFloat(last.amount) || 0) + drift);
+        // Negative drift on a tiny last row could push it below zero (e.g. $1 split
+        // 0.6% / 0.6% / 0.1%) — leave the drift unsettled rather than go negative.
+        if (settled >= 0) last.amount = String(settled);
     }
 
     return cloned;
@@ -2269,17 +2272,24 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         }]);
     }
 
+    /** The % / $ fields are text inputs (see the milestone row), so "$1,000.50"
+     *  can arrive verbatim — parseFloat would read that as 1. Keep digits and the
+     *  decimal point only, so what's stored is what parseFloat will see. */
+    function sanitizeMoneyInput(value: string): string {
+        return String(value).replace(/[^0-9.]/g, "");
+    }
+
     function updatePaymentSchedule(index: number, field: string, value: any) {
         const newSchedules = [...paymentSchedules];
         if (field === "percentage") {
-            newSchedules[index] = { ...newSchedules[index], percentage: value };
+            newSchedules[index] = { ...newSchedules[index], percentage: sanitizeMoneyInput(value) };
             const recalced = recalcMilestoneAmounts(newSchedules, total);
             setPaymentSchedules(recalced);
             return;
         } else if (field === "amount") {
             newSchedules[index] = {
                 ...newSchedules[index],
-                amount: value,
+                amount: sanitizeMoneyInput(value),
                 percentage: ""
             };
         } else {
@@ -2619,17 +2629,32 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
 
                     {/* Primary Actions */}
                     <button
-                        onClick={() => {
+                        onClick={async () => {
                             const unpaidSchedules = paymentSchedules.filter(s => s.status !== "Paid");
                             if (unpaidSchedules.length > 0) {
                                 const paidSum = paymentSchedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
                                 const milestoneSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
                                 const remaining = rm(total - paidSum);
                                 const unpaidSum = rm(milestoneSum - paidSum);
-                                if (Math.abs(unpaidSum - remaining) > 0.01) {
+                                // Integer-cent compare: float subtraction can turn an exactly-1¢
+                                // (tolerated) difference into 0.010000000000005 > 0.01.
+                                if (Math.abs(Math.round(unpaidSum * 100) - Math.round(remaining * 100)) > 1) {
                                     toast.error(`Payment milestones total $${milestoneSum.toFixed(2)} but estimate total is $${total.toFixed(2)}. Please adjust milestones.`);
                                     return;
                                 }
+                            }
+                            // sendEstimateToClient reads milestones from the database, so
+                            // corrections typed since the last save would be invisible to it —
+                            // the server would validate (and email) stale rows. Save first,
+                            // silently, exactly as handleSyncQB does before its push.
+                            try {
+                                await handleSave({ silent: true, skipRefresh: true });
+                            } catch (e: any) {
+                                if (!e?.isSaveConflict) {
+                                    const detail = e?.message ? ` (${e.message})` : "";
+                                    toast.error(`We couldn't confirm the save — the estimate was not sent.${detail}`);
+                                }
+                                return;
                             }
                             setShowSendModal(true);
                         }}
