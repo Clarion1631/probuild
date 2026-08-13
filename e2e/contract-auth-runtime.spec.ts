@@ -134,10 +134,19 @@ test.describe("staff with project access but no `contracts` permission (FINANCE)
         await expect(page.getByText("No contracts yet")).toBeVisible();
     });
 
-    test("getContracts returns an empty list", async ({ request }) => {
+    // getContracts REFUSES rather than returning []. Its gate is
+    // assertStaffPermission("contracts"), which throws before
+    // contractScopeWhere is ever consulted — so the action and the pages answer
+    // "no contracts" by two different mechanisms, and only the pages (which
+    // query Prisma directly through contractScopeWhere, never through this
+    // action) degrade to an empty list. Asserting `ok: true, data: []` here
+    // fails against the real system; that is what the first live run showed.
+    test("getContracts refuses outright — it never degrades to an empty list", async ({ request }) => {
         const result = await callAction(request, "getContracts", []);
-        expect(result.ok).toBe(true);
-        expect(result.data.length).toBe(0);
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe("Forbidden");
+        expect(result.raw).not.toContain(CONTRACT_INSCOPE_TOKEN);
+        expect(result.raw).not.toContain(CONTRACT_INSCOPE_BODY);
     });
 
     // Project access is not the contract permission — this is the exact
@@ -213,14 +222,22 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         });
     }
 
-    test("getContracts list excludes the converted and in-scope contracts", async ({ request }) => {
+    // The list must agree with the detail action, in BOTH directions — a filter
+    // that simply returned nothing would satisfy an exclusion-only assertion.
+    // This user reaches PROJECT_ID, so the in-scope contract is legitimately
+    // theirs and MUST appear; the converted one is on a project they cannot
+    // reach and must not, even though its leadId would otherwise admit it.
+    test("getContracts list admits what the by-id action admits and excludes the converted contract", async ({
+        request,
+    }) => {
         const result = await callAction(request, "getContracts", []);
         expect(result.ok).toBe(true);
         const ids = (result.data as any[]).map((c) => c.id);
+        expect(ids).toContain(CONTRACT_LEADONLY_ID);
+        expect(ids).toContain(CONTRACT_INSCOPE_ID);
         expect(ids).not.toContain(CONTRACT_CONVERTED_ID);
-        expect(ids).not.toContain(CONTRACT_INSCOPE_ID);
         expect(result.raw).not.toContain(CONTRACT_CONVERTED_TOKEN);
-        expect(result.raw).not.toContain(CONTRACT_INSCOPE_TOKEN);
+        expect(result.raw).not.toContain(CONTRACT_CONVERTED_BODY);
     });
 
     test.describe.serial("scratch contract write control", () => {
