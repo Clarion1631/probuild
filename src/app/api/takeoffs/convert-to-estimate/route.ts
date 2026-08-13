@@ -65,7 +65,6 @@ export async function POST(req: NextRequest) {
 
     const rawItems = aiData.items || [];
     const milestones = aiData.paymentMilestones || [];
-    const totalEstimate = aiData.totalEstimate || rawItems.reduce((s: number, i: any) => s + (i.total || 0), 0);
 
     // The AI quote carries sales tax as a visible "99-TAX" line item, but the Estimate model
     // speaks rate-based tax: totalAmount is tax-INCLUSIVE once taxRatePercent is set, and a
@@ -73,18 +72,64 @@ export async function POST(req: NextRequest) {
     // approval grosses the stored total up once (ensureProjectAndDepositInvoiceForEstimate).
     // Persisting the tax line as an item with a null rate therefore taxes the client twice.
     // Translate at this boundary, like the markup→margin conversion above: drop the tax
-    // line(s) from the items and store the equivalent rate instead. The rate is derived from
-    // the quoted amounts (not the AI's claimed percentage) so the stored total is preserved
-    // to the cent: subtotal × (1 + r/100) === subtotal + taxAmount === totalEstimate, which
-    // also keeps the AI's milestone amounts tying out against the total.
+    // line(s) from the items and store the equivalent rate instead. The ITEMS are the money
+    // truth (the editor recomputes totalAmount from them), so both the rate and the stored
+    // total derive from the non-tax item sum — never from the AI's header total, which is
+    // not guaranteed to equal the item sum — keeping the invariant
+    // totalAmount === subtotal × (1 + rate/100) exact after cent rounding.
     const taxLines = rawItems.filter((i: any) => isTaxRow(i));
+    const items = rawItems.filter((i: any) => !isTaxRow(i));
     const taxAmount = rmc(taxLines.reduce((s: number, i: any) => s + numOr(i.total, 0), 0));
-    const subtotal = rmc(totalEstimate - taxAmount);
-    // Degenerate quotes (tax with no taxable base, or tax exceeding the total) keep the old
-    // shape: tax stays a visible line item and the rate stays null.
+    const subtotal = rmc(items.reduce((s: number, i: any) => s + numOr(i.total, 0), 0));
     const canonicalizeTax = taxAmount > 0 && subtotal > 0;
-    const taxRatePercent = canonicalizeTax ? (taxAmount / subtotal) * 100 : null;
-    const items = canonicalizeTax ? rawItems.filter((i: any) => !isTaxRow(i)) : rawItems;
+    // A nonzero tax quote that can't be expressed as a rate on a positive subtotal (tax-only,
+    // negative tax, tax with no taxable base) must not be persisted in the old double-tax
+    // shape — send the user back to regenerate instead of storing a known-bad estimate.
+    // (A zero-amount tax line is simply dropped: removing it changes no totals.)
+    if (taxAmount !== 0 && !canonicalizeTax) {
+        return NextResponse.json(
+            { error: "The AI estimate's sales-tax line can't be reconciled with its taxable items. Regenerate the AI estimate, then convert again." },
+            { status: 400 }
+        );
+    }
+    let taxRatePercent: number | null = canonicalizeTax ? (taxAmount / subtotal) * 100 : null;
+    let taxRateName: string | null = canonicalizeTax ? String(taxLines[0]?.name || "Sales Tax").slice(0, 80) : null;
+    // Prefer the company's configured tax when it matches the derived rate (±0.05pp) AND
+    // reproduces the exact same cent total: the estimate editor resolves tax by NAME against
+    // CompanySettings.salesTaxes and silently falls back to the default rate when the name
+    // is unknown, so an AI-invented name would let the first editor save re-rate the quote.
+    // The cent-equivalence requirement means snapping can never move totalAmount, so the
+    // AI's milestone amounts keep tying out against it. A rate the company hasn't configured
+    // (or that matches only approximately) stays stored as derived; the residual editor
+    // defect for such rates is tracked as its own task. Fail-soft throughout: if settings
+    // can't be read or parsed, the derived rate and the AI's name stand.
+    if (canonicalizeTax && taxRatePercent != null) {
+        const derived = taxRatePercent;
+        try {
+            const settings = await prisma.companySettings.findUnique({
+                where: { id: "singleton" },
+                select: { salesTaxes: true },
+            });
+            const taxes = settings?.salesTaxes ? (JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number }>) : [];
+            const match = (Array.isArray(taxes) ? taxes : [])
+                .filter(t => typeof t.rate === "number" && typeof t.name === "string")
+                .filter(t => Math.abs((t.rate as number) - derived) <= 0.05)
+                .filter(t => rmc(subtotal * (1 + (t.rate as number) / 100)) === rmc(subtotal + taxAmount))
+                .sort((a, b) => Math.abs((a.rate as number) - derived) - Math.abs((b.rate as number) - derived))[0];
+            if (match) {
+                taxRatePercent = match.rate as number;
+                taxRateName = match.name as string;
+            }
+        } catch {
+            // Settings unavailable or unparseable: keep the derived rate and the AI's name.
+        }
+    }
+    // Canonical-path total is always subtotal + taxAmount (the snap above is cent-neutral by
+    // construction), which the derived rate reproduces: subtotal × (1 + r/100) rounds to the
+    // same cents.
+    const totalEstimate = canonicalizeTax
+        ? rmc(subtotal + taxAmount)
+        : numOrNull(aiData.totalEstimate) || subtotal;
 
     const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -99,12 +144,7 @@ export async function POST(req: NextRequest) {
                 status: "Draft",
                 totalAmount: totalEstimate,
                 balanceDue: totalEstimate,
-                ...(canonicalizeTax
-                    ? {
-                          taxRatePercent,
-                          taxRateName: String(taxLines[0]?.name || "Sales Tax").slice(0, 80),
-                      }
-                    : {}),
+                ...(canonicalizeTax ? { taxRatePercent, taxRateName } : {}),
                 privacy: "Shared",
             },
         });
