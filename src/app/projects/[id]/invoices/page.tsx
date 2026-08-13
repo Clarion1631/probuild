@@ -5,7 +5,8 @@ export default async function ProjectInvoices({ params }: { params: Promise<{ id
     const { id } = await params;
     const project = await getProject(id);
     if (!project) return <div className="p-6 text-hui-textMain">Project not found</div>;
-    const invoices = await getProjectInvoices(id);
+    // Invoice money fields are Prisma Decimals — serialize before crossing the server->client boundary.
+    const invoices = JSON.parse(JSON.stringify(await getProjectInvoices(id)));
 
     return (
         <div className="flex h-full bg-hui-background">
