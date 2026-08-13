@@ -581,8 +581,19 @@ test("every exported contract action authorizes and scopes by contract id", () =
 
     // Order alone is not enough: an early `return {} as any` ahead of the guard
     // satisfies every ordering assertion above while leaving the guard dead.
-    expect(action.slice(0, guardIndex), `${name} must not return before authorizing`)
-      .not.toMatch(/\breturn\b/);
+    const beforeGuard = action.slice(0, guardIndex);
+    expect(beforeGuard, `${name} must not return before authorizing`).not.toMatch(/\breturn\b/);
+
+    // Nor is "the guard is called" enough. `try { await assertContractAccess(id) }
+    // catch {}` satisfies every assertion above and reopens the hole in full,
+    // so the guard must not sit inside a caught block (Codex round-1).
+    expect(beforeGuard, `${name} must not swallow the authorization failure`)
+      .not.toMatch(/\btry\b/);
+
+    // And the action must still DO something after authorizing — otherwise a
+    // body gutted to `return null as any` passes as "secure".
+    expect(action.slice(guardIndex), `${name} must still do its work after authorizing`)
+      .toMatch(/prisma\.|executedContractPdfFor\(/);
   }
 
   // The list must be filtered by the scope rule, not merely authenticated — an
@@ -606,6 +617,39 @@ test("every exported contract action authorizes and scopes by contract id", () =
   }
   expect(pdf, "getExecutedContractPdf must delegate the lookup to the core")
     .toContain("executedContractPdfFor(");
+
+  // Gating the by-id actions is not enough while a differently named action
+  // returns the same rows. getLead embeds the lead's contracts and resolves its
+  // caller with currentStaffUserOrNull(), which returns null rather than
+  // throwing — so an unscoped `contracts: true` handed an anonymous caller the
+  // legal body, the signatures and the signing accessToken (Codex round-1
+  // blocker). The relation carries the list filter, exactly as the estimates
+  // relation beside it does.
+  const lead = exportSource(source, "getLead");
+  expect(lead, "getLead must scope the contracts it embeds")
+    .toMatch(/contracts: \{ where: contractScopeWhere\(user\) \}/);
+  expect(lead, "getLead must not embed contracts unscoped").not.toMatch(/contracts: true/);
+});
+
+// The live staff contract screens do NOT go through getContracts — they query
+// Prisma directly, so securing the action alone secured nothing a user actually
+// loads. Their layouts check project access / leadAccess but never `contracts`.
+test("the staff contract pages filter by the same scope rule the actions assert", () => {
+  for (const page of [
+    "src/app/projects/[id]/contracts/page.tsx",
+    "src/app/leads/[id]/contracts/page.tsx",
+  ]) {
+    const source = stripComments(readFileSync(join(process.cwd(), page), "utf8"));
+    expect(source, `${page} must resolve the viewer`).toContain("await getCurrentUserWithPermissions()");
+    expect(source, `${page} must apply the contract scope filter`).toContain("contractScopeWhere(viewer)");
+
+    // The filter must gate the contract query itself, not sit unused beside it.
+    const queryIndex = source.indexOf("prisma.contract.findMany(");
+    const filterIndex = source.indexOf("contractScopeWhere(viewer)");
+    expect(queryIndex, `${page} must still query contracts`).toBeGreaterThanOrEqual(0);
+    expect(filterIndex, `${page} must apply the filter inside the query`).toBeGreaterThan(queryIndex);
+    expect(filterIndex - queryIndex, `${page} must apply the filter to the contract query`).toBeLessThan(200);
+  }
 });
 
 test("the contract gate pairs the contracts permission with the job-scope rule", () => {

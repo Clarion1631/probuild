@@ -280,7 +280,16 @@ export const getLead = cache(async function getLead(id: string) {
         include: {
             client: true,
             estimates: scopedEstimateRelation(safeEstimateInclude, user),
-            contracts: true,
+            // Scoped for the same reason the estimates relation above is, and
+            // it mattered more here: currentStaffUserOrNull() returns null
+            // rather than throwing, so `contracts: true` handed an ANONYMOUS
+            // caller who knew a lead id every contract field — legal body,
+            // signatures, audit metadata and the accessToken that is by itself
+            // sufficient to view and sign. That defeated the per-action gates
+            // through a differently named action. contractScopeWhere matches
+            // nothing for a null user or one without the `contracts`
+            // permission. (Codex round-1 blocker.)
+            contracts: { where: contractScopeWhere(user) },
             manager: true,
             tasks: {
                 orderBy: { createdAt: "desc" }
