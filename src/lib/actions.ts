@@ -912,7 +912,8 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 
     revalidatePath(`/leads/${leadId}`);
     revalidatePath(`/leads`);
-    return lead;
+    // targetRevenue/expectedProfit are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(lead));
 }
 
 // =============================================
@@ -9104,7 +9105,8 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
@@ -9214,7 +9216,8 @@ export async function approveChangeOrder(id: string, signatureName: string, user
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 // Company-side countersignature. Distinct from approveChangeOrder (the customer's
@@ -9775,7 +9778,8 @@ export async function createPurchaseOrder(projectId: string, data: any) {
         }
     });
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
@@ -9929,8 +9933,9 @@ export async function updatePurchaseOrder(id: string, data: any) {
 
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    
-    return po;
+
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function deletePurchaseOrder(id: string) {
@@ -10022,7 +10027,8 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
     
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
@@ -10738,7 +10744,8 @@ export async function createProductLibraryItem(data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateProductLibraryItem(id: string, data: {
@@ -10764,7 +10771,8 @@ export async function updateProductLibraryItem(id: string, data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteProductLibraryItem(id: string) {
@@ -12345,7 +12353,8 @@ export async function addTeamCandidate(decisionId: string | null, data: {
         entityName: candidate.name,
     });
 
-    return candidate;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(candidate));
 }
 
 export async function importBoardPicksAsDecisions(projectId: string) {
@@ -13020,7 +13029,8 @@ export async function createCatalogItem(data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateCatalogItem(id: string, data: {
@@ -13038,7 +13048,8 @@ export async function updateCatalogItem(id: string, data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteCatalogItem(id: string) {
@@ -13207,7 +13218,8 @@ export async function createBidPackage(projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function updateBidPackage(id: string, projectId: string, data: {
@@ -13232,7 +13244,8 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
@@ -13261,7 +13274,8 @@ export async function addBidScope(packageId: string, projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return scope;
+    // budgetAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(scope));
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
@@ -13315,7 +13329,8 @@ export async function recordBidResponse(invitationId: string, packageId: string,
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return inv;
+    // bidAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(inv));
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
@@ -13368,7 +13383,8 @@ export async function createRetainer(projectId: string, data: {
     });
 
     revalidatePath(`/projects/${projectId}/retainers`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function updateRetainer(id: string, data: {
@@ -13396,7 +13412,8 @@ export async function updateRetainer(id: string, data: {
     const retainer = await prisma.retainer.update({ where: { id }, data: updateData });
     revalidatePath(`/projects/${existing.projectId}/retainers`);
     revalidatePath(`/projects/${existing.projectId}/retainers/${id}`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function deleteRetainer(id: string) {
