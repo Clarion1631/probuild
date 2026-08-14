@@ -105,9 +105,46 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     // text line if the whole description is one atomic row. Sibling rows give the
     // paginator safe break points between paragraphs (mirrors PortalInvoiceClient's
     // Notes section).
+    //
+    // A single paragraph with no blank lines (the real Mesplay Foundation CO has one)
+    // can still be taller than a page, so any paragraph over ~700 chars is further
+    // chunked at sentence boundaries (". ", "! ", "? ", punctuation kept with the
+    // preceding chunk) — accumulating sentences until the next one would cross the
+    // limit, then starting a new chunk. A single sentence longer than 700 chars is
+    // never split mid-sentence; it becomes its own chunk, and 700+ chars is still far
+    // below a page. Each chunk becomes its own sibling data-pdf-row too.
+    const DESCRIPTION_CHUNK_MAX_LEN = 700;
+    function chunkParagraph(paragraph: string): string[] {
+        if (paragraph.length <= DESCRIPTION_CHUNK_MAX_LEN) return [paragraph];
+        const sentences = paragraph.split(/(?<=[.!?])\s+/).filter(Boolean);
+        const chunks: string[] = [];
+        let current = "";
+        for (const sentence of sentences) {
+            if (current && current.length + 1 + sentence.length > DESCRIPTION_CHUNK_MAX_LEN) {
+                chunks.push(current);
+                current = sentence;
+            } else {
+                current = current ? `${current} ${sentence}` : sentence;
+            }
+        }
+        if (current) chunks.push(current);
+        return chunks;
+    }
     const descriptionParagraphs = initialData.description
         ? String(initialData.description).split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean)
         : [];
+    const descriptionChunks = descriptionParagraphs.flatMap((para: string, paraIdx: number) =>
+        chunkParagraph(para).map((text: string, chunkIdx: number) => ({ text, paraIdx, chunkIdx }))
+    );
+    // Gap below a chunk: pb-8 for the final row, pb-3 between paragraphs (existing
+    // rhythm), or a tighter pb-1 when the next row is another chunk of the SAME
+    // paragraph — these rows only ever use bottom padding (no row has top padding),
+    // so "space above the next chunk" is expressed as this row's own bottom padding.
+    function descriptionRowPadding(i: number): string {
+        if (i === descriptionChunks.length - 1) return "pb-8";
+        const next = descriptionChunks[i + 1];
+        return next.paraIdx === descriptionChunks[i].paraIdx ? "pb-1" : "pb-3";
+    }
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -211,24 +248,33 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     </div>
 
-                    {/* Memo / Description — heading and each paragraph are sibling data-pdf-row
-                        blocks (not nested inside a parent that itself carries data-pdf-row, which
-                        build-pdf.ts would ignore) so a long description gets safe per-paragraph
-                        page breaks instead of one atomic block that can hard-slice through text. */}
-                    {descriptionParagraphs.length > 0 && (
+                    {/* Memo / Description — heading and the FIRST description chunk share one
+                        data-pdf-row (anti-orphan: keeps the heading from stranding alone at the
+                        bottom of a page with no text under it). Remaining chunks are sibling
+                        data-pdf-row blocks (not nested inside a parent that itself carries
+                        data-pdf-row, which build-pdf.ts would ignore) so a long description gets
+                        safe page breaks between paragraphs, and between chunks of an over-length
+                        paragraph, instead of one atomic block that can hard-slice through text. */}
+                    {descriptionChunks.length > 0 && (
                         <div className="border-b border-slate-100">
-                            <div data-pdf-row="true" className="px-5 sm:px-10 pt-8 pb-3">
+                            <div data-pdf-row="true" className={`px-5 sm:px-10 pt-8 ${descriptionRowPadding(0)}`}>
                                 <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider">Reason for Change</h2>
+                                <p className="mt-3 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">
+                                    {descriptionChunks[0].text}
+                                </p>
                             </div>
-                            {descriptionParagraphs.map((para: string, i: number) => (
-                                <div
-                                    key={i}
-                                    data-pdf-row="true"
-                                    className={`px-5 sm:px-10 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap ${i === descriptionParagraphs.length - 1 ? "pb-8" : "pb-3"}`}
-                                >
-                                    {para}
-                                </div>
-                            ))}
+                            {descriptionChunks.slice(1).map((chunk, sliceIdx: number) => {
+                                const i = sliceIdx + 1;
+                                return (
+                                    <div
+                                        key={`${chunk.paraIdx}-${chunk.chunkIdx}`}
+                                        data-pdf-row="true"
+                                        className={`px-5 sm:px-10 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap ${descriptionRowPadding(i)}`}
+                                    >
+                                        {chunk.text}
+                                    </div>
+                                );
+                            })}
                         </div>
                     )}
 
