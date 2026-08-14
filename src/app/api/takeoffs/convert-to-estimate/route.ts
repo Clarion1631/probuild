@@ -60,14 +60,22 @@ function recomputeMilestoneAmounts(
  *     positive, so the ratio (and the margin it implies) is unchanged by flipping both signs
  *     positive before calling derivedMarginPct, which only guards `price <= 0` as "no margin".
  *     Mirrors the identical sign-check `splitTakeoffTax` already applies to the tax row's own
- *     credit case (`src/lib/takeoff-costing.ts`).
+ *     credit case (`src/lib/takeoff-costing.ts`). A credit sold BELOW cost (raw margin negative)
+ *     clamps to 0 exactly like the equivalent positive loss row does — and, like it, is flagged
+ *     by `marginIsUnrepresentable` (its rate<0 gate) rather than trusted.
  *  3. Convert the stated markup: margin = markup / (100 + markup) x 100.
  *  4. A cost/price pair present with MIXED signs (one negative, one not) is not a rate-based
  *     relationship — the ratio implies a number the row's own figures contradict (e.g. it can
  *     clamp to 99% while the numbers show the opposite). Rather than fabricate
  *     DEFAULT_MARGIN_PCT next to a pair it doesn't describe, such a row is stored at 0% margin —
  *     the same sentinel already written for pass-through tax rows, so downstream readers already
- *     treat 0 as a legitimate, non-default value.
+ *     treat 0 as a legitimate, non-default value. The sentinel is safe ONLY because the guard
+ *     layer refuses to trust it: both mixed orientations are flagged by `marginIsUnrepresentable`
+ *     (negative cost trips its rate<0 gate; negative sell its price<=0 gate), `marginIsSettable`
+ *     disables margin editing wherever sell <= 0, and baseCost/unitCost stay the authoritative
+ *     pair — nothing regenerates them from this margin without an explicit user edit (the
+ *     2026-08-09 warn-don't-rewrite product decision, see lib/budget-math.ts). Guard parity is
+ *     pinned by tests in tests/takeoff-convert-tax.test.ts.
  *  5. Fall back to the default margin — rows with no costing data at all (legacy rows saved
  *     before costing was carried).
  */

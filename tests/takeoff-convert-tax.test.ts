@@ -53,7 +53,7 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
-import { derivedMarginPct } from "../src/lib/budget-math";
+import { derivedMarginPct, marginIsSettable, marginIsUnrepresentable } from "../src/lib/budget-math";
 
 type CreateCall<T> = { data: T };
 
@@ -425,6 +425,27 @@ test("mixed-sign cost/price (no stated markup) is genuinely underivable and stor
 
     assert.equal(calls.estimateItemCreates.length, 1);
     assert.equal(calls.estimateItemCreates[0].data.markupPercent, 0);
+});
+
+// The stored sentinel/clamped margin on a sign-broken pair is only safe because the guard layer
+// refuses to trust it: marginIsUnrepresentable flags every such shape (so the UI warns and repair
+// sweeps exclude it), and marginIsSettable disables margin EDITING wherever sell <= 0. These
+// assertions pin that contract — if the guards ever loosen, the conversion's sentinel writes above
+// become silent lies and must change with them. (Codex review 2026-08-14, round 2.)
+test("guard parity: every sign-broken pair the conversion can store is flagged unrepresentable", () => {
+    // Mixed sign, negative cost against positive sell — the rate<0 gate.
+    assert.equal(marginIsUnrepresentable(-500, 1000), true);
+    // Mixed sign, positive cost against negative sell — the price<=0 gate.
+    assert.equal(marginIsUnrepresentable(500, -1000), true);
+    // Same-sign credit sold BELOW cost (raw margin -75%): clamps to 0 exactly like the equivalent
+    // positive loss row, and like it is flagged rather than trusted.
+    assert.equal(marginIsUnrepresentable(-35000, -20000), true);
+    // Margin editing is disabled outright wherever the sell price is not positive, so the flagged
+    // value cannot be used to regenerate cost/sell from the negative-sell orientation at all.
+    assert.equal(marginIsSettable(-1000), false);
+    assert.equal(marginIsSettable(0), false);
+    // Control: an ordinary representable pair is NOT flagged — the guard is a gate, not a blanket.
+    assert.equal(marginIsUnrepresentable(20000, 35000), false);
 });
 
 test("mixed-sign cost/price WITH a stated markupPercent still converts the stated markup, rather than jumping straight to 0", async () => {
