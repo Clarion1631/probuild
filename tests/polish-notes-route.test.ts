@@ -8,12 +8,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     createPolishNotesHandlers,
+    createRateLimiter,
     neutralizeFences,
     type PolishNotesDependencies,
 } from "../src/app/api/ai/polish-notes/route";
 
 function createDeps(overrides: {
     authOk?: boolean;
+    rateLimitOk?: boolean;
     polishImpl?: PolishNotesDependencies["polish"];
 } = {}) {
     const polishCalls: string[] = [];
@@ -22,6 +24,7 @@ function createDeps(overrides: {
             overrides.authOk === false
                 ? { ok: false, status: 401, error: "Unauthorized" }
                 : { ok: true, user: { id: "u1", role: "FIELD_CREW" } },
+        checkRateLimit: () => overrides.rateLimitOk ?? true,
         polish: async (notes) => {
             polishCalls.push(notes);
             if (overrides.polishImpl) return overrides.polishImpl(notes);
@@ -105,4 +108,49 @@ test("500 when polish() reports missing configuration", async () => {
     const { POST } = createPolishNotesHandlers(dependencies);
     const res = await POST(req({ notes: "worked on site" }));
     assert.equal(res.status, 500);
+});
+
+test("429 when checkRateLimit() denies the request, and polish() is never called", async () => {
+    const { dependencies, polishCalls } = createDeps({ rateLimitOk: false });
+    const { POST } = createPolishNotesHandlers(dependencies);
+    const res = await POST(req({ notes: "worked on site" }));
+    assert.equal(res.status, 429);
+    assert.equal(polishCalls.length, 0);
+});
+
+test("rate limit check happens before body parsing (429 even with an invalid JSON body)", async () => {
+    const { dependencies } = createDeps({ rateLimitOk: false });
+    const { POST } = createPolishNotesHandlers(dependencies);
+    const badReq = new Request("https://example.test/api/ai/polish-notes", { method: "POST", body: "not json" });
+    const res = await POST(badReq);
+    assert.equal(res.status, 429);
+});
+
+// ── createRateLimiter ──────────────────────────────────────────────────
+
+test("createRateLimiter allows up to the cap, then denies further requests within the window", () => {
+    let now = 0;
+    const checkRateLimit = createRateLimiter(() => now);
+    for (let i = 0; i < 20; i += 1) {
+        assert.equal(checkRateLimit("u1"), true, `request ${i + 1} should be allowed`);
+    }
+    assert.equal(checkRateLimit("u1"), false);
+});
+
+test("createRateLimiter tracks each userId independently", () => {
+    let now = 0;
+    const checkRateLimit = createRateLimiter(() => now);
+    for (let i = 0; i < 20; i += 1) checkRateLimit("u1");
+    assert.equal(checkRateLimit("u1"), false);
+    assert.equal(checkRateLimit("u2"), true);
+});
+
+test("createRateLimiter allows requests again once the window has elapsed (pruned on access)", () => {
+    let now = 0;
+    const checkRateLimit = createRateLimiter(() => now);
+    for (let i = 0; i < 20; i += 1) checkRateLimit("u1");
+    assert.equal(checkRateLimit("u1"), false);
+
+    now += 60 * 60 * 1000 + 1; // just past the 1-hour window
+    assert.equal(checkRateLimit("u1"), true);
 });

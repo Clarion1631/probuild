@@ -6,6 +6,41 @@ export const maxDuration = 30;
 const MAX_NOTES_LENGTH = 4000;
 const GEMINI_ERROR_MESSAGE = "Failed to polish notes — try again or keep your original notes";
 
+const RATE_LIMIT_MAX_REQUESTS = 20;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Cost guard on the paid Gemini call: at most RATE_LIMIT_MAX_REQUESTS
+ * requests per userId per RATE_LIMIT_WINDOW_MS, in-memory. This is a
+ * per-server-instance guard, not a security boundary — a serverless
+ * deployment with multiple instances (or a redeploy) resets the count per
+ * instance, so it stops a single runaway client from hammering the paid
+ * API without pretending to be an airtight global limit.
+ *
+ * Factored as a factory (rather than a bare module-level Map) so tests can
+ * construct an instance with an injected clock instead of depending on
+ * real wall-clock time.
+ */
+export function createRateLimiter(now: () => number = Date.now) {
+    const requestTimestamps = new Map<string, number[]>();
+    return function checkRateLimit(userId: string): boolean {
+        const currentTime = now();
+        // Prune on access rather than on a timer — this module has no
+        // background interval, so expired entries are dropped the next
+        // time that same userId is looked at.
+        const recent = (requestTimestamps.get(userId) ?? []).filter(
+            (timestamp) => currentTime - timestamp < RATE_LIMIT_WINDOW_MS
+        );
+        if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
+            requestTimestamps.set(userId, recent);
+            return false;
+        }
+        recent.push(currentTime);
+        requestTimestamps.set(userId, recent);
+        return true;
+    };
+}
+
 // Untrusted text (a field crew member's raw notes) must not be able to
 // prematurely close the fenced block below and inject its own "instructions"
 // into the surrounding prompt — neutralize any literal closing-tag sequence
@@ -33,6 +68,7 @@ type PolishResult =
 
 export interface PolishNotesDependencies {
     authenticate(req: Request): Promise<AuthResult>;
+    checkRateLimit(userId: string): boolean;
     /** Receives the ALREADY fence-neutralized notes text. */
     polish(neutralizedNotes: string): Promise<PolishResult>;
 }
@@ -42,6 +78,13 @@ export function createPolishNotesHandlers(dependencies: PolishNotesDependencies)
         async POST(req: Request) {
             const auth = await dependencies.authenticate(req);
             if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
+            if (!dependencies.checkRateLimit(auth.user.id)) {
+                return NextResponse.json(
+                    { error: "Too many requests — try again later" },
+                    { status: 429 }
+                );
+            }
 
             let body: unknown;
             try {
@@ -85,6 +128,7 @@ const handlers = createPolishNotesHandlers({
         if (!result.ok) return result;
         return { ok: true, user: { id: result.user.id, role: result.user.role } };
     },
+    checkRateLimit: createRateLimiter(),
     polish: async (neutralizedNotes) => {
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) return { ok: false, reason: "unconfigured" };
