@@ -83,3 +83,27 @@ export async function lockMoneyParents(
         await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${ids.invoiceId} FOR UPDATE`;
     }
 }
+
+/**
+ * Multi-parent variant of `lockMoneyParents`, for flows that legitimately span
+ * several Estimates/Invoices at once — a refunded Stripe charge can be recorded
+ * on milestone rows belonging to more than one document (see `refund-group.ts`).
+ *
+ * Keeps the same global Estimate → Invoice direction, and adds a second rule so
+ * two such transactions can't deadlock against each other: within a table the
+ * ids are locked in ascending order. Single-id callers of `lockMoneyParents`
+ * are trivially consistent with that ordering, so the two helpers interleave
+ * safely. Locked one row per statement rather than one `= ANY(...) ORDER BY`
+ * query so the acquisition order is explicit rather than plan-dependent.
+ */
+export async function lockMoneyParentsMany(
+    tx: Prisma.TransactionClient,
+    ids: { estimateIds?: readonly string[]; invoiceIds?: readonly string[] },
+): Promise<void> {
+    for (const estimateId of [...new Set(ids.estimateIds ?? [])].sort()) {
+        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
+    }
+    for (const invoiceId of [...new Set(ids.invoiceIds ?? [])].sort()) {
+        await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${invoiceId} FOR UPDATE`;
+    }
+}
