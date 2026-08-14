@@ -1,11 +1,9 @@
 import { NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import {
-    getContracts,
     getContract,
     updateContract,
     deleteContract,
-    getExecutedContractPdf,
     getContractSigningHistory,
     getContractSendDefaults,
     getLead,
@@ -76,12 +74,21 @@ export const dynamic = "force-dynamic";
 // relation was the Codex round-1 blocker (an anonymous caller holding a lead id
 // received every contract field, including the signing accessToken, through an
 // action that is not itself part of the contract family).
+//
+// `getContracts` and `getExecutedContractPdf` were in this allowlist until they
+// were DELETED from actions.ts as caller-less dead surface. They had no product
+// caller — this dispatcher was the only thing importing them — and a "use
+// server" export is a live POST endpoint regardless, so keeping them alive
+// purely so this suite could prove their gates behave was backwards. The scope
+// rule and the by-id gate they exercised are both still covered here: the list
+// side by getLead's embedded contracts relation and the two staff contract
+// pages (which query Prisma directly and never went through getContracts), and
+// the executed-PDF lookup by the portal page's use of the session-free core.
+// See docs/CONTRACTS.md.
 const ACTIONS: Record<string, (...args: any[]) => Promise<any>> = {
-    getContracts,
     getContract,
     updateContract,
     deleteContract,
-    getExecutedContractPdf,
     getContractSigningHistory,
     getContractSendDefaults,
     // Projected down to the id and the contracts relation. getLead otherwise
