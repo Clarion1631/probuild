@@ -155,14 +155,39 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 >
 > **Repointing `DIRECT_URL` at the session pooler does not rescue them** (tested 2026-08-13). The
 > pooler authenticates fine and read-only Prisma CLI commands work over it, but prod's schema and
-> migration history have drifted from the repo: `migrate diff` shows `db push` would propose 10
-> `DROP TABLE` and 41 `DROP COLUMN` against production, and `migrate status` reports no common
-> migration, which leaves `migrate dev` no useful work either. Neither mutating command was run
-> against prod, so those are the diffs they would face, not observed outcomes. Retiring the script
-> below needs a baseline reconciliation on top of the connection fix — see the
-> `probuild-schema-migration` skill before retrying this.
+> migration history had drifted from the repo: `migrate diff` showed `db push` would propose 10
+> `DROP TABLE` and 41 `DROP COLUMN` against production, and `migrate status` reported no common
+> migration, which left `migrate dev` no useful work either. Neither mutating command was run
+> against prod, so those are the diffs they would have faced, not observed outcomes.
+>
+> **The schema half of that is fixed (#370) and the history half is fixed (#382).** `schema.prisma`
+> now describes prod, and `prisma/migrations/` now holds a real baseline
+> (`20260814000000_baseline_production`), marked applied in prod's `_prisma_migrations` by a
+> deliberate one-off step that is gated on CI being green — it is NOT done by merging.
+> `migrate dev` still is not usable from this machine (it needs `DIRECT_URL`, still IPv6-only), so
+> the PowerShell script below remains the local write path. What changed is that the committed
+> migrations are now *true*: CI's `migrations` job builds a throwaway Postgres from them and asserts
+> it reproduces prod, so a fresh dev/CI database finally matches production.
 
-**Working approach:**
+### Baseline facts worth knowing before touching `prisma/migrations/`
+- The baseline was generated **from production** (`migrate diff --from-empty --to-schema-datasource`),
+  not from `schema.prisma` — Prisma's own documented baselining flow. It records what prod *is*, so
+  `migrate resolve --applied` is a true statement rather than a wish.
+- `schema.prisma` is deliberately a little **ahead** of prod. That gap is checked in verbatim at
+  `prisma/EXPECTED_SCHEMA_GAP.sql` and asserted by CI. Closing it means applying it as a real
+  migration and deleting the file — not editing the baseline.
+- **Prisma's diff engine cannot represent partial indexes and silently drops them.** Prod has seven,
+  three of them UNIQUE constraints carrying real invariants. They are appended by hand at the end of
+  the baseline. If you ever regenerate that file, re-append the block, or CI's
+  `scripts/check-migrations-match.mjs` will fail (which is the point).
+- **Never edit or regenerate the baseline.** It is marked applied in prod and its checksum is
+  recorded there; changing the file breaks `migrate status`. Corrections go in a new migration.
+- Some diff output is permanent and must never be applied — `prisma/PRISMA_PHANTOM_DIFF.sql`
+  explains the one current case (prod's partial unique index on `ClientMessage.twilioMessageSid`,
+  which Prisma cannot see and so proposes recreating forever).
+- `.github/workflows/db-push.yml` was deleted; see `docs/DB-MIGRATE-WORKFLOW.md`.
+
+**Working approach (local SQL writes):**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
 2. Run: `powershell -ExecutionPolicy Bypass -File "C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1"`
 3. Regenerate: `powershell -Command "cd 'C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site'; node_modules\.bin\prisma generate"`
