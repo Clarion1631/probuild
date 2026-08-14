@@ -1135,6 +1135,21 @@ const S = {
   estGroup: "mp3-e2e-eps-group",
   invGroupA: "mp3-e2e-ps-group-a",
   invGroupB: "mp3-e2e-ps-group-b",
+  // S9: a one-to-many group where the second clone was paid by CHEQUE. It has
+  // no PaymentIntent (the mirror could not claim the already-Paid estimate
+  // row), so it looks like a mirror but is a separate payment.
+  estimate4: "mp3-e2e-estimate-4",
+  invoice4a: "mp3-e2e-invoice-4a",
+  invoice4b: "mp3-e2e-invoice-4b",
+  estMixed: "mp3-e2e-eps-mixed",
+  invMixedStripe: "mp3-e2e-ps-mixed-stripe",
+  invMixedManual: "mp3-e2e-ps-mixed-manual",
+  // S10: a genuine 1:1 mirror whose estimate original predates the intent
+  // being written to both sides.
+  estimate5: "mp3-e2e-estimate-5",
+  invoice5: "mp3-e2e-invoice-5",
+  estLegacy: "mp3-e2e-eps-legacy",
+  invLegacy: "mp3-e2e-ps-legacy",
 };
 const S_NAME = "Stripe Mirror Drill - MP3TEST";
 const sPrisma = new PrismaClient();
@@ -1144,6 +1159,8 @@ const INTENT = "pi_mp3_e2e_intent";
 const PAIR2_INTENT = "pi_mp3_e2e_pair2_intent";
 const OTHER_INTENT = "pi_mp3_e2e_other_intent";
 const GROUP_INTENT = "pi_mp3_e2e_group_intent";
+const MIXED_INTENT = "pi_mp3_e2e_mixed_intent";
+const LEGACY_INTENT = "pi_mp3_e2e_legacy_intent";
 
 test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
   test.beforeAll(async () => {
@@ -1284,12 +1301,89 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
         },
       });
     }
+
+    // Fourth fixture: same one-to-many shape, but clone B was paid by cheque.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate4 },
+      update: { status: "Paid", totalAmount: 300, balanceDue: 0, statusBeforePayment: "Invoiced" },
+      create: {
+        id: S.estimate4, title: `${S_NAME} 4`, code: "EST-MP3TEST-4", projectId: S.project,
+        status: "Paid", taxExempt: true, totalAmount: 300, balanceDue: 0, statusBeforePayment: "Invoiced",
+      },
+    });
+    for (const [id, code] of [[S.invoice4a, "4A"], [S.invoice4b, "4B"]] as const) {
+      await sPrisma.invoice.upsert({
+        where: { id },
+        update: { status: "Paid", totalAmount: 300, balanceDue: 0 },
+        create: {
+          id, code: `INV-MP3TEST-${code}`, projectId: S.project, clientId: S.client,
+          estimateId: S.estimate4, status: "Paid", totalAmount: 300, balanceDue: 0, issueDate: new Date(),
+        },
+      });
+    }
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estMixed },
+      update: { status: "Paid", stripePaymentIntentId: MIXED_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.estMixed, estimateId: S.estimate4, name: "MP3 Mixed", amount: 300,
+        status: "Paid", order: 1, stripePaymentIntentId: MIXED_INTENT,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invMixedStripe },
+      update: { status: "Paid", stripePaymentIntentId: MIXED_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.invMixedStripe, invoiceId: S.invoice4a, name: "MP3 Mixed", amount: 300,
+        status: "Paid", sourceScheduleId: S.estMixed, stripePaymentIntentId: MIXED_INTENT,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invMixedManual },
+      update: { status: "Paid", stripePaymentIntentId: null, paymentMethod: "check", paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.invMixedManual, invoiceId: S.invoice4b, name: "MP3 Mixed", amount: 300,
+        status: "Paid", sourceScheduleId: S.estMixed, paymentMethod: "check", referenceNumber: "1042",
+      },
+    });
+
+    // Fifth fixture: a true 1:1 mirror whose ESTIMATE side carries no intent.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate5 },
+      update: { status: "Paid", totalAmount: 400, balanceDue: 0, statusBeforePayment: "Invoiced" },
+      create: {
+        id: S.estimate5, title: `${S_NAME} 5`, code: "EST-MP3TEST-5", projectId: S.project,
+        status: "Paid", taxExempt: true, totalAmount: 400, balanceDue: 0, statusBeforePayment: "Invoiced",
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice5 },
+      update: { status: "Paid", totalAmount: 400, balanceDue: 0 },
+      create: {
+        id: S.invoice5, code: "INV-MP3TEST-5", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate5, status: "Paid", totalAmount: 400, balanceDue: 0, issueDate: new Date(),
+      },
+    });
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estLegacy },
+      update: { status: "Paid", stripePaymentIntentId: null, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.estLegacy, estimateId: S.estimate5, name: "MP3 Legacy", amount: 400, status: "Paid", order: 1,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invLegacy },
+      update: { status: "Paid", stripePaymentIntentId: LEGACY_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.invLegacy, invoiceId: S.invoice5, name: "MP3 Legacy", amount: 400,
+        status: "Paid", sourceScheduleId: S.estLegacy, stripePaymentIntentId: LEGACY_INTENT,
+      },
+    });
   });
 
   test.afterAll(async () => {
     try {
-      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b];
-      const estimateIds = [S.estimate, S.estimate2, S.estimate3];
+      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b, S.invoice5];
+      const estimateIds = [S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5];
       await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: invoiceIds } } });
       await sPrisma.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
       await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
@@ -1479,5 +1573,49 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     });
     expect(after.map((i) => Number(i.balanceDue))).toEqual(before.map((i) => Number(i.balanceDue)));
     expect(after.map((i) => i.status)).toEqual(before.map((i) => i.status));
+  });
+
+  test("S9: a cheque-paid clone is NOT released just because it mirrors the charge", async () => {
+    // Codex round 1 blocker. Once the estimate milestone is Paid, a mirror claim
+    // on it fails, so a SECOND invoice clone settled by cheque ends up Paid with
+    // a null PaymentIntent — indistinguishable by shape from a Stripe mirror.
+    // Releasing it on this refund would raise a balance the client already paid.
+    const group = await resolveChargeGroup(sPrisma, MIXED_INTENT);
+    expect(group.invoiceSchedules.map((r) => r.id), "only the clone that carries the charge")
+      .toEqual([S.invMixedStripe]);
+    expect(group.unattributable.map((r) => r.id), "the cheque-paid clone is handed to a human")
+      .toEqual([S.invMixedManual]);
+
+    const unwound = await unwindRefundedCharge(sPrisma, MIXED_INTENT);
+    expect(unwound.unattributable.map((r) => r.id)).toEqual([S.invMixedManual]);
+
+    const manual = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invMixedManual } });
+    expect(manual.status, "the cheque payment is untouched").toBe("Paid");
+    const untouched = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice4b } });
+    expect(Number(untouched.balanceDue), "and its invoice is not re-opened").toBe(0);
+
+    // The Stripe side still unwinds normally.
+    const stripeClone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invMixedStripe } });
+    expect(stripeClone.status).toBe("Pending");
+    const refunded = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice4a } });
+    expect(Number(refunded.balanceDue)).toBe(300);
+  });
+
+  test("S10: a genuine 1:1 mirror with no intent on the estimate side IS released", async () => {
+    // The counterweight to S9: with exactly one Paid clone there is no second
+    // payment to confuse it with, so the legacy null-intent original is safe to
+    // adopt. Dropping this would leave the estimate claiming refunded money.
+    const group = await resolveChargeGroup(sPrisma, LEGACY_INTENT);
+    expect(group.estimateSchedules.map((r) => r.id), "the sole mirror is adopted").toEqual([S.estLegacy]);
+    expect(group.unattributable).toEqual([]);
+
+    await unwindRefundedCharge(sPrisma, LEGACY_INTENT);
+
+    const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estLegacy } });
+    expect(est.status).toBe("Pending");
+    const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate5 } });
+    expect(Number(estimate.balanceDue), "estimate balance restored").toBe(400);
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice5 } });
+    expect(Number(invoice.balanceDue), "invoice balance restored").toBe(400);
   });
 });

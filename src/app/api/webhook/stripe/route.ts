@@ -220,7 +220,7 @@ async function processEvent(eventId: string) {
                 const group = await resolveChargeGroup(prisma, paymentIntentId);
                 if (chargeGroupIsEmpty(group)) break;
 
-                let unwound: UnwindResult = { estimateSchedules: [], invoiceSchedules: [] };
+                let unwound: UnwindResult | null = null;
                 if (isFullyRefunded) {
                     unwound = await unwindRefundedCharge(prisma, paymentIntentId);
                 }
@@ -230,11 +230,21 @@ async function processEvent(eventId: string) {
                     const label = (rows: { name: string; parentCode: string | null }[]) =>
                         rows.map((r) => `${r.parentCode ?? "(no code)"} — ${r.name}`);
                     const found = [...label(group.invoiceSchedules), ...label(group.estimateSchedules)];
-                    const reset = [...label(unwound.invoiceSchedules), ...label(unwound.estimateSchedules)];
+                    const reset = unwound
+                        ? [...label(unwound.invoiceSchedules), ...label(unwound.estimateSchedules)]
+                        : [];
+                    // Paid mirror partners with no PaymentIntent that sit in a one-to-many
+                    // group: they might be this charge or a separate manual payment, so the
+                    // unwind refuses to guess and hands them to a human instead.
+                    const ambiguous = label(unwound?.unattributable ?? group.unattributable);
                     // `charge.amount_refunded` is the CUMULATIVE refund total, so this message reflects
                     // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
                     const summary = !isFullyRefunded
                         ? `This is a <strong>partial refund</strong>. The milestones below remain marked Paid; please reconcile the balances manually in the Stripe dashboard.`
+                        // An earlier delivery of this same refund already did the work — say so
+                        // rather than reporting a failure the office would chase.
+                        : unwound?.alreadyUnwound
+                        ? `Already reconciled by an earlier delivery of this refund. Nothing was left to reset.`
                         : reset.length === found.length
                         ? `All ${reset.length} milestone(s) recording this charge were reset to Pending and their balances restored.`
                         : reset.length > 0
@@ -242,6 +252,7 @@ async function processEvent(eventId: string) {
                         : `These milestones were <strong>not</strong> reset automatically — they no longer matched this charge when the refund was processed. Please reconcile the balances manually in the Stripe dashboard.`;
                     const primaryCode = group.invoiceSchedules[0]?.parentCode
                         ?? group.estimateSchedules[0]?.parentCode
+                        ?? group.unattributable[0]?.parentCode
                         ?? paymentIntentId;
                     await sendNotification(
                         refundSettings.notificationEmail,
@@ -249,9 +260,13 @@ async function processEvent(eventId: string) {
                         `<div style="font-family: sans-serif; padding: 20px;">
                             <h2>Refund Processed</h2>
                             <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)}.</p>
-                            <p>Milestones recording this charge:</p>
-                            <ul>${found.map((l) => `<li>${l}</li>`).join("")}</ul>
+                            ${found.length > 0 ? `<p>Milestones recording this charge:</p>
+                            <ul>${found.map((l) => `<li>${l}</li>`).join("")}</ul>` : ""}
                             <p>${summary}</p>
+                            ${ambiguous.length > 0 ? `<p><strong>Needs a human:</strong> these milestones mirror one of the above but carry no
+                            payment reference, so we cannot tell whether they recorded this charge or a separate
+                            payment. They were left as-is — please check them in the Stripe dashboard:</p>
+                            <ul>${ambiguous.map((l) => `<li>${l}</li>`).join("")}</ul>` : ""}
                         </div>`
                     );
                 }

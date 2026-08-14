@@ -287,6 +287,17 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         if (estimate.projectId) {
             await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
         }
+        // Then the Estimate, keeping the Project -> Estimate -> Invoice
+        // direction (no site locks an Estimate before a Project). This clone
+        // copies each milestone's status AND its stripePaymentIntentId, so
+        // without it a conversion could insert a fresh Paid clone of a charge
+        // that a `charge.refunded` unwind had already resolved and was about to
+        // release -- the new clone would keep the refunded money and its
+        // invoice a zero balance. Sharing the lock forces the two to order:
+        // convert-then-refund (the clone is seen and released) or
+        // refund-then-convert (the milestone is already Pending when cloned).
+        // See lib/refund-group.ts.
+        await lockMoneyParents(tx, { estimateId });
 
         const schedules = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId },
