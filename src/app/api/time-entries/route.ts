@@ -5,6 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
+import { requiresPhaseForClockIn } from "@/lib/logistics-time-entry";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -64,6 +65,11 @@ export async function POST(req: Request) {
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
 
+    const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { isLogistics: true },
+    });
+
     // Cost attribution: the estimate item is what actually gets charged, so it
     // must belong to this project (on an eligible estimate) and its cost code
     // wins over whatever the client sent. Mobile historically sent
@@ -94,6 +100,22 @@ export async function POST(req: Request) {
         // if it actually exists.
         const code = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
         resolvedCostCodeId = code?.id ?? null;
+    }
+
+    // A phase (cost code or estimate item) is required to clock in on a normal
+    // project — a logistics job (shop, travel, admin time) has no estimate to
+    // attach to, so it's the deliberate exception.
+    if (
+        requiresPhaseForClockIn({
+            isLogistics: project?.isLogistics ?? false,
+            hasCostCode: !!resolvedCostCodeId,
+            hasEstimateItem: !!resolvedEstimateItemId,
+        })
+    ) {
+        return NextResponse.json(
+            { error: "A phase or cost code is required to clock in on this project", code: "PHASE_REQUIRED" },
+            { status: 400 }
+        );
     }
 
     // Suggestion audit fields: trust nothing about the suggested task without

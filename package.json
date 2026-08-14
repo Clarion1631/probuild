@@ -15,7 +15,7 @@
     "test:payment-date": "tsx --test tests/payment-date-display.test.ts",
     "test:budget-math": "tsx --test tests/budget-math.test.ts",
     "test:estimate-item-upsert": "tsx --test tests/estimate-item-upsert.test.ts",
-    "test:unit": "tsx --test tests/estimate-item-payload.test.ts tests/budget-math.test.ts tests/payment-date-display.test.ts tests/estimate-item-upsert.test.ts tests/geocode-zip-guard.test.ts tests/takeoff-tax-split.test.ts tests/takeoff-convert-tax.test.ts tests/overtime.test.ts tests/pay-period-summary-route.test.ts tests/tz-date.test.ts tests/phase-options.test.ts tests/mobile-phases-route.test.ts tests/manager-crew-route.test.ts",
+    "test:unit": "tsx --test tests/estimate-item-payload.test.ts tests/budget-math.test.ts tests/payment-date-display.test.ts tests/estimate-item-upsert.test.ts tests/geocode-zip-guard.test.ts tests/takeoff-tax-split.test.ts tests/takeoff-convert-tax.test.ts tests/overtime.test.ts tests/pay-period-summary-route.test.ts tests/tz-date.test.ts tests/phase-options.test.ts tests/mobile-phases-route.test.ts tests/manager-crew-route.test.ts tests/logistics-time-entry.test.ts tests/polish-notes-route.test.ts",
     "test:e2e": "playwright test",
     "test:mobile-e2e": "node e2e/mobile-app/run-mobile-e2e.mjs",
     "test:qa": "npx playwright test e2e/quality-gate.spec.ts",

@@ -253,6 +253,11 @@ model Project {
   code                    String?
   tags                    String?
   color                   String?                      @default("#3b82f6") // Added color field
+  // Logistics/shop/admin job — not a client remodel. Clock-in on these projects
+  // doesn't require an estimate item / cost code (see /api/time-entries POST),
+  // and clock-out requires notes describing the work performed (see the
+  // /api/time-entries/[id] PATCH handler) since there's no cost-code context.
+  isLogistics             Boolean                      @default(false)
   paymentRemindersEnabled Boolean                      @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
   portalStageOverride     String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
   chatWebhookUrl          String? // Google Chat incoming webhook for the project's team space — treated as a credential: manager-only, never serialized to field crew
