@@ -109,6 +109,10 @@ export default async function proxy(req: any, event: any) {
         !isServerAction
         && process.env.E2E_TEST_ROUTES === "1"
         && !!process.env.PLAYWRIGHT_TEST_SECRET
+        // Affirmative, not merely "not production" — see the same clause in the
+        // route. Every other condition is satisfied by an ABSENT variable, so a
+        // self-hosted production server (no VERCEL_ENV) passed them all.
+        && (process.env.NODE_ENV !== "production" || process.env.CI === "true")
         && process.env.VERCEL_ENV !== "production"
         && typeof pathname === "string"
         && pathname === "/api/test-only/contract-actions"

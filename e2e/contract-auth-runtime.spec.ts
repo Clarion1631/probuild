@@ -53,11 +53,53 @@ async function callAction(
     });
     expect(
         res.status(),
-        `dispatcher returned ${res.status()} for action "${action}" — a 404 here means PLAYWRIGHT_TEST_SECRET/VERCEL_ENV gate is off and every downstream assertion in this file is vacuous`
+        `dispatcher returned ${res.status()} for action "${action}". A 404 means the route's gate is off — most likely E2E_TEST_ROUTES=1 is missing from the SERVER's environment (playwright.config.ts sets it on the webServer it starts, but reuseExistingServer will happily attach to a hand-started dev server that lacks it). Every downstream assertion in this file would be vacuous, so this fails loudly instead.`
     ).toBe(200);
     const raw = await res.text();
     return { ...JSON.parse(raw), raw };
 }
+
+// The dispatcher's own gate. Codex's round-2 point: nothing in this file failed
+// if a gate clause were deleted, so the route's protection was itself untested.
+// The three ENVIRONMENT clauses cannot be exercised from here — they are read by
+// the already-running server and a test cannot change them mid-run — but the
+// credential clause can, and it is the one an outside caller would actually
+// have to defeat. A bare 404 (not 401/403) is the contract: an unauthorized
+// caller must not even learn the route exists.
+test.describe("the dispatcher's own gate", () => {
+    test.use({ storageState: { cookies: [], origins: [] } });
+
+    for (const [label, headers] of [
+        ["a wrong secret", { "x-e2e-secret": "not-the-secret" }],
+        ["no secret at all", {}],
+    ] as const) {
+        test(`${label} gets a bare 404, not an action result`, async ({ request }) => {
+            const res = await request.post("/api/test-only/contract-actions", {
+                headers: { "content-type": "application/json", ...headers },
+                data: { action: "getContracts", args: [] },
+            });
+            expect(res.status()).toBe(404);
+            const body = await res.text();
+            expect(body).not.toContain(CONTRACT_INSCOPE_TOKEN);
+            expect(body).not.toContain(CONTRACT_LEADONLY_TOKEN);
+            expect(body).not.toContain(CONTRACT_CONVERTED_TOKEN);
+        });
+    }
+
+    test("an unknown action name never dispatches", async ({ request }) => {
+        const res = await request.post("/api/test-only/contract-actions", {
+            headers: {
+                "content-type": "application/json",
+                "x-e2e-secret": process.env.PLAYWRIGHT_TEST_SECRET || "",
+            },
+            // `constructor` would resolve on a plain object without the
+            // hasOwnProperty check the route uses.
+            data: { action: "constructor", args: [] },
+        });
+        expect(res.status()).toBe(400);
+        expect(await res.text()).toContain("Unknown action");
+    });
+});
 
 test.describe("unauthenticated caller", () => {
     test.use({ storageState: { cookies: [], origins: [] } });

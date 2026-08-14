@@ -70,5 +70,16 @@ export default defineConfig({
     url: "http://localhost:3000",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
+    env: {
+      // The test harness turning on its own test routes, which is the only
+      // context that should ever enable them. Without this a LOCAL run 404s on
+      // src/app/api/test-only/contract-actions and every dispatcher assertion
+      // in e2e/contract-auth-runtime.spec.ts fails — that spec's FINANCE and
+      // contract-staff blocks are meant to run locally, not only in CI.
+      // ci.yml sets the same variable at job level; a server started by hand
+      // (reuseExistingServer picks it up) will not have it, and the spec says
+      // so in its failure message rather than passing vacuously.
+      E2E_TEST_ROUTES: "1",
+    },
   },
 });

@@ -106,10 +106,14 @@ const ACTIONS: Record<string, (...args: any[]) => Promise<any>> = {
 const REPORTABLE_ERRORS = new Set([
     "Unauthorized",
     "Forbidden",
-    "Contract not found",
-    "Lead not found",
-    "This contract is not attached to a project or lead, so access cannot be checked",
 ]);
+// Deliberately just those two. An earlier version also passed through "Contract
+// not found" and the ownerless-contract message; Codex pointed out that
+// "not found" vs "Forbidden" is an existence oracle for a staff caller who
+// holds the `contracts` permission but not the scope — precisely the caller
+// assertContractAccess orders its checks to deny that distinction to. Every
+// other failure is still fully detectable as `ok: false`; only its wording is
+// withheld, and no test needs the wording.
 
 function secretMatches(provided: string | null): boolean {
     const expected = process.env.PLAYWRIGHT_TEST_SECRET;
@@ -133,6 +137,14 @@ function testOnlyRoutesEnabled(): boolean {
     return (
         process.env.E2E_TEST_ROUTES === "1"
         && !!process.env.PLAYWRIGHT_TEST_SECRET
+        // The POSITIVE condition. Every other clause here is a negative — an
+        // absent variable satisfies it — so on a self-hosted production server
+        // with no VERCEL_ENV at all, the earlier version enabled itself. This
+        // one has to be affirmatively true: either we are not a production
+        // build, or we are the CI Playwright job (which runs `npm run start`,
+        // i.e. NODE_ENV=production, with CI=true). A real production server is
+        // neither.
+        && (process.env.NODE_ENV !== "production" || process.env.CI === "true")
         && process.env.VERCEL_ENV !== "production"
     );
 }
