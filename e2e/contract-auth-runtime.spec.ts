@@ -21,7 +21,10 @@ import { signClientPortalToken } from "../src/lib/client-portal-auth";
  */
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
-const OOS_PROJECT_ID = "e2e-scope-oos-project";
+// (The out-of-scope PROJECT id is referenced only in prose now — its last
+// runtime use went with the forged-descriptor test. The seeded project itself
+// is still required, both by the converted-contract fixture below and by
+// estimate-scope-labels.spec.ts, so only the unused constant is dropped here.)
 const OOS_LEAD_ID = "e2e-scope-oos-lead";
 const TEST_CLIENT_ID = "test-client-do-not-delete";
 const TEST_CLIENT_EMAIL = "test-client@goldentouchremodeling.com";
@@ -76,10 +79,14 @@ test.describe("the dispatcher's own gate", () => {
         test(`${label} gets a bare 404, not an action result`, async ({ request }) => {
             const res = await request.post("/api/test-only/contract-actions", {
                 headers: { "content-type": "application/json", ...headers },
-                // An ALLOWLISTED action, deliberately: if this named something
-                // unknown, the 404 could come from the allowlist rather than
-                // from the credential gate, and the test would pass even if the
-                // gate were removed.
+                // An ALLOWLISTED action, deliberately. This used to name
+                // `getContracts`, which the deletion turned into an unknown
+                // action. That would not have made the test vacuous — unknown
+                // actions answer 400, not 404, so an removed credential gate
+                // would still have failed the expected-404 assertion (Codex
+                // corrected my first reading of this). Naming a live action is
+                // simply more direct: the credential gate becomes the only
+                // thing in the request that can produce a 404.
                 data: { action: "getContract", args: [CONTRACT_INSCOPE_ID] },
             });
             expect(res.status()).toBe(404);
@@ -218,9 +225,15 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
     // a caller-supplied {projectId, leadId} descriptor — the hole #367 closed.
     // It could only be written against `getExecutedContractPdf`, because that
     // was the sole action in the family taking a descriptor rather than a bare
-    // id. That action has been deleted, so no remaining action in this
-    // dispatcher accepts caller-supplied ownership at all and the attack it
-    // guarded against has no entry point left. The session-free core it wrapped,
+    // id. That action has been deleted, so no surviving action in this
+    // dispatcher takes ownership as an AUTHORIZATION input: each authorizes by
+    // bare contract id and reloads current ownership from the row, leaving the
+    // read bypass no entry point. (Narrower than "accepts no caller-supplied
+    // ownership at all", which Codex showed is false: updateContract's payload
+    // still reaches Prisma by spread, so ownership keys can ride along in the
+    // UPDATE even though they cannot influence the access decision. That is a
+    // pre-existing mass-assignment gap, tracked separately, not something this
+    // branch introduced or removed coverage for.) The core it wrapped,
     // executedContractPdfFor, still takes a descriptor, but only from callers
     // that already hold the loaded row (the portal, after getContractForPortal
     // proves ownership; countersignContractAsCompany, after its own gate) — so
