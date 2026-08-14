@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { requiresPhaseForClockIn, checkLogisticsClockOutNotes } from "../src/lib/logistics-time-entry";
+import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "../src/lib/logistics-time-entry";
 
 // ── requiresPhaseForClockIn ────────────────────────────────────────────────
 
@@ -104,4 +104,64 @@ test("logistics clock-out with only whitespace supplied notes -> rejected", () =
         suppliedNotes: "   ",
     });
     assert.equal(result.ok, false);
+});
+
+// ── applyMealSkippedWaiver ──────────────────────────────────────────────
+
+const WAIVER_NOTE = "Worked through WA meal break (voluntary waiver recorded at clock-out)";
+
+test("mealSkipped true on a clock-out persists it and sets needsReview + reviewReason", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: true,
+        settingEndTime: true,
+        existingReviewReason: null,
+    });
+    assert.deepEqual(result, { mealSkipped: true, needsReview: true, reviewReason: WAIVER_NOTE });
+});
+
+test("mealSkipped false on a clock-out persists false and does not touch needsReview/reviewReason", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: false,
+        settingEndTime: true,
+        existingReviewReason: null,
+    });
+    assert.deepEqual(result, { mealSkipped: false });
+});
+
+test("mealSkipped absent on a clock-out leaves everything untouched", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: undefined,
+        settingEndTime: true,
+        existingReviewReason: null,
+    });
+    assert.deepEqual(result, {});
+});
+
+test("non-boolean mealSkipped is ignored rather than coerced", () => {
+    for (const value of ["true", 1, 0, "false", null, {}, []]) {
+        const result = applyMealSkippedWaiver({
+            mealSkipped: value,
+            settingEndTime: true,
+            existingReviewReason: null,
+        });
+        assert.deepEqual(result, {}, `expected no-op for ${JSON.stringify(value)}`);
+    }
+});
+
+test("mealSkipped true appends to an existing reviewReason instead of clobbering it", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: true,
+        settingEndTime: true,
+        existingReviewReason: "Flagged for missing GPS ping",
+    });
+    assert.equal(result.reviewReason, `Flagged for missing GPS ping; ${WAIVER_NOTE}`);
+});
+
+test("mealSkipped true on a non-clock-out edit (settingEndTime: false) is ignored entirely", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: true,
+        settingEndTime: false,
+        existingReviewReason: null,
+    });
+    assert.deepEqual(result, {});
 });

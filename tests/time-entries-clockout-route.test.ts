@@ -32,6 +32,7 @@ function baseEntry(overrides: Partial<ClockOutTimeEntryRow> = {}): ClockOutTimeE
         projectId: "p1",
         startTime: START,
         notes: null,
+        reviewReason: null,
         ...overrides,
     };
 }
@@ -144,9 +145,7 @@ test("non-logistics project clock-out is unaffected: closes fine with no notes a
 });
 
 // mobile's clockOut() also sends `mealSkipped` (WA L&I meal-break attestation).
-// It is not read/persisted by this route today (pre-existing gap, not part of
-// this change) — this test only guards that the new notes logic doesn't
-// misinterpret it or otherwise break the request when it's present.
+// It does not interfere with the unrelated notes check when both are present.
 test("mealSkipped in the body does not interfere with the clock-out or the notes check", async () => {
     const { dependencies, updateCalls } = createDeps({ isLogistics: false, entry: baseEntry({ notes: null }) });
     const { createClockOutHandler } = await routeModulePromise;
@@ -165,6 +164,77 @@ test("mealSkipped + logistics with no notes still correctly rejects on the notes
     assert.equal(res.status, 400);
     assert.equal(updateCalls.length, 0);
 });
+
+// ── mealSkipped persistence (WA meal-break voluntary waiver) ──────────────
+// PUT is the mobile clock-out call, and always closes the entry, so every
+// request here is a clock-out mutation by construction.
+
+const WAIVER_NOTE = "Worked through WA meal break (voluntary waiver recorded at clock-out)";
+
+test("mealSkipped: true persists it and sets needsReview + reviewReason", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ reviewReason: null }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data;
+    assert.equal(data.mealSkipped, true);
+    assert.equal(data.needsReview, true);
+    assert.equal(data.reviewReason, WAIVER_NOTE);
+});
+
+test("mealSkipped: false persists false and does NOT set needsReview", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: false }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data;
+    assert.equal(data.mealSkipped, false);
+    assert.equal("needsReview" in data, false);
+    assert.equal("reviewReason" in data, false);
+});
+
+test("mealSkipped absent leaves mealSkipped/needsReview/reviewReason untouched", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data;
+    assert.equal("mealSkipped" in data, false);
+    assert.equal("needsReview" in data, false);
+    assert.equal("reviewReason" in data, false);
+});
+
+test("non-boolean mealSkipped value is ignored", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: "true" }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data;
+    assert.equal("mealSkipped" in data, false);
+    assert.equal("needsReview" in data, false);
+    assert.equal("reviewReason" in data, false);
+});
+
+test("mealSkipped: true appends to an existing reviewReason instead of clobbering it", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ reviewReason: "Flagged for missing GPS ping" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.reviewReason, `Flagged for missing GPS ping; ${WAIVER_NOTE}`);
+});
+
+// PUT always ends the shift (endTime defaults to now), so there is no "non-clock-out
+// edit" call site to exercise through this route — that guard is covered directly
+// on the shared applyMealSkippedWaiver() helper in tests/logistics-time-entry.test.ts,
+// which the PATCH /api/time-entries/[id] edit flow also uses (defense in depth,
+// mirroring the logistics-notes check above).
 
 test("computes durationHours/laborCost/burdenCost from the OWNER's rates, not the editor's", async () => {
     const { dependencies, updateCalls } = createDeps({

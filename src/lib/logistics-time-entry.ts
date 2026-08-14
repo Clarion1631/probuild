@@ -51,3 +51,47 @@ export function checkLogisticsClockOutNotes(
     const effective = trimmedSupplied !== undefined ? trimmedSupplied : (input.existingNotes ?? "").trim();
     return { ok: effective.length > 0, notes: trimmedSupplied };
 }
+
+export interface MealSkippedWaiverInput {
+    /** Raw value from the request body — only `true`/`false` are honored, anything else is ignored. */
+    mealSkipped: unknown;
+    /** True only when this request is actually setting a (non-null) endTime (a clock-out). */
+    settingEndTime: boolean;
+    existingReviewReason: string | null | undefined;
+}
+
+export interface MealSkippedWaiverResult {
+    /** Fields to merge into the update — omitted keys mean "don't touch the stored value". */
+    mealSkipped?: boolean;
+    needsReview?: boolean;
+    reviewReason?: string;
+}
+
+const MEAL_WAIVER_NOTE = "Worked through WA meal break (voluntary waiver recorded at clock-out)";
+
+/**
+ * WA meal-break voluntary waiver attestation: mobile's clock-out modal asks
+ * shifts over 5 hours whether the worker took their 30-minute break, and
+ * sends `mealSkipped: true` when they voluntarily worked through it. Only
+ * ever applies on an actual clock-out (a mutation that sets endTime) — other
+ * edits must never touch mealSkipped/needsReview/reviewReason — and a
+ * non-boolean value is ignored rather than coerced. Pay math and
+ * mealDeductionHours are untouched: meal breaks clock the worker out on
+ * mobile, so worked-through time is already paid in full by design.
+ */
+export function applyMealSkippedWaiver(input: MealSkippedWaiverInput): MealSkippedWaiverResult {
+    if (!input.settingEndTime) return {};
+    if (input.mealSkipped !== true && input.mealSkipped !== false) return {};
+
+    if (input.mealSkipped === false) {
+        return { mealSkipped: false };
+    }
+
+    return {
+        mealSkipped: true,
+        needsReview: true,
+        reviewReason: input.existingReviewReason
+            ? `${input.existingReviewReason}; ${MEAL_WAIVER_NOTE}`
+            : MEAL_WAIVER_NOTE,
+    };
+}

@@ -5,7 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
-import { checkLogisticsClockOutNotes } from "@/lib/logistics-time-entry";
+import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -174,6 +174,20 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (logisticsCheck.notes !== undefined) {
         data.notes = logisticsCheck.notes;
     }
+
+    // WA meal-break voluntary waiver attestation — same rule as the PUT
+    // clock-out path (src/app/api/time-entries/route.ts): applies only when
+    // this PATCH is actually setting endTime (a clock-out), never on a plain
+    // edit. Defense in depth for a call site mobile doesn't currently use for
+    // this flag (see PUT), same posture as the notes check above.
+    Object.assign(
+        data,
+        applyMealSkippedWaiver({
+            mealSkipped: body.mealSkipped,
+            settingEndTime,
+            existingReviewReason: existing.reviewReason,
+        })
+    );
 
     // Capture the as-clocked values exactly once. Subsequent edits update the latest
     // times but never overwrite the original snapshot.

@@ -5,7 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
-import { requiresPhaseForClockIn, checkLogisticsClockOutNotes } from "@/lib/logistics-time-entry";
+import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -180,6 +180,7 @@ export interface ClockOutTimeEntryRow {
     projectId: string;
     startTime: Date;
     notes: string | null;
+    reviewReason: string | null;
 }
 
 export interface ClockOutDependencies {
@@ -198,7 +199,7 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             const { user } = auth;
 
             const body = await req.json();
-            const { id, endTime, latitude, longitude, notes } = body;
+            const { id, endTime, latitude, longitude, notes, mealSkipped } = body;
 
             if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
 
@@ -251,6 +252,17 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             if (longitude) updateData.longitude = longitude;
             if (logisticsCheck.notes !== undefined) updateData.notes = logisticsCheck.notes;
 
+            // WA meal-break voluntary waiver attestation — PUT always closes the
+            // entry, so this is always a clock-out.
+            Object.assign(
+                updateData,
+                applyMealSkippedWaiver({
+                    mealSkipped,
+                    settingEndTime: true,
+                    existingReviewReason: existing.reviewReason,
+                })
+            );
+
             if (user.role === "MANAGER" || user.role === "ADMIN") {
                 if (existing.userId !== user.id) {
                     updateData.editedByManagerId = user.id;
@@ -281,7 +293,7 @@ const clockOutHandler = createClockOutHandler({
     findTimeEntry: async (id) => {
         return prisma.timeEntry.findUnique({
             where: { id },
-            select: { id: true, userId: true, projectId: true, startTime: true, notes: true },
+            select: { id: true, userId: true, projectId: true, startTime: true, notes: true, reviewReason: true },
         });
     },
     findProjectIsLogistics: async (projectId) => {
