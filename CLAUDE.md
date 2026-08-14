@@ -152,6 +152,15 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 > Supabase's IPv4 add-on) and this machine has no IPv6 default route. **5432 is not a blocked port** and
 > the free tier is not the cause — the shared session pooler listens on 5432 too and completes a TCP
 > handshake over IPv4. Full evidence table in the `probuild-schema-migration` skill.
+>
+> **Repointing `DIRECT_URL` at the session pooler does not rescue them** (tested 2026-08-13). The
+> pooler authenticates fine and read-only Prisma CLI commands work over it, but prod's schema and
+> migration history have drifted from the repo: `migrate diff` shows `db push` would propose 10
+> `DROP TABLE` and 41 `DROP COLUMN` against production, and `migrate status` reports no common
+> migration, which leaves `migrate dev` no useful work either. Neither mutating command was run
+> against prod, so those are the diffs they would face, not observed outcomes. Retiring the script
+> below needs a baseline reconciliation on top of the connection fix — see the
+> `probuild-schema-migration` skill before retrying this.
 
 **Working approach:**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`
@@ -204,7 +213,7 @@ If a feature doesn't map to a real workflow step for a real role (estimator, PM,
 - **Server components by default** — only add `"use client"` when strictly needed (event handlers, hooks, browser APIs)
 - **No dummy UI** — every button, link, and form must be fully wired before committing
 - **Database** — always use Prisma (`src/lib/prisma.ts`), not the direct Supabase client, for data access; the Supabase client (`src/lib/supabase.ts`) is Storage-only (there are no `supabase.auth` calls anywhere in `src/`)
-- **Schema changes** — do NOT use `npx prisma db push` or `prisma migrate dev`. Both connect over `DIRECT_URL` (yes, `db push` too — a datasource `directUrl` overrides `url` as the connection target), whose host is IPv6-only and unreachable here; 5432 itself is fine, and neither command hangs on this machine — see "Schema migrations". Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
+- **Schema changes** — do NOT use `npx prisma db push` or `prisma migrate dev`. Both connect over `DIRECT_URL` (yes, `db push` too — a datasource `directUrl` overrides `url` as the connection target), whose host is IPv6-only and unreachable here; 5432 itself is fine, and neither command hangs on this machine — see "Schema migrations". Repointing `DIRECT_URL` at the session pooler fixes the connection but not the commands — prod has drifted from `schema.prisma`, so `db push` would propose dropping 10 tables and 41 columns. Instead: apply SQL via `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`, then regenerate client via **PowerShell** (never Git Bash — Git Bash triggers `copyEngine: false` which breaks the local dev engine)
 - **DATABASE_URL must include `?pgbouncer=true`** — Supabase transaction pooler (port 6543) + Prisma requires this flag. Without it you get `42P05 prepared statement already exists` and the site goes down. Correct format: `postgresql://...@aws-0-us-west-2.pooler.supabase.com:6543/postgres?pgbouncer=true`
 - **Auth roles** — ADMIN, MANAGER, FIELD_CREW, FINANCE — check `src/lib/permissions.ts` before adding role-gated UI
 - **Toasts** — use `sonner` (already in layout), not any other toast library

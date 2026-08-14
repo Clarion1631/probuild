@@ -9,6 +9,12 @@ import {
   type SignatureStorageBucket,
 } from "../src/lib/signature-storage";
 import {
+  mirrorInvoiceSettleToEstimate,
+  mirrorInvoiceUnsettleToEstimate,
+  mirrorEstimateUnsettleToInvoice,
+  findInvoiceMirrorOfEstimateSchedule,
+} from "../src/lib/payment-mirror";
+import {
   approveChangeOrderWithSignature,
   type ChangeOrderApprovalDependencies,
   type ChangeOrderSignatureCleanupEvent,
@@ -1095,5 +1101,279 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     expect(actionSource).toContain("await approveChangeOrderWithSignature(");
     expect(actionSource).not.toContain("await persistSignature(");
     expect(actionSource).not.toContain("await approveChangeOrderCore(");
+  });
+});
+
+/**
+ * Stripe-rail mirror regression â€” the invoice-side Stripe rails (webhook settle,
+ * portal `verifyStripeSession` fallback, and the two full-refund branches) did no
+ * mirroring at all, so a client paying a Stripe invoice left the estimate copy
+ * showing unpaid. These tests drive the shared helpers those rails now call
+ * (`src/lib/payment-mirror.ts`) directly against real rows: the webhook itself
+ * cannot be exercised here because it needs a signed Stripe payload.
+ */
+const S = {
+  client: "mp3-e2e-client",
+  project: "mp3-e2e-project",
+  estimate: "mp3-e2e-estimate",
+  invoice: "mp3-e2e-invoice",
+  estDeposit: "mp3-e2e-eps-deposit",
+  invDeposit: "mp3-e2e-ps-deposit",
+  estAmbigA: "mp3-e2e-eps-ambig-a",
+  estAmbigB: "mp3-e2e-eps-ambig-b",
+  estAmbigDecoy: "mp3-e2e-eps-ambig-decoy",
+  invAmbig: "mp3-e2e-ps-ambig",
+  // S5/S6 live on their OWN estimate+invoice pair so their paid milestone
+  // can't move the balances S1-S4 assert on.
+  estimate2: "mp3-e2e-estimate-2",
+  invoice2: "mp3-e2e-invoice-2",
+  estOther: "mp3-e2e-eps-other",
+  invOtherCharge: "mp3-e2e-ps-other-charge",
+};
+const S_NAME = "Stripe Mirror Drill - MP3TEST";
+const sPrisma = new PrismaClient();
+const INTENT = "pi_mp3_e2e_intent";
+const OTHER_INTENT = "pi_mp3_e2e_other_intent";
+
+test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
+  test.beforeAll(async () => {
+    await sPrisma.client.upsert({
+      where: { id: S.client },
+      update: {},
+      create: { id: S.client, name: "MP3 Drill Client", initials: "M3" },
+    });
+    await sPrisma.project.upsert({
+      where: { id: S.project },
+      update: {},
+      create: { id: S.project, name: S_NAME, clientId: S.client, status: "In Progress" },
+    });
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate },
+      update: { status: "Invoiced", totalAmount: 1000, balanceDue: 1000, statusBeforePayment: null },
+      create: {
+        id: S.estimate, title: S_NAME, code: "EST-MP3TEST", projectId: S.project,
+        status: "Invoiced", taxExempt: true, totalAmount: 1000, balanceDue: 1000,
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice },
+      update: { status: "Issued", totalAmount: 1000, balanceDue: 1000 },
+      create: {
+        id: S.invoice, code: "INV-MP3TEST", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate, status: "Issued", totalAmount: 1000, balanceDue: 1000,
+        issueDate: new Date(),
+      },
+    });
+    // Linked pair (the normal converted-estimate shape).
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estDeposit },
+      update: { status: "Pending", paidAt: null, paymentDate: null, paymentMethod: null, stripeSessionId: null, stripePaymentIntentId: null },
+      create: { id: S.estDeposit, estimateId: S.estimate, name: "MP3 Deposit", amount: 600, status: "Pending", order: 1 },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invDeposit },
+      update: { status: "Pending", paidAt: null, paymentDate: null },
+      create: { id: S.invDeposit, invoiceId: S.invoice, name: "MP3 Deposit", amount: 600, status: "Pending", sourceScheduleId: S.estDeposit },
+    });
+    // Two UNLINKED estimate rows with the same name+amount: the legacy fallback
+    // must refuse to guess between them. A THIRD same-name row with a different
+    // amount sits alongside them — with the old `take: 2` window that row could
+    // displace one of the real matches and make an ambiguous pair look unique,
+    // so its presence is what makes this case a regression test.
+    for (const id of [S.estAmbigA, S.estAmbigB]) {
+      await sPrisma.estimatePaymentSchedule.upsert({
+        where: { id },
+        update: { status: "Pending", paidAt: null, paymentDate: null },
+        create: { id, estimateId: S.estimate, name: "MP3 Ambiguous", amount: 200, status: "Pending", order: 3 },
+      });
+    }
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estAmbigDecoy },
+      update: { status: "Pending", paidAt: null, paymentDate: null },
+      create: { id: S.estAmbigDecoy, estimateId: S.estimate, name: "MP3 Ambiguous", amount: 999, status: "Pending", order: 2 },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invAmbig },
+      update: { status: "Pending", paidAt: null, paymentDate: null },
+      create: { id: S.invAmbig, invoiceId: S.invoice, name: "MP3 Ambiguous", amount: 200, status: "Pending" },
+    });
+    // Second pair, fully paid by a single charge. Its ONLY linked invoice clone
+    // starts out settled through a DIFFERENT charge — refunding this milestone's
+    // charge must not release it (S5), and once the clone does belong to this
+    // charge the refund must unwind it (S6).
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate2 },
+      update: { status: "Invoiced", totalAmount: 200, balanceDue: 0, statusBeforePayment: null },
+      create: {
+        id: S.estimate2, title: `${S_NAME} 2`, code: "EST-MP3TEST-2", projectId: S.project,
+        status: "Invoiced", taxExempt: true, totalAmount: 200, balanceDue: 0,
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice2 },
+      update: { status: "Paid", totalAmount: 200, balanceDue: 0 },
+      create: {
+        id: S.invoice2, code: "INV-MP3TEST-2", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate2, status: "Paid", totalAmount: 200, balanceDue: 0,
+        issueDate: new Date(),
+      },
+    });
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estOther },
+      update: { status: "Paid", stripePaymentIntentId: INTENT },
+      create: {
+        id: S.estOther, estimateId: S.estimate2, name: "MP3 Other", amount: 200,
+        status: "Paid", order: 1, stripePaymentIntentId: INTENT,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invOtherCharge },
+      update: { status: "Paid", stripePaymentIntentId: OTHER_INTENT },
+      create: {
+        id: S.invOtherCharge, invoiceId: S.invoice2, name: "MP3 Other", amount: 200,
+        status: "Paid", sourceScheduleId: S.estOther, stripePaymentIntentId: OTHER_INTENT,
+      },
+    });
+  });
+
+  test.afterAll(async () => {
+    try {
+      await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: [S.invoice, S.invoice2] } } });
+      await sPrisma.invoice.deleteMany({ where: { id: { in: [S.invoice, S.invoice2] } } });
+      await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: [S.estimate, S.estimate2] } } });
+      await sPrisma.estimate.deleteMany({ where: { id: { in: [S.estimate, S.estimate2] } } });
+      await sPrisma.project.deleteMany({ where: { id: S.project } });
+      await sPrisma.client.deleteMany({ where: { id: S.client } });
+    } finally {
+      await sPrisma.$disconnect();
+    }
+  });
+
+  test("S1: settling the invoice copy mirrors onto the estimate milestone", async () => {
+    const now = new Date();
+    // Stand in for what the Stripe rail's own transaction does before it mirrors:
+    // claim the invoice-side row and recompute the invoice. The assertion below is
+    // that the ESTIMATE ends up agreeing with that invoice, which is the invariant.
+    await sPrisma.paymentSchedule.update({
+      where: { id: S.invDeposit },
+      data: { status: "Paid", paidAt: now, paymentDate: now, stripePaymentIntentId: INTENT },
+    });
+    await sPrisma.invoice.update({
+      where: { id: S.invoice },
+      data: { balanceDue: 400, status: "Partially Paid" },
+    });
+    const payment = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
+
+    const mirrored = await sPrisma.$transaction((tx) =>
+      mirrorInvoiceSettleToEstimate(tx, {
+        estimateId: S.estimate,
+        payment,
+        data: { paymentDate: now, paidAt: now, paymentMethod: "card", stripePaymentIntentId: INTENT },
+      }),
+    );
+
+    expect(mirrored, "the estimate copy was claimed").toBe(true);
+    const estCopy = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estDeposit } });
+    expect(estCopy.status, "estimate milestone mirrors the Stripe invoice payment").toBe("Paid");
+
+    const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate } });
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice } });
+    expect(Number(estimate.balanceDue), "estimate balance drops by the paid milestone").toBe(400);
+    expect(Number(estimate.balanceDue), "the two documents agree on what is owed")
+      .toBe(Number(invoice.balanceDue));
+    expect(estimate.status).toBe("Partially Paid");
+    expect(estimate.statusBeforePayment, "pre-payment status captured for undo").toBe("Invoiced");
+  });
+
+  test("S2: mirroring is at-most-once â€” a replay claims nothing and moves no balance", async () => {
+    const now = new Date();
+    const payment = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
+    const before = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate } });
+
+    const mirrored = await sPrisma.$transaction((tx) =>
+      mirrorInvoiceSettleToEstimate(tx, {
+        estimateId: S.estimate,
+        payment,
+        data: { paymentDate: now, paidAt: now, paymentMethod: "card", stripePaymentIntentId: INTENT },
+      }),
+    );
+
+    expect(mirrored, "an already-Paid mirror is not re-claimed").toBe(false);
+    const after = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate } });
+    expect(Number(after.balanceDue)).toBe(Number(before.balanceDue));
+  });
+
+  test("S3: a full refund unwinds the estimate mirror and keeps its Stripe ids", async () => {
+    const payment = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
+
+    const unwound = await sPrisma.$transaction((tx) =>
+      mirrorInvoiceUnsettleToEstimate(tx, { estimateId: S.estimate, payment }),
+    );
+
+    expect(unwound, "the estimate copy was released").toBe(true);
+    const estCopy = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estDeposit } });
+    expect(estCopy.status).toBe("Pending");
+    // The Stripe ids MUST survive the reset: they are how a redelivered refund
+    // re-finds this exact row. Clearing them would let a duplicate delivery land
+    // on a different clone sharing the intent and unset a real payment.
+    expect(estCopy.stripePaymentIntentId, "the charge link survives the reset").toBe(INTENT);
+
+    const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate } });
+    expect(Number(estimate.balanceDue), "estimate balance restored in full").toBe(1000);
+    expect(estimate.status, "pre-payment status restored").toBe("Invoiced");
+    expect(estimate.statusBeforePayment).toBeNull();
+  });
+
+  test("S4: an ambiguous unlinked pair is left alone rather than guessed at", async () => {
+    const now = new Date();
+    const payment = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invAmbig } });
+
+    const mirrored = await sPrisma.$transaction((tx) =>
+      mirrorInvoiceSettleToEstimate(tx, {
+        estimateId: S.estimate,
+        payment,
+        data: { paymentDate: now, paidAt: now, paymentMethod: "card" },
+      }),
+    );
+
+    expect(mirrored, "two identical candidates must not resolve to one").toBe(false);
+    const rows = await sPrisma.estimatePaymentSchedule.findMany({
+      where: { id: { in: [S.estAmbigA, S.estAmbigB, S.estAmbigDecoy] } },
+    });
+    expect(rows.every((r) => r.status === "Pending"), "no candidate was touched").toBe(true);
+  });
+
+  test("S5: refunding an estimate milestone never releases a clone paid by another charge", async () => {
+    const schedule = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estOther } });
+
+    const mirror = await sPrisma.$transaction((tx) =>
+      findInvoiceMirrorOfEstimateSchedule(tx, schedule),
+    );
+
+    expect(mirror, "the sole linked clone carries a different PaymentIntent").toBeNull();
+    const clone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invOtherCharge } });
+    expect(clone.status, "the other charge's payment stays Paid").toBe("Paid");
+  });
+
+  test("S6: refunding an estimate milestone unwinds its invoice clone and balance", async () => {
+    // Re-point the clone at THIS charge, which is the ordinary settled pair.
+    await sPrisma.paymentSchedule.update({
+      where: { id: S.invOtherCharge },
+      data: { stripePaymentIntentId: INTENT, status: "Paid" },
+    });
+    const schedule = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estOther } });
+
+    const unwound = await sPrisma.$transaction(async (tx) => {
+      const mirror = await findInvoiceMirrorOfEstimateSchedule(tx, schedule);
+      expect(mirror?.id, "the same-charge clone is the mirror").toBe(S.invOtherCharge);
+      return mirror ? await mirrorEstimateUnsettleToInvoice(tx, mirror) : false;
+    });
+
+    expect(unwound, "the invoice clone was released").toBe(true);
+    const clone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invOtherCharge } });
+    expect(clone.status).toBe("Pending");
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice2 } });
+    expect(Number(invoice.balanceDue), "invoice balance restored by the refunded amount").toBe(200);
+    expect(invoice.status).toBe("Issued");
   });
 });
