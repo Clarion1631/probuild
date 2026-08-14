@@ -74,6 +74,11 @@ export function dateOnlyInTimeZone(date: string, timeZone: string): Date {
     return instantForWallClock(date, timeZone, 12, 0, 0, 0, "date");
 }
 
+/** The instant of local midnight (00:00:00.000) for a calendar date in the given time zone. */
+export function startOfDateInTimeZone(date: string, timeZone: string): Date {
+    return instantForWallClock(date, timeZone, 0, 0, 0, 0, "date");
+}
+
 export function dateInputInTimeZone(value: string | Date | null | undefined, timeZone: string, label: string): Date | null {
     if (value === null || value === undefined || value === "") return null;
     if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {

@@ -4,6 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { toCompanyDayKey } from "@/lib/company-day";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { bucketWorkweeks, type OvertimeTimeEntry } from "@/lib/overtime";
 
 // One-shot dashboard payload for the mobile manager tab. Replaces ~4 prior client-side
 // Supabase queries + 2 realtime subscriptions; mobile polls this every 30s while focused.
@@ -178,8 +180,47 @@ export async function GET(req: Request) {
         }
     }
 
+    // -------- Weekly overtime (WA weekly rule: hours over 40 in a Mon-Sun
+    // company-local workweek are 1.5x). Bucketed per-employee straight from
+    // weeklyEntries, which are already scoped to [weekStart, weekEnd) as
+    // requested by the caller (mobile's default is a Sun-Sat display week,
+    // not the Mon-Sun legal workweek). Because of that mismatch, a workweek
+    // that straddles the edge of the requested window is judged only on the
+    // hours actually inside the window — if hours worked just outside it
+    // would have pushed the week over 40, this figure can understate OT for
+    // that boundary week. That's an acceptable approximation for an
+    // at-a-glance dashboard; a payroll-accurate number should come from
+    // /api/mobile/pay-period-summary, which pads its query to see full
+    // workweeks regardless of the requested range. --------
+    const companyTimeZone = await resolveCompanyTimeZone();
+    const entriesByUser = new Map<string, OvertimeTimeEntry[]>();
+    for (const e of weeklyEntries) {
+        if (typeof e.durationHours !== "number" || e.durationHours <= 0) continue;
+        const list = entriesByUser.get(e.userId);
+        const entry: OvertimeTimeEntry = { startTime: e.startTime, durationHours: e.durationHours };
+        if (list) list.push(entry);
+        else entriesByUser.set(e.userId, [entry]);
+    }
+    const overtimeHoursByUser = new Map<string, number>();
+    let weeklyRegularHours = 0;
+    let weeklyOvertimeHours = 0;
+    for (const [userId, userEntries] of entriesByUser) {
+        const weeks = bucketWorkweeks(userEntries, companyTimeZone);
+        const otHours = weeks.reduce((sum, w) => sum + w.overtimeHours, 0);
+        const regHours = weeks.reduce((sum, w) => sum + w.regularHours, 0);
+        overtimeHoursByUser.set(userId, otHours);
+        weeklyOvertimeHours += otHours;
+        weeklyRegularHours += regHours;
+    }
+
     const employeeStats = Array.from(employeeAgg.entries())
-        .map(([userId, v]) => ({ userId, name: v.name, hours: v.hours, cost: v.cost }))
+        .map(([userId, v]) => ({
+            userId,
+            name: v.name,
+            hours: v.hours,
+            cost: v.cost,
+            overtimeHours: overtimeHoursByUser.get(userId) ?? 0,
+        }))
         .sort((a, b) => b.hours - a.hours);
 
     // -------- Per-project rollup --------
@@ -370,6 +411,8 @@ export async function GET(req: Request) {
         weeklyTotalHours,
         weeklyLaborCost,
         weeklyBurdenedCost,
+        weeklyRegularHours,
+        weeklyOvertimeHours,
         activeJobs,
         offsiteWorkers,
         employeeStats,
