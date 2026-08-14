@@ -63,10 +63,20 @@ export default function PortalContractClient({
         markContractViewed(initialContract.id, accessToken || undefined).catch(console.error);
     }, [initialContract.id, accessToken]);
 
+    // DOMPurify requires a browser DOM and is undefined in the Node SSR environment
+    // that renders this "use client" component's first HTML. Gate on a mounted flag
+    // (false on both the server render and the initial client render, so no hydration
+    // mismatch) rather than `typeof window`, which would flip true on the very first
+    // client render and diverge from the server-sent markup.
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => {
+        setMounted(true);
+    }, []);
+
     // Parse and Inject HTML Buttons — returns derived block counts alongside HTML
     const { parsedBody, totalRequiredBlocks, totalSigBlocks } = React.useMemo(() => {
         // Sanitize DB content before rendering; our own placeholder injections below are safe
-        let html = DOMPurify.sanitize(initialContract.body || "", { USE_PROFILES: { html: true } });
+        let html = mounted ? DOMPurify.sanitize(initialContract.body || "", { USE_PROFILES: { html: true } }) : "";
         const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 
         let sigCount = 0;
@@ -144,7 +154,7 @@ export default function PortalContractClient({
         }
 
         return { parsedBody: html, totalRequiredBlocks: sigCount + initCount, totalSigBlocks: sigCount };
-    }, [initialContract.body, isSigned, initialContract.approvedAt, initialContract.contractorSignedAt, initialContract.contractorSignatureUrl, initialContract.contractorSignedBy, signatures, initials]);
+    }, [mounted, initialContract.body, isSigned, initialContract.approvedAt, initialContract.contractorSignedAt, initialContract.contractorSignatureUrl, initialContract.contractorSignedBy, signatures, initials]);
 
     // Attach Delegated Listeners
     useEffect(() => {
