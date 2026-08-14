@@ -79,13 +79,9 @@ export function createPolishNotesHandlers(dependencies: PolishNotesDependencies)
             const auth = await dependencies.authenticate(req);
             if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-            if (!dependencies.checkRateLimit(auth.user.id)) {
-                return NextResponse.json(
-                    { error: "Too many requests — try again later" },
-                    { status: 429 }
-                );
-            }
-
+            // Validate the body BEFORE consuming rate-limit quota — a request
+            // that will never reach Gemini (bad JSON, blank, or oversized
+            // notes) must not burn a slot that a real request could have used.
             let body: unknown;
             try {
                 body = await req.json();
@@ -102,6 +98,13 @@ export function createPolishNotesHandlers(dependencies: PolishNotesDependencies)
                 return NextResponse.json(
                     { error: `notes must be ${MAX_NOTES_LENGTH} characters or fewer` },
                     { status: 400 }
+                );
+            }
+
+            if (!dependencies.checkRateLimit(auth.user.id)) {
+                return NextResponse.json(
+                    { error: "Too many requests — try again later" },
+                    { status: 429 }
                 );
             }
 

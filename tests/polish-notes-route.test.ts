@@ -19,19 +19,23 @@ function createDeps(overrides: {
     polishImpl?: PolishNotesDependencies["polish"];
 } = {}) {
     const polishCalls: string[] = [];
+    const rateLimitCalls: string[] = [];
     const dependencies: PolishNotesDependencies = {
         authenticate: async () =>
             overrides.authOk === false
                 ? { ok: false, status: 401, error: "Unauthorized" }
                 : { ok: true, user: { id: "u1", role: "FIELD_CREW" } },
-        checkRateLimit: () => overrides.rateLimitOk ?? true,
+        checkRateLimit: (userId) => {
+            rateLimitCalls.push(userId);
+            return overrides.rateLimitOk ?? true;
+        },
         polish: async (notes) => {
             polishCalls.push(notes);
             if (overrides.polishImpl) return overrides.polishImpl(notes);
             return { ok: true, polished: `Polished: ${notes}` };
         },
     };
-    return { dependencies, polishCalls };
+    return { dependencies, polishCalls, rateLimitCalls };
 }
 
 function req(body: unknown) {
@@ -118,12 +122,35 @@ test("429 when checkRateLimit() denies the request, and polish() is never called
     assert.equal(polishCalls.length, 0);
 });
 
-test("rate limit check happens before body parsing (429 even with an invalid JSON body)", async () => {
-    const { dependencies } = createDeps({ rateLimitOk: false });
+test("body validation happens before the rate limit check: invalid JSON is 400 even when the caller is rate-limited, and the limiter is never consulted", async () => {
+    const { dependencies, rateLimitCalls } = createDeps({ rateLimitOk: false });
     const { POST } = createPolishNotesHandlers(dependencies);
     const badReq = new Request("https://example.test/api/ai/polish-notes", { method: "POST", body: "not json" });
     const res = await POST(badReq);
-    assert.equal(res.status, 429);
+    assert.equal(res.status, 400);
+    assert.equal(rateLimitCalls.length, 0);
+});
+
+test("checkRateLimit is not consulted (no quota consumed) when notes is missing or blank", async () => {
+    const { dependencies, rateLimitCalls } = createDeps();
+    const { POST } = createPolishNotesHandlers(dependencies);
+    await POST(req({}));
+    await POST(req({ notes: "   " }));
+    assert.equal(rateLimitCalls.length, 0);
+});
+
+test("checkRateLimit is not consulted (no quota consumed) when notes exceeds the length cap", async () => {
+    const { dependencies, rateLimitCalls } = createDeps();
+    const { POST } = createPolishNotesHandlers(dependencies);
+    await POST(req({ notes: "a".repeat(4001) }));
+    assert.equal(rateLimitCalls.length, 0);
+});
+
+test("checkRateLimit IS consulted, exactly once, once notes passes validation", async () => {
+    const { dependencies, rateLimitCalls } = createDeps();
+    const { POST } = createPolishNotesHandlers(dependencies);
+    await POST(req({ notes: "worked on site" }));
+    assert.deepEqual(rateLimitCalls, ["u1"]);
 });
 
 // ── createRateLimiter ──────────────────────────────────────────────────
