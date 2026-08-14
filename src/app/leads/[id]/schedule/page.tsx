@@ -22,5 +22,6 @@ export default async function LeadSchedulePage({ params }: Props) {
 
     if (!lead) return redirect("/leads");
 
-    return <LeadScheduleClient leadId={id} leadName={lead.name} initialTasks={tasks} />;
+    // Task total is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return <LeadScheduleClient leadId={id} leadName={lead.name} initialTasks={JSON.parse(JSON.stringify(tasks))} />;
 }

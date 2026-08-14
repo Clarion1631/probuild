@@ -20,8 +20,9 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
+import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
@@ -109,6 +110,7 @@ import {
 } from "./schedule-task-core";
 import { convertLeadToProjectCore } from "./lead-conversion-core";
 import { buildContractMergeData, normalizeContractBody, resolveMergeFields, createContractFromTemplateCore, createContractBlankCore } from "./contract-creation-core";
+import { executedContractPdfFor } from "./contract-files-core";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 // Import the -core module, not the "server-only" wrapper: actions.ts is in the
@@ -279,7 +281,16 @@ export const getLead = cache(async function getLead(id: string) {
         include: {
             client: true,
             estimates: scopedEstimateRelation(safeEstimateInclude, user),
-            contracts: true,
+            // Scoped for the same reason the estimates relation above is, and
+            // it mattered more here: currentStaffUserOrNull() returns null
+            // rather than throwing, so `contracts: true` handed an ANONYMOUS
+            // caller who knew a lead id every contract field — legal body,
+            // signatures, audit metadata and the accessToken that is by itself
+            // sufficient to view and sign. That defeated the per-action gates
+            // through a differently named action. contractScopeWhere matches
+            // nothing for a null user or one without the `contracts`
+            // permission. (Codex round-1 blocker.)
+            contracts: { where: contractScopeWhere(user) },
             manager: true,
             tasks: {
                 orderBy: { createdAt: "desc" }
@@ -902,7 +913,8 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 
     revalidatePath(`/leads/${leadId}`);
     revalidatePath(`/leads`);
-    return lead;
+    // targetRevenue/expectedProfit are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(lead));
 }
 
 // =============================================
@@ -3437,24 +3449,6 @@ export async function archiveEstimate(estimateId: string) {
     return { success: true, archived };
 }
 
-// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
-// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
-        where: { id: "singleton" },
-        select: { salesTaxes: true },
-    });
-    if (!settings?.salesTaxes) return 0;
-    try {
-        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
-        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
-        const def = taxes.find(t => t.isDefault) || taxes[0];
-        return typeof def.rate === "number" ? def.rate : 0;
-    } catch {
-        return 0;
-    }
-}
-
 export async function createInvoiceFromEstimate(estimateId: string) {
     // `invoices` says WHAT you may do, not WHICH job — the invoice this mints
     // inherits the estimate's numbers, so the source estimate must be in scope.
@@ -4151,14 +4145,9 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
  * data. Only a real absence of a signed-in staff user returns null.
  */
 async function currentStaffUserOrNull(): Promise<any | null> {
-    const user = await getCurrentUserWithPermissions();
-    if (user) return user;
-
-    if (await canUseDevAuthFallback()) {
-        const devSession = await getSessionOrDev();
-        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
-    }
-    return null;
+    // Body moved to permissions.ts so server components that scope a query
+    // themselves can share it without actions.ts publishing another endpoint.
+    return currentStaffViewerOrNull();
 }
 
 async function assertActiveStaff(): Promise<any> {
@@ -4261,6 +4250,54 @@ async function assertContractContextAccess(context: { type: "project" | "lead"; 
     const scope = context.type === "project" ? { projectId: context.id } : { leadId: context.id };
     if (!canCreateContractFor(user, scope)) throw new Error("Forbidden");
     return user;
+}
+
+/**
+ * Resolve a contract's owning project/lead. Deliberately reads the owner from
+ * the DATABASE by id: every contract action is addressed by contract id, and
+ * the descriptor a caller hands us is exactly the thing an attacker controls.
+ */
+async function contractOwnerOrThrow(contractId: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { projectId: true, leadId: true, title: true },
+    });
+    if (!contract) throw new Error("Contract not found");
+    return contract;
+}
+
+/**
+ * Horizontal-access check for a contract already resolved to its owner.
+ * Same shape as assertEstimateScope, and fails CLOSED on an ownerless contract
+ * for the same reason: both ownership columns are optional in the schema, so
+ * "no project and no lead" would otherwise be authorized by default.
+ */
+function assertContractScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This contract is not attached to a project or lead, so access cannot be checked");
+    }
+    if (!canAccessContract(user, scope)) throw new Error("Forbidden");
+}
+
+/**
+ * Permission + scope for a single EXISTING contract, addressed by contract id.
+ *
+ * The contract-family actions in this file are exported Server Actions, i.e.
+ * individually invokable POST endpoints — "only imported by a staff page" is
+ * not an enforced boundary. Reading a contract exposes its legal body, the
+ * approval IP/user-agent trail, the signature storage paths and the portal
+ * `accessToken`, which by itself authorizes a client to view AND SIGN; writing
+ * one can clear a contractor signature. Both therefore need the same gate.
+ *
+ * Permission is asserted BEFORE the lookup so the "Contract not found" vs
+ * "Forbidden" difference cannot be used as an existence oracle by a caller who
+ * holds no contract permission at all.
+ */
+async function assertContractAccess(contractId: string) {
+    const user = await assertStaffPermission("contracts");
+    const contract = await contractOwnerOrThrow(contractId);
+    assertContractScope(user, contract);
+    return { user, projectId: contract.projectId, leadId: contract.leadId, title: contract.title };
 }
 
 /** Resolve an estimate's owning project/lead, for callers that hold a user already. */
@@ -5288,10 +5325,13 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 
 export async function getEstimateTemplates() {
     await assertEstimatePermission();
-    return await prisma.estimateTemplate.findMany({
+    const templates = await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
+    // Item baseCost/unitCost are Prisma Decimals, which can't cross the server->client
+    // boundary; consumers already coerce with Number(...).
+    return JSON.parse(JSON.stringify(templates));
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
@@ -5900,10 +5940,21 @@ export async function getResolvedMergePreview(
 }
 
 export async function getContracts(projectId?: string, leadId?: string) {
+    // Called with no arguments this returned EVERY contract with all scalar
+    // fields — legal body, approval IP/user-agent, signature paths and the
+    // portal accessToken that authorizes signing — to any anonymous caller.
+    // The scope filter is the list form of the same rule assertContractAccess
+    // applies to one row, so the list and the detail page cannot disagree.
+    const user = await assertStaffPermission("contracts");
     return prisma.contract.findMany({
         where: {
-            ...(projectId ? { projectId } : {}),
-            ...(leadId ? { leadId } : {}),
+            AND: [
+                contractScopeWhere(user),
+                {
+                    ...(projectId ? { projectId } : {}),
+                    ...(leadId ? { leadId } : {}),
+                },
+            ],
         },
         orderBy: { createdAt: "desc" },
         include: {
@@ -5914,6 +5965,11 @@ export async function getContracts(projectId?: string, leadId?: string) {
 }
 
 export async function getContract(id: string) {
+    // Staff-only, scoped to the owning job. The docstring on getContractForPortal
+    // below always CLAIMED this one was "admin-only"; nothing enforced it, so an
+    // anonymous caller could read any contract — including its accessToken — plus
+    // the full related client record, by id alone.
+    await assertContractAccess(id);
     return prisma.contract.findUnique({
         where: { id },
         include: {
@@ -5979,49 +6035,20 @@ export async function getContractForPortal(id: string, token?: string | null) {
 }
 
 /**
- * Returns the executed PDF ProjectFile for a specific contract.
+ * Staff-facing executed-contract file lookup. The lookup itself lives in
+ * src/lib/contract-files-core.ts (session-free, shared with the client portal,
+ * which proves access by accessToken or portal session instead).
  *
- * Files written by the finalize route set `ProjectFile.name` to the exact string
- * `Executed_Contract_{contractId}.pdf` (no timestamp prefix — the timestamp only
- * appears in the storage path, not the DB `name` column). We use exact equality
- * for airtight lookup.
- *
- * Legacy fallback: files written before the contractId naming convention used
- * `Executed_Contract_{safeTitle}.pdf`. If exact-match returns nothing we retry
- * with the title-based prefix as a best-effort courtesy for old data. Same-title
- * collisions on legacy data are accepted as a known limitation — new data is
- * unambiguous.
+ * ONLY the contract `id` in the argument is trusted. The owning project/lead
+ * and the title are re-read from the database, because the whole descriptor
+ * used to be caller-supplied: naming another job's projectId returned that
+ * job's executed PDF, and a crafted `title` steered the legacy prefix match.
+ * The parameter keeps its old shape so existing callers are unchanged; the
+ * extra fields are now ignored.
  */
 export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const where: any = contract.projectId
-        ? { projectId: contract.projectId }
-        : contract.leadId
-            ? { leadId: contract.leadId }
-            : null;
-    if (!where) return null;
-
-    // Preferred: exact-match on the contract-id-embedded filename.
-    const exactName = `Executed_Contract_${contract.id}.pdf`;
-    const byContractId = await prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: exactName,
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
-    if (byContractId) return byContractId;
-
-    // Legacy fallback — title-prefixed files from before the contractId naming change.
-    const legacyPrefix = `Executed_Contract_${contract.title.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-    return prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: { startsWith: legacyPrefix },
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
+    const { projectId, leadId, title } = await assertContractAccess(contract.id);
+    return executedContractPdfFor({ id: contract.id, title, projectId, leadId });
 }
 
 export async function createContractFromTemplate(
@@ -6084,6 +6111,11 @@ export async function createContractFromPdf(
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    // Unauthenticated before this gate: an anonymous caller could rewrite any
+    // contract's title/body/status/requiresCountersign by id — and because a
+    // text edit clears the contractor signature (see below), a plain edit was
+    // enough to strip a signature off a live legal document.
+    await assertContractAccess(id);
     const existing = await prisma.contract.findUnique({
         where: { id },
         select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
@@ -6155,6 +6187,9 @@ export async function updateContract(id: string, data: { title?: string; body?: 
 }
 
 export async function deleteContract(id: string) {
+    // Unauthenticated before this gate: an anonymous caller could permanently
+    // delete any contract — signed ones included — by id alone.
+    await assertContractAccess(id);
     const contract = await prisma.contract.findUnique({ where: { id } });
     await prisma.contract.delete({ where: { id } });
     if (contract?.projectId) revalidatePath(`/projects/${contract.projectId}`);
@@ -6332,11 +6367,13 @@ export async function sendContractToClient(
 // Prefill for the "Send contract" dialog: the primary recipient + the default CC set
 // (additional client email + assigned manager) that the user can edit before sending.
 export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
-    const session = await getServerSession(authOptions);
-    const caller = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
-        : null;
-    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+    // Was authenticated but neither permission-checked nor scoped: a hard-coded
+    // role list let any FINANCE user pass an arbitrary contract id and read the
+    // client's primary/additional email plus the assigned manager's. FINANCE's
+    // role default is `estimates`, not `contracts`, and this prefills a dialog
+    // whose send path (assertContractSendPermission) already demands `contracts`
+    // — so the old list granted a preview of data it could never act on.
+    await assertContractAccess(contractId);
 
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
@@ -6854,6 +6891,10 @@ export async function approveContract(contractId: string, signatureName: string,
 }
 
 export async function getContractSigningHistory(contractId: string) {
+    // Unauthenticated before this gate: signer names, IP addresses, user agents,
+    // notes and — because this action resolves `secure:` refs into loadable URLs
+    // — the signature IMAGES themselves, for any contract id.
+    await assertContractAccess(contractId);
     const records = await prisma.contractSigningRecord.findMany({
         where: { contractId },
         orderBy: { signedAt: "desc" },
@@ -6900,7 +6941,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
     // than returning a false success with no file.
     if (contract.status === "Finalized") {
-        const existing = await getExecutedContractPdf(contract);
+        const existing = await executedContractPdfFor(contract);
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
@@ -6984,7 +7025,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     });
     if (!after) throw new Error("Contract not found");
     if (after.status === "Finalized") {
-        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+        return { success: true, file: await executedContractPdfFor(after), alreadyFinalized: true };
     }
     if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
         throw new Error("Contract is not in a countersignable state.");
@@ -7000,7 +7041,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         // the winner is still archiving (or rolled back), so tell the admin to retry rather than
         // returning a false success with no file.
         const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
-        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        const existing = fresh?.status === "Finalized" ? await executedContractPdfFor(fresh) : null;
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
@@ -9047,7 +9088,8 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
@@ -9157,7 +9199,8 @@ export async function approveChangeOrder(id: string, signatureName: string, user
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 // Company-side countersignature. Distinct from approveChangeOrder (the customer's
@@ -9718,7 +9761,8 @@ export async function createPurchaseOrder(projectId: string, data: any) {
         }
     });
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
@@ -9826,7 +9870,8 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     }
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return newPo;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(newPo));
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
@@ -9871,8 +9916,9 @@ export async function updatePurchaseOrder(id: string, data: any) {
 
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    
-    return po;
+
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function deletePurchaseOrder(id: string) {
@@ -9964,7 +10010,8 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
     
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
@@ -10680,7 +10727,8 @@ export async function createProductLibraryItem(data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateProductLibraryItem(id: string, data: {
@@ -10706,7 +10754,8 @@ export async function updateProductLibraryItem(id: string, data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteProductLibraryItem(id: string) {
@@ -12287,7 +12336,8 @@ export async function addTeamCandidate(decisionId: string | null, data: {
         entityName: candidate.name,
     });
 
-    return candidate;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(candidate));
 }
 
 export async function importBoardPicksAsDecisions(projectId: string) {
@@ -12962,7 +13012,8 @@ export async function createCatalogItem(data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateCatalogItem(id: string, data: {
@@ -12980,7 +13031,8 @@ export async function updateCatalogItem(id: string, data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteCatalogItem(id: string) {
@@ -13149,7 +13201,8 @@ export async function createBidPackage(projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function updateBidPackage(id: string, projectId: string, data: {
@@ -13174,7 +13227,8 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
@@ -13203,7 +13257,8 @@ export async function addBidScope(packageId: string, projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return scope;
+    // budgetAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(scope));
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
@@ -13257,7 +13312,8 @@ export async function recordBidResponse(invitationId: string, packageId: string,
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return inv;
+    // bidAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(inv));
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
@@ -13310,7 +13366,8 @@ export async function createRetainer(projectId: string, data: {
     });
 
     revalidatePath(`/projects/${projectId}/retainers`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function updateRetainer(id: string, data: {
@@ -13338,7 +13395,8 @@ export async function updateRetainer(id: string, data: {
     const retainer = await prisma.retainer.update({ where: { id }, data: updateData });
     revalidatePath(`/projects/${existing.projectId}/retainers`);
     revalidatePath(`/projects/${existing.projectId}/retainers/${id}`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function deleteRetainer(id: string) {
@@ -13639,7 +13697,8 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     }));
 
     revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string, purchaseOrderId: string) {
@@ -13722,7 +13781,8 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     revalidatePath(`/projects/${projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 // Result of restoreEstimateItemAssociations — reports exactly what was (and wasn't) restored
@@ -13937,11 +13997,13 @@ export async function restoreEstimateItemAssociations({
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
     await assertFinancialProjectAccess(projectId);
 
-    return prisma.purchaseOrder.findMany({
+    const pos = await prisma.purchaseOrder.findMany({
         where: { projectId },
         select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },
         orderBy: { createdAt: "desc" },
     });
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pos));
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {

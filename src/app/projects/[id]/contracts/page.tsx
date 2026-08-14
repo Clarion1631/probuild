@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import EntityContractsClient from "@/components/EntityContractsClient";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { currentStaffUserOrNull, contractScopeWhere } from "@/lib/permissions";
 
 export const dynamic = "force-dynamic";
 
@@ -17,11 +18,27 @@ export default async function ProjectContractsPage({ params }: { params: Promise
     // Fetch all contracts visible to this project: those directly attached (projectId = X)
     // and those on the linked originating lead (leadId = linked-lead-id).
     // OR returns unique rows; no manual dedup needed.
+    // Scoped by the SAME rule the contract server actions assert. The layout
+    // above checks project access but never the `contracts` permission, and
+    // this page queries Prisma directly rather than through getContracts — so
+    // without this filter a FINANCE user (role default: `estimates`, not
+    // `contracts`) holding project access could read the contract body,
+    // signatures and the signing accessToken here despite being refused by
+    // every guarded action. It also stops the page rendering rows whose edit /
+    // delete / history buttons would throw Forbidden: the linked-lead union
+    // below is deliberately bidirectional, and canAccessJobScope lets the
+    // project id win whenever a converted contract carries both.
+    const viewer = await currentStaffUserOrNull();
     const contracts = await prisma.contract.findMany({
         where: {
-            OR: [
-                { projectId: project.id },
-                ...(linkedLeadId ? [{ leadId: linkedLeadId }] : []),
+            AND: [
+                contractScopeWhere(viewer),
+                {
+                    OR: [
+                        { projectId: project.id },
+                        ...(linkedLeadId ? [{ leadId: linkedLeadId }] : []),
+                    ],
+                },
             ],
         },
         // Only the record COUNT is rendered here; the Signing History modal loads full

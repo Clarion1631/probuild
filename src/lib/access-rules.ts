@@ -129,7 +129,53 @@ export function canAccessEstimate(user: ProjectScopedUser, scope: EstimateOwner)
  * should not thereby be able to generate its contract.
  */
 export function canCreateContractFor(user: ProjectScopedUser, scope: EstimateOwner): boolean {
+    return canAccessContract(user, scope);
+}
+
+/**
+ * Whether this user may read or write an EXISTING contract on the given job.
+ *
+ * Identical rule to canCreateContractFor by design — reading a contract exposes
+ * its legal body, the approval IP/user-agent audit trail, the signature storage
+ * paths and the portal `accessToken` that by itself authorizes a client to view
+ * AND SIGN the document. That is at least as sensitive as authoring one, so the
+ * two share a single decision rather than drifting into "read is looser".
+ * Separate NAME so the contract-read call sites read honestly and so the truth
+ * table in e2e/financial-action-auth.spec.ts pins both meanings independently.
+ */
+export function canAccessContract(user: ProjectScopedUser, scope: EstimateOwner): boolean {
     return hasPermission(user, "contracts") && canAccessJobScope(user, scope);
+}
+
+/** Matches no contract at all. Used where the caller has no accessible scope. */
+const MATCHES_NO_CONTRACT = { id: { in: [] as string[] } };
+
+/**
+ * The Prisma where-fragment form of canAccessContract: the same decision asked
+ * of the whole Contract table at once, so the list and the detail page cannot
+ * answer differently. Every branch mirrors a branch of canAccessContract,
+ * including the ownerless one — a contract attached to neither a project nor a
+ * lead is filtered out for every role, because canAccessContract rejects it for
+ * every role.
+ *
+ * Unlike estimateScopeWhere this ALSO encodes the vertical permission: a caller
+ * without `contracts` matches nothing at all. Safe to drop into a top-level
+ * `where` or an `AND: [...]` alongside caller-supplied filters.
+ */
+export function contractScopeWhere(user: ProjectScopedUser | null | undefined): any {
+    if (!user?.role) return MATCHES_NO_CONTRACT;
+    if (!hasPermission(user, "contracts")) return MATCHES_NO_CONTRACT;
+
+    const projectIds = accessibleProjectIds(user);
+    if (projectIds === "ALL") return ATTACHED_TO_AN_OWNER;
+
+    const branches: any[] = [];
+    if (projectIds.length > 0) branches.push({ projectId: { in: projectIds } });
+    // Mirrors "if (scope.projectId) ... else leadAccess": the lead branch is
+    // only reached when there is no project, hence `projectId: null` here.
+    if (hasPermission(user, "leadAccess")) branches.push({ projectId: null, leadId: { not: null } });
+    if (branches.length === 0) return MATCHES_NO_CONTRACT;
+    return { OR: branches };
 }
 
 /**

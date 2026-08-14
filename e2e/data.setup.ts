@@ -42,6 +42,22 @@ const OOS_ESTIMATE_ID = "e2e-scope-oos-estimate";
 const OOS_LEAD_ID = "e2e-scope-oos-lead";
 const OOS_LEAD_ESTIMATE_ID = "e2e-scope-oos-lead-estimate";
 
+// --- Contract-auth fixtures (prefix e2e-contract-) ---
+// Two more staff users, distinct from SCOPED_STAFF above, because the contract
+// guard (canAccessContract) is BOTH a vertical check (the `contracts`
+// permission) and the horizontal one (project/lead scope) — proving it needs a
+// user that has scope but lacks the permission, and a separate user that has
+// the permission but lacks scope on a specific job. See
+// e2e/contract-auth-runtime.spec.ts, which exercises PR #367's
+// assertContractAccess/canAccessContract/contractScopeWhere through the
+// test-only dispatcher.
+const FINANCE_STAFF_EMAIL = "finance-staff@test.local";
+const CONTRACT_STAFF_EMAIL = "contract-staff@test.local";
+const CONTRACT_INSCOPE_ID = "e2e-contract-inscope";
+const CONTRACT_CONVERTED_ID = "e2e-contract-converted";
+const CONTRACT_LEADONLY_ID = "e2e-contract-leadonly";
+const CONTRACT_EXECUTED_PDF_ID = "e2e-contract-executed-pdf";
+
 // Substrings that identify the LIVE database. The e2e suite creates leads,
 // estimates, and invoices — it must never do that against production data.
 // See docs/TESTING.md (the Henderson-lead incident, June 2026).
@@ -495,6 +511,223 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
         console.log("[data.setup] partial-scope fixtures upserted:", {
             project: OOS_PROJECT_ID, lead: OOS_LEAD_ID, estimates: [OOS_ESTIMATE_ID, OOS_LEAD_ESTIMATE_ID],
         });
+
+        // --- Contract-auth fixtures ---
+        // FINANCE: holds project access (PROJECT_ID) but NOT `contracts` — FINANCE's
+        // role default is `estimates` (getDefaultPermission in access-rules.ts), never
+        // `contracts`. This is the user who must get an EMPTY contract list from the
+        // pages and "Forbidden" from every by-id contract action, proving project
+        // access alone is not the contract permission.
+        const financeStaff = await prisma.user.upsert({
+            where: { email: FINANCE_STAFF_EMAIL },
+            update: { role: "FINANCE", status: "ACTIVATED" },
+            create: {
+                email: FINANCE_STAFF_EMAIL,
+                name: "E2E Finance Staff",
+                role: "FINANCE",
+                status: "ACTIVATED",
+            },
+        });
+        const financePermissions = {
+            estimates: true,
+            leadAccess: true,
+            contracts: false,
+            autoGrantNewProjects: false,
+        };
+        await prisma.userPermission.upsert({
+            where: { userId: financeStaff.id },
+            update: financePermissions,
+            create: { userId: financeStaff.id, ...financePermissions },
+        });
+        await prisma.projectAccess.upsert({
+            where: { userId_projectId: { userId: financeStaff.id, projectId: PROJECT_ID } },
+            update: {},
+            create: { userId: financeStaff.id, projectId: PROJECT_ID },
+        });
+        await prisma.projectAccess.deleteMany({
+            where: { userId: financeStaff.id, projectId: { not: PROJECT_ID } },
+        });
+        const financeCrewProjects = await prisma.project.findMany({
+            where: { id: { not: PROJECT_ID }, crew: { some: { id: financeStaff.id } } },
+            select: { id: true },
+        });
+        for (const p of financeCrewProjects) {
+            await prisma.project.update({
+                where: { id: p.id },
+                data: { crew: { disconnect: { id: financeStaff.id } } },
+            });
+        }
+        console.log("[data.setup] finance staff user upserted:", { id: financeStaff.id, email: financeStaff.email });
+
+        // CONTRACT_STAFF: holds `contracts` + `leadAccess`, but scope reaches only
+        // PROJECT_ID — proves canAccessJobScope lets projectId win when a converted
+        // contract carries BOTH ids (CONTRACT_CONVERTED_ID below): leadAccess must
+        // not rescue a contract on a project this user cannot otherwise reach.
+        const contractStaff = await prisma.user.upsert({
+            where: { email: CONTRACT_STAFF_EMAIL },
+            update: { role: "EMPLOYEE", status: "ACTIVATED" },
+            create: {
+                email: CONTRACT_STAFF_EMAIL,
+                name: "E2E Contract Staff",
+                role: "EMPLOYEE",
+                status: "ACTIVATED",
+            },
+        });
+        const contractPermissions = {
+            estimates: true,
+            leadAccess: true,
+            contracts: true,
+            autoGrantNewProjects: false,
+        };
+        await prisma.userPermission.upsert({
+            where: { userId: contractStaff.id },
+            update: contractPermissions,
+            create: { userId: contractStaff.id, ...contractPermissions },
+        });
+        await prisma.projectAccess.upsert({
+            where: { userId_projectId: { userId: contractStaff.id, projectId: PROJECT_ID } },
+            update: {},
+            create: { userId: contractStaff.id, projectId: PROJECT_ID },
+        });
+        await prisma.projectAccess.deleteMany({
+            where: { userId: contractStaff.id, projectId: { not: PROJECT_ID } },
+        });
+        const contractCrewProjects = await prisma.project.findMany({
+            where: { id: { not: PROJECT_ID }, crew: { some: { id: contractStaff.id } } },
+            select: { id: true },
+        });
+        for (const p of contractCrewProjects) {
+            await prisma.project.update({
+                where: { id: p.id },
+                data: { crew: { disconnect: { id: contractStaff.id } } },
+            });
+        }
+        console.log("[data.setup] contract staff user upserted:", { id: contractStaff.id, email: contractStaff.email });
+
+        // Three contracts covering the three scope shapes canAccessContract cares
+        // about. Every field is restated in `update:` — an empty update adopts
+        // whatever drift an earlier run left behind.
+        await prisma.contract.upsert({
+            where: { id: CONTRACT_INSCOPE_ID },
+            update: {
+                projectId: PROJECT_ID,
+                leadId: null,
+                title: "E2E In-Scope Contract — DO NOT DELETE",
+                body: "E2E IN-SCOPE CONTRACT BODY — DO NOT DELETE",
+                status: "Draft",
+                accessToken: "e2e-contract-token-inscope",
+            },
+            create: {
+                id: CONTRACT_INSCOPE_ID,
+                projectId: PROJECT_ID,
+                leadId: null,
+                title: "E2E In-Scope Contract — DO NOT DELETE",
+                body: "E2E IN-SCOPE CONTRACT BODY — DO NOT DELETE",
+                status: "Draft",
+                accessToken: "e2e-contract-token-inscope",
+            },
+        });
+        // THIS IS THE CRITICAL ONE — carries BOTH projectId and leadId, like a
+        // converted lead. leadAccess alone would admit it via the lead, but
+        // canAccessJobScope lets the project id win, and contract-staff cannot
+        // reach OOS_PROJECT_ID, so it must be refused.
+        await prisma.contract.upsert({
+            where: { id: CONTRACT_CONVERTED_ID },
+            update: {
+                projectId: OOS_PROJECT_ID,
+                leadId: OOS_LEAD_ID,
+                title: "E2E Converted Contract — DO NOT DELETE",
+                body: "E2E CONVERTED CONTRACT BODY — DO NOT DELETE",
+                status: "Draft",
+                accessToken: "e2e-contract-token-converted",
+            },
+            create: {
+                id: CONTRACT_CONVERTED_ID,
+                projectId: OOS_PROJECT_ID,
+                leadId: OOS_LEAD_ID,
+                title: "E2E Converted Contract — DO NOT DELETE",
+                body: "E2E CONVERTED CONTRACT BODY — DO NOT DELETE",
+                status: "Draft",
+                accessToken: "e2e-contract-token-converted",
+            },
+        });
+        // The POSITIVE control, reachable by contract-staff via leadAccess. Also
+        // the contract the portal tests use (lead-owned, so /portal/contracts/[id]
+        // skips the getPortalVisibility(projectId) branch). Signed + approvedBy/At
+        // set, with requiresCountersign explicitly false, so the portal treats it
+        // as executed (isExecuted = isSigned && !awaitingCountersign) and renders
+        // the archived-PDF banner. A default only applies on `create` — restated
+        // here in `update` too, or a pre-existing `true` on a reused database
+        // would survive and silently flip the portal's executed/awaiting state.
+        await prisma.contract.upsert({
+            where: { id: CONTRACT_LEADONLY_ID },
+            update: {
+                projectId: null,
+                leadId: OOS_LEAD_ID,
+                title: "E2E Lead-Only Contract — DO NOT DELETE",
+                body: "E2E LEAD-ONLY CONTRACT BODY — DO NOT DELETE",
+                status: "Signed",
+                accessToken: "e2e-contract-token-leadonly",
+                approvedBy: "Test Client",
+                approvedAt: new Date(),
+                requiresCountersign: false,
+            },
+            create: {
+                id: CONTRACT_LEADONLY_ID,
+                projectId: null,
+                leadId: OOS_LEAD_ID,
+                title: "E2E Lead-Only Contract — DO NOT DELETE",
+                body: "E2E LEAD-ONLY CONTRACT BODY — DO NOT DELETE",
+                status: "Signed",
+                accessToken: "e2e-contract-token-leadonly",
+                approvedBy: "Test Client",
+                approvedAt: new Date(),
+                requiresCountersign: false,
+            },
+        });
+        console.log("[data.setup] contracts upserted:", {
+            inscope: CONTRACT_INSCOPE_ID, converted: CONTRACT_CONVERTED_ID, leadonly: CONTRACT_LEADONLY_ID,
+        });
+
+        // Executed-PDF file for CONTRACT_LEADONLY_ID. Name must be the EXACT string
+        // executedContractPdfFor() matches on (src/lib/contract-files-core.ts).
+        await prisma.projectFile.upsert({
+            where: { id: CONTRACT_EXECUTED_PDF_ID },
+            update: {
+                leadId: OOS_LEAD_ID,
+                projectId: null,
+                mimeType: "application/pdf",
+                name: `Executed_Contract_${CONTRACT_LEADONLY_ID}.pdf`,
+                url: "https://example.test/e2e/executed-contract.pdf",
+            },
+            create: {
+                id: CONTRACT_EXECUTED_PDF_ID,
+                leadId: OOS_LEAD_ID,
+                projectId: null,
+                mimeType: "application/pdf",
+                name: `Executed_Contract_${CONTRACT_LEADONLY_ID}.pdf`,
+                url: "https://example.test/e2e/executed-contract.pdf",
+            },
+        });
+        console.log("[data.setup] executed contract PDF file upserted:", { id: CONTRACT_EXECUTED_PDF_ID });
+
+        // Portal sanity check: resolveSessionClientId (src/lib/portal-auth.ts)
+        // collapses to `null` — silently — if this email matches zero OR more than
+        // one Client row, which would make the portal-session contract test pass
+        // for the wrong reason (a null session falls through to the accessToken-only
+        // path, never exercising the session branch at all).
+        const portalClientMatches = await prisma.client.findMany({
+            where: { email: "test-client@goldentouchremodeling.com" },
+            select: { id: true },
+        });
+        console.log("[data.setup] portal client sanity check:", portalClientMatches);
+        if (portalClientMatches.length !== 1) {
+            throw new Error(
+                `[data.setup] expected exactly one Client with email test-client@goldentouchremodeling.com, ` +
+                    `found ${portalClientMatches.length}. resolveSessionClientId() would silently return null, ` +
+                    `and the portal-session contract test would pass for the wrong reason.`
+            );
+        }
 
         const verify = await prisma.project.findUnique({ where: { id: PROJECT_ID }, select: { id: true, name: true } });
         console.log("[data.setup] verify project exists:", verify);
