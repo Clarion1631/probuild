@@ -11,6 +11,10 @@ import assert from "node:assert/strict";
 import {
     bucketWorkweeks,
     priceWorkweek,
+    priceEntrySplits,
+    priceEntryBurden,
+    sumEntryPay,
+    roundToCents,
     OVERTIME_MULTIPLIER,
     WA_WEEKLY_OVERTIME_THRESHOLD_HOURS,
     type OvertimeTimeEntry,
@@ -137,6 +141,24 @@ test("DST fall-back week (Nov 2026) still buckets Mon-Sun correctly and spans th
     assert.equal(transitionWeek.weekEnd.getTime(), nextWeek.weekStart.getTime());
 });
 
+test("bucketWorkweeks honors the timeZone parameter — it is not hardcoded to America/Los_Angeles", () => {
+    // 2026-08-17T06:30:00Z reads as Sunday 2026-08-16 in America/Los_Angeles
+    // (the last day of the Aug 10-16 workweek) but Monday 2026-08-17 in
+    // America/New_York (the first day of the Aug 17-23 workweek) — a real
+    // instant where the two zones disagree about which workweek a punch
+    // belongs to. If bucketWorkweeks ever regressed to a hardcoded LA day-key
+    // (e.g. via company-day.ts's toCompanyDayKey), this would fail because
+    // both calls would land in the same week.
+    const instant = new Date("2026-08-17T06:30:00.000Z");
+    const entry: OvertimeTimeEntry = { startTime: instant, durationHours: 4 };
+
+    const [laWeek] = bucketWorkweeks([entry], "America/Los_Angeles");
+    assert.equal(laWeek.weekStartKey, "2026-08-10");
+
+    const [nyWeek] = bucketWorkweeks([entry], "America/New_York");
+    assert.equal(nyWeek.weekStartKey, "2026-08-17");
+});
+
 test("bucketWorkweeks skips entries with zero, negative, or non-finite duration (e.g. still clocked in)", () => {
     const entries: OvertimeTimeEntry[] = [
         entryOn("2026-08-10", 8),
@@ -167,4 +189,85 @@ test("a week with no overtime hours prices with zero overtime pay", () => {
     const pay = priceWorkweek({ regularHours: WA_WEEKLY_OVERTIME_THRESHOLD_HOURS - 1, overtimeHours: 0 }, 25, 5);
     assert.equal(pay.overtimePay, 0);
     assert.equal(pay.totalPay, pay.regularPay);
+});
+
+test("roundToCents corrects binary floating-point representation error before rounding half-up", () => {
+    // 1.005 * 100 evaluates to 100.49999999999999 in IEEE 754 double
+    // arithmetic — a naive Math.round(dollars * 100) rounds that DOWN to 100
+    // ($1.00), silently shorting a genuine half-cent-up case. roundToCents
+    // must still land on 101 ($1.01).
+    assert.equal(Math.round(1.005 * 100), 100); // the bug this guards against
+    assert.equal(roundToCents(1.005), 101);
+    assert.equal(roundToCents(0.145), 15); // another classic float-noise case (14.499999999999998)
+});
+
+test("priceWorkweek: totalPay always equals regularPay + overtimePay exactly, even when the unrounded sum would round differently", () => {
+    // regularPay and overtimePay each round DOWN to $0.00 individually
+    // (0.4 cents each), but their unrounded sum (0.8 cents) would round UP to
+    // $0.01 if the total were computed by rounding the raw sum instead of
+    // summing the already-rounded parts. The chosen policy is: round the
+    // parts, total = their sum — so totalPay must be $0.00 here, not $0.01.
+    const pay = priceWorkweek({ regularHours: 0.004, overtimeHours: 0.004 / 1.5 }, 1, 0);
+    assert.equal(pay.regularPay, 0);
+    assert.equal(pay.overtimePay, 0);
+    assert.equal(pay.totalPay, 0);
+    assert.equal(pay.totalPay, pay.regularPay + pay.overtimePay);
+});
+
+test("priceEntrySplits prices each entry at its OWN rate — a later rate change does not retroactively reprice an earlier entry", () => {
+    // Mon: 40h at $20/hr (fully regular). Tue: 4h at $30/hr (a rate change
+    // took effect) — the whole week is already at 40h, so this entry is
+    // entirely OT, priced at ITS rate ($30 * 1.5), not the Monday entry's rate.
+    const monday: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-10", TZ), durationHours: 40 };
+    const tuesday: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-11", TZ), durationHours: 4 };
+    const [week] = bucketWorkweeks([monday, tuesday], TZ);
+
+    const rates = new Map([
+        [monday, 20],
+        [tuesday, 30],
+    ]);
+    const priced = priceEntrySplits(week.entries, (entry) => ({ hourlyRate: rates.get(entry)!, rateSource: "entry" }));
+
+    const mondayPay = priced.find((p) => p.entry === monday)!;
+    const tuesdayPay = priced.find((p) => p.entry === tuesday)!;
+
+    assert.equal(mondayPay.regularHours, 40);
+    assert.equal(mondayPay.regularPay, 800); // 40 * 20
+    assert.equal(mondayPay.overtimePay, 0);
+
+    assert.equal(tuesdayPay.overtimeHours, 4);
+    assert.equal(tuesdayPay.regularPay, 0);
+    assert.equal(tuesdayPay.overtimePay, 180); // 4 * 30 * 1.5
+
+    const totals = sumEntryPay(priced);
+    assert.equal(totals.regularPay, 800);
+    assert.equal(totals.overtimePay, 180);
+    assert.equal(totals.totalPay, 980);
+});
+
+test("priceEntrySplits reports rateSource so a fallback-priced entry (no stored historical rate) can be flagged rather than silently trusted", () => {
+    const withRate: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-10", TZ), durationHours: 8 };
+    const withoutRate: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-11", TZ), durationHours: 8 };
+    const [week] = bucketWorkweeks([withRate, withoutRate], TZ);
+
+    const priced = priceEntrySplits(week.entries, (entry) =>
+        entry === withRate ? { hourlyRate: 25, rateSource: "entry" } : { hourlyRate: 18, rateSource: "fallback" },
+    );
+
+    assert.equal(priced.find((p) => p.entry === withRate)!.rateSource, "entry");
+    assert.equal(priced.find((p) => p.entry === withoutRate)!.rateSource, "fallback");
+});
+
+test("priceEntryBurden is flat per hour (never OT-multiplied) and honors a per-entry burden rate", () => {
+    const monday: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-10", TZ), durationHours: 40 };
+    const tuesday: OvertimeTimeEntry = { startTime: dateOnlyInTimeZone("2026-08-11", TZ), durationHours: 4 };
+    const [week] = bucketWorkweeks([monday, tuesday], TZ);
+
+    const burdenRates = new Map([
+        [monday, 5],
+        [tuesday, 7],
+    ]);
+    const burden = priceEntryBurden(week.entries, (entry) => burdenRates.get(entry)!);
+    // 40 * 5 + 4 * 7 = 200 + 28 = 228 — no 1.5x on Tuesday's OT hours.
+    assert.equal(burden, 228);
 });

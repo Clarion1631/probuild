@@ -5,6 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { addCalendarDaysInTimeZone } from "@/lib/tz-date";
 import { bucketWorkweeks, type OvertimeTimeEntry } from "@/lib/overtime";
 
 // One-shot dashboard payload for the mobile manager tab. Replaces ~4 prior client-side
@@ -55,7 +56,13 @@ export async function GET(req: Request) {
     }
 
     const weekStart = weekStartParam ? new Date(weekStartParam) : startOfThisWeek();
-    const weekEnd = new Date(weekStart.getTime() + 7 * 86_400_000);
+    // 7 CALENDAR days later, not weekStart + 168h — a fixed hour offset lands an
+    // hour off local midnight across a DST transition week (e.g. a week
+    // containing the November fall-back is 169 real hours, not 168).
+    const companyTimeZone = await resolveCompanyTimeZone();
+    const weekEnd = Number.isNaN(weekStart.getTime())
+        ? new Date(NaN)
+        : addCalendarDaysInTimeZone(weekStart, 7, companyTimeZone);
 
     if (
         Number.isNaN(dayStart.getTime()) ||
@@ -190,9 +197,8 @@ export async function GET(req: Request) {
     // would have pushed the week over 40, this figure can understate OT for
     // that boundary week. That's an acceptable approximation for an
     // at-a-glance dashboard; a payroll-accurate number should come from
-    // /api/mobile/pay-period-summary, which pads its query to see full
-    // workweeks regardless of the requested range. --------
-    const companyTimeZone = await resolveCompanyTimeZone();
+    // /api/mobile/pay-period-summary, which queries the exact full workweeks
+    // overlapping the requested range regardless of the display window. --------
     const entriesByUser = new Map<string, OvertimeTimeEntry[]>();
     for (const e of weeklyEntries) {
         if (typeof e.durationHours !== "number" || e.durationHours <= 0) continue;
