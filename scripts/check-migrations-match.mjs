@@ -142,12 +142,19 @@ const { PrismaClient } = await import('@prisma/client')
 const db = new PrismaClient({ datasources: { db: { url } } })
 const q = (sql) => db.$queryRawUnsafe(sql)
 
-const norm = (s) => s.replace(/\s+/g, ' ').replace(/\bpublic\./g, '').trim()
-
-// Compare two name->definition maps exactly: missing, extra, and changed.
+// Definitions are compared RAW. Both sides come from the same server-side
+// pg_get_*def functions, which emit a canonical form, so any normalisation here
+// would only be able to hide a real difference — collapsing whitespace or
+// stripping a schema qualifier also rewrites the inside of string literals and
+// quoted identifiers, which is exactly where a meaningful change could hide.
+//
+// Keys include the table, because PostgreSQL allows the same constraint name on
+// different tables; keying by name alone would let a constraint that moved to
+// the wrong table pass, and would silently collapse duplicates.
 function compareDefs(label, expectedRows, actualRows, hint) {
-  const exp = new Map(expectedRows.map((r) => [r.name, norm(r.def)]))
-  const act = new Map(actualRows.map((r) => [r.name, norm(r.def)]))
+  const key = (r) => (r.table ? `${r.table}.${r.name}` : r.name)
+  const exp = new Map(expectedRows.map((r) => [key(r), r.def]))
+  const act = new Map(actualRows.map((r) => [key(r), r.def]))
   for (const [name, def] of exp) {
     if (!act.has(name)) fail(`${label} "${name}" is MISSING from the database.\n  ${hint}`)
     else if (act.get(name) !== def)
@@ -178,21 +185,34 @@ compareDefs(
 compareDefs(
   'check constraint',
   snap.checkConstraints,
-  await q(`SELECT conname AS name, pg_get_constraintdef(oid) AS def
+  await q(`SELECT conname AS name, conrelid::regclass::text AS "table",
+                  pg_get_constraintdef(oid) AS def
              FROM pg_constraint
             WHERE connamespace = 'public'::regnamespace AND contype IN ('c','x')`),
   'Prisma has no check-constraint concept; the baseline tail block creates these.'
 )
 
-const actualRls = new Set(
+// FORCE matters, not just ENABLE: these 26 tables have zero policies, so the
+// application only reads them because owners bypass RLS. FORCE removes that
+// bypass and would deny the owner too — a silent empty-result failure. Assert
+// the flag, not merely the table name.
+const actualRls = new Map(
   (
-    await q(`SELECT relname AS name FROM pg_class
+    await q(`SELECT relname AS name, relforcerowsecurity AS forced FROM pg_class
               WHERE relnamespace = 'public'::regnamespace AND relrowsecurity`)
-  ).map((r) => r.name)
+  ).map((r) => [r.name, r.forced])
 )
-const expectedRls = new Set(snap.rlsTables.map((r) => r.name))
-for (const t of expectedRls) if (!actualRls.has(t)) fail(`RLS is not enabled on "${t}" but is in production.`)
-for (const t of actualRls) if (!expectedRls.has(t)) fail(`RLS is enabled on "${t}" but not in production's snapshot.`)
+const expectedRls = new Map(snap.rlsTables.map((r) => [r.name, r.forced]))
+for (const [t, forced] of expectedRls) {
+  if (!actualRls.has(t)) fail(`RLS is not enabled on "${t}" but is in production.`)
+  else if (actualRls.get(t) !== forced)
+    fail(
+      `RLS FORCE differs on "${t}": production has forced=${forced}, this database has ` +
+        `forced=${actualRls.get(t)}. With no policies attached, FORCE denies even the owner.`
+    )
+}
+for (const t of actualRls.keys())
+  if (!expectedRls.has(t)) fail(`RLS is enabled on "${t}" but not in production's snapshot.`)
 
 const actualPolicies = await q(
   `SELECT tablename AS "table", policyname AS name FROM pg_policies WHERE schemaname = 'public'`

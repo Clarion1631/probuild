@@ -8,9 +8,12 @@
 -- express. So Prisma sees "no unique index here" and proposes creating a plain
 -- one, forever.
 --
--- Applying it would fail outright — the baseline already created an index of
--- that exact name — and if it somehow succeeded it would be strictly stricter
--- than production.
+-- Applying it fails outright: the baseline already created an index of that
+-- exact name. (It is worth being precise about what is NOT wrong with it — a
+-- plain unique index on a single nullable column is not stricter than the
+-- partial one, since ordinary uniqueness already permits many NULLs. The two
+-- differ in index size and in nothing else that matters here. The name
+-- collision is the whole reason it must never be applied.)
 --
 -- This file exists so the difference between "a real gap we intend to close"
 -- (prisma/EXPECTED_SCHEMA_GAP.sql) and "a permanent artefact of Prisma's blind
