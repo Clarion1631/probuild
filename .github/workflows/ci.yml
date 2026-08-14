@@ -48,6 +48,18 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
+      - name: Probe diffs
+        run: |
+          echo "=== A: from-empty -> datamodel (does the model render at all?) ==="
+          npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > /tmp/a.sql
+          echo "lines=$(wc -l < /tmp/a.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/a.sql || true)"
+          echo "=== B: from-url -> empty (what does Prisma think the DB HAS?) ==="
+          npx prisma migrate diff --from-url "$DIRECT_URL" --to-empty --script > /tmp/b.sql
+          echo "lines=$(wc -l < /tmp/b.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/b.sql || true)"
+          echo "=== C: from-empty -> url (what would rebuild the DB?) ==="
+          npx prisma migrate diff --from-empty --to-url "$DIRECT_URL" --script > /tmp/c.sql
+          echo "lines=$(wc -l < /tmp/c.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/c.sql || true)"
+
       - name: Probe
         run: |
           node -e "
