@@ -241,10 +241,11 @@ async function processEvent(eventId: string) {
                     // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
                     const summary = !isFullyRefunded
                         ? `This is a <strong>partial refund</strong>. The milestones below remain marked Paid; please reconcile the balances manually in the Stripe dashboard.`
-                        // An earlier delivery of this same refund already did the work — say so
-                        // rather than reporting a failure the office would chase.
-                        : unwound?.alreadyUnwound
-                        ? `Already reconciled by an earlier delivery of this refund. Nothing was left to reset.`
+                        // Nothing was still Paid once the unwind held its locks. Usually a
+                        // redelivery of this refund, but a staff "undo payment" landing first
+                        // looks the same, so this must not credit an earlier delivery.
+                        : unwound?.nothingLeftPaid
+                        ? `Nothing recording this charge was still marked Paid when reconciliation ran, so there was nothing to reset.`
                         : reset.length === found.length
                         ? `All ${reset.length} milestone(s) recording this charge were reset to Pending and their balances restored.`
                         : reset.length > 0

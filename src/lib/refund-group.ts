@@ -34,20 +34,28 @@ import { toNum } from "@/lib/prisma-helpers";
  * silently reopen all of those. Making the refund group-complete fixes the bug
  * without touching what any of them see.
  *
- * ── Why a NULL intent is not a match ────────────────────────────────────────
+ * ── Why a NULL intent is never a match ──────────────────────────────────────
  *
  * Manual, QuickBooks and pre-mirror legacy settlements leave the column null,
  * so a Paid mirror partner carrying no intent MIGHT be the same money. But it
  * might equally be a genuinely separate payment: once the estimate milestone is
- * Paid, a mirror claim on it fails, so a second invoice clone settled by cheque
- * also ends up Paid with a null intent. Releasing that on a refund of X would
- * raise a balance the client has already paid — the exact class of error this
- * module exists to prevent (Codex round 1).
+ * Paid, a mirror claim on it fails, so an invoice clone settled by cheque also
+ * ends up Paid with a null intent. Releasing that on a refund of X would raise
+ * a balance the client has already paid — the exact class of error this module
+ * exists to prevent.
  *
- * So a null-intent partner is adopted ONLY where the mirror is genuinely 1:1
- * (the estimate milestone has exactly one Paid clone). In a one-to-many group
- * it cannot be attributed to a charge, so it is left alone and reported to the
- * office instead of guessed at.
+ * A first attempt adopted such a partner where the mirror was 1:1, on the
+ * theory that a single clone leaves nothing to confuse it with. That is wrong:
+ * cardinality is not payment identity, and a lone cheque-paid mirror is
+ * indistinguishable from a lone legacy Stripe mirror (Codex round 2). Nothing
+ * on these rows records WHICH payment a null-intent settlement was, so there is
+ * no honest way to decide.
+ *
+ * So: only rows carrying the intent are released. Paid mirror partners with no
+ * intent are collected as `unattributable` — never written, always reported —
+ * so a human resolves them instead of the code guessing. The cost is that a
+ * genuinely legacy 1:1 mirror is no longer auto-unwound; the office is told
+ * about it by name in the refund email, which is the honest trade.
  */
 
 /** Anything with the schedule delegates — the client or a transaction client. */
@@ -66,9 +74,9 @@ export type ChargeGroup = {
     estimateSchedules: ChargeGroupRow[];
     invoiceSchedules: ChargeGroupRow[];
     /**
-     * Paid mirror partners carrying no intent that sit in a one-to-many group,
-     * so they cannot be attributed to this charge. Never touched; surfaced so
-     * the office can reconcile them by hand.
+     * Paid mirror partners carrying no PaymentIntent. They may or may not
+     * record this charge and nothing on the row says which, so they are never
+     * touched — only surfaced, so the office can reconcile them by hand.
      */
     unattributable: ChargeGroupRow[];
     estimateIds: string[];
@@ -113,66 +121,61 @@ export async function resolveChargeGroup(db: Db, paymentIntentId: string): Promi
         select: INV_SELECT,
     });
 
-    const adoptedEst: ChargeGroupRow[] = [];
-    const adoptedInv: ChargeGroupRow[] = [];
+    // Nothing below is ever released. These are the Paid mirror partners that
+    // carry no PaymentIntent — possibly this charge, possibly a cheque — which
+    // the office is asked to resolve by hand.
     const unattributable: ChargeGroupRow[] = [];
 
-    // ── estimate → invoice ──────────────────────────────────────────────────
-    // A Paid clone with a null intent is this charge's mirror only when it is
-    // the milestone's ONLY Paid clone.
-    for (const est of directEst) {
+    // ── estimate → invoice: null-intent clones of a released milestone ──────
+    if (directEst.length > 0) {
         const clones = await db.paymentSchedule.findMany({
-            where: { sourceScheduleId: est.id, status: "Paid" },
+            where: {
+                sourceScheduleId: { in: directEst.map((r) => r.id) },
+                status: "Paid",
+                stripePaymentIntentId: null,
+            },
             select: INV_SELECT,
         });
-        const nulls = clones.filter((c) => c.stripePaymentIntentId === null);
-        if (nulls.length === 0) continue;
-        if (clones.length === 1) adoptedInv.push(invRow(nulls[0]));
-        else unattributable.push(...nulls.map(invRow));
+        unattributable.push(...clones.map(invRow));
     }
 
-    // ── invoice → estimate ──────────────────────────────────────────────────
+    // ── invoice → estimate: null-intent originals of a released clone ───────
+    const sourceIds = directInv.map((r) => r.sourceScheduleId).filter((id): id is string => !!id);
+    if (sourceIds.length > 0) {
+        const sources = await db.estimatePaymentSchedule.findMany({
+            where: { id: { in: sourceIds }, status: "Paid", stripePaymentIntentId: null },
+            select: EST_SELECT,
+        });
+        unattributable.push(...sources.map(estRow));
+    }
+
+    // ── pre-link legacy rows: no `sourceScheduleId` to follow ───────────────
+    // Same name+amount shape the removed per-row helper matched on, but used
+    // only to NAME a candidate for the office. Every plausible candidate is
+    // reported, including an ambiguous set — dropping those silently would let
+    // the invoice reset while its estimate quietly kept the money (round 2).
     for (const inv of directInv) {
-        if (inv.sourceScheduleId) {
-            const source = await db.estimatePaymentSchedule.findFirst({
-                where: { id: inv.sourceScheduleId, status: "Paid", stripePaymentIntentId: null },
-                select: EST_SELECT,
-            });
-            if (!source) continue;
-            // Same 1:1 test from the estimate's side: if the milestone has other
-            // Paid clones, this null-intent original cannot be attributed.
-            const paidClones = await db.paymentSchedule.count({
-                where: { sourceScheduleId: source.id, status: "Paid" },
-            });
-            if (paidClones === 1) adoptedEst.push(estRow(source));
-            else unattributable.push(estRow(source));
-            continue;
-        }
-        // Pre-link legacy row: no `sourceScheduleId`, so fall back to the same
-        // name+amount uniqueness rule the removed per-row unsettle helper used.
-        // A 1:1 legacy pair has no second clone to confuse it with.
+        if (inv.sourceScheduleId) continue;
         const estimateId = inv.invoice?.estimateId;
         if (!estimateId) continue;
         const candidates = await db.estimatePaymentSchedule.findMany({
-            where: {
-                estimateId, name: inv.name, status: "Paid",
-                OR: [{ stripePaymentIntentId: paymentIntentId }, { stripePaymentIntentId: null }],
-            },
+            where: { estimateId, name: inv.name, status: "Paid", stripePaymentIntentId: null },
             select: EST_SELECT,
         });
-        const matching = candidates.filter((c) => toNum(c.amount) === toNum(inv.amount));
-        if (matching.length === 1) adoptedEst.push(estRow(matching[0]));
+        unattributable.push(
+            ...candidates.filter((c) => toNum(c.amount) === toNum(inv.amount)).map(estRow),
+        );
     }
 
-    const estimateSchedules = dedupeById([...directEst.map(estRow), ...adoptedEst]);
-    const invoiceSchedules = dedupeById([...directInv.map(invRow), ...adoptedInv]);
+    const estimateSchedules = dedupeById(directEst.map(estRow));
+    const invoiceSchedules = dedupeById(directInv.map(invRow));
+    // A row carrying the intent is released, so it can never also be reported
+    // as unresolved by one of the link paths above.
     const claimed = new Set([...estimateSchedules, ...invoiceSchedules].map((r) => r.id));
 
     return {
         estimateSchedules,
         invoiceSchedules,
-        // A row adopted via one path must never also be reported as unresolved
-        // via another.
         unattributable: dedupeById(unattributable).filter((r) => !claimed.has(r.id)),
         estimateIds: distinct(estimateSchedules.map((r) => r.parentId)),
         invoiceIds: distinct(invoiceSchedules.map((r) => r.parentId)),
@@ -184,11 +187,14 @@ export type UnwindResult = {
     invoiceSchedules: ChargeGroupRow[];
     unattributable: ChargeGroupRow[];
     /**
-     * True when the group was already empty under the locks — an earlier
-     * delivery of the same refund had done the work. Distinguishes "nothing to
-     * do" from "we tried and failed", which the office email must not conflate.
+     * True when nothing recording this charge was still Paid once the locks
+     * were held. That is all it means: usually a redelivery of the same refund,
+     * but a staff `unrecordPayment` winning the locks first looks identical, so
+     * the office wording must not credit an earlier refund delivery for it
+     * (Codex round 2). It exists to separate "there was nothing left to do"
+     * from "we tried and could not".
      */
-    alreadyUnwound: boolean;
+    nothingLeftPaid: boolean;
 };
 
 /**
@@ -202,47 +208,30 @@ export type UnwindResult = {
  * Re-running on an already-unwound group is a no-op, because the group only
  * ever contains Paid rows.
  *
- * The resets are two batched `updateMany` calls rather than one per row: the
- * whole unwind shares a single transaction with a bounded timeout, and a wide
- * mirror group would otherwise put a hundred-odd sequential statements inside
- * it.
+ * Each side resets in ONE statement rather than one per row: the whole unwind
+ * shares a single transaction with a bounded timeout, and a wide mirror group
+ * would otherwise put a hundred-odd sequential statements inside it.
+ *
+ * The statements are raw so they can use `RETURNING id`, which reports exactly
+ * the rows THIS update changed. An `updateMany` count plus a re-read cannot:
+ * a row another writer had already moved off Paid reads back as not-Paid and
+ * would be counted as reset by us (Codex round 2).
  */
-export async function unwindChargeGroup(tx: Db, group: ChargeGroup): Promise<Omit<UnwindResult, "alreadyUnwound">> {
-    const estIds = group.estimateSchedules.map((r) => r.id);
-    const invIds = group.invoiceSchedules.map((r) => r.id);
+export async function unwindChargeGroup(tx: Db, group: ChargeGroup): Promise<Omit<UnwindResult, "nothingLeftPaid">> {
+    const resetRows = async (table: "EstimatePaymentSchedule" | "PaymentSchedule", ids: string[]) => {
+        if (ids.length === 0) return new Set<string>();
+        const rows = await tx.$queryRaw<{ id: string }[]>`
+            UPDATE ${Prisma.raw(`"${table}"`)}
+               SET "status" = 'Pending', "paidAt" = NULL, "paymentDate" = NULL
+             WHERE "id" = ANY(${ids}) AND "status" = 'Paid'
+         RETURNING "id"`;
+        return new Set(rows.map((r) => r.id));
+    };
 
-    let estimateSchedules = group.estimateSchedules;
-    if (estIds.length > 0) {
-        const reset = await tx.estimatePaymentSchedule.updateMany({
-            where: { id: { in: estIds }, status: "Paid" },
-            data: { status: "Pending", paidAt: null, paymentDate: null },
-        });
-        // The group was resolved under the parent locks, so every member should
-        // still be Paid. Re-read only if something slipped past a writer that
-        // does not take those locks, so the report never over-claims.
-        if (reset.count !== estIds.length) {
-            const still = await tx.estimatePaymentSchedule.findMany({
-                where: { id: { in: estIds }, status: "Paid" }, select: { id: true },
-            });
-            const stuck = new Set(still.map((r) => r.id));
-            estimateSchedules = estimateSchedules.filter((r) => !stuck.has(r.id));
-        }
-    }
-
-    let invoiceSchedules = group.invoiceSchedules;
-    if (invIds.length > 0) {
-        const reset = await tx.paymentSchedule.updateMany({
-            where: { id: { in: invIds }, status: "Paid" },
-            data: { status: "Pending", paidAt: null, paymentDate: null },
-        });
-        if (reset.count !== invIds.length) {
-            const still = await tx.paymentSchedule.findMany({
-                where: { id: { in: invIds }, status: "Paid" }, select: { id: true },
-            });
-            const stuck = new Set(still.map((r) => r.id));
-            invoiceSchedules = invoiceSchedules.filter((r) => !stuck.has(r.id));
-        }
-    }
+    const estDone = await resetRows("EstimatePaymentSchedule", group.estimateSchedules.map((r) => r.id));
+    const invDone = await resetRows("PaymentSchedule", group.invoiceSchedules.map((r) => r.id));
+    const estimateSchedules = group.estimateSchedules.filter((r) => estDone.has(r.id));
+    const invoiceSchedules = group.invoiceSchedules.filter((r) => invDone.has(r.id));
 
     // Recompute only the parents that actually lost a payment.
     for (const estimateId of distinct(estimateSchedules.map((r) => r.parentId))) {
@@ -300,7 +289,11 @@ export async function unwindRefundedCharge(
             const unwound = await unwindChargeGroup(tx, group);
             return {
                 missingParents: null,
-                result: { ...unwound, alreadyUnwound: chargeGroupIsEmpty(group) },
+                result: {
+                    ...unwound,
+                    nothingLeftPaid: group.estimateSchedules.length === 0
+                        && group.invoiceSchedules.length === 0,
+                },
             };
         // Locks, two batched resets and a recompute per parent. The 5s default
         // is tight once a wide group also has to wait on a busy Invoice lock,

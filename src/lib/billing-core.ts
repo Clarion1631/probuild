@@ -268,36 +268,41 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     });
 
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
-    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
     // Clone the estimate's milestones into invoice-side PaymentSchedules. The
-    // source read + clone inserts run in ONE transaction that first takes the
-    // same Project row lock setProjectStartDate uses: a start-date move can
-    // then never slip between our read of the source dueDates and the clone
-    // inserts (which would leave the new clones on pre-shift dates while their
-    // EPS rows and the project's tasks moved -- a partially shifted mirror
-    // group). Lock order is parent-before-child (Project before its Estimate/
-    // Invoice children), matching the canonical money-lock direction in
-    // tx-retry.ts; withTxRetry covers residual serialization failures.
+    // source read, the clone inserts AND the resulting balance/status write run
+    // in ONE transaction that takes the same Project row lock setProjectStartDate
+    // uses: a start-date move can then never slip between our read of the source
+    // dueDates and the clone inserts (which would leave the new clones on
+    // pre-shift dates while their EPS rows and the project's tasks moved -- a
+    // partially shifted mirror group). withTxRetry covers residual serialization
+    // failures.
     // (Lock + scheduleTaskId propagation ported from c250526 during the
     // feat/company-pipeline-dashboard merge.)
-    const paidAmount = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        // Lead-owned estimates (no projectId) need no lock -- start-date
-        // moves only target projects.
-        if (estimate.projectId) {
-            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
-        }
-        // Then the Estimate, keeping the Project -> Estimate -> Invoice
-        // direction (no site locks an Estimate before a Project). This clone
-        // copies each milestone's status AND its stripePaymentIntentId, so
-        // without it a conversion could insert a fresh Paid clone of a charge
-        // that a `charge.refunded` unwind had already resolved and was about to
-        // release -- the new clone would keep the refunded money and its
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Estimate FIRST, then Project. This clone copies each milestone's
+        // status AND its stripePaymentIntentId, so without the Estimate lock a
+        // conversion could insert a fresh Paid clone of a charge that a
+        // `charge.refunded` unwind had already resolved and was about to
+        // release -- the new clone would keep the refunded money and leave its
         // invoice a zero balance. Sharing the lock forces the two to order:
         // convert-then-refund (the clone is seen and released) or
         // refund-then-convert (the milestone is already Pending when cloned).
         // See lib/refund-group.ts.
-        await lockMoneyParents(tx, { estimateId });
+        //
+        // The order is Estimate -> Project, NOT the reverse:
+        // restoreEstimateItemAssociations in actions.ts holds one transaction
+        // spanning PurchaseOrder -> Estimate -> EstimateItem -> Project, so
+        // taking Project first here would let that flow hold Estimate while
+        // waiting on Project and this one hold Project while waiting on
+        // Estimate (Codex round 2). Holding both across the read+insert is what
+        // the Project lock was for, and that is unchanged by the reorder.
+        await lockMoneyParents(tx, { estimateId, invoiceId: invoice.id });
+        // Lead-owned estimates (no projectId) need no Project lock -- start-date
+        // moves only target projects.
+        if (estimate.projectId) {
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
+        }
 
         const schedules = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId },
@@ -339,18 +344,24 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
                 },
             });
         }
+        // The derived balance/status is written INSIDE this transaction, under
+        // the same Estimate+Invoice locks the clone inserts hold. It used to
+        // run after the commit, which let a `charge.refunded` unwind slip in
+        // between: the refund would reset the just-cloned Paid milestone and
+        // recompute the invoice to Issued, and this write would then overwrite
+        // it back to Paid/zero-balance from a paidAmount that was already
+        // stale. Rows Pending, invoice claiming nothing was owed (Codex
+        // round 2).
+        const newBalanceDue = Math.max(0, total - paidAmount);
+        const invoiceStatus = paidAmount > 0
+            ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
+            : "Draft";
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
+        });
         return paidAmount;
     }));
-
-    const newBalanceDue = Math.max(0, total - paidAmount);
-    const invoiceStatus = paidAmount > 0
-        ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
-        : "Draft";
-
-    await prisma.invoice.update({
-        where: { id: invoice.id },
-        data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
-    });
 
     revalidatePath(`/projects/${estimate.projectId}/invoices`);
     return { id: invoice.id, projectId: estimate.projectId };

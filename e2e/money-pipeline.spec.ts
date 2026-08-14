@@ -1150,6 +1150,13 @@ const S = {
   invoice5: "mp3-e2e-invoice-5",
   estLegacy: "mp3-e2e-eps-legacy",
   invLegacy: "mp3-e2e-ps-legacy",
+  // S11: a pre-link invoice row (no sourceScheduleId) with two identical
+  // estimate candidates — attribution is impossible, silence is not acceptable.
+  estimate6: "mp3-e2e-estimate-6",
+  invoice6: "mp3-e2e-invoice-6",
+  estPrelinkA: "mp3-e2e-eps-prelink-a",
+  estPrelinkB: "mp3-e2e-eps-prelink-b",
+  invPrelink: "mp3-e2e-ps-prelink",
 };
 const S_NAME = "Stripe Mirror Drill - MP3TEST";
 const sPrisma = new PrismaClient();
@@ -1161,6 +1168,7 @@ const OTHER_INTENT = "pi_mp3_e2e_other_intent";
 const GROUP_INTENT = "pi_mp3_e2e_group_intent";
 const MIXED_INTENT = "pi_mp3_e2e_mixed_intent";
 const LEGACY_INTENT = "pi_mp3_e2e_legacy_intent";
+const PRELINK_INTENT = "pi_mp3_e2e_prelink_intent";
 
 test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
   test.beforeAll(async () => {
@@ -1378,12 +1386,48 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
         status: "Paid", sourceScheduleId: S.estLegacy, stripePaymentIntentId: LEGACY_INTENT,
       },
     });
+
+    // Sixth fixture: pre-link invoice row, two indistinguishable candidates.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate6 },
+      update: { status: "Paid", totalAmount: 1000, balanceDue: 0, statusBeforePayment: "Invoiced" },
+      create: {
+        id: S.estimate6, title: `${S_NAME} 6`, code: "EST-MP3TEST-6", projectId: S.project,
+        status: "Paid", taxExempt: true, totalAmount: 1000, balanceDue: 0, statusBeforePayment: "Invoiced",
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice6 },
+      update: { status: "Paid", totalAmount: 500, balanceDue: 0 },
+      create: {
+        id: S.invoice6, code: "INV-MP3TEST-6", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate6, status: "Paid", totalAmount: 500, balanceDue: 0, issueDate: new Date(),
+      },
+    });
+    for (const [id, order] of [[S.estPrelinkA, 1], [S.estPrelinkB, 2]] as const) {
+      await sPrisma.estimatePaymentSchedule.upsert({
+        where: { id },
+        update: { status: "Paid", stripePaymentIntentId: null, paidAt: new Date(), paymentDate: new Date() },
+        create: {
+          id, estimateId: S.estimate6, name: "MP3 Prelink", amount: 500, status: "Paid", order,
+        },
+      });
+    }
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invPrelink },
+      update: { status: "Paid", stripePaymentIntentId: PRELINK_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        // No sourceScheduleId: this is the pre-link shape.
+        id: S.invPrelink, invoiceId: S.invoice6, name: "MP3 Prelink", amount: 500,
+        status: "Paid", stripePaymentIntentId: PRELINK_INTENT,
+      },
+    });
   });
 
   test.afterAll(async () => {
     try {
-      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b, S.invoice5];
-      const estimateIds = [S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5];
+      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b, S.invoice5, S.invoice6];
+      const estimateIds = [S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5, S.estimate6];
       await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: invoiceIds } } });
       await sPrisma.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
       await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
@@ -1601,21 +1645,43 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(Number(refunded.balanceDue)).toBe(300);
   });
 
-  test("S10: a genuine 1:1 mirror with no intent on the estimate side IS released", async () => {
-    // The counterweight to S9: with exactly one Paid clone there is no second
-    // payment to confuse it with, so the legacy null-intent original is safe to
-    // adopt. Dropping this would leave the estimate claiming refunded money.
+  test("S10: a lone null-intent mirror is REPORTED, not released", async () => {
+    // The counterweight to S9. A single Paid clone was briefly treated as proof
+    // that a null-intent partner recorded this charge — but a lone cheque-paid
+    // mirror looks exactly like a lone legacy Stripe mirror, and nothing on the
+    // row says which it is (Codex round 2). So it is named for a human instead
+    // of being moved on a guess.
     const group = await resolveChargeGroup(sPrisma, LEGACY_INTENT);
-    expect(group.estimateSchedules.map((r) => r.id), "the sole mirror is adopted").toEqual([S.estLegacy]);
-    expect(group.unattributable).toEqual([]);
+    expect(group.estimateSchedules, "the estimate side carries no charge reference").toEqual([]);
+    expect(group.invoiceSchedules.map((r) => r.id)).toEqual([S.invLegacy]);
+    expect(group.unattributable.map((r) => r.id), "and is handed to a human by name")
+      .toEqual([S.estLegacy]);
 
-    await unwindRefundedCharge(sPrisma, LEGACY_INTENT);
+    const unwound = await unwindRefundedCharge(sPrisma, LEGACY_INTENT);
+    expect(unwound.unattributable.map((r) => r.id)).toEqual([S.estLegacy]);
 
     const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estLegacy } });
-    expect(est.status).toBe("Pending");
-    const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate5 } });
-    expect(Number(estimate.balanceDue), "estimate balance restored").toBe(400);
+    expect(est.status, "left alone rather than guessed at").toBe("Paid");
+    // The row that does carry the charge still unwinds.
+    const inv = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invLegacy } });
+    expect(inv.status).toBe("Pending");
     const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice5 } });
     expect(Number(invoice.balanceDue), "invoice balance restored").toBe(400);
+  });
+
+  test("S11: an ambiguous pre-link candidate set is reported, never silently dropped", async () => {
+    // A legacy invoice row with no sourceScheduleId and TWO identical estimate
+    // candidates. Neither can be attributed — but the invoice side still resets,
+    // so staying silent would leave the estimate quietly holding the money.
+    const group = await resolveChargeGroup(sPrisma, PRELINK_INTENT);
+    expect(group.invoiceSchedules.map((r) => r.id)).toEqual([S.invPrelink]);
+    expect(group.unattributable.map((r) => r.id).sort(), "both candidates surface")
+      .toEqual([S.estPrelinkA, S.estPrelinkB].sort());
+
+    await unwindRefundedCharge(sPrisma, PRELINK_INTENT);
+    const rows = await sPrisma.estimatePaymentSchedule.findMany({
+      where: { id: { in: [S.estPrelinkA, S.estPrelinkB] } },
+    });
+    expect(rows.every((r) => r.status === "Paid"), "neither candidate was touched").toBe(true);
   });
 });
