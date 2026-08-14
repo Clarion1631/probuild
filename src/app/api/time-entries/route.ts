@@ -192,7 +192,21 @@ export interface ClockOutDependencies {
     findTimeEntry(id: string): Promise<ClockOutTimeEntryRow | null>;
     findProjectIsLogistics(projectId: string): Promise<boolean>;
     findOwnerRates(userId: string): Promise<{ hourlyRate: number; burdenRate: number } | null>;
-    updateTimeEntry(id: string, data: Record<string, unknown>): Promise<unknown>;
+    /**
+     * Atomically close the entry: applies `data` (which always sets endTime)
+     * ONLY IF the row is still open (endTime IS NULL) at the database — the
+     * guard against two concurrent PUTs both passing the earlier in-memory
+     * `existing.endTime != null` check and racing to overwrite each other's
+     * close. `ok: false` means zero rows matched the guard (a lost race, or
+     * the entry was already closed) — `current` is the row's present state,
+     * for the caller to fold into the 409 body the same way the up-front
+     * already-closed check does.
+     */
+    closeTimeEntry(
+        id: string,
+        userId: string,
+        data: Record<string, unknown>
+    ): Promise<{ ok: true; entry: unknown } | { ok: false; current: unknown | null }>;
 }
 
 export function createClockOutHandler(dependencies: ClockOutDependencies) {
@@ -216,9 +230,19 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
 
             // A closed entry can never be re-closed via PUT — the client must
             // use the PATCH edit flow to change an already-set endTime.
+            // Include the existing (already-closed) entry in the body,
+            // serialized the same way a 200 response would — a client that
+            // actually succeeded on an earlier request but lost the response
+            // (dropped connection, app killed mid-flight) can reconcile its
+            // local "still clocked in" state against this instead of just
+            // seeing a bare failure and retrying forever.
             if (existing.endTime != null) {
                 return NextResponse.json(
-                    { error: "Time entry is already clocked out", code: "ALREADY_CLOCKED_OUT" },
+                    {
+                        error: "Time entry is already clocked out",
+                        code: "ALREADY_CLOCKED_OUT",
+                        entry: JSON.parse(JSON.stringify(existing)),
+                    },
                     { status: 409 }
                 );
             }
@@ -304,8 +328,22 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 }
             }
 
-            const timeEntry = await dependencies.updateTimeEntry(id, updateData);
-            return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
+            const closeResult = await dependencies.closeTimeEntry(id, existing.userId, updateData);
+            if (!closeResult.ok) {
+                // Lost the race to a concurrent PUT that closed the entry
+                // between the check above and this call — same 409 shape as
+                // the up-front already-closed check.
+                return NextResponse.json(
+                    {
+                        error: "Time entry is already clocked out",
+                        code: "ALREADY_CLOCKED_OUT",
+                        entry: closeResult.current ? JSON.parse(JSON.stringify(closeResult.current)) : null,
+                    },
+                    { status: 409 }
+                );
+            }
+
+            return NextResponse.json(JSON.parse(JSON.stringify(closeResult.entry)));
         },
     };
 }
@@ -325,10 +363,9 @@ const clockOutHandler = createClockOutHandler({
         };
     },
     findTimeEntry: async (id) => {
-        return prisma.timeEntry.findUnique({
-            where: { id },
-            select: { id: true, userId: true, projectId: true, startTime: true, endTime: true, notes: true, reviewReason: true },
-        });
+        // Full row (no `select`) — this is also what's serialized into a
+        // 409 ALREADY_CLOCKED_OUT body, which must match a 200's shape.
+        return prisma.timeEntry.findUnique({ where: { id } });
     },
     findProjectIsLogistics: async (projectId) => {
         const project = await prisma.project.findUnique({ where: { id: projectId }, select: { isLogistics: true } });
@@ -339,8 +376,23 @@ const clockOutHandler = createClockOutHandler({
         if (!owner) return null;
         return { hourlyRate: toNum(owner.hourlyRate), burdenRate: toNum(owner.burdenRate) };
     },
-    updateTimeEntry: async (id, data) => {
-        return prisma.timeEntry.update({ where: { id }, data });
+    closeTimeEntry: async (id, userId, data) => {
+        return prisma.$transaction(async (t) => {
+            // The guard: only rows still open (endTime IS NULL), scoped to
+            // the entry's own stored userId, actually get closed. Two
+            // concurrent PUTs can both pass the in-memory already-closed
+            // check above — only one of these updateMany calls can match.
+            const claim = await t.timeEntry.updateMany({
+                where: { id, userId, endTime: null },
+                data,
+            });
+            if (claim.count === 0) {
+                const current = await t.timeEntry.findUnique({ where: { id } });
+                return { ok: false as const, current };
+            }
+            const entry = await t.timeEntry.findUniqueOrThrow({ where: { id } });
+            return { ok: true as const, entry };
+        });
     },
 });
 

@@ -44,8 +44,10 @@ function createDeps(overrides: {
     entry?: ClockOutTimeEntryRow | null;
     isLogistics?: boolean;
     ownerRates?: { hourlyRate: number; burdenRate: number } | null;
+    /** Simulate a concurrent PUT winning the atomic close guard first. */
+    closeRaceLost?: boolean;
 } = {}) {
-    const updateCalls: Array<{ id: string; data: Record<string, unknown> }> = [];
+    const updateCalls: Array<{ id: string; userId: string; data: Record<string, unknown> }> = [];
     const dependencies: ClockOutDependencies = {
         authenticate: async () =>
             overrides.authOk === false
@@ -55,9 +57,13 @@ function createDeps(overrides: {
         findProjectIsLogistics: async () => overrides.isLogistics ?? false,
         findOwnerRates: async () =>
             overrides.ownerRates !== undefined ? overrides.ownerRates : { hourlyRate: 20, burdenRate: 5 },
-        updateTimeEntry: async (id, data) => {
-            updateCalls.push({ id, data });
-            return { id, ...data };
+        closeTimeEntry: async (id, userId, data) => {
+            updateCalls.push({ id, userId, data });
+            if (overrides.closeRaceLost) {
+                const current = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });
+                return { ok: false, current };
+            }
+            return { ok: true, entry: { id, userId, ...data } };
         },
     };
     return { dependencies, updateCalls };
@@ -293,17 +299,46 @@ test("computes durationHours/laborCost/burdenCost from the OWNER's rates, not th
 
 // ── clock-out hardening: re-close, future/invalid endTime ────────────────
 
-test("re-clock-out on an already-closed entry is rejected with 409 ALREADY_CLOCKED_OUT", async () => {
-    const { dependencies, updateCalls } = createDeps({
-        entry: baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") }),
-    });
+test("re-clock-out on an already-closed entry is rejected with 409 ALREADY_CLOCKED_OUT, and the closed entry is included for client reconciliation", async () => {
+    const closedEntry = baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") });
+    const { dependencies, updateCalls } = createDeps({ entry: closedEntry });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
     const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T20:00:00.000Z" }));
     assert.equal(res.status, 409);
     const body = await res.json();
     assert.equal(body.code, "ALREADY_CLOCKED_OUT");
+    assert.deepEqual(body.entry, JSON.parse(JSON.stringify(closedEntry)));
     assert.equal(updateCalls.length, 0);
+});
+
+test("a concurrent close race lost at the DB-level guard still surfaces as 409 ALREADY_CLOCKED_OUT with the entry's current state", async () => {
+    // The in-memory already-closed check above passes (entry looks open),
+    // but a concurrent PUT wins the atomic updateMany guard first.
+    const { dependencies, updateCalls } = createDeps({ closeRaceLost: true, entry: baseEntry({ endTime: null }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T19:00:00.000Z" }));
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, "ALREADY_CLOCKED_OUT");
+    assert.equal(body.entry.id, "te1");
+    assert.equal(body.entry.endTime, "2026-08-10T19:00:00.000Z");
+    // The DB guard was actually attempted (this is what caught the race,
+    // not the in-memory check, which had already passed).
+    assert.equal(updateCalls.length, 1);
+});
+
+test("closeTimeEntry's atomic guard scopes to the entry's own stored userId, not the requester's", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        role: "MANAGER",
+        entry: baseEntry({ userId: "owner-1" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].userId, "owner-1");
 });
 
 test("a future endTime beyond the clock-skew allowance is rejected with 400", async () => {
