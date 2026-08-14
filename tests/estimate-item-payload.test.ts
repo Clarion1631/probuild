@@ -568,7 +568,7 @@ test("billableCoItems drops section rows without guessing at their meaning", () 
 test("every money path refuses a change order carrying section headers", () => {
     const root = path.join(__dirname, "..");
     const guarded = {
-        "src/lib/change-order-core.ts": 2,   // write + approve
+        "src/lib/change-order-core.ts": 3,   // write + approve + manual approve
         "src/lib/billing-core.ts": 2,        // send + bill
     };
     for (const [file, expected] of Object.entries(guarded)) {

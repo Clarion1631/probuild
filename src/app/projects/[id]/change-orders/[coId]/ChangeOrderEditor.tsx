@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder, manuallyApproveChangeOrder } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
@@ -26,6 +26,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSending, setIsSending] = useState(false);
     const [isBilling, setIsBilling] = useState(false);
     const [billingPreview, setBillingPreview] = useState<any | null>(null);
+    const [showManualApproveConfirm, setShowManualApproveConfirm] = useState(false);
+    const [isManuallyApproving, setIsManuallyApproving] = useState(false);
 
     // A signed CO is a contract: title, description, and items are the approved
     // scope and remain immutable after approval. The server enforces the same
@@ -41,6 +43,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     );
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
+    const canManuallyApprove = (status === "Draft" || status === "Sent") && !initialData.clientSignatureUrl;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.
@@ -72,6 +75,23 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             toast.error(e?.message || "Failed to countersign change order");
         } finally {
             setIsSigning(false);
+        }
+    }
+
+    async function handleManualApprove() {
+        setIsManuallyApproving(true);
+        try {
+            // Staff-side approval — bills the same as the portal path but never
+            // emails the client (see manuallyApproveChangeOrder).
+            const updated = await manuallyApproveChangeOrder(initialData.id);
+            setStatus(updated.status);
+            toast.success("Change order marked as approved (manual)");
+            setShowManualApproveConfirm(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to mark as approved");
+        } finally {
+            setIsManuallyApproving(false);
         }
     }
 
@@ -637,6 +657,41 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                             <p className="text-sm">Awaiting client signature</p>
                                             {status === "Sent" && (
                                                 <p className="text-xs mt-1 text-slate-400">We&apos;ve asked the client to sign this.</p>
+                                            )}
+                                            {canManuallyApprove && (
+                                                showManualApproveConfirm ? (
+                                                    <div className="mt-4 pt-4 border-t border-slate-200 text-left">
+                                                        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+                                                            Approves without client signature. Billing milestones are created but nothing is emailed to the client.
+                                                        </p>
+                                                        <div className="flex justify-center gap-2 mt-3">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setShowManualApproveConfirm(false)}
+                                                                disabled={isManuallyApproving}
+                                                                className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={handleManualApprove}
+                                                                disabled={isManuallyApproving}
+                                                                className="hui-btn hui-btn-primary text-xs px-3 py-1.5 disabled:opacity-50"
+                                                            >
+                                                                {isManuallyApproving ? "Approving…" : "Confirm approval"}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setShowManualApproveConfirm(true)}
+                                                        className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-3"
+                                                    >
+                                                        Mark as Approved (manual)
+                                                    </button>
+                                                )
                                             )}
                                         </div>
                                     )}

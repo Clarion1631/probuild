@@ -32,7 +32,7 @@ import { postDailyLogSummary } from "./chat-webhook";
 import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { recordPaymentCore } from "./payment-record-core";
-import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
+import { deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
@@ -9283,6 +9283,56 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
     revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${existing.projectId}/change-orders`);
     return { success: true };
+}
+
+// Staff-side manual approval. Distinct from approveChangeOrder (the customer's
+// portal approval) and countersignChangeOrderAsCompany (records the company's
+// counter-signature but leaves status untouched): this flips status to
+// Approved itself, without a client ever signing. Auth mirrors
+// countersignChangeOrderAsCompany — staff-only, no separate project-access
+// check. The post-approval billing automation runs exactly as it does for the
+// portal path, except the client-facing milestone payment email is suppressed
+// (see handleChangeOrderApproved's suppressClientEmails option).
+export async function manuallyApproveChangeOrder(id: string) {
+    "use server";
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    // Role gate — only ADMIN/MANAGER can manually approve on the client's behalf.
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    const staffName = (user.name || session.user.email || "").trim();
+    const approval = await manuallyApproveChangeOrderCore(id, {
+        staffName,
+        approvedAt: new Date(),
+    });
+    if (!approval) throw new Error("Change order not found");
+    const { co, transitioned } = approval;
+
+    // Exactly-once post-approval automation, same as approveChangeOrder — bill
+    // onto the invoice and notify the team, with client emails suppressed since
+    // no client ever saw or signed this change order.
+    if (transitioned) {
+        const runAutomation = async () => {
+            try {
+                const { handleChangeOrderApproved } = await import("./billing-core");
+                await handleChangeOrderApproved(id, { freshlyApproved: true, suppressClientEmails: true });
+            } catch (err) {
+                console.error("[manuallyApproveChangeOrder] post-approval automation failed:", err);
+            }
+        };
+        try {
+            after(runAutomation);
+        } catch {
+            await runAutomation();
+        }
+    }
+
+    revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${co.projectId}/change-orders`);
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {

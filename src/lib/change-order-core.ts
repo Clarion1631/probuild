@@ -419,6 +419,82 @@ export async function approveChangeOrderCore(
 }
 
 /**
+ * Staff-side manual approval — lets an internal user flip a change order to
+ * Approved without the client ever visiting the portal. Distinct from
+ * approveChangeOrderCore (the customer's signed approval, which requires
+ * status Sent and a persisted signature): this accepts Draft or Sent, never
+ * writes clientSignatureUrl, and stamps approvedBy with a "(manual approval —
+ * staff)" suffix so the audit trail can never be mistaken for a client
+ * signature. Rejects a CO that is already Approved or already carries a
+ * client signature — the portal approval flow owns that state once it exists.
+ * Carries the same item/section-row/subtotal invariants as
+ * approveChangeOrderCore so a manually-approved CO can never reach billing in
+ * a state billChangeOrderCore would otherwise reject.
+ */
+export async function manuallyApproveChangeOrderCore(
+    id: string,
+    approval: { staffName: string; approvedAt: Date },
+) {
+    return prisma.$transaction(async (tx) => {
+        // Same parent-row lock as approveChangeOrderCore/updateChangeOrderCore/
+        // billing — status, item existence, subtotal validation, and the
+        // approval write observe one serialized state.
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
+            clientSignatureUrl: string | null;
+        }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl"
+            FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
+        const current = locked[0];
+        if (!current) return null;
+
+        if (current.status !== "Draft" && current.status !== "Sent") {
+            throw new Error(`Change order ${current.code} must be Draft or Sent to be manually approved.`);
+        }
+        if (current.clientSignatureUrl) {
+            throw new Error(`Change order ${current.code} already has a client signature — use the portal approval flow.`);
+        }
+
+        if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");
+
+        if (current.pricingType === "COST_PLUS") {
+            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
+            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        }
+
+        const items = await tx.changeOrderItem.findMany({
+            where: { changeOrderId: id },
+            select: { name: true, type: true, quantity: true, unitCost: true },
+        });
+        // Legacy rows written before section headers were rejected at the write path.
+        const sectionRows = coSectionRowNames(items);
+        if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
+        if (current.pricingType !== "COST_PLUS" && items.length === 0) {
+            throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
+        }
+
+        const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
+        const renderedSubtotalCents = itemSubtotalCents(items);
+        if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
+            throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
+        }
+        if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
+            throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
+        }
+
+        const co = await tx.changeOrder.update({
+            where: { id },
+            data: {
+                status: "Approved",
+                approvedBy: `${approval.staffName.trim()} (manual approval — staff)`,
+                approvedAt: approval.approvedAt,
+            },
+        });
+        return { co, transitioned: true };
+    }, { timeout: 15_000 });
+}
+
+/**
  * Session-free delete core. The permission-gated server action is the only
  * remote entry point; lifecycle and signature-audit checks remain in this
  * locked transaction.

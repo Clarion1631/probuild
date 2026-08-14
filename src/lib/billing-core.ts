@@ -1732,7 +1732,11 @@ export async function billChangeOrderCore(
 
 export async function handleChangeOrderApproved(
     changeOrderId: string,
-    opts?: { notify?: boolean; freshlyApproved?: boolean },
+    opts?: { notify?: boolean; freshlyApproved?: boolean; suppressClientEmails?: boolean },
+    dependencies: {
+        billChangeOrder?: typeof billChangeOrderCore;
+        sendMilestoneInvoices?: typeof sendMilestoneInvoicesCore;
+    } = {},
 ): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean }> {
     const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean } = { billed: false, sent: false, issues: [] };
     let coLabel = changeOrderId;
@@ -1755,7 +1759,7 @@ export async function handleChangeOrderApproved(
             summary.awaitingActuals = true;
             amountLabel = `cost + ${co.markupPercent ?? 10}% + tax`;
         } else {
-            const bill = await billChangeOrderCore(changeOrderId);
+            const bill = await (dependencies.billChangeOrder ?? billChangeOrderCore)(changeOrderId);
             if (bill.ok) {
             // Show the customer's true charge (subtotal + tax) in the team alert.
             amountLabel = "alreadyBilled" in bill && !bill.alreadyBilled && "subtotal" in bill
@@ -1770,10 +1774,16 @@ export async function handleChangeOrderApproved(
             // email (billChangeOrderCore's row lock guarantees exactly one fresh bill).
                 summary.billed = true;
                 summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
+            } else if (opts?.suppressClientEmails) {
+                // Manual staff approval: billing rows/invoice totals are created
+                // exactly as on the portal path, but no client ever signed this CO,
+                // so no client-facing payment email goes out.
+                summary.billed = true;
+                summary.issues.push("Manually approved by staff — billing created, no payment email sent to the client.");
             } else {
                 summary.billed = true;
                 const freshIds = bill.milestones.filter((row) => row.created).map((row) => row.id);
-                const send = await sendMilestoneInvoicesCore(bill.invoiceId, freshIds, undefined, undefined, "Auto (change-order approval)");
+                const send = await (dependencies.sendMilestoneInvoices ?? sendMilestoneInvoicesCore)(bill.invoiceId, freshIds, undefined, undefined, "Auto (change-order approval)");
                 const resultIssues = send.results.map(r => r.error).filter((e): e is string => !!e);
                 summary.sent = send.results.some(r => !!r.sentTo);
                 if (resultIssues.length) summary.issues.push(...resultIssues);
