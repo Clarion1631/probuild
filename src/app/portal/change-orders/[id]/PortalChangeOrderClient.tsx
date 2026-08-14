@@ -7,6 +7,7 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
+import { buildPdf } from "@/lib/build-pdf";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
     const [isApproving, setIsApproving] = useState(false);
@@ -14,6 +15,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState("");
+    const [isDownloading, setIsDownloading] = useState(false);
 
     const handleApprove = async () => {
         if (!signature.trim()) {
@@ -46,6 +48,30 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
+    const changeOrderBannerText = `${companyName} • Change Order ${initialData.code} (continued)`;
+
+    async function handleDownload() {
+        const element = document.getElementById("change-order-document-wrapper");
+        if (!element) return;
+        setIsDownloading(true);
+        const prevShadow = element.style.boxShadow;
+        const prevBorder = element.style.border;
+        try {
+            element.style.boxShadow = "none";
+            element.style.border = "none";
+            const pdf = await buildPdf(element, { bannerText: changeOrderBannerText });
+            pdf.save(`ChangeOrder_${initialData.code || initialData.id}.pdf`);
+        } catch (err) {
+            console.error("Download failed:", err);
+            toast.error("Couldn't generate the PDF. Please try again.");
+        } finally {
+            // Restore even on failure — a thrown buildPdf() must not leave the
+            // card visually altered (no shadow/border) for the rest of the visit.
+            element.style.boxShadow = prevShadow;
+            element.style.border = prevBorder;
+            setIsDownloading(false);
+        }
+    }
 
     const items = initialData.items || [];
     // Same integer-cents math as the editor, updateChangeOrder's item sync, and
@@ -72,7 +98,20 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                     <span className="text-sm text-slate-500">Change Order Portal</span>
                 </div>
                 <div className="flex items-center gap-4">
-                    <Link href={`/portal/projects/${initialData.projectId}`} className="text-sm text-blue-600 hover:underline">
+                    <button
+                        data-pdf-skip="true"
+                        onClick={handleDownload}
+                        disabled={isDownloading}
+                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition disabled:opacity-50"
+                    >
+                        {isDownloading ? (
+                            <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                        ) : (
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        )}
+                        {isDownloading ? "Generating..." : "Download PDF"}
+                    </button>
+                    <Link data-pdf-skip="true" href={`/portal/projects/${initialData.projectId}`} className="text-sm text-blue-600 hover:underline">
                         Back to Portal
                     </Link>
                     {isApproved && (
@@ -83,10 +122,10 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="change-order-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
-                    <div className="px-5 sm:px-10 pt-10 pb-8 border-b border-slate-200">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 pt-10 pb-8 border-b border-slate-200">
                         <div className="flex flex-col gap-6 sm:flex-row sm:justify-between items-start">
                             <div>
                                 {companySettings?.logoUrl ? (
@@ -142,14 +181,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
                     {/* Memo / Description */}
                     {initialData.description && (
-                        <div className="px-5 sm:px-10 py-8 border-b border-slate-100">
+                        <div data-pdf-row="true" className="px-5 sm:px-10 py-8 border-b border-slate-100">
                             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Reason for Change</h2>
                             <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{initialData.description}</p>
                         </div>
                     )}
 
                     {isCostPlus && (
-                        <div className="mx-5 sm:mx-10 mt-6 p-5 bg-amber-50 border border-amber-200 rounded-lg">
+                        <div data-pdf-row="true" className="mx-5 sm:mx-10 mt-6 p-5 bg-amber-50 border border-amber-200 rounded-lg">
                             <p className="text-xs font-semibold text-amber-700 uppercase tracking-wider">Cost-plus terms</p>
                             <p className="text-xl font-bold text-slate-900 mt-1">Cost + {initialData.markupPercent ?? 10}% + tax</p>
                             <p className="text-sm text-slate-600 mt-2">This approval covers the scope and markup terms. Work is billed from actual time and materials; scope-line prices are non-binding estimates.</p>
@@ -158,7 +197,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
                     {/* Signed Badge */}
                     {isApproved && initialData.approvedBy && (
-                        <div className="mx-5 sm:mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
+                        <div data-pdf-row="true" className="mx-5 sm:mx-10 mt-6 p-5 bg-green-50 border border-green-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center shrink-0">
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
@@ -180,7 +219,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
                     {/* Company Countersignature */}
                     {initialData.companySignedBy && (
-                        <div className="mx-5 sm:mx-10 mt-4 p-5 bg-slate-50 border border-slate-200 rounded-lg">
+                        <div data-pdf-row="true" className="mx-5 sm:mx-10 mt-4 p-5 bg-slate-50 border border-slate-200 rounded-lg">
                             <div className="flex items-start gap-3">
                                 <div className="w-8 h-8 bg-amber-100 rounded-full flex items-center justify-center shrink-0">
                                     <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
@@ -219,7 +258,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                 {billableCoItems(items).map((item: any) => {
                                     const itemTotal = coLineCents(Number(item.quantity || 0), Number(item.unitCost || 0)) / 100;
                                     return (
-                                        <tr key={item.id}>
+                                        <tr data-pdf-row="true" key={item.id}>
                                             <td className="py-3 align-top">
                                                 <div className="font-medium text-slate-800">{item.name}</div>
                                                 {item.description && (
@@ -233,13 +272,13 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     );
                                 })}
                                 {items.length === 0 && (
-                                    <tr><td colSpan={4} className="py-6 text-center text-slate-400">No items specified for this Change Order.</td></tr>
+                                    <tr data-pdf-row="true"><td colSpan={4} className="py-6 text-center text-slate-400">No items specified for this Change Order.</td></tr>
                                 )}
                             </tbody>
                         </table>
 
                         {/* Totals */}
-                        {!isCostPlus ? <div className="flex justify-end mt-6">
+                        {!isCostPlus ? <div data-pdf-row="true" className="flex justify-end mt-6">
                             <div className="w-full sm:w-72">
                                 <div className="flex justify-between py-2 text-sm text-slate-600">
                                     <span>Subtotal</span>
@@ -254,13 +293,13 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <span>{formatCurrency(total)}</span>
                                 </div>
                             </div>
-                        </div> : <div className="flex justify-end mt-6"><div className="w-full sm:w-72 border-t-2 border-slate-800 pt-3 text-right"><p className="text-xs text-slate-500 uppercase">Approved terms</p><p className="text-lg font-bold text-amber-600">Cost + {initialData.markupPercent ?? 10}% + tax</p></div></div>}
+                        </div> : <div data-pdf-row="true" className="flex justify-end mt-6"><div className="w-full sm:w-72 border-t-2 border-slate-800 pt-3 text-right"><p className="text-xs text-slate-500 uppercase">Approved terms</p><p className="text-lg font-bold text-amber-600">Cost + {initialData.markupPercent ?? 10}% + tax</p></div></div>}
 
                         {!isCostPlus && schedules.length > 0 && (
                             <div className="mt-8 border-t border-slate-200 pt-6">
                                 <h3 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Payment schedule</h3>
                                 <div className="space-y-2">
-                                    {schedules.map((row: any) => <div key={row.id} className="flex justify-between text-sm"><span>{row.name}{row.dueDate ? ` · ${new Date(row.dueDate).toLocaleDateString()}` : ""}</span><strong>{formatCurrency(row.amount)}</strong></div>)}
+                                    {schedules.map((row: any) => <div data-pdf-row="true" key={row.id} className="flex justify-between text-sm"><span>{row.name}{row.dueDate ? ` · ${new Date(row.dueDate).toLocaleDateString()}` : ""}</span><strong>{formatCurrency(row.amount)}</strong></div>)}
                                 </div>
                             </div>
                         )}
@@ -268,7 +307,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
                     {/* Signature / Approval Area */}
                     {isSent && (
-                        <div className="px-5 sm:px-10 pb-10 print:hidden">
+                        <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
                                     <h3 className="text-lg font-bold text-slate-800 mb-2">Ready to Approve?</h3>
@@ -338,7 +377,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     )}
                     {!isApproved && !isSent && (
-                        <div className="px-5 sm:px-10 pb-10 print:hidden">
+                        <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8 text-center">
                                 <h3 className="text-lg font-bold text-slate-800 mb-2">Change Order Under Revision</h3>
                                 <p className="text-sm text-slate-500">This change order is not currently available for approval. Please use the newest link from your contractor.</p>
