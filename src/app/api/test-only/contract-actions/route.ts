@@ -1,11 +1,9 @@
 import { NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import {
-    getContracts,
     getContract,
     updateContract,
     deleteContract,
-    getExecutedContractPdf,
     getContractSigningHistory,
     getContractSendDefaults,
     getLead,
@@ -42,25 +40,34 @@ import {
  * "Forbidden" vs "Unauthorized" vs data — and the actions already surface both
  * strings to any caller who triggers them through the UI.
  *
- * THREE INDEPENDENT ENVIRONMENT/CREDENTIAL GATES, plus an allowlist:
+ * FOUR INDEPENDENT ENVIRONMENT/CREDENTIAL GATES, plus an allowlist:
  *  1. E2E_TEST_ROUTES must be exactly "1" — an explicit, positive opt-in whose
  *     ONLY purpose is enabling test routes. Codex's point: deriving "test
  *     routes are on" from an auth secret makes the route a side effect of a
  *     credential rather than a decision, so a secret that leaked into an
- *     environment would silently switch it on. This flag is set nowhere but
- *     the CI Playwright job.
+ *     environment would silently switch it on. Nothing in the app sets this;
+ *     the Playwright harness sets it for the server it starts (see the
+ *     `env` block in playwright.config.ts), so it is on for a local Playwright
+ *     run as well as in CI — but never for a server started any other way.
  *  2. PLAYWRIGHT_TEST_SECRET must be set. Production does not set it (it is
  *     also what registers the test-only CredentialsProvider in lib/auth.ts —
  *     see CLAUDE.md).
- *  3. VERCEL_ENV must not be "production". Note this one FAILS OPEN when
+ *  3. NODE_ENV must not be "production" UNLESS CI is "true". This is the
+ *     positive clause: the CI job runs `npm run start`, i.e. a production
+ *     NODE_ENV, so it needs the CI escape hatch; a real production server has
+ *     neither.
+ *  4. VERCEL_ENV must not be "production". Note this one FAILS OPEN when
  *     VERCEL_ENV is undefined (self-hosted, or a promoted artifact), which is
  *     exactly why it is the belt and gate 1 is the braces — never rely on it
  *     alone.
- *  4. Then: the request must present that secret in `x-e2e-secret`, compared in
- *     constant time, and name one of the eight allowlisted actions.
+ *  5. Then: the request must present that secret in `x-e2e-secret`, compared in
+ *     constant time, and name one of the six allowlisted actions.
  *
- * Every rejection is a bare 404, not a 401/403: an enabled-but-unauthorized
- * caller learns nothing about whether the route exists. Thrown errors are
+ * Every ENVIRONMENT or CREDENTIAL rejection is a bare 404, not a 401/403: an
+ * enabled-but-unauthorized caller learns nothing about whether the route
+ * exists. (A caller who has already cleared those gates and merely names an
+ * unknown action gets a 400 — at that point it is a malformed request from an
+ * authorized test, not a probe, and the distinction leaks nothing.) Thrown errors are
  * mapped through a known-message allowlist rather than returned raw, so a
  * malformed argument cannot surface Prisma model names or source paths the way
  * an unsanitized `Error.message` would.
@@ -76,12 +83,22 @@ export const dynamic = "force-dynamic";
 // relation was the Codex round-1 blocker (an anonymous caller holding a lead id
 // received every contract field, including the signing accessToken, through an
 // action that is not itself part of the contract family).
+//
+// `getContracts` and `getExecutedContractPdf` were in this allowlist until they
+// were DELETED from actions.ts as caller-less dead surface. They had no product
+// caller — this dispatcher was the only thing importing them — and in this
+// build every export of that module is registered as a live POST endpoint
+// anyway (measured, see docs/CONTRACTS.md), so keeping them alive purely so
+// this suite could prove their gates behave was backwards. The scope
+// rule and the by-id gate they exercised are both still covered here: the list
+// side by getLead's embedded contracts relation and the two staff contract
+// pages (which query Prisma directly and never went through getContracts), and
+// the executed-PDF lookup by the portal page's use of the session-free core.
+// See docs/CONTRACTS.md.
 const ACTIONS: Record<string, (...args: any[]) => Promise<any>> = {
-    getContracts,
     getContract,
     updateContract,
     deleteContract,
-    getExecutedContractPdf,
     getContractSigningHistory,
     getContractSendDefaults,
     // Projected down to the id and the contracts relation. getLead otherwise

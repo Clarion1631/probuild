@@ -12,7 +12,7 @@ import { uploadSecureDoc, removeSecureDoc } from "./secure-storage";
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/** Canonical DB `name` of the executed-contract ProjectFile (matched exactly by getExecutedContractPdf). */
+/** Canonical DB `name` of the executed-contract ProjectFile (matched exactly by executedContractPdfFor). */
 export function executedContractFileName(contractId: string): string {
   return `Executed_Contract_${contractId}.pdf`;
 }
