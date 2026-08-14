@@ -60,7 +60,44 @@ function dateParts(date: string, label: string) {
     return { year, month, day };
 }
 
-/** Resolve the instant whose LOCAL wall clock (in timeZone) reads the given y/m/d h:m:s.ms. DST-safe via fixed-point iteration on the UTC offset. */
+/**
+ * Search forward in 1-minute steps (small enough to be exact, cheap enough
+ * not to matter) for the first instant whose LOCAL calendar date in
+ * timeZone equals the target date. Bounded to 6 hours — comfortably past
+ * any real-world DST gap (the largest known are ~2h; most are 1h).
+ */
+function firstInstantOnLocalDate(fromMs: number, year: number, month: number, day: number, timeZone: string): number {
+    const STEP_MS = 60_000;
+    const MAX_STEPS = 6 * 60;
+    let candidate = fromMs;
+    for (let step = 0; step <= MAX_STEPS; step += 1) {
+        const wc = wallClockPartsAt(candidate, timeZone);
+        if (wc.year === year && wc.month === month && wc.day === day) return candidate;
+        candidate += STEP_MS;
+    }
+    // Should be unreachable for any real IANA zone, but return the furthest
+    // point searched rather than an instant we never actually checked.
+    return candidate;
+}
+
+/**
+ * Resolve the instant whose LOCAL wall clock (in timeZone) reads the given
+ * y/m/d h:m:s.ms. DST-safe via fixed-point iteration on the UTC offset —
+ * EXCEPT that iteration assumes the desired wall-clock moment exists at all,
+ * which isn't always true: a spring-forward DST transition can skip a whole
+ * range of local time. Africa/Casablanca is the sharpest real example —
+ * clocks there jump directly from 23:59:59 to 01:00:00, so local midnight
+ * never happens on the day a transition lands. Asking this function for
+ * 2009-06-01 00:00:00 there, the naive iteration converges to
+ * 2009-05-31T23:00:00Z, which reads back as 23:00 on May 31 — the WRONG
+ * calendar day, silently.
+ *
+ * So after the fixed-point iteration, validate the result by formatting it
+ * back in timeZone. If it doesn't read back as the exact desired wall clock,
+ * the desired moment doesn't exist — search forward for the first instant
+ * that at least lands on the correct calendar date, and return that instead
+ * of a wrong-day instant.
+ */
 function resolveWallClockInstant(
     year: number,
     month: number,
@@ -76,6 +113,33 @@ function resolveWallClockInstant(
     for (let attempt = 0; attempt < 3; attempt += 1) {
         instant = desiredWallClock - offsetAt(instant, timeZone);
     }
+
+    // Validate against the NORMALIZED target, not the raw arguments —
+    // Date.UTC happily overflows (e.g. day=33 rolls into next month, as
+    // addCalendarDaysInTimeZone's `wc.day + days` does routinely), so
+    // comparing against un-normalized year/month/day would reject every
+    // valid overflowed result and send the search-forward fallback hunting
+    // for a calendar date that never occurs.
+    const target = new Date(desiredWallClock);
+    const targetYear = target.getUTCFullYear();
+    const targetMonth = target.getUTCMonth() + 1;
+    const targetDay = target.getUTCDate();
+    const targetHour = target.getUTCHours();
+    const targetMinute = target.getUTCMinutes();
+    const targetSecond = target.getUTCSeconds();
+
+    const resolved = wallClockPartsAt(instant, timeZone);
+    const matches =
+        resolved.year === targetYear &&
+        resolved.month === targetMonth &&
+        resolved.day === targetDay &&
+        resolved.hour === targetHour &&
+        resolved.minute === targetMinute &&
+        resolved.second === targetSecond;
+    if (!matches) {
+        instant = firstInstantOnLocalDate(instant, targetYear, targetMonth, targetDay, timeZone);
+    }
+
     return new Date(instant);
 }
 

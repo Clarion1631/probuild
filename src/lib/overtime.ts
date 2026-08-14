@@ -63,16 +63,27 @@ function roundHours(value: number): number {
 
 /**
  * Round a dollar amount to the nearest cent, as an integer number of cents.
- * Correcting for binary floating-point representation error (e.g.
- * `1.005 * 100` evaluates to `100.49999999999999`, not `100.5`) BEFORE the
- * half-up round — otherwise genuine half-cent values round down instead of up.
+ * Corrects for binary floating-point REPRESENTATION error (e.g. `1.005 * 100`
+ * evaluates to `100.49999999999999`, not `100.5`) before the half-up round —
+ * otherwise a genuine half-cent value rounds down instead of up.
+ *
+ * The correction has to be scaled to the value's own floating-point
+ * precision (an ULP-relative epsilon), not a fixed decimal snap: an earlier
+ * version used `toFixed(4)`, which overcorrects — it also bumps a REAL
+ * (non-representation-error) near-half-cent value like 1.0049999 up to
+ * 100.5000 and wrongly rounds it to 101 instead of the correct 100.
+ * `Number.EPSILON * 4` nudges only by a few times the smallest possible
+ * float gap near the value, enough to cancel representation noise (typically
+ * ~1e-14 relative) without touching a difference as large as 1.0049999 vs
+ * 1.005 (~1e-7 relative).
+ *
  * All money math in this module goes through integer cents and is only
  * converted back to dollars at the very end, so a total built from several
  * rounded parts (e.g. totalPay) is always exactly the sum of those parts —
  * never off by a cent from independently re-rounding the unrounded sum.
  */
 export function roundToCents(dollars: number): number {
-    return Math.round(Number((dollars * 100).toFixed(4)));
+    return Math.round(dollars * 100 * (1 + Number.EPSILON * 4));
 }
 
 export function centsToDollars(cents: number): number {

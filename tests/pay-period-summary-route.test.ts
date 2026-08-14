@@ -2,11 +2,17 @@
  * Route-level tests for GET /api/mobile/pay-period-summary, using the same
  * dependency-injection pattern as tests/qbo-expense-sync-route.test.ts — no
  * database required.
+ *
+ * Imports from the pure core module (src/lib/pay-period-summary-core.ts),
+ * NOT the route file itself — the route file has a STATIC import of
+ * mobile-auth.ts, which throws at module load without NEXTAUTH_SECRET.
+ * Going through the core module keeps that fail-fast behavior on the real
+ * route while leaving this suite free of any env-var dependency.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPayPeriodSummaryHandlers, type PayPeriodSummaryDependencies } from "../src/app/api/mobile/pay-period-summary/route";
+import { createPayPeriodSummaryHandlers, type PayPeriodSummaryDependencies } from "../src/lib/pay-period-summary-core";
 
 const TZ = "America/Los_Angeles";
 
@@ -211,4 +217,43 @@ test("a stored historical rate prices an entry differently from the target user'
     assert.equal(body.regularPay, 144); // 8 * 18, not 8 * 25
     assert.equal(body.burdenCost, 24); // 8 * 3
     assert.equal(body.ratesUsingCurrentRateFallback, 0);
+});
+
+test("a burden-only rate gap is still counted in ratesUsingCurrentRateFallback (not just a labor-rate gap)", async () => {
+    // Stored laborCost is present (so pricing IS historically accurate for
+    // pay) but burdenCost is missing — a data gap on burden alone. This must
+    // still increment the fallback counter: the response's burdenCost for
+    // this entry silently used the CURRENT burden rate, which is exactly the
+    // kind of gap the counter exists to surface.
+    const monday = new Date("2026-08-10T15:00:00.000-07:00"); // Mon 8am PT, 8h
+    const { dependencies } = createDeps({
+        hourlyRate: 25,
+        burdenRate: 4, // current burden rate — used as the fallback for this entry
+        entries: [{ startTime: monday, durationHours: 8, laborCost: 8 * 18, burdenCost: null }],
+    });
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+
+    const res = await GET(req("?start=2026-08-10T00:00:00-07:00&end=2026-08-11T00:00:00-07:00"));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.regularPay, 144); // 8 * 18 — labor pricing unaffected
+    assert.equal(body.burdenCost, 32); // 8 * 4 — fell back to the CURRENT burden rate
+    assert.equal(body.ratesUsingCurrentRateFallback, 1); // burden-only gap still counts
+});
+
+test("an entry falling back on BOTH labor and burden counts once, not twice", async () => {
+    const monday = new Date("2026-08-10T15:00:00.000-07:00");
+    const tuesday = new Date("2026-08-11T15:00:00.000-07:00");
+    const { dependencies } = createDeps({
+        entries: [
+            { startTime: monday, durationHours: 8, laborCost: null, burdenCost: null }, // both fall back
+            { startTime: tuesday, durationHours: 8, laborCost: 8 * 20, burdenCost: 8 * 2 }, // neither falls back
+        ],
+    });
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+
+    const res = await GET(req("?start=2026-08-10T00:00:00-07:00&end=2026-08-12T00:00:00-07:00"));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.ratesUsingCurrentRateFallback, 1); // Monday counts once, Tuesday not at all
 });

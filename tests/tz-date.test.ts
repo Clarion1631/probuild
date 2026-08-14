@@ -62,6 +62,15 @@ test("addDaysToKey is pure calendar-key arithmetic, unaffected by any time zone"
     assert.equal(addDaysToKey("2026-02-25", 5), "2026-03-02"); // month rollover
 });
 
+test("startOfDateInTimeZone lands on the correct calendar date even when local midnight is skipped by a DST transition (Africa/Casablanca)", () => {
+    // Morocco's clocks jump directly from 23:59:59 to 01:00:00 on 2009-06-01
+    // — local midnight that day never happens. A naive fixed-point offset
+    // iteration converges to 2009-05-31T23:00:00Z, which reads back as
+    // 23:00 on May 31 in Casablanca — the WRONG calendar day, silently.
+    const start = startOfDateInTimeZone("2009-06-01", "Africa/Casablanca");
+    assert.equal(dayKeyInTimeZone(start, "Africa/Casablanca"), "2009-06-01");
+});
+
 test("startOfDateInTimeZone and endOfDateInTimeZone bracket a full company-local day", () => {
     const start = startOfDateInTimeZone("2026-08-10", TZ);
     const end = endOfDateInTimeZone("2026-08-10", TZ);

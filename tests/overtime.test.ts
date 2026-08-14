@@ -201,6 +201,16 @@ test("roundToCents corrects binary floating-point representation error before ro
     assert.equal(roundToCents(0.145), 15); // another classic float-noise case (14.499999999999998)
 });
 
+test("roundToCents does not overcorrect a real (non-representation-error) near-half-cent value", () => {
+    // 1.0049999 is genuinely NOT a half-cent value — it's a hair under it —
+    // and must round DOWN to 100. An earlier toFixed(4)-based correction
+    // snapped this to 100.5000 and wrongly rounded it up to 101; the
+    // ULP-relative epsilon correction must not make that mistake.
+    assert.equal(roundToCents(1.0049999), 100);
+    // The genuine half-cent case from the test above must still round up.
+    assert.equal(roundToCents(1.005), 101);
+});
+
 test("priceWorkweek: totalPay always equals regularPay + overtimePay exactly, even when the unrounded sum would round differently", () => {
     // regularPay and overtimePay each round DOWN to $0.00 individually
     // (0.4 cents each), but their unrounded sum (0.8 cents) would round UP to
