@@ -17,7 +17,7 @@ export interface CrewRouteDependencies {
     authenticate(req: Request): Promise<AuthResult>;
     getProject(projectId: string): Promise<{ id: string } | null>;
     getCurrentCrew(projectId: string): Promise<CrewMember[]>;
-    /** Returns only the subset of the given ids that are actually assignable (ACTIVATED FIELD_CREW users). */
+    /** Returns only the subset of the given ids that are actually assignable (ACTIVATED FIELD_CREW or MANAGER users). */
     getAssignableUsers(userIds: string[]): Promise<CrewMember[]>;
     applyCrew(input: { projectId: string; userIds: string[]; actorName: string }): Promise<CrewMember[]>;
 }
@@ -72,7 +72,7 @@ export function createCrewRouteHandlers(dependencies: CrewRouteDependencies) {
                 const invalid = wanted.filter((id) => !assignableIds.has(id));
                 if (invalid.length > 0) {
                     return NextResponse.json(
-                        { error: `Not assignable as crew (must be an activated field crew user): ${invalid.join(", ")}` },
+                        { error: `Not assignable as crew (must be an activated field crew or manager user): ${invalid.join(", ")}` },
                         { status: 400 }
                     );
                 }
@@ -118,7 +118,7 @@ const handlers = createCrewRouteHandlers({
     },
     getAssignableUsers: async (userIds) => {
         return prisma.user.findMany({
-            where: { id: { in: userIds }, status: "ACTIVATED", role: "FIELD_CREW" },
+            where: { id: { in: userIds }, status: "ACTIVATED", role: { in: ["FIELD_CREW", "MANAGER"] } },
             select: { id: true, name: true, email: true, role: true },
         });
     },

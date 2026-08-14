@@ -118,6 +118,30 @@ test("POST 400 when a submitted user id is not assignable (not returned by getAs
     assert.equal(applyCalls.length, 0);
 });
 
+// FIELD_CREW and MANAGER are assignable as job crew; ADMIN is not (Justin's
+// call — managers can be put on crew, admins never show up as options).
+
+test("POST accepts a MANAGER as assignable crew", async () => {
+    const managerUser: CrewMember = { id: "m1", name: "Site Manager", email: "m1@example.test", role: "MANAGER" };
+    const { dependencies, applyCalls } = createDeps({ assignableUsers: [managerUser] });
+    const { POST } = createCrewRouteHandlers(dependencies);
+    const res = await POST(postReq({ crewUserIds: ["m1"] }), "p1");
+    assert.equal(res.status, 200);
+    assert.deepEqual(applyCalls[0].userIds, ["m1"]);
+});
+
+test("POST still rejects an ADMIN as assignable crew", async () => {
+    // getAssignableUsers mirrors the real query (FIELD_CREW/MANAGER only) — an
+    // ADMIN id is simply never returned as assignable.
+    const { dependencies, applyCalls } = createDeps({ assignableUsers: [] });
+    const { POST } = createCrewRouteHandlers(dependencies);
+    const res = await POST(postReq({ crewUserIds: ["admin1"] }), "p1");
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /Not assignable as crew/);
+    assert.equal(applyCalls.length, 0);
+});
+
 test("POST applies the crew via applyCrew() and returns the updated list", async () => {
     const { dependencies, applyCalls } = createDeps();
     const { POST } = createCrewRouteHandlers(dependencies);

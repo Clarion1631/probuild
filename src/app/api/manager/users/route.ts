@@ -4,10 +4,8 @@ import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 
 // MANAGER/ADMIN only — the assignable-crew list for the manager's crew picker
-// (src/app/api/manager/jobs/[id]/crew/route.ts POST). Same crew-eligibility
-// rule as getScheduleCrewMembers() (src/lib/actions.ts) and the ACTIVATED
-// check setProjectCrew() enforces on new additions (src/lib/schedule-core.ts):
-// only ACTIVATED FIELD_CREW users are assignable as project crew.
+// (src/app/api/manager/jobs/[id]/crew/route.ts POST). ACTIVATED FIELD_CREW or
+// MANAGER users are assignable as project crew — ADMIN is not.
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
@@ -18,7 +16,7 @@ export async function GET(req: Request) {
     }
 
     const users = await prisma.user.findMany({
-        where: { status: "ACTIVATED", role: "FIELD_CREW" },
+        where: { status: "ACTIVATED", role: { in: ["FIELD_CREW", "MANAGER"] } },
         orderBy: { name: "asc" },
         select: { id: true, name: true, email: true, role: true },
     });
