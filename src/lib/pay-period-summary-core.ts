@@ -60,6 +60,9 @@ import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
 type AuthedUser = { id: string; role: string };
 type AuthResult = { ok: true; user: AuthedUser } | { ok: false; status: number; error: string };
 
+/** Longest [start, end) range a single request may cover — bounds the workweek query fan-out (see file header) and guards against an unbounded scan. */
+export const MAX_PAY_PERIOD_RANGE_DAYS = 62;
+
 type PriceableEntry = OvertimeTimeEntry & {
     laborCost: number | null;
     burdenCost: number | null;
@@ -116,6 +119,13 @@ export function createPayPeriodSummaryHandlers(dependencies: PayPeriodSummaryDep
             const end = new Date(endParam);
             if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end.getTime() <= start.getTime()) {
                 return NextResponse.json({ error: "Invalid start/end range" }, { status: 400 });
+            }
+            const rangeDays = (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
+            if (rangeDays > MAX_PAY_PERIOD_RANGE_DAYS) {
+                return NextResponse.json(
+                    { error: `start/end range must not exceed ${MAX_PAY_PERIOD_RANGE_DAYS} days` },
+                    { status: 400 }
+                );
             }
 
             let targetUserId = user.id;

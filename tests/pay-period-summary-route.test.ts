@@ -12,7 +12,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPayPeriodSummaryHandlers, type PayPeriodSummaryDependencies } from "../src/lib/pay-period-summary-core";
+import {
+    createPayPeriodSummaryHandlers,
+    MAX_PAY_PERIOD_RANGE_DAYS,
+    type PayPeriodSummaryDependencies,
+} from "../src/lib/pay-period-summary-core";
 
 const TZ = "America/Los_Angeles";
 
@@ -72,6 +76,24 @@ test("400 when end <= start", async () => {
     const { GET } = createPayPeriodSummaryHandlers(dependencies);
     const res = await GET(req("?start=2026-08-10T08:00:00-07:00&end=2026-08-10T08:00:00-07:00"));
     assert.equal(res.status, 400);
+});
+
+test(`400 when the range exceeds ${MAX_PAY_PERIOD_RANGE_DAYS} days`, async () => {
+    const { dependencies } = createDeps();
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+    const start = new Date("2026-01-01T00:00:00.000Z");
+    const end = new Date(start.getTime() + (MAX_PAY_PERIOD_RANGE_DAYS + 1) * 24 * 60 * 60 * 1000);
+    const res = await GET(req(`?start=${start.toISOString()}&end=${end.toISOString()}`));
+    assert.equal(res.status, 400);
+});
+
+test(`a range of exactly ${MAX_PAY_PERIOD_RANGE_DAYS} days is accepted`, async () => {
+    const { dependencies } = createDeps();
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+    const start = new Date("2026-01-01T00:00:00.000Z");
+    const end = new Date(start.getTime() + MAX_PAY_PERIOD_RANGE_DAYS * 24 * 60 * 60 * 1000);
+    const res = await GET(req(`?start=${start.toISOString()}&end=${end.toISOString()}`));
+    assert.equal(res.status, 200);
 });
 
 test("propagates the authenticate() failure status/error unchanged", async () => {
