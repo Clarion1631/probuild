@@ -1,19 +1,29 @@
 /**
- * handleChangeOrderApproved's suppressClientEmails option (billing-core.ts).
+ * handleChangeOrderApproved's suppressClientEmails option AND its DB-derived backstop
+ * (billing-core.ts).
  *
  * The manual-approval path (manuallyApproveChangeOrder -> handleChangeOrderApproved with
  * { suppressClientEmails: true }) must still create billing rows/invoice totals exactly as the
- * portal path does, but must NEVER invoke the client-facing milestone-send function. This test
- * proves that by injecting fakes for billChangeOrder/sendMilestoneInvoices via
+ * portal path does, but must NEVER invoke the client-facing milestone-send function.
+ *
+ * Suppression must also hold for callers that never pass the option at all — the hourly
+ * co-billing-sweep cron calls `handleChangeOrderApproved(co.id)` with no opts, so if the inline
+ * after() callback ever drops (no delivery guarantee) or its first attempt fails, the cron's
+ * retry must still recognize a manually-approved CO from the row itself (Approved, no
+ * clientSignatureUrl, approvedBy carries the manual-approval marker — see co-approval.ts) and
+ * suppress the client email on its own, independent of the option.
+ *
+ * This proves both by injecting fakes for billChangeOrder/sendMilestoneInvoices via
  * handleChangeOrderApproved's `dependencies` parameter (mirroring billChangeOrderCore's own
  * existing logActivity/revalidatePath DI) and asserting the send fake's call count.
  *
  * `@/lib/prisma` is mocked with the same `Module.prototype.require` patch used by
  * tests/takeoff-convert-tax.test.ts and tests/change-order-manual-approval-core.test.ts (see the
  * former's header comment for the full rationale). Only two lookups need faking here —
- * `changeOrder.findUnique` (routes past the COST_PLUS branch) and `companySettings.findUnique`
- * (returning null so the best-effort team-notification email never fires a real network call) —
- * because billing itself is fully replaced by the injected `billChangeOrder` fake.
+ * `changeOrder.findUnique` (routes past the COST_PLUS branch and carries the manual-approval
+ * provenance) and `companySettings.findUnique` (returning null so the best-effort
+ * team-notification email never fires a real network call) — because billing itself is fully
+ * replaced by the injected `billChangeOrder` fake.
  */
 
 import { test, before, beforeEach } from "node:test";
@@ -81,19 +91,40 @@ before(async () => {
 
 beforeEach(() => {
     resetFixture();
-    state.changeOrder = {
+    // No notification email configured -> the best-effort team-notify block is a no-op,
+    // so no real network call happens during the test.
+    state.companySettings = null;
+});
+
+/** A CO the client actually signed on the portal — clientSignatureUrl set, approvedBy is
+ * the client's own typed name (no manual-approval marker). isManualCoApproval() is false. */
+function portalApprovedCo() {
+    return {
+        code: "CO-001",
+        title: "Extra tile",
+        totalAmount: 500,
+        pricingType: "FIXED",
+        markupPercent: null,
+        approvedBy: "Jane Client",
+        clientSignatureUrl: "https://example.com/signatures/co-1-client.png",
+        project: { name: "Mueller Bathroom" },
+    };
+}
+
+/** A CO manually approved by staff — no clientSignatureUrl, approvedBy carries the
+ * " (manual approval — staff)" marker. isManualCoApproval() is true. */
+function manualApprovedCo() {
+    return {
         code: "CO-001",
         title: "Extra tile",
         totalAmount: 500,
         pricingType: "FIXED",
         markupPercent: null,
         approvedBy: "Jane Doe (manual approval — staff)",
+        clientSignatureUrl: null,
         project: { name: "Mueller Bathroom" },
     };
-    // No notification email configured -> the best-effort team-notify block is a no-op,
-    // so no real network call happens during the test.
-    state.companySettings = null;
-});
+}
 
 function freshBillResult() {
     return {
@@ -115,7 +146,8 @@ function freshBillResult() {
     };
 }
 
-test("suppressClientEmails: true bills the change order but never calls the milestone-send function", async () => {
+test("explicit suppressClientEmails:true suppresses the send even for a portal-signed CO", async () => {
+    state.changeOrder = portalApprovedCo();
     let sendCallCount = 0;
     const billChangeOrder = async () => freshBillResult();
     const sendMilestoneInvoices = async () => {
@@ -134,7 +166,8 @@ test("suppressClientEmails: true bills the change order but never calls the mile
     assert.equal(summary.sent, false);
 });
 
-test("without suppressClientEmails (portal path, default), the milestone-send function is still called exactly once", async () => {
+test("default path (portal-signed CO, no option passed) still calls the milestone-send function", async () => {
+    state.changeOrder = portalApprovedCo();
     let sendCallCount = 0;
     let sendArgs: any[] = [];
     const billChangeOrder = async () => freshBillResult();
@@ -155,4 +188,26 @@ test("without suppressClientEmails (portal path, default), the milestone-send fu
     assert.deepEqual(sendArgs[1], ["ms-1"]);
     assert.equal(summary.billed, true);
     assert.equal(summary.sent, true);
+});
+
+test("cron path: a manually-approved CO in the DB suppresses the send even when the caller never passes suppressClientEmails", async () => {
+    // Mirrors co-billing-sweep's exact call shape: handleChangeOrderApproved(co.id) with no
+    // second argument at all — the option is never in play here, only the DB row itself.
+    state.changeOrder = manualApprovedCo();
+    let sendCallCount = 0;
+    const billChangeOrder = async () => freshBillResult();
+    const sendMilestoneInvoices = async () => {
+        sendCallCount += 1;
+        return { results: [{ sentTo: "client@example.com", error: undefined }] };
+    };
+
+    const summary = await handleChangeOrderApproved(
+        "co-1",
+        undefined,
+        { billChangeOrder, sendMilestoneInvoices },
+    );
+
+    assert.equal(sendCallCount, 0, "a manually-approved CO must suppress the client email even without the explicit option");
+    assert.equal(summary.billed, true);
+    assert.equal(summary.sent, false);
 });

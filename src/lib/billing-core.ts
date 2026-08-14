@@ -17,6 +17,7 @@ import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
 import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { isManualCoApproval, staffNameFromManualApprovedBy } from "./co-approval";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 
@@ -1743,17 +1744,29 @@ export async function handleChangeOrderApproved(
     let amountLabel = "";
     let projectName = "";
     let sentTo = "";
+    // DB-derived, not just the caller's option: a CO that is Approved with no
+    // clientSignatureUrl and the manual-approval marker on approvedBy must never
+    // email the client, no matter who calls this handler. The explicit
+    // opts.suppressClientEmails still ORs in (kept for the inline caller, which
+    // reads its own freshly-committed transaction result rather than a stale
+    // read) — but this is what protects the cron backstop (co-billing-sweep),
+    // which never passes the option at all.
+    let isManualApproval = false;
+    let manualApprovedBy = "";
 
     try {
         const co = await prisma.changeOrder.findUnique({
             where: { id: changeOrderId },
-            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, project: { select: { name: true } } },
+            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, clientSignatureUrl: true, project: { select: { name: true } } },
         });
         if (co) {
             coLabel = `${co.code} — ${co.title}`;
             amountLabel = formatCurrency(co.totalAmount);
             projectName = co.project?.name ?? "";
+            isManualApproval = isManualCoApproval(co);
+            manualApprovedBy = staffNameFromManualApprovedBy(co.approvedBy);
         }
+        const suppressClientEmails = Boolean(opts?.suppressClientEmails) || isManualApproval;
 
         if (co?.pricingType === "COST_PLUS") {
             summary.awaitingActuals = true;
@@ -1774,7 +1787,7 @@ export async function handleChangeOrderApproved(
             // email (billChangeOrderCore's row lock guarantees exactly one fresh bill).
                 summary.billed = true;
                 summary.issues.push(`Already on invoice ${bill.invoiceCode} as "${bill.milestoneName}" — no new payment email sent (it may have gone out earlier; check before resending).`);
-            } else if (opts?.suppressClientEmails) {
+            } else if (suppressClientEmails) {
                 // Manual staff approval: billing rows/invoice totals are created
                 // exactly as on the portal path, but no client ever signed this CO,
                 // so no client-facing payment email goes out.
@@ -1822,17 +1835,28 @@ export async function handleChangeOrderApproved(
         const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { notificationEmail: true, companyName: true, email: true } });
         const to = settings?.notificationEmail?.trim() || settings?.email?.trim();
         if (to) {
-            const ok = summary.sent;
-            const subject = summary.awaitingActuals
-                ? `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`
-                : ok
-                    ? `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`
-                    : `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`;
-            const detail = summary.awaitingActuals
-                ? `<p>The customer approved the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`
-                : ok
-                    ? `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`
-                    : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
+            // Four honest outcomes, not "sent vs. needs a look": a clean manual
+            // approval billed correctly with no client email is SUCCESS, not a
+            // warning — it never signed anything for the client to begin with.
+            // Only a real billing failure (bill.ok === false, still landing in
+            // summary.issues with summary.billed left false) earns the ⚠️ bucket.
+            const outcomeKind: "awaitingActuals" | "sent" | "manual" | "needsLook" =
+                summary.awaitingActuals ? "awaitingActuals"
+                : summary.sent ? "sent"
+                : (isManualApproval && summary.billed) ? "manual"
+                : "needsLook";
+            const subject = {
+                awaitingActuals: `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`,
+                sent: `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`,
+                manual: `✅ Change order manually approved by staff — ${coLabel} (${amountLabel})`,
+                needsLook: `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`,
+            }[outcomeKind];
+            const detail = {
+                awaitingActuals: `<p>${isManualApproval ? `Staff (<strong>${esc(manualApprovedBy)}</strong>) manually approved` : "The customer approved"} the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`,
+                sent: `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`,
+                manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual; no payment email was sent to the client.</p>`,
+                needsLook: `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`,
+            }[outcomeKind];
             await sendNotification(
                 to,
                 subject,

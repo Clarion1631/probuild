@@ -5,6 +5,7 @@ import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
 import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
+import { isManualCoApproval } from './co-approval';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 import { isEstimateSectionRow, rm } from './estimate-item-payload';
 
@@ -1426,7 +1427,10 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     if (co.status === 'Approved' && co.approvedBy) {
         y -= 50;
         checkNewPage(100);
-        page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        // A manually-approved CO was never signed by the client — label it honestly
+        // rather than implying a client signature that doesn't exist.
+        const approvalLabel = isManualCoApproval(co) ? 'Approval (Recorded by Staff)' : 'Client Approval';
+        page.drawText(approvalLabel, { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
         y -= 20;
         page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 15;

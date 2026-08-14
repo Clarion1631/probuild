@@ -81,6 +81,13 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     async function handleManualApprove() {
         setIsManuallyApproving(true);
         try {
+            // Save first, exactly like Send for Approval below — otherwise a staff
+            // member could edit items/pricing, then approve, and bill whatever was
+            // last saved to the DB instead of what's on screen. Fail closed: a
+            // failed save must never reach the approval call. handleSave() already
+            // toasts its own failure.
+            const saved = isScopeLocked ? true : await handleSave();
+            if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
             const updated = await manuallyApproveChangeOrder(initialData.id);

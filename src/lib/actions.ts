@@ -9288,21 +9288,29 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 // Staff-side manual approval. Distinct from approveChangeOrder (the customer's
 // portal approval) and countersignChangeOrderAsCompany (records the company's
 // counter-signature but leaves status untouched): this flips status to
-// Approved itself, without a client ever signing. Auth mirrors
-// countersignChangeOrderAsCompany — staff-only, no separate project-access
-// check. The post-approval billing automation runs exactly as it does for the
-// portal path, except the client-facing milestone payment email is suppressed
-// (see handleChangeOrderApproved's suppressClientEmails option).
+// Approved itself, without a client ever signing. Role gate mirrors
+// countersignChangeOrderAsCompany (ADMIN/MANAGER only — narrower than the
+// general "changeOrders" permission, since this bypasses the client's own
+// signature). assertActiveStaff is the same shared user loader
+// assertProjectMemberStaff/assertChangeOrderPermission use (it carries
+// projectAccess/assignedProjects, unlike a bare prisma.user.findUnique(role)
+// lookup), so canAccessProject below has something real to check — same
+// project-scope pattern as the tag/type/code actions
+// (updateProjectTags/updateProjectType via assertProjectMemberStaff). The
+// post-approval billing automation runs exactly as it does for the portal
+// path, except the client-facing milestone payment email is suppressed (see
+// handleChangeOrderApproved's suppressClientEmails option and its own
+// DB-derived backstop for callers, like the cron sweep, that don't pass it).
 export async function manuallyApproveChangeOrder(id: string) {
     "use server";
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await assertActiveStaff();
+    if (user.role !== "ADMIN" && user.role !== "MANAGER") throw new Error("Forbidden");
 
-    // Role gate — only ADMIN/MANAGER can manually approve on the client's behalf.
-    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, name: true } });
-    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+    const target = await prisma.changeOrder.findUnique({ where: { id }, select: { projectId: true } });
+    if (!target) throw new Error("Change order not found");
+    if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
 
-    const staffName = (user.name || session.user.email || "").trim();
+    const staffName = (user.name || user.email || "").trim();
     const approval = await manuallyApproveChangeOrderCore(id, {
         staffName,
         approvedAt: new Date(),

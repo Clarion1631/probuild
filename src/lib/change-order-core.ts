@@ -1,6 +1,7 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { MANUAL_CO_APPROVAL_SUFFIX } from "./co-approval";
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -486,7 +487,7 @@ export async function manuallyApproveChangeOrderCore(
             where: { id },
             data: {
                 status: "Approved",
-                approvedBy: `${approval.staffName.trim()} (manual approval — staff)`,
+                approvedBy: `${approval.staffName.trim()}${MANUAL_CO_APPROVAL_SUFFIX}`,
                 approvedAt: approval.approvedAt,
             },
         });

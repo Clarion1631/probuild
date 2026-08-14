@@ -7,6 +7,7 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
+import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 import { buildPdf } from "@/lib/build-pdf";
 
 export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
@@ -45,6 +46,11 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const isApproved = initialData.status === "Approved";
     const isSent = initialData.status === "Sent";
     const isDeclined = initialData.status === "Declined";
+    // Staff can approve on the client's behalf without a signature (manual
+    // approval) — the badge below must never claim the client signed something
+    // they never saw. See src/lib/co-approval.ts.
+    const isManualApproval = isManualCoApproval(initialData);
+    const manualApprovedByName = staffNameFromManualApprovedBy(initialData.approvedBy);
     // Draft covers "never sent yet" and "pulled back for edits after being sent" — the
     // client-facing copy already calls this state "Under Revision" in the skipped panel
     // below; the badge reuses that same label so a Draft/superseded CO never reads as
@@ -294,8 +300,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
                                 </div>
                                 <div>
-                                    <h3 className="text-sm font-semibold text-green-800">Electronically Signed and Approved</h3>
-                                    <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{initialData.approvedBy}</strong></p>
+                                    <h3 className="text-sm font-semibold text-green-800">
+                                        {isManualApproval ? "Approved by Staff (Manual Approval)" : "Electronically Signed and Approved"}
+                                    </h3>
+                                    <p className="text-sm text-green-700 mt-0.5">
+                                        {isManualApproval
+                                            ? <>Approved by <strong>{companyName} staff</strong>{manualApprovedByName ? ` — ${manualApprovedByName}` : ""}</>
+                                            : <>Signed by: <strong>{initialData.approvedBy}</strong></>}
+                                    </p>
                                     <p className="text-xs text-green-600 mt-0.5">{new Date(initialData.approvedAt).toLocaleString()}</p>
                                 </div>
                             </div>
