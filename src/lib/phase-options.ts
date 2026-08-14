@@ -1,8 +1,53 @@
 // Pure reduction for the mobile phase picker
 // (src/app/api/mobile/projects/[id]/phases/route.ts). Kept free of Prisma/Next
-// imports so the approved-only filtering and representative-item selection can
-// be unit-tested directly (mirrors src/lib/overtime.ts's convention) — the
-// route does the DB fetch and just passes in the candidate rows.
+// imports so the canonical-estimate selection and representative-item
+// selection can be unit-tested directly (mirrors src/lib/overtime.ts's
+// convention) — the route does the DB fetches and just passes in the
+// candidate rows.
+//
+// Two-step reduction, in this order:
+//   1. selectCanonicalEstimateId() picks ONE canonical estimate id from
+//      every Approved, non-archived estimate on the project — regardless of
+//      whether that estimate's items currently have an active cost code.
+//   2. buildPhaseOptions() reduces the (already estimate-scoped) items down
+//      to distinct active cost codes.
+// The order matters: picking the canonical estimate only from estimates
+// whose items HAPPEN to have active cost codes would make a newer approved
+// estimate with no active-cost-coded items invisible to selection, letting
+// an older estimate's stale items leak through. An empty buildPhaseOptions()
+// result for the canonical estimate is a legitimate empty phase list, not a
+// signal to fall back to another estimate.
+
+export interface EstimateCandidate {
+    /** Estimate.id */
+    estimateId: string;
+    /** Estimate.approvedAt if set, else Estimate.createdAt (ISO string) — the recency key for canonical-estimate selection. Lexicographic ISO-8601 comparison sorts chronologically. */
+    recencyKey: string;
+}
+
+/**
+ * Pick ONE canonical estimate id from a set of Approved, non-archived
+ * estimate candidates for a project (most recently approved, falling back to
+ * most recently created via recencyKey, then estimateId as a final
+ * tiebreak). Returns null when there are no candidates — a project with no
+ * Approved estimate has no canonical estimate, and therefore no phase list.
+ */
+export function selectCanonicalEstimateId(estimates: EstimateCandidate[]): string | null {
+    let canonicalEstimateId: string | null = null;
+    let canonicalRecencyKey = "";
+    for (const candidate of estimates) {
+        const isMoreRecent = candidate.recencyKey > canonicalRecencyKey;
+        const isTieBrokenLower =
+            candidate.recencyKey === canonicalRecencyKey &&
+            canonicalEstimateId !== null &&
+            candidate.estimateId < canonicalEstimateId;
+        if (canonicalEstimateId === null || isMoreRecent || isTieBrokenLower) {
+            canonicalEstimateId = candidate.estimateId;
+            canonicalRecencyKey = candidate.recencyKey;
+        }
+    }
+    return canonicalEstimateId;
+}
 
 export interface PhaseCandidateItem {
     estimateItemId: string;
@@ -12,12 +57,6 @@ export interface PhaseCandidateItem {
     costCodeActive: boolean;
     costCodeCode: string;
     costCodeName: string;
-    estimateStatus: string;
-    estimateArchived: boolean;
-    /** Estimate.id — used to pick ONE canonical estimate when several Approved estimates exist on the project. */
-    estimateId: string;
-    /** Estimate.approvedAt if set, else Estimate.createdAt (ISO string) — the recency key for canonical-estimate selection. Lexicographic ISO-8601 comparison sorts chronologically. */
-    estimateRecencyKey: string;
 }
 
 export interface PhaseOption {
@@ -29,39 +68,20 @@ export interface PhaseOption {
 }
 
 /**
- * Distinct, active cost codes referenced by items on the ONE canonical
- * Approved (non-archived) estimate for the project, one representative item
- * per cost code (lowest order, then id), sorted by code.
+ * Distinct, active cost codes referenced by items on a single (already
+ * chosen) estimate, one representative item per cost code (lowest order,
+ * then id), sorted by code.
  *
- * A project can carry more than one Approved estimate at once — merging
- * items across all of them would make the phase list flap as estimates are
- * approved/edited. Instead, pick a single canonical estimate deterministically
- * (most recently approved, falling back to most recently created via
- * estimateRecencyKey, then estimateId as a final tiebreak) and use only its
- * items.
+ * Callers are expected to have already picked the canonical estimate (see
+ * selectCanonicalEstimateId) and scoped `items` to just that estimate's
+ * items — this function has no estimate-level knowledge of its own, so an
+ * empty or all-ineligible `items` array correctly yields an empty result
+ * instead of silently reaching into another estimate.
  */
 export function buildPhaseOptions(items: PhaseCandidateItem[]): PhaseOption[] {
-    const eligible = items.filter(
-        (i) => i.costCodeId && i.costCodeActive && i.estimateStatus === "Approved" && !i.estimateArchived
-    );
+    const eligible = items.filter((i) => i.costCodeId && i.costCodeActive);
 
-    let canonicalEstimateId: string | null = null;
-    let canonicalRecencyKey = "";
-    for (const item of eligible) {
-        const isMoreRecent = item.estimateRecencyKey > canonicalRecencyKey;
-        const isTieBrokenLower =
-            item.estimateRecencyKey === canonicalRecencyKey &&
-            canonicalEstimateId !== null &&
-            item.estimateId < canonicalEstimateId;
-        if (canonicalEstimateId === null || isMoreRecent || isTieBrokenLower) {
-            canonicalEstimateId = item.estimateId;
-            canonicalRecencyKey = item.estimateRecencyKey;
-        }
-    }
-
-    const fromCanonicalEstimate = eligible.filter((i) => i.estimateId === canonicalEstimateId);
-
-    const sorted = [...fromCanonicalEstimate].sort((a, b) => {
+    const sorted = [...eligible].sort((a, b) => {
         if (a.order !== b.order) return a.order - b.order;
         return a.estimateItemId < b.estimateItemId ? -1 : a.estimateItemId > b.estimateItemId ? 1 : 0;
     });

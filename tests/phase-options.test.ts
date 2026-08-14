@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildPhaseOptions, type PhaseCandidateItem } from "../src/lib/phase-options";
+import { buildPhaseOptions, selectCanonicalEstimateId, type PhaseCandidateItem } from "../src/lib/phase-options";
 
 function item(overrides: Partial<PhaseCandidateItem> = {}): PhaseCandidateItem {
     return {
@@ -10,31 +10,14 @@ function item(overrides: Partial<PhaseCandidateItem> = {}): PhaseCandidateItem {
         costCodeActive: true,
         costCodeCode: "01-DEMO",
         costCodeName: "Demolition",
-        estimateStatus: "Approved",
-        estimateArchived: false,
-        estimateId: "est1",
-        estimateRecencyKey: "2026-01-01T00:00:00.000Z",
         ...overrides,
     };
 }
 
+// ── buildPhaseOptions (operates on items already scoped to ONE estimate) ──
+
 test("empty input -> empty output", () => {
     assert.deepEqual(buildPhaseOptions([]), []);
-});
-
-test("only items on Approved estimates are included", () => {
-    const items = [
-        item({ estimateItemId: "a", costCodeId: "cc1", estimateStatus: "Approved" }),
-        item({ estimateItemId: "b", costCodeId: "cc2", costCodeCode: "02-FRAME", estimateStatus: "Sent" }),
-        item({ estimateItemId: "c", costCodeId: "cc3", costCodeCode: "03-ROOF", estimateStatus: "Invoiced" }),
-    ];
-    const result = buildPhaseOptions(items);
-    assert.deepEqual(result.map((p) => p.costCodeId), ["cc1"]);
-});
-
-test("archived estimates are excluded even if status is Approved", () => {
-    const items = [item({ estimateArchived: true })];
-    assert.deepEqual(buildPhaseOptions(items), []);
 });
 
 test("inactive cost codes are excluded", () => {
@@ -76,56 +59,62 @@ test("result is sorted by cost code, not input order", () => {
     assert.deepEqual(result.map((p) => p.code), ["01-DEMO", "02-FRAME"]);
 });
 
-// ── canonical estimate selection (multiple Approved estimates) ───────────
+// ── selectCanonicalEstimateId ──────────────────────────────────────────────
 
-test("when multiple estimates are Approved, only items from the most recently approved estimate are used", () => {
-    const items = [
-        item({
-            estimateItemId: "old-item",
-            costCodeId: "cc1",
-            estimateId: "est-old",
-            estimateRecencyKey: "2026-01-01T00:00:00.000Z",
-        }),
-        item({
-            estimateItemId: "new-item",
-            costCodeId: "cc2",
-            costCodeCode: "02-FRAME",
-            estimateId: "est-new",
-            estimateRecencyKey: "2026-06-01T00:00:00.000Z",
-        }),
-    ];
-    const result = buildPhaseOptions(items);
-    assert.deepEqual(result.map((p) => p.estimateItemId), ["new-item"]);
+test("selectCanonicalEstimateId: no candidates -> null", () => {
+    assert.equal(selectCanonicalEstimateId([]), null);
 });
 
-test("a non-eligible estimate (Sent, or archived) never becomes the canonical estimate even if more recent", () => {
-    const items = [
-        item({
-            estimateItemId: "approved-item",
-            costCodeId: "cc1",
-            estimateId: "est-approved",
-            estimateStatus: "Approved",
-            estimateRecencyKey: "2026-01-01T00:00:00.000Z",
-        }),
-        item({
-            estimateItemId: "sent-item",
-            costCodeId: "cc2",
-            costCodeCode: "02-FRAME",
-            estimateId: "est-sent",
-            estimateStatus: "Sent",
-            estimateRecencyKey: "2026-06-01T00:00:00.000Z",
-        }),
-    ];
-    const result = buildPhaseOptions(items);
-    assert.deepEqual(result.map((p) => p.estimateItemId), ["approved-item"]);
+test("selectCanonicalEstimateId: a single candidate is canonical", () => {
+    assert.equal(
+        selectCanonicalEstimateId([{ estimateId: "est1", recencyKey: "2026-01-01T00:00:00.000Z" }]),
+        "est1"
+    );
 });
 
-test("ties on estimate recency break deterministically on the lower estimateId", () => {
-    const items = [
-        item({ estimateItemId: "from-b", costCodeId: "cc1", estimateId: "est-b", estimateRecencyKey: "2026-01-01T00:00:00.000Z" }),
-        item({ estimateItemId: "from-a", costCodeId: "cc1", estimateId: "est-a", estimateRecencyKey: "2026-01-01T00:00:00.000Z" }),
-    ];
-    const result = buildPhaseOptions(items);
-    assert.equal(result.length, 1);
-    assert.equal(result[0].estimateItemId, "from-a");
+test("selectCanonicalEstimateId: the most recently approved/created candidate wins", () => {
+    const result = selectCanonicalEstimateId([
+        { estimateId: "est-old", recencyKey: "2026-01-01T00:00:00.000Z" },
+        { estimateId: "est-new", recencyKey: "2026-06-01T00:00:00.000Z" },
+    ]);
+    assert.equal(result, "est-new");
+});
+
+test("selectCanonicalEstimateId: ties on recencyKey break deterministically on the lower estimateId", () => {
+    const result = selectCanonicalEstimateId([
+        { estimateId: "est-b", recencyKey: "2026-01-01T00:00:00.000Z" },
+        { estimateId: "est-a", recencyKey: "2026-01-01T00:00:00.000Z" },
+    ]);
+    assert.equal(result, "est-a");
+});
+
+// ── canonical-then-filter interaction (the fix) ────────────────────────────
+
+test("BLOCKER regression: a newer approved estimate whose items have no active cost codes still becomes canonical, yielding an EMPTY phase list — not the older estimate's items", () => {
+    // Selection runs over every Approved estimate for the project, regardless
+    // of whether its items currently have an active cost code.
+    const canonicalEstimateId = selectCanonicalEstimateId([
+        { estimateId: "est-old", recencyKey: "2026-01-01T00:00:00.000Z" },
+        { estimateId: "est-new", recencyKey: "2026-06-01T00:00:00.000Z" },
+    ]);
+    assert.equal(canonicalEstimateId, "est-new");
+
+    // The route scopes the items query to just the canonical estimate (a DB
+    // WHERE estimateId = canonicalEstimateId), so est-old's items — even
+    // though they'd have qualified — are never even fetched. est-new's own
+    // items exist but none have an active cost code (e.g. every code on it
+    // was deactivated).
+    const itemsOnCanonicalEstimate = [item({ estimateItemId: "new-item", costCodeId: "cc1", costCodeActive: false })];
+
+    assert.deepEqual(buildPhaseOptions(itemsOnCanonicalEstimate), []);
+});
+
+test("a non-eligible estimate (Sent, or archived) never enters selectCanonicalEstimateId's candidate set even if more recent", () => {
+    // The route only queries Estimate rows with status "Approved" and
+    // archivedAt: null in the first place, so a Sent/archived estimate never
+    // becomes a candidate at all — simulated here by simply not including it.
+    const canonicalEstimateId = selectCanonicalEstimateId([
+        { estimateId: "est-approved", recencyKey: "2026-01-01T00:00:00.000Z" },
+    ]);
+    assert.equal(canonicalEstimateId, "est-approved");
 });

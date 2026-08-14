@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { buildPhaseOptions, type PhaseOption } from "@/lib/phase-options";
+import { buildPhaseOptions, selectCanonicalEstimateId, type PhaseOption } from "@/lib/phase-options";
 
 export const dynamic = "force-dynamic";
 
@@ -60,25 +60,42 @@ const handlers = createPhasesHandlers({
         return prisma.project.findUnique({ where: { id: projectId }, select: { id: true, status: true } });
     },
     getPhases: async (projectId) => {
-        // Status/archived/project filtering pushed into the query (rather than
-        // fetching every cost-coded item on the project and filtering in JS) —
-        // only items on Approved, non-archived estimates for this project, with
-        // an active cost code, come back at all. The remaining approved-only
-        // representative-item selection (and picking ONE canonical estimate
-        // when several are Approved) is the pure buildPhaseOptions() reduction
-        // (unit-tested directly).
+        // Canonical-estimate selection runs FIRST, against every Approved,
+        // non-archived estimate for the project — independent of whether any
+        // of its items currently have an active cost code. Filtering items
+        // down to active cost codes before picking the canonical estimate
+        // was the bug: a newer approved estimate whose items had no active
+        // cost codes (yet, or at all) was invisible to selection, so an
+        // older estimate's stale items leaked through. See
+        // selectCanonicalEstimateId / buildPhaseOptions in phase-options.ts
+        // for the two-step pure logic (unit-tested directly).
+        const estimates = await prisma.estimate.findMany({
+            where: { projectId, status: "Approved", archivedAt: null },
+            select: { id: true, approvedAt: true, createdAt: true },
+        });
+
+        const canonicalEstimateId = selectCanonicalEstimateId(
+            estimates.map((estimate) => ({
+                estimateId: estimate.id,
+                recencyKey: (estimate.approvedAt ?? estimate.createdAt).toISOString(),
+            }))
+        );
+        if (!canonicalEstimateId) return [];
+
+        // Only NOW filter to active cost-coded items — scoped to just the
+        // canonical estimate. An empty result here is a legitimate empty
+        // phase list, not a signal to fall back to another estimate.
         const items = await prisma.estimateItem.findMany({
             where: {
+                estimateId: canonicalEstimateId,
                 costCodeId: { not: null },
                 costCode: { isActive: true },
-                estimate: { projectId, status: "Approved", archivedAt: null },
             },
             select: {
                 id: true,
                 order: true,
                 costCodeId: true,
                 costCode: { select: { code: true, name: true, isActive: true } },
-                estimate: { select: { id: true, status: true, archivedAt: true, approvedAt: true, createdAt: true } },
             },
         });
 
@@ -92,10 +109,6 @@ const handlers = createPhasesHandlers({
                     costCodeActive: item.costCode!.isActive,
                     costCodeCode: item.costCode!.code,
                     costCodeName: item.costCode!.name,
-                    estimateStatus: item.estimate.status,
-                    estimateArchived: item.estimate.archivedAt != null,
-                    estimateId: item.estimate.id,
-                    estimateRecencyKey: (item.estimate.approvedAt ?? item.estimate.createdAt).toISOString(),
                 }))
         );
     },
