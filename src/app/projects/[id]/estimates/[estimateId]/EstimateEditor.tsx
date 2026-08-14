@@ -175,6 +175,7 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct, marginPatchForRate, marginIsSettable } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
+import { buildTaxOptions, resolveActiveTax, taxFieldsForSave } from "@/lib/estimate-tax-options";
 import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
 // Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
@@ -333,20 +334,17 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
-    const defaultTaxRate = salesTaxes.find(t => t.isDefault) || salesTaxes[0] || null;
-    // Preserve the originally saved rate even if it was renamed/removed from settings,
-    // so we don't silently overwrite it with the default on next save.
-    const orphanedRate = useMemo(() => {
-        const savedName = initialEstimate.taxRateName;
-        const savedPct = initialEstimate.taxRatePercent;
-        if (!savedName || savedPct == null) return null;
-        if (salesTaxes.some(t => t.name === savedName && Number(t.rate) === Number(savedPct))) return null;
-        return { name: savedName, rate: Number(savedPct), isDefault: false, orphaned: true as const };
-    }, [initialEstimate.taxRateName, initialEstimate.taxRatePercent, salesTaxes]);
-    const taxOptions = orphanedRate ? [...salesTaxes, orphanedRate] : salesTaxes;
-    const [selectedTaxName, setSelectedTaxName] = useState<string | null>(
-        initialEstimate.taxRateName ?? defaultTaxRate?.name ?? null
+    // Options are identified by KEY, not by display name — resolving tax by name silently
+    // re-quotes the client whenever the estimate's stored name collides with a company tax at a
+    // different rate (the takeoff-conversion case), or when the rate was stored with no name at
+    // all. See src/lib/estimate-tax-options.ts.
+    const taxOptionSet = useMemo(
+        () => buildTaxOptions(salesTaxes, { name: initialEstimate.taxRateName, percent: initialEstimate.taxRatePercent }),
+        [salesTaxes, initialEstimate.taxRateName, initialEstimate.taxRatePercent],
     );
+    const taxOptions = taxOptionSet.options;
+    const defaultTaxRate = taxOptionSet.defaultOption;
+    const [selectedTaxKey, setSelectedTaxKey] = useState<string | null>(taxOptionSet.initialKey);
     const [isAiFilling, setIsAiFilling] = useState(false);
     const [isAiAssigningPhases, setIsAiAssigningPhases] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
@@ -435,20 +433,20 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
         memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
         notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
-        taxExempt, selectedTaxName, paymentSchedules,
+        taxExempt, selectedTaxKey, paymentSchedules,
     });
     useEffect(() => {
         fieldsRef.current = {
             title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
             memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
             notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
-            taxExempt, selectedTaxName, paymentSchedules,
+            taxExempt, selectedTaxKey, paymentSchedules,
         };
     }, [
         title, code, status, processingFeeMarkup, hideProcessingFee, expirationDate,
         memo, termsAndConditions, overviewEnabled, overviewTitle, overviewBody,
         notesEnabled, notesTitle, notesBody, notesPlacement, signatureUrl, targetMargin,
-        taxExempt, selectedTaxName, paymentSchedules,
+        taxExempt, selectedTaxKey, paymentSchedules,
     ]);
 
     // Serializes every call to handleSave so overlapping saves (e.g. the blur-triggered
@@ -483,7 +481,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const getEstimateSnapshot = useCallback((itemsOverride?: any[], fieldsOverride?: Partial<typeof fieldsRef.current>) => {
         const srcItems = itemsOverride ?? itemsRef.current;
         const f = { ...fieldsRef.current, ...fieldsOverride };
-        const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
+        const activeTax = resolveActiveTax(taxOptions, f.selectedTaxKey, defaultTaxRate);
 
         // Exactly what a save would write, field for field: serialize (order, section
         // roll-up, unitCost mirror) then project through the same function saveEstimate's
@@ -524,8 +522,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
             signatureUrl: f.signatureUrl || null,
             targetMarginPercent: parseFloat(f.targetMargin) || 25,
             taxExempt: !!f.taxExempt,
-            taxRateName: f.taxExempt ? null : (activeTax?.name || null),
-            taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
+            ...taxFieldsForSave(activeTax, !!f.taxExempt),
             items: mappedItems,
             paymentSchedules: mappedSchedules,
         };
@@ -1138,10 +1135,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const itemTotals = useMemo(() => computeEstimateItemTotals(items), [items]);
     // Subtotal from leaf items only (sections would double-count)
     const subtotal = computeEstimateSubtotal(items);
-    const activeTax = taxOptions.find(t => t.name === selectedTaxName) || defaultTaxRate;
+    const activeTax = resolveActiveTax(taxOptions, selectedTaxKey, defaultTaxRate);
     const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
     const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
-    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
+    // This line is client-facing, so a rate stored without a name reads as a plain tax line
+    // rather than the picker's internal "Saved rate" wording.
+    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name || "Estimated Tax"} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
     // WA DOR: exempt sales need a reseller permit / exemption certificate on the client record
     const taxCertStatus = getTaxCertStatus({ url: context.clientTaxExemptCertUrl, expiresAt: context.clientTaxExemptCertExpiresAt });
     const showTaxCertWarning = taxExempt && taxCertStatus !== "valid";
@@ -1190,7 +1189,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
      */
     function computeSellTotals(sourceItems: any[], f: typeof fieldsRef.current) {
         const sourceSubtotal = computeEstimateSubtotal(sourceItems);
-        const activeTax = taxOptions.find(t => t.name === f.selectedTaxName) || defaultTaxRate;
+        const activeTax = resolveActiveTax(taxOptions, f.selectedTaxKey, defaultTaxRate);
         const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
         const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
         const sourceTax = rm(sourceSubtotal * sourceTaxRate);
@@ -1265,8 +1264,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                     signatureUrl: f.signatureUrl || null,
                     targetMarginPercent: parseFloat(f.targetMargin) || 25,
                     taxExempt: f.taxExempt,
-                    taxRateName: f.taxExempt ? null : (activeTax?.name || null),
-                    taxRatePercent: f.taxExempt ? null : (activeTax?.rate ?? null),
+                    ...taxFieldsForSave(activeTax, !!f.taxExempt),
                     itemsRevision: itemsRevisionRef.current,
                 }, mappedItems);
 
@@ -3678,31 +3676,34 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             <span className="text-slate-800">{formatCurrency(tax)}</span>
                                         </div>
                                     )}
-                                    {viewMode === "internal" && salesTaxes.length > 0 && (
+                                    {/* taxOptions, not salesTaxes: an estimate can carry a saved rate
+                                        the company no longer configures, and hiding the picker would
+                                        leave it unswitchable. */}
+                                    {viewMode === "internal" && taxOptions.length > 0 && (
                                         <div className="flex items-center gap-2 text-xs text-slate-500">
                                             <select
-                                                value={taxExempt ? "__exempt__" : (selectedTaxName || "")}
+                                                value={taxExempt ? "__exempt__" : (selectedTaxKey || "")}
                                                 onChange={(e) => {
                                                     if (e.target.value === "__exempt__") {
                                                         setTaxExempt(true);
-                                                        setSelectedTaxName(null);
+                                                        setSelectedTaxKey(null);
                                                     } else {
                                                         setTaxExempt(false);
-                                                        setSelectedTaxName(e.target.value);
+                                                        setSelectedTaxKey(e.target.value);
                                                     }
                                                 }}
                                                 className="hui-input text-xs py-1 pl-2 pr-6 rounded"
                                             >
                                                 {taxOptions.map(t => (
-                                                    <option key={t.name} value={t.name}>
-                                                        {t.name} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){("orphaned" in t && t.orphaned) ? " — not in settings" : ""}
+                                                    <option key={t.key} value={t.key}>
+                                                        {t.label} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){t.orphaned ? " — not in settings" : ""}
                                                     </option>
                                                 ))}
                                                 <option value="__exempt__">Tax Exempt</option>
                                             </select>
                                         </div>
                                     )}
-                                    {viewMode === "internal" && salesTaxes.length === 0 && (
+                                    {viewMode === "internal" && taxOptions.length === 0 && (
                                         <div className="flex items-center gap-2 text-xs text-slate-500">
                                             <input
                                                 type="checkbox"
