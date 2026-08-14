@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { ReactNode } from "react";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { toast } from "sonner";
 import Avatar from "@/components/Avatar";
 import { useEditor, EditorContent } from '@tiptap/react';
