@@ -10,6 +10,7 @@ import { formatCurrency } from "@/lib/utils";
 import PortalVisitTracker from "@/components/PortalVisitTracker";
 import PortalWelcomeGuide from "@/components/PortalWelcomeGuide";
 import { resolveSessionClientId } from "@/lib/portal-auth";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import PortalProjectTracker from "./PortalProjectTracker";
@@ -88,7 +89,9 @@ export default async function PortalProjectDetail(props: {
         include: {
             client: true,
             estimates: {
-                where: { privacy: 'Shared', status: { not: 'Draft' } },
+                // Same predicate as the detail route, so the list can never show
+                // something the detail route 404s (or hide something it serves).
+                where: portalVisibleEstimateWhere(),
                 orderBy: { createdAt: 'desc' },
                 select: {
                     id: true, number: true, title: true, code: true, status: true,

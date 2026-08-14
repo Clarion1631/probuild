@@ -13,6 +13,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
@@ -1630,7 +1631,11 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
     // Staff members can preview an estimate they are scoped to; portal clients
     // must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
-    const isStaff = !!(staffSession?.user as any)?.role;
+    // An explicit allowlist, not "any truthy role" — this branch bypasses the
+    // client gate below, so an unexpected role value must fall to the client path
+    // (which fails closed) rather than be handed staff access.
+    const isStaff = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]
+        .includes((staffSession?.user as { role?: string } | undefined)?.role ?? "");
     // The session carries a role but not projectAccess/assignedProjects, so the
     // horizontal check needs the full user row.
     const staffUser = isStaff ? await currentStaffUserOrNull() : null;
@@ -1641,12 +1646,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
 
-        // Restrict the query to the client's own estimates below
+        // Ownership alone is not enough. An estimate the contractor has never
+        // shared is internal pricing, and ids are reachable by walking the
+        // sequential `number` route — so AND the shared-ness predicate onto the
+        // ownership predicate. AND-composed rather than spread, because two `OR`
+        // keys in one object silently drop the first.
         const ownershipFilter = {
             id,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         };
 
@@ -2026,13 +2040,21 @@ export async function markEstimateViewed(estimateId: string) {
 
     // Atomic first-view claim — two simultaneous opens produce exactly one
     // notification and one activity event.
+    // Same shared-ness gate as getEstimateForPortal — an estimate the client
+    // cannot open must not be markable as viewed either, even by calling this
+    // server action directly. AND-composed so the two OR predicates cannot collide.
     const claim = await prisma.estimate.updateMany({
         where: {
             id: estimateId,
             viewedAt: null,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         },
         data: { viewedAt: new Date() },
