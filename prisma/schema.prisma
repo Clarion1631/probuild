@@ -2376,6 +2376,8 @@ model AutomationEvent {
   @@index([kind, createdAt])
   @@index([createdAt])
   @@index([docNumber, createdAt])
+  @@index([qbPurchaseId])
+  @@index([driveFileId])
 }
 
 model StripeEvent {

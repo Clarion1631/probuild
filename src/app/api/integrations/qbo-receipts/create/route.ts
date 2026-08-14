@@ -102,10 +102,22 @@ export interface QboReceiptCreateHandlerDependencies {
     isPushPaused?: () => Promise<boolean>;
 }
 
-/** Command-center audit: one event per authenticated push attempt. */
+/**
+ * Command-center audit: one event per authenticated push attempt.
+ *
+ * Every call site sits AFTER auth + body validation succeed (`input.fileId`
+ * is always a real string by then), so `detail.fileId` is baked in here once
+ * rather than re-added at each call site — that is how every logged outcome
+ * on this path ends up carrying the FULL Drive fileId, never just the
+ * 21-char `docNumber` prefix (which two different fileIds can share).
+ * Unauthorized and invalid-body requests never reach this function — there
+ * is no trusted file id yet at that point — so they are correctly excluded
+ * from this guarantee (see the early-return checks above, which log nothing).
+ */
 function pushEventFromOutcome(
     input: CreateQBReceiptPurchaseInput,
     outcome: { status: "created" | "already-exists" | "fallback" | "error"; reason?: string },
+    detail?: Record<string, unknown>,
 ): AutomationEventInput {
     const taxCents = input.groups
         .filter(g => g.tax === true && Number.isFinite(g.amount))
@@ -121,6 +133,7 @@ function pushEventFromOutcome(
         fileName: input.fileName,
         amountCents: Number.isFinite(input.totalAmount) ? Math.round(input.totalAmount * 100) : undefined,
         taxCents: taxCents > 0 ? taxCents : undefined,
+        detail: { fileId: input.fileId, ...detail },
     };
 }
 
@@ -131,6 +144,11 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
             // then the opt-in kill switch. push-disabled is deterministic —
             // 200/ok:false, not a 503: it is expected steady-state until the
             // feature is turned on, and the Apps Script must not retry it forever.
+            // Unauthorized and malformed/incomplete-body requests return here
+            // WITHOUT logging an event and are deliberately excluded from the
+            // "every logged outcome carries fileId" guarantee below — there is
+            // no trusted file id to log yet (a bad actor could claim any
+            // fileId in an unauthenticated or unvalidated body).
             const secret = dependencies.getIngestSecret();
             if (!secret || request.headers.get("x-ingest-key") !== secret) {
                 return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
@@ -175,9 +193,7 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
             // from the intake graph and inflate the hands-free rate).
             const isPushPausedFn = dependencies.isPushPaused ?? (() => isPaused(PAUSE_KEYS.receiptPush));
             if (await isPushPausedFn()) {
-                const event = pushEventFromOutcome(input, { status: "fallback", reason: "push-paused" });
-                event.detail = { fileId: input.fileId };
-                await logEvent(event);
+                await logEvent(pushEventFromOutcome(input, { status: "fallback", reason: "push-paused" }));
                 return NextResponse.json({ ok: false, reason: "push-paused" });
             }
 
@@ -202,19 +218,20 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 // Apps Script treats ok:false as terminal, same convention as
                 // sendToProBuild.txt.
                 const result = await dependencies.createPurchase(tokens, input);
-                const event = pushEventFromOutcome(input, result.ok
-                    ? { status: result.alreadyExists ? "already-exists" : "created" }
-                    : { status: "fallback", reason: result.reason });
-                // Full ids for the Command Center's validation panel: the Drive
-                // file link needs the WHOLE fileId (docNumber is a 21-char
-                // prefix) and the QBO deep link needs the purchase id.
-                event.detail = {
-                    fileId: input.fileId,
-                    ...(result.ok ? { qbPurchaseId: result.qbPurchaseId } : {}),
-                    // Attachment evidence AT BOOKING TIME (fresh creates only —
-                    // already-exists responses don't re-report it).
-                    ...(result.ok && !result.alreadyExists ? { attachment: result.attachment } : {}),
-                };
+                const event = pushEventFromOutcome(
+                    input,
+                    result.ok
+                        ? { status: result.alreadyExists ? "already-exists" : "created" }
+                        : { status: "fallback", reason: result.reason },
+                    {
+                        // The QBO deep link needs the purchase id (fileId is
+                        // already baked into `detail` by pushEventFromOutcome).
+                        ...(result.ok ? { qbPurchaseId: result.qbPurchaseId } : {}),
+                        // Attachment evidence AT BOOKING TIME (fresh creates only —
+                        // already-exists responses don't re-report it).
+                        ...(result.ok && !result.alreadyExists ? { attachment: result.attachment } : {}),
+                    },
+                );
                 await logEvent(event);
                 return NextResponse.json(result);
             } catch (error) {

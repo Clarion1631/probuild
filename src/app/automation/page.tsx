@@ -2,249 +2,499 @@ import type { ReactNode } from "react";
 import { redirect } from "next/navigation";
 import { formatCurrency } from "@/lib/utils";
 import { getCurrentUserWithPermissions, hasPermission, isAdminOrManager } from "@/lib/permissions";
+import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
+import { fetchBankRegister, type BankRegisterRow } from "@/lib/qbo-bank-register";
+import { isPurchaseType } from "@/lib/register-types";
+import {
+    mergeRegister,
+    classifyOrphanReceipts,
+    actionableOrphanReceipts,
+    type MergedRegisterRow,
+    type OrphanReceipt,
+} from "@/lib/register-merge";
 import {
     automationSummary,
     receiptDailyBuckets,
     recentAutomationEvents,
     receiptJourneys,
+    receiptJourneysForKeys,
+    journeyKey,
     type ReceiptJourney,
+    type AutomationSummary,
+    type AutomationDayBucket,
 } from "@/lib/automation-events";
 import { suggestFix, type FixSuggestion } from "@/lib/automation-suggestions";
 import { pauseStates } from "@/lib/automation-settings";
-import IntakeChart from "./components/intake-chart";
+import {
+    fetchRegisterMergeInputs,
+    orphanProjectNames,
+    drilldownExpenseByPurchaseId,
+    reviewIssueByPurchaseId,
+    type RawExpense,
+    type OpenReviewIssue,
+} from "./register-data";
+import { applyRegisterFilters } from "./register-filters";
+import { amountSign, formatRelativeTime, friendlyType } from "./components/format";
+import { StatCard } from "./components/shared/stat-card";
 import SyncNowButton from "./components/sync-now-button";
-import PipelineControls from "./components/pipeline-controls";
-import JourneyList, { type SerializedJourney } from "./components/journey-list";
-import { formatRelativeTime } from "./components/format";
+import CopyIdButton from "./components/copy-id-button";
+import { DocumentationPips, DocumentationLegend } from "./components/register/documentation-pips";
+import { OrphanReceipts } from "./components/register/orphan-receipts";
+import { JourneySection } from "./components/register/journey-section";
+import type { SerializedJourney } from "./components/journey-list";
+import { PipelineHealth } from "./components/pipeline-health";
+import { ExpandableRow } from "./components/register/expandable-row";
+import { LinksCell } from "./components/register/links-cell";
+import { RowDrilldown } from "./components/register/row-drilldown";
+import { matchReceiptJourney, type ReceiptJourneyMatch, type ReceiptJourneyIndex } from "./components/register/match-receipt-journey";
+import { toSerializedJourney } from "./components/register/serialize-journey";
 
 export const dynamic = "force-dynamic";
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+// ── Filters (plan §3 — "shared across the whole page") ─────────────────────
+
+type RangeKey = "30" | "60" | "90";
+type TypeFilter = "all" | "in" | "out";
+
+function parseFilters(sp: Record<string, string | string[] | undefined>) {
+    const range: RangeKey = sp.range === "60" || sp.range === "90" ? sp.range : "30";
+    const type: TypeFilter = sp.type === "in" || sp.type === "out" ? sp.type : "all";
+    const reviewOnly = sp.review === "1";
+    // Deep link for the future Chat card's link button (plan §3/§5 step 9):
+    // ?focus=<qbTxnId> expands that row and scrolls it into view on load.
+    const focus = typeof sp.focus === "string" && sp.focus ? sp.focus : null;
+    return { range, type, reviewOnly, focus };
+}
+
+function FilterChip({ href, active, children }: { href: string; active: boolean; children: ReactNode }) {
     return (
-        <div className="hui-card p-5">
-            <p className="text-xs font-semibold text-hui-textMuted uppercase tracking-wider">{label}</p>
-            <p className="text-2xl font-bold text-hui-textMain mt-1">{value}</p>
-            {sub && <p className="text-xs text-hui-textMuted mt-1">{sub}</p>}
+        <a
+            href={href}
+            className={`inline-flex items-center px-3 py-1 text-xs font-medium rounded-full transition ${
+                active ? "bg-hui-primary text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
+            }`}
+        >
+            {children}
+        </a>
+    );
+}
+
+// ── Register table helpers ──────────────────────────────────────────────────
+
+/** One row's worth of what the table renders — built either from a fully
+ * merged register row, or (when the merge inputs couldn't be fetched, see
+ * `mergeUnavailable` below) straight from the raw bank register row with an
+ * honest "unavailable" note instead of pips. Keeps the table's JSX single-path
+ * regardless of which source produced the row. */
+interface DisplayRow {
+    key: string;
+    date: string;
+    qbType: string;
+    docNum: string | null;
+    name: string | null;
+    amountCents: number;
+    isPurchase: boolean;
+    qbTxnId: string | null;
+    projectId: string | null;
+    projectName: string | null;
+    receiptUrl: string | null;
+    documentation: ReactNode;
+    needsReview: boolean;
+    /** Present only when the merge succeeded — powers the row drill-down
+     * (plan §3/§5 step 9). Null on the degraded raw-register fallback path,
+     * where there's no edge/status data to drill into. */
+    drilldown: {
+        row: MergedRegisterRow;
+        expense: RawExpense | null;
+        journeyMatch: ReceiptJourneyMatch | null;
+        reviewIssue: OpenReviewIssue | null;
+    } | null;
+}
+
+function sinceMsForRangeDays(days: number): number {
+    return Date.now() - days * 86_400_000;
+}
+
+/** B3: a promise that never settles (a hung query) is not a rejection — an
+ * ordinary try/catch around it blocks the whole page forever waiting. Races
+ * it against a timeout so a stuck pipeline-health fetch degrades the same
+ * way an outright failure does, instead of holding the register (the data
+ * the user actually came for) hostage. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+            setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+        }),
+    ]);
+}
+
+function ConnectionErrorCard({ title, message }: { title: string; message: string }) {
+    return (
+        <div className="hui-card p-8 text-center">
+            <h2 className="text-base font-semibold text-hui-textMain">{title}</h2>
+            <p className="text-sm text-hui-textMuted mt-1">{message}</p>
         </div>
     );
 }
 
-function ChartPanel({ title, subtitle, isEmpty, children }: { title: string; subtitle: string; isEmpty: boolean; children: ReactNode }) {
-    return (
-        <div className="hui-card p-5">
-            <h2 className="text-base font-semibold text-hui-textMain mb-1">{title}</h2>
-            <p className="text-xs text-hui-textMuted mb-3">{subtitle}</p>
-            {isEmpty ? (
-                <div className="flex items-center justify-center text-sm text-hui-textMuted" style={{ height: 280 }}>
-                    No receipts processed in this window yet.
-                </div>
-            ) : (
-                children
-            )}
-        </div>
-    );
-}
-
-// ── Sync runs section helpers (adapted from the old activity-feed.tsx) ─────
-
-interface SkippedSampleItem {
-    qbPurchaseId: string;
-    reason: string;
-}
-
-interface SyncCounts {
-    imported?: number;
-    updated?: number;
-    skipped?: number;
-    deactivated?: number;
-    skippedByReason?: Record<string, number>;
-    skippedSample?: SkippedSampleItem[];
-}
-
-function parseSkippedByReason(value: unknown): Record<string, number> | undefined {
-    if (!value || typeof value !== "object") return undefined;
-    const entries = Object.entries(value as Record<string, unknown>).filter(
-        (entry): entry is [string, number] => typeof entry[1] === "number"
-    );
-    return entries.length ? Object.fromEntries(entries) : undefined;
-}
-
-function parseSkippedSample(value: unknown): SkippedSampleItem[] | undefined {
-    if (!Array.isArray(value)) return undefined;
-    const items = value.filter((item): item is SkippedSampleItem => {
-        if (!item || typeof item !== "object") return false;
-        const obj = item as Record<string, unknown>;
-        return typeof obj.qbPurchaseId === "string" && typeof obj.reason === "string";
-    });
-    return items.length ? items : undefined;
-}
-
-function parseSyncCounts(detail: string | null): SyncCounts | null {
-    if (!detail) return null;
-    try {
-        const parsed: unknown = JSON.parse(detail);
-        if (!parsed || typeof parsed !== "object") return null;
-        const obj = parsed as Record<string, unknown>;
-        return {
-            imported: typeof obj.imported === "number" ? obj.imported : undefined,
-            updated: typeof obj.updated === "number" ? obj.updated : undefined,
-            skipped: typeof obj.skipped === "number" ? obj.skipped : undefined,
-            deactivated: typeof obj.deactivated === "number" ? obj.deactivated : undefined,
-            skippedByReason: parseSkippedByReason(obj.skippedByReason),
-            skippedSample: parseSkippedSample(obj.skippedSample),
-        };
-    } catch {
-        return null;
-    }
-}
-
-function describeSource(source: string | null): string {
-    if (!source) return "unknown";
-    return source.startsWith("manual:") ? "manual" : source;
-}
-
-function formatCounts(counts: SyncCounts): string {
-    const parts: string[] = [];
-    if (counts.imported) parts.push(`${counts.imported} imported`);
-    if (counts.updated) parts.push(`${counts.updated} updated`);
-    if (counts.skipped) parts.push(`${counts.skipped} skipped`);
-    if (counts.deactivated) parts.push(`${counts.deactivated} deactivated`);
-    return parts.length ? parts.join(", ") : "no changes";
-}
-
-const SKIP_REASON_LABELS: Record<string, string> = {
-    "no-active-project": "no matching active project in ProBuild",
-    "missing-customer": "no job on the transaction (overhead)",
-    "equity-draw": "owner draw",
-    "mixed-customer-allocation": "job and non-job lines mixed",
-    "multiple-customers": "split across multiple jobs",
-    "invalid-amount": "zero or invalid amount",
-    "overhead-project-unavailable": "overhead project unavailable",
-    "ambiguous-project": "matches more than one project",
-    "no-estimate": "project has no estimate to cost against",
-    "missing-purchase-id": "QuickBooks row missing its id",
-    "missing-sync-token": "QuickBooks row missing its sync token",
-    "invalid-transaction-date": "invalid transaction date",
-};
-
-function describeSkipReason(reason: string): string {
-    return SKIP_REASON_LABELS[reason] ?? reason;
-}
-
-function formatSkippedBreakdown(byReason: Record<string, number>): string {
-    return Object.entries(byReason)
-        .sort(([, a], [, b]) => b - a)
-        .map(([reason, count]) => `${count} × ${describeSkipReason(reason)}`)
-        .join(" · ");
-}
-
-function SyncStatusPill({ status }: { status: string }) {
-    const style =
-        status === "error"
-            ? { bg: "bg-red-100", text: "text-red-700", label: "Error" }
-            : { bg: "bg-teal-100", text: "text-teal-700", label: "Synced" };
-    return (
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${style.bg} ${style.text}`}>
-            {style.label}
-        </span>
-    );
-}
-
-// ── Journey serialization ───────────────────────────────────────────────────
-
-function serializeJourney(j: ReceiptJourney): SerializedJourney {
-    return {
-        docNumber: j.docNumber,
-        fileName: j.fileName,
-        vendor: j.vendor,
-        projectName: j.projectName,
-        amountCents: j.amountCents,
-        taxCents: j.taxCents,
-        firstSeen: j.firstSeen.toISOString(),
-        lastSeen: j.lastSeen.toISOString(),
-        steps: j.steps.map((s) => ({
-            at: s.at.toISOString(),
-            stage: s.stage,
-            status: s.status,
-            reason: s.reason,
-            detail: s.detail,
-        })),
-        finalState: j.finalState,
-        finalReason: j.finalReason,
-        syncedExpenseId: j.syncedExpenseId,
-        syncedProjectName: j.syncedProjectName,
-        backfilled: j.backfilled,
-        driveFileId: j.driveFileId,
-        qbPurchaseId: j.qbPurchaseId,
-        synced: j.synced
-            ? {
-                  expenseId: j.synced.expenseId,
-                  projectId: j.synced.projectId,
-                  projectName: j.synced.projectName,
-                  amountCents: j.synced.amountCents,
-                  vendor: j.synced.vendor,
-                  receiptUrl: j.synced.receiptUrl,
-                  syncedAt: j.synced.syncedAt.toISOString(),
-              }
-            : null,
-    };
-}
-
-export default async function AutomationPage() {
+export default async function AutomationPage(props: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     const user = await getCurrentUserWithPermissions();
     if (!user) redirect("/login");
     if (!hasPermission(user, "financialReports")) redirect("/projects");
 
     const isAdmin = isAdminOrManager(user);
+    const sp = await props.searchParams;
+    const { range, type, reviewOnly, focus } = parseFilters(sp);
+    // Captured ONCE, server-side, and threaded through every component that
+    // needs "now" (stale-receipt detection) — calling Date.now() again
+    // inside a client component would read a different clock value on
+    // hydration than SSR did, risking a hydration mismatch right at a
+    // threshold boundary. This IS the fix for that: an async Server
+    // Component runs once per request (no client re-render to be impure
+    // against), so capturing a single stable timestamp here is exactly what
+    // prevents descendant client components from each calling Date.now()
+    // independently during SSR vs. hydration.
+    const nowMs = Date.now();
+
+    function filterHref(overrides: { range?: string; type?: string; review?: string }) {
+        const params = new URLSearchParams();
+        const nextRange = overrides.range ?? range;
+        const nextType = overrides.type ?? type;
+        const nextReview = overrides.review ?? (reviewOnly ? "1" : "0");
+        if (nextRange !== "30") params.set("range", nextRange);
+        if (nextType !== "all") params.set("type", nextType);
+        if (nextReview === "1") params.set("review", "1");
+        const qs = params.toString();
+        return qs ? `/automation?${qs}` : "/automation";
+    }
 
     const pushEnabled = process.env.QBO_RECEIPT_PUSH_ENABLED === "true";
     const syncCronEnabled = process.env.QBO_EXPENSE_SYNC_CRON_ENABLED !== "false";
 
-    const [summary, buckets, events, journeys, pauses] = await Promise.all([
-        automationSummary(),
-        receiptDailyBuckets(30),
-        recentAutomationEvents(50),
-        receiptJourneys(30, 100),
-        pauseStates(),
-    ]);
+    const endDate = new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+    const rangeDays = Number(range);
+    const startDateObj = new Date(`${endDate}T00:00:00Z`);
+    // Both endpoints inclusive in the GL report — "30d" means 30 dates.
+    startDateObj.setUTCDate(startDateObj.getUTCDate() - (rangeDays - 1));
+    const startDate = startDateObj.toISOString().slice(0, 10);
 
-    const chartEmpty = buckets.every((b) => b.created === 0 && b.fallback === 0 && b.error === 0);
+    let registerRows: BankRegisterRow[] | null = null;
+    let fetchedAt = "";
+    let stale = false;
+    let errorCard: ReactNode = null;
 
-    // "≈4 minutes of manual entry" per receipt is a rough, admittedly-fuzzy
-    // stand-in for the real number (vendor lookup + line items + payment
-    // method + filing) — rounded to the nearest half hour so it reads as an
-    // estimate, not a stopwatch reading.
+    try {
+        // Tokens are fetched lazily INSIDE fetchBankRegister — only on a
+        // cache miss — because getFreshQBTokens refreshes OAuth every call.
+        const register = await fetchBankRegister(getFreshQBTokens, startDate, endDate);
+        registerRows = register.rows;
+        fetchedAt = register.fetchedAt;
+        stale = register.stale;
+    } catch (error) {
+        if (error instanceof QBNotConnectedError) {
+            errorCard = <ConnectionErrorCard title="QuickBooks isn't connected" message="Connect QuickBooks to see the register." />;
+        } else {
+            errorCard = (
+                <ConnectionErrorCard
+                    title="Couldn't load the register"
+                    message="Couldn't load the register from QuickBooks — try again in a minute."
+                />
+            );
+        }
+    }
+
+    if (!registerRows) {
+        return (
+            <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
+                <div>
+                    <h1 className="text-xl font-bold text-hui-textMain">Automation</h1>
+                </div>
+                {errorCard}
+            </div>
+        );
+    }
+
+    // Merge inputs (job-cost expenses, receipt-push audit events, purchase
+    // classifications) are a separate fetch from the register itself, and
+    // can fail independently of it (e.g. the dev DB gap on
+    // AutomationEvent.qbPurchaseId/driveFileId ahead of that migration —
+    // see register-data.ts). Degrade to the raw register with an honest
+    // "documentation status unavailable" note rather than losing the whole
+    // page over it. Only data (no JSX) is computed inside the try — JSX
+    // construction is lazy, so building elements inside a try/catch can't
+    // actually catch their render errors and is left for after this block.
+    let mergeUnavailable = false;
+    let documented = 0, receiptProvenanceUnverified = 0, needsReview = 0, expectedNonJobSpend = 0, unknownClassification = 0, denominator = 0;
+    let mergedRows: MergedRegisterRow[] | null = null;
+    let actionableOrphans: OrphanReceipt[] = [];
+    let orphanProjectNameMap = new Map<string, string>();
+    let journeyIndex: ReceiptJourneyIndex = { byQbPurchaseId: new Map(), byDocNumber: new Map(), truncated: false };
+    let expenseByPurchaseId = new Map<string, RawExpense>();
+    let reviewIssueMap = new Map<string, OpenReviewIssue>();
+    // Receipt journey PIPELINE LIST (plan §3) — a separate, display-capped
+    // fetch from the row drill-down's targeted lookup above; this one is a
+    // genuine "browse the most recent receipts" list, so a display cap is
+    // the right shape for it (see `receiptJourneys` in automation-events.ts).
+    let pipelineJourneyList: ReceiptJourney[] = [];
+    // Findings 6/7: true when either journey fetch above had to cap its
+    // underlying event query — drill-downs/the pipeline list may be built
+    // from partial history. Surfaced as the page's existing degraded-data
+    // warning style, and threaded to JourneySection to suppress
+    // suggestion-cards/"stuck" conclusions that assume complete history.
+    let journeyIndexTruncated = false;
+    let pipelineJourneysTruncated = false;
+
+    try {
+        const mergeInputs = await fetchRegisterMergeInputs(registerRows, sinceMsForRangeDays(rangeDays));
+        const merged = mergeRegister(registerRows, mergeInputs.expenses, mergeInputs.receiptEvents, mergeInputs.classifications);
+        const orphans = classifyOrphanReceipts(mergeInputs.receiptEvents, registerRows);
+        // Row drill-down journeys (plan §3/§5 step 9): N2 fix — instead of
+        // matching every row against a bulk, count-capped journey list (an
+        // R × J scan on the page that carries the money register, and one
+        // whose cap could silently drop a genuinely-matching older journey),
+        // fetch ONLY the journeys for the identifiers THIS register's rows
+        // actually carry, pre-indexed for an O(1) lookup per row below.
+        expenseByPurchaseId = drilldownExpenseByPurchaseId(mergeInputs.rawExpenses);
+        reviewIssueMap = reviewIssueByPurchaseId(mergeInputs.openReviewIssues);
+
+        // Commit the merge results BEFORE the journey fetches below: journeys
+        // are ancillary drill-down/pipeline display data, and their failure
+        // must not throw away a register merge that already succeeded (it
+        // previously flipped the page-wide `mergeUnavailable` degrade AND
+        // made this page disagree with the CSV export's filter semantics).
+        mergedRows = merged.rows;
+        documented = merged.counts.documented;
+        receiptProvenanceUnverified = merged.counts.receiptProvenanceUnverified;
+        needsReview = merged.counts.needsReview;
+        expectedNonJobSpend = merged.counts.expectedNonJobSpend;
+        unknownClassification = merged.counts.unknownClassification;
+        denominator = merged.counts.denominator;
+        actionableOrphans = actionableOrphanReceipts(orphans);
+        orphanProjectNameMap = orphanProjectNames(mergeInputs.rawReceiptEvents);
+
+        try {
+            const [journeyIndexResult, pipelineResult] = await Promise.all([
+                receiptJourneysForKeys(
+                    merged.rows.filter((r) => r.edges).map((r) => ({ qbPurchaseId: r.qbTxnId, docNumber: r.docNum })),
+                    rangeDays,
+                ),
+                receiptJourneys(rangeDays, 200),
+            ]);
+            journeyIndex = journeyIndexResult;
+            journeyIndexTruncated = journeyIndexResult.truncated;
+            pipelineJourneyList = pipelineResult.journeys;
+            pipelineJourneysTruncated = pipelineResult.truncated;
+        } catch (journeyError) {
+            // Drill-downs/pipeline list degrade to empty; the register itself
+            // (rows, counts, filters) stays fully live.
+            console.error("journey fetch failed", journeyError instanceof Error ? journeyError.message : "UnknownError");
+        }
+    } catch (error) {
+        console.error("register merge inputs failed", error instanceof Error ? error.message : "UnknownError");
+        mergeUnavailable = true;
+    }
+
+    const orphanCount = actionableOrphans.length;
+    // True when essentially every job-costable row hasn't been sorted into a
+    // job cost or overhead yet (e.g. classification data hasn't been
+    // populated at all). Repeating "Not categorized yet" on every one of
+    // ~141 rows is noise once it's page-wide — say it once in a banner above
+    // the table instead (DocumentationPips.suppressUnclassifiedNote hides
+    // the per-row repeat when this is true), same status, no logic change.
+    const mostRowsUncategorized = !mergeUnavailable && denominator > 0 && unknownClassification / denominator >= 0.9;
+    const orphanSection: ReactNode = mergeUnavailable ? (
+        <div className="hui-card p-5 text-sm text-hui-textMuted">
+            Can&apos;t show receipts that never reached the bank right now — that data couldn&apos;t be loaded.
+        </div>
+    ) : (
+        <OrphanReceipts orphans={actionableOrphans} projectNames={orphanProjectNameMap} />
+    );
+
+    // Reuses the same toSerializedJourney used by row-drilldown.tsx, so
+    // driveFileId/qbPurchaseId/keyConfirmed carry through identically in
+    // both places.
+    const pipelineJourneys = pipelineJourneyList;
+    const serializedJourneys: SerializedJourney[] = pipelineJourneys.map(toSerializedJourney);
+    // Keyed by the full driveFileId (falling back to a docNumber+firstSeen
+    // composite) — NEVER the bare docNumber alone, which is a 21-char Drive
+    // fileId prefix two different receipts can share; keying by it would let
+    // one journey's suggestion silently overwrite another's.
+    const journeySuggestions: Record<string, FixSuggestion | null> = {};
+    for (const j of pipelineJourneys) {
+        const suggestion = suggestFix(j);
+        if (suggestion) journeySuggestions[journeyKey(j)] = suggestion;
+    }
+    const journeySection: ReactNode = mergeUnavailable ? (
+        <div className="hui-card p-5 text-sm text-hui-textMuted">
+            Receipt pipeline view unavailable right now — documentation data couldn&apos;t be loaded.
+        </div>
+    ) : (
+        <JourneySection
+            journeys={serializedJourneys}
+            suggestions={journeySuggestions}
+            now={nowMs}
+            truncated={pipelineJourneysTruncated}
+        />
+    );
+
+    const displayRows: DisplayRow[] = mergedRows
+        ? mergedRows.map((r, i) => ({
+            key: `${r.qbTxnId ?? "row"}-${i}`,
+            date: r.date,
+            qbType: r.qbType,
+            docNum: r.docNum,
+            name: r.name,
+            amountCents: r.amountCents,
+            isPurchase: r.isPurchaseType,
+            qbTxnId: r.qbTxnId,
+            projectId: r.projectId,
+            projectName: r.projectName,
+            receiptUrl: r.receiptUrl,
+            documentation: <DocumentationPips row={r} suppressUnclassifiedNote={mostRowsUncategorized} />,
+            needsReview: r.status === "needs-review",
+            drilldown: {
+                row: r,
+                expense: r.qbTxnId ? expenseByPurchaseId.get(r.qbTxnId) ?? null : null,
+                journeyMatch: r.edges ? matchReceiptJourney(r, journeyIndex) : null,
+                reviewIssue: r.qbTxnId ? reviewIssueMap.get(r.qbTxnId) ?? null : null,
+            },
+        }))
+        : registerRows.map((r, i) => ({
+            key: `${r.qbTxnId ?? "row"}-${i}`,
+            date: r.date,
+            qbType: r.qbType,
+            docNum: r.docNum,
+            name: r.name,
+            amountCents: r.amountCents,
+            isPurchase: isPurchaseType(r.qbType),
+            qbTxnId: r.qbTxnId,
+            projectId: null,
+            projectName: null,
+            receiptUrl: null,
+            documentation: <span className="text-xs text-hui-textMuted italic">Documentation status unavailable</span>,
+            needsReview: false,
+            drilldown: null,
+        }));
+
+    const moneyInCents = registerRows.filter((r) => r.amountCents > 0).reduce((sum, r) => sum + r.amountCents, 0);
+    const moneyOutCents = registerRows.filter((r) => r.amountCents < 0).reduce((sum, r) => sum + Math.abs(r.amountCents), 0);
+
+    const filteredRows = applyRegisterFilters(displayRows, { type, reviewOnly, mergeUnavailable });
+
+    // ?focus=<qbTxnId> (plan §3/§5 step 9 deep link) named a row that exists
+    // on this page but the current type/review filters hid it — say so
+    // rather than silently rendering as if that row never existed.
+    const focusHiddenByFilters =
+        focus !== null && displayRows.some((r) => r.qbTxnId === focus) && !filteredRows.some((r) => r.qbTxnId === focus);
+
+    // Pipeline health inputs — independent of the register/merge above, so a
+    // register or merge failure doesn't need to take this section down too.
+    // Isolated behind its own try/catch (mirrors `mergeUnavailable` above):
+    // these ran inside the SAME Promise.all as the register/merge fetch
+    // before, so one ancillary failure here (e.g. `recentAutomationEvents`)
+    // rejected the whole page and hid the register the user actually came
+    // for.
+    let pipelineHealthUnavailable = false;
+    let summary: AutomationSummary = {
+        pushedThisMonth: 0,
+        fallbackThisMonth: 0,
+        amountCentsThisMonth: 0,
+        taxCentsThisMonth: 0,
+        lastSync: null,
+        handsFreeRate30d: null,
+    };
+    let buckets: AutomationDayBucket[] = [];
+    let events: Awaited<ReturnType<typeof recentAutomationEvents>> = [];
+    // Fail closed: an unknown pause state disables the manual sync button
+    // rather than presenting it as available.
+    let pauses = { receiptPushPaused: true, qboSyncPaused: true };
+    try {
+        // B3: 15s timeout so a hung query can't hold the register hostage
+        // (a promise that never settles isn't a rejection an ordinary catch
+        // would see), and the resolved shape is validated HERE, inside the
+        // protected block — consuming it unguarded outside the try (as
+        // before) meant a malformed result would throw past the catch and
+        // crash the render instead of degrading gracefully.
+        const [summaryResult, bucketsResult, eventsResult, pausesResult] = await withTimeout(
+            Promise.all([
+                automationSummary(),
+                receiptDailyBuckets(30),
+                recentAutomationEvents(50),
+                pauseStates(),
+            ]),
+            15_000,
+        );
+        const shapeOk =
+            summaryResult && typeof summaryResult === "object" &&
+            Array.isArray(bucketsResult) &&
+            Array.isArray(eventsResult) &&
+            pausesResult && typeof pausesResult.receiptPushPaused === "boolean" && typeof pausesResult.qboSyncPaused === "boolean";
+        if (!shapeOk) {
+            throw new Error("pipeline health inputs malformed");
+        }
+        summary = summaryResult;
+        buckets = bucketsResult;
+        events = eventsResult;
+        pauses = pausesResult;
+    } catch (error) {
+        console.error("pipeline health inputs failed", error instanceof Error ? error.message : "UnknownError");
+        pipelineHealthUnavailable = true;
+    }
     const minutesSaved = summary.pushedThisMonth * 4;
     const hoursSavedRaw = Math.round((minutesSaved / 60) * 2) / 2;
     const hoursSavedLabel = Number.isInteger(hoursSavedRaw) ? String(hoursSavedRaw) : hoursSavedRaw.toFixed(1);
     const onARoll = summary.handsFreeRate30d !== null && summary.handsFreeRate30d >= 0.8;
-
-    const lastSyncCounts = summary.lastSync ? parseSyncCounts(summary.lastSync.detail) : null;
-
-    const serializedJourneys = journeys.map(serializeJourney);
-    const suggestions: Record<string, FixSuggestion | null> = {};
-    for (const j of journeys) {
-        const suggestion = suggestFix(j);
-        if (suggestion) suggestions[j.docNumber] = suggestion;
-    }
-
     const syncRuns = events.filter((e) => e.kind === "qbo-sync").slice(0, 15);
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
             {/* Header */}
-            <div className="flex items-center justify-between">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
                 <div>
                     <h1 className="text-xl font-bold text-hui-textMain">Automation</h1>
-                    <p className="text-sm text-hui-textMuted mt-1">
-                        Receipts in, books done — the pipeline watching itself.
+                    <p className="text-sm text-hui-textMuted mt-1 max-w-3xl">
+                        QuickBooks WTB account register — posted QuickBooks entries affecting account 154, fetched at{" "}
+                        <span title={new Date(fetchedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
+                            {formatRelativeTime(new Date(fetchedAt), nowMs)}
+                        </span>
+                        . This view cannot see bank transactions that are pending, excluded, or missing from QuickBooks.
+                        Bank-side completeness requires the monthly WTB CSV compare.
                     </p>
-                    <div className="flex gap-3">
+                    {stale && (
+                        <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                            QuickBooks didn&apos;t answer just now — showing the last successful fetch.
+                        </div>
+                    )}
+                    {mergeUnavailable && (
+                        <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                            Documentation status (receipt / job cost / amount) couldn&apos;t be loaded right now — the register
+                            itself below is still current.
+                        </div>
+                    )}
+                    {journeyIndexTruncated && (
+                        <div className="mt-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                            Receipt journey history is incomplete for this range — some row drill-downs below may show
+                            partial results.
+                        </div>
+                    )}
+                    <div className="flex gap-3 mt-2">
                         <a href="/automation/guide" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
                             How this pipeline works ↗
                         </a>
-                        <a href="/automation/bank" className="text-xs font-medium text-hui-primary hover:underline">
-                            Bank register →
+                        <a href="/automation/guide#running-it" target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-hui-primary hover:underline">
+                            How to run this ↗
+                        </a>
+                        <a href={filterHref({})} className="text-xs font-medium text-hui-primary hover:underline">
+                            Refresh ↻
+                        </a>
+                        <a
+                            href={`/api/automation/export?range=${range}&type=${type}${reviewOnly ? "&review=1" : ""}`}
+                            className="text-xs font-medium text-hui-primary hover:underline"
+                        >
+                            Download CSV ⤓
                         </a>
                     </div>
                 </div>
@@ -257,153 +507,224 @@ export default async function AutomationPage() {
             </div>
 
             {/* Stat tiles */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <StatCard label="Receipts booked this month" value={String(summary.pushedThisMonth)} />
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                <StatCard label="Money in" value={formatCurrency(moneyInCents / 100)} valueClassName="text-teal-700" />
+                <StatCard label="Money out" value={formatCurrency(moneyOutCents / 100)} />
                 <StatCard
-                    label="Hands-free rate (30d)"
-                    value={summary.handsFreeRate30d === null ? "—" : `${Math.round(summary.handsFreeRate30d * 100)}%`}
-                    sub="Booked automatically vs. emailed as fallback"
+                    label="Documented"
+                    value={mergeUnavailable ? "—" : `${documented} of ${denominator} job purchases fully documented`}
                 />
-                <StatCard label="Booked this month" value={formatCurrency(summary.amountCentsThisMonth / 100)} />
+                <StatCard label="Needs review" value={mergeUnavailable ? "—" : String(needsReview)} />
+                <StatCard label="Receipts stuck outside the bank" value={mergeUnavailable ? "—" : String(orphanCount)} />
+            </div>
+
+            {/* Secondary counts — nothing hides, plan §2 */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <StatCard
-                    label="Sales tax captured"
-                    value={formatCurrency(summary.taxCentsThisMonth / 100)}
-                    sub="Reclaimable — reseller permit"
+                    label="Overhead and owner draws"
+                    value={mergeUnavailable ? "—" : String(expectedNonJobSpend)}
+                    sub="No job cost expected here on purpose"
+                />
+                <StatCard
+                    label="Receipt not traced"
+                    value={mergeUnavailable ? "—" : String(receiptProvenanceUnverified)}
+                    sub="Job cost and amount match, but we can't find the receipt in the automation records"
+                />
+                <StatCard
+                    label="Not categorized yet"
+                    value={mergeUnavailable ? "—" : String(unknownClassification)}
+                    sub="We don't know if these are job costs or overhead"
                 />
             </div>
 
-            {/* Receipts — per-receipt journey drill-down */}
-            <div>
-                <h2 className="text-base font-semibold text-hui-textMain mb-3">Receipts</h2>
-                <JourneyList journeys={serializedJourneys} suggestions={suggestions} />
+            {/* Filters — shared across the register table */}
+            <div className="flex gap-2 flex-wrap items-center">
+                <FilterChip href={filterHref({ range: "30" })} active={range === "30"}>30d</FilterChip>
+                <FilterChip href={filterHref({ range: "60" })} active={range === "60"}>60d</FilterChip>
+                <FilterChip href={filterHref({ range: "90" })} active={range === "90"}>90d</FilterChip>
+                <span className="w-px h-4 bg-slate-300 mx-1" />
+                <FilterChip href={filterHref({ type: "all" })} active={type === "all"}>All</FilterChip>
+                <FilterChip href={filterHref({ type: "in" })} active={type === "in"}>Money in</FilterChip>
+                <FilterChip href={filterHref({ type: "out" })} active={type === "out"}>Money out</FilterChip>
+                <span className="w-px h-4 bg-slate-300 mx-1" />
+                <FilterChip href={filterHref({ review: reviewOnly ? "0" : "1" })} active={reviewOnly}>
+                    Needs review only
+                </FilterChip>
             </div>
-
-            {/* Intake chart */}
-            <ChartPanel
-                title="Receipts processed — last 30 days"
-                subtitle="Booked automatically vs. email fallback vs. errors."
-                isEmpty={chartEmpty}
-            >
-                <IntakeChart data={buckets} />
-            </ChartPanel>
-
-            {/* Gamified strip */}
-            <div className="hui-card p-5">
-                <p className="text-sm text-hui-textMain">
-                    <span className="font-semibold">≈ {hoursSavedLabel} hrs</span> of data entry saved this month
+            {reviewOnly && mergeUnavailable && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 -mt-2">
+                    Review status is unavailable right now, so &quot;Needs review only&quot; isn&apos;t applied — showing every
+                    row instead of hiding all of them.
                 </p>
-                {onARoll && (
-                    <p className="text-sm text-hui-textMain mt-1">🔥 The robots are on a roll</p>
-                )}
-            </div>
-
-            {/* Status card */}
-            <div className="hui-card p-5">
-                <h2 className="text-base font-semibold text-hui-textMain mb-4">Pipeline status</h2>
-                <div className="space-y-3">
-                    <PipelineControls
-                        pushEnabled={pushEnabled}
-                        syncCronEnabled={syncCronEnabled}
-                        receiptPushPaused={pauses.receiptPushPaused}
-                        qboSyncPaused={pauses.qboSyncPaused}
-                        isAdmin={isAdmin}
-                    />
-                    <div className="flex items-center justify-between py-2">
-                        <div>
-                            <p className="text-sm font-medium text-hui-textMain">Last sync</p>
-                            {summary.lastSync ? (
-                                <>
-                                    <p className="text-xs text-hui-textMuted" title={summary.lastSync.at.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
-                                        {formatRelativeTime(summary.lastSync.at)} · {summary.lastSync.status} · {describeSource(summary.lastSync.source)}
-                                        {lastSyncCounts && (
-                                            <>
-                                                {" · "}
-                                                {[
-                                                    lastSyncCounts.imported ? `${lastSyncCounts.imported} imported` : null,
-                                                    lastSyncCounts.updated ? `${lastSyncCounts.updated} updated` : null,
-                                                    lastSyncCounts.skipped ? `${lastSyncCounts.skipped} skipped` : null,
-                                                    lastSyncCounts.deactivated ? `${lastSyncCounts.deactivated} deactivated` : null,
-                                                ].filter(Boolean).join(", ") || "no changes"}
-                                            </>
-                                        )}
-                                    </p>
-                                    {lastSyncCounts?.skipped && lastSyncCounts.skippedByReason && (
-                                        <p
-                                            className="text-xs text-hui-textMuted mt-0.5"
-                                            title={[
-                                                lastSyncCounts.skippedSample?.length
-                                                    ? `QBO purchases: ${lastSyncCounts.skippedSample.map((s) => s.qbPurchaseId).join(", ")}`
-                                                    : null,
-                                                "Skipped means QuickBooks kept it but it didn't map to a ProBuild job — loans, overhead, and owner draws are supposed to be skipped.",
-                                            ].filter(Boolean).join(". ")}
-                                        >
-                                            Skipped: {formatSkippedBreakdown(lastSyncCounts.skippedByReason)}
-                                        </p>
-                                    )}
-                                </>
-                            ) : (
-                                <p className="text-xs text-hui-textMuted">No sync has run yet.</p>
-                            )}
-                        </div>
-                    </div>
-                </div>
-                <p className="text-xs text-hui-textMuted mt-4 pt-3 border-t border-hui-border">
-                    Receipt scan runs every 10 minutes in Google Drive.
+            )}
+            {focusHiddenByFilters && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 -mt-2">
+                    The row you followed a link to is hidden by the current filters —{" "}
+                    <a href={filterHref({ type: "all", review: "0" })} className="underline">
+                        clear filters
+                    </a>{" "}
+                    to see it.
                 </p>
-            </div>
+            )}
 
-            {/* Sync runs — collapsed by default */}
-            <details className="hui-card group">
-                <summary className="cursor-pointer list-none px-5 py-4 flex items-center justify-between text-base font-semibold text-hui-textMain select-none">
-                    Sync runs
-                    <span className="text-xs font-normal text-hui-textMuted group-open:hidden">Show</span>
-                    <span className="text-xs font-normal text-hui-textMuted hidden group-open:inline">Hide</span>
-                </summary>
-                <div className="border-t border-hui-border overflow-hidden">
-                    {syncRuns.length === 0 ? (
-                        <p className="text-sm text-hui-textMuted px-5 py-6">No sync runs recorded yet.</p>
-                    ) : (
+            {mostRowsUncategorized && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    Most of these purchases haven&apos;t been sorted into a job cost or overhead yet, so most rows below
+                    will say &quot;Not categorized yet.&quot; That&apos;s expected until that gets set up — it doesn&apos;t
+                    mean anything is wrong with these entries.
+                </p>
+            )}
+
+            <DocumentationLegend />
+
+            {/* Register table */}
+            <div className="hui-card overflow-hidden">
+                {filteredRows.length === 0 ? (
+                    <p className="text-sm text-hui-textMuted py-8 text-center">Nothing here for this range.</p>
+                ) : (
+                    <div className="overflow-x-auto">
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="border-b border-hui-border bg-slate-50">
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider w-32">When</th>
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Status + source</th>
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Counts</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Date</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Type</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Doc/Check #</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Payee</th>
+                                    <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Amount</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Documentation</th>
+                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Links</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
-                                {syncRuns.map((e) => {
-                                    const counts = parseSyncCounts(e.detail);
-                                    return (
-                                        <tr key={e.id} className="hover:bg-slate-50 transition">
-                                            <td className="px-4 py-3 text-hui-textMuted whitespace-nowrap" title={e.createdAt.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}>
-                                                {formatRelativeTime(e.createdAt)}
+                                {filteredRows.map((row) => {
+                                    const summary = (
+                                        <>
+                                            <td className="px-4 py-3 text-hui-textMain whitespace-nowrap">
+                                                {row.drilldown && (
+                                                    <span className="inline-block w-3 text-hui-textMuted select-none" aria-hidden="true">
+                                                        ▸
+                                                    </span>
+                                                )}
+                                                {row.date}
                                             </td>
                                             <td className="px-4 py-3 text-hui-textMain">
-                                                <div className="flex items-center gap-2">
-                                                    <SyncStatusPill status={e.status} />
-                                                    <span className="text-xs text-hui-textMuted">{describeSource(e.source)}</span>
+                                                <span title={row.qbType}>{friendlyType(row.qbType, row.docNum)}</span>
+                                            </td>
+                                            <td className="px-4 py-3 text-hui-textMuted">{row.docNum ?? "—"}</td>
+                                            <td className="px-4 py-3 text-hui-textMain">
+                                                {row.name ?? "—"}
+                                                {row.projectName && (
+                                                    <p className="text-xs text-hui-textMuted">{row.projectName}</p>
+                                                )}
+                                            </td>
+                                            <td
+                                                className={`px-4 py-3 text-right font-medium tabular-nums ${
+                                                    row.amountCents > 0 ? "text-teal-700" : "text-hui-textMain"
+                                                }`}
+                                            >
+                                                {amountSign(row.amountCents)}
+                                                {formatCurrency(Math.abs(row.amountCents) / 100)}
+                                            </td>
+                                            <td className="px-4 py-3">{row.documentation}</td>
+                                            <LinksCell>
+                                                <div className="flex gap-2 items-center flex-wrap text-xs">
+                                                    {row.isPurchase && row.qbTxnId && (
+                                                        <a
+                                                            href={`https://qbo.intuit.com/app/expense?txnId=${encodeURIComponent(row.qbTxnId)}`}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            title="Best-effort link — if it doesn't open the purchase, use the copied ID to search in QuickBooks"
+                                                            className="font-medium text-hui-primary hover:underline"
+                                                        >
+                                                            QuickBooks ↗
+                                                        </a>
+                                                    )}
+                                                    {row.qbTxnId && <CopyIdButton value={row.qbTxnId} label="QuickBooks ID" />}
+                                                    {row.receiptUrl && (
+                                                        <a
+                                                            href={row.receiptUrl}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="font-medium text-hui-primary hover:underline"
+                                                        >
+                                                            Receipt ↗
+                                                        </a>
+                                                    )}
+                                                    {row.projectId && (
+                                                        <a href={`/projects/${row.projectId}`} className="font-medium text-hui-primary hover:underline">
+                                                            Project ↗
+                                                        </a>
+                                                    )}
                                                 </div>
-                                                {e.status === "error" && e.reason && (
-                                                    <p className="text-xs text-hui-textMuted mt-1">{e.reason}</p>
-                                                )}
-                                            </td>
-                                            <td className="px-4 py-3 text-hui-textMuted">
-                                                <div>{counts ? formatCounts(counts) : "—"}</div>
-                                                {counts?.skipped && counts.skippedByReason && (
-                                                    <p className="text-xs text-hui-textMuted mt-0.5">
-                                                        {formatSkippedBreakdown(counts.skippedByReason)}
-                                                    </p>
-                                                )}
-                                            </td>
-                                        </tr>
+                                            </LinksCell>
+                                        </>
+                                    );
+
+                                    if (!row.drilldown) {
+                                        return (
+                                            <tr key={row.key} className="hover:bg-slate-50 transition">
+                                                {summary}
+                                            </tr>
+                                        );
+                                    }
+
+                                    return (
+                                        <ExpandableRow
+                                            key={row.key}
+                                            qbTxnId={row.qbTxnId}
+                                            focusTxnId={focus}
+                                            columnCount={7}
+                                            summary={summary}
+                                        >
+                                            <RowDrilldown
+                                                row={row.drilldown.row}
+                                                expense={row.drilldown.expense}
+                                                journeyMatch={row.drilldown.journeyMatch}
+                                                reviewIssue={row.drilldown.reviewIssue}
+                                                now={nowMs}
+                                            />
+                                        </ExpandableRow>
                                     );
                                 })}
                             </tbody>
                         </table>
-                    )}
+                    </div>
+                )}
+            </div>
+            <p className="text-xs text-hui-textMuted -mt-3">
+                {filteredRows.length} entries · {startDate} to {endDate}
+            </p>
+
+            {/* Orphan receipts */}
+            {orphanSection}
+
+            {/* Receipt pipeline — journey list, Verify in QuickBooks + AI review (plan §3) */}
+            {journeySection}
+
+            {/* Pipeline health — collapsible, plan §5 step 7 */}
+            {pipelineHealthUnavailable ? (
+                <div className="hui-card p-5 text-sm text-hui-textMuted">
+                    Pipeline health unavailable right now — the register above is still current.
                 </div>
-            </details>
+            ) : (
+                <PipelineHealth
+                    pushedThisMonth={summary.pushedThisMonth}
+                    handsFreeRate30d={summary.handsFreeRate30d}
+                    amountCentsThisMonth={summary.amountCentsThisMonth}
+                    taxCentsThisMonth={summary.taxCentsThisMonth}
+                    lastSync={summary.lastSync}
+                    buckets={buckets}
+                    hoursSavedLabel={hoursSavedLabel}
+                    onARoll={onARoll}
+                    pushEnabled={pushEnabled}
+                    syncCronEnabled={syncCronEnabled}
+                    receiptPushPaused={pauses.receiptPushPaused}
+                    qboSyncPaused={pauses.qboSyncPaused}
+                    isAdmin={isAdmin}
+                    syncRuns={syncRuns}
+                    now={nowMs}
+                />
+            )}
         </div>
     );
 }
