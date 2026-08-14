@@ -67,7 +67,16 @@ export interface MealSkippedWaiverResult {
     reviewReason?: string;
 }
 
+/** Sentinel waiver-reason text — the ONE place this string is defined, so appending and removing it can never drift out of sync. */
 const MEAL_WAIVER_NOTE = "Worked through WA meal break (voluntary waiver recorded at clock-out)";
+
+/** reviewReason entries are joined with "; " when appended — see below. */
+function reviewReasonParts(reviewReason: string | null | undefined): string[] {
+    return (reviewReason ?? "")
+        .split("; ")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+}
 
 /**
  * WA meal-break voluntary waiver attestation: mobile's clock-out modal asks
@@ -78,20 +87,36 @@ const MEAL_WAIVER_NOTE = "Worked through WA meal break (voluntary waiver recorde
  * non-boolean value is ignored rather than coerced. Pay math and
  * mealDeductionHours are untouched: meal breaks clock the worker out on
  * mobile, so worked-through time is already paid in full by design.
+ *
+ * Idempotent in both directions, since mobile can send the same clock-out
+ * request more than once (retry, double-tap):
+ * - `true`: appends MEAL_WAIVER_NOTE only if it isn't already present —
+ *   repeating `true` must not duplicate the reason. needsReview is still
+ *   set true either way.
+ * - `false`: removes MEAL_WAIVER_NOTE from reviewReason if present,
+ *   preserving any other reasons, and only clears needsReview when the
+ *   resulting reviewReason is empty — a `false` must never clear a review
+ *   flag some other reason (e.g. a GPS flag) justifies.
  */
 export function applyMealSkippedWaiver(input: MealSkippedWaiverInput): MealSkippedWaiverResult {
     if (!input.settingEndTime) return {};
     if (input.mealSkipped !== true && input.mealSkipped !== false) return {};
 
+    const existingParts = reviewReasonParts(input.existingReviewReason);
+    const hasWaiverNote = existingParts.includes(MEAL_WAIVER_NOTE);
+
     if (input.mealSkipped === false) {
-        return { mealSkipped: false };
+        if (!hasWaiverNote) return { mealSkipped: false };
+
+        const remainingParts = existingParts.filter((part) => part !== MEAL_WAIVER_NOTE);
+        const result: MealSkippedWaiverResult = { mealSkipped: false, reviewReason: remainingParts.join("; ") };
+        if (remainingParts.length === 0) result.needsReview = false;
+        return result;
     }
 
     return {
         mealSkipped: true,
         needsReview: true,
-        reviewReason: input.existingReviewReason
-            ? `${input.existingReviewReason}; ${MEAL_WAIVER_NOTE}`
-            : MEAL_WAIVER_NOTE,
+        reviewReason: hasWaiverNote ? existingParts.join("; ") : [...existingParts, MEAL_WAIVER_NOTE].join("; "),
     };
 }

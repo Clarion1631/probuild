@@ -165,3 +165,55 @@ test("mealSkipped true on a non-clock-out edit (settingEndTime: false) is ignore
     });
     assert.deepEqual(result, {});
 });
+
+// ── applyMealSkippedWaiver idempotency ────────────────────────────────────
+
+test("mealSkipped true repeated on an already-recorded waiver does not duplicate the reason", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: true,
+        settingEndTime: true,
+        existingReviewReason: WAIVER_NOTE,
+    });
+    assert.deepEqual(result, { mealSkipped: true, needsReview: true, reviewReason: WAIVER_NOTE });
+});
+
+test("mealSkipped true repeated alongside another reason does not duplicate the waiver note", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: true,
+        settingEndTime: true,
+        existingReviewReason: `Flagged for missing GPS ping; ${WAIVER_NOTE}`,
+    });
+    assert.deepEqual(result, {
+        mealSkipped: true,
+        needsReview: true,
+        reviewReason: `Flagged for missing GPS ping; ${WAIVER_NOTE}`,
+    });
+});
+
+test("mealSkipped false removes only the waiver reason, preserving another reason and its review flag", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: false,
+        settingEndTime: true,
+        existingReviewReason: `Flagged for missing GPS ping; ${WAIVER_NOTE}`,
+    });
+    assert.deepEqual(result, { mealSkipped: false, reviewReason: "Flagged for missing GPS ping" });
+    assert.equal("needsReview" in result, false);
+});
+
+test("mealSkipped false removes the waiver reason and clears needsReview when nothing else justifies it", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: false,
+        settingEndTime: true,
+        existingReviewReason: WAIVER_NOTE,
+    });
+    assert.deepEqual(result, { mealSkipped: false, reviewReason: "", needsReview: false });
+});
+
+test("mealSkipped false with no waiver reason present leaves everything untouched (an unrelated reason isn't disturbed)", () => {
+    const result = applyMealSkippedWaiver({
+        mealSkipped: false,
+        settingEndTime: true,
+        existingReviewReason: "Flagged for missing GPS ping",
+    });
+    assert.deepEqual(result, { mealSkipped: false });
+});

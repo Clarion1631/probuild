@@ -231,6 +231,42 @@ test("mealSkipped: true appends to an existing reviewReason instead of clobberin
     assert.equal(updateCalls[0].data.reviewReason, `Flagged for missing GPS ping; ${WAIVER_NOTE}`);
 });
 
+test("mealSkipped: true repeated does not duplicate the waiver reason", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ reviewReason: WAIVER_NOTE }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.reviewReason, WAIVER_NOTE);
+    assert.equal(updateCalls[0].data.needsReview, true);
+});
+
+test("mealSkipped: false after true removes the waiver reason and clears needsReview when nothing else justifies review", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ reviewReason: WAIVER_NOTE }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: false }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.reviewReason, "");
+    assert.equal(updateCalls[0].data.needsReview, false);
+});
+
+test("mealSkipped: false alongside another reviewReason removes only the waiver note, leaving the other reason's review flag alone", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ reviewReason: `Flagged for missing GPS ping; ${WAIVER_NOTE}` }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", mealSkipped: false }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.reviewReason, "Flagged for missing GPS ping");
+    assert.equal("needsReview" in updateCalls[0].data, false);
+});
+
 // PUT always ends the shift (endTime defaults to now), so there is no "non-clock-out
 // edit" call site to exercise through this route — that guard is covered directly
 // on the shared applyMealSkippedWaiver() helper in tests/logistics-time-entry.test.ts,
