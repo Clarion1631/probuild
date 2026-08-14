@@ -60,21 +60,25 @@ const handlers = createPhasesHandlers({
         return prisma.project.findUnique({ where: { id: projectId }, select: { id: true, status: true } });
     },
     getPhases: async (projectId) => {
-        // All cost-coded items across every estimate on this project — the
-        // approved-only / active-only / representative-item selection is the
-        // pure buildPhaseOptions() reduction (unit-tested directly), so this
-        // stays a plain fetch.
+        // Status/archived/project filtering pushed into the query (rather than
+        // fetching every cost-coded item on the project and filtering in JS) —
+        // only items on Approved, non-archived estimates for this project, with
+        // an active cost code, come back at all. The remaining approved-only
+        // representative-item selection (and picking ONE canonical estimate
+        // when several are Approved) is the pure buildPhaseOptions() reduction
+        // (unit-tested directly).
         const items = await prisma.estimateItem.findMany({
             where: {
                 costCodeId: { not: null },
-                estimate: { projectId },
+                costCode: { isActive: true },
+                estimate: { projectId, status: "Approved", archivedAt: null },
             },
             select: {
                 id: true,
                 order: true,
                 costCodeId: true,
                 costCode: { select: { code: true, name: true, isActive: true } },
-                estimate: { select: { status: true, archivedAt: true } },
+                estimate: { select: { id: true, status: true, archivedAt: true, approvedAt: true, createdAt: true } },
             },
         });
 
@@ -90,6 +94,8 @@ const handlers = createPhasesHandlers({
                     costCodeName: item.costCode!.name,
                     estimateStatus: item.estimate.status,
                     estimateArchived: item.estimate.archivedAt != null,
+                    estimateId: item.estimate.id,
+                    estimateRecencyKey: (item.estimate.approvedAt ?? item.estimate.createdAt).toISOString(),
                 }))
         );
     },

@@ -12,6 +12,8 @@ function item(overrides: Partial<PhaseCandidateItem> = {}): PhaseCandidateItem {
         costCodeName: "Demolition",
         estimateStatus: "Approved",
         estimateArchived: false,
+        estimateId: "est1",
+        estimateRecencyKey: "2026-01-01T00:00:00.000Z",
         ...overrides,
     };
 }
@@ -72,4 +74,58 @@ test("result is sorted by cost code, not input order", () => {
     ];
     const result = buildPhaseOptions(items);
     assert.deepEqual(result.map((p) => p.code), ["01-DEMO", "02-FRAME"]);
+});
+
+// ── canonical estimate selection (multiple Approved estimates) ───────────
+
+test("when multiple estimates are Approved, only items from the most recently approved estimate are used", () => {
+    const items = [
+        item({
+            estimateItemId: "old-item",
+            costCodeId: "cc1",
+            estimateId: "est-old",
+            estimateRecencyKey: "2026-01-01T00:00:00.000Z",
+        }),
+        item({
+            estimateItemId: "new-item",
+            costCodeId: "cc2",
+            costCodeCode: "02-FRAME",
+            estimateId: "est-new",
+            estimateRecencyKey: "2026-06-01T00:00:00.000Z",
+        }),
+    ];
+    const result = buildPhaseOptions(items);
+    assert.deepEqual(result.map((p) => p.estimateItemId), ["new-item"]);
+});
+
+test("a non-eligible estimate (Sent, or archived) never becomes the canonical estimate even if more recent", () => {
+    const items = [
+        item({
+            estimateItemId: "approved-item",
+            costCodeId: "cc1",
+            estimateId: "est-approved",
+            estimateStatus: "Approved",
+            estimateRecencyKey: "2026-01-01T00:00:00.000Z",
+        }),
+        item({
+            estimateItemId: "sent-item",
+            costCodeId: "cc2",
+            costCodeCode: "02-FRAME",
+            estimateId: "est-sent",
+            estimateStatus: "Sent",
+            estimateRecencyKey: "2026-06-01T00:00:00.000Z",
+        }),
+    ];
+    const result = buildPhaseOptions(items);
+    assert.deepEqual(result.map((p) => p.estimateItemId), ["approved-item"]);
+});
+
+test("ties on estimate recency break deterministically on the lower estimateId", () => {
+    const items = [
+        item({ estimateItemId: "from-b", costCodeId: "cc1", estimateId: "est-b", estimateRecencyKey: "2026-01-01T00:00:00.000Z" }),
+        item({ estimateItemId: "from-a", costCodeId: "cc1", estimateId: "est-a", estimateRecencyKey: "2026-01-01T00:00:00.000Z" }),
+    ];
+    const result = buildPhaseOptions(items);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].estimateItemId, "from-a");
 });

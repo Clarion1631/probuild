@@ -14,6 +14,10 @@ export interface PhaseCandidateItem {
     costCodeName: string;
     estimateStatus: string;
     estimateArchived: boolean;
+    /** Estimate.id — used to pick ONE canonical estimate when several Approved estimates exist on the project. */
+    estimateId: string;
+    /** Estimate.approvedAt if set, else Estimate.createdAt (ISO string) — the recency key for canonical-estimate selection. Lexicographic ISO-8601 comparison sorts chronologically. */
+    estimateRecencyKey: string;
 }
 
 export interface PhaseOption {
@@ -25,16 +29,39 @@ export interface PhaseOption {
 }
 
 /**
- * Distinct, active cost codes referenced by items on Approved (non-archived)
- * estimates, one representative item per cost code (lowest order, then id),
- * sorted by code.
+ * Distinct, active cost codes referenced by items on the ONE canonical
+ * Approved (non-archived) estimate for the project, one representative item
+ * per cost code (lowest order, then id), sorted by code.
+ *
+ * A project can carry more than one Approved estimate at once — merging
+ * items across all of them would make the phase list flap as estimates are
+ * approved/edited. Instead, pick a single canonical estimate deterministically
+ * (most recently approved, falling back to most recently created via
+ * estimateRecencyKey, then estimateId as a final tiebreak) and use only its
+ * items.
  */
 export function buildPhaseOptions(items: PhaseCandidateItem[]): PhaseOption[] {
     const eligible = items.filter(
         (i) => i.costCodeId && i.costCodeActive && i.estimateStatus === "Approved" && !i.estimateArchived
     );
 
-    const sorted = [...eligible].sort((a, b) => {
+    let canonicalEstimateId: string | null = null;
+    let canonicalRecencyKey = "";
+    for (const item of eligible) {
+        const isMoreRecent = item.estimateRecencyKey > canonicalRecencyKey;
+        const isTieBrokenLower =
+            item.estimateRecencyKey === canonicalRecencyKey &&
+            canonicalEstimateId !== null &&
+            item.estimateId < canonicalEstimateId;
+        if (canonicalEstimateId === null || isMoreRecent || isTieBrokenLower) {
+            canonicalEstimateId = item.estimateId;
+            canonicalRecencyKey = item.estimateRecencyKey;
+        }
+    }
+
+    const fromCanonicalEstimate = eligible.filter((i) => i.estimateId === canonicalEstimateId);
+
+    const sorted = [...fromCanonicalEstimate].sort((a, b) => {
         if (a.order !== b.order) return a.order - b.order;
         return a.estimateItemId < b.estimateItemId ? -1 : a.estimateItemId > b.estimateItemId ? 1 : 0;
     });
