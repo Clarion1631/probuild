@@ -270,10 +270,19 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     // Editing milestones NEVER emails or notifies the client on any path — the
     // only client emails are the Send button and payment receipts/notifications
     // (see docs/MILESTONE-EDITING.md for the audited list).
-    const clientVisibleMoney = !!linkedInvoice || !!initialEstimate.sentAt
+    // viewedAt is checked too: the portal currently lets a client open an estimate
+    // it owns regardless of status (tracked separately), so an opened-but-never-sent
+    // draft is still client-visible money.
+    const clientVisibleMoney = !!linkedInvoice || !!initialEstimate.sentAt || !!initialEstimate.viewedAt
         || ["Sent", "Viewed", "Approved", "Invoiced", "Paid"].includes(status);
     const [milestonesUnlocked, setMilestonesUnlocked] = useState(false);
     const milestonesLocked = clientVisibleMoney && !milestonesUnlocked;
+    // Ref mirror for async callers (AI generate/import): the response handler runs in a
+    // closure from the render that STARTED the request, so it must read the lock as it
+    // is NOW — e.g. the estimate was sent while generation was in flight — not as it
+    // was when the request began.
+    const milestonesLockedRef = useRef(milestonesLocked);
+    milestonesLockedRef.current = milestonesLocked;
 
     function unlockMilestones() {
         const ok = window.confirm(
@@ -1820,12 +1829,15 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // While the schedule is locked (client-visible money), an item import must not touch
         // milestones at all — no rebalance, no appended plan. The Schedule Total row and the
         // send-time mismatch block surface any resulting gap; unlocking re-enables editing.
-        const newSchedules = milestonesLocked
+        // Read through the ref, not this closure: the estimate may have been sent (locking
+        // the schedule) while the AI/import request was in flight.
+        const lockedNow = milestonesLockedRef.current;
+        const newSchedules = lockedNow
             ? baseSchedules
             : incomingMilestones
                 ? [...baseSchedules, ...data.paymentMilestones!]
                 : recalcMilestoneAmounts(baseSchedules, computeSellTotals(newItems, fieldsRef.current).total);
-        if (milestonesLocked && incomingMilestones) {
+        if (lockedNow && incomingMilestones) {
             toast.info("Payment milestones are locked — the imported milestones were not applied. Unlock the schedule to edit it.");
         }
 
@@ -1839,7 +1851,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // rebalanced schedules go to the save alone: the [total] effect updates client state
         // itself, and it does so with a functional updater, so it can't clobber a schedule
         // edit that has reached state but not yet the ref.
-        if (incomingMilestones && !milestonesLocked) {
+        if (incomingMilestones && !lockedNow) {
             setPaymentSchedules(newSchedules);
         }
         onMerged?.();

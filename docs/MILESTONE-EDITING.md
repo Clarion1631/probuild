@@ -10,7 +10,7 @@ paths.
 
 | Estimate state | What the client sees |
 |---|---|
-| Draft, never sent | Nothing. Edit freely. |
+| Never sent, never invoiced, never viewed | Nothing they've looked at. Edit freely. **Known gap:** `getEstimateForPortal` authorizes any estimate the portal client owns, without checking status or `sentAt` — a client who guesses/follows a portal link CAN open an unsent draft (tracked as a separate fix). The editor lock treats `viewedAt` as client-visible to compensate. |
 | Sent / Viewed / Approved, no invoice yet | The **estimate's own** payment schedule, in the portal and on any re-send. |
 | Invoiced, invoice has payment rows | The **invoice's** schedule (`Invoice.payments`). Estimate-side edits are invisible to the client and do NOT change what they owe. |
 
@@ -21,8 +21,11 @@ order.
 ## The editor lock (this change)
 
 `EstimateEditor.tsx` locks the whole Payment Schedule section when the money is
-client-visible: an invoice exists, `sentAt` is set, or status is
-Sent/Viewed/Approved/Invoiced/Paid. Draft estimates are never locked.
+client-visible: an invoice exists, `sentAt` or `viewedAt` is set, or status is
+Sent/Viewed/Approved/Invoiced/Paid. An estimate that has never been sent, viewed,
+or invoiced is never locked — the pre-send workflow is unchanged. (A Draft that
+HAS one of those markers — e.g. status manually reset after sending — stays
+locked; the markers win over the status label.)
 
 While locked:
 - Every milestone input (name, %, amount, due date) is disabled.
@@ -33,7 +36,8 @@ While locked:
 - AI generate/import merges items but leaves the schedule untouched (a payload that
   carries its own milestones gets a toast saying they were not applied).
 - Record Payment, receipts, and Undo payment still work — those are payment
-  lifecycle, not schedule editing, and each has its own modal.
+  lifecycle, not schedule editing. Record Payment and Undo confirm via their own
+  modals; Send/Resend Receipt fires directly from the row button.
 
 "Locked — unlock to edit" (header of the schedule section) opens a confirm dialog and
 unlocks until the page is left. Nothing is persisted about the unlock. After unlock,
@@ -50,12 +54,13 @@ which fires on *payments*, never on edits.
 | Path | Where | Notifies client? |
 |---|---|---|
 | Estimate save (editor autosave + Save) | `saveEstimate`, `src/lib/actions.ts` (paymentSchedules upsert in the save transaction) | No |
-| Send estimate | `sendEstimateToClient`, `src/lib/actions.ts` | Sends the estimate email deliberately. Since #362 it does **not** rewrite milestones — a schedule that doesn't sum to balance due **blocks the send** with an error. |
+| Send estimate | `sendEstimateToClient`, `src/lib/actions.ts` | Sends the estimate email deliberately. Since #362 it does **not** rewrite milestones — a schedule whose unpaid sum differs from balance due by more than one cent **blocks the send** with an error (the 1¢ tolerance absorbs rounding). |
 | Invoice "Edit amounts" | `updatePendingMilestoneAmountsCore`, `src/lib/billing-core.ts` | No (QB re-staging only) |
 | Split invoice milestones | `splitInvoiceMilestonesCore`, `src/lib/billing-core.ts` | No |
 | Add invoice milestone | `addInvoiceMilestone`, `src/lib/actions.ts` | No |
 | Delete invoice milestone | `deleteInvoiceMilestoneCore`, `src/lib/billing-core.ts` | No |
-| Payment settle/unsettle | `recordPayment`, `recordEstimatePayment`, Stripe webhook, portal payment, QB sync | Yes — by design, via the single-writer outbox (`enqueueMilestonePaid`). This is payment lifecycle, not editing. |
+| Payment settle | `recordPayment`, `recordEstimatePayment`, Stripe webhook, portal payment, QB sync | Yes — by design, via the single-writer outbox (`enqueueMilestonePaid`). This is payment lifecycle, not editing. |
+| Payment unsettle (undo) | `unrecordPayment` / `unrecordEstimatePayment` | No — both mirrors are released, but no notification is enqueued. |
 
 If you add a new milestone-mutating path: it must not notify, it must respect the
 mirror invariant (`PaymentSchedule.sourceScheduleId` pairs update together), and it

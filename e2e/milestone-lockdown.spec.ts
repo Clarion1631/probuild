@@ -23,6 +23,8 @@ const IDS = {
     sentDeposit: `${PFX}-eps-sent-dep`,
     sentFinal: `${PFX}-eps-sent-fin`,
     draftDeposit: `${PFX}-eps-draft-dep`,
+    viewedEstimate: `${PFX}-est-viewed`,
+    viewedDeposit: `${PFX}-eps-viewed-dep`,
 };
 
 test.describe.serial("Milestone lockdown on client-visible estimates", () => {
@@ -75,6 +77,27 @@ test.describe.serial("Milestone lockdown on client-visible estimates", () => {
             where: { id: IDS.sentFinal },
             update: { amount: 400, status: "Pending" },
             create: { id: IDS.sentFinal, estimateId: IDS.sentEstimate, name: "ML Final", amount: 400, status: "Pending", order: 2 },
+        });
+        // Status says Draft but the client has opened it — the marker must win over the label.
+        await prisma.estimate.upsert({
+            where: { id: IDS.viewedEstimate },
+            update: { status: "Draft", sentAt: null, viewedAt: new Date() },
+            create: {
+                id: IDS.viewedEstimate,
+                title: "ML Viewed Estimate",
+                code: "EST-MLVIEWED",
+                projectId: IDS.project,
+                status: "Draft",
+                viewedAt: new Date(),
+                taxExempt: true,
+                totalAmount: 1000,
+                balanceDue: 1000,
+            },
+        });
+        await prisma.estimatePaymentSchedule.upsert({
+            where: { id: IDS.viewedDeposit },
+            update: { amount: 1000, status: "Pending" },
+            create: { id: IDS.viewedDeposit, estimateId: IDS.viewedEstimate, name: "ML Viewed Deposit", amount: 1000, status: "Pending", order: 1 },
         });
         await prisma.estimatePaymentSchedule.upsert({
             where: { id: IDS.draftDeposit },
@@ -129,6 +152,13 @@ test.describe.serial("Milestone lockdown on client-visible estimates", () => {
         await page.getByTestId("unlock-milestones").click();
 
         await expect(page.getByTestId("unlock-milestones")).toBeVisible();
+        await expect(page.getByPlaceholder("e.g. Initial Deposit").first()).toBeDisabled();
+    });
+
+    test("status Draft but client has viewed it: still locked", async ({ page }) => {
+        await page.goto(`/projects/${IDS.project}/estimates/${IDS.viewedEstimate}`, { waitUntil: "networkidle" });
+
+        await expect(page.getByTestId("unlock-milestones"), "viewedAt must lock even with a Draft status").toBeVisible();
         await expect(page.getByPlaceholder("e.g. Initial Deposit").first()).toBeDisabled();
     });
 
