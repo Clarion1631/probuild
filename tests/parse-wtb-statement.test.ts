@@ -3,7 +3,7 @@ import test from "node:test";
 import {
     parseStatementMeta,
     resolveYear,
-    findColumnThreshold,
+    findColumnBandsByPage,
     parseActivityRows,
     stripPageBoilerplate,
     parseChecksPosted,
@@ -11,24 +11,26 @@ import {
 
 // Fixture note: none of this is real Golden Touch financial data. It's a
 // small synthetic statement built to the same row/column geometry pdfjs-dist
-// reports for the real WTB PDFs (Additions header x≈426.1, Subtractions
-// header x≈517.9 → threshold≈472; amount right-aligns to the FIRST row of a
-// wrapped transaction, continuation rows have no date/money) — see
+// reports for the real WTB PDFs (Additions right-edge≈472.66, Subtractions
+// right-edge≈579.58; amount right-aligns to the FIRST row of a wrapped
+// transaction, continuation rows have no date/money) — see
 // scripts/parse-wtb-statement.mjs for how that geometry was derived from the
-// real statements.
+// real statements. Column bands are calibrated per page from each item's
+// RIGHT edge (x + width), not its left x position, so fixture items only
+// need `right` set on the header cells and on money-shaped tokens.
 
-interface Item { str: string; x: number }
-function row(items: Item[]) {
-    return { items, text: items.map(i => i.str).join(" ") };
+interface Item { str: string; right?: number }
+function row(items: Item[], page = 1) {
+    return { items, text: items.map(i => i.str).join(" "), page };
 }
 
 const HEADER_ROW = row([
-    { str: "Date", x: 55.8 },
-    { str: "Description", x: 109.3 },
-    { str: "Additions", x: 426.1 },
-    { str: "Subtractions", x: 517.9 },
+    { str: "Date" },
+    { str: "Description" },
+    { str: "Additions", right: 472.66 },
+    { str: "Subtractions", right: 579.58 },
 ]);
-const THRESHOLD = 472; // (426.1 + 517.9) / 2
+const BANDS_BY_PAGE = findColumnBandsByPage([HEADER_ROW]);
 
 const MONTH_YEAR = new Map([[3, 2026], [4, 2026]]);
 
@@ -88,29 +90,30 @@ test("resolveYear", async t => {
     });
 });
 
-test("findColumnThreshold", async t => {
-    await t.test("returns the midpoint between the Additions and Subtractions header x positions", () => {
-        assert.equal(findColumnThreshold([HEADER_ROW]), THRESHOLD);
+test("findColumnBandsByPage", async t => {
+    await t.test("returns a page -> Additions/Subtractions right-edge Map", () => {
+        const bands = findColumnBandsByPage([HEADER_ROW]);
+        assert.deepEqual(bands.get(1), { additionsRight: 472.66, subtractionsRight: 579.58 });
     });
 
-    await t.test("throws loudly when the header row can't be found", () => {
-        assert.throws(() => findColumnThreshold([row([{ str: "nothing", x: 1 }])]));
+    await t.test("throws loudly when no page's header row can be found", () => {
+        assert.throws(() => findColumnBandsByPage([row([{ str: "nothing" }])]));
     });
 });
 
 test("stripPageBoilerplate", async t => {
     await t.test("removes the recurring per-page footer/header block between two transactions", () => {
         const rows = [
-            row([{ str: "3/02", x: 55.8 }, { str: "FIRST VENDOR", x: 109.3 }, { str: "10.00", x: 549.1 }]),
-            row([{ str: "Statement of Account", x: 438.6 }]),
-            row([{ str: "March 2,2026", x: 524.7 }]),
-            row([{ str: "April 1,2026", x: 513.2 }]),
-            row([{ str: "9998887777", x: 522.3 }]),
-            row([{ str: "30", x: 554.0 }]),
-            row([{ str: "1 of 2", x: 554.0 }]),
-            row([{ str: "Activity in Date Order", x: 55.8 }]),
+            row([{ str: "3/02" }, { str: "FIRST VENDOR" }, { str: "10.00", right: 579.1 }]),
+            row([{ str: "Statement of Account" }]),
+            row([{ str: "March 2,2026" }]),
+            row([{ str: "April 1,2026" }]),
+            row([{ str: "9998887777" }]),
+            row([{ str: "30" }]),
+            row([{ str: "1 of 2" }]),
+            row([{ str: "Activity in Date Order" }]),
             HEADER_ROW,
-            row([{ str: "3/03", x: 55.8 }, { str: "SECOND VENDOR", x: 109.3 }, { str: "20.00", x: 549.1 }]),
+            row([{ str: "3/03" }, { str: "SECOND VENDOR" }, { str: "20.00", right: 579.1 }]),
         ];
         const stripped = stripPageBoilerplate(rows);
         assert.deepEqual(stripped.map(r => r.text), [
@@ -120,15 +123,15 @@ test("stripPageBoilerplate", async t => {
     });
 
     await t.test("passes rows through unchanged when there is no boilerplate block", () => {
-        const rows = [row([{ str: "3/02", x: 55.8 }, { str: "X", x: 109.3 }, { str: "1.00", x: 549.1 }])];
+        const rows = [row([{ str: "3/02" }, { str: "X" }, { str: "1.00", right: 579.1 }])];
         assert.deepEqual(stripPageBoilerplate(rows), rows);
     });
 });
 
 test("parseActivityRows", async t => {
     await t.test("parses a single-row transaction (short description + amount on the same row)", () => {
-        const rows = [row([{ str: "3/02", x: 55.8 }, { str: "DEPOSIT", x: 109.3 }, { str: "500.00", x: 442.3 }])];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const rows = [row([{ str: "3/02" }, { str: "DEPOSIT" }, { str: "500.00", right: 472.3 }])];
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines.length, 1);
         assert.deepEqual(lines[0], {
             postedDate: "2026-03-02",
@@ -138,12 +141,12 @@ test("parseActivityRows", async t => {
         });
     });
 
-    await t.test("credit column (x < threshold) is positive; debit column (x >= threshold) is negative", () => {
+    await t.test("credit column (right edge near Additions) is positive; debit column (right edge near Subtractions) is negative", () => {
         const rows = [
-            row([{ str: "3/02", x: 55.8 }, { str: "REFUND CO", x: 109.3 }, { str: "12.34", x: 442.3 }]),
-            row([{ str: "3/03", x: 55.8 }, { str: "VENDOR CO", x: 109.3 }, { str: "56.78", x: 549.1 }]),
+            row([{ str: "3/02" }, { str: "REFUND CO" }, { str: "12.34", right: 471.9 }]),
+            row([{ str: "3/03" }, { str: "VENDOR CO" }, { str: "56.78", right: 579.9 }]),
         ];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines[0].amountCents, 1234);
         assert.equal(lines[1].amountCents, -5678);
     });
@@ -152,11 +155,11 @@ test("parseActivityRows", async t => {
         // Mirrors the real WTB layout: the amount sits on the FIRST row of
         // the block, and further description lines wrap below it.
         const rows = [
-            row([{ str: "3/05", x: 55.8 }, { str: "ACME SUPPLY CO #123 MAIN ST POS", x: 109.3 }, { str: "25.36", x: 549.1 }]),
-            row([{ str: "DEB 1234 03/04/26 00012345 ANYTOWN", x: 109.3 }]),
-            row([{ str: "C#1234", x: 109.3 }]),
+            row([{ str: "3/05" }, { str: "ACME SUPPLY CO #123 MAIN ST POS" }, { str: "25.36", right: 579.2 }]),
+            row([{ str: "DEB 1234 03/04/26 00012345 ANYTOWN" }]),
+            row([{ str: "C#1234" }]),
         ];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines.length, 1);
         assert.equal(lines[0].rawDescriptor, "ACME SUPPLY CO #123 MAIN ST POS DEB 1234 03/04/26 00012345 ANYTOWN C#1234");
         assert.equal(lines[0].amountCents, -2536);
@@ -164,41 +167,45 @@ test("parseActivityRows", async t => {
 
     await t.test("finalizes a still-open multi-row transaction once the NEXT date row starts", () => {
         const rows = [
-            row([{ str: "3/05", x: 55.8 }, { str: "FIRST", x: 109.3 }, { str: "1.00", x: 549.1 }]),
-            row([{ str: "MORE TEXT", x: 109.3 }]),
-            row([{ str: "3/06", x: 55.8 }, { str: "SECOND", x: 109.3 }, { str: "2.00", x: 549.1 }]),
+            row([{ str: "3/05" }, { str: "FIRST" }, { str: "1.00", right: 472.5 }]),
+            row([{ str: "MORE TEXT" }]),
+            row([{ str: "3/06" }, { str: "SECOND" }, { str: "2.00", right: 472.5 }]),
         ];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines.length, 2);
         assert.equal(lines[0].rawDescriptor, "FIRST MORE TEXT");
         assert.equal(lines[1].rawDescriptor, "SECOND");
     });
 
     await t.test("finalizes the last open transaction at the end of the row list", () => {
-        const rows = [row([{ str: "3/05", x: 55.8 }, { str: "LAST ONE", x: 109.3 }, { str: "9.99", x: 549.1 }])];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const rows = [row([{ str: "3/05" }, { str: "LAST ONE" }, { str: "9.99", right: 472.5 }])];
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines.length, 1);
         assert.equal(lines[0].rawDescriptor, "LAST ONE");
     });
 
     await t.test("ignores rows encountered while no record is open", () => {
-        const rows = [row([{ str: "stray boilerplate text", x: 200 }])];
-        assert.deepEqual(parseActivityRows(rows, MONTH_YEAR, THRESHOLD), []);
+        const rows = [row([{ str: "stray boilerplate text" }])];
+        assert.deepEqual(parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE), []);
     });
 
-    await t.test("drops a date-opening row that never carries an amount, rather than mis-attributing a later amount to it", () => {
+    await t.test("throws when a date-opening row never carries an amount, rather than mis-attributing a later amount to it", () => {
+        // Design intent (see the module comment above parseActivityRows): a
+        // date row with no in-band amount is a structural surprise and
+        // aborts loudly rather than silently dropping the row.
         const rows = [
-            row([{ str: "3/05", x: 55.8 }, { str: "NO AMOUNT HERE", x: 109.3 }]),
-            row([{ str: "3/06", x: 55.8 }, { str: "REAL ONE", x: 109.3 }, { str: "3.00", x: 549.1 }]),
+            row([{ str: "3/05" }, { str: "NO AMOUNT HERE" }]),
+            row([{ str: "3/06" }, { str: "REAL ONE" }, { str: "3.00", right: 472.5 }]),
         ];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
-        assert.equal(lines.length, 1);
-        assert.equal(lines[0].rawDescriptor, "REAL ONE");
+        assert.throws(
+            () => parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE),
+            /opens a transaction with no amount inside a calibrated column band/,
+        );
     });
 
     await t.test("sub-dollar amounts with no leading zero (\".54\") parse correctly", () => {
-        const rows = [row([{ str: "3/06", x: 55.8 }, { str: "TINY FEE", x: 109.3 }, { str: ".54", x: 549.1 }])];
-        const lines = parseActivityRows(rows, MONTH_YEAR, THRESHOLD);
+        const rows = [row([{ str: "3/06" }, { str: "TINY FEE" }, { str: ".54", right: 579.5 }])];
+        const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines[0].amountCents, -54);
     });
 });

@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
     normalizePayee,
-    computeLineHash,
-    assignLineHashes,
+    versionedHash,
+    computeStatementContentHash,
+    isValidCalendarDate,
+    isSafeCents,
+    reconcileObservations,
+    INT4_MIN,
+    INT4_MAX,
 } from "../src/lib/bank-ledger";
 
 test("normalizePayee", async t => {
@@ -67,72 +72,178 @@ test("normalizePayee", async t => {
     await t.test("empty/falsy input returns an empty string", () => {
         assert.equal(normalizePayee(""), "");
     });
+
+    await t.test("a descriptor consisting entirely of stripped rail metadata returns an empty string", () => {
+        // Callers (the ingest route) must treat "" as exceptional, not a
+        // normal identity — this test just documents that normalizePayee
+        // itself makes no attempt to avoid producing "".
+        assert.equal(normalizePayee("C#6098 866-483-7521 07/01/26 123456"), "");
+    });
 });
 
-test("computeLineHash", async t => {
-    await t.test("is deterministic for identical input", () => {
-        const input = { account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", occurrenceIndex: 0 };
-        assert.equal(computeLineHash(input), computeLineHash({ ...input }));
+test("versionedHash", async t => {
+    await t.test("is deterministic for identical fields", () => {
+        assert.equal(versionedHash(["a", 1, "b"]), versionedHash(["a", 1, "b"]));
     });
 
-    await t.test("changes when occurrenceIndex changes and nothing else does", () => {
-        const base = { account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", occurrenceIndex: 0 };
-        assert.notEqual(computeLineHash(base), computeLineHash({ ...base, occurrenceIndex: 1 }));
-    });
-
-    await t.test("changes when any other field changes", () => {
-        const base = { account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", occurrenceIndex: 0 };
-        assert.notEqual(computeLineHash(base), computeLineHash({ ...base, account: "WTB-8516" }));
-        assert.notEqual(computeLineHash(base), computeLineHash({ ...base, postedDate: "2026-07-17" }));
-        assert.notEqual(computeLineHash(base), computeLineHash({ ...base, amountCents: -7401 }));
-        assert.notEqual(computeLineHash(base), computeLineHash({ ...base, rawDescriptor: "US MARKET " }));
+    await t.test("does not collide across a delimiter boundary between two fields", () => {
+        // The bug the versioned JSON encoding replaces: joining with "|"
+        // would make ("a|b", "c") and ("a", "b|c") hash identically.
+        assert.notEqual(versionedHash(["a|b", "c"]), versionedHash(["a", "b|c"]));
     });
 
     await t.test("is a 64-char lowercase hex sha256 digest", () => {
-        const hash = computeLineHash({ account: "A", postedDate: "2026-01-01", amountCents: 100, rawDescriptor: "X", occurrenceIndex: 0 });
-        assert.match(hash, /^[0-9a-f]{64}$/);
+        assert.match(versionedHash(["x"]), /^[0-9a-f]{64}$/);
     });
 });
 
-test("assignLineHashes", async t => {
-    await t.test("assigns 0-based occurrence indexes per identical (date, amount, descriptor) key, in array order", () => {
-        const lines = [
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-            { postedDate: "2026-07-16", amountCents: -2901, rawDescriptor: "US MARKET OTHER" },
-        ];
-        const result = assignLineHashes("WTB-0723", lines);
-        assert.equal(result[0].occurrenceIndex, 0);
-        assert.equal(result[1].occurrenceIndex, 1);
-        assert.equal(result[2].occurrenceIndex, 0);
+test("computeStatementContentHash", async t => {
+    const base = {
+        account: "WTB-0723",
+        periodStart: "2026-07-01",
+        periodEnd: "2026-07-31",
+        openingCents: 100000,
+        closingCents: 200000,
+        lines: [{ postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }],
+    };
+
+    await t.test("is deterministic for identical input", () => {
+        assert.equal(computeStatementContentHash(base), computeStatementContentHash({ ...base }));
     });
 
-    await t.test("gives identical same-day duplicates distinct hashes", () => {
-        const lines = [
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-        ];
-        const result = assignLineHashes("WTB-0723", lines);
-        assert.notEqual(result[0].lineHash, result[1].lineHash);
-    });
-
-    await t.test("re-running on the identical, identically-ordered batch reproduces the identical hashes (idempotent retry)", () => {
-        const lines = [
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
-            { postedDate: "2026-07-17", amountCents: -100, rawDescriptor: "OTHER" },
-        ];
-        const first = assignLineHashes("WTB-0723", lines).map(l => l.lineHash);
-        const second = assignLineHashes("WTB-0723", lines).map(l => l.lineHash);
-        assert.deepEqual(first, second);
-    });
-
-    await t.test("each computed lineHash matches computeLineHash with the same occurrence index", () => {
-        const lines = [{ postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" }];
-        const [result] = assignLineHashes("WTB-0723", lines);
-        assert.equal(
-            result.lineHash,
-            computeLineHash({ account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", occurrenceIndex: 0 }),
+    await t.test("changes when any field changes", () => {
+        assert.notEqual(computeStatementContentHash(base), computeStatementContentHash({ ...base, account: "WTB-8516" }));
+        assert.notEqual(computeStatementContentHash(base), computeStatementContentHash({ ...base, openingCents: 100001 }));
+        assert.notEqual(
+            computeStatementContentHash(base),
+            computeStatementContentHash({ ...base, lines: [{ ...base.lines[0], amountCents: -7401 }] }),
         );
+    });
+
+    await t.test("changes when line order changes", () => {
+        const twoLines = {
+            ...base,
+            lines: [
+                { postedDate: "2026-07-16", amountCents: -100, rawDescriptor: "A", checkNumber: null },
+                { postedDate: "2026-07-17", amountCents: -200, rawDescriptor: "B", checkNumber: null },
+            ],
+        };
+        const reordered = { ...twoLines, lines: [...twoLines.lines].reverse() };
+        assert.notEqual(computeStatementContentHash(twoLines), computeStatementContentHash(reordered));
+    });
+});
+
+test("isValidCalendarDate", async t => {
+    await t.test("accepts real calendar dates", () => {
+        assert.equal(isValidCalendarDate("2026-07-16"), true);
+        assert.equal(isValidCalendarDate("2026-02-28"), true);
+        assert.equal(isValidCalendarDate("2028-02-29"), true); // leap year
+    });
+
+    await t.test("rejects a day that doesn't exist in that month", () => {
+        assert.equal(isValidCalendarDate("2026-02-31"), false);
+        assert.equal(isValidCalendarDate("2026-04-31"), false);
+    });
+
+    await t.test("rejects a non-leap-year February 29th", () => {
+        assert.equal(isValidCalendarDate("2026-02-29"), false);
+    });
+
+    await t.test("rejects malformed shapes", () => {
+        assert.equal(isValidCalendarDate("2026/07/16"), false);
+        assert.equal(isValidCalendarDate("26-07-16"), false);
+        assert.equal(isValidCalendarDate(""), false);
+    });
+
+    await t.test("rejects non-string input", () => {
+        assert.equal(isValidCalendarDate(20260716), false);
+        assert.equal(isValidCalendarDate(null), false);
+        assert.equal(isValidCalendarDate(undefined), false);
+    });
+
+    await t.test("rejects an implausible year", () => {
+        assert.equal(isValidCalendarDate("0026-07-16"), false);
+        assert.equal(isValidCalendarDate("9999-07-16"), false);
+    });
+});
+
+test("isSafeCents", async t => {
+    await t.test("accepts safe integers within int4 bounds", () => {
+        assert.equal(isSafeCents(0), true);
+        assert.equal(isSafeCents(-7400), true);
+        assert.equal(isSafeCents(INT4_MIN), true);
+        assert.equal(isSafeCents(INT4_MAX), true);
+    });
+
+    await t.test("rejects values outside int4 bounds", () => {
+        assert.equal(isSafeCents(INT4_MAX + 1), false);
+        assert.equal(isSafeCents(INT4_MIN - 1), false);
+    });
+
+    await t.test("rejects non-integers and unsafe values", () => {
+        assert.equal(isSafeCents(1.5), false);
+        assert.equal(isSafeCents(Number.MAX_SAFE_INTEGER + 1), false);
+        assert.equal(isSafeCents(NaN), false);
+        assert.equal(isSafeCents(Infinity), false);
+    });
+
+    await t.test("rejects non-number input", () => {
+        assert.equal(isSafeCents("100"), false);
+        assert.equal(isSafeCents(null), false);
+    });
+});
+
+test("reconcileObservations", async t => {
+    await t.test("links a QBO observation to a canonical BankLine on an exact account+date+amount match", () => {
+        const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null }];
+        const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 }];
+        assert.deepEqual(reconcileObservations(observations, bankLines), [{ observationId: "obs1", bankLineId: "bl1" }]);
+    });
+
+    await t.test("does not link when there is no exact match", () => {
+        const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null }];
+        const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7401 }];
+        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+    });
+
+    await t.test("skips observations already linked to a canonical BankLine", () => {
+        const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: "already-linked" }];
+        const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 }];
+        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+    });
+
+    await t.test("matches one-to-one: two identical observations claim two distinct BankLines, not the same one twice", () => {
+        const observations = [
+            { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null },
+            { id: "obs2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null },
+        ];
+        const bankLines = [
+            { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 },
+            { id: "bl2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 },
+        ];
+        const links = reconcileObservations(observations, bankLines);
+        assert.equal(links.length, 2);
+        assert.notEqual(links[0].bankLineId, links[1].bankLineId);
+    });
+
+    await t.test("a third identical observation is left unmatched once both candidate BankLines are claimed", () => {
+        const observations = [
+            { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null },
+            { id: "obs2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null },
+            { id: "obs3", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null },
+        ];
+        const bankLines = [
+            { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 },
+            { id: "bl2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400 },
+        ];
+        const links = reconcileObservations(observations, bankLines);
+        assert.equal(links.length, 2);
+        assert.equal(links.some(l => l.observationId === "obs3"), false);
+    });
+
+    await t.test("never matches across accounts even with the same date+amount", () => {
+        const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, bankLineId: null }];
+        const bankLines = [{ id: "bl1", account: "WTB-8516", postedDate: "2026-07-16", amountCents: -7400 }];
+        assert.deepEqual(reconcileObservations(observations, bankLines), []);
     });
 });

@@ -2617,26 +2617,61 @@ model ReviewAlertEpisode {
 
 // ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
 // docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
-// Codex peer-review amendments: durable per-transaction identity (BankLine),
-// append-only, one bank line tracked by STATE not a coverage percentage. The
-// /automation dashboard becomes a report over these tables instead of a live
-// in-memory merge. Matching must use payee TEXT + rails, never amount+date
-// alone (see the Chevron/Cash App wrong-match lesson in that doc).
+// Codex peer-review round-1 amendments (2026-08-14): BankLine is the
+// canonical transaction ledger, and the bank STATEMENT is true north — a
+// canonical BankLine is only ever minted from a STATEMENT observation, never
+// from QBO. BankLineObservation holds one row per source sighting (a
+// statement line, a QBO register row, ...), uniquely identified by its own
+// source locator, so two sources reporting the "same" transaction both stay
+// on record instead of one silently overwriting the other via a hash
+// collision. Cross-source dedup is an explicit reconcile step
+// (reconcileObservations in src/lib/bank-ledger.ts) that links an
+// observation to a canonical BankLine by exact account+postedDate+amountCents
+// — never a side effect of ingest. Immutable source identity, mutable
+// workflow state: BankLine/BankLineObservation/StatementImport rows are never
+// overwritten; BankLine.state and the validation columns change as
+// automation progresses. The /automation dashboard becomes a report over
+// these tables instead of a live in-memory merge. Matching must use payee
+// TEXT + rails, never amount+date alone (see the Chevron/Cash App
+// wrong-match lesson in that doc).
+//
+// Pseudo-enum columns stay Prisma `String` (repo convention) — allowed
+// values are documented on each field and enforced by a Postgres CHECK
+// constraint of the same name in scripts/apply-bank-ledger.mjs, since Prisma
+// writes (and raw SQL) bypass anything short of a DB constraint.
+
+model StatementImport {
+  id           String   @id @default(cuid())
+  account      String // e.g. "WTB-0723"
+  periodStart  DateTime @db.Date
+  periodEnd    DateTime @db.Date
+  openingCents Int
+  closingCents Int
+  // sha256(JSON.stringify([1, account, periodStart, periodEnd, openingCents,
+  // closingCents, lines])) — computeStatementContentHash() in
+  // src/lib/bank-ledger.ts. An identical re-post of the same statement
+  // reproduces this hash exactly, which is what makes re-ingesting a
+  // statement content-addressed and safe to retry: same hash for the same
+  // account+period is a no-op, a different hash is a conflict (HTTP 409),
+  // never a silent overwrite.
+  contentHash  String   @unique
+  status       String   @default("FINALIZED") // PENDING, FINALIZED, FAILED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  observations BankLineObservation[]
+
+  @@unique([account, periodStart, periodEnd])
+}
 
 model BankLine {
   id              String   @id @default(cuid())
   account         String // e.g. "WTB-0723"
-  postedDate      DateTime
+  postedDate      DateTime @db.Date
   amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition
   rawDescriptor   String
-  normalizedPayee String
+  normalizedPayee String // "" is a valid but exceptional value — paired with state EXCEPTION, never silently accepted as a real identity
   checkNumber     String?
-  source          String // STATEMENT, QBO_REGISTER
-  statementId     String?
-  // sha256(account|postedDate|amountCents|rawDescriptor|occurrence-index) —
-  // same-day duplicate lines (two identical $74 charges) get distinct hashes
-  // via the occurrence index rather than colliding.
-  lineHash        String   @unique
   state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
   exceptionReason String?
 
@@ -2652,12 +2687,45 @@ model BankLine {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  observations      BankLineObservation[]
   items             BankLineItem[]
-  refundsAsOriginal RefundEvent[]  @relation("RefundEventOriginal")
-  refundsAsRefund   RefundEvent[]  @relation("RefundEventRefund")
+  refundsAsOriginal RefundEvent[]         @relation("RefundEventOriginal")
+  refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
 
   @@index([account, postedDate])
   @@index([qbTxnId])
+}
+
+model BankLineObservation {
+  id     String @id @default(cuid())
+  source String // STATEMENT, QBO_REGISTER
+  account String
+
+  // StatementImport.id for STATEMENT; the constant "QBO_REGISTER" for
+  // QBO_REGISTER (there is no per-import document there — the register is
+  // one ongoing stream identified by sourceLineId alone).
+  sourceDocumentId String
+  // The durable per-source line identity that replaced request-local
+  // occurrenceIndex hashing: a 0-based sequence position within the
+  // statement import (STATEMENT) or the QBO transaction id (QBO_REGISTER).
+  sourceLineId     String
+
+  postedDate    DateTime @db.Date
+  amountCents   Int
+  rawDescriptor String
+  checkNumber   String?
+
+  bankLineId String?
+  bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: SetNull)
+
+  statementImportId String?
+  statementImport   StatementImport? @relation(fields: [statementImportId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([source, account, sourceDocumentId, sourceLineId])
+  @@index([bankLineId])
+  @@index([account, postedDate])
 }
 
 model BankLineItem {
@@ -2683,8 +2751,8 @@ model RefundEvent {
   refundBankLineId   String?
   refundBankLine     BankLine? @relation("RefundEventRefund", fields: [refundBankLineId], references: [id], onDelete: SetNull)
   vendorRefundRef    String?
-  amountCents        Int
-  taxCents           Int       @default(0)
+  amountCents        Int       // positive magnitude, never signed — CHECK (amountCents > 0)
+  taxCents           Int       @default(0) // CHECK (taxCents >= 0 AND taxCents <= amountCents)
   status             String    @default("EXPECTED") // EXPECTED, CREDIT_SEEN, PAIRED, POSTED
   notes              String?
 
