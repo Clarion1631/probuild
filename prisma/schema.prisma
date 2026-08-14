@@ -2614,3 +2614,83 @@ model ReviewAlertEpisode {
   @@unique([issueId, generation])
   @@index([batchId])
 }
+
+// ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
+// docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
+// Codex peer-review amendments: durable per-transaction identity (BankLine),
+// append-only, one bank line tracked by STATE not a coverage percentage. The
+// /automation dashboard becomes a report over these tables instead of a live
+// in-memory merge. Matching must use payee TEXT + rails, never amount+date
+// alone (see the Chevron/Cash App wrong-match lesson in that doc).
+
+model BankLine {
+  id              String   @id @default(cuid())
+  account         String // e.g. "WTB-0723"
+  postedDate      DateTime
+  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition
+  rawDescriptor   String
+  normalizedPayee String
+  checkNumber     String?
+  source          String // STATEMENT, QBO_REGISTER
+  statementId     String?
+  // sha256(account|postedDate|amountCents|rawDescriptor|occurrence-index) —
+  // same-day duplicate lines (two identical $74 charges) get distinct hashes
+  // via the occurrence index rather than colliding.
+  lineHash        String   @unique
+  state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
+  exceptionReason String?
+
+  // Validation columns
+  qbTxnId           String?
+  qbBankMatched     Boolean  @default(false)
+  probuildExpenseId String?
+  projectName       String?
+  projectValidated  Boolean  @default(false)
+  receiptUrl        String?
+  taxValidated      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items             BankLineItem[]
+  refundsAsOriginal RefundEvent[]  @relation("RefundEventOriginal")
+  refundsAsRefund   RefundEvent[]  @relation("RefundEventRefund")
+
+  @@index([account, postedDate])
+  @@index([qbTxnId])
+}
+
+model BankLineItem {
+  id             String   @id @default(cuid())
+  bankLineId     String
+  bankLine       BankLine @relation(fields: [bankLineId], references: [id], onDelete: Cascade)
+  description    String
+  qty            Decimal?
+  unitPriceCents Int?
+  lineTotalCents Int?
+  source         String // RECEIPT_AI, LOWES_CSV, AMAZON_APP, MANUAL
+  jobHint        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([bankLineId])
+}
+
+model RefundEvent {
+  id                 String    @id @default(cuid())
+  originalBankLineId String?
+  originalBankLine   BankLine? @relation("RefundEventOriginal", fields: [originalBankLineId], references: [id], onDelete: SetNull)
+  refundBankLineId   String?
+  refundBankLine     BankLine? @relation("RefundEventRefund", fields: [refundBankLineId], references: [id], onDelete: SetNull)
+  vendorRefundRef    String?
+  amountCents        Int
+  taxCents           Int       @default(0)
+  status             String    @default("EXPECTED") // EXPECTED, CREDIT_SEEN, PAIRED, POSTED
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([originalBankLineId])
+  @@index([refundBankLineId])
+}
