@@ -1157,6 +1157,14 @@ const S = {
   estPrelinkA: "mp3-e2e-eps-prelink-a",
   estPrelinkB: "mp3-e2e-eps-prelink-b",
   invPrelink: "mp3-e2e-ps-prelink",
+  // S12: the shape reachable only by walking BOTH links — a null-intent estimate
+  // original whose OTHER clone is also null-intent.
+  estimate7: "mp3-e2e-estimate-7",
+  invoice7a: "mp3-e2e-invoice-7a",
+  invoice7b: "mp3-e2e-invoice-7b",
+  estSib: "mp3-e2e-eps-sib",
+  invSibCharge: "mp3-e2e-ps-sib-charge",
+  invSibNull: "mp3-e2e-ps-sib-null",
 };
 const S_NAME = "Stripe Mirror Drill - MP3TEST";
 const sPrisma = new PrismaClient();
@@ -1169,6 +1177,7 @@ const GROUP_INTENT = "pi_mp3_e2e_group_intent";
 const MIXED_INTENT = "pi_mp3_e2e_mixed_intent";
 const LEGACY_INTENT = "pi_mp3_e2e_legacy_intent";
 const PRELINK_INTENT = "pi_mp3_e2e_prelink_intent";
+const SIBLING_INTENT = "pi_mp3_e2e_sibling_intent";
 
 test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
   test.beforeAll(async () => {
@@ -1422,12 +1431,61 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
         status: "Paid", stripePaymentIntentId: PRELINK_INTENT,
       },
     });
+
+    // Seventh fixture: E(null intent) with clones A(SIBLING_INTENT) and B(null).
+    // B is reachable only by walking invoice->estimate and then back out again.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate7 },
+      update: { status: "Paid", totalAmount: 700, balanceDue: 0, statusBeforePayment: "Invoiced" },
+      create: {
+        id: S.estimate7, title: `${S_NAME} 7`, code: "EST-MP3TEST-7", projectId: S.project,
+        status: "Paid", taxExempt: true, totalAmount: 700, balanceDue: 0, statusBeforePayment: "Invoiced",
+      },
+    });
+    for (const [id, code] of [[S.invoice7a, "7A"], [S.invoice7b, "7B"]] as const) {
+      await sPrisma.invoice.upsert({
+        where: { id },
+        update: { status: "Paid", totalAmount: 700, balanceDue: 0 },
+        create: {
+          id, code: `INV-MP3TEST-${code}`, projectId: S.project, clientId: S.client,
+          estimateId: S.estimate7, status: "Paid", totalAmount: 700, balanceDue: 0, issueDate: new Date(),
+        },
+      });
+    }
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estSib },
+      update: { status: "Paid", stripePaymentIntentId: null, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.estSib, estimateId: S.estimate7, name: "MP3 Sibling", amount: 700, status: "Paid", order: 1,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invSibCharge },
+      update: { status: "Paid", stripePaymentIntentId: SIBLING_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.invSibCharge, invoiceId: S.invoice7a, name: "MP3 Sibling", amount: 700,
+        status: "Paid", sourceScheduleId: S.estSib, stripePaymentIntentId: SIBLING_INTENT,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invSibNull },
+      update: { status: "Paid", stripePaymentIntentId: null, paymentMethod: "check", paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.invSibNull, invoiceId: S.invoice7b, name: "MP3 Sibling", amount: 700,
+        status: "Paid", sourceScheduleId: S.estSib, paymentMethod: "check",
+      },
+    });
   });
 
   test.afterAll(async () => {
     try {
-      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b, S.invoice5, S.invoice6];
-      const estimateIds = [S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5, S.estimate6];
+      const invoiceIds = [
+        S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b,
+        S.invoice5, S.invoice6, S.invoice7a, S.invoice7b,
+      ];
+      const estimateIds = [
+        S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5, S.estimate6, S.estimate7,
+      ];
       await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: invoiceIds } } });
       await sPrisma.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
       await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
@@ -1683,5 +1741,25 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
       where: { id: { in: [S.estPrelinkA, S.estPrelinkB] } },
     });
     expect(rows.every((r) => r.status === "Paid"), "neither candidate was touched").toBe(true);
+  });
+
+  test("S12: a null-intent sibling reachable only through a null-intent original is still reported", async () => {
+    // E(null) -> clones A(charge) and B(null). Walking out only from milestones
+    // that carry the charge never reaches B, because E does not carry it either.
+    // B is safe from being reset, but a report that claims to name every Paid
+    // mirror must actually name it (Codex round 3).
+    const group = await resolveChargeGroup(sPrisma, SIBLING_INTENT);
+    expect(group.invoiceSchedules.map((r) => r.id), "only the clone carrying the charge releases")
+      .toEqual([S.invSibCharge]);
+    expect(group.unattributable.map((r) => r.id).sort(), "BOTH null-intent mirrors are named")
+      .toEqual([S.estSib, S.invSibNull].sort());
+
+    const unwound = await unwindRefundedCharge(sPrisma, SIBLING_INTENT);
+    expect(unwound.unattributable.map((r) => r.id).sort()).toEqual([S.estSib, S.invSibNull].sort());
+
+    const untouched = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invSibNull } });
+    expect(untouched.status, "and neither is written").toBe("Paid");
+    const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estSib } });
+    expect(est.status).toBe("Paid");
   });
 });

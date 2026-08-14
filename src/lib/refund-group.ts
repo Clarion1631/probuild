@@ -126,27 +126,33 @@ export async function resolveChargeGroup(db: Db, paymentIntentId: string): Promi
     // the office is asked to resolve by hand.
     const unattributable: ChargeGroupRow[] = [];
 
-    // ── estimate → invoice: null-intent clones of a released milestone ──────
-    if (directEst.length > 0) {
+    // ── invoice → estimate: null-intent originals of a released clone ───────
+    const sourceIds = directInv.map((r) => r.sourceScheduleId).filter((id): id is string => !!id);
+    const nullSources = sourceIds.length > 0
+        ? await db.estimatePaymentSchedule.findMany({
+            where: { id: { in: sourceIds }, status: "Paid", stripePaymentIntentId: null },
+            select: EST_SELECT,
+        })
+        : [];
+    unattributable.push(...nullSources.map(estRow));
+
+    // ── estimate → invoice: null-intent clones of a milestone in the group ──
+    // The source set is the released milestones PLUS the null-intent originals
+    // just found. Walking only the released ones missed the shape where the
+    // estimate row carries no intent: E(null) with clones A(intent X) and
+    // B(null) reports E but never reached B, so a Paid mirror went unmentioned
+    // in a report that claims to name them all (Codex round 3).
+    const mirrorSourceIds = distinct([...directEst.map((r) => r.id), ...nullSources.map((r) => r.id)]);
+    if (mirrorSourceIds.length > 0) {
         const clones = await db.paymentSchedule.findMany({
             where: {
-                sourceScheduleId: { in: directEst.map((r) => r.id) },
+                sourceScheduleId: { in: mirrorSourceIds },
                 status: "Paid",
                 stripePaymentIntentId: null,
             },
             select: INV_SELECT,
         });
         unattributable.push(...clones.map(invRow));
-    }
-
-    // ── invoice → estimate: null-intent originals of a released clone ───────
-    const sourceIds = directInv.map((r) => r.sourceScheduleId).filter((id): id is string => !!id);
-    if (sourceIds.length > 0) {
-        const sources = await db.estimatePaymentSchedule.findMany({
-            where: { id: { in: sourceIds }, status: "Paid", stripePaymentIntentId: null },
-            select: EST_SELECT,
-        });
-        unattributable.push(...sources.map(estRow));
     }
 
     // ── pre-link legacy rows: no `sourceScheduleId` to follow ───────────────

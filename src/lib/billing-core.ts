@@ -267,7 +267,14 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         },
     });
 
+    // Named immediately, outside the clone transaction. Folding this into that
+    // transaction briefly made a retryable or terminal failure leave the
+    // already-visible invoice reading "INV-TEMP", which
+    // createInvoiceFromEstimateGuarded would later mistake for a finished
+    // conversion (Codex round 3). The orphan-invoice failure mode is
+    // pre-existing; this keeps it no worse than it was.
     const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
+    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
 
     // Clone the estimate's milestones into invoice-side PaymentSchedules. The
     // source read, the clone inserts AND the resulting balance/status write run
@@ -297,7 +304,17 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         // waiting on Project and this one hold Project while waiting on
         // Estimate (Codex round 2). Holding both across the read+insert is what
         // the Project lock was for, and that is unchanged by the reorder.
-        await lockMoneyParents(tx, { estimateId, invoiceId: invoice.id });
+        //
+        // The INVOICE is deliberately not locked here. It was, briefly, and that
+        // put Invoice before Project -- which deadlocks against deleteProjects,
+        // whose `onDelete: Cascade` locks Project and then its Invoice children
+        // (and which is not retry-wrapped; Codex round 3). It buys nothing
+        // either: this invoice was created moments ago and the only way another
+        // flow can reach it is through a clone, and clones are inserted under
+        // the Estimate lock. The implicit row lock from the update below lands
+        // after Project, giving Estimate -> Project -> Invoice, which agrees
+        // with deleteProjects' Project -> Invoice.
+        await lockMoneyParents(tx, { estimateId });
         // Lead-owned estimates (no projectId) need no Project lock -- start-date
         // moves only target projects.
         if (estimate.projectId) {
@@ -358,7 +375,7 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
             : "Draft";
         await tx.invoice.update({
             where: { id: invoice.id },
-            data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
+            data: { balanceDue: newBalanceDue, status: invoiceStatus },
         });
         return paidAmount;
     }));
