@@ -44,6 +44,11 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
 
     const isApproved = initialData.status === "Approved";
     const isSent = initialData.status === "Sent";
+    const isDeclined = initialData.status === "Declined";
+    // Draft covers "never sent yet" and "pulled back for edits after being sent" — the
+    // client-facing copy already calls this state "Under Revision" in the skipped panel
+    // below; the badge reuses that same label so a Draft/superseded CO never reads as
+    // approvable on the printed PDF.
     const companyName = companySettings?.companyName || "Golden Touch Remodeling";
     const companyPhone = companySettings?.phone || "";
     const companyEmail = companySettings?.email || "";
@@ -56,9 +61,18 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setIsDownloading(true);
         const prevShadow = element.style.boxShadow;
         const prevBorder = element.style.border;
+        // buildPdf measures element.offsetHeight BEFORE the html-to-image capture step,
+        // which filters out [data-pdf-skip] nodes. The two terminal panels below (Ready
+        // to Approve? / Change Order Under Revision) are data-pdf-skip, so if they're
+        // still visible during measurement, totalHeight is inflated relative to what's
+        // actually captured — which can add a blank trailing page. Hide them for
+        // measurement too so both steps see the identical layout.
+        const skipEls = Array.from(element.querySelectorAll<HTMLElement>("[data-pdf-skip]"));
+        const prevDisplays = skipEls.map(el => el.style.display);
         try {
             element.style.boxShadow = "none";
             element.style.border = "none";
+            skipEls.forEach(el => { el.style.display = "none"; });
             const pdf = await buildPdf(element, { bannerText: changeOrderBannerText });
             pdf.save(`ChangeOrder_${initialData.code || initialData.id}.pdf`);
         } catch (err) {
@@ -66,9 +80,10 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
             toast.error("Couldn't generate the PDF. Please try again.");
         } finally {
             // Restore even on failure — a thrown buildPdf() must not leave the
-            // card visually altered (no shadow/border) for the rest of the visit.
+            // card visually altered (no shadow/border, hidden panels) for the rest of the visit.
             element.style.boxShadow = prevShadow;
             element.style.border = prevBorder;
+            skipEls.forEach((el, i) => { el.style.display = prevDisplays[i]; });
             setIsDownloading(false);
         }
     }
@@ -84,6 +99,15 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const taxLabel = coTaxLabel(initialData.estimate);
     const isCostPlus = initialData.pricingType === "COST_PLUS";
     const schedules = initialData.paymentSchedules || [];
+
+    // Split on blank lines so each paragraph can be its own top-level data-pdf-row —
+    // build-pdf.ts hard-slices any row taller than one page, which can cut through a
+    // text line if the whole description is one atomic row. Sibling rows give the
+    // paginator safe break points between paragraphs (mirrors PortalInvoiceClient's
+    // Notes section).
+    const descriptionParagraphs = initialData.description
+        ? String(initialData.description).split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean)
+        : [];
 
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
@@ -153,9 +177,17 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                                             Approved
                                         </span>
-                                    ) : (
+                                    ) : isSent ? (
                                         <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
-                                            Pending Approval
+                                            Sent - Awaiting Approval
+                                        </span>
+                                    ) : isDeclined ? (
+                                        <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-red-50 text-red-700 border border-red-200 uppercase tracking-wider">
+                                            Declined
+                                        </span>
+                                    ) : (
+                                        <span className="inline-flex items-center px-3 py-1 rounded-md text-xs font-bold bg-slate-100 text-slate-600 border border-slate-300 uppercase tracking-wider">
+                                            Under Revision
                                         </span>
                                     )}
                                 </div>
@@ -179,11 +211,24 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         </div>
                     </div>
 
-                    {/* Memo / Description */}
-                    {initialData.description && (
-                        <div data-pdf-row="true" className="px-5 sm:px-10 py-8 border-b border-slate-100">
-                            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider mb-3">Reason for Change</h2>
-                            <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{initialData.description}</p>
+                    {/* Memo / Description — heading and each paragraph are sibling data-pdf-row
+                        blocks (not nested inside a parent that itself carries data-pdf-row, which
+                        build-pdf.ts would ignore) so a long description gets safe per-paragraph
+                        page breaks instead of one atomic block that can hard-slice through text. */}
+                    {descriptionParagraphs.length > 0 && (
+                        <div className="border-b border-slate-100">
+                            <div data-pdf-row="true" className="px-5 sm:px-10 pt-8 pb-3">
+                                <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wider">Reason for Change</h2>
+                            </div>
+                            {descriptionParagraphs.map((para: string, i: number) => (
+                                <div
+                                    key={i}
+                                    data-pdf-row="true"
+                                    className={`px-5 sm:px-10 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap ${i === descriptionParagraphs.length - 1 ? "pb-8" : "pb-3"}`}
+                                >
+                                    {para}
+                                </div>
+                            ))}
                         </div>
                     )}
 
