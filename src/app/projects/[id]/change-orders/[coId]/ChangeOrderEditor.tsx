@@ -8,6 +8,11 @@ import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
 
+// handleSave's return type: the server action returns a JSON-serialized Prisma row,
+// but status/revision are the only fields the manual-approval CAS and Send-for-Approval
+// paths depend on.
+type SavedChangeOrder = { status: string; revision: number } & Record<string, unknown>;
+
 export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
     const router = useRouter();
     const [title, setTitle] = useState(initialData.title);
@@ -88,11 +93,11 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // toasts its own failure.
             // On the scope-locked path we pass the page-load revision, so a
             // countersign or any other edit since page load fails closed with a refresh message.
-            const saved = isScopeLocked ? { updatedAt: initialData.updatedAt } : await handleSave();
+            const saved = isScopeLocked ? { revision: initialData.revision } : await handleSave();
             if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
-            const updated = await manuallyApproveChangeOrder(initialData.id, saved.updatedAt);
+            const updated = await manuallyApproveChangeOrder(initialData.id, saved.revision);
             setStatus(updated.status);
             toast.success("Change order marked as approved (manual)");
             setShowManualApproveConfirm(false);
@@ -106,8 +111,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
 
     // Returns whether the save persisted — the send flow must not email the client
     // a signature request when the save failed (they'd sign the stale amounts).
-    async function handleSave(): Promise<any | null> {
-        if (isDeleting) return false; // Prevent saving if we are in the middle of deleting
+    async function handleSave(): Promise<SavedChangeOrder | null> {
+        if (isDeleting) return null; // Prevent saving if we are in the middle of deleting
         if (isScopeLocked) {
             toast.error("Signed change orders are locked. Create a new change order for additional work.");
             return null;

@@ -245,7 +245,7 @@ export async function POST(req: Request) {
         }
         await tx.changeOrder.update({
             where: { id: changeOrderId },
-            data: { totalAmount: subtotal, balanceDue: subtotal },
+            data: { totalAmount: subtotal, balanceDue: subtotal, revision: { increment: 1 } },
         });
         return {
             ok: true as const, changed: true, code: co.code, title: co.title, projectId: co.projectId, verdict,

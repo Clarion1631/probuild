@@ -1535,6 +1535,10 @@ model ChangeOrder {
   status        String   @default("Draft") // Draft, Sent, Approved, Declined
   totalAmount   Decimal  @default(0)
   balanceDue    Decimal  @default(0)
+  // Optimistic-concurrency token for approval/billing — bumped in every transaction that
+  // changes billing inputs (items, schedules, pricing, status, signatures); NOT bumped by
+  // passive writes like viewedAt.
+  revision      Int      @default(0)
   pricingType   String   @default("FIXED")
   // COST_PLUS only: a TRUE markup on actuals — billing = (labor + expenses) * (1 + markupPercent/100), see lib/billing-core.ts.
   // Deliberately a different semantic from ChangeOrderItem.markupPercent / EstimateItem.markupPercent, which hold gross margin on sell.

@@ -354,7 +354,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             scalarData.viewedAt = null;
         }
 
-        return tx.changeOrder.update({ where: { id }, data: scalarData });
+        return tx.changeOrder.update({ where: { id }, data: { ...scalarData, revision: { increment: 1 } } });
     }, { timeout: 15_000 });
 }
 
@@ -413,6 +413,7 @@ export async function approveChangeOrderCore(
                 approvedBy: approval.signatureName.trim(),
                 approvedAt: approval.approvedAt,
                 clientSignatureUrl: approval.clientSignatureUrl,
+                revision: { increment: 1 },
             },
         });
         return { co, transitioned: true };
@@ -434,7 +435,7 @@ export async function approveChangeOrderCore(
  */
 export async function manuallyApproveChangeOrderCore(
     id: string,
-    approval: { staffName: string; approvedAt: Date; expectedUpdatedAt: Date },
+    approval: { staffName: string; approvedAt: Date; expectedRevision: number },
 ) {
     return prisma.$transaction(async (tx) => {
         // Same parent-row lock as approveChangeOrderCore/updateChangeOrderCore/
@@ -442,9 +443,9 @@ export async function manuallyApproveChangeOrderCore(
         // approval write observe one serialized state.
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
-            clientSignatureUrl: string | null; updatedAt: Date;
+            clientSignatureUrl: string | null; revision: number;
         }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "updatedAt"
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -458,10 +459,11 @@ export async function manuallyApproveChangeOrderCore(
 
         // CAS guard against the save/approve two-request race: the client does
         // save (request 1) then approve (request 2), and a concurrent edit
-        // between them must not bill stale values. updatedAt is the revision
-        // token the caller read the page with — a mismatch means the row
-        // changed underneath it since then.
-        if (current.updatedAt.getTime() !== approval.expectedUpdatedAt.getTime()) {
+        // between them must not bill stale values. revision is a monotonic
+        // counter bumped by every transaction that changes billing inputs
+        // (items, schedules, pricing, status, signatures) — a mismatch means
+        // the row changed underneath the caller since it loaded the page.
+        if (current.revision !== approval.expectedRevision) {
             throw new Error(`Change order ${current.code} was modified after this page loaded — refresh and try again.`);
         }
 
@@ -498,6 +500,7 @@ export async function manuallyApproveChangeOrderCore(
                 status: "Approved",
                 approvedBy: `${approval.staffName.trim()}${MANUAL_CO_APPROVAL_SUFFIX}`,
                 approvedAt: approval.approvedAt,
+                revision: { increment: 1 },
             },
         });
         return { co, transitioned: true };

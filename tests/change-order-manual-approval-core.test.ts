@@ -1,5 +1,6 @@
 /**
- * manuallyApproveChangeOrderCore — staff-side approval without a client signature.
+ * manuallyApproveChangeOrderCore — staff-side approval without a client signature — and
+ * updateChangeOrderCore's revision bump on its parent update.
  *
  * change-order-core.ts talks to Postgres directly via `import { prisma } from "./prisma"` inside a
  * `prisma.$transaction` callback, so exercising the real function (not a hand-rolled reimplementation
@@ -8,6 +9,11 @@
  * rationale for a manual require() patch over `node:test`'s own `mock.module()`) — scoped to the
  * literal "./prisma" specifier change-order-core.ts's own `import` transpiles to, applied once at
  * module load in `before()`, then restored so nothing downstream depends on the patch staying live.
+ *
+ * The same fakePrisma also backs updateChangeOrderCore's own tests below — it calls
+ * resolveCompanyTimeZone() (company-timezone.ts), which imports the identical "./prisma" specifier
+ * and reads `prisma.companySettings.findUnique` directly (not through the transaction client), so
+ * the root-level fakePrisma object needs that method too.
  */
 
 import { test, before, beforeEach } from "node:test";
@@ -18,10 +24,18 @@ type ChangeOrderRow = {
     id: string;
     code: string;
     status: string;
+    title: string;
+    description: string | null;
     pricingType: string;
     totalAmount: number;
+    markupPercent: number | null;
+    approvedBy: string | null;
+    approvedAt: Date | null;
     clientSignatureUrl: string | null;
-    updatedAt: Date;
+    companySignedBy: string | null;
+    companySignedAt: Date | null;
+    companySignatureUrl: string | null;
+    revision: number;
 };
 
 type ItemRow = { name: string; type: string; quantity: number; unitCost: number };
@@ -35,16 +49,35 @@ const calls = {
 const state: {
     changeOrder: ChangeOrderRow | null;
     items: ItemRow[];
-} = { changeOrder: null, items: [] };
+    schedules: Array<{ id: string; name: string; amount: number; dueDate: Date | null; order: number }>;
+} = { changeOrder: null, items: [], schedules: [] };
 
 function resetFixture() {
     calls.rowLocks.length = 0;
     calls.changeOrderUpdates.length = 0;
     state.changeOrder = null;
     state.items = [];
+    state.schedules = [];
+}
+
+function applyUpdateData(row: ChangeOrderRow, data: Record<string, unknown>): ChangeOrderRow {
+    // Mirror Prisma's `{ increment: N }` semantics against the fixture's stored
+    // revision so the returned row reflects the post-write value, the same
+    // shape the real database would return.
+    const { revision, ...rest } = data;
+    const nextRevision = revision && typeof revision === "object" && "increment" in (revision as any)
+        ? row.revision + (revision as any).increment
+        : ((revision as number | undefined) ?? row.revision);
+    return { ...row, ...rest, revision: nextRevision };
 }
 
 const fakePrisma = {
+    // resolveCompanyTimeZone() (company-timezone.ts) reads this directly off the
+    // root client, not through a transaction — updateChangeOrderCore calls it
+    // before opening its transaction.
+    companySettings: {
+        findUnique: async () => ({ timeZone: null }),
+    },
     $transaction: async (fn: (tx: any) => Promise<any>) => {
         const tx = {
             $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -54,14 +87,21 @@ const fakePrisma = {
             },
             changeOrderPaymentSchedule: {
                 count: async () => 0,
+                findMany: async () => state.schedules,
+                deleteMany: async () => ({ count: 0 }),
+                update: async () => { throw new Error("unexpected changeOrderPaymentSchedule.update in this fixture"); },
+                create: async () => { throw new Error("unexpected changeOrderPaymentSchedule.create in this fixture"); },
             },
             changeOrderItem: {
                 findMany: async () => state.items,
+                deleteMany: async () => ({ count: 0 }),
+                update: async () => { throw new Error("unexpected changeOrderItem.update in this fixture"); },
+                create: async () => { throw new Error("unexpected changeOrderItem.create in this fixture"); },
             },
             changeOrder: {
                 update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
                     calls.changeOrderUpdates.push(args);
-                    return { ...state.changeOrder, ...args.data };
+                    return applyUpdateData(state.changeOrder!, args.data);
                 },
             },
         };
@@ -71,8 +111,9 @@ const fakePrisma = {
 
 let manuallyApproveChangeOrderCore: (
     id: string,
-    approval: { staffName: string; approvedAt: Date; expectedUpdatedAt: Date },
+    approval: { staffName: string; approvedAt: Date; expectedRevision: number },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
+let updateChangeOrderCore: (id: string, data: Record<string, unknown>) => Promise<any>;
 
 const PRISMA_SPECIFIER = "./prisma";
 
@@ -91,7 +132,7 @@ before(async () => {
         return originalRequire.apply(this, arguments as unknown as [string]);
     } as typeof Module.prototype.require;
 
-    let mod: { manuallyApproveChangeOrderCore?: unknown };
+    let mod: { manuallyApproveChangeOrderCore?: unknown; updateChangeOrderCore?: unknown };
     try {
         mod = await import("../src/lib/change-order-core");
     } finally {
@@ -106,35 +147,44 @@ before(async () => {
         );
     }
     manuallyApproveChangeOrderCore = mod.manuallyApproveChangeOrderCore as typeof manuallyApproveChangeOrderCore;
+    updateChangeOrderCore = mod.updateChangeOrderCore as typeof updateChangeOrderCore;
 });
 
 beforeEach(() => {
     resetFixture();
 });
 
-const FIXTURE_UPDATED_AT = new Date("2026-08-01T00:00:00.000Z");
+const FIXTURE_REVISION = 3;
 
 function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderRow {
     return {
         id: "co-1",
         code: "CO-001",
         status: "Draft",
+        title: "Old Title",
+        description: null,
         pricingType: "FIXED",
         totalAmount: 1000,
+        markupPercent: null,
+        approvedBy: null,
+        approvedAt: null,
         clientSignatureUrl: null,
-        updatedAt: FIXTURE_UPDATED_AT,
+        companySignedBy: null,
+        companySignedAt: null,
+        companySignatureUrl: null,
+        revision: FIXTURE_REVISION,
         ...overrides,
     };
 }
 
 const oneItem: ItemRow[] = [{ name: "Extra tile", type: "Labor", quantity: 1, unitCost: 1000 }];
 
-test("manual approve from Draft: sets status Approved, stamps approvedBy with the staff suffix, never writes a client signature", async () => {
+test("manual approve from Draft: sets status Approved, stamps approvedBy with the staff suffix, never writes a client signature, bumps revision", async () => {
     state.changeOrder = draftChangeOrder();
     state.items = oneItem;
 
     const approvedAt = new Date("2026-08-14T12:00:00.000Z");
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt, expectedUpdatedAt: FIXTURE_UPDATED_AT });
+    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt, expectedRevision: FIXTURE_REVISION });
 
     assert.ok(result, "expected a transition result");
     assert.equal(result!.transitioned, true);
@@ -144,6 +194,7 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     assert.equal(write.data.status, "Approved");
     assert.equal(write.data.approvedBy, "Jane Doe (manual approval — staff)");
     assert.equal(write.data.approvedAt, approvedAt);
+    assert.deepEqual(write.data.revision, { increment: 1 });
     // Manual approval must never write a client signature — that field simply
     // isn't in the update payload at all.
     assert.equal(Object.prototype.hasOwnProperty.call(write.data, "clientSignatureUrl"), false);
@@ -153,7 +204,7 @@ test("manual approve from Sent also succeeds", async () => {
     state.changeOrder = draftChangeOrder({ status: "Sent" });
     state.items = oneItem;
 
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT });
+    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION });
     assert.ok(result);
     assert.equal(result!.co.status, "Approved");
 });
@@ -163,7 +214,7 @@ test("manual approve is rejected when the change order is already Approved", asy
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION }),
         /must be Draft or Sent/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
@@ -177,40 +228,61 @@ test("manual approve is rejected when a client signature already exists", async 
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION }),
         /already has a client signature/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
 });
 
-test("manual approve is rejected when expectedUpdatedAt doesn't match the locked row's updatedAt (CAS guard)", async () => {
+test("manual approve is rejected when expectedRevision doesn't match the locked row's revision (CAS guard)", async () => {
     // Simulates the save/approve two-request race: the row was modified after
-    // the page loaded (e.g. a concurrent edit), so the stale revision token
-    // the client still holds must be refused rather than billed.
-    state.changeOrder = draftChangeOrder({ updatedAt: new Date("2026-08-02T00:00:00.000Z") });
+    // the page loaded (e.g. a concurrent edit bumped revision), so the stale
+    // revision token the client still holds must be refused rather than billed.
+    state.changeOrder = draftChangeOrder({ revision: FIXTURE_REVISION + 1 });
     state.items = oneItem;
 
     await assert.rejects(
         () => manuallyApproveChangeOrderCore("co-1", {
             staffName: "Jane Doe",
             approvedAt: new Date(),
-            expectedUpdatedAt: new Date("2026-08-01T00:00:00.000Z"),
+            expectedRevision: FIXTURE_REVISION,
         }),
         /modified after this page loaded — refresh and try again/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
 });
 
-test("manual approve succeeds when expectedUpdatedAt matches the locked row's updatedAt", async () => {
-    const rowUpdatedAt = new Date("2026-08-05T09:30:00.000Z");
-    state.changeOrder = draftChangeOrder({ updatedAt: rowUpdatedAt });
+test("manual approve succeeds when expectedRevision matches the locked row's revision, and the update payload bumps revision", async () => {
+    const rowRevision = 7;
+    state.changeOrder = draftChangeOrder({ revision: rowRevision });
     state.items = oneItem;
 
     const result = await manuallyApproveChangeOrderCore("co-1", {
         staffName: "Jane Doe",
         approvedAt: new Date(),
-        expectedUpdatedAt: rowUpdatedAt,
+        expectedRevision: rowRevision,
     });
     assert.ok(result);
     assert.equal(result!.transitioned, true);
+    assert.equal(calls.changeOrderUpdates.length, 1);
+    assert.deepEqual(calls.changeOrderUpdates[0].data.revision, { increment: 1 });
+});
+
+test("updateChangeOrderCore's parent update includes revision: { increment: 1 }", async () => {
+    state.changeOrder = draftChangeOrder({ title: "Old Title" });
+    state.items = [];
+    state.schedules = [];
+
+    const updated = await updateChangeOrderCore("co-1", { title: "New Title" });
+
+    assert.equal(updated.title, "New Title");
+    assert.equal(calls.changeOrderUpdates.length, 1);
+    const write = calls.changeOrderUpdates[0];
+    assert.equal(write.where.id, "co-1");
+    assert.equal(write.data.title, "New Title");
+    assert.deepEqual(write.data.revision, { increment: 1 });
+    // Post-save revision is what the CAS on manual approval must match — prove
+    // the fixture's increment semantics actually moved the number, not just
+    // that the write payload shape looks right.
+    assert.equal(updated.revision, FIXTURE_REVISION + 1);
 });

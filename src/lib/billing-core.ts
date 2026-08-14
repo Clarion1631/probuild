@@ -1731,12 +1731,6 @@ export async function billChangeOrderCore(
     };
 }
 
-// Standard manual-approval billing notice — pushed to summary.issues whenever
-// billing succeeds but no client email goes out because staff approved
-// manually. Extracted so the team-email block below can filter it back out
-// when deciding whether anything ELSE (e.g. a schedule failure) needs a look.
-const MANUAL_BILLING_NOTICE = "Manually approved by staff — billing created, no payment email sent to the client.";
-
 export async function handleChangeOrderApproved(
     changeOrderId: string,
     opts?: { notify?: boolean; freshlyApproved?: boolean; suppressClientEmails?: boolean },
@@ -1744,8 +1738,8 @@ export async function handleChangeOrderApproved(
         billChangeOrder?: typeof billChangeOrderCore;
         sendMilestoneInvoices?: typeof sendMilestoneInvoicesCore;
     } = {},
-): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean }> {
-    const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean } = { billed: false, sent: false, issues: [] };
+): Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean; clientEmailSuppressed?: boolean }> {
+    const summary: { billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean; clientEmailSuppressed?: boolean } = { billed: false, sent: false, issues: [] };
     let coLabel = changeOrderId;
     let amountLabel = "";
     let projectName = "";
@@ -1796,9 +1790,11 @@ export async function handleChangeOrderApproved(
             } else if (suppressClientEmails) {
                 // Manual staff approval: billing rows/invoice totals are created
                 // exactly as on the portal path, but no client ever signed this CO,
-                // so no client-facing payment email goes out.
+                // so no client-facing payment email goes out. Structural flag, not
+                // an issue — this is expected behavior for a manual approval, not
+                // a problem to surface as a caution.
                 summary.billed = true;
-                summary.issues.push(MANUAL_BILLING_NOTICE);
+                summary.clientEmailSuppressed = true;
             } else {
                 summary.billed = true;
                 const freshIds = bill.milestones.filter((row) => row.created).map((row) => row.id);
@@ -1852,13 +1848,16 @@ export async function handleChangeOrderApproved(
                 : (isManualApproval && summary.billed) ? "manual"
                 : "needsLook";
             // A schedule failure (pushed to summary.issues above, after billing)
-            // must not be hidden behind the manual outcome's ✅ subject — filter
-            // the standard manual notice back out to see if anything ELSE needs a look.
-            const manualExtraIssues = summary.issues.filter((issue) => issue !== MANUAL_BILLING_NOTICE);
-            const manualNeedsLook = outcomeKind === "manual" && manualExtraIssues.length > 0;
+            // must not be hidden behind a clean ✅ subject — summary.issues by this
+            // point carries only actual problems (the manual-approval notice is now
+            // a structural flag, not an issue), so no filtering is needed.
+            const awaitingActualsNeedsLook = outcomeKind === "awaitingActuals" && summary.issues.length > 0;
+            const manualNeedsLook = outcomeKind === "manual" && summary.issues.length > 0;
             const reviewParagraph = `<p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
             const subject = {
-                awaitingActuals: `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`,
+                awaitingActuals: awaitingActualsNeedsLook
+                    ? `⚠️ Change order approved — awaiting actuals, needs a look — ${coLabel} (${amountLabel})`
+                    : `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`,
                 sent: `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`,
                 manual: manualNeedsLook
                     ? `⚠️ Change order manually approved — needs a look — ${coLabel} (${amountLabel})`
@@ -1866,9 +1865,9 @@ export async function handleChangeOrderApproved(
                 needsLook: `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`,
             }[outcomeKind];
             const detail = {
-                awaitingActuals: `<p>${isManualApproval ? `Staff (<strong>${esc(manualApprovedBy)}</strong>) manually approved` : "The customer approved"} the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`,
+                awaitingActuals: `<p>${isManualApproval ? `Staff (<strong>${esc(manualApprovedBy)}</strong>) manually approved` : "The customer approved"} the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>${awaitingActualsNeedsLook ? `<ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
                 sent: `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`,
-                manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual; no payment email was sent to the client.</p>${manualNeedsLook ? `<ul>${manualExtraIssues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
+                manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual.${summary.clientEmailSuppressed ? " No payment email was sent to the client." : ""}</p>${manualNeedsLook ? `<ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
                 needsLook: isManualApproval
                     ? `<p>Staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} manually approved this change order (no client signature), but the automation did not complete cleanly:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}`
                     : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}`,
@@ -1984,7 +1983,7 @@ export async function sendChangeOrderToClientCore(
 
         const sentCo = await tx.changeOrder.update({
             where: { id: changeOrderId },
-            data: { status: "Sent", sentAt: new Date() },
+            data: { status: "Sent", sentAt: new Date(), revision: { increment: 1 } },
             select: { updatedAt: true },
         });
 
