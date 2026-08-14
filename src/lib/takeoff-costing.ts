@@ -8,8 +8,8 @@
  * merely named "…tax…" was excluded from markup in the UI and then marked up by the server.
  */
 
-/** The reserved phase code the AI prompt assigns to the WA sales tax line. */
-const TAX_COST_CODE = "99-TAX";
+/** The reserved phase code carried by the AI takeoff's sales tax line. */
+export const TAX_COST_CODE = "99-TAX";
 
 /**
  * Whether a cost code marks a sales-tax pass-through row.
@@ -96,7 +96,7 @@ export type TakeoffTaxSplit = {
  * shipped) shape alone. 30 mirrors the taxRatePercent validation bound in gpt-estimate.ts.
  *
  * KNOWN LIMIT: the rate is derived as taxAmount / preTaxSubtotal, which assumes the AI taxed the
- * WHOLE subtotal — which is exactly what the prompt instructs ("the 8.4% tax applies to the ENTIRE
+ * WHOLE subtotal — which is exactly what the prompt instructs ("the tax applies to the ENTIRE
  * CONTRACT PRICE"). If a takeoff ever taxes only part of the base, the derived rate is a BLENDED
  * rate: the stored total still ties out to the penny today, but a later edit reprices tax at the
  * blended rate. That is accepted deliberately — bailing out would restore a guaranteed

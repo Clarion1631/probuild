@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { derivedMarginPct } from "@/lib/budget-math";
 import { isTaxCostCode, numOr, numOrNull, rmc, splitTakeoffTax } from "@/lib/takeoff-costing";
+import { parseSalesTaxes } from "@/lib/sales-tax";
 
 /** The margin stored when a takeoff row carries no usable costing at all. */
 const DEFAULT_MARGIN_PCT = 25;
@@ -120,21 +121,33 @@ export async function POST(req: NextRequest) {
     const split = splitTakeoffTax(rawItems);
     const items = split.taxRatePercent != null ? split.items : rawItems;
 
+    // The generating route now snapshots the rate and jurisdiction the takeoff was priced at, so the
+    // rate does not have to be reconstructed from the tax row's dollars at all. Trust it only when
+    // it RECONCILES with those dollars to the penny — a snapshot that disagrees with the line items
+    // is not a description of this estimate, and the items are what the client was shown. Legacy
+    // takeoffs carry no snapshot and fall through to the derivation below unchanged.
+    const snapshot = aiData?.salesTax;
+    const snapshotRate = typeof snapshot?.rate === "number" && Number.isFinite(snapshot.rate) ? snapshot.rate : null;
+    const snapshotReconciles =
+        snapshotRate != null &&
+        snapshotRate >= 0 &&
+        split.taxRatePercent != null &&
+        rmc((split.preTaxSubtotal * snapshotRate) / 100) === split.taxAmount;
+    const snapshotName =
+        snapshotReconciles && typeof snapshot?.name === "string" && snapshot.name.trim() !== "" ? snapshot.name.trim() : null;
+
     let taxRateName: string | null = null;
-    if (split.taxRatePercent != null) {
+    if (snapshotReconciles) {
+        taxRateName = snapshotName ?? "Sales Tax";
+    } else if (split.taxRatePercent != null) {
         const companySettings = await prisma.companySettings.findUnique({
             where: { id: "singleton" },
             select: { salesTaxes: true },
         });
-        let salesTaxes: Array<{ name?: string; rate?: number }> = [];
-        try {
-            const parsed = companySettings?.salesTaxes ? JSON.parse(companySettings.salesTaxes) : [];
-            // JSON.parse("null") and JSON.parse("{}") both succeed without being an array, and a
-            // subsequent .find/.filter would throw and fail the whole conversion.
-            salesTaxes = Array.isArray(parsed) ? parsed : [];
-        } catch {
-            salesTaxes = [];
-        }
+        // parseSalesTaxes swallows unparseable/non-array stored values (JSON.parse("null") and
+        // JSON.parse("{}") both succeed without being an array, and the .filter below would throw
+        // and fail the whole conversion).
+        const salesTaxes = parseSalesTaxes(companySettings?.salesTaxes);
         // Two configured jurisdictions can share a rate, and the AI takeoff line's own name can
         // assert a jurisdiction the derived rate contradicts — either way, naming the wrong city on
         // a client-facing document is worse than a neutral label. Only trust a configured tax's
@@ -150,7 +163,12 @@ export async function POST(req: NextRequest) {
         taxRateName = soleMatch && typeof soleMatch.name === "string" && soleMatch.name.trim() !== "" ? soleMatch.name : "Sales Tax";
     }
 
-    const finalTotal = split.taxRatePercent != null ? rmc(split.preTaxSubtotal + split.taxAmount) : totalEstimate;
+    // When the snapshot reconciles it is the exact configured rate, so it is stored in preference to
+    // the derived one: they agree to the penny on this estimate's dollars (that is what reconciling
+    // means), but only the snapshot is the rate a later edit should reprice at.
+    const storedTaxRate = snapshotReconciles ? snapshotRate : split.taxRatePercent;
+
+    const finalTotal = storedTaxRate != null ? rmc(split.preTaxSubtotal + split.taxAmount) : totalEstimate;
 
     const code = `EST-${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -166,7 +184,7 @@ export async function POST(req: NextRequest) {
                 totalAmount: finalTotal,
                 balanceDue: finalTotal,
                 privacy: "Shared",
-                ...(split.taxRatePercent != null ? { taxRatePercent: split.taxRatePercent, taxRateName } : {}),
+                ...(storedTaxRate != null ? { taxRatePercent: storedTaxRate, taxRateName } : {}),
             },
         });
 
