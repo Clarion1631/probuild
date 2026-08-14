@@ -56,16 +56,34 @@ function recomputeMilestoneAmounts(
  * Preference order:
  *  1. Derive from the row's own cost and price — the pair is what the client was quoted, so the
  *     margin derived from it keeps the row internally consistent no matter what the model claimed.
- *  2. Convert the stated markup: margin = markup / (100 + markup) x 100.
- *  3. Fall back to the default margin (also covers legacy rows saved before costing was carried).
+ *  2. Credit rows: cost and price both negative derive the SAME way — dividing two negatives is
+ *     positive, so the ratio (and the margin it implies) is unchanged by flipping both signs
+ *     positive before calling derivedMarginPct, which only guards `price <= 0` as "no margin".
+ *     Mirrors the identical sign-check `splitTakeoffTax` already applies to the tax row's own
+ *     credit case (`src/lib/takeoff-costing.ts`).
+ *  3. Convert the stated markup: margin = markup / (100 + markup) x 100.
+ *  4. A cost/price pair present with MIXED signs (one negative, one not) is not a rate-based
+ *     relationship — the ratio implies a number the row's own figures contradict (e.g. it can
+ *     clamp to 99% while the numbers show the opposite). Rather than fabricate
+ *     DEFAULT_MARGIN_PCT next to a pair it doesn't describe, such a row is stored at 0% margin —
+ *     the same sentinel already written for pass-through tax rows, so downstream readers already
+ *     treat 0 as a legitimate, non-default value.
+ *  5. Fall back to the default margin — rows with no costing data at all (legacy rows saved
+ *     before costing was carried).
  */
 function marginPercentFor(item: any, baseCost: number | null, unitCost: number): number {
     if (baseCost != null && baseCost > 0 && unitCost > 0) {
         return derivedMarginPct(baseCost, unitCost);
     }
+    if (baseCost != null && baseCost < 0 && unitCost < 0) {
+        return derivedMarginPct(-baseCost, -unitCost);
+    }
     const markup = numOrNull(item.markupPercent);
     if (markup != null && markup > -100) {
         return (markup / (100 + markup)) * 100;
+    }
+    if ((baseCost != null && baseCost < 0) || unitCost < 0) {
+        return 0;
     }
     return DEFAULT_MARGIN_PCT;
 }

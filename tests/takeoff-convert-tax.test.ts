@@ -371,6 +371,110 @@ test("canonical conversion: tax row stripped from line items, rate/name/total pe
     assert.equal(calls.takeoffUpdates[0].data.status, "Completed");
 });
 
+// --- marginPercentFor: negative-costing rows -------------------------------------------------
+
+test("credit row: cost and price both negative derive the SAME margin the positive pair would", async () => {
+    // No 99-TAX row, so splitTakeoffTax never runs and finalTotal falls back to the raw
+    // totalEstimate — the only thing under test here is marginPercentFor's own branch, not the
+    // tax split.
+    const items = [{ costCode: "02-FRAME", name: "Credit Frame", total: -35000, baseCost: -20000, unitCost: -35000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-credit",
+        name: "Credit Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -35000,
+            paymentMilestones: [{ name: "Refund", percentage: "100", amount: "-35000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-credit"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    const row = calls.estimateItemCreates[0].data;
+    assert.equal(row.baseCost, -20000); // sign preserved on the stored cost/price themselves
+    assert.equal(row.unitCost, -35000);
+    // Same margin as the canonical positive Frame row (baseCost 20000, unitCost 35000) above —
+    // flipping both signs before deriving must not change the implied margin.
+    const expectedMargin = derivedMarginPct(20000, 35000);
+    assert.equal(row.markupPercent, expectedMargin);
+    assert.notEqual(row.markupPercent, 25); // proves this derived, rather than hit the default
+});
+
+test("mixed-sign cost/price (no stated markup) is genuinely underivable and stores 0%, not the fabricated default", async () => {
+    const items = [{ costCode: "02-FRAME", name: "Mixed Sign Item", total: -1000, baseCost: 500, unitCost: -1000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-mixed",
+        name: "Mixed Sign Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "-1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-mixed"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 0);
+});
+
+test("mixed-sign cost/price WITH a stated markupPercent still converts the stated markup, rather than jumping straight to 0", async () => {
+    // markupPercent 25 (true markup) here converts to a 20% margin — proves the markup-conversion
+    // branch is still consulted before the mixed-sign fallback, not bypassed by it.
+    const items = [
+        { costCode: "02-FRAME", name: "Mixed Sign With Markup", total: -1000, baseCost: 500, unitCost: -1000, quantity: 1, markupPercent: 25 },
+    ];
+    state.takeoff = {
+        id: "takeoff-mixed-markup",
+        name: "Mixed Sign Job With Markup",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "-1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-mixed-markup"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 20);
+});
+
+test("no costing data at all (no baseCost/unitCost pair, no stated markup) still defaults to 25% — unaffected by the negative-costing fix", async () => {
+    const items = [{ costCode: "02-FRAME", name: "No Costing Data", total: 1000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-legacy",
+        name: "Legacy Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: 1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-legacy"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 25);
+});
+
 // --- bail-out case: no usable rate ------------------------------------------------------------
 
 function bailOutTakeoff() {
