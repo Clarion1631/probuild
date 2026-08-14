@@ -26,12 +26,19 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const [terms, setTerms] = useState(initialData?.terms || "");
     const [memos, setMemos] = useState(initialData?.memos || "");
     
-    // Line items
-    const [items, setItems] = useState<any[]>(
-        initialData?.items?.length > 0 
-            ? initialData.items 
-            : [{ id: "temp-1", description: "", quantity: 1, unitCost: 0, total: 0, costCodeId: null, order: 0 }]
-    );
+    // Line items. Quick-created / imported POs legitimately carry a totalAmount with zero
+    // item rows (quickCreatePOAndLink in src/lib/actions.ts). Seed the placeholder row
+    // CARRYING that stored total: the displayed total (a plain items-sum below) is correct
+    // on load, and the first save persists the amount as a real, consistent line item
+    // instead of a $0 row silently overwriting the stored total server-side
+    // (updatePurchaseOrder persists whatever total the client sends). A user who really
+    // wants to zero the PO can still edit the row to $0 — the seed only sets the starting
+    // value. New POs (no initialData) seed $0 exactly as before.
+    const [items, setItems] = useState<any[]>(() => {
+        if (initialData?.items?.length > 0) return initialData.items;
+        const carried = Number(initialData?.totalAmount) || 0;
+        return [{ id: "temp-1", description: "", quantity: 1, unitCost: carried, total: carried, costCodeId: null, order: 0 }];
+    });
 
     const [isSaving, setIsSaving] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -52,7 +59,8 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const fileInputRef = useRef<HTMLInputElement>(null);
     const isSavingRef = useRef(false); // sync guard against double-tap Save
 
-    // Dynamic calculations
+    // Dynamic calculations — always the plain items-sum. The itemless-PO case is handled
+    // at state seeding above, so display, payload, and persisted rows can never disagree.
     const totalAmount = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
 
     const handleItemChange = (index: number, field: string, value: any) => {

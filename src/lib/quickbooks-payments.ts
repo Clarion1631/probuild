@@ -747,7 +747,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                 let referenceNumber: string | null = null;
                 if (paymentId) {
                     const p = await getQBPayment(tokens, paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
+                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
                     referenceNumber = p?.referenceNumber || null;
                 }
                 const recorded = await settleMilestoneFromQBPayment({
@@ -791,7 +791,7 @@ export async function syncQuickBooksPayments(scope?: { invoiceId?: string; proje
                 let referenceNumber: string | null = null;
                 if (paymentId) {
                     const p = await getQBPayment(tokens, paymentId);
-                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00`);
+                    if (p?.txnDate) paidAt = new Date(`${p.txnDate}T12:00:00Z`);
                     referenceNumber = p?.referenceNumber || null;
                 }
                 const settled = await settleProgressBillingPaidCore(billing.id, { paidAt, referenceNumber, qbPaymentId: paymentId });

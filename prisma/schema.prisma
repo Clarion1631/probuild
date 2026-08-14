@@ -647,7 +647,10 @@ model PaymentSchedule {
   taxAmount             Decimal?
   status                String    @default("Pending") // Pending, Paid, Canceled
   dueDate               DateTime?
-  paymentDate           DateTime?
+  // Mirrored to EstimatePaymentSchedule.paymentDate, which is Timestamptz(6) — the two
+  // sides must match or every settle copy crosses timestamp semantics. Carries DUAL
+  // SEMANTICS (calendar day vs instant); see lib/payment-date.ts before touching it.
+  paymentDate           DateTime? @db.Timestamptz(6)
   stripeSessionId       String?
   stripePaymentIntentId String?
   paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"; "quickbooks" via QB Payments
@@ -655,7 +658,8 @@ model PaymentSchedule {
   notes                 String? // free-form memo
   receiptSentAt         DateTime? // last time admin sent the receipt email
   lastReminderAt        DateTime? @db.Timestamptz(6) // last time the automated payment-reminder cron emailed the client for this milestone
-  paidAt                DateTime?
+  // Mirrored to EstimatePaymentSchedule.paidAt (Timestamptz(6)) — keep the types equal.
+  paidAt                DateTime? @db.Timestamptz(6)
   createdAt             DateTime  @default(now())
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
@@ -2376,6 +2380,8 @@ model AutomationEvent {
   @@index([kind, createdAt])
   @@index([createdAt])
   @@index([docNumber, createdAt])
+  @@index([qbPurchaseId])
+  @@index([driveFileId])
 }
 
 model StripeEvent {
@@ -2611,13 +2617,4 @@ model ReviewAlertEpisode {
 
   @@unique([issueId, generation])
   @@index([batchId])
-}
-
-// One-time pre-migration backup captured by scripts/apply-selections-playground.mjs. Scheduled for deletion; nothing reads it.
-model SelectionProposalStatusBackup {
-  id         String   @id @default(cuid())
-  status     String
-  capturedAt DateTime @default(now()) @db.Timestamptz(6)
-
-  @@map("_SelectionProposalStatusBackup")
 }

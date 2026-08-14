@@ -21,7 +21,10 @@ import { signClientPortalToken } from "../src/lib/client-portal-auth";
  */
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
-const OOS_PROJECT_ID = "e2e-scope-oos-project";
+// (The out-of-scope PROJECT id is referenced only in prose now — its last
+// runtime use went with the forged-descriptor test. The seeded project itself
+// is still required, both by the converted-contract fixture below and by
+// estimate-scope-labels.spec.ts, so only the unused constant is dropped here.)
 const OOS_LEAD_ID = "e2e-scope-oos-lead";
 const TEST_CLIENT_ID = "test-client-do-not-delete";
 const TEST_CLIENT_EMAIL = "test-client@goldentouchremodeling.com";
@@ -76,7 +79,15 @@ test.describe("the dispatcher's own gate", () => {
         test(`${label} gets a bare 404, not an action result`, async ({ request }) => {
             const res = await request.post("/api/test-only/contract-actions", {
                 headers: { "content-type": "application/json", ...headers },
-                data: { action: "getContracts", args: [] },
+                // An ALLOWLISTED action, deliberately. This used to name
+                // `getContracts`, which the deletion turned into an unknown
+                // action. That would not have made the test vacuous — unknown
+                // actions answer 400, not 404, so an removed credential gate
+                // would still have failed the expected-404 assertion (Codex
+                // corrected my first reading of this). Naming a live action is
+                // simply more direct: the credential gate becomes the only
+                // thing in the request that can produce a 404.
+                data: { action: "getContract", args: [CONTRACT_INSCOPE_ID] },
             });
             expect(res.status()).toBe(404);
             const body = await res.text();
@@ -109,14 +120,9 @@ test.describe("unauthenticated caller", () => {
     );
 
     for (const [action, args] of [
-        ["getContracts", []],
         ["getContract", [CONTRACT_INSCOPE_ID]],
         ["updateContract", [CONTRACT_INSCOPE_ID, { title: "hacked" }]],
         ["deleteContract", [CONTRACT_INSCOPE_ID]],
-        [
-            "getExecutedContractPdf",
-            [{ id: CONTRACT_LEADONLY_ID, title: CONTRACT_LEADONLY_TITLE, projectId: null, leadId: OOS_LEAD_ID }],
-        ],
         ["getContractSigningHistory", [CONTRACT_INSCOPE_ID]],
         ["getContractSendDefaults", [CONTRACT_INSCOPE_ID]],
     ] as const) {
@@ -177,20 +183,14 @@ test.describe("staff with project access but no `contracts` permission (FINANCE)
         await expect(page.getByText("No contracts yet")).toBeVisible();
     });
 
-    // getContracts REFUSES rather than returning []. Its gate is
-    // assertStaffPermission("contracts"), which throws before
-    // contractScopeWhere is ever consulted — so the action and the pages answer
-    // "no contracts" by two different mechanisms, and only the pages (which
-    // query Prisma directly through contractScopeWhere, never through this
-    // action) degrade to an empty list. Asserting `ok: true, data: []` here
-    // fails against the real system; that is what the first live run showed.
-    test("getContracts refuses outright — it never degrades to an empty list", async ({ request }) => {
-        const result = await callAction(request, "getContracts", []);
-        expect(result.ok).toBe(false);
-        expect(result.error).toBe("Forbidden");
-        expect(result.raw).not.toContain(CONTRACT_INSCOPE_TOKEN);
-        expect(result.raw).not.toContain(CONTRACT_INSCOPE_BODY);
-    });
+    // A `getContracts` case sat here: it asserted the LIST action refuses this
+    // caller outright rather than degrading to an empty list, because its gate
+    // (assertStaffPermission) threw before contractScopeWhere was consulted.
+    // That action has since been deleted as caller-less dead surface, and the
+    // behaviour it described no longer has a subject — the two page tests just
+    // above are now the whole of the list story, and they are the mechanism the
+    // product actually uses (direct Prisma + contractScopeWhere, never the
+    // action). See docs/CONTRACTS.md.
 
     // Project access is not the contract permission — this is the exact
     // over-grant contractScopeWhere's vertical check exists to stop. Every
@@ -200,10 +200,6 @@ test.describe("staff with project access but no `contracts` permission (FINANCE)
         ["getContract", [CONTRACT_INSCOPE_ID]],
         ["updateContract", [CONTRACT_INSCOPE_ID, { title: "hacked" }]],
         ["deleteContract", [CONTRACT_INSCOPE_ID]],
-        [
-            "getExecutedContractPdf",
-            [{ id: CONTRACT_INSCOPE_ID, title: "irrelevant", projectId: PROJECT_ID, leadId: null }],
-        ],
         ["getContractSigningHistory", [CONTRACT_INSCOPE_ID]],
         ["getContractSendDefaults", [CONTRACT_INSCOPE_ID]],
     ] as const) {
@@ -224,31 +220,34 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         expect(result.data.id).toBe(CONTRACT_LEADONLY_ID);
     });
 
-    // contractOwnerOrThrow exists specifically so ownership is read from the DB
-    // by contract id, NOT from the caller-supplied descriptor — but nothing
-    // else in this file pins that, because every other call passes truthful
-    // ownership. Here the descriptor LIES: it claims CONTRACT_CONVERTED_ID
-    // (which actually lives on OOS_PROJECT_ID, unreachable to this user) is
-    // lead-only on OOS_LEAD_ID, which this user CAN reach via leadAccess. If
-    // getExecutedContractPdf ever regressed to trusting the supplied
-    // projectId/leadId instead of re-reading them from the DB row, this is the
-    // only test in the file that would catch it — every other test here passes
-    // truthful descriptors and would keep passing under that regression.
-    test("forged descriptor cannot smuggle access to a contract this user cannot reach", async ({ request }) => {
-        const result = await callAction(request, "getExecutedContractPdf", [
-            { id: CONTRACT_CONVERTED_ID, title: "irrelevant", projectId: null, leadId: OOS_LEAD_ID },
-        ]);
-        expect(result.ok).toBe(false);
-        expect(result.error).toBe("Forbidden");
-    });
+    // A forged-descriptor test sat here. It was the only test pinning that
+    // ownership is re-read from the DB by contract id rather than trusted from
+    // a caller-supplied {projectId, leadId} descriptor — the hole #367 closed.
+    // It could only be written against `getExecutedContractPdf`, because that
+    // was the sole action in the family taking a descriptor rather than a bare
+    // id. That action has been deleted, so no surviving action in this
+    // dispatcher takes ownership as an AUTHORIZATION input: each authorizes by
+    // bare contract id and reloads current ownership from the row, leaving the
+    // read bypass no entry point. (Narrower than "accepts no caller-supplied
+    // ownership at all", which Codex showed is false: updateContract's payload
+    // still reaches Prisma by spread, so ownership keys can ride along in the
+    // UPDATE even though they cannot influence the access decision. That is a
+    // pre-existing mass-assignment gap, tracked separately, not something this
+    // branch introduced or removed coverage for.) The core it wrapped,
+    // executedContractPdfFor, still takes a descriptor, but only from callers
+    // that already hold the loaded row (the portal, after getContractForPortal
+    // proves ownership; countersignContractAsCompany, after its own gate) — so
+    // there is no untrusted descriptor anywhere on that path to forge.
 
-    test("positive control: getContracts lists the lead-only contract", async ({ request }) => {
-        const result = await callAction(request, "getContracts", []);
-        expect(result.ok).toBe(true);
-        expect((result.data as any[]).some((c) => c.id === CONTRACT_LEADONLY_ID)).toBe(true);
-    });
+    // A `getContracts` positive control sat here too, for the same deleted
+    // action. Its subject is covered by the page-level positive controls below,
+    // which exercise the real list mechanism (direct Prisma + contractScopeWhere).
 
-    test("positive control: signing history / send defaults / executed PDF succeed on the lead-only contract", async ({
+    // The executed-PDF leg of this control went with getExecutedContractPdf.
+    // The seeded ProjectFile it asserted on is still exercised end-to-end by
+    // the portal tests at the bottom of this file, which render the real
+    // executed-PDF link through the session-free core.
+    test("positive control: signing history / send defaults succeed on the lead-only contract", async ({
         request,
     }) => {
         const history = await callAction(request, "getContractSigningHistory", [CONTRACT_LEADONLY_ID]);
@@ -256,17 +255,6 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
 
         const sendDefaults = await callAction(request, "getContractSendDefaults", [CONTRACT_LEADONLY_ID]);
         expect(sendDefaults.ok).toBe(true);
-
-        const pdf = await callAction(request, "getExecutedContractPdf", [
-            { id: CONTRACT_LEADONLY_ID, title: CONTRACT_LEADONLY_TITLE, projectId: null, leadId: OOS_LEAD_ID },
-        ]);
-        expect(pdf.ok).toBe(true);
-        // A guard that denies everyone would ALSO fail this assertion — but a
-        // lookup that resolves to `null` on every call (never actually reading
-        // the seeded ProjectFile) would still pass `ok: true`. Assert the real
-        // file came back, not just that the call didn't throw.
-        expect(pdf.data).not.toBeNull();
-        expect(pdf.raw).toContain("example.test/e2e/executed-contract.pdf");
     });
 
     // It carries BOTH ids and canAccessJobScope lets projectId win, so
@@ -275,10 +263,6 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         ["getContract", [CONTRACT_CONVERTED_ID]],
         ["updateContract", [CONTRACT_CONVERTED_ID, { title: "hacked" }]],
         ["deleteContract", [CONTRACT_CONVERTED_ID]],
-        [
-            "getExecutedContractPdf",
-            [{ id: CONTRACT_CONVERTED_ID, title: "irrelevant", projectId: OOS_PROJECT_ID, leadId: OOS_LEAD_ID }],
-        ],
         ["getContractSigningHistory", [CONTRACT_CONVERTED_ID]],
         ["getContractSendDefaults", [CONTRACT_CONVERTED_ID]],
     ] as const) {
@@ -289,23 +273,15 @@ test.describe("staff with `contracts` + `leadAccess` but no access to the conver
         });
     }
 
-    // The list must agree with the detail action, in BOTH directions — a filter
-    // that simply returned nothing would satisfy an exclusion-only assertion.
-    // This user reaches PROJECT_ID, so the in-scope contract is legitimately
-    // theirs and MUST appear; the converted one is on a project they cannot
-    // reach and must not, even though its leadId would otherwise admit it.
-    test("getContracts list admits what the by-id action admits and excludes the converted contract", async ({
-        request,
-    }) => {
-        const result = await callAction(request, "getContracts", []);
-        expect(result.ok).toBe(true);
-        const ids = (result.data as any[]).map((c) => c.id);
-        expect(ids).toContain(CONTRACT_LEADONLY_ID);
-        expect(ids).toContain(CONTRACT_INSCOPE_ID);
-        expect(ids).not.toContain(CONTRACT_CONVERTED_ID);
-        expect(result.raw).not.toContain(CONTRACT_CONVERTED_TOKEN);
-        expect(result.raw).not.toContain(CONTRACT_CONVERTED_BODY);
-    });
+    // A bidirectional list-vs-detail agreement test sat here, against
+    // getContracts. That action is deleted, and it was never how the product
+    // listed contracts anyway — the staff pages query Prisma directly through
+    // contractScopeWhere. The same both-directions property is asserted at page
+    // level further down: "project contracts page shows the in-scope contract,
+    // not the empty state" (must-appear) and "lead contracts page ... hides the
+    // converted contract" (must-not-appear), against the real mechanism rather
+    // than a parallel one. The must-appear half matters most — a filter that
+    // simply returned nothing would satisfy an exclusion-only assertion.
 
     // Without this, the unauthenticated block's "getLead never throws, but its
     // embedded contracts relation stays empty" assertion is vacuous — an empty
