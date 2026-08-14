@@ -22,6 +22,7 @@ import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
+import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
@@ -3446,24 +3447,6 @@ export async function archiveEstimate(estimateId: string) {
         revalidatePath(`/leads/${estimate.leadId}/estimates`);
     }
     return { success: true, archived };
-}
-
-// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
-// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
-        where: { id: "singleton" },
-        select: { salesTaxes: true },
-    });
-    if (!settings?.salesTaxes) return 0;
-    try {
-        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
-        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
-        const def = taxes.find(t => t.isDefault) || taxes[0];
-        return typeof def.rate === "number" ? def.rate : 0;
-    } catch {
-        return 0;
-    }
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
