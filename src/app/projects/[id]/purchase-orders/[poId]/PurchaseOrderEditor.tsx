@@ -53,7 +53,16 @@ export default function PurchaseOrderEditor({ context, initialData }: { context:
     const isSavingRef = useRef(false); // sync guard against double-tap Save
 
     // Dynamic calculations
-    const totalAmount = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
+    const itemsTotal = items.reduce((acc, curr) => acc + (Number(curr.total) || 0), 0);
+    // Quick-created / imported POs can legitimately carry a total with zero line items
+    // (see quickCreatePOAndLink in src/lib/actions.ts). This editor always seeds a blank
+    // placeholder row when there are none, so a bare items-sum would show — and on Save,
+    // persist — $0, silently destroying that stored total. Fall back to the stored total
+    // only while the itemized sum is still $0; as soon as a real priced item is entered,
+    // the computed sum takes over as normal.
+    const totalAmount = (!initialData?.items || initialData.items.length === 0) && itemsTotal === 0
+        ? (Number(initialData?.totalAmount) || 0)
+        : itemsTotal;
 
     const handleItemChange = (index: number, field: string, value: any) => {
         const newItems = [...items];
