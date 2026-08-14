@@ -28,6 +28,7 @@ const IDS = {
     clientB: "pea-e2e-client-b",
     leadA: "pea-e2e-lead-a",
     leadB: "pea-e2e-lead-b",
+    projectA: "pea-e2e-project-a",
     draftUnsent: "pea-e2e-est-draft-unsent",
     sent: "pea-e2e-est-sent",
     unsentDefaultStatus: "pea-e2e-est-unsent-default-status",
@@ -162,11 +163,21 @@ test.beforeAll(async () => {
                 sentAt: null, approvedAt: null,
             },
         });
+        // Invoice.projectId and .clientId are both REQUIRED relations, so the
+        // invoice needs a project even though the estimate it proves out is
+        // lead-based. The estimate stays on the lead: the gate reads the
+        // `invoices` relation by estimateId, not by any shared project.
+        await prisma.project.upsert({
+            where: { id: IDS.projectA },
+            update: {},
+            create: { id: IDS.projectA, name: "Portal Access Project A", clientId: IDS.clientA },
+        });
         await prisma.invoice.upsert({
             where: { id: IDS.invoiceForUnsent },
             update: {},
             create: {
                 id: IDS.invoiceForUnsent, code: "INV-PEA-1", estimateId: IDS.invoicedUnsent,
+                projectId: IDS.projectA, clientId: IDS.clientA,
                 status: "Issued", totalAmount: 1000, balanceDue: 1000,
             },
         });
@@ -192,8 +203,9 @@ test.afterAll(async () => {
         await prisma.activityLog.deleteMany({
             where: { OR: [{ entityId: { in: estimateIds } }, { leadId: { in: [IDS.leadA, IDS.leadB] } }] },
         });
-        await prisma.invoice.deleteMany({ where: { estimateId: { in: estimateIds } } });
+        await prisma.invoice.deleteMany({ where: { OR: [{ estimateId: { in: estimateIds } }, { projectId: IDS.projectA }] } });
         await prisma.estimate.deleteMany({ where: { id: { in: estimateIds } } });
+        await prisma.project.deleteMany({ where: { id: IDS.projectA } });
         await prisma.lead.deleteMany({ where: { id: { in: [IDS.leadA, IDS.leadB] } } });
         await prisma.client.deleteMany({ where: { id: { in: [IDS.clientA, IDS.clientB] } } });
     } finally {
