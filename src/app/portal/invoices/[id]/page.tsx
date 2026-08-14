@@ -52,6 +52,8 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
             // non-locking first so the order can never invert against another flow.
             const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
             await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+            // One settle instant, taken AFTER the locks — see payment-record-core.ts.
+            const settledAt = new Date();
             const claim = await t.paymentSchedule.updateMany({
                 where: { id: scheduleId, invoiceId, status: { not: "Paid" } },
                 data: {
@@ -59,8 +61,10 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                     stripeSessionId: sessionId,
                     stripePaymentIntentId: session.payment_intent as string | null,
                     paymentMethod,
-                    paymentDate: new Date(),
-                    paidAt: new Date(),
+                    // Stripe-sourced: a real INSTANT, not a calendar day (see lib/payment-date.ts).
+                    // Both columns take the same instant so they can never disagree.
+                    paymentDate: settledAt,
+                    paidAt: settledAt,
                 },
             });
             const won = claim.count > 0;

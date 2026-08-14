@@ -43,6 +43,14 @@ export async function recordPaymentCore(
         const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
         await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
 
+        // ONE settle instant for BOTH sides of the mirrored pair. Calling new Date()
+        // separately per side stamped them ~0.5s apart, so the invoice and estimate copies
+        // of the same payment disagreed on paidAt (11 such pairs in prod as of 2026-08-14).
+        // Taken AFTER the parent locks: a contended settle can wait on the lock, and a
+        // stamp captured before that wait would record when we started queueing rather
+        // than when we settled — landing in the previous day or month near a boundary.
+        const settledAt = new Date();
+
         const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" };
@@ -53,7 +61,7 @@ export async function recordPaymentCore(
             data: {
                 status: "Paid",
                 paymentDate,
-                paidAt: new Date(),
+                paidAt: settledAt,
                 paymentMethod: method,
                 referenceNumber,
                 notes,
@@ -101,7 +109,7 @@ export async function recordPaymentCore(
             if (estCopy) {
                 const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
                     where: { id: estCopy.id, status: { not: "Paid" } },
-                    data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
+                    data: { status: "Paid", paymentDate, paidAt: settledAt, paymentMethod: method, referenceNumber },
                 });
                 if (mirrorClaim.count > 0) {
                     const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
