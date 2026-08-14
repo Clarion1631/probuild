@@ -70,7 +70,8 @@ Top untested suspects (need the log to confirm — don't guess-build):
 - Refresh token in `CompanySettings.googleDriveRefreshToken`; lead media root = "ProBuild Leads" in that Drive
 
 **Vercel**
-- Project `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL`, scope `justins-projects-a2347a8d`, token `$VERCEL_TOKEN`
+- Project `prj_sd7R3WIYZCRMnu5IhAudBdc4vuIL`, scope `justins-projects-a2347a8d`
+- Auth: `VERCEL_TOKEN` in the environment, else the persisted `vercel login`. The CLI reads either one silently — never put the value on a command line (see the deploy section below).
 
 ---
 
@@ -84,10 +85,26 @@ npx eas-cli submit -p ios --latest --non-interactive              # ascAppId 677
 npx eas-cli update --channel production --message "..."           # OTA, seconds
 ```
 
-**Web deploy** (from `gtr-probuild-site`, auto-deploy is OFF by design):
+**Web deploy.** Git auto-deploy is **ON** — merging to `main` ships to prod on its
+own, so the CLI is for shipping ahead of a merge (or any other manual deploy):
 ```bash
-vercel deploy --prod --yes --scope justins-projects-a2347a8d --token $VERCEL_TOKEN --archive=tgz
+vercel deploy --prod --yes --scope justins-projects-a2347a8d --cwd "C:\Users\jat00\workspaces\golden-touch\active\gtr-probuild-site"
 ```
+`--cwd` must point at the canonical checkout — worktrees have no `.vercel` link,
+and `--scope` only selects the team, so without it `--yes` can target the wrong
+project.
+
+> **Never pass `--token`.** On success the CLI prints a "next steps" block that
+> reconstructs follow-up commands and copies your global flags through verbatim,
+> putting the token in the terminal and in any agent transcript. That has forced
+> three rotations. The flag is unnecessary: precedence is `--token` → a
+> **non-empty** `VERCEL_TOKEN` in the environment → the persisted `vercel login`,
+> and the latter two are read silently and never echoed. Note an invalid explicit
+> flag or a stale env token does **not** fall back to the persisted login — it
+> just fails, so check `vercel whoami` first. `--archive=tgz` is also unneeded
+> (~1,389 source files vs a 15,000 cap) and it defeats per-file upload caching —
+> add it only if an upload actually stalls. Full rule: the "Deploying to Vercel"
+> section of `CLAUDE.md`.
 
 ---
 
