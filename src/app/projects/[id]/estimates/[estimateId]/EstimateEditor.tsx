@@ -262,6 +262,37 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const linkedInvoiceHref = linkedInvoice && linkedInvoiceProjectId
         ? `/projects/${linkedInvoiceProjectId}/invoices/${linkedInvoice.id}`
         : null;
+    // ── Milestone lockdown (Aug 2026, after the Mesplay INV-00171 drift) ──
+    // Once the client can see this money — the estimate was sent, or an invoice
+    // exists — the schedule is read-only until deliberately unlocked below. The
+    // unlock lasts until the page is left; it is never persisted. Draft estimates
+    // are never locked, so the normal build-and-send workflow is unchanged.
+    // Editing milestones NEVER emails or notifies the client on any path — the
+    // only client emails are the Send button and payment receipts/notifications
+    // (see docs/MILESTONE-EDITING.md for the audited list).
+    // viewedAt is checked too: the portal currently lets a client open an estimate
+    // it owns regardless of status (tracked separately), so an opened-but-never-sent
+    // draft is still client-visible money.
+    const clientVisibleMoney = !!linkedInvoice || !!initialEstimate.sentAt || !!initialEstimate.viewedAt
+        || ["Sent", "Viewed", "Approved", "Invoiced", "Paid"].includes(status);
+    const [milestonesUnlocked, setMilestonesUnlocked] = useState(false);
+    const milestonesLocked = clientVisibleMoney && !milestonesUnlocked;
+    // Ref mirror for async callers (AI generate/import): the response handler runs in a
+    // closure from the render that STARTED the request, so it must read the lock as it
+    // is NOW — e.g. the estimate was sent while generation was in flight — not as it
+    // was when the request began.
+    const milestonesLockedRef = useRef(milestonesLocked);
+    milestonesLockedRef.current = milestonesLocked;
+
+    function unlockMilestones() {
+        const ok = window.confirm(
+            (linkedInvoice
+                ? `This payment schedule is locked because this estimate has been invoiced (${linkedInvoice.code}).\n\nEdits here never email the client and do NOT change the invoice the client sees — the invoice schedule must be aligned separately.`
+                : "This payment schedule is locked because this estimate has been sent to the client.\n\nEdits here never email the client, but they DO change the schedule the client sees if you re-send or they revisit the portal.") +
+            "\n\nUnlock milestone editing until you leave this page?"
+        );
+        if (ok) setMilestonesUnlocked(true);
+    }
     const [isSaving, setIsSaving] = useState(false);
     const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -1123,15 +1154,19 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
     const dynamicBalanceDue = rm(total - paidMilestonesSum);
 
-    // Auto-recalculate percentage-based milestones when total changes (last absorbs rounding residual)
+    // Auto-recalculate percentage-based milestones when total changes (last absorbs rounding residual).
+    // Never while locked: opening an invoiced/sent estimate, or editing its line items, must not
+    // mutate the schedule the client can see. On unlock this re-runs and pct rows snap to the
+    // current total — deliberate, right after the user confirmed they want to edit.
     useEffect(() => {
+        if (milestonesLocked) return;
         setPaymentSchedules(prev => {
             if (prev.length === 0) return prev;
             const updated = recalcMilestoneAmounts(prev, total);
             const changed = updated.some((s, i) => s.amount !== prev[i].amount);
             return changed ? updated : prev;
         });
-    }, [total]);
+    }, [total, milestonesLocked]);
 
     // Internal margin calculations
     // Base cost from leaf items only (sections would double-count)
@@ -1791,9 +1826,20 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // single total over-allocates (recalcMilestoneAmounts can only clamp the last
         // residual). Normalizing or replacing there is a product decision, not a bug fix.
         const incomingMilestones = data.paymentMilestones && data.paymentMilestones.length > 0;
-        const newSchedules = incomingMilestones
-            ? [...baseSchedules, ...data.paymentMilestones!]
-            : recalcMilestoneAmounts(baseSchedules, computeSellTotals(newItems, fieldsRef.current).total);
+        // While the schedule is locked (client-visible money), an item import must not touch
+        // milestones at all — no rebalance, no appended plan. The Schedule Total row and the
+        // send-time mismatch block surface any resulting gap; unlocking re-enables editing.
+        // Read through the ref, not this closure: the estimate may have been sent (locking
+        // the schedule) while the AI/import request was in flight.
+        const lockedNow = milestonesLockedRef.current;
+        const newSchedules = lockedNow
+            ? baseSchedules
+            : incomingMilestones
+                ? [...baseSchedules, ...data.paymentMilestones!]
+                : recalcMilestoneAmounts(baseSchedules, computeSellTotals(newItems, fieldsRef.current).total);
+        if (lockedNow && incomingMilestones) {
+            toast.info("Payment milestones are locked — the imported milestones were not applied. Unlock the schedule to edit it.");
+        }
 
         // Update UI immediately — don't wait for save. itemsRef is set synchronously (not
         // just via the effect that mirrors `items`) so a save queued right behind this one
@@ -1805,7 +1851,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
         // rebalanced schedules go to the save alone: the [total] effect updates client state
         // itself, and it does so with a functional updater, so it can't clobber a schedule
         // edit that has reached state but not yet the ref.
-        if (incomingMilestones) {
+        if (incomingMilestones && !lockedNow) {
             setPaymentSchedules(newSchedules);
         }
         onMerged?.();
@@ -2305,6 +2351,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function addPaymentSchedule() {
+        if (milestonesLocked) return; // client-visible money — unlock first
         // Creation-time convenience only: prefill with whatever the schedule is
         // currently short of the total. Never rewritten after this point.
         const scheduleSum = paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0);
@@ -2330,6 +2377,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function updatePaymentSchedule(index: number, field: string, value: any) {
+        if (milestonesLocked) return; // client-visible money — unlock first
         const newSchedules = [...paymentSchedules];
         if (field === "percentage") {
             newSchedules[index] = { ...newSchedules[index], percentage: sanitizeMoneyInput(value) };
@@ -2355,6 +2403,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
      *  milestone. User-triggered replacement for the old silent "last row absorbs
      *  the residual" behavior that kept reverting hand-typed amounts. */
     function distributeRemainder() {
+        if (milestonesLocked) return; // client-visible money — unlock first
         const scheduleSum = rm(paymentSchedules.reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0));
         const diff = rm(total - scheduleSum);
         if (Math.abs(diff) < 0.01) return;
@@ -2376,6 +2425,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     }
 
     function removePaymentSchedule(index: number) {
+        if (milestonesLocked) return; // client-visible money — unlock first
         // Invoice-side milestones are snapshots — deleting the estimate copy does
         // NOT remove it from an already-generated invoice.
         if (linkedInvoice) {
@@ -3318,6 +3368,26 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                             <div className="bg-white border-t border-slate-200 mt-8">
                                 <div className="flex items-center justify-between bg-slate-50/50 border-b border-slate-100 px-8 py-5">
                                     <h3 className="font-bold text-slate-800 tracking-tight">Payment Schedule</h3>
+                                    {clientVisibleMoney && (milestonesLocked ? (
+                                        <button
+                                            onClick={unlockMilestones}
+                                            data-testid="unlock-milestones"
+                                            className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600 bg-white border border-slate-300 rounded-md px-3 py-1.5 hover:bg-slate-50 transition shadow-sm"
+                                            title="The client can see this money, so milestones are locked. Unlock to edit — edits never notify the client."
+                                        >
+                                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                                            </svg>
+                                            Locked — unlock to edit
+                                        </button>
+                                    ) : (
+                                        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700" data-testid="milestones-unlocked">
+                                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                                <path strokeLinecap="round" strokeLinejoin="round" d="M8 11V7a4 4 0 018 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
+                                            </svg>
+                                            Unlocked for this visit — edits never notify the client
+                                        </span>
+                                    ))}
                                 </div>
                                 {linkedInvoice && (
                                     <div className="bg-amber-50 border-b border-amber-200 px-8 py-3">
@@ -3393,7 +3463,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     value={schedule.name}
                                                     onChange={e => updatePaymentSchedule(index, "name", e.target.value)}
                                                     placeholder="e.g. Initial Deposit"
-                                                    disabled={isPaid}
+                                                    disabled={isPaid || milestonesLocked}
                                                     className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 -ml-3 transition-all text-sm font-semibold text-slate-800 disabled:cursor-default"
                                                 />
                                                 {isPaid && methodLabel && (
@@ -3411,7 +3481,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     value={schedule.percentage || (total > 0 && schedule.amount ? String(rm(((parseFloat(schedule.amount) || 0) / total) * 100)) : "")}
                                                     onChange={e => updatePaymentSchedule(index, "percentage", e.target.value)}
                                                     placeholder="%"
-                                                    disabled={isPaid}
+                                                    disabled={isPaid || milestonesLocked}
                                                     className={`w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pr-6 transition-all text-sm font-medium disabled:cursor-default ${!schedule.percentage && schedule.amount ? 'text-slate-300 italic' : 'text-slate-600'}`}
                                                 />
                                                 <span className="absolute right-7 top-2 text-slate-400 text-xs">%</span>
@@ -3427,7 +3497,8 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                             inputMode="decimal"
                                                             value={schedule.amount}
                                                             onChange={e => updatePaymentSchedule(index, "amount", e.target.value)}
-                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800"
+                                                            disabled={milestonesLocked}
+                                                            className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-3 py-1.5 pl-5 transition-all text-sm font-medium text-slate-800 disabled:cursor-default"
                                                         />
                                                     </>
                                                 )}
@@ -3437,7 +3508,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                     type="date"
                                                     value={schedule.dueDate ? new Date(schedule.dueDate).toISOString().split('T')[0] : ''}
                                                     onChange={e => updatePaymentSchedule(index, "dueDate", e.target.value ? new Date(e.target.value).toISOString() : null)}
-                                                    disabled={isPaid}
+                                                    disabled={isPaid || milestonesLocked}
                                                     className="w-full bg-transparent focus:outline-none focus:bg-white focus:ring-1 ring-slate-200 rounded px-2 py-1.5 text-right transition-all text-sm font-medium text-slate-500 disabled:cursor-default"
                                                 />
                                             </div>
@@ -3499,7 +3570,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                 )}
                                             </div>
                                             <div className="w-10 pt-0.5 flex justify-end">
-                                                {!isPaid && (
+                                                {!isPaid && !milestonesLocked && (
                                                     <button onClick={() => removePaymentSchedule(index)} className="text-slate-300 hover:text-red-500 hover:bg-red-50 rounded p-1.5 transition opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto">
                                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                                                     </button>
@@ -3532,12 +3603,14 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                         <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${diff > 0 ? 'text-amber-700 bg-amber-100' : 'text-red-700 bg-red-100'}`}>
                                                             {diff > 0 ? `${formatCurrency(diff)} under` : `${formatCurrency(Math.abs(diff))} over`}
                                                         </span>
-                                                        <button
-                                                            onClick={distributeRemainder}
-                                                            className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 underline underline-offset-2"
-                                                        >
-                                                            {diff > 0 ? "Add remainder to last milestone" : "Deduct overage from last milestone"}
-                                                        </button>
+                                                        {!milestonesLocked && (
+                                                            <button
+                                                                onClick={distributeRemainder}
+                                                                className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 underline underline-offset-2"
+                                                            >
+                                                                {diff > 0 ? "Add remainder to last milestone" : "Deduct overage from last milestone"}
+                                                            </button>
+                                                        )}
                                                     </>
                                                 )}
                                             </div>
@@ -3738,8 +3811,12 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     <h4 className="font-semibold text-indigo-900 text-sm">Payment Schedule</h4>
                                     <p className="text-xs text-indigo-700/70 mt-0.5">Allow your clients to pay in milestones (e.g., Deposit, Completion).</p>
                                 </div>
-                                <button onClick={addPaymentSchedule} className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3">
-                                    + Add milestone
+                                <button
+                                    onClick={milestonesLocked ? unlockMilestones : addPaymentSchedule}
+                                    title={milestonesLocked ? "The client can see this money, so milestones are locked. Click to unlock editing." : undefined}
+                                    className="hui-btn hui-btn-secondary text-indigo-700 border-indigo-200 hover:bg-indigo-100 bg-white transition shadow-sm text-xs py-1.5 px-3"
+                                >
+                                    {milestonesLocked ? "Locked — unlock to edit" : "+ Add milestone"}
                                 </button>
                             </div>
                         </div>

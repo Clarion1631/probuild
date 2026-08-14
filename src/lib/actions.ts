@@ -13,6 +13,7 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
@@ -22,6 +23,7 @@ import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
+import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
@@ -920,7 +922,8 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 
     revalidatePath(`/leads/${leadId}`);
     revalidatePath(`/leads`);
-    return lead;
+    // targetRevenue/expectedProfit are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(lead));
 }
 
 // =============================================
@@ -1637,7 +1640,11 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
     // Staff members can preview an estimate they are scoped to; portal clients
     // must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
-    const isStaff = !!(staffSession?.user as any)?.role;
+    // An explicit allowlist, not "any truthy role" — this branch bypasses the
+    // client gate below, so an unexpected role value must fall to the client path
+    // (which fails closed) rather than be handed staff access.
+    const isStaff = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]
+        .includes((staffSession?.user as { role?: string } | undefined)?.role ?? "");
     // The session carries a role but not projectAccess/assignedProjects, so the
     // horizontal check needs the full user row.
     const staffUser = isStaff ? await currentStaffUserOrNull() : null;
@@ -1648,12 +1655,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
 
-        // Restrict the query to the client's own estimates below
+        // Ownership alone is not enough. An estimate the contractor has never
+        // shared is internal pricing, and ids are reachable by walking the
+        // sequential `number` route — so AND the shared-ness predicate onto the
+        // ownership predicate. AND-composed rather than spread, because two `OR`
+        // keys in one object silently drop the first.
         const ownershipFilter = {
             id,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         };
 
@@ -2033,13 +2049,21 @@ export async function markEstimateViewed(estimateId: string) {
 
     // Atomic first-view claim — two simultaneous opens produce exactly one
     // notification and one activity event.
+    // Same shared-ness gate as getEstimateForPortal — an estimate the client
+    // cannot open must not be markable as viewed either, even by calling this
+    // server action directly. AND-composed so the two OR predicates cannot collide.
     const claim = await prisma.estimate.updateMany({
         where: {
             id: estimateId,
             viewedAt: null,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         },
         data: { viewedAt: new Date() },
@@ -3453,24 +3477,6 @@ export async function archiveEstimate(estimateId: string) {
         revalidatePath(`/leads/${estimate.leadId}/estimates`);
     }
     return { success: true, archived };
-}
-
-// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
-// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
-        where: { id: "singleton" },
-        select: { salesTaxes: true },
-    });
-    if (!settings?.salesTaxes) return 0;
-    try {
-        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
-        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
-        const def = taxes.find(t => t.isDefault) || taxes[0];
-        return typeof def.rate === "number" ? def.rate : 0;
-    } catch {
-        return 0;
-    }
 }
 
 export async function createInvoiceFromEstimate(estimateId: string) {
@@ -5349,10 +5355,13 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 
 export async function getEstimateTemplates() {
     await assertEstimatePermission();
-    return await prisma.estimateTemplate.findMany({
+    const templates = await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
+    // Item baseCost/unitCost are Prisma Decimals, which can't cross the server->client
+    // boundary; consumers already coerce with Number(...).
+    return JSON.parse(JSON.stringify(templates));
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
@@ -5960,30 +5969,17 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
-export async function getContracts(projectId?: string, leadId?: string) {
-    // Called with no arguments this returned EVERY contract with all scalar
-    // fields — legal body, approval IP/user-agent, signature paths and the
-    // portal accessToken that authorizes signing — to any anonymous caller.
-    // The scope filter is the list form of the same rule assertContractAccess
-    // applies to one row, so the list and the detail page cannot disagree.
-    const user = await assertStaffPermission("contracts");
-    return prisma.contract.findMany({
-        where: {
-            AND: [
-                contractScopeWhere(user),
-                {
-                    ...(projectId ? { projectId } : {}),
-                    ...(leadId ? { leadId } : {}),
-                },
-            ],
-        },
-        orderBy: { createdAt: "desc" },
-        include: {
-            project: { select: { name: true, client: { select: { name: true } } } },
-            lead: { select: { name: true, client: { select: { name: true } } } },
-        }
-    });
-}
+// `getContracts` was deleted here. It had no callers anywhere — the live staff
+// screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
+// directly with contractScopeWhere(viewer). Having no callers did NOT make it
+// inert: as this module actually builds (Next 16.2.11), the server-reference
+// manifest registers all 360 of its exports as individually invokable POST
+// endpoints, 37 of them unreferenced anywhere in src/ — so a caller-less export
+// here is live attack surface whose gate nothing exercises. Next documents that
+// unused actions MAY be eliminated, so that is a measurement of this build, not
+// a universal rule; see docs/CONTRACTS.md. #367 gated it; this removes it. The
+// scope rule it used, contractScopeWhere, is NOT orphaned: the two pages above
+// and getLead's contracts relation are its consumers.
 
 export async function getContract(id: string) {
     // Staff-only, scoped to the owning job. The docstring on getContractForPortal
@@ -6055,22 +6051,12 @@ export async function getContractForPortal(id: string, token?: string | null) {
     return contract;
 }
 
-/**
- * Staff-facing executed-contract file lookup. The lookup itself lives in
- * src/lib/contract-files-core.ts (session-free, shared with the client portal,
- * which proves access by accessToken or portal session instead).
- *
- * ONLY the contract `id` in the argument is trusted. The owning project/lead
- * and the title are re-read from the database, because the whole descriptor
- * used to be caller-supplied: naming another job's projectId returned that
- * job's executed PDF, and a crafted `title` steered the legacy prefix match.
- * The parameter keeps its old shape so existing callers are unchanged; the
- * extra fields are now ignored.
- */
-export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const { projectId, leadId, title } = await assertContractAccess(contract.id);
-    return executedContractPdfFor({ id: contract.id, title, projectId, leadId });
-}
+// `getExecutedContractPdf` was deleted here, for the same reason as
+// `getContracts` above: no callers, but on this build every export of this
+// module is registered as a POST endpoint anyway. Every real caller already uses
+// the session-free core `executedContractPdfFor` in contract-files-core.ts —
+// the client portal proves access by accessToken/portal session, and
+// countersignContractAsCompany calls it after its own gate.
 
 export async function createContractFromTemplate(
     templateId: string,
@@ -9109,7 +9095,8 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
@@ -9219,7 +9206,8 @@ export async function approveChangeOrder(id: string, signatureName: string, user
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 // Company-side countersignature. Distinct from approveChangeOrder (the customer's
@@ -9780,7 +9768,8 @@ export async function createPurchaseOrder(projectId: string, data: any) {
         }
     });
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
@@ -9888,7 +9877,8 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     }
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return newPo;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(newPo));
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
@@ -9933,8 +9923,9 @@ export async function updatePurchaseOrder(id: string, data: any) {
 
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    
-    return po;
+
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function deletePurchaseOrder(id: string) {
@@ -10026,7 +10017,8 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
     
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
@@ -10742,7 +10734,8 @@ export async function createProductLibraryItem(data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateProductLibraryItem(id: string, data: {
@@ -10768,7 +10761,8 @@ export async function updateProductLibraryItem(id: string, data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteProductLibraryItem(id: string) {
@@ -12349,7 +12343,8 @@ export async function addTeamCandidate(decisionId: string | null, data: {
         entityName: candidate.name,
     });
 
-    return candidate;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(candidate));
 }
 
 export async function importBoardPicksAsDecisions(projectId: string) {
@@ -13024,7 +13019,8 @@ export async function createCatalogItem(data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateCatalogItem(id: string, data: {
@@ -13042,7 +13038,8 @@ export async function updateCatalogItem(id: string, data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteCatalogItem(id: string) {
@@ -13211,7 +13208,8 @@ export async function createBidPackage(projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function updateBidPackage(id: string, projectId: string, data: {
@@ -13236,7 +13234,8 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
@@ -13265,7 +13264,8 @@ export async function addBidScope(packageId: string, projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return scope;
+    // budgetAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(scope));
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
@@ -13319,7 +13319,8 @@ export async function recordBidResponse(invitationId: string, packageId: string,
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return inv;
+    // bidAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(inv));
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
@@ -13372,7 +13373,8 @@ export async function createRetainer(projectId: string, data: {
     });
 
     revalidatePath(`/projects/${projectId}/retainers`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function updateRetainer(id: string, data: {
@@ -13400,7 +13402,8 @@ export async function updateRetainer(id: string, data: {
     const retainer = await prisma.retainer.update({ where: { id }, data: updateData });
     revalidatePath(`/projects/${existing.projectId}/retainers`);
     revalidatePath(`/projects/${existing.projectId}/retainers/${id}`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function deleteRetainer(id: string) {
@@ -13701,7 +13704,8 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     }));
 
     revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function unlinkPOFromEstimateItem(estimateItemId: string, purchaseOrderId: string) {
@@ -13784,7 +13788,8 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     revalidatePath(`/projects/${projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 // Result of restoreEstimateItemAssociations — reports exactly what was (and wasn't) restored
@@ -13999,11 +14004,13 @@ export async function restoreEstimateItemAssociations({
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
     await assertFinancialProjectAccess(projectId);
 
-    return prisma.purchaseOrder.findMany({
+    const pos = await prisma.purchaseOrder.findMany({
         where: { projectId },
         select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },
         orderBy: { createdAt: "desc" },
     });
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pos));
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {

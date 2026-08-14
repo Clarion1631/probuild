@@ -3,7 +3,8 @@ import { getAllInvoices } from "@/lib/actions";
 import GlobalInvoiceListClient from "./GlobalInvoiceListClient";
 
 export default async function GlobalInvoicesPage() {
-    const invoices = await getAllInvoices();
+    // Invoice money fields are Prisma Decimals — serialize before crossing the server->client boundary.
+    const invoices = JSON.parse(JSON.stringify(await getAllInvoices()));
 
     return (
         <div className="flex h-full bg-hui-background">

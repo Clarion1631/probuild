@@ -349,7 +349,14 @@ export default function TakeoffsClient({ contextType, contextId, contextName }: 
                 throw new Error(err.error || "Failed to convert");
             }
             const result = await res.json();
-            toast.success(`Estimate ${result.code} created with ${result.itemCount} line items!`);
+            // The conversion is idempotent: a takeoff that was already converted (stale tab, a
+            // double submit, a direct API call) gets its EXISTING estimate back rather than a
+            // second one. Say so instead of claiming a creation that didn't happen.
+            toast.success(
+                result.alreadyConverted
+                    ? `This takeoff was already converted — opening estimate ${result.code}.`
+                    : `Estimate ${result.code} created with ${result.itemCount} line items!`,
+            );
             router.push(result.redirectUrl);
         } catch (err: any) {
             toast.error(err.message || "Failed to convert to estimate");
