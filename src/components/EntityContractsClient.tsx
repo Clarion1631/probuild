@@ -9,7 +9,7 @@ import {
     createContractFromPdf,
 } from "@/lib/actions";
 import { toast } from "sonner";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import dynamic from "next/dynamic";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 import DocumentSignModal from "@/components/DocumentSignModal";

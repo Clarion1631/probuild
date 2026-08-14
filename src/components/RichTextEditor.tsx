@@ -2,7 +2,7 @@
 
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { useEffect } from "react";
 
 /**
