@@ -8,12 +8,8 @@ import {
   persistOwnedSignature,
   type SignatureStorageBucket,
 } from "../src/lib/signature-storage";
-import {
-  mirrorInvoiceSettleToEstimate,
-  mirrorInvoiceUnsettleToEstimate,
-  mirrorEstimateUnsettleToInvoice,
-  findInvoiceMirrorOfEstimateSchedule,
-} from "../src/lib/payment-mirror";
+import { mirrorInvoiceSettleToEstimate } from "../src/lib/payment-mirror";
+import { resolveChargeGroup, unwindRefundedCharge } from "../src/lib/refund-group";
 import {
   approveChangeOrderWithSignature,
   type ChangeOrderApprovalDependencies,
@@ -1129,11 +1125,25 @@ const S = {
   invoice2: "mp3-e2e-invoice-2",
   estOther: "mp3-e2e-eps-other",
   invOtherCharge: "mp3-e2e-ps-other-charge",
+  // S7/S8: ONE estimate milestone with TWO paid invoice clones carrying the same
+  // PaymentIntent — the shape `convertEstimateToInvoice` produces when a paid
+  // estimate is converted more than once, and the bug this suite section exists
+  // for. Its own documents again, so the group unwind can't disturb S1-S6.
+  estimate3: "mp3-e2e-estimate-3",
+  invoice3a: "mp3-e2e-invoice-3a",
+  invoice3b: "mp3-e2e-invoice-3b",
+  estGroup: "mp3-e2e-eps-group",
+  invGroupA: "mp3-e2e-ps-group-a",
+  invGroupB: "mp3-e2e-ps-group-b",
 };
 const S_NAME = "Stripe Mirror Drill - MP3TEST";
 const sPrisma = new PrismaClient();
+// One intent per scenario: a refund now unwinds EVERY row recording the charge,
+// so sharing an intent across scenarios would make them unwind each other.
 const INTENT = "pi_mp3_e2e_intent";
+const PAIR2_INTENT = "pi_mp3_e2e_pair2_intent";
 const OTHER_INTENT = "pi_mp3_e2e_other_intent";
+const GROUP_INTENT = "pi_mp3_e2e_group_intent";
 
 test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
   test.beforeAll(async () => {
@@ -1220,28 +1230,70 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     });
     await sPrisma.estimatePaymentSchedule.upsert({
       where: { id: S.estOther },
-      update: { status: "Paid", stripePaymentIntentId: INTENT },
+      update: { status: "Paid", stripePaymentIntentId: PAIR2_INTENT, paidAt: new Date(), paymentDate: new Date() },
       create: {
         id: S.estOther, estimateId: S.estimate2, name: "MP3 Other", amount: 200,
-        status: "Paid", order: 1, stripePaymentIntentId: INTENT,
+        status: "Paid", order: 1, stripePaymentIntentId: PAIR2_INTENT,
       },
     });
     await sPrisma.paymentSchedule.upsert({
       where: { id: S.invOtherCharge },
-      update: { status: "Paid", stripePaymentIntentId: OTHER_INTENT },
+      update: { status: "Paid", stripePaymentIntentId: OTHER_INTENT, paidAt: new Date(), paymentDate: new Date() },
       create: {
         id: S.invOtherCharge, invoiceId: S.invoice2, name: "MP3 Other", amount: 200,
         status: "Paid", sourceScheduleId: S.estOther, stripePaymentIntentId: OTHER_INTENT,
       },
     });
+
+    // Third fixture: ONE estimate milestone, TWO invoices, both clones Paid and
+    // both carrying the same charge. $500 milestone on a $500 estimate.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate3 },
+      update: { status: "Paid", totalAmount: 500, balanceDue: 0, statusBeforePayment: "Invoiced" },
+      create: {
+        id: S.estimate3, title: `${S_NAME} 3`, code: "EST-MP3TEST-3", projectId: S.project,
+        status: "Paid", taxExempt: true, totalAmount: 500, balanceDue: 0, statusBeforePayment: "Invoiced",
+      },
+    });
+    for (const id of [S.invoice3a, S.invoice3b]) {
+      await sPrisma.invoice.upsert({
+        where: { id },
+        update: { status: "Paid", totalAmount: 500, balanceDue: 0 },
+        create: {
+          id, code: `INV-MP3TEST-${id.endsWith("a") ? "3A" : "3B"}`, projectId: S.project,
+          clientId: S.client, estimateId: S.estimate3, status: "Paid",
+          totalAmount: 500, balanceDue: 0, issueDate: new Date(),
+        },
+      });
+    }
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estGroup },
+      update: { status: "Paid", stripePaymentIntentId: GROUP_INTENT, paidAt: new Date(), paymentDate: new Date() },
+      create: {
+        id: S.estGroup, estimateId: S.estimate3, name: "MP3 Group", amount: 500,
+        status: "Paid", order: 1, stripePaymentIntentId: GROUP_INTENT,
+      },
+    });
+    for (const [id, invoiceId] of [[S.invGroupA, S.invoice3a], [S.invGroupB, S.invoice3b]] as const) {
+      await sPrisma.paymentSchedule.upsert({
+        where: { id },
+        update: { status: "Paid", stripePaymentIntentId: GROUP_INTENT, paidAt: new Date(), paymentDate: new Date() },
+        create: {
+          id, invoiceId, name: "MP3 Group", amount: 500, status: "Paid",
+          sourceScheduleId: S.estGroup, stripePaymentIntentId: GROUP_INTENT,
+        },
+      });
+    }
   });
 
   test.afterAll(async () => {
     try {
-      await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: [S.invoice, S.invoice2] } } });
-      await sPrisma.invoice.deleteMany({ where: { id: { in: [S.invoice, S.invoice2] } } });
-      await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: [S.estimate, S.estimate2] } } });
-      await sPrisma.estimate.deleteMany({ where: { id: { in: [S.estimate, S.estimate2] } } });
+      const invoiceIds = [S.invoice, S.invoice2, S.invoice3a, S.invoice3b];
+      const estimateIds = [S.estimate, S.estimate2, S.estimate3];
+      await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: invoiceIds } } });
+      await sPrisma.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
+      await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
+      await sPrisma.estimate.deleteMany({ where: { id: { in: estimateIds } } });
       await sPrisma.project.deleteMany({ where: { id: S.project } });
       await sPrisma.client.deleteMany({ where: { id: S.client } });
     } finally {
@@ -1303,16 +1355,15 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(Number(after.balanceDue)).toBe(Number(before.balanceDue));
   });
 
-  test("S3: a full refund unwinds the estimate mirror and keeps its Stripe ids", async () => {
-    const payment = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
+  test("S3: a full refund unwinds both sides of the charge and keeps its Stripe ids", async () => {
+    const unwound = await unwindRefundedCharge(sPrisma, INTENT);
 
-    const unwound = await sPrisma.$transaction((tx) =>
-      mirrorInvoiceUnsettleToEstimate(tx, { estimateId: S.estimate, payment }),
-    );
-
-    expect(unwound, "the estimate copy was released").toBe(true);
+    expect(unwound.estimateSchedules.map((r) => r.id), "the estimate copy was released").toEqual([S.estDeposit]);
+    expect(unwound.invoiceSchedules.map((r) => r.id), "the invoice copy was released too").toEqual([S.invDeposit]);
     const estCopy = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estDeposit } });
     expect(estCopy.status).toBe("Pending");
+    const invCopy = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
+    expect(invCopy.status).toBe("Pending");
     // The Stripe ids MUST survive the reset: they are how a redelivered refund
     // re-finds this exact row. Clearing them would let a duplicate delivery land
     // on a different clone sharing the intent and unset a real payment.
@@ -1322,6 +1373,9 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(Number(estimate.balanceDue), "estimate balance restored in full").toBe(1000);
     expect(estimate.status, "pre-payment status restored").toBe("Invoiced");
     expect(estimate.statusBeforePayment).toBeNull();
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice } });
+    expect(Number(invoice.balanceDue), "invoice balance restored in full").toBe(1000);
+    expect(invoice.status).toBe("Issued");
   });
 
   test("S4: an ambiguous unlinked pair is left alone rather than guessed at", async () => {
@@ -1343,37 +1397,87 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(rows.every((r) => r.status === "Pending"), "no candidate was touched").toBe(true);
   });
 
-  test("S5: refunding an estimate milestone never releases a clone paid by another charge", async () => {
-    const schedule = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estOther } });
+  test("S5: refunding a charge never releases a clone paid by another charge", async () => {
+    const group = await resolveChargeGroup(sPrisma, PAIR2_INTENT);
 
-    const mirror = await sPrisma.$transaction((tx) =>
-      findInvoiceMirrorOfEstimateSchedule(tx, schedule),
-    );
+    expect(group.estimateSchedules.map((r) => r.id), "only the row this charge settled").toEqual([S.estOther]);
+    expect(group.invoiceSchedules, "the linked clone carries a DIFFERENT PaymentIntent").toEqual([]);
 
-    expect(mirror, "the sole linked clone carries a different PaymentIntent").toBeNull();
+    await unwindRefundedCharge(sPrisma, PAIR2_INTENT);
     const clone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invOtherCharge } });
     expect(clone.status, "the other charge's payment stays Paid").toBe("Paid");
+    const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice2 } });
+    expect(Number(invoice.balanceDue), "and its invoice balance is untouched").toBe(0);
   });
 
-  test("S6: refunding an estimate milestone unwinds its invoice clone and balance", async () => {
-    // Re-point the clone at THIS charge, which is the ordinary settled pair.
+  test("S6: refunding a charge unwinds the invoice clone that recorded it", async () => {
+    // Re-point the clone at a charge shared with its estimate original, which is
+    // the ordinary settled pair. (S5 already released the estimate side.)
+    await sPrisma.estimatePaymentSchedule.update({
+      where: { id: S.estOther },
+      data: { status: "Paid", paidAt: new Date(), paymentDate: new Date() },
+    });
     await sPrisma.paymentSchedule.update({
       where: { id: S.invOtherCharge },
-      data: { stripePaymentIntentId: INTENT, status: "Paid" },
-    });
-    const schedule = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estOther } });
-
-    const unwound = await sPrisma.$transaction(async (tx) => {
-      const mirror = await findInvoiceMirrorOfEstimateSchedule(tx, schedule);
-      expect(mirror?.id, "the same-charge clone is the mirror").toBe(S.invOtherCharge);
-      return mirror ? await mirrorEstimateUnsettleToInvoice(tx, mirror) : false;
+      data: { stripePaymentIntentId: PAIR2_INTENT, status: "Paid" },
     });
 
-    expect(unwound, "the invoice clone was released").toBe(true);
+    const unwound = await unwindRefundedCharge(sPrisma, PAIR2_INTENT);
+
+    expect(unwound.invoiceSchedules.map((r) => r.id), "the invoice clone was released").toEqual([S.invOtherCharge]);
     const clone = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invOtherCharge } });
     expect(clone.status).toBe("Pending");
     const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice2 } });
     expect(Number(invoice.balanceDue), "invoice balance restored by the refunded amount").toBe(200);
     expect(invoice.status).toBe("Issued");
+  });
+
+  test("S7: a refund releases EVERY clone of the charge, across every invoice", async () => {
+    // The regression: `stripePaymentIntentId` is not unique, so the old handler
+    // reset exactly one of these three rows. The other two kept showing money
+    // the client got back, and their invoices kept a wrong balanceDue.
+    const group = await resolveChargeGroup(sPrisma, GROUP_INTENT);
+    expect(group.invoiceSchedules.map((r) => r.id).sort(), "both clones are in the group")
+      .toEqual([S.invGroupA, S.invGroupB].sort());
+    expect(group.invoiceIds.length, "spanning two separate invoices").toBe(2);
+
+    const unwound = await unwindRefundedCharge(sPrisma, GROUP_INTENT);
+
+    expect(unwound.estimateSchedules.map((r) => r.id)).toEqual([S.estGroup]);
+    expect(unwound.invoiceSchedules.map((r) => r.id).sort()).toEqual([S.invGroupA, S.invGroupB].sort());
+
+    const rows = await sPrisma.paymentSchedule.findMany({ where: { id: { in: [S.invGroupA, S.invGroupB] } } });
+    expect(rows.every((r) => r.status === "Pending"), "no clone is left claiming the refunded money").toBe(true);
+    expect(rows.every((r) => r.stripePaymentIntentId === GROUP_INTENT), "charge links survive the reset").toBe(true);
+
+    for (const id of [S.invoice3a, S.invoice3b]) {
+      const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id } });
+      expect(Number(invoice.balanceDue), `invoice ${id} balance restored`).toBe(500);
+      expect(invoice.status).toBe("Issued");
+    }
+    const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate3 } });
+    expect(Number(estimate.balanceDue), "estimate balance restored").toBe(500);
+    expect(estimate.status).toBe("Invoiced");
+  });
+
+  test("S8: a redelivered refund is a no-op, not a second unwind", async () => {
+    const before = await sPrisma.invoice.findMany({
+      where: { id: { in: [S.invoice3a, S.invoice3b] } },
+      orderBy: { id: "asc" },
+    });
+
+    const group = await resolveChargeGroup(sPrisma, GROUP_INTENT);
+    expect(group.estimateSchedules.length + group.invoiceSchedules.length,
+      "nothing Paid still records the charge").toBe(0);
+    const unwound = await unwindRefundedCharge(sPrisma, GROUP_INTENT);
+    expect(unwound.estimateSchedules).toEqual([]);
+    expect(unwound.invoiceSchedules).toEqual([]);
+
+    const after = await sPrisma.invoice.findMany({
+      where: { id: { in: [S.invoice3a, S.invoice3b] } },
+      orderBy: { id: "asc" },
+    });
+    expect(after.map((i) => Number(i.balanceDue))).toEqual(before.map((i) => Number(i.balanceDue)));
+    expect(after.map((i) => i.status)).toEqual(before.map((i) => i.status));
   });
 });
