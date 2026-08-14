@@ -7,6 +7,50 @@ on:
     branches: [main]
 
 jobs:
+  # Proves that prisma/migrations/ still reproduces PRODUCTION's schema. Before
+  # the 2026-08-14 baseline, prisma/migrations/ and prod's _prisma_migrations had
+  # no common ancestor at all: the folder held one never-applied 3-line file, and
+  # nothing in CI or the deploy path ever ran `migrate deploy`, so a database
+  # built from the committed migrations bore no relation to prod.
+  #
+  # Runs against a throwaway Postgres service container — NEVER the live DB.
+  migrations:
+    name: Migrations reproduce production
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: probuild
+          POSTGRES_PASSWORD: probuild
+          POSTGRES_DB: probuild_migrations
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+      DIRECT_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm install
+
+      # Executes the baseline for real. Nothing had ever run this SQL before it
+      # was committed, so this step alone is the difference between a baseline
+      # that is known-good and one that merely looks right.
+      - name: Apply committed migrations to the throwaway database
+        run: npx prisma migrate deploy
+
+      - name: Assert the result matches production's shape
+        run: node scripts/check-migrations-match.mjs
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest

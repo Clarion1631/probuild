@@ -1,11 +1,22 @@
-name: DB Push
+name: DB Migrate
 
 on:
   workflow_dispatch:
 
+# This workflow used to run `prisma db push --accept-data-loss` against the
+# PRODUCTION secrets on a manual dispatch. That is a destructive command: it
+# makes the database match schema.prisma by whatever means necessary, including
+# dropping tables and columns. Until PR #370 adopted production's real shape into
+# schema.prisma, one click here would have proposed dropping 10 tables and 41
+# columns of live data. GitHub's runners can reach the IPv6-only DIRECT_URL host
+# that developer machines cannot, so nothing local would have stopped it.
+#
+# Now that prisma/migrations/ has a true baseline, the supported command is
+# `migrate deploy`: it applies pending migrations in order and never drops
+# anything a migration did not explicitly ask it to drop.
 jobs:
-  db-push:
-    name: Prisma DB Push
+  migrate:
+    name: Prisma Migrate Deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,8 +25,15 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm install
-      - run: npx prisma db push --accept-data-loss
+
+      - name: Show what is pending (read-only)
+        run: npx prisma migrate status
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DIRECT_URL: ${{ secrets.DIRECT_URL }}
-      - run: echo "✅ Schema synced successfully"
+
+      - name: Apply pending migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
