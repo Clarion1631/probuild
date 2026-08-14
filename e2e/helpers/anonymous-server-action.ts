@@ -30,6 +30,26 @@ import type { APIRequestContext } from "@playwright/test";
  * Action ids are GLOBAL, not per-route: any route that reaches the Next runtime
  * will dispatch any id. That is exactly the property an attacker uses, and the
  * property this harness relies on.
+ *
+ * RELATIONSHIP TO src/app/api/test-only/contract-actions/route.ts (PR #367)
+ * ------------------------------------------------------------------------
+ * That route solves the same problem from the other side: it imports the
+ * actions and calls them inside a request. The two are complementary, not
+ * duplicates.
+ *
+ *   - It can address an action by NAME with no build artifacts, and it can
+ *     drive a caller's own identity (portal client, scoped staff) easily.
+ *   - This harness exercises the REAL remote surface instead: the actual
+ *     `Next-Action` dispatch, and therefore the src/proxy.ts layer in front of
+ *     it. That is the path an anonymous attacker actually has, and it is not
+ *     reachable through an imported function call. It also ships no production
+ *     code.
+ *
+ * Its header notes that server-component actions have "no stable client
+ * reference a test could POST to". That is true of the CLIENT chunks, but the
+ * SERVER manifest read below names every action regardless of whether any
+ * client component imports it — which is why this works for
+ * convertLeadToProject, whose only caller is an inline server action.
  */
 
 const MANIFEST_PATH = join(process.cwd(), ".next", "server", "server-reference-manifest.json");
