@@ -12,7 +12,14 @@
 // existing table is touched. This has never been applied to any database —
 // there is no prior incompatible shape to repair.
 //
-//   node scripts/apply-bank-ledger.mjs --yes
+//   node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name>
+//
+// --expect-db (or the BANK_LEDGER_EXPECT_DB env var) is REQUIRED in addition
+// to --yes: this script queries current_database() and the server identity
+// and refuses to run a single statement if they don't match what you typed —
+// "--yes" alone only proves you meant to run *something*, not that you knew
+// which database DATABASE_URL currently points at (Codex round-2 finding:
+// generic --yes is not enough).
 //
 // Apply BEFORE deploying the build that selects these tables (P2022 otherwise).
 import { PrismaClient } from "@prisma/client";
@@ -38,16 +45,49 @@ function maskUrl(url) {
 const { url, from } = resolveDatabaseUrl();
 const maskedUrl = maskUrl(url);
 
+function readFlagValue(flag) {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 ? process.argv[idx + 1] : undefined;
+}
+
+const expectDb = readFlagValue("--expect-db") || process.env.BANK_LEDGER_EXPECT_DB;
+
 if (!process.argv.includes("--yes")) {
     console.error(
         `Refusing to run without --yes.\n` +
         `Target database (from ${from}): ${maskedUrl}\n` +
-        `Re-run as: node scripts/apply-bank-ledger.mjs --yes`,
+        `Re-run as: node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name>`,
+    );
+    process.exit(1);
+}
+
+if (!expectDb) {
+    console.error(
+        `Refusing to run without an expected database identity.\n` +
+        `Target database (from ${from}): ${maskedUrl}\n` +
+        `--yes alone does not prove you know which database this is about to mutate.\n` +
+        `Pass --expect-db <database-name> or set BANK_LEDGER_EXPECT_DB.`,
     );
     process.exit(1);
 }
 
 const prisma = new PrismaClient({ datasources: { db: { url } } });
+
+/** Queried and compared against --expect-db BEFORE the first mutating statement runs. */
+async function verifyDatabaseIdentity() {
+    const rows = await prisma.$queryRaw`
+        SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port`;
+    const actual = rows[0];
+    const host = actual.host ?? "local/unix-socket";
+    const port = actual.port ?? "?";
+    if (actual.db !== expectDb) {
+        throw new Error(
+            `Refusing to run: connected database "${actual.db}" (host=${host} port=${port}) ` +
+            `does not match --expect-db "${expectDb}". Aborting before any mutation.`,
+        );
+    }
+    console.log(`Verified target database identity: "${actual.db}" (host=${host} port=${port})`);
+}
 
 const statements = [
     `CREATE TABLE IF NOT EXISTS "StatementImport" (
@@ -161,6 +201,28 @@ const statements = [
            ON DELETE SET NULL ON UPDATE CASCADE;
        END IF;
      END $$`,
+    // Codex round-2: at most one linked observation per (source, bankLineId)
+    // — a canonical BankLine can never accumulate two QBO_REGISTER
+    // observations (or two STATEMENT observations) across separate
+    // reconciliation/ingest runs. Prisma cannot express a partial index, so
+    // this exists ONLY here (see the schema.prisma NOTE above the model).
+    `CREATE UNIQUE INDEX IF NOT EXISTS "BankLineObservation_source_bankLineId_key"
+       ON "BankLineObservation" ("source", "bankLineId")
+       WHERE "bankLineId" IS NOT NULL`,
+    // Codex round-2: source-dependent shape — STATEMENT rows always carry
+    // both statementImportId and bankLineId (minted together at ingest);
+    // QBO_REGISTER rows must never carry a statementImportId.
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM pg_constraint WHERE conname = 'BankLineObservation_source_shape_check' AND conrelid = '"BankLineObservation"'::regclass
+       ) THEN
+         ALTER TABLE "BankLineObservation" ADD CONSTRAINT "BankLineObservation_source_shape_check"
+           CHECK (
+             (source = 'STATEMENT' AND "statementImportId" IS NOT NULL AND "bankLineId" IS NOT NULL)
+             OR (source = 'QBO_REGISTER' AND "statementImportId" IS NULL)
+           );
+       END IF;
+     END $$`,
     `ALTER TABLE "BankLineObservation" ENABLE ROW LEVEL SECURITY`,
 
     `CREATE TABLE IF NOT EXISTS "BankLineItem" (
@@ -261,6 +323,38 @@ const statements = [
            CHECK ("taxCents" >= 0 AND "taxCents" <= "amountCents");
        END IF;
      END $$`,
+    // Codex round-2 (should-fix d): originalBankLineId must reference a
+    // DEBIT BankLine (amountCents < 0) and refundBankLineId a CREDIT
+    // BankLine (amountCents > 0) — a plain CHECK constraint can't reach
+    // across tables, so this is a trigger. Mirrored at the app layer by
+    // validateRefundEventSigns() in src/lib/bank-ledger.ts, which is meant
+    // to catch this BEFORE the write and give a normal validation error;
+    // this trigger is the backstop for anything that bypasses that helper.
+    `CREATE OR REPLACE FUNCTION check_refund_event_signs() RETURNS TRIGGER AS $BODY$
+     DECLARE
+       orig_amount INTEGER;
+       refund_amount INTEGER;
+     BEGIN
+       IF NEW."originalBankLineId" IS NOT NULL THEN
+         SELECT "amountCents" INTO orig_amount FROM "BankLine" WHERE "id" = NEW."originalBankLineId";
+         IF orig_amount IS NOT NULL AND orig_amount >= 0 THEN
+           RAISE EXCEPTION 'RefundEvent.originalBankLineId must reference a debit BankLine (amountCents < 0), got %', orig_amount;
+         END IF;
+       END IF;
+       IF NEW."refundBankLineId" IS NOT NULL THEN
+         SELECT "amountCents" INTO refund_amount FROM "BankLine" WHERE "id" = NEW."refundBankLineId";
+         IF refund_amount IS NOT NULL AND refund_amount <= 0 THEN
+           RAISE EXCEPTION 'RefundEvent.refundBankLineId must reference a credit BankLine (amountCents > 0), got %', refund_amount;
+         END IF;
+       END IF;
+       RETURN NEW;
+     END;
+     $BODY$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS refund_event_signs_trigger ON "RefundEvent"`,
+    `CREATE TRIGGER refund_event_signs_trigger
+       BEFORE INSERT OR UPDATE ON "RefundEvent"
+       FOR EACH ROW EXECUTE FUNCTION check_refund_event_signs()`,
+
     `ALTER TABLE "RefundEvent" ENABLE ROW LEVEL SECURITY`,
 ];
 
@@ -276,51 +370,83 @@ const expectedColumns = {
     RefundEvent: ["originalBankLineId", "refundBankLineId", "amountCents", "taxCents", "status"],
 };
 
+// Each constraint/index is paired with the table it belongs to so
+// verifyShape() can resolve that table's OID WITHIN THE TARGET SCHEMA and
+// check against it — a bare unqualified name lookup (the old approach) can
+// silently match an identically-named object in another schema.
 const expectedConstraints = [
-    "StatementImport_contentHash_key",
-    "StatementImport_account_periodStart_periodEnd_key",
-    "StatementImport_status_check",
-    "BankLine_state_check",
-    "BankLineObservation_source_account_sourceDocumentId_sourceLineId_key",
-    "BankLineObservation_source_check",
-    "BankLineItem_source_check",
-    "RefundEvent_status_check",
-    "RefundEvent_amountCents_check",
-    "RefundEvent_taxCents_check",
+    { name: "StatementImport_contentHash_key", table: "StatementImport" },
+    { name: "StatementImport_account_periodStart_periodEnd_key", table: "StatementImport" },
+    { name: "StatementImport_status_check", table: "StatementImport" },
+    { name: "BankLine_state_check", table: "BankLine" },
+    { name: "BankLineObservation_source_account_sourceDocumentId_sourceLineId_key", table: "BankLineObservation" },
+    { name: "BankLineObservation_source_check", table: "BankLineObservation" },
+    { name: "BankLineObservation_source_bankLineId_key", table: "BankLineObservation" },
+    { name: "BankLineObservation_source_shape_check", table: "BankLineObservation" },
+    { name: "BankLineItem_source_check", table: "BankLineItem" },
+    { name: "RefundEvent_status_check", table: "RefundEvent" },
+    { name: "RefundEvent_amountCents_check", table: "RefundEvent" },
+    { name: "RefundEvent_taxCents_check", table: "RefundEvent" },
 ];
 
-async function verifyShape() {
+/** Resolved once, before verifyShape() runs any lookup — see the module comment on --expect-db for why bare/unqualified lookups are unsafe. */
+async function resolveCurrentSchema() {
+    const rows = await prisma.$queryRaw`SELECT current_schema() AS schema`;
+    const schema = rows[0]?.schema;
+    if (!schema) throw new Error("Could not resolve current_schema() to verify against");
+    return schema;
+}
+
+async function verifyShape(schema) {
     for (const [table, columns] of Object.entries(expectedColumns)) {
         const rows = await prisma.$queryRaw`
             SELECT column_name FROM information_schema.columns
-             WHERE table_name = ${table} AND column_name = ANY(${columns})`;
+             WHERE table_schema = ${schema} AND table_name = ${table} AND column_name = ANY(${columns})`;
         const found = new Set(rows.map(r => r.column_name));
         const missing = columns.filter(c => !found.has(c));
         if (missing.length > 0) {
-            throw new Error(`Verification failed: "${table}" is missing expected column(s): ${missing.join(", ")}`);
+            throw new Error(`Verification failed: "${schema}"."${table}" is missing expected column(s): ${missing.join(", ")}`);
         }
     }
 
-    for (const name of expectedConstraints) {
+    for (const { name, table } of expectedConstraints) {
+        // conrelid is resolved from an explicitly schema-qualified
+        // "schema"."table" string, never a bare table name, so this can't
+        // match a same-named constraint on a same-named table living in a
+        // different schema on an unexpected search_path.
+        const qualifiedTable = `"${schema}"."${table}"`;
         const rows = await prisma.$queryRaw`
-            SELECT 1 FROM pg_constraint WHERE conname = ${name}
+            SELECT 1 FROM pg_constraint
+             WHERE conname = ${name} AND conrelid = ${qualifiedTable}::regclass
             UNION ALL
-            SELECT 1 FROM pg_indexes WHERE indexname = ${name}`;
+            SELECT 1 FROM pg_indexes
+             WHERE indexname = ${name} AND schemaname = ${schema} AND tablename = ${table}`;
         if (rows.length === 0) {
-            throw new Error(`Verification failed: expected constraint/index "${name}" not found`);
+            throw new Error(`Verification failed: expected constraint/index "${name}" not found on "${schema}"."${table}"`);
         }
+    }
+
+    const triggerRows = await prisma.$queryRaw`
+        SELECT 1 FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE t.tgname = 'refund_event_signs_trigger' AND n.nspname = ${schema} AND c.relname = 'RefundEvent'`;
+    if (triggerRows.length === 0) {
+        throw new Error(`Verification failed: expected trigger "refund_event_signs_trigger" not found on "${schema}"."RefundEvent"`);
     }
 }
 
 async function main() {
     console.log(`Applying to ${maskedUrl} (DATABASE_URL from ${from})`);
+    await verifyDatabaseIdentity();
 
     for (const sql of statements) {
         console.log(`  ${sql.replace(/\s+/g, " ").slice(0, 90)}...`);
         await prisma.$executeRawUnsafe(sql);
     }
 
-    await verifyShape();
+    const schema = await resolveCurrentSchema();
+    await verifyShape(schema);
 
     console.log("StatementImport / BankLine / BankLineObservation / BankLineItem / RefundEvent schema applied and verified.");
 }

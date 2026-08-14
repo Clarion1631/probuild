@@ -24,7 +24,7 @@ function makeHandlers(overrides: Partial<BankLedgerIngestHandlerDependencies> = 
             createStatementImportCalls.push(input);
             return { statementImportId: "stmt-1", inserted: (input as { lines: unknown[] }).lines.length };
         },
-        findExistingQboObservations: async () => new Set(),
+        findExistingQboObservations: async () => new Map(),
         createQboObservations: async rows => {
             createQboObservationsCalls.push(...rows);
             return rows.length;
@@ -32,6 +32,19 @@ function makeHandlers(overrides: Partial<BankLedgerIngestHandlerDependencies> = 
     };
     const handlers = createBankLedgerIngestHandlers({ ...defaults, ...overrides });
     return { handlers, createStatementImportCalls, createQboObservationsCalls };
+}
+
+function statementBody(overrides: Record<string, unknown> = {}) {
+    return {
+        source: "STATEMENT",
+        account: "WTB-0723",
+        periodStart: "2026-07-01",
+        periodEnd: "2026-07-31",
+        openingCents: 100000,
+        closingCents: 92600,
+        lines: [{ postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" }],
+        ...overrides,
+    };
 }
 
 test("bank-ledger ingest: auth", async t => {
@@ -79,7 +92,7 @@ test("bank-ledger ingest: validation", async t => {
 
     await t.test("400 too-many-lines over the request cap", async () => {
         const { handlers } = makeHandlers();
-        const lines = Array.from({ length: 20001 }, (_, i) => ({ postedDate: "2026-01-01", amountCents: -100 - i, rawDescriptor: "X" }));
+        const lines = Array.from({ length: 5001 }, (_, i) => ({ postedDate: "2026-01-01", amountCents: -100 - i, rawDescriptor: "X" }));
         const res = await handlers.POST(makeRequest({ source: "STATEMENT", account: "WTB-0723", lines }));
         assert.equal(res.status, 400);
         assert.equal((await res.json()).reason, "too-many-lines");
@@ -118,7 +131,7 @@ test("bank-ledger ingest: happy path", async t => {
             periodStart: "2026-07-01",
             periodEnd: "2026-07-31",
             openingCents: 100000,
-            closingCents: 200000,
+            closingCents: 592600,
             lines: [
                 { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET US MARKET POS DEB 1027" },
                 { postedDate: "2026-07-17", amountCents: 500000, rawDescriptor: "DEPOSIT" },
@@ -220,5 +233,123 @@ test("bank-ledger ingest: happy path", async t => {
         const call = createStatementImportCalls[0] as { lines: Array<{ sequence: number }> };
         assert.equal(call.lines.length, 2);
         assert.notEqual(call.lines[0].sequence, call.lines[1].sequence);
+    });
+});
+
+test("bank-ledger ingest: statement semantic validation", async t => {
+    await t.test("400 line-date-outside-period when a line falls before periodStart", async () => {
+        const { handlers, createStatementImportCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(statementBody({
+            lines: [{ postedDate: "2026-06-30", amountCents: -7400, rawDescriptor: "US MARKET" }],
+        })));
+        assert.equal(res.status, 400);
+        assert.equal((await res.json()).reason, "line-date-outside-period");
+        assert.equal(createStatementImportCalls.length, 0);
+    });
+
+    await t.test("400 line-date-outside-period when a line falls after periodEnd", async () => {
+        const { handlers, createStatementImportCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(statementBody({
+            lines: [{ postedDate: "2026-08-01", amountCents: -7400, rawDescriptor: "US MARKET" }],
+        })));
+        assert.equal(res.status, 400);
+        assert.equal((await res.json()).reason, "line-date-outside-period");
+        assert.equal(createStatementImportCalls.length, 0);
+    });
+
+    await t.test("400 balance-mismatch when openingCents + sum(lines) !== closingCents", async () => {
+        const { handlers, createStatementImportCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(statementBody({ closingCents: 92601 })));
+        assert.equal(res.status, 400);
+        assert.equal((await res.json()).reason, "balance-mismatch");
+        assert.equal(createStatementImportCalls.length, 0);
+    });
+
+    await t.test("nothing is written when semantic validation fails (rejected before the DB call)", async () => {
+        const { handlers, createStatementImportCalls } = makeHandlers();
+        await handlers.POST(makeRequest(statementBody({ closingCents: 0 })));
+        assert.equal(createStatementImportCalls.length, 0);
+    });
+
+    await t.test("passes through to insertion when the statement is semantically valid", async () => {
+        const { handlers, createStatementImportCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(statementBody()));
+        assert.equal(res.status, 200);
+        assert.equal(createStatementImportCalls.length, 1);
+    });
+});
+
+test("bank-ledger ingest: QBO_REGISTER", async t => {
+    function qboBody(lines: unknown[], account = "WTB-0723") {
+        return { source: "QBO_REGISTER", account, lines };
+    }
+
+    await t.test("inserts new QBO observations and reports existing=0", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 0 });
+        assert.equal(createQboObservationsCalls.length, 1);
+    });
+
+    await t.test("400 invalid-line when qbTxnId is missing", async () => {
+        const { handlers } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET" },
+        ])));
+        assert.equal(res.status, 400);
+        assert.equal((await res.json()).reason, "invalid-line");
+    });
+
+    await t.test("409 qbo-txn-conflict when a stored qbTxnId is retried with different content", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 409);
+        assert.equal((await res.json()).reason, "qbo-txn-conflict");
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("200 no-op (existing=1) when a stored qbTxnId is retried with IDENTICAL content", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), { ok: true, inserted: 0, existing: 1 });
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("409 qbo-duplicate-conflict when the SAME request carries one qbTxnId with two different contents", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-16", amountCents: -7401, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 409);
+        assert.equal((await res.json()).reason, "qbo-duplicate-conflict");
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
+
+    await t.test("identical duplicate qbTxnId within one request collapses to a single insert", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1 });
+        assert.equal(createQboObservationsCalls.length, 1);
     });
 });

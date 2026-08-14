@@ -77,6 +77,32 @@ test("parseStatementMeta", async t => {
     await t.test("throws when the account number is missing", () => {
         assert.throws(() => parseStatementMeta("nothing useful here"));
     });
+
+    await t.test("throws loudly when the mandatory Deposits/Credits control total is missing", () => {
+        const withoutDeposits = text.replace(/\+ Deposits\/Credits \(2\) \$500\.00\n/, "");
+        assert.throws(() => parseStatementMeta(withoutDeposits), /Deposits\/Credits/);
+    });
+
+    await t.test("throws loudly when the mandatory Checks/Debits control total is missing", () => {
+        const withoutDebits = text.replace(/- Checks\/Debits \(3\) \$265\.44\n/, "");
+        assert.throws(() => parseStatementMeta(withoutDebits), /Checks\/Debits/);
+    });
+
+    await t.test("checksTotalCents is null (not thrown) when the statement has no \"Checks Posted\" section at all — a proven zero-check period", () => {
+        const meta = parseStatementMeta(text);
+        assert.equal(meta.checksTotalCents, null);
+    });
+
+    await t.test("throws loudly when a \"Checks Posted\" section is present but \"Total Checks =\" never prints", () => {
+        const withChecksSectionButNoFooter = text + "\nChecks Posted\nCheck No Date Amount\n1024 3/17 4,000.00\n";
+        assert.throws(() => parseStatementMeta(withChecksSectionButNoFooter), /Total Checks/);
+    });
+
+    await t.test("parses checksTotalCents when both the section and the footer are present", () => {
+        const withChecks = text + "\nChecks Posted\nCheck No Date Amount\n1024 3/17 4,000.00\nTotal Checks = $4,000.00\n";
+        const meta = parseStatementMeta(withChecks);
+        assert.equal(meta.checksTotalCents, 400000);
+    });
 });
 
 test("resolveYear", async t => {
@@ -207,6 +233,15 @@ test("parseActivityRows", async t => {
         const rows = [row([{ str: "3/06" }, { str: "TINY FEE" }, { str: ".54", right: 579.5 }])];
         const lines = parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE);
         assert.equal(lines[0].amountCents, -54);
+    });
+
+    await t.test("throws loudly on a page with no calibration of its own, rather than reusing an earlier page's bands", () => {
+        // BANDS_BY_PAGE only has page 1 calibrated (see the module-level HEADER_ROW).
+        const rows = [row([{ str: "3/05" }, { str: "PAGE 2 ROW" }, { str: "9.99", right: 472.5 }], 2)];
+        assert.throws(
+            () => parseActivityRows(rows, MONTH_YEAR, BANDS_BY_PAGE),
+            /Structural surprise: no column-band calibration found for page 2/,
+        );
     });
 });
 

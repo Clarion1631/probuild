@@ -2625,15 +2625,25 @@ model ReviewAlertEpisode {
 // source locator, so two sources reporting the "same" transaction both stay
 // on record instead of one silently overwriting the other via a hash
 // collision. Cross-source dedup is an explicit reconcile step
-// (reconcileObservations in src/lib/bank-ledger.ts) that links an
-// observation to a canonical BankLine by exact account+postedDate+amountCents
-// — never a side effect of ingest. Immutable source identity, mutable
-// workflow state: BankLine/BankLineObservation/StatementImport rows are never
-// overwritten; BankLine.state and the validation columns change as
-// automation progresses. The /automation dashboard becomes a report over
-// these tables instead of a live in-memory merge. Matching must use payee
-// TEXT + rails, never amount+date alone (see the Chevron/Cash App
-// wrong-match lesson in that doc).
+// (reconcileObservations in src/lib/bank-ledger.ts, exposed via
+// POST /api/integrations/bank-ledger/reconcile) that links an observation to
+// a canonical BankLine by EXACT account+postedDate+amountCents+
+// normalizedPayee match (plus checkNumber agreement whenever either side
+// carries one) — never a side effect of ingest, and never on
+// amount+date/rails alone (see the Chevron/Cash App wrong-match lesson in
+// that doc — amount+date alone is zero confidence). Immutable source
+// identity, mutable workflow state: BankLine/BankLineObservation/
+// StatementImport rows are never overwritten; BankLine.state and the
+// validation columns change as automation progresses. The /automation
+// dashboard becomes a report over these tables instead of a live in-memory
+// merge.
+//
+// Codex peer-review round-2 amendments (2026-08-14): reconciliation links
+// are written by a transactional persistence function (see the reconcile
+// route) that uses a SAVEPOINT per proposed link inside one transaction, so
+// a unique-index conflict on one link (a concurrent run already claimed
+// that BankLine, or that Observation) rolls back only that link and is
+// reported back to the caller — it never fails the whole batch.
 //
 // Pseudo-enum columns stay Prisma `String` (repo convention) — allowed
 // values are documented on each field and enforced by a Postgres CHECK
@@ -2696,6 +2706,22 @@ model BankLine {
   @@index([qbTxnId])
 }
 
+// NOTE: two invariants live ONLY in raw SQL, applied by
+// scripts/apply-bank-ledger.mjs — Prisma cannot express either in schema.prisma:
+//   1. A partial UNIQUE index caps each canonical BankLine at ONE linked
+//      observation PER SOURCE, so a canonical line can never accumulate two
+//      QBO observations (or two STATEMENT observations) across separate
+//      reconciliation/ingest runs:
+//        CREATE UNIQUE INDEX ... ON "BankLineObservation" ("source", "bankLineId")
+//          WHERE "bankLineId" IS NOT NULL
+//   2. A source-dependent CHECK constraint enforces each source's own shape —
+//      STATEMENT rows always carry both statementImportId and bankLineId
+//      (minted together at ingest); QBO_REGISTER rows must never carry a
+//      statementImportId (there is no per-import document for that source):
+//        CHECK (
+//          (source = 'STATEMENT' AND "statementImportId" IS NOT NULL AND "bankLineId" IS NOT NULL)
+//          OR (source = 'QBO_REGISTER' AND "statementImportId" IS NULL)
+//        )
 model BankLineObservation {
   id     String @id @default(cuid())
   source String // STATEMENT, QBO_REGISTER
@@ -2715,6 +2741,11 @@ model BankLineObservation {
   rawDescriptor String
   checkNumber   String?
 
+  // Reconciliation target (see the reconcile route). NULL until an explicit
+  // reconcileObservations() link is persisted; STATEMENT rows get theirs at
+  // ingest time (the canonical line minted alongside them). At most one
+  // observation per (source, bankLineId) — see the partial unique index note
+  // above.
   bankLineId String?
   bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: SetNull)
 
@@ -2744,6 +2775,17 @@ model BankLineItem {
   @@index([bankLineId])
 }
 
+// NOTE: originalBankLineId must point to a DEBIT BankLine (amountCents < 0)
+// and refundBankLineId to a CREDIT BankLine (amountCents > 0) — a refund
+// pairs the original outgoing charge with the credit that reverses it, and
+// swapping them silently produces a RefundEvent that means the opposite of
+// what it says. Prisma can't express a cross-table CHECK, so this is
+// enforced two ways: a BEFORE INSERT/UPDATE trigger
+// (refund_event_signs_trigger, applied by scripts/apply-bank-ledger.mjs) as
+// the DB-level backstop, and validateRefundEventSigns() in
+// src/lib/bank-ledger.ts, which any future write path MUST call first so a
+// bad pairing surfaces as a normal validation error rather than a raised
+// Postgres exception.
 model RefundEvent {
   id                 String    @id @default(cuid())
   originalBankLineId String?

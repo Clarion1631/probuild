@@ -1,7 +1,15 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { normalizePayee, computeStatementContentHash, isValidCalendarDate, isSafeCents } from "@/lib/bank-ledger";
+import {
+    normalizePayee,
+    computeStatementContentHash,
+    computeQboLineContentHash,
+    validateStatementSemantics,
+    isValidCalendarDate,
+    isSafeCents,
+} from "@/lib/bank-ledger";
 
 export const dynamic = "force-dynamic";
 // Statements now post as ONE complete request (see MAX_LINES_PER_REQUEST) and
@@ -32,17 +40,34 @@ export const maxDuration = 120;
  *   own durable identity (qbTxnId) and land as BankLineObservation rows only
  *   — no canonical BankLine is minted. Linking a QBO observation to a
  *   canonical BankLine is the separate, explicit reconcileObservations()
- *   step in src/lib/bank-ledger.ts, never an ingest-time side effect.
+ *   step in src/lib/bank-ledger.ts, never an ingest-time side effect
+ *   (see the sibling reconcile route). A qbTxnId retried with DIFFERENT
+ *   content (date/amount/descriptor/check#) — whether against what's
+ *   already stored or against another line earlier in the SAME request — is
+ *   a 409 conflict, never a silent skip or overwrite: QuickBooks never
+ *   legitimately reassigns a transaction id to different content, so a
+ *   content mismatch under the same id means the puller re-sent an
+ *   edited/corrected row, and that has to be looked at, not swallowed.
+ *
+ * A STATEMENT request is also rejected (400, before anything is written) if
+ * it fails semantic validation: any line dated outside periodStart/periodEnd,
+ * or openingCents + sum(signed lines) !== closingCents. Both are structural
+ * guarantees the statement itself makes about its own lines — a request that
+ * breaks either one is malformed regardless of whether every individual
+ * field parsed.
  *
  * Auth: x-ingest-key header must equal BANK_LEDGER_INGEST_SECRET, the same
  * shared-secret contract as receipt-ingest and qbo-receipts/create.
  */
 
 // One complete statement per request (chunking removed — see the module
-// comment). Real WTB statements run at most a few hundred lines; this cap is
-// a generous structural guard against a malformed/runaway payload, not a
-// batching mechanism.
-const MAX_LINES_PER_REQUEST = 20000;
+// comment). The largest of the 7 real WTB statements parsed to date is 238
+// lines; this cap leaves generous headroom over that while still being a
+// realistic structural guard against a malformed/runaway payload rather than
+// the earlier 20000 (which, at the old one-row-at-a-time write pattern,
+// meant up to 40,000 serial inserts per request — see createStatementImport,
+// now bulk-inserted).
+const MAX_LINES_PER_REQUEST = 5000;
 const VALID_SOURCES = new Set(["STATEMENT", "QBO_REGISTER"]);
 const MAX_ACCOUNT_LEN = 64;
 const MAX_DESCRIPTOR_LEN = 500;
@@ -123,6 +148,13 @@ function validateQboLine(raw: IngestLineInput, index: number): { ok: true; value
 /** Thrown by createStatementImport when a concurrent request wins the (account, periodStart, periodEnd) unique constraint first. */
 export class StatementImportRaceError extends Error {}
 
+export interface ExistingQboObservation {
+    postedDate: string;
+    amountCents: number;
+    rawDescriptor: string;
+    checkNumber: string | null;
+}
+
 export interface StatementImportLineInput {
     sequence: number;
     postedDate: string;
@@ -152,7 +184,8 @@ export interface BankLedgerIngestHandlerDependencies {
         lines: StatementImportLineInput[];
     }): Promise<{ statementImportId: string; inserted: number }>;
 
-    findExistingQboObservations(account: string, qbTxnIds: string[]): Promise<Set<string>>;
+    /** Returns the currently-stored content for each already-seen qbTxnId (whatever is present in the input list), keyed by qbTxnId — used to detect a retried id with DIFFERENT content. */
+    findExistingQboObservations(account: string, qbTxnIds: string[]): Promise<Map<string, ExistingQboObservation>>;
 
     createQboObservations(rows: Array<{
         account: string;
@@ -182,6 +215,22 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
             const result = validateStatementLine(rawLines[i] ?? {}, i);
             if (!result.ok) return NextResponse.json({ ok: false, reason: "invalid-line", index: result.error.index, field: result.error.field }, { status: 400 });
             validated.push(result.value);
+        }
+
+        const semanticFailures = validateStatementSemantics({
+            periodStart,
+            periodEnd,
+            openingCents,
+            closingCents,
+            lines: validated.map(l => ({ postedDate: l.postedDate, amountCents: l.amountCents })),
+        });
+        if (semanticFailures.length > 0) {
+            return NextResponse.json({
+                ok: false,
+                reason: semanticFailures[0].reason,
+                index: semanticFailures[0].index,
+                failures: semanticFailures,
+            }, { status: 400 });
         }
 
         const contentHash = computeStatementContentHash({
@@ -239,23 +288,54 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
             validated.push(result.value);
         }
 
-        const qbTxnIds = validated.map(l => l.qbTxnId);
-        const existingIds = await dependencies.findExistingQboObservations(account, qbTxnIds);
-        const toInsert = validated.filter(l => !existingIds.has(l.qbTxnId));
+        // Reject a qbTxnId that appears twice in THIS request with different
+        // content before ever touching the database — two lines claiming the
+        // same durable identity with different dates/amounts/descriptors
+        // can't both be right, and picking one silently would be a guess.
+        const seenInRequest = new Map<string, string>(); // qbTxnId -> content hash of the first occurrence
+        for (let i = 0; i < validated.length; i++) {
+            const line = validated[i];
+            const hash = computeQboLineContentHash(line);
+            const priorHash = seenInRequest.get(line.qbTxnId);
+            if (priorHash !== undefined && priorHash !== hash) {
+                return NextResponse.json({ ok: false, reason: "qbo-duplicate-conflict", index: i, qbTxnId: line.qbTxnId }, { status: 409 });
+            }
+            seenInRequest.set(line.qbTxnId, hash);
+        }
 
-        const rows = toInsert.map(l => ({
-            account,
-            postedDate: l.postedDate,
-            amountCents: l.amountCents,
-            rawDescriptor: l.rawDescriptor,
-            checkNumber: l.checkNumber,
-            qbTxnId: l.qbTxnId,
-        }));
+        const qbTxnIds = [...seenInRequest.keys()];
+        const existing = await dependencies.findExistingQboObservations(account, qbTxnIds);
+
+        for (const line of validated) {
+            const priorContent = existing.get(line.qbTxnId);
+            if (priorContent && computeQboLineContentHash(priorContent) !== computeQboLineContentHash(line)) {
+                return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: line.qbTxnId }, { status: 409 });
+            }
+        }
+
+        // Content-identical repeats (already stored, or duplicated within this
+        // request) collapse to a single insert attempt per qbTxnId — sequence
+        // has no meaning here (unlike STATEMENT lines): qbTxnId IS the identity.
+        const insertedQbTxnIds = new Set<string>();
+        const rows: Array<{ account: string; postedDate: string; amountCents: number; rawDescriptor: string; checkNumber: string | null; qbTxnId: string }> = [];
+        for (const line of validated) {
+            if (existing.has(line.qbTxnId)) continue;
+            if (insertedQbTxnIds.has(line.qbTxnId)) continue;
+            insertedQbTxnIds.add(line.qbTxnId);
+            rows.push({
+                account,
+                postedDate: line.postedDate,
+                amountCents: line.amountCents,
+                rawDescriptor: line.rawDescriptor,
+                checkNumber: line.checkNumber,
+                qbTxnId: line.qbTxnId,
+            });
+        }
 
         const inserted = rows.length > 0 ? await dependencies.createQboObservations(rows) : 0;
-        const existing = validated.length - inserted;
+        const existingCount = validated.length - inserted;
 
-        return NextResponse.json({ ok: true, inserted, existing });
+        return NextResponse.json({ ok: true, inserted, existing: existingCount });
     }
 
     return {
@@ -333,38 +413,43 @@ const handlers = createBankLedgerIngestHandlers({
                     },
                 });
 
-                let inserted = 0;
-                for (const line of input.lines) {
-                    const bankLine = await tx.bankLine.create({
-                        data: {
-                            account: input.account,
-                            postedDate: new Date(line.postedDate),
-                            amountCents: line.amountCents,
-                            rawDescriptor: line.rawDescriptor,
-                            normalizedPayee: line.normalizedPayee,
-                            checkNumber: line.checkNumber,
-                            state: line.exception ? "EXCEPTION" : "POSTED",
-                            exceptionReason: line.exception ? "empty-normalized-payee" : null,
-                        },
-                    });
-                    await tx.bankLineObservation.create({
-                        data: {
-                            source: "STATEMENT",
-                            account: input.account,
-                            sourceDocumentId: statementImport.id,
-                            sourceLineId: String(line.sequence),
-                            postedDate: new Date(line.postedDate),
-                            amountCents: line.amountCents,
-                            rawDescriptor: line.rawDescriptor,
-                            checkNumber: line.checkNumber,
-                            bankLineId: bankLine.id,
-                            statementImportId: statementImport.id,
-                        },
-                    });
-                    inserted += 1;
-                }
+                // Pre-generate every id so both tables can be bulk-inserted with
+                // createMany (2 statements total) instead of one create() per
+                // line per table (2N serial round-trips) — see the module
+                // comment / MAX_LINES_PER_REQUEST for why that mattered.
+                const bankLineIds = input.lines.map(() => randomUUID());
 
-                return { statementImportId: statementImport.id, inserted };
+                await tx.bankLine.createMany({
+                    data: input.lines.map((line, i) => ({
+                        id: bankLineIds[i],
+                        account: input.account,
+                        postedDate: new Date(line.postedDate),
+                        amountCents: line.amountCents,
+                        rawDescriptor: line.rawDescriptor,
+                        normalizedPayee: line.normalizedPayee,
+                        checkNumber: line.checkNumber,
+                        state: line.exception ? "EXCEPTION" : "POSTED",
+                        exceptionReason: line.exception ? "empty-normalized-payee" : null,
+                    })),
+                });
+
+                await tx.bankLineObservation.createMany({
+                    data: input.lines.map((line, i) => ({
+                        id: randomUUID(),
+                        source: "STATEMENT",
+                        account: input.account,
+                        sourceDocumentId: statementImport.id,
+                        sourceLineId: String(line.sequence),
+                        postedDate: new Date(line.postedDate),
+                        amountCents: line.amountCents,
+                        rawDescriptor: line.rawDescriptor,
+                        checkNumber: line.checkNumber,
+                        bankLineId: bankLineIds[i],
+                        statementImportId: statementImport.id,
+                    })),
+                });
+
+                return { statementImportId: statementImport.id, inserted: input.lines.length };
             });
         } catch (error) {
             if (isUniqueConstraintError(error)) throw new StatementImportRaceError();
@@ -375,9 +460,18 @@ const handlers = createBankLedgerIngestHandlers({
     findExistingQboObservations: async (account, qbTxnIds) => {
         const rows = await prisma.bankLineObservation.findMany({
             where: { source: "QBO_REGISTER", account, sourceDocumentId: "QBO_REGISTER", sourceLineId: { in: qbTxnIds } },
-            select: { sourceLineId: true },
+            select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         });
-        return new Set(rows.map(r => r.sourceLineId));
+        const result = new Map<string, ExistingQboObservation>();
+        for (const row of rows) {
+            result.set(row.sourceLineId, {
+                postedDate: row.postedDate.toISOString().slice(0, 10),
+                amountCents: row.amountCents,
+                rawDescriptor: row.rawDescriptor,
+                checkNumber: row.checkNumber,
+            });
+        }
+        return result;
     },
 
     createQboObservations: async rows => {

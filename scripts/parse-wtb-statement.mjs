@@ -112,6 +112,24 @@ function dollarsToCents(str) {
  * start/end date — needed to resolve the bare M/D dates in the activity
  * table to a full calendar date) from the "SUMMARY OF ACCOUNTS" /
  * "CHECKING ACCOUNTS" / "Statement of Account" / "Checks Posted" header text.
+ *
+ * Every control total WTB actually prints is MANDATORY here — if the
+ * format ever stops matching (a template change, an OCR artifact, ...) this
+ * throws rather than silently downgrading that gate to "not checked" in
+ * evaluateGates(). Verified against all 7 real WTB statements in
+ * I:\My Drive\Claude\Bookeeping\WTB\ (2026-02 through 2026-08):
+ *   - "+ Deposits/Credits (N) $X" and "- Checks/Debits (N) $X" print on
+ *     EVERY one of the 7 — mandatory, unconditional.
+ *   - "Total Checks = $X" prints on every statement that has a "Checks
+ *     Posted" section — i.e. every period with at least one check. Exactly
+ *     one of the 7 (2026-02) has zero checks that period and omits BOTH the
+ *     "Checks Posted" section and "Total Checks =" footer entirely, so that
+ *     control is only mandatory when "Checks Posted" is present in the text
+ *     — a genuinely proven absence, not an assumed one.
+ *   - WTB never prints a check COUNT anywhere (only the dollar total) in
+ *     any of the 7 statements — confirmed by inspecting the raw "Checks
+ *     Posted" section text on every one, including the 238-line 2026-08
+ *     statement's two-page checks table. There is no count to gate on.
  */
 export function parseStatementMeta(text) {
     const accountMatch = text.match(/Account #(\d+)/);
@@ -125,15 +143,22 @@ export function parseStatementMeta(text) {
     const endingBalanceCents = dollarsToCents(endingMatch[1]);
 
     const depositsMatch = text.match(/\+\s*Deposits\/Credits\s*\((\d+)\)\s*\$([\d,]+\.\d{2})/);
-    const debitsMatch = text.match(/-\s*Checks\/Debits\s*\((\d+)\)\s*\$([\d,]+\.\d{2})/);
-    const statementDeposits = depositsMatch
-        ? { count: Number(depositsMatch[1]), totalCents: dollarsToCents(depositsMatch[2]) }
-        : null;
-    const statementDebits = debitsMatch
-        ? { count: Number(debitsMatch[1]), totalCents: dollarsToCents(debitsMatch[2]) }
-        : null;
+    if (!depositsMatch) throw new Error("Could not find \"+ Deposits/Credits (N) $X\" control total — mandatory on every real WTB statement");
+    const statementDeposits = { count: Number(depositsMatch[1]), totalCents: dollarsToCents(depositsMatch[2]) };
 
+    const debitsMatch = text.match(/-\s*Checks\/Debits\s*\((\d+)\)\s*\$([\d,]+\.\d{2})/);
+    if (!debitsMatch) throw new Error("Could not find \"- Checks/Debits (N) $X\" control total — mandatory on every real WTB statement");
+    const statementDebits = { count: Number(debitsMatch[1]), totalCents: dollarsToCents(debitsMatch[2]) };
+
+    // "Total Checks = $X" is mandatory ONLY when the statement has a "Checks
+    // Posted" section at all — a period with zero checks omits both
+    // entirely (proven against the real 2026-02 statement), so its absence
+    // there is a verified structural fact, not a silently-skipped gate.
+    const hasChecksSection = /Checks Posted/.test(text);
     const totalChecksMatch = text.match(/Total Checks\s*=\s*\$([\d,]+\.\d{2})/);
+    if (hasChecksSection && !totalChecksMatch) {
+        throw new Error("Found a \"Checks Posted\" section but no \"Total Checks = $X\" footer — mandatory control total is missing");
+    }
     const checksTotalCents = totalChecksMatch ? dollarsToCents(totalChecksMatch[1]) : null;
 
     const periodMatch = text.match(
@@ -228,18 +253,20 @@ export function findColumnBandsByPage(rows) {
     return bands;
 }
 
+/**
+ * Every real statement observed repeats the Additions/Subtractions header on
+ * every page of the activity table, so a page reaching classifyRow() with no
+ * calibration of its own is a structural surprise — a WTB template change, a
+ * scanned/rotated page, or some other layout drift that a stale threshold
+ * borrowed from a different page would silently misclassify rather than
+ * catch. This never falls back to another page's bands; it aborts.
+ */
 function bandsForPage(bandsByPage, page) {
-    if (bandsByPage.has(page)) return bandsByPage.get(page);
-    // Defensive fallback only — every real statement observed repeats the
-    // header on every page, so this path is never exercised against real
-    // data. Falls back to the nearest earlier calibrated page rather than
-    // guessing at an uncalibrated one.
-    let best = null;
-    for (const [p, b] of bandsByPage) {
-        if (p <= page && (best === null || p > best[0])) best = [p, b];
+    const bands = bandsByPage.get(page);
+    if (!bands) {
+        throw new Error(`Structural surprise: no column-band calibration found for page ${page} — refusing to reuse another page's bands`);
     }
-    if (!best) throw new Error(`No column-band calibration available for or before page ${page}`);
-    return best[1];
+    return bands;
 }
 
 /**
@@ -451,38 +478,41 @@ export function evaluateGates(meta, lines) {
         });
     }
 
+    // statementDeposits/statementDebits are mandatory fields on `meta` as of
+    // parseStatementMeta (it throws rather than let either come back null) —
+    // these two gates always run, never conditionally skipped.
     const creditLines = lines.filter(l => l.amountCents > 0);
-    if (meta.statementDeposits) {
-        if (creditLines.length !== meta.statementDeposits.count) {
-            failures.push({
-                gate: "deposits-count",
-                detail: `parsed ${creditLines.length} credit line(s), statement says ${meta.statementDeposits.count}`,
-            });
-        }
-        if (totalCreditCents !== meta.statementDeposits.totalCents) {
-            failures.push({
-                gate: "deposits-total",
-                detail: `parsed credits total ${fmt(totalCreditCents)}, statement says ${fmt(meta.statementDeposits.totalCents)}`,
-            });
-        }
+    if (creditLines.length !== meta.statementDeposits.count) {
+        failures.push({
+            gate: "deposits-count",
+            detail: `parsed ${creditLines.length} credit line(s), statement says ${meta.statementDeposits.count}`,
+        });
+    }
+    if (totalCreditCents !== meta.statementDeposits.totalCents) {
+        failures.push({
+            gate: "deposits-total",
+            detail: `parsed credits total ${fmt(totalCreditCents)}, statement says ${fmt(meta.statementDeposits.totalCents)}`,
+        });
     }
 
     const debitLines = lines.filter(l => l.amountCents < 0);
-    if (meta.statementDebits) {
-        if (debitLines.length !== meta.statementDebits.count) {
-            failures.push({
-                gate: "debits-count",
-                detail: `parsed ${debitLines.length} debit line(s), statement says ${meta.statementDebits.count}`,
-            });
-        }
-        if (-totalDebitCents !== meta.statementDebits.totalCents) {
-            failures.push({
-                gate: "debits-total",
-                detail: `parsed debits total ${fmt(-totalDebitCents)}, statement says ${fmt(meta.statementDebits.totalCents)}`,
-            });
-        }
+    if (debitLines.length !== meta.statementDebits.count) {
+        failures.push({
+            gate: "debits-count",
+            detail: `parsed ${debitLines.length} debit line(s), statement says ${meta.statementDebits.count}`,
+        });
+    }
+    if (-totalDebitCents !== meta.statementDebits.totalCents) {
+        failures.push({
+            gate: "debits-total",
+            detail: `parsed debits total ${fmt(-totalDebitCents)}, statement says ${fmt(meta.statementDebits.totalCents)}`,
+        });
     }
 
+    // checksTotalCents is legitimately null for a verified zero-check period
+    // (see parseStatementMeta) — that is the ONLY reason it's ever null, so
+    // skipping the gate here is not "skip on parse failure", it's "skip
+    // because there is provably nothing to check".
     if (meta.checksTotalCents !== null) {
         const checkLines = lines.filter(l => l.checkNumber !== null);
         const checksTotalCents = -checkLines.reduce((sum, l) => sum + l.amountCents, 0);

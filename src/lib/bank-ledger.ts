@@ -122,6 +122,28 @@ export function computeStatementContentHash(input: StatementContentHashInput): s
     ]);
 }
 
+export interface QboLineContentHashInput {
+    /** YYYY-MM-DD */
+    postedDate: string;
+    amountCents: number;
+    rawDescriptor: string;
+    checkNumber: string | null;
+}
+
+/**
+ * Content-addresses a single QBO register line (everything about it EXCEPT
+ * its durable identity, qbTxnId). Two sightings of the same qbTxnId with the
+ * same hash are the same observation retried; a different hash under the
+ * same qbTxnId is a conflict — QuickBooks never legitimately reassigns a
+ * transaction id to different content, so that can only mean the puller
+ * re-sent a corrected/edited row (or two different transactions collided on
+ * an id), and either way the ingest route must reject it (409) rather than
+ * silently keep the first-seen version or overwrite it.
+ */
+export function computeQboLineContentHash(input: QboLineContentHashInput): string {
+    return versionedHash([input.postedDate, input.amountCents, input.rawDescriptor, input.checkNumber]);
+}
+
 // ── Validation helpers ────────────────────────────────────────────────────
 
 /** Postgres INTEGER (int4) bounds — the column type backing every *Cents field. */
@@ -153,6 +175,64 @@ export function isValidCalendarDate(value: unknown): value is string {
     return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
+// ── Statement semantic validation ────────────────────────────────────────
+
+export interface StatementSemanticsInput {
+    /** YYYY-MM-DD */
+    periodStart: string;
+    /** YYYY-MM-DD */
+    periodEnd: string;
+    openingCents: number;
+    closingCents: number;
+    lines: Array<{
+        /** YYYY-MM-DD */
+        postedDate: string;
+        amountCents: number;
+    }>;
+}
+
+export interface StatementSemanticsFailure {
+    reason: "line-date-outside-period" | "balance-mismatch";
+    index?: number;
+    detail: string;
+}
+
+/**
+ * Statement-level sanity checks that the per-field validators in the ingest
+ * route can't catch on their own: every line's shape can be individually
+ * valid (a real calendar date, an int4-safe amount) while the STATEMENT as a
+ * whole is still wrong — a line dated outside the statement's own period, or
+ * a set of lines whose signed sum doesn't reconcile openingCents to
+ * closingCents. Both are checked (not just the first) so the route can
+ * report every problem in one pass; the caller decides what to do with a
+ * non-empty result (the ingest route rejects with 400 before writing
+ * anything).
+ */
+export function validateStatementSemantics(input: StatementSemanticsInput): StatementSemanticsFailure[] {
+    const failures: StatementSemanticsFailure[] = [];
+
+    input.lines.forEach((line, index) => {
+        if (line.postedDate < input.periodStart || line.postedDate > input.periodEnd) {
+            failures.push({
+                reason: "line-date-outside-period",
+                index,
+                detail: `line ${index} postedDate ${line.postedDate} falls outside statement period ${input.periodStart}..${input.periodEnd}`,
+            });
+        }
+    });
+
+    const sumCents = input.lines.reduce((sum, l) => sum + l.amountCents, 0);
+    const expectedClosingCents = input.openingCents + sumCents;
+    if (expectedClosingCents !== input.closingCents) {
+        failures.push({
+            reason: "balance-mismatch",
+            detail: `openingCents ${input.openingCents} + sum(lines) ${sumCents} = ${expectedClosingCents}, statement says closingCents ${input.closingCents}`,
+        });
+    }
+
+    return failures;
+}
+
 // ── Cross-source reconciliation ──────────────────────────────────────────
 
 export interface ReconcileObservation {
@@ -161,6 +241,9 @@ export interface ReconcileObservation {
     /** YYYY-MM-DD */
     postedDate: string;
     amountCents: number;
+    /** normalizePayee(rawDescriptor) — computed by the caller, never "" trusted as an identity (see below). */
+    normalizedPayee: string;
+    checkNumber: string | null;
     bankLineId: string | null;
 }
 
@@ -170,6 +253,8 @@ export interface ReconcileBankLine {
     /** YYYY-MM-DD */
     postedDate: string;
     amountCents: number;
+    normalizedPayee: string;
+    checkNumber: string | null;
 }
 
 export interface ReconcileLink {
@@ -177,18 +262,36 @@ export interface ReconcileLink {
     bankLineId: string;
 }
 
+function reconcileKey(row: { account: string; postedDate: string; amountCents: number; normalizedPayee: string; checkNumber: string | null }): string {
+    // JSON-encoded (not delimiter-joined) for the same reason versionedHash()
+    // is — an account/payee string containing "|" must never collide with a
+    // different field split across the delimiter.
+    return JSON.stringify([row.account, row.postedDate, row.amountCents, row.normalizedPayee, row.checkNumber]);
+}
+
 /**
  * Links not-yet-reconciled observations (bankLineId === null — in practice
  * always QBO_REGISTER, since STATEMENT observations get their canonical
  * BankLine at ingest time) to a canonical BankLine by an EXACT
- * account+postedDate+amountCents match. One canonical line can only absorb
- * one observation and vice versa (first-match-wins in input order) — no
- * fuzzy/near matching, no payee comparison. That keeps this function pure,
- * deterministic, and conservative: an unmatched observation is left
- * unmatched rather than guessed at (fuzzy matching is explicitly out of
- * scope for Phase 1; see the Chevron/Cash App wrong-match lesson in
- * docs/RECEIPT-AUTOMATION-PHASES.md for why amount+date alone is not
- * trusted for anything beyond this narrow, exact-match reconciliation).
+ * account+postedDate+amountCents+normalizedPayee match, and — when either
+ * side carries one — an exact checkNumber match too (a check-numbered
+ * observation and a check-numbered candidate with DIFFERENT numbers can
+ * never be the same transaction, even if everything else lines up).
+ * Amount+date alone is zero confidence (see the Chevron/Cash App
+ * wrong-match lesson in docs/RECEIPT-AUTOMATION-PHASES.md) — two
+ * transactions for different payees on the same account/day for the same
+ * amount now sort into different match keys entirely and are never
+ * cross-matched. An empty normalizedPayee ("" — the EXCEPTION case; see
+ * normalizePayee()) is never treated as a valid identity on either side, so
+ * it can never match anything here either.
+ *
+ * One canonical line can only absorb one observation and vice versa
+ * (first-match-wins in input order within a key). A key with more
+ * observations than candidate lines leaves the excess unmatched rather than
+ * guessing which one is "really" the match — but note that isn't the same
+ * as ambiguity: every remaining pairing under a shared key is still a fully
+ * qualified match (same account/date/amount/payee/check#), just with
+ * insufficient supply on one side.
  */
 export function reconcileObservations(
     observations: ReconcileObservation[],
@@ -196,7 +299,8 @@ export function reconcileObservations(
 ): ReconcileLink[] {
     const available = new Map<string, string[]>();
     for (const line of bankLines) {
-        const key = `${line.account}|${line.postedDate}|${line.amountCents}`;
+        if (line.normalizedPayee === "") continue;
+        const key = reconcileKey(line);
         const ids = available.get(key);
         if (ids) ids.push(line.id);
         else available.set(key, [line.id]);
@@ -205,11 +309,43 @@ export function reconcileObservations(
     const links: ReconcileLink[] = [];
     for (const obs of observations) {
         if (obs.bankLineId !== null) continue;
-        const key = `${obs.account}|${obs.postedDate}|${obs.amountCents}`;
+        if (obs.normalizedPayee === "") continue;
+        const key = reconcileKey(obs);
         const ids = available.get(key);
         if (!ids || ids.length === 0) continue;
         const bankLineId = ids.shift()!;
         links.push({ observationId: obs.id, bankLineId });
     }
     return links;
+}
+
+// ── Refund sign validation ───────────────────────────────────────────────
+
+export interface RefundSignCheckLine {
+    amountCents: number;
+}
+
+export type RefundSignCheckResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Application-layer mirror of the `refund_event_signs_trigger` DB trigger
+ * (scripts/apply-bank-ledger.mjs): a RefundEvent pairs a debit (the
+ * original charge leaving the account, negative amountCents) with a credit
+ * (the refund itself landing back in the account, positive amountCents).
+ * Any future code path that creates or updates a RefundEvent must call this
+ * BEFORE writing, so a swapped pairing surfaces as a normal validation
+ * error rather than a raised Postgres exception from the trigger — the
+ * trigger is the backstop of last resort, not the primary UX.
+ */
+export function validateRefundEventSigns(
+    original: RefundSignCheckLine | null,
+    refund: RefundSignCheckLine | null,
+): RefundSignCheckResult {
+    if (original && original.amountCents >= 0) {
+        return { ok: false, reason: "originalBankLineId must reference a debit BankLine (amountCents < 0)" };
+    }
+    if (refund && refund.amountCents <= 0) {
+        return { ok: false, reason: "refundBankLineId must reference a credit BankLine (amountCents > 0)" };
+    }
+    return { ok: true };
 }
