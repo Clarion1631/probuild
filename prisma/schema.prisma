@@ -2613,11 +2613,3 @@ model ReviewAlertEpisode {
   @@index([batchId])
 }
 
-// One-time pre-migration backup captured by scripts/apply-selections-playground.mjs. Scheduled for deletion; nothing reads it.
-model SelectionProposalStatusBackup {
-  id         String   @id @default(cuid())
-  status     String
-  capturedAt DateTime @default(now()) @db.Timestamptz(6)
-
-  @@map("_SelectionProposalStatusBackup")
-}

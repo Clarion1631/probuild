@@ -30,15 +30,6 @@ ALTER TABLE "Project" DROP CONSTRAINT "Project_leadId_fkey";
 -- DropForeignKey
 ALTER TABLE "TaskCommentPhoto" DROP CONSTRAINT "TaskCommentPhoto_commentId_fkey";
 
--- CreateTable
-CREATE TABLE "_SelectionProposalStatusBackup" (
-    "id" TEXT NOT NULL,
-    "status" TEXT NOT NULL,
-    "capturedAt" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT "_SelectionProposalStatusBackup_pkey" PRIMARY KEY ("id")
-);
-
 -- CreateIndex
 CREATE INDEX "ClientMessage_leadId_idx" ON "ClientMessage"("leadId");
 

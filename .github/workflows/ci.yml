@@ -40,38 +40,16 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-      - run: npm install
+      # `npm ci`, not `npm install`: this job's whole purpose is byte-level
+      # reproducibility, so the toolchain that renders DDL has to come from the
+      # lockfile rather than being free to resolve a different engine build.
+      - run: npm ci
 
       # Executes the baseline for real. Nothing had ever run this SQL before it
       # was committed, so this step alone is the difference between a baseline
       # that is known-good and one that merely looks right.
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
-
-      - name: Probe diffs
-        run: |
-          echo "=== A: from-empty -> datamodel (does the model render at all?) ==="
-          npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > /tmp/a.sql
-          echo "lines=$(wc -l < /tmp/a.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/a.sql || true)"
-          echo "=== B: from-url -> empty (what does Prisma think the DB HAS?) ==="
-          npx prisma migrate diff --from-url "$DIRECT_URL" --to-empty --script > /tmp/b.sql
-          echo "lines=$(wc -l < /tmp/b.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/b.sql || true)"
-          echo "=== C: from-empty -> url (what would rebuild the DB?) ==="
-          npx prisma migrate diff --from-empty --to-url "$DIRECT_URL" --script > /tmp/c.sql
-          echo "lines=$(wc -l < /tmp/c.sql) backup=$(grep -c _SelectionProposalStatusBackup /tmp/c.sql || true)"
-
-      - name: Probe
-        run: |
-          node -e "
-          const {PrismaClient}=require('@prisma/client');
-          const p=new PrismaClient({datasources:{db:{url:process.env.DIRECT_URL}}});
-          (async()=>{
-            const u=await p.\$queryRawUnsafe(\"SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE '\\\\_%' ORDER BY 1\");
-            console.log('UNDERSCORE TABLES:', JSON.stringify(u));
-            const n=await p.\$queryRawUnsafe(\"SELECT count(*)::int c FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'\");
-            console.log('TABLE COUNT:', JSON.stringify(n));
-            await p.\$disconnect();
-          })()"
 
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
