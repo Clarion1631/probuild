@@ -1,6 +1,8 @@
 import { getContractForPortal, getPublicCompanySettings, getPortalVisibility } from "@/lib/actions";
-// The session-free core, NOT the getExecutedContractPdf server action: this page
-// has no staff session. Access was already proven above by getContractForPortal,
+// The session-free core, NOT a staff-gated server action: this page has no
+// staff session. (The staff wrapper `getExecutedContractPdf` that used to sit
+// beside this core in actions.ts has since been deleted as caller-less dead
+// surface.) Access was already proven above by getContractForPortal,
 // which matches the emailed accessToken or a portal session resolving to the
 // owning Client, and the descriptor below comes from the row it returned.
 import { executedContractPdfFor } from "@/lib/contract-files-core";

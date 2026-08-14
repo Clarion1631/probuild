@@ -5,6 +5,7 @@ import { authOptions } from "@/lib/auth";
 import { sendNotification } from "@/lib/email";
 import { sendSMS, htmlToSmsText, type SmsResult } from "@/lib/sms";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
 
 function escapeHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -126,7 +127,13 @@ export async function POST(request: Request) {
             where: { id: leadId },
             include: {
                 client: true,
-                estimates: { select: { id: true, code: true, title: true, status: true } },
+                // Only estimates the client is allowed to open in the portal — this
+                // message emails them a PDF and a portal link, so anything else
+                // would route around the portal gate.
+                estimates: {
+                    where: portalVisibleEstimateWhere(),
+                    select: { id: true, code: true, title: true, status: true },
+                },
             },
         });
         if (!lead) return NextResponse.json({ error: "Lead not found" }, { status: 404 });
@@ -140,7 +147,13 @@ export async function POST(request: Request) {
             where: { id: projectId! },
             include: {
                 client: true,
-                estimates: { select: { id: true, code: true, title: true, status: true } },
+                // Only estimates the client is allowed to open in the portal — this
+                // message emails them a PDF and a portal link, so anything else
+                // would route around the portal gate.
+                estimates: {
+                    where: portalVisibleEstimateWhere(),
+                    select: { id: true, code: true, title: true, status: true },
+                },
             },
         });
         if (!project) return NextResponse.json({ error: "Project not found" }, { status: 404 });
@@ -170,8 +183,21 @@ export async function POST(request: Request) {
     const resolvedAttachments: { type: string; id: string; name: string; url?: string }[] = [];
     const supabaseHost = (process.env.SUPABASE_URL || "").replace(/^https?:\/\//, "");
 
+    // Attachment ids come from the request body, so an estimate id is only
+    // honoured when it belongs to the lead/project this message is addressed to
+    // AND is one the client is allowed to see in the portal. Without the first
+    // check a staff caller could PDF another client's pricing; without the second
+    // this route becomes the way around the portal gate, since it emails both a
+    // rendered PDF and a portal link. `estimates` is already filtered by
+    // portalVisibleEstimateWhere() when it is loaded above.
+    const attachableEstimateIds = new Set(estimates.map(e => e.id));
+
     for (const att of attachments) {
         if (att.type === "estimate") {
+            if (!attachableEstimateIds.has(att.id)) {
+                console.warn("[clientMessages] Rejected estimate id that is not a shareable estimate of this lead/project:", att.id);
+                continue;
+            }
             try {
                 const { generateEstimatePdf } = await import("@/lib/pdf");
                 const pdfBuffer = await generateEstimatePdf(att.id);

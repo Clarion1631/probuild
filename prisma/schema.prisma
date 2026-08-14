@@ -2612,4 +2612,3 @@ model ReviewAlertEpisode {
   @@unique([issueId, generation])
   @@index([batchId])
 }
-

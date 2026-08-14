@@ -1242,6 +1242,7 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
 
     // Header mirrors the invoice PDF: 26pt title, BILL TO block (name + email),
     // right-aligned meta column, then a divider clear of both columns.
+    y -= 24;
     page.drawText('CHANGE ORDER', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
 
     if (co.title) {
