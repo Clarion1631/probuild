@@ -31,6 +31,7 @@ function baseEntry(overrides: Partial<ClockOutTimeEntryRow> = {}): ClockOutTimeE
         userId: "u1",
         projectId: "p1",
         startTime: START,
+        endTime: null,
         notes: null,
         reviewReason: null,
         ...overrides,
@@ -252,4 +253,85 @@ test("computes durationHours/laborCost/burdenCost from the OWNER's rates, not th
     assert.equal(data.laborCost, 200); // 4 * 50
     assert.equal(data.burdenCost, 40); // 4 * 10
     assert.equal(data.editedByManagerId, "u1");
+});
+
+// ── clock-out hardening: re-close, future/invalid endTime ────────────────
+
+test("re-clock-out on an already-closed entry is rejected with 409 ALREADY_CLOCKED_OUT", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ endTime: new Date("2026-08-10T19:00:00.000Z") }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T20:00:00.000Z" }));
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, "ALREADY_CLOCKED_OUT");
+    assert.equal(updateCalls.length, 0);
+});
+
+test("a future endTime beyond the clock-skew allowance is rejected with 400", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const farFuture = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour ahead
+    const res = await PUT(putReq({ id: "te1", endTime: farFuture }));
+    assert.equal(res.status, 400);
+    assert.equal(updateCalls.length, 0);
+});
+
+test("an endTime within the small clock-skew allowance is accepted", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const withinSkew = new Date(Date.now() + 2 * 60 * 1000).toISOString(); // 2 minutes ahead
+    const res = await PUT(putReq({ id: "te1", endTime: withinSkew }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls.length, 1);
+});
+
+test("endTime equal to startTime is rejected with 400", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: START.toISOString() }));
+    assert.equal(res.status, 400);
+    assert.equal(updateCalls.length, 0);
+});
+
+test("endTime before startTime is rejected with 400", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const before = new Date(START.getTime() - 60 * 60 * 1000).toISOString();
+    const res = await PUT(putReq({ id: "te1", endTime: before }));
+    assert.equal(res.status, 400);
+    assert.equal(updateCalls.length, 0);
+});
+
+test("an unparseable endTime is rejected with 400", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "not-a-date" }));
+    assert.equal(res.status, 400);
+    assert.equal(updateCalls.length, 0);
+});
+
+test("normal clock-out with no endTime supplied (defaults to now) is unaffected", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1" }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls.length, 1);
+});
+
+test("normal clock-out with a valid past-of-now endTime is unaffected", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T19:00:00.000Z" }));
+    assert.equal(res.status, 200);
+    assert.equal(updateCalls[0].data.durationHours, 4);
 });

@@ -179,9 +179,13 @@ export interface ClockOutTimeEntryRow {
     userId: string;
     projectId: string;
     startTime: Date;
+    endTime: Date | null;
     notes: string | null;
     reviewReason: string | null;
 }
+
+/** Client clock skew allowance for a supplied endTime — see the PUT handler. */
+const CLOCK_OUT_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
 export interface ClockOutDependencies {
     authenticate(req: Request): Promise<ClockOutAuthResult>;
@@ -210,8 +214,39 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
             }
 
-            // PUT always closes the entry (endTime defaults to now below), so
-            // every call here is a clock-out. Logistics jobs carry no
+            // A closed entry can never be re-closed via PUT — the client must
+            // use the PATCH edit flow to change an already-set endTime.
+            if (existing.endTime != null) {
+                return NextResponse.json(
+                    { error: "Time entry is already clocked out", code: "ALREADY_CLOCKED_OUT" },
+                    { status: 409 }
+                );
+            }
+
+            // Validate a client-supplied endTime rather than trusting it outright:
+            // it must parse, must be after the clock-in time, and must not be in
+            // the future beyond a small clock-skew allowance. Reject with 400 on
+            // any violation — the pattern this route already uses for bad input —
+            // rather than silently clamping.
+            let end: Date;
+            if (endTime !== undefined && endTime !== null) {
+                const parsedEnd = new Date(endTime);
+                if (Number.isNaN(parsedEnd.getTime())) {
+                    return NextResponse.json({ error: "Invalid endTime" }, { status: 400 });
+                }
+                if (parsedEnd.getTime() <= existing.startTime.getTime()) {
+                    return NextResponse.json({ error: "endTime must be after the clock-in time" }, { status: 400 });
+                }
+                if (parsedEnd.getTime() > Date.now() + CLOCK_OUT_FUTURE_SKEW_MS) {
+                    return NextResponse.json({ error: "endTime cannot be in the future" }, { status: 400 });
+                }
+                end = parsedEnd;
+            } else {
+                end = new Date();
+            }
+
+            // PUT always closes the entry (endTime resolved above), so every
+            // call here is a clock-out. Logistics jobs carry no
             // cost-code/estimate-item context on the entry, so notes are the
             // only record of what was actually done — require one (already on
             // the entry, or supplied in this request).
@@ -229,7 +264,6 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
-            const end = endTime ? new Date(endTime) : new Date();
             const durationMs = end.getTime() - existing.startTime.getTime();
             let durationHours = durationMs / (1000 * 60 * 60);
             if (durationHours < 0) durationHours = 0;
@@ -293,7 +327,7 @@ const clockOutHandler = createClockOutHandler({
     findTimeEntry: async (id) => {
         return prisma.timeEntry.findUnique({
             where: { id },
-            select: { id: true, userId: true, projectId: true, startTime: true, notes: true, reviewReason: true },
+            select: { id: true, userId: true, projectId: true, startTime: true, endTime: true, notes: true, reviewReason: true },
         });
     },
     findProjectIsLogistics: async (projectId) => {
