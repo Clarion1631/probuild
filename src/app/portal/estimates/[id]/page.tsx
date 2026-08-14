@@ -4,15 +4,49 @@ import PortalEstimateClient from "./PortalEstimateClient";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { getServerSession } from "next-auth/next";
+import { authOptions } from "@/lib/auth";
+import { resolveSessionClientId } from "@/lib/portal-auth";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
+import type { Prisma } from "@prisma/client";
+
+// An explicit allowlist, not "any truthy role" — the staff branch of
+// getEstimateForPortal bypasses the client gate entirely, so anything that can
+// carry a role must be a known staff role to reach it.
+const STAFF_ROLES = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"];
 
 export default async function PortalEstimatePage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
     
-    // Support sequential numeric ID double-routing lookups by resolving to the canonical CUID
+    const staffSession = await getServerSession(authOptions);
+    const isStaff = STAFF_ROLES.includes((staffSession?.user as { role?: string } | undefined)?.role ?? "");
+
+    // Support sequential numeric ID double-routing lookups by resolving to the
+    // canonical CUID. For a portal client this is scoped by the SAME rules the
+    // detail fetch uses — ownership plus shared-ness. An unscoped lookup turns the
+    // sequential `number` into an enumeration oracle: it hands back a real CUID
+    // (confirming the estimate exists) even when getEstimateForPortal then denies it.
     const isNumeric = (str: string) => /^\d+$/.test(str);
     if (isNumeric(resolvedParams.id)) {
+        let numberWhere: Prisma.EstimateWhereInput = { number: parseInt(resolvedParams.id, 10) };
+        if (!isStaff) {
+            const sessionClientId = await resolveSessionClientId();
+            if (!sessionClientId) return notFound();
+            numberWhere = {
+                AND: [
+                    numberWhere,
+                    {
+                        OR: [
+                            { project: { is: { clientId: sessionClientId } } },
+                            { lead: { is: { clientId: sessionClientId } } },
+                        ],
+                    },
+                    portalVisibleEstimateWhere(),
+                ],
+            };
+        }
         const est = await prisma.estimate.findFirst({
-            where: { number: parseInt(resolvedParams.id, 10) },
+            where: numberWhere,
             select: { id: true }
         });
         if (est) {
@@ -20,6 +54,18 @@ export default async function PortalEstimatePage({ params }: { params: Promise<{
         } else {
             return notFound();
         }
+    }
+
+    // Authorize BEFORE any money-path work. The QuickBooks pull below mutates
+    // payment state, and it used to run first — so anyone holding a CUID could
+    // trigger a sync on an estimate they cannot read. getEstimateForPortal is the
+    // single authority for both callers (client ownership + shared-ness, or the
+    // staff project scope), so it has to be what gates the sync. An earlier
+    // version probed only the client path and let staff through unscoped; an
+    // out-of-scope staff session could still drive the sync.
+    const estimate = await getEstimateForPortal(resolvedParams.id);
+    if (!estimate) {
+        return notFound();
     }
 
     // Self-healing payment state: if a milestone on this estimate's invoice is
@@ -33,14 +79,31 @@ export default async function PortalEstimatePage({ params }: { params: Promise<{
     if (pendingQB) {
         const { syncQuickBooksPayments } = await import("@/lib/quickbooks-payments");
         await syncQuickBooksPayments({ invoiceId: pendingQB.invoiceId }).catch(() => {});
+        // The sync just rewrote the very payment rows `estimate` carries, and
+        // getEstimateForPortal is request-cached — re-reading it would hand back
+        // the pre-sync snapshot. Re-read the milestones directly and splice them
+        // in, so the client sees "Paid" on this render rather than the next one.
+        const freshInvoice = await prisma.invoice.findFirst({
+            where: { estimateId: resolvedParams.id },
+            select: {
+                id: true, code: true, status: true,
+                payments: {
+                    select: {
+                        id: true, name: true, amount: true, status: true, dueDate: true,
+                        paidAt: true, paymentDate: true, paymentMethod: true,
+                        stripeSessionId: true, qbInvoiceLink: true,
+                    },
+                    orderBy: { createdAt: "asc" },
+                },
+            },
+            orderBy: { createdAt: "asc" },
+        });
+        if (freshInvoice) {
+            (estimate as { invoices?: unknown[] }).invoices = JSON.parse(JSON.stringify([freshInvoice]));
+        }
     }
 
-    const estimate = await getEstimateForPortal(resolvedParams.id);
     const settings = await getPublicCompanySettings();
-
-    if (!estimate) {
-        return notFound();
-    }
 
     // Check portal visibility if estimate belongs to a project
     if (estimate.projectId) {
