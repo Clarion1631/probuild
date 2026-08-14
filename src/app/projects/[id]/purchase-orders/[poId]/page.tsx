@@ -43,7 +43,9 @@ export default async function PurchaseOrderDetailPage({
         });
 
         if (!po) redirect(`/projects/${projectId}/purchase-orders`);
-        initialData = po;
+        // totalAmount and item unitCost/total are Prisma Decimals — serialize before
+        // crossing the server->client boundary.
+        initialData = JSON.parse(JSON.stringify(po));
     }
 
     return (
