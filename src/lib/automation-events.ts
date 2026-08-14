@@ -573,13 +573,15 @@ interface SyncedExpenseInput {
  * iterate last — silently overwriting an earlier match and depending on
  * `expenses`' incidental array order rather than which one is actually
  * newest. Fixed by collecting every match per journey FIRST, then: the
- * NEWEST (by `syncedAt`, compared explicitly) wins the journey's `synced`
- * fields; if more than one Expense matched, a single "ambiguous" step is
- * appended instead of one "synced" step per match, so the ambiguity is
- * visible rather than silently resolved; and `j.steps` is re-sorted by `at`
- * afterward, since an appended sync-landing timestamp is not guaranteed to
- * fall after every existing step (it comes from the sync run, not the
- * receipt-push event stream this journey's other steps were built from).
+ * NEWEST (by `syncedAt`, compared explicitly, with `createdAt` desc then
+ * `id` desc as deterministic tie-breakers for an exact `syncedAt` tie — see
+ * the sort comparator below) wins the journey's `synced` fields; if more
+ * than one Expense matched, a single "ambiguous" step is appended instead of
+ * one "synced" step per match, so the ambiguity is visible rather than
+ * silently resolved; and `j.steps` is re-sorted by `at` afterward, since an
+ * appended sync-landing timestamp is not guaranteed to fall after every
+ * existing step (it comes from the sync run, not the receipt-push event
+ * stream this journey's other steps were built from).
  */
 function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: SyncedExpenseInput[]): void {
     const matchesByJourney = new Map<ReceiptJourney, { exp: SyncedExpenseInput; fullId: string }[]>();
@@ -609,9 +611,24 @@ function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: S
     }
 
     for (const [j, matches] of matchesByJourney) {
+        // Codex round 2 finding 8 completion: `syncedAt` values can tie
+        // (two Expense rows synced in the same batch, or both falling back
+        // to an identical `createdAt`) — a comparator that returns 0 on a
+        // tie leaves `.sort()`'s ordering unspecified (V8 is stable, but
+        // relying on incidental array order is exactly what this fix was
+        // supposed to stop doing). Break ties deterministically: newest
+        // `createdAt` next, then highest `id` (plain string compare is fine
+        // — this only needs to be a STABLE, deterministic pick, not a
+        // meaningful ordering).
         const withSyncedAt = matches
             .map((m) => ({ ...m, syncedAt: m.exp.qbSyncedAt ?? m.exp.createdAt }))
-            .sort((a, b) => b.syncedAt.getTime() - a.syncedAt.getTime());
+            .sort((a, b) => {
+                const bySyncedAt = b.syncedAt.getTime() - a.syncedAt.getTime();
+                if (bySyncedAt !== 0) return bySyncedAt;
+                const byCreatedAt = b.exp.createdAt.getTime() - a.exp.createdAt.getTime();
+                if (byCreatedAt !== 0) return byCreatedAt;
+                return a.exp.id < b.exp.id ? 1 : a.exp.id > b.exp.id ? -1 : 0;
+            });
         const { exp: newest, fullId, syncedAt } = withSyncedAt[0];
 
         j.syncedExpenseId = newest.id;

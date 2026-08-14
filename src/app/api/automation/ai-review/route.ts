@@ -251,14 +251,14 @@ export function parseReasonablenessJson(text: string): ReasonablenessVerdict | n
     }
 }
 
-/** Codex round 1 finding 2: how long a single Gemini call may run before
- * `withTimeout` below gives up on it and resolves to its branch's
- * fail-closed value — this route runs TWO independent Gemini calls (tier 1
- * and the reasonableness judgment) in `Promise.all`, and a hang in either
- * must not cost the other its result or push the whole request past this
- * route's `maxDuration` (120s: room for the receipt fetch + a possible
- * tier 2 Claude escalation on top of these). */
-const GEMINI_TIMEOUT_MS = 20_000;
+/** Codex round 1 finding 2 (+ round 2's completion covering tier 2): how
+ * long a single model call — either of the two Gemini calls run together in
+ * `Promise.all` (tier 1, the reasonableness judgment), or the standalone
+ * tier 2 Claude escalation — may run before `withTimeout` below gives up on
+ * it and resolves to its branch's fail-closed value. A hang in any one of
+ * them must not cost another call its result or push the whole request past
+ * this route's `maxDuration` (120s). */
+const AI_CALL_TIMEOUT_MS = 20_000;
 
 /**
  * Races `promise` against a `ms` timeout that resolves — never rejects — to
@@ -298,7 +298,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T, label: str
 }
 
 /** Calls Gemini with the reasonableness prompt and parses its verdict.
- * Never throws and never hangs past `GEMINI_TIMEOUT_MS` — any missing API
+ * Never throws and never hangs past `AI_CALL_TIMEOUT_MS` — any missing API
  * key, network failure, timeout, or unparseable response resolves to
  * `REASONABLENESS_UNKNOWN`. */
 async function judgeReasonableness(input: ReasonablenessInput): Promise<ReasonablenessVerdict> {
@@ -312,7 +312,7 @@ async function judgeReasonableness(input: ReasonablenessInput): Promise<Reasonab
             });
             return parseReasonablenessJson(response.text ?? "") ?? REASONABLENESS_UNKNOWN;
         })(),
-        GEMINI_TIMEOUT_MS,
+        AI_CALL_TIMEOUT_MS,
         REASONABLENESS_UNKNOWN,
         "ai-review reasonableness",
     );
@@ -450,7 +450,7 @@ function claudeContent(base64: string, mediaType: string, prompt: string): Anthr
     ];
 }
 
-/** Never throws and never hangs past `GEMINI_TIMEOUT_MS` (see `withTimeout`)
+/** Never throws and never hangs past `AI_CALL_TIMEOUT_MS` (see `withTimeout`)
  * — a timeout, network failure, or unparseable response all resolve to
  * `null`, the same "couldn't read it" value a legible-but-failed read
  * already produced before this fix. */
@@ -471,24 +471,40 @@ async function tier1Gemini(base64: string, mediaType: string): Promise<ModelRead
             });
             return parseModelJson(response.text ?? "");
         })(),
-        GEMINI_TIMEOUT_MS,
+        AI_CALL_TIMEOUT_MS,
         null,
         "ai-review tier1",
     );
 }
 
+/** Codex round 2 finding 2 completion: same `withTimeout` mechanism as
+ * `tier1Gemini`/`judgeReasonableness` — this call had no per-call deadline
+ * of its own, so a hang here (the "big guns" escalation, not always
+ * attempted) could still run the route past `maxDuration` even though the
+ * two Gemini calls in `Promise.all` were already bounded. Never throws or
+ * hangs past `AI_CALL_TIMEOUT_MS`; a timeout, network failure, or
+ * unparseable response all resolve to `null` — the caller's existing
+ * try/catch around this call site becomes a no-op safety net, not the
+ * primary guard. */
 async function tier2Claude(base64: string, mediaType: string, booked: BookedValues, tier1: ModelRead | null): Promise<(ModelRead & Partial<Arbitration>) | null> {
     if (!process.env.ANTHROPIC_API_KEY) return null;
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const response = await anthropic.messages.create({
-        model: "claude-opus-5",
-        // Opus 5 thinks adaptively and thinking tokens count against this cap;
-        // 2048 risked a truncated JSON tail on a hard receipt.
-        max_tokens: 8000,
-        messages: [{ role: "user", content: claudeContent(base64, mediaType, arbitrationPrompt(booked, tier1)) }],
-    });
-    const text = response.content.filter(b => b.type === "text").map(b => (b as { text: string }).text).join("");
-    return parseModelJson(text);
+    return withTimeout(
+        (async () => {
+            const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+            const response = await anthropic.messages.create({
+                model: "claude-opus-5",
+                // Opus 5 thinks adaptively and thinking tokens count against this cap;
+                // 2048 risked a truncated JSON tail on a hard receipt.
+                max_tokens: 8000,
+                messages: [{ role: "user", content: claudeContent(base64, mediaType, arbitrationPrompt(booked, tier1)) }],
+            });
+            const text = response.content.filter(b => b.type === "text").map(b => (b as { text: string }).text).join("");
+            return parseModelJson(text);
+        })(),
+        AI_CALL_TIMEOUT_MS,
+        null,
+        "ai-review tier2",
+    );
 }
 
 export async function POST(request: Request) {
@@ -628,7 +644,7 @@ export async function POST(request: Request) {
         // ── Tier 1 (receipt re-read) and the reasonableness judgment run in
         // parallel — two independent Gemini calls that share no inputs, so
         // there's no reason to pay for them sequentially. Each is
-        // individually fail-closed and bounded to GEMINI_TIMEOUT_MS
+        // individually fail-closed and bounded to AI_CALL_TIMEOUT_MS
         // (tier1Gemini/judgeReasonableness's own `withTimeout`, computeReasonableness's
         // own try/catch around the DB reads that build its input) — neither
         // branch can reject or hang this `Promise.all`.
