@@ -48,6 +48,19 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
+      - name: Probe
+        run: |
+          node -e "
+          const {PrismaClient}=require('@prisma/client');
+          const p=new PrismaClient({datasources:{db:{url:process.env.DIRECT_URL}}});
+          (async()=>{
+            const u=await p.\$queryRawUnsafe(\"SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE '\\\\_%' ORDER BY 1\");
+            console.log('UNDERSCORE TABLES:', JSON.stringify(u));
+            const n=await p.\$queryRawUnsafe(\"SELECT count(*)::int c FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'\");
+            console.log('TABLE COUNT:', JSON.stringify(n));
+            await p.\$disconnect();
+          })()"
+
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
