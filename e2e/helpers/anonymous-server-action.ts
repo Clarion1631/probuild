@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { APIRequestContext } from "@playwright/test";
 
@@ -43,11 +43,52 @@ export const ACTIONS_MODULE = "src/lib/actions.ts";
  *  - `npm run dev` bypasses src/proxy.ts entirely, so a dev run would prove
  *    something different from what ships.
  *
- * Playwright starts `npm run start` when CI is set and `npm run dev` otherwise
- * (playwright.config.ts), so the manifest's presence is the signal.
+ * Playwright serves `npm run start` (rather than `npm run dev`) and pins
+ * `workers: 1` off the SAME `CI` variable — see playwright.config.ts — so
+ * requiring CI here is what makes both the production-server assumption and
+ * the run-alone assumption TRUE rather than merely documented. Several
+ * assertions compare row counts and would be racy under the default local
+ * worker count. The manifest check stays because CI alone does not guarantee
+ * a build happened.
  */
+export function behaviouralAuthCasesCanRun(): boolean {
+    return !!process.env.CI && existsSync(MANIFEST_PATH);
+}
+
 export function productionServerActionManifestExists(): boolean {
     return existsSync(MANIFEST_PATH);
+}
+
+/**
+ * Refuse to run against a build that predates the code it claims to test.
+ *
+ * Without this the documented local flow hides a trap: build once, invert a
+ * guard in actions.ts, then re-run with CI=1 and no rebuild. `npm run start`,
+ * the action ids, and the positive controls would all exercise the OLD, still
+ * secure artifact and report green over vulnerable source. CI is immune (its
+ * job always builds first), but the local flow is the one a human uses *while
+ * editing a guard* — precisely when a false green costs the most.
+ *
+ * An mtime comparison is a heuristic rather than a proof, but it is
+ * deterministic for the case that matters (source edited after the last
+ * build) and it fails LOUD instead of silently passing.
+ */
+export function assertBuildIsNotStalerThanSource(
+    sourceFiles: string[] = [ACTIONS_MODULE],
+): void {
+    if (!existsSync(MANIFEST_PATH)) return;
+    const builtAt = statSync(MANIFEST_PATH).mtimeMs;
+    for (const relative of sourceFiles) {
+        const absolute = join(process.cwd(), relative);
+        if (!existsSync(absolute)) continue;
+        if (statSync(absolute).mtimeMs > builtAt) {
+            throw new Error(
+                `[anonymous-server-action] ${relative} is NEWER than the production build. `
+                + `These cases would exercise the PREVIOUS build and could report green over changed `
+                + `source. Re-run \`npm run build\` before the behavioural auth cases.`
+            );
+        }
+    }
 }
 
 type ManifestWorker = { exportedName?: string; filename?: string };
