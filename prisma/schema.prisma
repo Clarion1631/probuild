@@ -2678,7 +2678,7 @@ model BankLine {
   id              String   @id @default(cuid())
   account         String // e.g. "WTB-0723"
   postedDate      DateTime @db.Date
-  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition
+  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition — IMMUTABLE once any RefundEvent references this line (bank_line_amount_immutable_trigger, scripts/apply-bank-ledger.mjs; Codex round-3 should-fix)
   rawDescriptor   String
   normalizedPayee String // "" is a valid but exceptional value — paired with state EXCEPTION, never silently accepted as a real identity
   checkNumber     String?
@@ -2746,11 +2746,18 @@ model BankLineObservation {
   // ingest time (the canonical line minted alongside them). At most one
   // observation per (source, bankLineId) — see the partial unique index note
   // above.
+  //
+  // onDelete: Restrict, not SetNull (Codex round-3 should-fix) — the
+  // source-shape CHECK above requires STATEMENT rows to carry BOTH
+  // bankLineId and statementImportId, so nulling either one on a parent
+  // delete would violate that CHECK. Restrict makes the deletion policy
+  // explicit (delete/reassign the observation first) instead of failing
+  // confusingly, or, for QBO_REGISTER rows, silently dropping a link.
   bankLineId String?
-  bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: SetNull)
+  bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: Restrict)
 
   statementImportId String?
-  statementImport   StatementImport? @relation(fields: [statementImportId], references: [id], onDelete: SetNull)
+  statementImport   StatementImport? @relation(fields: [statementImportId], references: [id], onDelete: Restrict)
 
   createdAt DateTime @default(now())
 
@@ -2786,6 +2793,12 @@ model BankLineItem {
 // src/lib/bank-ledger.ts, which any future write path MUST call first so a
 // bad pairing surfaces as a normal validation error rather than a raised
 // Postgres exception.
+//
+// That trigger only guards RefundEvent write time — a separate parent-side
+// trigger (bank_line_amount_immutable_trigger, Codex round-3 should-fix)
+// rejects any later UPDATE that changes BankLine.amountCents once a
+// RefundEvent references that line, so the sign pairing validated here can't
+// be silently broken afterward by editing the BankLine instead.
 model RefundEvent {
   id                 String    @id @default(cuid())
   originalBankLineId String?

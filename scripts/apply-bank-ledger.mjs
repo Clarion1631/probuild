@@ -1,31 +1,34 @@
 // One-off additive migration for the Bank Ledger (Receipt Automation Phase 1,
 // docs/RECEIPT-AUTOMATION-PHASES.md "Persistence decision" + Codex
-// peer-review round-1 amendments): StatementImport (one row per ingested
-// statement, content-addressed), BankLine (canonical per-transaction
-// identity + state — only ever minted from a STATEMENT observation),
-// BankLineObservation (one row per source sighting: a statement line or a
-// QBO register row), BankLineItem (line-item child rows), RefundEvent
-// (returns as events, linked to the original line).
+// peer-review round-1/round-2/round-3 amendments): StatementImport (one row
+// per ingested statement, content-addressed), BankLine (canonical
+// per-transaction identity + state — only ever minted from a STATEMENT
+// observation), BankLineObservation (one row per source sighting: a
+// statement line or a QBO register row), BankLineItem (line-item child
+// rows), RefundEvent (returns as events, linked to the original line).
 //
 // Additive and idempotent: pure CREATE TABLE IF NOT EXISTS / guarded FK and
 // CHECK-constraint adds, safe to re-run while an older build is live. No
 // existing table is touched. This has never been applied to any database —
 // there is no prior incompatible shape to repair.
 //
-//   node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name>
+//   node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name> --expect-host <host>
 //
-// --expect-db (or the BANK_LEDGER_EXPECT_DB env var) is REQUIRED in addition
-// to --yes: this script queries current_database() and the server identity
-// and refuses to run a single statement if they don't match what you typed —
-// "--yes" alone only proves you meant to run *something*, not that you knew
-// which database DATABASE_URL currently points at (Codex round-2 finding:
-// generic --yes is not enough).
+// --expect-db and --expect-host (or the BANK_LEDGER_EXPECT_DB /
+// BANK_LEDGER_EXPECT_HOST env vars) are BOTH REQUIRED in addition to --yes:
+// this script queries current_database() and the server's actual host and
+// refuses to run a single statement if either doesn't match what you typed —
+// "--yes" alone only proves you meant to run *something*, and --expect-db
+// alone only proves you knew the database NAME, not which SERVER it lives on
+// (Codex round-3 finding: two servers can share a database name, and the
+// round-2 check compared db name only, never host).
 //
 // Apply BEFORE deploying the build that selects these tables (P2022 otherwise).
 import { PrismaClient } from "@prisma/client";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
-function resolveDatabaseUrl() {
+export function resolveDatabaseUrl() {
     if (process.env.DATABASE_URL) return { url: process.env.DATABASE_URL, from: "process.env.DATABASE_URL" };
     // .env.local before .env: Next.js env-file precedence is DATABASE_URL >
     // .env.local > .env, and a stale value in the less-specific file must
@@ -38,55 +41,63 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
 }
 
-function maskUrl(url) {
+export function maskUrl(url) {
     return url.replace(/:[^:@]*@/, ":****@");
 }
-
-const { url, from } = resolveDatabaseUrl();
-const maskedUrl = maskUrl(url);
 
 function readFlagValue(flag) {
     const idx = process.argv.indexOf(flag);
     return idx >= 0 ? process.argv[idx + 1] : undefined;
 }
 
-const expectDb = readFlagValue("--expect-db") || process.env.BANK_LEDGER_EXPECT_DB;
-
-if (!process.argv.includes("--yes")) {
-    console.error(
-        `Refusing to run without --yes.\n` +
-        `Target database (from ${from}): ${maskedUrl}\n` +
-        `Re-run as: node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name>`,
-    );
-    process.exit(1);
+/**
+ * Pure comparison, exported for unit testing without a live DB connection
+ * (Codex round-3, defect 6). `actual` is the row shape returned by the
+ * current_database()/inet_server_addr()/inet_server_port() query below.
+ * Compares BOTH database name and server host — a match on name alone
+ * (the round-2 check) lets two different servers that happen to share a
+ * database name pass silently.
+ *
+ * @param {{ db: string, host: string | null, port: number | string | null }} actual
+ * @param {string} expectDb
+ * @param {string} expectHost
+ * @returns {{ ok: true, host: string, port: number | string } | { ok: false, message: string }}
+ */
+export function checkDatabaseIdentity(actual, expectDb, expectHost) {
+    const host = actual.host ?? "local/unix-socket";
+    const port = actual.port ?? "?";
+    if (actual.db !== expectDb || host !== expectHost) {
+        return {
+            ok: false,
+            message:
+                `Refusing to run: connected database "${actual.db}" (host=${host} port=${port}) ` +
+                `does not match --expect-db "${expectDb}" / --expect-host "${expectHost}". Aborting before any mutation.`,
+        };
+    }
+    return { ok: true, host, port };
 }
 
-if (!expectDb) {
-    console.error(
-        `Refusing to run without an expected database identity.\n` +
-        `Target database (from ${from}): ${maskedUrl}\n` +
-        `--yes alone does not prove you know which database this is about to mutate.\n` +
-        `Pass --expect-db <database-name> or set BANK_LEDGER_EXPECT_DB.`,
-    );
-    process.exit(1);
-}
+// Assigned only when this file is run directly (see the isMainModule guard
+// at the bottom) — declared here so verifyDatabaseIdentity()/main() below
+// can close over them without needing every function to thread them through
+// as parameters. Left undefined when the module is merely imported (e.g. by
+// a test importing checkDatabaseIdentity), so importing this file never
+// triggers DATABASE_URL resolution, --yes/--expect-* validation, or a real
+// Prisma connection as a side effect.
+let prisma;
+let expectDb;
+let expectHost;
+let maskedUrl;
+let urlFrom;
 
-const prisma = new PrismaClient({ datasources: { db: { url } } });
-
-/** Queried and compared against --expect-db BEFORE the first mutating statement runs. */
+/** Queried and compared against --expect-db/--expect-host BEFORE the first mutating statement runs. */
 async function verifyDatabaseIdentity() {
     const rows = await prisma.$queryRaw`
         SELECT current_database() AS db, inet_server_addr()::text AS host, inet_server_port() AS port`;
     const actual = rows[0];
-    const host = actual.host ?? "local/unix-socket";
-    const port = actual.port ?? "?";
-    if (actual.db !== expectDb) {
-        throw new Error(
-            `Refusing to run: connected database "${actual.db}" (host=${host} port=${port}) ` +
-            `does not match --expect-db "${expectDb}". Aborting before any mutation.`,
-        );
-    }
-    console.log(`Verified target database identity: "${actual.db}" (host=${host} port=${port})`);
+    const check = checkDatabaseIdentity(actual, expectDb, expectHost);
+    if (!check.ok) throw new Error(check.message);
+    console.log(`Verified target database identity: "${actual.db}" (host=${check.host} port=${check.port})`);
 }
 
 const statements = [
@@ -177,6 +188,14 @@ const statements = [
            CHECK ("source" IN ('STATEMENT', 'QBO_REGISTER'));
        END IF;
      END $$`,
+    // Codex round-3 should-fix: STATEMENT rows' bankLineId/statementImportId
+    // are both required NOT NULL by the source-shape CHECK below, so
+    // ON DELETE SET NULL on either FK would make deleting the referenced
+    // BankLine/StatementImport violate that CHECK. RESTRICT makes the
+    // deletion policy explicit — delete/reassign the observation first —
+    // instead of failing confusingly (or, for QBO_REGISTER rows where
+    // bankLineId genuinely may be null, silently degrading a link without
+    // anyone deciding that was fine).
     `DO $$ BEGIN
        IF NOT EXISTS (
          SELECT 1 FROM pg_constraint
@@ -186,7 +205,7 @@ const statements = [
          ALTER TABLE "BankLineObservation"
            ADD CONSTRAINT "BankLineObservation_bankLineId_fkey"
            FOREIGN KEY ("bankLineId") REFERENCES "BankLine"("id")
-           ON DELETE SET NULL ON UPDATE CASCADE;
+           ON DELETE RESTRICT ON UPDATE CASCADE;
        END IF;
      END $$`,
     `DO $$ BEGIN
@@ -198,7 +217,7 @@ const statements = [
          ALTER TABLE "BankLineObservation"
            ADD CONSTRAINT "BankLineObservation_statementImportId_fkey"
            FOREIGN KEY ("statementImportId") REFERENCES "StatementImport"("id")
-           ON DELETE SET NULL ON UPDATE CASCADE;
+           ON DELETE RESTRICT ON UPDATE CASCADE;
        END IF;
      END $$`,
     // Codex round-2: at most one linked observation per (source, bankLineId)
@@ -356,6 +375,32 @@ const statements = [
        FOR EACH ROW EXECUTE FUNCTION check_refund_event_signs()`,
 
     `ALTER TABLE "RefundEvent" ENABLE ROW LEVEL SECURITY`,
+
+    // Codex round-3 should-fix: refund sign integrity (the trigger above)
+    // only guards RefundEvent write time — nothing stopped BankLine.amountCents
+    // itself from being mutated afterward, which could silently flip a debit
+    // a RefundEvent already pointed to as its "original" into a credit (or
+    // vice versa) without re-validating the pairing. This mirrors that same
+    // rule from the parent side: once ANY RefundEvent references a BankLine
+    // (as either original or refund), that line's amountCents becomes
+    // immutable.
+    `CREATE OR REPLACE FUNCTION check_bank_line_amount_immutable() RETURNS TRIGGER AS $BODY$
+     BEGIN
+       IF NEW."amountCents" <> OLD."amountCents" THEN
+         IF EXISTS (
+           SELECT 1 FROM "RefundEvent"
+            WHERE "originalBankLineId" = OLD."id" OR "refundBankLineId" = OLD."id"
+         ) THEN
+           RAISE EXCEPTION 'BankLine.amountCents cannot change once a RefundEvent references this line (id %)', OLD."id";
+         END IF;
+       END IF;
+       RETURN NEW;
+     END;
+     $BODY$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS bank_line_amount_immutable_trigger ON "BankLine"`,
+    `CREATE TRIGGER bank_line_amount_immutable_trigger
+       BEFORE UPDATE ON "BankLine"
+       FOR EACH ROW EXECUTE FUNCTION check_bank_line_amount_immutable()`,
 ];
 
 // Table -> a representative subset of columns that must exist, spot-checking
@@ -387,6 +432,11 @@ const expectedConstraints = [
     { name: "RefundEvent_status_check", table: "RefundEvent" },
     { name: "RefundEvent_amountCents_check", table: "RefundEvent" },
     { name: "RefundEvent_taxCents_check", table: "RefundEvent" },
+];
+
+const expectedTriggers = [
+    { name: "refund_event_signs_trigger", table: "RefundEvent" },
+    { name: "bank_line_amount_immutable_trigger", table: "BankLine" },
 ];
 
 /** Resolved once, before verifyShape() runs any lookup — see the module comment on --expect-db for why bare/unqualified lookups are unsafe. */
@@ -426,18 +476,20 @@ async function verifyShape(schema) {
         }
     }
 
-    const triggerRows = await prisma.$queryRaw`
-        SELECT 1 FROM pg_trigger t
-        JOIN pg_class c ON c.oid = t.tgrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE t.tgname = 'refund_event_signs_trigger' AND n.nspname = ${schema} AND c.relname = 'RefundEvent'`;
-    if (triggerRows.length === 0) {
-        throw new Error(`Verification failed: expected trigger "refund_event_signs_trigger" not found on "${schema}"."RefundEvent"`);
+    for (const { name, table } of expectedTriggers) {
+        const triggerRows = await prisma.$queryRaw`
+            SELECT 1 FROM pg_trigger t
+            JOIN pg_class c ON c.oid = t.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE t.tgname = ${name} AND n.nspname = ${schema} AND c.relname = ${table}`;
+        if (triggerRows.length === 0) {
+            throw new Error(`Verification failed: expected trigger "${name}" not found on "${schema}"."${table}"`);
+        }
     }
 }
 
 async function main() {
-    console.log(`Applying to ${maskedUrl} (DATABASE_URL from ${from})`);
+    console.log(`Applying to ${maskedUrl} (DATABASE_URL from ${urlFrom})`);
     await verifyDatabaseIdentity();
 
     for (const sql of statements) {
@@ -451,9 +503,44 @@ async function main() {
     console.log("StatementImport / BankLine / BankLineObservation / BankLineItem / RefundEvent schema applied and verified.");
 }
 
-main()
-    .catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    })
-    .finally(() => prisma.$disconnect());
+// Only resolve DATABASE_URL, validate flags, open a real Prisma connection,
+// and run main() when this file is executed directly (`node
+// scripts/apply-bank-ledger.mjs ...`) — never as a side effect of another
+// module importing it (e.g. a test importing checkDatabaseIdentity).
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMainModule) {
+    const resolved = resolveDatabaseUrl();
+    urlFrom = resolved.from;
+    maskedUrl = maskUrl(resolved.url);
+
+    expectDb = readFlagValue("--expect-db") || process.env.BANK_LEDGER_EXPECT_DB;
+    expectHost = readFlagValue("--expect-host") || process.env.BANK_LEDGER_EXPECT_HOST;
+
+    if (!process.argv.includes("--yes")) {
+        console.error(
+            `Refusing to run without --yes.\n` +
+            `Target database (from ${urlFrom}): ${maskedUrl}\n` +
+            `Re-run as: node scripts/apply-bank-ledger.mjs --yes --expect-db <database-name> --expect-host <host>`,
+        );
+        process.exit(1);
+    }
+
+    if (!expectDb || !expectHost) {
+        console.error(
+            `Refusing to run without an expected server identity.\n` +
+            `Target database (from ${urlFrom}): ${maskedUrl}\n` +
+            `--yes alone does not prove you know which server/database this is about to mutate.\n` +
+            `Pass --expect-db <database-name> --expect-host <host> (or set BANK_LEDGER_EXPECT_DB / BANK_LEDGER_EXPECT_HOST).`,
+        );
+        process.exit(1);
+    }
+
+    prisma = new PrismaClient({ datasources: { db: { url: resolved.url } } });
+
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma.$disconnect());
+}

@@ -335,6 +335,29 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
         const inserted = rows.length > 0 ? await dependencies.createQboObservations(rows) : 0;
         const existingCount = validated.length - inserted;
 
+        if (rows.length > 0 && inserted < rows.length) {
+            // Race (Codex round-3, defect 7a): between the pre-insert
+            // findExistingQboObservations() check above and this createMany,
+            // a concurrent request for the SAME qbTxnId could have been
+            // inserted first — createMany(skipDuplicates: true) silently
+            // drops our row in that case rather than erroring, and
+            // `inserted` alone can't tell us whether the winner's content
+            // matched ours. Re-read every id we attempted and compare
+            // content: a stored hash that differs from what THIS request
+            // tried to insert means the concurrent writer's content was
+            // genuinely different, and that must 409 like any other
+            // qbo-txn-conflict — never a silent 200.
+            const attemptedIds = rows.map(row => row.qbTxnId);
+            const postInsert = await dependencies.findExistingQboObservations(account, attemptedIds);
+            for (const row of rows) {
+                const stored = postInsert.get(row.qbTxnId);
+                if (!stored) continue;
+                if (computeQboLineContentHash(stored) !== computeQboLineContentHash(row)) {
+                    return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: row.qbTxnId }, { status: 409 });
+                }
+            }
+        }
+
         return NextResponse.json({ ok: true, inserted, existing: existingCount });
     }
 

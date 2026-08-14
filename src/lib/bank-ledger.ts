@@ -131,6 +131,22 @@ export interface QboLineContentHashInput {
 }
 
 /**
+ * Trims and collapses internal whitespace so a purely representational
+ * difference in how the same descriptor was re-transmitted (extra spaces,
+ * leading/trailing whitespace) never changes the hash. Hashing-only — the
+ * stored rawDescriptor itself is left verbatim.
+ */
+function normalizeDescriptorForHash(value: string): string {
+    return value.trim().replace(/\s+/g, " ");
+}
+
+/** "" and whitespace-only are the same as "no check number" for hashing purposes — never a distinct identity from null. */
+function normalizeCheckNumberForHash(value: string | null): string | null {
+    if (value === null) return null;
+    return value.trim() === "" ? null : value;
+}
+
+/**
  * Content-addresses a single QBO register line (everything about it EXCEPT
  * its durable identity, qbTxnId). Two sightings of the same qbTxnId with the
  * same hash are the same observation retried; a different hash under the
@@ -139,9 +155,19 @@ export interface QboLineContentHashInput {
  * re-sent a corrected/edited row (or two different transactions collided on
  * an id), and either way the ingest route must reject it (409) rather than
  * silently keep the first-seen version or overwrite it.
+ *
+ * rawDescriptor whitespace and an empty-string vs. null checkNumber are
+ * normalized BEFORE hashing (Codex round-3, defect 7b) so a representation-
+ * only difference between two sightings of the same transaction can never
+ * false-positive a 409 — only a genuine content change does.
  */
 export function computeQboLineContentHash(input: QboLineContentHashInput): string {
-    return versionedHash([input.postedDate, input.amountCents, input.rawDescriptor, input.checkNumber]);
+    return versionedHash([
+        input.postedDate,
+        input.amountCents,
+        normalizeDescriptorForHash(input.rawDescriptor),
+        normalizeCheckNumberForHash(input.checkNumber),
+    ]);
 }
 
 // ── Validation helpers ────────────────────────────────────────────────────
@@ -262,6 +288,22 @@ export interface ReconcileLink {
     bankLineId: string;
 }
 
+/** A shared match key (account+date+amount+payee+check#) with more than one observation and/or more than one candidate BankLine — no pairing within it can be inferred, so every member stays unmatched. Surfaced explicitly rather than silently dropped. */
+export interface ReconcileAmbiguousGroup {
+    account: string;
+    postedDate: string;
+    amountCents: number;
+    normalizedPayee: string;
+    checkNumber: string | null;
+    observationIds: string[];
+    bankLineIds: string[];
+}
+
+export interface ReconcileResult {
+    links: ReconcileLink[];
+    ambiguous: ReconcileAmbiguousGroup[];
+}
+
 function reconcileKey(row: { account: string; postedDate: string; amountCents: number; normalizedPayee: string; checkNumber: string | null }): string {
     // JSON-encoded (not delimiter-joined) for the same reason versionedHash()
     // is — an account/payee string containing "|" must never collide with a
@@ -285,38 +327,53 @@ function reconcileKey(row: { account: string; postedDate: string; amountCents: n
  * normalizePayee()) is never treated as a valid identity on either side, so
  * it can never match anything here either.
  *
- * One canonical line can only absorb one observation and vice versa
- * (first-match-wins in input order within a key). A key with more
- * observations than candidate lines leaves the excess unmatched rather than
- * guessing which one is "really" the match — but note that isn't the same
- * as ambiguity: every remaining pairing under a shared key is still a fully
- * qualified match (same account/date/amount/payee/check#), just with
- * insufficient supply on one side.
+ * A group only links when the pairing is UNAMBIGUOUS: exactly one unlinked
+ * observation and exactly one candidate BankLine share the key. Any group
+ * with more than one on either side (Codex round-3, defect 1 — e.g. 1
+ * observation + 2 identical candidates, or an N:N group) previously linked
+ * arbitrarily by input order via `ids.shift()`; that guess is gone. Such a
+ * group is reported back in `ambiguous` instead — visible, not silently
+ * dropped and not silently guessed — and every id in it is left unmatched
+ * for a human (or a future check-number/amount tiebreaker) to resolve.
  */
 export function reconcileObservations(
     observations: ReconcileObservation[],
     bankLines: ReconcileBankLine[],
-): ReconcileLink[] {
-    const available = new Map<string, string[]>();
+): ReconcileResult {
+    const bankLinesByKey = new Map<string, string[]>();
     for (const line of bankLines) {
         if (line.normalizedPayee === "") continue;
         const key = reconcileKey(line);
-        const ids = available.get(key);
+        const ids = bankLinesByKey.get(key);
         if (ids) ids.push(line.id);
-        else available.set(key, [line.id]);
+        else bankLinesByKey.set(key, [line.id]);
     }
 
-    const links: ReconcileLink[] = [];
+    const observationsByKey = new Map<string, string[]>();
     for (const obs of observations) {
         if (obs.bankLineId !== null) continue;
         if (obs.normalizedPayee === "") continue;
         const key = reconcileKey(obs);
-        const ids = available.get(key);
-        if (!ids || ids.length === 0) continue;
-        const bankLineId = ids.shift()!;
-        links.push({ observationId: obs.id, bankLineId });
+        const ids = observationsByKey.get(key);
+        if (ids) ids.push(obs.id);
+        else observationsByKey.set(key, [obs.id]);
     }
-    return links;
+
+    const links: ReconcileLink[] = [];
+    const ambiguous: ReconcileAmbiguousGroup[] = [];
+
+    for (const [key, observationIds] of observationsByKey) {
+        const bankLineIds = bankLinesByKey.get(key);
+        if (!bankLineIds || bankLineIds.length === 0) continue; // no candidates at all — nothing to report, nothing to match
+        if (observationIds.length === 1 && bankLineIds.length === 1) {
+            links.push({ observationId: observationIds[0], bankLineId: bankLineIds[0] });
+            continue;
+        }
+        const [account, postedDate, amountCents, normalizedPayee, checkNumber] = JSON.parse(key) as [string, string, number, string, string | null];
+        ambiguous.push({ account, postedDate, amountCents, normalizedPayee, checkNumber, observationIds: [...observationIds], bankLineIds: [...bankLineIds] });
+    }
+
+    return { links, ambiguous };
 }
 
 // ── Refund sign validation ───────────────────────────────────────────────

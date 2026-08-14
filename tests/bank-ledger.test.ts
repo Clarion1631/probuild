@@ -200,22 +200,37 @@ test("reconcileObservations", async t => {
     await t.test("links a QBO observation to a canonical BankLine on an exact account+date+amount+payee match", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), [{ observationId: "obs1", bankLineId: "bl1" }]);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [{ observationId: "obs1", bankLineId: "bl1" }], ambiguous: [] });
     });
 
     await t.test("does not link when there is no exact match", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7401, normalizedPayee: "US MARKET", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
     await t.test("skips observations already linked to a canonical BankLine", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: "already-linked" }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
-    await t.test("matches one-to-one: two identical observations claim two distinct BankLines, not the same one twice", () => {
+    await t.test("Codex round-3 defect 1: 1 observation + 2 identical candidate BankLines stays UNMATCHED and is reported ambiguous, never guessed by input order", () => {
+        const observations = [
+            { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
+        ];
+        const bankLines = [
+            { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
+            { id: "bl2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
+        ];
+        const result = reconcileObservations(observations, bankLines);
+        assert.deepEqual(result.links, []);
+        assert.equal(result.ambiguous.length, 1);
+        assert.deepEqual(result.ambiguous[0].observationIds, ["obs1"]);
+        assert.deepEqual(result.ambiguous[0].bankLineIds.sort(), ["bl1", "bl2"]);
+    });
+
+    await t.test("Codex round-3 defect 1: 2 identical observations + 2 identical candidate BankLines (N:N) stays UNMATCHED and is reported ambiguous", () => {
         const observations = [
             { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
             { id: "obs2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
@@ -224,12 +239,14 @@ test("reconcileObservations", async t => {
             { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
             { id: "bl2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
         ];
-        const links = reconcileObservations(observations, bankLines);
-        assert.equal(links.length, 2);
-        assert.notEqual(links[0].bankLineId, links[1].bankLineId);
+        const result = reconcileObservations(observations, bankLines);
+        assert.deepEqual(result.links, []);
+        assert.equal(result.ambiguous.length, 1);
+        assert.deepEqual(result.ambiguous[0].observationIds.sort(), ["obs1", "obs2"]);
+        assert.deepEqual(result.ambiguous[0].bankLineIds.sort(), ["bl1", "bl2"]);
     });
 
-    await t.test("a third identical observation is left unmatched once both candidate BankLines are claimed", () => {
+    await t.test("3 identical observations + 2 identical candidate BankLines (N:N, unequal counts) is still fully ambiguous, not 2 guessed links + 1 unmatched", () => {
         const observations = [
             { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
             { id: "obs2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
@@ -239,45 +256,52 @@ test("reconcileObservations", async t => {
             { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
             { id: "bl2", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
         ];
-        const links = reconcileObservations(observations, bankLines);
-        assert.equal(links.length, 2);
-        assert.equal(links.some(l => l.observationId === "obs3"), false);
+        const result = reconcileObservations(observations, bankLines);
+        assert.deepEqual(result.links, []);
+        assert.equal(result.ambiguous.length, 1);
+        assert.deepEqual(result.ambiguous[0].observationIds.sort(), ["obs1", "obs2", "obs3"]);
+    });
+
+    await t.test("a distinct match key with no candidate BankLine at all is left unmatched WITHOUT being reported ambiguous (nothing to disambiguate)", () => {
+        const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null }];
+        const result = reconcileObservations(observations, []);
+        assert.deepEqual(result, { links: [], ambiguous: [] });
     });
 
     await t.test("never matches across accounts even with the same date+amount+payee", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-8516", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
     await t.test("does NOT cross-match two different payees sharing account+date+amount (the Chevron/Cash App class of bug)", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "CHEVRON", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "CASH APP KANDI SNYDER", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
     await t.test("amount+date+payee alone is not enough when a check number is present and disagrees", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -400000, normalizedPayee: "CHECK", checkNumber: "1024", bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -400000, normalizedPayee: "CHECK", checkNumber: "1025" }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
     await t.test("matches when check numbers agree, in addition to account+date+amount+payee", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -400000, normalizedPayee: "CHECK", checkNumber: "1024", bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -400000, normalizedPayee: "CHECK", checkNumber: "1024" }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), [{ observationId: "obs1", bankLineId: "bl1" }]);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [{ observationId: "obs1", bankLineId: "bl1" }], ambiguous: [] });
     });
 
     await t.test("never matches an observation with an empty normalizedPayee (the EXCEPTION case)", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 
     await t.test("never matches a candidate BankLine with an empty normalizedPayee", () => {
         const observations = [{ id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "", checkNumber: null, bankLineId: null }];
         const bankLines = [{ id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "SOMETHING", checkNumber: null }];
-        assert.deepEqual(reconcileObservations(observations, bankLines), []);
+        assert.deepEqual(reconcileObservations(observations, bankLines), { links: [], ambiguous: [] });
     });
 });
 
@@ -292,6 +316,25 @@ test("computeQboLineContentHash", async t => {
         assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, amountCents: -7401 }));
         assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, postedDate: "2026-07-17" }));
         assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, rawDescriptor: "OTHER" }));
+        assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, checkNumber: "1024" }));
+    });
+
+    await t.test("Codex round-3 defect 7b: leading/trailing/collapsed whitespace in rawDescriptor does not change the hash", () => {
+        const base = { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null };
+        assert.equal(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, rawDescriptor: "  US MARKET  " }));
+        assert.equal(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, rawDescriptor: "US  MARKET" }));
+        assert.equal(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, rawDescriptor: "US\tMARKET" }));
+    });
+
+    await t.test("Codex round-3 defect 7b: an empty-string checkNumber hashes identically to null", () => {
+        const base = { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null };
+        assert.equal(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, checkNumber: "" }));
+        assert.equal(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, checkNumber: "   " }));
+    });
+
+    await t.test("a genuinely different descriptor or check number still changes the hash despite normalization", () => {
+        const base = { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null };
+        assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, rawDescriptor: "LOWES" }));
         assert.notEqual(computeQboLineContentHash(base), computeQboLineContentHash({ ...base, checkNumber: "1024" }));
     });
 });

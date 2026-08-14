@@ -352,4 +352,62 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         assert.deepEqual(await res.json(), { ok: true, inserted: 1, existing: 1 });
         assert.equal(createQboObservationsCalls.length, 1);
     });
+
+    await t.test("Codex round-3 defect 7a: a concurrent request that wins the createMany(skipDuplicates) race with DIFFERENT content 409s, never a silent 200", async () => {
+        let findExistingCalls = 0;
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => {
+                findExistingCalls++;
+                if (findExistingCalls === 1) return new Map(); // pre-insert check: nothing stored yet
+                // Post-insert re-check: a concurrent request won the race and
+                // inserted DIFFERENT content under the same qbTxnId.
+                return new Map([["qb-1", { postedDate: "2026-07-16", amountCents: -9999, rawDescriptor: "OTHER VENDOR", checkNumber: null }]]);
+            },
+            createQboObservations: async () => 0, // simulate skipDuplicates silently skipping our row
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 409);
+        const body = await res.json();
+        assert.equal(body.reason, "qbo-txn-conflict");
+        assert.equal(body.qbTxnId, "qb-1");
+        assert.equal(findExistingCalls, 2);
+    });
+
+    await t.test("Codex round-3 defect 7a: a lost race with IDENTICAL content is a benign no-op, not a 409", async () => {
+        let findExistingCalls = 0;
+        const { handlers } = makeHandlers({
+            findExistingQboObservations: async () => {
+                findExistingCalls++;
+                if (findExistingCalls === 1) return new Map();
+                // The concurrent winner inserted the SAME content we tried to.
+                return new Map([["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }]]);
+            },
+            createQboObservations: async () => 0,
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.inserted, 0);
+        assert.equal(body.existing, 1);
+    });
+
+    await t.test("Codex round-3 defect 7b: a representation-only difference (whitespace, empty-string checkNumber) does NOT 409", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map([
+                ["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US  MARKET", checkNumber: "" }],
+            ]),
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+        ])));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.inserted, 0);
+        assert.equal(body.existing, 1);
+        assert.equal(createQboObservationsCalls.length, 0);
+    });
 });
