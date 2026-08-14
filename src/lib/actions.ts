@@ -470,25 +470,43 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 
 export async function deleteLead(id: string) {
     await assertActiveStaff();
-    // Prevent deletion of leads that have a linked project — checking the FK directly is
-    // authoritative. Previously this only checked stage === "Won", but any stage can be
-    // linked to a project, and with unlink removed there is no recovery path from a
-    // Postgres FK constraint violation.
-    const linked = await prisma.project.findUnique({ where: { leadId: id }, select: { id: true } });
-    if (linked) {
-        throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+    // One transaction for the whole flow. The guard below is a read, so it cannot stop a
+    // Project from being created against this lead a moment later; once
+    // Project_leadId_fkey is ON DELETE RESTRICT (migration 20260814120000) that race makes
+    // `lead.delete` raise P2003. Run as separate statements the contract deletes would
+    // already have committed by then, leaving the lead alive with its contracts gone.
+    // Inside the transaction the FK failure rolls the deletes back with it.
+    try {
+        await prisma.$transaction(async (tx) => {
+            // Prevent deletion of leads that have a linked project — checking the FK directly is
+            // authoritative. Previously this only checked stage === "Won", but any stage can be
+            // linked to a project, and with unlink removed there is no recovery path from a
+            // Postgres FK constraint violation.
+            const linked = await tx.project.findUnique({ where: { leadId: id }, select: { id: true } });
+            if (linked) {
+                throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+            }
+            const lead = await tx.lead.findUnique({ where: { id }, select: { stage: true } });
+            if (lead?.stage === "Won") {
+                throw new Error("Cannot delete a converted lead. Archive it instead.");
+            }
+            // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
+            // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
+            // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
+            await tx.contract.deleteMany({ where: { leadId: id, projectId: null } });
+            await tx.lead.delete({
+                where: { id }
+            });
+        });
+    } catch (error: any) {
+        // P2003 = FK constraint failure, i.e. a Project was linked to this lead between the
+        // guard above and the delete. Nothing was written — report it the same way the guard
+        // does instead of surfacing a raw Prisma error.
+        if (error?.code === "P2003") {
+            throw new Error("Cannot delete a lead that has a linked project. Delete or detach the project first.");
+        }
+        throw error;
     }
-    const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
-    if (lead?.stage === "Won") {
-        throw new Error("Cannot delete a converted lead. Archive it instead.");
-    }
-    // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
-    // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
-    // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
-    await prisma.contract.deleteMany({ where: { leadId: id, projectId: null } });
-    await prisma.lead.delete({
-        where: { id }
-    });
     revalidatePath(`/leads`);
 }
 

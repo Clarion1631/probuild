@@ -22,9 +22,27 @@
 --   * Project_managerId_fkey does not exist in production at all. Until now
 --     Project.managerId could reference a deleted User.
 --
--- Production applies this via scripts/apply-missing-fk-indexes.mjs (the local
--- write path — see CLAUDE.md "Schema migrations"), then records it with
--- `prisma migrate resolve --applied 20260814120000_missing_fk_indexes`.
+-- Production applies this via `node scripts/apply-missing-fk-indexes.mjs --prod`
+-- (the local write path — see CLAUDE.md "Schema migrations"), then records it
+-- with `prisma migrate resolve --applied 20260814120000_missing_fk_indexes`.
+--
+-- BEGIN/COMMIT is explicit because Prisma does not wrap a PostgreSQL migration
+-- file in a transaction for you. Without it a failure partway down — say the
+-- Project_managerId_fkey add hitting an orphaned managerId — would leave the six
+-- drops applied and their re-adds missing, i.e. a database with FEWER foreign
+-- keys than it started with and no record that the migration ran. All of it is
+-- transactional DDL in PostgreSQL, so all-or-nothing is available here; the one
+-- statement form that could not participate, CREATE INDEX CONCURRENTLY, is
+-- deliberately not used in this file (see below).
+--
+-- These CREATE INDEX statements are NOT CONCURRENTLY. This file only ever runs
+-- against a throwaway database — CI's migrations job and any future
+-- `migrate deploy` on a fresh instance — where a brief write lock costs nothing
+-- and transactional safety is worth more. Production does not run this file at
+-- all; scripts/apply-missing-fk-indexes.mjs builds the same indexes
+-- CONCURRENTLY, outside any transaction, with a bounded lock_timeout.
+
+BEGIN;
 
 -- DropForeignKey
 ALTER TABLE "ClientMessage" DROP CONSTRAINT "ClientMessage_projectId_fkey";
@@ -73,3 +91,5 @@ ALTER TABLE "TaskCommentPhoto" ADD CONSTRAINT "TaskCommentPhoto_commentId_fkey" 
 
 -- AddForeignKey
 ALTER TABLE "ClientMessage" ADD CONSTRAINT "ClientMessage_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+COMMIT;
