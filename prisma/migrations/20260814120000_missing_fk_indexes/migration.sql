@@ -1,16 +1,30 @@
--- The KNOWN, ACCEPTED gap between the committed migrations and prisma/schema.prisma.
+-- Closes the gap that prisma/EXPECTED_SCHEMA_GAP.sql recorded when the
+-- 2026-08-14 baseline was taken: seven foreign keys and three indexes that
+-- prisma/schema.prisma declares but production never actually had.
 --
--- prisma/schema.prisma is currently slightly AHEAD of production: PR #370 adopted
--- production's real shape into the schema file, but a handful of indexes and
--- foreign keys that schema.prisma declares were never actually created in prod.
--- This file is that gap, captured verbatim from production on 2026-08-14.
+-- The baseline (20260814000000_baseline_production) was generated FROM
+-- PRODUCTION, so it faithfully records prod's shape INCLUDING these omissions.
+-- This migration is the correction, exactly as the baseline's header and
+-- CLAUDE.md prescribe: a new migration, never an edit to the baseline.
 --
--- CI (scripts/check-migrations-match.mjs) asserts that a database built from
--- prisma/migrations/ differs from schema.prisma by EXACTLY this set — which is
--- how we prove the migrations reproduce production and nothing else drifted.
+-- Five of the seven "drops" below are not removals. Production already has
+-- those constraints, but with ON UPDATE NO ACTION where schema.prisma declares
+-- ON UPDATE CASCADE; PostgreSQL has no ALTER CONSTRAINT for referential
+-- actions, so changing one means DROP + ADD. Ids are cuids and are never
+-- rewritten, so the ON UPDATE action is inert in practice — this aligns the
+-- catalog with the declaration rather than changing behaviour.
 --
--- The follow-up that applies this gap to production should apply it as a normal
--- migration and then DELETE this file (an empty/absent file means zero gap).
+-- Two changes are NOT inert and are called out deliberately:
+--   * Project_leadId_fkey moves ON DELETE SET NULL -> RESTRICT. Deleting a Lead
+--     that has been converted to a Project now fails instead of silently
+--     orphaning the Project. RESTRICT is what schema.prisma has declared all
+--     along, so the Prisma client already assumes it.
+--   * Project_managerId_fkey does not exist in production at all. Until now
+--     Project.managerId could reference a deleted User.
+--
+-- Production applies this via scripts/apply-missing-fk-indexes.mjs (the local
+-- write path — see CLAUDE.md "Schema migrations"), then records it with
+-- `prisma migrate resolve --applied 20260814120000_missing_fk_indexes`.
 
 -- DropForeignKey
 ALTER TABLE "ClientMessage" DROP CONSTRAINT "ClientMessage_projectId_fkey";
@@ -59,4 +73,3 @@ ALTER TABLE "TaskCommentPhoto" ADD CONSTRAINT "TaskCommentPhoto_commentId_fkey" 
 
 -- AddForeignKey
 ALTER TABLE "ClientMessage" ADD CONSTRAINT "ClientMessage_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
