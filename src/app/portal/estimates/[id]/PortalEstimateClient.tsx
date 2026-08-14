@@ -748,6 +748,15 @@ function formatFileSize(bytes: number): string {
 function TermsAndConditions({ html }: { html: string }) {
     const ref = useRef<HTMLDivElement>(null);
 
+    // DOMPurify needs a browser DOM; in the Node SSR pass `DOMPurify.sanitize` is
+    // undefined and calling it throws. Same mounted-gate as PortalContractClient:
+    // false on the server render AND the first client render (no hydration
+    // mismatch), then flips true and the content sanitizes client-side.
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => {
+        setMounted(true);
+    }, []);
+
     // Detect rich HTML by whether the content starts with a block-level tag.
     // Legacy plain-text snapshots never start with "<p" or "<h"; editor-produced
     // HTML always does. Anchoring to trimStart() avoids false-positives from
@@ -760,7 +769,7 @@ function TermsAndConditions({ html }: { html: string }) {
         trimmed.startsWith("<ol") ||
         trimmed.startsWith("<div");
 
-    const sanitized = isRichHtml ? DOMPurify.sanitize(html) : "";
+    const sanitized = mounted && isRichHtml ? DOMPurify.sanitize(html) : "";
 
     // After mount, wrap each top-level block element in a data-pdf-row wrapper
     // so the PDF paginator can break between paragraphs/sections instead of
@@ -819,6 +828,12 @@ function TermsAndConditions({ html }: { html: string }) {
 function PortalRichSection({ title, html, variant }: { title: string; html: string; variant: "overview" | "notes" }) {
     const ref = useRef<HTMLDivElement>(null);
 
+    // Same SSR guard as TermsAndConditions above — see that comment.
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => {
+        setMounted(true);
+    }, []);
+
     const trimmed = (html || "").trimStart();
     const isRichHtml =
         trimmed.startsWith("<p") ||
@@ -827,7 +842,7 @@ function PortalRichSection({ title, html, variant }: { title: string; html: stri
         trimmed.startsWith("<ol") ||
         trimmed.startsWith("<div");
 
-    const sanitized = isRichHtml ? DOMPurify.sanitize(html) : "";
+    const sanitized = mounted && isRichHtml ? DOMPurify.sanitize(html) : "";
 
     useEffect(() => {
         if (!ref.current || !isRichHtml) return;
