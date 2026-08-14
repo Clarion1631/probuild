@@ -5,7 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
-import { requiresPhaseForClockIn } from "@/lib/logistics-time-entry";
+import { requiresPhaseForClockIn, checkLogisticsClockOutNotes } from "@/lib/logistics-time-entry";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -163,58 +163,141 @@ export async function POST(req: Request) {
     return NextResponse.json(timeEntry);
 }
 
-export async function PUT(req: Request) {
-    const auth = await authenticateMobileOrSession(req);
-    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
-    const { user } = auth;
+// ── PUT (clock-out) — extracted into a DI-testable factory ──────────────────
+// This is the real clock-out path the mobile app calls (lib/api.ts
+// timeEntries.clockOut -> PUT /api/time-entries; the PATCH [id] handler's
+// edit-flow clock-out check is defense in depth for a different call site,
+// not the primary one).
 
-    const body = await req.json();
-    const { id, endTime, latitude, longitude } = body;
+type ClockOutAuthedUser = { id: string; role: string; hourlyRate: number; burdenRate: number };
+type ClockOutAuthResult =
+    | { ok: true; user: ClockOutAuthedUser }
+    | { ok: false; status: number; error: string };
 
-    if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
+export interface ClockOutTimeEntryRow {
+    id: string;
+    userId: string;
+    projectId: string;
+    startTime: Date;
+    notes: string | null;
+}
 
-    const existing = await prisma.timeEntry.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Time Entry not found" }, { status: 404 });
+export interface ClockOutDependencies {
+    authenticate(req: Request): Promise<ClockOutAuthResult>;
+    findTimeEntry(id: string): Promise<ClockOutTimeEntryRow | null>;
+    findProjectIsLogistics(projectId: string): Promise<boolean>;
+    findOwnerRates(userId: string): Promise<{ hourlyRate: number; burdenRate: number } | null>;
+    updateTimeEntry(id: string, data: Record<string, unknown>): Promise<unknown>;
+}
 
-    if (existing.userId !== user.id && user.role !== 'MANAGER' && user.role !== 'ADMIN') {
-        return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
-    }
+export function createClockOutHandler(dependencies: ClockOutDependencies) {
+    return {
+        async PUT(req: Request) {
+            const auth = await dependencies.authenticate(req);
+            if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+            const { user } = auth;
 
-    const end = endTime ? new Date(endTime) : new Date();
-    const durationMs = end.getTime() - existing.startTime.getTime();
-    let durationHours = durationMs / (1000 * 60 * 60);
-    if (durationHours < 0) durationHours = 0;
+            const body = await req.json();
+            const { id, endTime, latitude, longitude, notes } = body;
 
-    // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
-    // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
-    const owner = existing.userId === user.id
-        ? user
-        : await prisma.user.findUnique({ where: { id: existing.userId } });
-    if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
-    const laborCost = durationHours * toNum(owner.hourlyRate);
-    const burdenCost = durationHours * toNum(owner.burdenRate);
+            if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
 
-    const updateData: any = {
-        endTime: end,
-        durationHours,
-        laborCost,
-        burdenCost,
+            const existing = await dependencies.findTimeEntry(id);
+            if (!existing) return NextResponse.json({ error: "Time Entry not found" }, { status: 404 });
+
+            if (existing.userId !== user.id && user.role !== "MANAGER" && user.role !== "ADMIN") {
+                return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
+            }
+
+            // PUT always closes the entry (endTime defaults to now below), so
+            // every call here is a clock-out. Logistics jobs carry no
+            // cost-code/estimate-item context on the entry, so notes are the
+            // only record of what was actually done — require one (already on
+            // the entry, or supplied in this request).
+            const isLogistics = await dependencies.findProjectIsLogistics(existing.projectId);
+            const logisticsCheck = checkLogisticsClockOutNotes({
+                isLogistics,
+                settingEndTime: true,
+                existingNotes: existing.notes,
+                suppliedNotes: typeof notes === "string" ? notes : undefined,
+            });
+            if (!logisticsCheck.ok) {
+                return NextResponse.json(
+                    { error: "Notes are required to clock out of a logistics job", code: "LOGISTICS_NOTES_REQUIRED" },
+                    { status: 400 }
+                );
+            }
+
+            const end = endTime ? new Date(endTime) : new Date();
+            const durationMs = end.getTime() - existing.startTime.getTime();
+            let durationHours = durationMs / (1000 * 60 * 60);
+            if (durationHours < 0) durationHours = 0;
+
+            // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
+            // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
+            const owner = existing.userId === user.id ? user : await dependencies.findOwnerRates(existing.userId);
+            if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
+            const laborCost = durationHours * owner.hourlyRate;
+            const burdenCost = durationHours * owner.burdenRate;
+
+            const updateData: Record<string, unknown> = {
+                endTime: end,
+                durationHours,
+                laborCost,
+                burdenCost,
+            };
+
+            if (latitude) updateData.latitude = latitude;
+            if (longitude) updateData.longitude = longitude;
+            if (logisticsCheck.notes !== undefined) updateData.notes = logisticsCheck.notes;
+
+            if (user.role === "MANAGER" || user.role === "ADMIN") {
+                if (existing.userId !== user.id) {
+                    updateData.editedByManagerId = user.id;
+                    updateData.editedAt = new Date();
+                }
+            }
+
+            const timeEntry = await dependencies.updateTimeEntry(id, updateData);
+            return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
+        },
     };
+}
 
-    if (latitude) updateData.latitude = latitude;
-    if (longitude) updateData.longitude = longitude;
+const clockOutHandler = createClockOutHandler({
+    authenticate: async (req) => {
+        const result = await authenticateMobileOrSession(req);
+        if (!result.ok) return result;
+        return {
+            ok: true,
+            user: {
+                id: result.user.id,
+                role: result.user.role,
+                hourlyRate: toNum(result.user.hourlyRate),
+                burdenRate: toNum(result.user.burdenRate),
+            },
+        };
+    },
+    findTimeEntry: async (id) => {
+        return prisma.timeEntry.findUnique({
+            where: { id },
+            select: { id: true, userId: true, projectId: true, startTime: true, notes: true },
+        });
+    },
+    findProjectIsLogistics: async (projectId) => {
+        const project = await prisma.project.findUnique({ where: { id: projectId }, select: { isLogistics: true } });
+        return project?.isLogistics ?? false;
+    },
+    findOwnerRates: async (userId) => {
+        const owner = await prisma.user.findUnique({ where: { id: userId }, select: { hourlyRate: true, burdenRate: true } });
+        if (!owner) return null;
+        return { hourlyRate: toNum(owner.hourlyRate), burdenRate: toNum(owner.burdenRate) };
+    },
+    updateTimeEntry: async (id, data) => {
+        return prisma.timeEntry.update({ where: { id }, data });
+    },
+});
 
-    if (user.role === 'MANAGER' || user.role === 'ADMIN') {
-        if (existing.userId !== user.id) {
-            updateData.editedByManagerId = user.id;
-            updateData.editedAt = new Date();
-        }
-    }
-
-    const timeEntry = await prisma.timeEntry.update({
-        where: { id },
-        data: updateData
-    });
-
-    return NextResponse.json(JSON.parse(JSON.stringify(timeEntry)));
+export async function PUT(req: Request) {
+    return clockOutHandler.PUT(req);
 }
