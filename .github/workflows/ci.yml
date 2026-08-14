@@ -158,6 +158,15 @@ jobs:
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
       SENTRY_ORG: golden-touch-remodeling
       PLAYWRIGHT_TEST_SECRET: ${{ secrets.PLAYWRIGHT_TEST_SECRET }}
+      # Explicit opt-in for src/app/api/test-only/contract-actions (and the
+      # src/proxy.ts bypass it needs): the dispatcher e2e/contract-auth-runtime.spec.ts
+      # calls to exercise the contract guards behaviorally. Deliberately set ONLY
+      # in this job — a secret leaking into an environment must not silently turn
+      # the route on, so "test routes are enabled" is its own positive decision,
+      # not a side effect of PLAYWRIGHT_TEST_SECRET being present. Without it the
+      # dispatcher 404s and the spec fails loudly instead of silently passing
+      # against a route that never ran.
+      E2E_TEST_ROUTES: "1"
       CI: true
 
     steps:

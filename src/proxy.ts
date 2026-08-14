@@ -90,6 +90,36 @@ export default async function proxy(req: any, event: any) {
         }
     }
 
+    // Test-only contract-action dispatcher (src/app/api/test-only/contract-actions).
+    // It exists so an UNAUTHENTICATED request reaches the action and is refused
+    // by assertContractAccess — a proxy redirect to /login would prove nothing
+    // about the action's own gate, which is exactly what
+    // e2e/contract-auth-runtime.spec.ts has to pin.
+    //
+    // The conditions here MUST stay identical to testOnlyRoutesEnabled() in that
+    // route, and `!isServerAction` is load-bearing on top of them. Codex flagged
+    // the earlier version: it checked only PLAYWRIGHT_TEST_SECRET while the
+    // route also checked VERCEL_ENV, so the two supposedly-matching gates did
+    // not match, and it waved through a request carrying a `next-action` header
+    // that the checks above had deliberately just scrutinised. An anonymous
+    // caller has no session cookie, so the stale-cookie check above does not
+    // cover them. Bypassing the proxy is never allowed to also mean bypassing
+    // the Server Action boundary.
+    if (
+        !isServerAction
+        && process.env.E2E_TEST_ROUTES === "1"
+        && !!process.env.PLAYWRIGHT_TEST_SECRET
+        // Affirmative, not merely "not production" — see the same clause in the
+        // route. Every other condition is satisfied by an ABSENT variable, so a
+        // self-hosted production server (no VERCEL_ENV) passed them all.
+        && (process.env.NODE_ENV !== "production" || process.env.CI === "true")
+        && process.env.VERCEL_ENV !== "production"
+        && typeof pathname === "string"
+        && pathname === "/api/test-only/contract-actions"
+    ) {
+        return NextResponse.next();
+    }
+
     // Legal pages are readable by anyone but are not an action endpoint.
     if (isServerAction && typeof pathname === "string" && LEGAL_PAGE_PATTERN.test(pathname)) {
         return new NextResponse("Forbidden", { status: 403 });
