@@ -3071,42 +3071,89 @@ ALTER TABLE "_VendorToVendorTag" ADD CONSTRAINT "_VendorToVendorTag_A_fkey" FORE
 -- AddForeignKey
 ALTER TABLE "_VendorToVendorTag" ADD CONSTRAINT "_VendorToVendorTag_B_fkey" FOREIGN KEY ("B") REFERENCES "VendorTag"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
-
--- ---------------------------------------------------------------------------
--- Partial indexes.
+-- ==== PRISMA BLIND SPOTS (hand-maintained, generated block) ====
 --
--- Prisma's migrate/introspection engine has no representation for a partial
--- index, so `migrate diff --from-empty --to-schema-datasource` silently OMITS
--- all seven of these rather than emitting them. Three of them are UNIQUE and
--- enforce real invariants (Twilio webhook dedup, deposit-reservation
--- uniqueness, one client thread per project) — a database built without them
--- accepts duplicates that production rejects, which is precisely the
--- CI-does-not-match-prod failure this baseline exists to prevent.
+-- Everything above is Prisma's own `migrate diff --from-empty
+-- --to-schema-datasource` output. Everything below is NOT: these are objects
+-- that exist in production but that Prisma's migrate engine has no
+-- representation for, so it omits them from that output silently — no
+-- warning, no comment, nothing. A database built from the generated half
+-- alone is missing all of them.
 --
--- They are therefore appended by hand, verbatim from production's
--- pg_indexes.indexdef. If you ever regenerate this file from the diff engine,
--- you MUST re-append this block. scripts/check-partial-indexes.mjs asserts the
--- set below still matches production, so drift here fails CI rather than
--- rotting silently.
--- ---------------------------------------------------------------------------
+-- This block is generated from prisma/prisma-blind-spots.json (itself
+-- snapshotted from production by scripts/snapshot-prisma-blind-spots.mjs).
+-- scripts/check-migrations-match.mjs asserts a migrated database matches that
+-- file exactly, so drift here fails CI instead of rotting.
+--
+-- This migration is already marked applied in production and its checksum is
+-- recorded there. Do NOT edit or regenerate it — corrections belong in a new
+-- migration.
 
--- CreateIndex
-CREATE UNIQUE INDEX "ClientMessage_twilioMessageSid_key" ON "ClientMessage" USING btree ("twilioMessageSid") WHERE ("twilioMessageSid" IS NOT NULL);
+-- ---- 7 partial indexes ----
+-- Three are UNIQUE and carry real invariants: Twilio webhook dedup,
+-- deposit-reservation uniqueness, and one client thread per project. Without
+-- them a database accepts duplicates production rejects.
 
--- CreateIndex
-CREATE UNIQUE INDEX "DepositIngest_paymentScheduleId_reservation_key" ON "DepositIngest" USING btree ("paymentScheduleId") WHERE ((status = ANY (ARRAY['processing'::text, 'qbo_unknown'::text, 'qbo_created'::text, 'applied'::text, 'reconcile'::text, 'failed'::text])) AND ("paymentScheduleId" IS NOT NULL));
+CREATE UNIQUE INDEX "ClientMessage_twilioMessageSid_key" ON public."ClientMessage" USING btree ("twilioMessageSid") WHERE ("twilioMessageSid" IS NOT NULL);
 
--- CreateIndex
-CREATE UNIQUE INDEX "MessageThread_projectId_client_unique" ON "MessageThread" USING btree ("projectId") WHERE ("subcontractorId" IS NULL);
+CREATE UNIQUE INDEX "DepositIngest_paymentScheduleId_reservation_key" ON public."DepositIngest" USING btree ("paymentScheduleId") WHERE ((status = ANY (ARRAY['processing'::text, 'qbo_unknown'::text, 'qbo_created'::text, 'applied'::text, 'reconcile'::text, 'failed'::text])) AND ("paymentScheduleId" IS NOT NULL));
 
--- CreateIndex
-CREATE INDEX "ReviewAlertBatch_claimed_lease_idx" ON "ReviewAlertBatch" USING btree ("claimedAt", "createdAt") WHERE (status = 'CLAIMED'::text);
+CREATE UNIQUE INDEX "MessageThread_projectId_client_unique" ON public."MessageThread" USING btree ("projectId") WHERE ("subcontractorId" IS NULL);
 
--- CreateIndex
-CREATE INDEX "ReviewAlertBatch_pending_retry_idx" ON "ReviewAlertBatch" USING btree ("nextAttemptAt", "createdAt") WHERE (status = 'PENDING'::text);
+CREATE INDEX "ReviewAlertBatch_claimed_lease_idx" ON public."ReviewAlertBatch" USING btree ("claimedAt", "createdAt") WHERE (status = 'CLAIMED'::text);
 
--- CreateIndex
-CREATE INDEX "ReviewAlertEpisode_claimed_lease_idx" ON "ReviewAlertEpisode" USING btree ("claimedAt", "createdAt") WHERE (status = 'CLAIMED'::text);
+CREATE INDEX "ReviewAlertBatch_pending_retry_idx" ON public."ReviewAlertBatch" USING btree ("nextAttemptAt", "createdAt") WHERE (status = 'PENDING'::text);
 
--- CreateIndex
-CREATE INDEX "ReviewAlertEpisode_pending_retry_idx" ON "ReviewAlertEpisode" USING btree ("nextAttemptAt", "createdAt") WHERE (status = 'PENDING'::text);
+CREATE INDEX "ReviewAlertEpisode_claimed_lease_idx" ON public."ReviewAlertEpisode" USING btree ("claimedAt", "createdAt") WHERE (status = 'CLAIMED'::text);
+
+CREATE INDEX "ReviewAlertEpisode_pending_retry_idx" ON public."ReviewAlertEpisode" USING btree ("nextAttemptAt", "createdAt") WHERE (status = 'PENDING'::text);
+
+-- ---- 6 CHECK constraints ----
+-- Prisma has no check-constraint concept at all. Two of these are XOR
+-- ownership invariants (a ClientMessage belongs to a lead or a project, never
+-- both or neither; likewise a RoomDesign).
+
+ALTER TABLE "QboPurchaseClassification" ADD CONSTRAINT "QboPurchaseClassification_classification_check" CHECK ((classification = ANY (ARRAY['job-cost'::text, 'overhead'::text, 'owner-draw'::text, 'unknown'::text])));
+
+ALTER TABLE "ReviewAlertBatch" ADD CONSTRAINT "ReviewAlertBatch_status_check" CHECK ((status = ANY (ARRAY['PENDING'::text, 'CLAIMED'::text, 'SENT'::text, 'FAILED'::text])));
+
+ALTER TABLE "ReviewAlertEpisode" ADD CONSTRAINT "ReviewAlertEpisode_status_check" CHECK ((status = ANY (ARRAY['PENDING'::text, 'CLAIMED'::text, 'SENT'::text, 'FAILED'::text, 'SUPERSEDED'::text, 'CANCELLED'::text, 'SUPPRESSED'::text, 'BATCHED'::text])));
+
+ALTER TABLE "RolloutGate" ADD CONSTRAINT "RolloutGate_status_check" CHECK ((status = ANY (ARRAY['pending'::text, 'in-progress'::text, 'complete'::text])));
+
+ALTER TABLE "RoomDesign" ADD CONSTRAINT "RoomDesign_owner_xor" CHECK (((("projectId" IS NOT NULL) AND ("leadId" IS NULL)) OR (("projectId" IS NULL) AND ("leadId" IS NOT NULL))));
+
+ALTER TABLE "ClientMessage" ADD CONSTRAINT "chk_client_message_one_owner" CHECK ((((("leadId" IS NOT NULL))::integer + (("projectId" IS NOT NULL))::integer) = 1));
+
+-- ---- row-level security on 26 tables ----
+-- Enabled in production with zero policies attached. Table owners bypass RLS
+-- unless FORCE is set, which is why the application still reads these tables;
+-- reproduced here so a migrated database matches production rather than
+-- quietly diverging.
+
+ALTER TABLE "AutomationEvent" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "AutomationSetting" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ChatDelivery" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DailyLog" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DailyLogPhoto" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "Decision" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DecisionTemplate" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DecisionTemplateItem" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DepositIngest" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DispatchPublication" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "DispatchPublicationChange" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "EstimateItemPurchaseOrder" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "McpConfirmation" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "McpKey" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "Permit" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ProductLibraryItem" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ProjectProductFavorite" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "QboPurchaseClassification" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ReviewAlertBatch" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ReviewAlertEpisode" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "ReviewIssue" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "RolloutGate" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "SelectionItemComment" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "SelectionProposal" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "TaskMaterial" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "TaskPunchItem" ENABLE ROW LEVEL SECURITY;

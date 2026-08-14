@@ -51,6 +51,16 @@ jobs:
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
+      # prisma/EXPECTED_SCHEMA_GAP.sql is intended to become the NEXT migration,
+      # so its executability is part of its contract. Running it here catches the
+      # class of error that would otherwise only surface against production —
+      # e.g. an index whose name the baseline already used.
+      - name: Apply the recorded schema gap
+        run: npx prisma db execute --file prisma/EXPECTED_SCHEMA_GAP.sql --schema prisma/schema.prisma
+
+      - name: Assert the gap actually closes the gap
+        run: node scripts/check-migrations-match.mjs --gap-applied
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest

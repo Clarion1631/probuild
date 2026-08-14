@@ -40,9 +40,6 @@ CREATE TABLE "_SelectionProposalStatusBackup" (
 );
 
 -- CreateIndex
-CREATE UNIQUE INDEX "ClientMessage_twilioMessageSid_key" ON "ClientMessage"("twilioMessageSid");
-
--- CreateIndex
 CREATE INDEX "ClientMessage_leadId_idx" ON "ClientMessage"("leadId");
 
 -- CreateIndex

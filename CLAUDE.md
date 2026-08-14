@@ -160,9 +160,10 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 > migration, which left `migrate dev` no useful work either. Neither mutating command was run
 > against prod, so those are the diffs they would have faced, not observed outcomes.
 >
-> **The schema half of that is fixed (#370) and the history half is fixed (#377).** `schema.prisma`
+> **The schema half of that is fixed (#370) and the history half is fixed (#382).** `schema.prisma`
 > now describes prod, and `prisma/migrations/` now holds a real baseline
-> (`20260814000000_baseline_production`) that is marked applied in prod's `_prisma_migrations`.
+> (`20260814000000_baseline_production`), marked applied in prod's `_prisma_migrations` by a
+> deliberate one-off step that is gated on CI being green — it is NOT done by merging.
 > `migrate dev` still is not usable from this machine (it needs `DIRECT_URL`, still IPv6-only), so
 > the PowerShell script below remains the local write path. What changed is that the committed
 > migrations are now *true*: CI's `migrations` job builds a throwaway Postgres from them and asserts
@@ -179,7 +180,12 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
   three of them UNIQUE constraints carrying real invariants. They are appended by hand at the end of
   the baseline. If you ever regenerate that file, re-append the block, or CI's
   `scripts/check-migrations-match.mjs` will fail (which is the point).
-- Never run the baseline against prod. It is already marked applied there.
+- **Never edit or regenerate the baseline.** It is marked applied in prod and its checksum is
+  recorded there; changing the file breaks `migrate status`. Corrections go in a new migration.
+- Some diff output is permanent and must never be applied — `prisma/PRISMA_PHANTOM_DIFF.sql`
+  explains the one current case (prod's partial unique index on `ClientMessage.twilioMessageSid`,
+  which Prisma cannot see and so proposes recreating forever).
+- `.github/workflows/db-push.yml` was deleted; see `docs/DB-MIGRATE-WORKFLOW.md`.
 
 **Working approach (local SQL writes):**
 1. Edit SQL in `C:\Users\jat00\AppData\Local\Temp\apply_schema.ps1`

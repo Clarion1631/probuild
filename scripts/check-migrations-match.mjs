@@ -2,23 +2,31 @@
 // Proves that a database built from prisma/migrations/ reproduces PRODUCTION.
 //
 // Run against a THROWAWAY Postgres that has just had `prisma migrate deploy`
-// applied to it. Never point this at production (it only reads, but there is no
-// reason to).
+// applied. Never point it at production.
 //
-// Two assertions, because one alone is not enough:
+//   node scripts/check-migrations-match.mjs            # after migrate deploy
+//   node scripts/check-migrations-match.mjs --gap-applied
+//       # after additionally applying prisma/EXPECTED_SCHEMA_GAP.sql, which
+//       # proves that file is executable and really does close the gap
 //
-//  1. The migrated database differs from prisma/schema.prisma by EXACTLY the set
-//     of statements in prisma/EXPECTED_SCHEMA_GAP.sql — which was captured from
-//     production. Same diff-to-schema => same shape as production, as far as
-//     Prisma can see.
+// Two independent assertions, because neither alone is sufficient:
 //
-//  2. Prisma CANNOT see partial indexes; its diff engine has no representation
-//     for them and silently omits them. So assertion 1 is blind to exactly the
-//     objects most likely to be lost when the baseline is regenerated. We
-//     therefore query pg_indexes directly and require all seven to be present,
-//     with their WHERE clauses intact. Three of them are UNIQUE and enforce real
-//     invariants (Twilio webhook dedup, deposit-reservation uniqueness, one
-//     client thread per project).
+//  1. DIFF SET. The database's `migrate diff` to schema.prisma must equal
+//     EXPECTED_SCHEMA_GAP.sql + PRISMA_PHANTOM_DIFF.sql, statement for
+//     statement. Production's diff to schema.prisma is the same set, so
+//     matching it means matching production's shape as far as Prisma can see.
+//
+//  2. BLIND SPOTS. Prisma's diff engine cannot represent partial indexes, check
+//     constraints, or row-level security, and omits them from its output
+//     without comment. Assertion 1 is therefore structurally blind to exactly
+//     the objects most likely to be lost. We compare those directly against
+//     prisma/prisma-blind-spots.json, which was snapshotted from production.
+//
+// What this does NOT prove: object classes absent from both checks. Production
+// currently has no views, no triggers, no stored routines and no RLS policies
+// (verified 2026-08-14, see the snapshot's `policies` array), so the two
+// assertions together do cover it today — but that is a fact about production
+// right now, not a guarantee. Add a class here if one ever appears.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -26,6 +34,10 @@ import path from 'node:path'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const GAP_FILE = path.join(ROOT, 'prisma', 'EXPECTED_SCHEMA_GAP.sql')
+const PHANTOM_FILE = path.join(ROOT, 'prisma', 'PRISMA_PHANTOM_DIFF.sql')
+const SNAPSHOT = path.join(ROOT, 'prisma', 'prisma-blind-spots.json')
+const gapApplied = process.argv.includes('--gap-applied')
+
 const url = process.env.DIRECT_URL || process.env.DATABASE_URL
 if (!url) {
   console.error('check-migrations-match: set DIRECT_URL (or DATABASE_URL) to the throwaway database')
@@ -36,9 +48,22 @@ if (/supabase\.(co|com)/i.test(url) && process.env.ALLOW_PROD_MIGRATION_CHECK !=
   process.exit(2)
 }
 
-// Split a SQL script into normalised, comparable statements: drop comment lines
-// and blank lines, collapse whitespace, then sort (statement ORDER is not
-// meaningful for a diff-set comparison, only membership).
+let failed = false
+const fail = (msg) => {
+  failed = true
+  console.error('\n✖ ' + msg)
+}
+
+// ---------------------------------------------------------------------------
+// 1. diff set
+// ---------------------------------------------------------------------------
+
+// Normalise a SQL script into comparable statements. Splitting on ';' is safe
+// for THIS input specifically: every statement is machine-generated DDL from
+// Prisma or from pg_get_*def, none of which emit a semicolon inside a string
+// literal or a dollar-quoted body. It would not be safe for arbitrary SQL, so
+// if this ever has to handle hand-written migrations, replace it with a real
+// lexer rather than extending the heuristic.
 function statements(sql) {
   return sql
     .split(/\r?\n/)
@@ -47,8 +72,27 @@ function statements(sql) {
     .split(';')
     .map((s) => s.replace(/\s+/g, ' ').trim())
     .filter(Boolean)
-    .sort()
 }
+
+// Multiset difference: a statement appearing twice must appear twice on both
+// sides. Plain set membership would let a duplicated statement pass unnoticed.
+function multisetDiff(a, b) {
+  const counts = new Map()
+  for (const s of b) counts.set(s, (counts.get(s) ?? 0) + 1)
+  const extra = []
+  for (const s of a) {
+    const n = counts.get(s) ?? 0
+    if (n === 0) extra.push(s)
+    else counts.set(s, n - 1)
+  }
+  return extra
+}
+
+const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '')
+const expected = [
+  ...(gapApplied ? [] : statements(read(GAP_FILE))),
+  ...statements(read(PHANTOM_FILE)),
+]
 
 const actualRaw = execFileSync(
   process.platform === 'win32' ? 'npx.cmd' : 'npx',
@@ -64,82 +108,108 @@ const actualRaw = execFileSync(
   ],
   { cwd: ROOT, encoding: 'utf8', shell: process.platform === 'win32' }
 )
-
-const expected = statements(existsSync(GAP_FILE) ? readFileSync(GAP_FILE, 'utf8') : '')
 const actual = statements(actualRaw)
 
-const missing = expected.filter((s) => !actual.includes(s))
-const unexpected = actual.filter((s) => !expected.includes(s))
+const unexpected = multisetDiff(actual, expected)
+const missing = multisetDiff(expected, actual)
 
-let failed = false
 if (unexpected.length) {
-  failed = true
-  console.error(
-    `\n✖ ${unexpected.length} statement(s) differ between the migrated database and schema.prisma\n` +
-      `  that are NOT part of the accepted production gap. The migrations no longer\n` +
-      `  reproduce production — either a migration is missing, or schema.prisma moved\n` +
-      `  without one.\n`
+  fail(
+    `${unexpected.length} statement(s) differ between this database and schema.prisma that are\n` +
+      `  NOT accounted for. Either a migration is missing, or schema.prisma moved without one:`
   )
   for (const s of unexpected) console.error('    + ' + s)
 }
 if (missing.length) {
-  failed = true
-  console.error(
-    `\n✖ ${missing.length} statement(s) in prisma/EXPECTED_SCHEMA_GAP.sql no longer appear in the diff.\n` +
-      `  If production was brought up to date, apply that gap as a real migration and\n` +
-      `  delete the file — do not leave it stale.\n`
+  fail(
+    `${missing.length} expected statement(s) no longer appear in the diff. If the gap was closed,\n` +
+      `  apply it as a real migration and delete prisma/EXPECTED_SCHEMA_GAP.sql rather than\n` +
+      `  leaving it stale:`
   )
   for (const s of missing) console.error('    - ' + s)
 }
-
-// ---- assertion 2: the partial indexes Prisma's diff cannot see -------------
-const REQUIRED_PARTIAL = {
-  ClientMessage_twilioMessageSid_key: '"twilioMessageSid" IS NOT NULL',
-  DepositIngest_paymentScheduleId_reservation_key: '"paymentScheduleId" IS NOT NULL',
-  MessageThread_projectId_client_unique: '"subcontractorId" IS NULL',
-  ReviewAlertBatch_claimed_lease_idx: "'CLAIMED'",
-  ReviewAlertBatch_pending_retry_idx: "'PENDING'",
-  ReviewAlertEpisode_claimed_lease_idx: "'CLAIMED'",
-  ReviewAlertEpisode_pending_retry_idx: "'PENDING'",
+if (unexpected.length || missing.length) {
+  console.error('\n--- full diff actually produced (for reference) ---')
+  console.error(actualRaw.trim() || '(empty)')
+  console.error('--- end ---')
 }
 
+// ---------------------------------------------------------------------------
+// 2. blind spots
+// ---------------------------------------------------------------------------
+const snap = JSON.parse(readFileSync(SNAPSHOT, 'utf8'))
 const { PrismaClient } = await import('@prisma/client')
-const client = new PrismaClient({ datasources: { db: { url } } })
-const rows = await client.$queryRawUnsafe(
-  `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexdef ILIKE '%WHERE%'`
-)
-await client.$disconnect()
+const db = new PrismaClient({ datasources: { db: { url } } })
+const q = (sql) => db.$queryRawUnsafe(sql)
 
-const found = new Map(rows.map((r) => [r.indexname, r.indexdef]))
-for (const [name, mustContain] of Object.entries(REQUIRED_PARTIAL)) {
-  const def = found.get(name)
-  if (!def) {
-    failed = true
-    console.error(
-      `\n✖ partial index "${name}" is missing from the migrated database.\n` +
-        `  Prisma's diff engine omits partial indexes, so this is almost certainly a\n` +
-        `  baseline that was regenerated without re-appending the hand-written block\n` +
-        `  at the end of prisma/migrations/20260814000000_baseline_production/migration.sql.`
-    )
-  } else if (!def.includes(mustContain)) {
-    failed = true
-    console.error(
-      `\n✖ partial index "${name}" exists but its predicate changed.\n` +
-        `  expected to contain: ${mustContain}\n  actual: ${def}`
-    )
+const norm = (s) => s.replace(/\s+/g, ' ').replace(/\bpublic\./g, '').trim()
+
+// Compare two name->definition maps exactly: missing, extra, and changed.
+function compareDefs(label, expectedRows, actualRows, hint) {
+  const exp = new Map(expectedRows.map((r) => [r.name, norm(r.def)]))
+  const act = new Map(actualRows.map((r) => [r.name, norm(r.def)]))
+  for (const [name, def] of exp) {
+    if (!act.has(name)) fail(`${label} "${name}" is MISSING from the database.\n  ${hint}`)
+    else if (act.get(name) !== def)
+      fail(
+        `${label} "${name}" has a DIFFERENT definition than production.\n` +
+          `  expected: ${def}\n  actual:   ${act.get(name)}`
+      )
+  }
+  for (const name of act.keys()) {
+    if (!exp.has(name))
+      fail(
+        `${label} "${name}" exists in the database but not in prisma/prisma-blind-spots.json.\n` +
+          `  If you added it deliberately, re-run scripts/snapshot-prisma-blind-spots.mjs against\n` +
+          `  production and commit the result.`
+      )
   }
 }
-const extraPartial = [...found.keys()].filter((n) => !(n in REQUIRED_PARTIAL))
-if (extraPartial.length) {
-  console.error(
-    `\n! note: ${extraPartial.length} partial index(es) present that this check does not know about: ` +
-      extraPartial.join(', ') +
-      `\n  If you added them deliberately, add them to REQUIRED_PARTIAL here and to the baseline.`
+
+compareDefs(
+  'partial index',
+  snap.partialIndexes,
+  await q(`SELECT c.relname AS name, pg_get_indexdef(i.indexrelid) AS def
+             FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relnamespace = 'public'::regnamespace AND i.indpred IS NOT NULL`),
+  "Prisma's diff omits partial indexes — the baseline's generated tail block is the only thing that creates them."
+)
+
+compareDefs(
+  'check constraint',
+  snap.checkConstraints,
+  await q(`SELECT conname AS name, pg_get_constraintdef(oid) AS def
+             FROM pg_constraint
+            WHERE connamespace = 'public'::regnamespace AND contype IN ('c','x')`),
+  'Prisma has no check-constraint concept; the baseline tail block creates these.'
+)
+
+const actualRls = new Set(
+  (
+    await q(`SELECT relname AS name FROM pg_class
+              WHERE relnamespace = 'public'::regnamespace AND relrowsecurity`)
+  ).map((r) => r.name)
+)
+const expectedRls = new Set(snap.rlsTables.map((r) => r.name))
+for (const t of expectedRls) if (!actualRls.has(t)) fail(`RLS is not enabled on "${t}" but is in production.`)
+for (const t of actualRls) if (!expectedRls.has(t)) fail(`RLS is enabled on "${t}" but not in production's snapshot.`)
+
+const actualPolicies = await q(
+  `SELECT tablename AS "table", policyname AS name FROM pg_policies WHERE schemaname = 'public'`
+)
+if (actualPolicies.length !== snap.policies.length)
+  fail(
+    `${actualPolicies.length} RLS policies present, snapshot records ${snap.policies.length}. ` +
+      `Re-snapshot if production changed.`
   )
-}
+
+await db.$disconnect()
 
 if (failed) process.exit(1)
 console.log(
-  `✓ migrations reproduce production: ${actual.length} diff statement(s), all accounted for by ` +
-    `prisma/EXPECTED_SCHEMA_GAP.sql, and all ${Object.keys(REQUIRED_PARTIAL).length} partial indexes present.`
+  `✓ migrations reproduce production` +
+    (gapApplied ? ' with EXPECTED_SCHEMA_GAP.sql applied' : '') +
+    `: ${actual.length} diff statement(s) all accounted for; ` +
+    `${snap.partialIndexes.length} partial indexes, ${snap.checkConstraints.length} check constraints, ` +
+    `${snap.rlsTables.length} RLS tables all match.`
 )

@@ -1,0 +1,22 @@
+-- Statements `prisma migrate diff` will ALWAYS propose against a database that
+-- exactly matches production, and that must NEVER be applied.
+--
+-- These are not drift. They are the diff engine reporting on objects it cannot
+-- see. schema.prisma marks ClientMessage.twilioMessageSid `@unique`; production
+-- enforces that with a PARTIAL unique index
+-- (`... WHERE "twilioMessageSid" IS NOT NULL`), which Prisma has no way to
+-- express. So Prisma sees "no unique index here" and proposes creating a plain
+-- one, forever.
+--
+-- Applying it would fail outright — the baseline already created an index of
+-- that exact name — and if it somehow succeeded it would be strictly stricter
+-- than production.
+--
+-- This file exists so the difference between "a real gap we intend to close"
+-- (prisma/EXPECTED_SCHEMA_GAP.sql) and "a permanent artefact of Prisma's blind
+-- spots" (here) is written down rather than rediscovered. Unlike the gap file,
+-- this one does not get deleted; it shrinks only if Prisma gains partial-index
+-- support or the schema stops relying on one.
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ClientMessage_twilioMessageSid_key" ON "ClientMessage"("twilioMessageSid");
