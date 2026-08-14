@@ -1731,6 +1731,12 @@ export async function billChangeOrderCore(
     };
 }
 
+// Standard manual-approval billing notice — pushed to summary.issues whenever
+// billing succeeds but no client email goes out because staff approved
+// manually. Extracted so the team-email block below can filter it back out
+// when deciding whether anything ELSE (e.g. a schedule failure) needs a look.
+const MANUAL_BILLING_NOTICE = "Manually approved by staff — billing created, no payment email sent to the client.";
+
 export async function handleChangeOrderApproved(
     changeOrderId: string,
     opts?: { notify?: boolean; freshlyApproved?: boolean; suppressClientEmails?: boolean },
@@ -1757,7 +1763,7 @@ export async function handleChangeOrderApproved(
     try {
         const co = await prisma.changeOrder.findUnique({
             where: { id: changeOrderId },
-            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, clientSignatureUrl: true, project: { select: { name: true } } },
+            select: { code: true, title: true, totalAmount: true, pricingType: true, markupPercent: true, approvedBy: true, clientSignatureUrl: true, status: true, project: { select: { name: true } } },
         });
         if (co) {
             coLabel = `${co.code} — ${co.title}`;
@@ -1792,7 +1798,7 @@ export async function handleChangeOrderApproved(
                 // exactly as on the portal path, but no client ever signed this CO,
                 // so no client-facing payment email goes out.
                 summary.billed = true;
-                summary.issues.push("Manually approved by staff — billing created, no payment email sent to the client.");
+                summary.issues.push(MANUAL_BILLING_NOTICE);
             } else {
                 summary.billed = true;
                 const freshIds = bill.milestones.filter((row) => row.created).map((row) => row.id);
@@ -1845,17 +1851,27 @@ export async function handleChangeOrderApproved(
                 : summary.sent ? "sent"
                 : (isManualApproval && summary.billed) ? "manual"
                 : "needsLook";
+            // A schedule failure (pushed to summary.issues above, after billing)
+            // must not be hidden behind the manual outcome's ✅ subject — filter
+            // the standard manual notice back out to see if anything ELSE needs a look.
+            const manualExtraIssues = summary.issues.filter((issue) => issue !== MANUAL_BILLING_NOTICE);
+            const manualNeedsLook = outcomeKind === "manual" && manualExtraIssues.length > 0;
+            const reviewParagraph = `<p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
             const subject = {
                 awaitingActuals: `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`,
                 sent: `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`,
-                manual: `✅ Change order manually approved by staff — ${coLabel} (${amountLabel})`,
+                manual: manualNeedsLook
+                    ? `⚠️ Change order manually approved — needs a look — ${coLabel} (${amountLabel})`
+                    : `✅ Change order manually approved by staff — ${coLabel} (${amountLabel})`,
                 needsLook: `⚠️ Change order approved — needs a look — ${coLabel} (${amountLabel})`,
             }[outcomeKind];
             const detail = {
                 awaitingActuals: `<p>${isManualApproval ? `Staff (<strong>${esc(manualApprovedBy)}</strong>) manually approved` : "The customer approved"} the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>`,
                 sent: `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`,
-                manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual; no payment email was sent to the client.</p>`,
-                needsLook: `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul><p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`,
+                manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual; no payment email was sent to the client.</p>${manualNeedsLook ? `<ul>${manualExtraIssues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
+                needsLook: isManualApproval
+                    ? `<p>Staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} manually approved this change order (no client signature), but the automation did not complete cleanly:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}`
+                    : `<p>The customer signed, but no payment email went out automatically:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}`,
             }[outcomeKind];
             await sendNotification(
                 to,

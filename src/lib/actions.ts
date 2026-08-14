@@ -9301,7 +9301,7 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 // path, except the client-facing milestone payment email is suppressed (see
 // handleChangeOrderApproved's suppressClientEmails option and its own
 // DB-derived backstop for callers, like the cron sweep, that don't pass it).
-export async function manuallyApproveChangeOrder(id: string) {
+export async function manuallyApproveChangeOrder(id: string, expectedUpdatedAt: string) {
     "use server";
     const user = await assertActiveStaff();
     if (user.role !== "ADMIN" && user.role !== "MANAGER") throw new Error("Forbidden");
@@ -9310,10 +9310,14 @@ export async function manuallyApproveChangeOrder(id: string) {
     if (!target) throw new Error("Change order not found");
     if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
 
+    const expected = new Date(expectedUpdatedAt);
+    if (!expectedUpdatedAt || Number.isNaN(expected.getTime())) throw new Error("Missing change-order revision — refresh and try again.");
+
     const staffName = (user.name || user.email || "").trim();
     const approval = await manuallyApproveChangeOrderCore(id, {
         staffName,
         approvedAt: new Date(),
+        expectedUpdatedAt: expected,
     });
     if (!approval) throw new Error("Change order not found");
     const { co, transitioned } = approval;

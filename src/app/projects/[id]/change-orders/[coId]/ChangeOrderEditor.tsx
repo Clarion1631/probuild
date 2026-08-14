@@ -86,11 +86,13 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // last saved to the DB instead of what's on screen. Fail closed: a
             // failed save must never reach the approval call. handleSave() already
             // toasts its own failure.
-            const saved = isScopeLocked ? true : await handleSave();
+            // On the scope-locked path we pass the page-load revision, so a
+            // countersign or any other edit since page load fails closed with a refresh message.
+            const saved = isScopeLocked ? { updatedAt: initialData.updatedAt } : await handleSave();
             if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
-            const updated = await manuallyApproveChangeOrder(initialData.id);
+            const updated = await manuallyApproveChangeOrder(initialData.id, saved.updatedAt);
             setStatus(updated.status);
             toast.success("Change order marked as approved (manual)");
             setShowManualApproveConfirm(false);
@@ -104,11 +106,11 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
 
     // Returns whether the save persisted — the send flow must not email the client
     // a signature request when the save failed (they'd sign the stale amounts).
-    async function handleSave(): Promise<boolean> {
+    async function handleSave(): Promise<any | null> {
         if (isDeleting) return false; // Prevent saving if we are in the middle of deleting
         if (isScopeLocked) {
             toast.error("Signed change orders are locked. Create a new change order for additional work.");
-            return false;
+            return null;
         }
         setIsSaving(true);
         const mappedItems = items.map((item, index) => ({
@@ -146,10 +148,10 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             setStatus(updated.status);
             toast.success("Change Order saved");
             router.refresh();
-            return true;
+            return updated;
         } catch (e: any) {
             toast.error(e?.message || "Failed to save CO");
-            return false;
+            return null;
         } finally {
             setIsSaving(false);
         }

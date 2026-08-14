@@ -21,6 +21,7 @@ type ChangeOrderRow = {
     pricingType: string;
     totalAmount: number;
     clientSignatureUrl: string | null;
+    updatedAt: Date;
 };
 
 type ItemRow = { name: string; type: string; quantity: number; unitCost: number };
@@ -70,7 +71,7 @@ const fakePrisma = {
 
 let manuallyApproveChangeOrderCore: (
     id: string,
-    approval: { staffName: string; approvedAt: Date },
+    approval: { staffName: string; approvedAt: Date; expectedUpdatedAt: Date },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 
 const PRISMA_SPECIFIER = "./prisma";
@@ -111,6 +112,8 @@ beforeEach(() => {
     resetFixture();
 });
 
+const FIXTURE_UPDATED_AT = new Date("2026-08-01T00:00:00.000Z");
+
 function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderRow {
     return {
         id: "co-1",
@@ -119,6 +122,7 @@ function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderR
         pricingType: "FIXED",
         totalAmount: 1000,
         clientSignatureUrl: null,
+        updatedAt: FIXTURE_UPDATED_AT,
         ...overrides,
     };
 }
@@ -130,7 +134,7 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     state.items = oneItem;
 
     const approvedAt = new Date("2026-08-14T12:00:00.000Z");
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt });
+    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt, expectedUpdatedAt: FIXTURE_UPDATED_AT });
 
     assert.ok(result, "expected a transition result");
     assert.equal(result!.transitioned, true);
@@ -149,7 +153,7 @@ test("manual approve from Sent also succeeds", async () => {
     state.changeOrder = draftChangeOrder({ status: "Sent" });
     state.items = oneItem;
 
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date() });
+    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT });
     assert.ok(result);
     assert.equal(result!.co.status, "Approved");
 });
@@ -159,7 +163,7 @@ test("manual approve is rejected when the change order is already Approved", asy
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date() }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT }),
         /must be Draft or Sent/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
@@ -173,8 +177,40 @@ test("manual approve is rejected when a client signature already exists", async 
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date() }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedUpdatedAt: FIXTURE_UPDATED_AT }),
         /already has a client signature/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("manual approve is rejected when expectedUpdatedAt doesn't match the locked row's updatedAt (CAS guard)", async () => {
+    // Simulates the save/approve two-request race: the row was modified after
+    // the page loaded (e.g. a concurrent edit), so the stale revision token
+    // the client still holds must be refused rather than billed.
+    state.changeOrder = draftChangeOrder({ updatedAt: new Date("2026-08-02T00:00:00.000Z") });
+    state.items = oneItem;
+
+    await assert.rejects(
+        () => manuallyApproveChangeOrderCore("co-1", {
+            staffName: "Jane Doe",
+            approvedAt: new Date(),
+            expectedUpdatedAt: new Date("2026-08-01T00:00:00.000Z"),
+        }),
+        /modified after this page loaded — refresh and try again/,
+    );
+    assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("manual approve succeeds when expectedUpdatedAt matches the locked row's updatedAt", async () => {
+    const rowUpdatedAt = new Date("2026-08-05T09:30:00.000Z");
+    state.changeOrder = draftChangeOrder({ updatedAt: rowUpdatedAt });
+    state.items = oneItem;
+
+    const result = await manuallyApproveChangeOrderCore("co-1", {
+        staffName: "Jane Doe",
+        approvedAt: new Date(),
+        expectedUpdatedAt: rowUpdatedAt,
+    });
+    assert.ok(result);
+    assert.equal(result!.transitioned, true);
 });

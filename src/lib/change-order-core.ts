@@ -434,7 +434,7 @@ export async function approveChangeOrderCore(
  */
 export async function manuallyApproveChangeOrderCore(
     id: string,
-    approval: { staffName: string; approvedAt: Date },
+    approval: { staffName: string; approvedAt: Date; expectedUpdatedAt: Date },
 ) {
     return prisma.$transaction(async (tx) => {
         // Same parent-row lock as approveChangeOrderCore/updateChangeOrderCore/
@@ -442,9 +442,9 @@ export async function manuallyApproveChangeOrderCore(
         // approval write observe one serialized state.
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
-            clientSignatureUrl: string | null;
+            clientSignatureUrl: string | null; updatedAt: Date;
         }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl"
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "updatedAt"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -454,6 +454,15 @@ export async function manuallyApproveChangeOrderCore(
         }
         if (current.clientSignatureUrl) {
             throw new Error(`Change order ${current.code} already has a client signature — use the portal approval flow.`);
+        }
+
+        // CAS guard against the save/approve two-request race: the client does
+        // save (request 1) then approve (request 2), and a concurrent edit
+        // between them must not bill stale values. updatedAt is the revision
+        // token the caller read the page with — a mismatch means the row
+        // changed underneath it since then.
+        if (current.updatedAt.getTime() !== approval.expectedUpdatedAt.getTime()) {
+            throw new Error(`Change order ${current.code} was modified after this page loaded — refresh and try again.`);
         }
 
         if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");

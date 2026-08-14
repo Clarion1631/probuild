@@ -15,10 +15,11 @@ export const MANUAL_CO_APPROVAL_SUFFIX = " (manual approval — staff)";
 export type ManualApprovalCoFields = {
     clientSignatureUrl?: string | null;
     approvedBy?: string | null;
+    status?: string | null;
 };
 
 export function isManualCoApproval(co: ManualApprovalCoFields | null | undefined): boolean {
-    return !!co && !co.clientSignatureUrl && !!co.approvedBy && co.approvedBy.endsWith(MANUAL_CO_APPROVAL_SUFFIX);
+    return !!co && co.status === "Approved" && !co.clientSignatureUrl && !!co.approvedBy && co.approvedBy.endsWith(MANUAL_CO_APPROVAL_SUFFIX);
 }
 
 /** Strips the marker suffix back off, e.g. for "Jane Doe (manual approval — staff)" -> "Jane Doe". */
