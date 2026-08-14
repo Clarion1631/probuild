@@ -7,18 +7,52 @@
  * math passing tells us nothing about whether the route wired the real values through correctly —
  * this test drives the actual POST handler against a mocked Prisma and asserts on what was written.
  *
- * Requires Node's module-mocking flag: `--experimental-test-module-mocks` (see package.json).
- *
  * `@/lib/prisma` is mocked ONCE at module scope (not per-test / not re-imported) because
- * re-registering `mock.module` for the same specifier across multiple dynamic re-imports of the
- * route was observed to silently keep serving the FIRST test's mocked prisma object instead of a
- * fresh one — the route module doesn't seem to actually re-evaluate its `@/lib/prisma` import on a
+ * re-registering the mock for the same specifier across multiple dynamic re-imports of the route
+ * was observed to silently keep serving the FIRST test's mocked prisma object instead of a fresh
+ * one — the route module doesn't seem to actually re-evaluate its `@/lib/prisma` import on a
  * cache-busted re-import. Instead, the fake Prisma's behavior reads from a single mutable `state`
  * object that each test overwrites before calling the (single, statically loaded) route handler.
+ *
+ * HOW THE MOCK IS APPLIED — and why this is a manual `Module.prototype.require` patch rather than
+ * `node:test`'s own `mock.module()`, even though `--experimental-test-module-mocks` sounds like
+ * exactly the built-in tool for this job:
+ *
+ * This suite passed locally (this workstation runs Node 24) on every run while failing in CI
+ * (pinned to Node 20 — see .github/workflows/ci.yml) on every run, always with the same symptom:
+ * `TypeError: POST is not a function` across all 15 tests. Reproducing CI's exact Node version
+ * directly (not just "some Linux box" — Node 20.19.0 on a real Linux filesystem) isolated the
+ * cause precisely:
+ *
+ *   - tsx compiles this test file (and the route it dynamically imports) to CommonJS —
+ *     `typeof __dirname === "string"` at runtime here proves it — and route.ts's static
+ *     `import { prisma } from "@/lib/prisma"` transpiles to a literal `require("@/lib/prisma")`
+ *     call, alias text left untouched (tsx defers "@/..." alias resolution to its own require
+ *     hook rather than rewriting the string at transform time). Confirmed by monkey-patching
+ *     `Module.prototype.require` and logging every call made while importing the route.
+ *   - `node:test`'s `mock.module()` does not merely fail to intercept that CJS `require()` call on
+ *     Node 20 — calling it AT ALL (even wrapped in try/catch, even when its own registration call
+ *     doesn't throw) corrupts something in the require chain such that a subsequent, otherwise-
+ *     working manual `require()` patch for the same specifier stops taking effect too. Confirmed
+ *     by an A/B run on Node 20.19.0: identical test file, only the `mock.module()` call present vs
+ *     removed — present: all 15 fail with `POST is not a function`; removed (require-patch only):
+ *     all 15 pass. Node 22+ does not exhibit this — `mock.module()` alone was already sufficient
+ *     there, which is exactly why this was invisible on every local run.
+ *
+ * Given `mock.module()` is actively unsafe here on the Node version this repo's CI actually runs,
+ * this file does not call it at all, and `--experimental-test-module-mocks` has been dropped from
+ * `test:unit` in package.json (no other file in that script uses `mock.module` — verified by grep
+ * across every file `test:unit` runs before making that change). The mock is instead a plain
+ * `Module.prototype.require` override scoped to the exact literal specifier route.ts uses
+ * ("@/lib/prisma"), restored immediately after the route's one-time synchronous load. This is
+ * fully deterministic — it doesn't depend on any module resolver's notion of what "@/lib/prisma"
+ * resolves to, only on Node's own `require()` dispatch, which both Node 20 and Node 22+ interpose
+ * on. See `before()` below.
  */
 
-import { test, mock, before, beforeEach } from "node:test";
+import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import Module from "node:module";
 import { derivedMarginPct } from "../src/lib/budget-math";
 
 type CreateCall<T> = { data: T };
@@ -84,9 +118,57 @@ const fakePrisma = {
 // time any test body runs.
 let POST: (req: Request) => Promise<Response>;
 
+// The literal specifier route.ts uses for its own `import { prisma } from "@/lib/prisma"` — see
+// the file-header comment for why the mock below is keyed on this exact string (route.ts's own
+// unresolved import text, confirmed by intercepting every require() call while loading it) rather
+// than any path the test file itself computes for where it thinks that module lives.
+const PRISMA_SPECIFIER = "@/lib/prisma";
+
 before(async () => {
-    mock.module("../src/lib/prisma", { namedExports: { prisma: fakePrisma } });
-    const routeModule = await import("../src/app/api/takeoffs/convert-to-estimate/route");
+    // A manual CJS require() patch — see the file-header comment for why this replaces
+    // node:test's own `mock.module()` entirely rather than supplementing it. Scoped narrowly to
+    // the literal "@/lib/prisma" string so it can never shadow any other module, and restored in
+    // `finally` immediately after the route's one-time synchronous load — everything the route
+    // needs from prisma is captured into its closures at that moment, so nothing downstream
+    // depends on the patch staying in place.
+    const originalRequire = Module.prototype.require;
+    let requirePatchHit = false;
+    (Module.prototype as unknown as { require: (id: string) => unknown }).require = function (
+        this: NodeModule,
+        id: string,
+    ) {
+        if (id === PRISMA_SPECIFIER) {
+            requirePatchHit = true;
+            return { prisma: fakePrisma };
+        }
+        // eslint-disable-next-line prefer-rest-params
+        return originalRequire.apply(this, arguments as unknown as [string]);
+    } as typeof Module.prototype.require;
+
+    let routeModule: { POST?: unknown };
+    try {
+        routeModule = await import("../src/app/api/takeoffs/convert-to-estimate/route");
+    } finally {
+        Module.prototype.require = originalRequire;
+    }
+
+    // Loud, explicit guard: a mock that silently fails to apply must never again surface as 15
+    // mysterious "POST is not a function" failures scattered across every test body. If the patch
+    // above never actually reached route.ts's "@/lib/prisma" import, fail here, once, with the
+    // exact specifier it was keyed on and whether the patch even fired.
+    if (typeof routeModule.POST !== "function") {
+        throw new Error(
+            `takeoff-convert-tax.test.ts: mock of "${PRISMA_SPECIFIER}" did not apply — ` +
+                `route module's POST export is ${typeof routeModule.POST}, not a function. ` +
+                `The require() patch scoped to "${PRISMA_SPECIFIER}" ` +
+                `${requirePatchHit ? "WAS" : "was NOT"} hit while importing ` +
+                `"../src/app/api/takeoffs/convert-to-estimate/route". ` +
+                `If this fires, the route's "@/lib/prisma" import is resolving to something other ` +
+                `than the literal string "${PRISMA_SPECIFIER}" on this Node/tsx combination — ` +
+                `update PRISMA_SPECIFIER (and the require() patch's match) to whatever it resolves ` +
+                `to here instead of silently letting these tests fail downstream.`,
+        );
+    }
     POST = routeModule.POST as any;
 });
 
