@@ -17,6 +17,7 @@ import {
     MAX_PAY_PERIOD_RANGE_DAYS,
     type PayPeriodSummaryDependencies,
 } from "../src/lib/pay-period-summary-core";
+import { startOfDateInTimeZone } from "../src/lib/tz-date";
 
 const TZ = "America/Los_Angeles";
 
@@ -94,6 +95,30 @@ test(`a range of exactly ${MAX_PAY_PERIOD_RANGE_DAYS} days is accepted`, async (
     const end = new Date(start.getTime() + MAX_PAY_PERIOD_RANGE_DAYS * 24 * 60 * 60 * 1000);
     const res = await GET(req(`?start=${start.toISOString()}&end=${end.toISOString()}`));
     assert.equal(res.status, 200);
+});
+
+test(`a range of exactly ${MAX_PAY_PERIOD_RANGE_DAYS} company-local calendar days that spans a DST fall-back (a 25h day) is still accepted`, async () => {
+    // 2026-10-01 -> 2026-12-02 (PT) is exactly 62 company-local calendar
+    // days apart (Oct has 31 days, Nov has 30, plus 1 into December), and it
+    // spans the 2026-11-01 DST fall-back in America/Los_Angeles, where that
+    // one calendar day is 25 real hours instead of 24. The old fixed
+    // elapsedMs/86_400_000 math would compute ~62.04 days for this range and
+    // wrongly reject it even though it is exactly 62 calendar days.
+    const { dependencies } = createDeps();
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+    const start = startOfDateInTimeZone("2026-10-01", TZ);
+    const end = startOfDateInTimeZone("2026-12-02", TZ);
+    const res = await GET(req(`?start=${start.toISOString()}&end=${end.toISOString()}`));
+    assert.equal(res.status, 200);
+});
+
+test(`a range of ${MAX_PAY_PERIOD_RANGE_DAYS + 1} company-local calendar days spanning the same DST fall-back is still rejected`, async () => {
+    const { dependencies } = createDeps();
+    const { GET } = createPayPeriodSummaryHandlers(dependencies);
+    const start = startOfDateInTimeZone("2026-10-01", TZ);
+    const end = startOfDateInTimeZone("2026-12-03", TZ); // 63 calendar days
+    const res = await GET(req(`?start=${start.toISOString()}&end=${end.toISOString()}`));
+    assert.equal(res.status, 400);
 });
 
 test("propagates the authenticate() failure status/error unchanged", async () => {

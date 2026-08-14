@@ -10,7 +10,7 @@ import {
     type EntryPay,
     type OvertimeTimeEntry,
 } from "@/lib/overtime";
-import { addDaysToKey, startOfDateInTimeZone } from "@/lib/tz-date";
+import { addDaysToKey, dayKeyInTimeZone, daysBetweenDayKeys, startOfDateInTimeZone } from "@/lib/tz-date";
 
 // Pure DI core for GET /api/mobile/pay-period-summary — no static import of
 // mobile-auth.ts (which throws at MODULE LOAD if NEXTAUTH_SECRET is unset)
@@ -120,7 +120,17 @@ export function createPayPeriodSummaryHandlers(dependencies: PayPeriodSummaryDep
             if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end.getTime() <= start.getTime()) {
                 return NextResponse.json({ error: "Invalid start/end range" }, { status: 400 });
             }
-            const rangeDays = (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
+
+            const timeZone = await dependencies.resolveTimeZone();
+
+            // Company-local CALENDAR days, not fixed 24h math — a range of
+            // exactly MAX_PAY_PERIOD_RANGE_DAYS company-local calendar days
+            // spanning a DST transition is not exactly N*24h of real time (a
+            // fall-back day is 25h, a spring-forward day is 23h), so dividing
+            // raw elapsed ms by 86,400,000 can wrongly reject a legitimate
+            // range (fall-back) or wrongly accept an over-long one
+            // (spring-forward).
+            const rangeDays = daysBetweenDayKeys(dayKeyInTimeZone(start, timeZone), dayKeyInTimeZone(end, timeZone));
             if (rangeDays > MAX_PAY_PERIOD_RANGE_DAYS) {
                 return NextResponse.json(
                     { error: `start/end range must not exceed ${MAX_PAY_PERIOD_RANGE_DAYS} days` },
@@ -138,8 +148,6 @@ export function createPayPeriodSummaryHandlers(dependencies: PayPeriodSummaryDep
 
             const targetUser = await dependencies.getUser(targetUserId);
             if (!targetUser) return NextResponse.json({ error: "User not found" }, { status: 404 });
-
-            const timeZone = await dependencies.resolveTimeZone();
 
             // Exact full workweeks overlapping [start, end) — see file header.
             const rangeStartKey = workweekStartKey(start, timeZone);
