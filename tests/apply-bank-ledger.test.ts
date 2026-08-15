@@ -9,6 +9,28 @@ import { checkDatabaseIdentity, statements } from "../scripts/apply-bank-ledger.
 // and no env vars set. If that guard ever regresses, this import itself
 // starts throwing/exiting and every test below fails immediately.
 
+test("apply SQL never emits identifiers PostgreSQL will silently truncate", () => {
+    const identifierPatterns = [
+        /\bCREATE(?: UNIQUE)? INDEX IF NOT EXISTS "([^"]+)"/g,
+        /\bCONSTRAINT "([^"]+)"/g,
+        /\bCREATE(?: OR REPLACE)? FUNCTION ([A-Za-z_][A-Za-z0-9_]*)/g,
+        /\b(?:DROP TRIGGER IF EXISTS|CREATE TRIGGER) ([A-Za-z_][A-Za-z0-9_]*)/g,
+    ];
+    const names = statements.flatMap((sql: string) =>
+        identifierPatterns.flatMap(pattern =>
+            Array.from(sql.matchAll(new RegExp(pattern.source, "g")), match => match[1]),
+        ),
+    );
+
+    assert.ok(names.length > 0, "expected the apply script to emit named schema objects");
+    for (const name of names) {
+        assert.ok(
+            Buffer.byteLength(name, "utf8") <= 63,
+            `PostgreSQL will truncate the ${Buffer.byteLength(name, "utf8")}-byte identifier "${name}"`,
+        );
+    }
+});
+
 test("checkDatabaseIdentity (Codex round-3 defect 6: host is compared, not just db name)", async t => {
     await t.test("passes when both db and host match", () => {
         const result = checkDatabaseIdentity({ db: "probuild", host: "10.0.0.5", port: 5432 }, "probuild", "10.0.0.5");

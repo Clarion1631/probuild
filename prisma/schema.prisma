@@ -2765,7 +2765,7 @@ model BankLineObservation {
 
   createdAt DateTime @default(now())
 
-  @@unique([source, account, sourceDocumentId, sourceLineId])
+  @@unique([source, account, sourceDocumentId, sourceLineId], map: "BankLineObservation_source_account_sourceDocumentId_sourceLineI")
   @@index([bankLineId])
   @@index([account, postedDate])
 }

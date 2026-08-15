@@ -90,6 +90,13 @@ let expectHost;
 let maskedUrl;
 let urlFrom;
 
+// PostgreSQL stores at most 63 bytes per identifier. Prisma's default name
+// for this four-column unique index is 68 bytes and is therefore silently
+// truncated to this value by PostgreSQL. Keep one canonical spelling for
+// both DDL and post-apply verification; schema.prisma maps to the same name.
+const bankLineObservationSourceIdentityIndex =
+    "BankLineObservation_source_account_sourceDocumentId_sourceLineI";
+
 /** Queried and compared against --expect-db/--expect-host BEFORE the first mutating statement runs. */
 async function verifyDatabaseIdentity() {
     const rows = await prisma.$queryRaw`
@@ -181,7 +188,7 @@ export const statements = [
        "createdAt"         TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
        CONSTRAINT "BankLineObservation_pkey" PRIMARY KEY ("id")
      )`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS "BankLineObservation_source_account_sourceDocumentId_sourceLineId_key"
+    `CREATE UNIQUE INDEX IF NOT EXISTS "${bankLineObservationSourceIdentityIndex}"
        ON "BankLineObservation" ("source", "account", "sourceDocumentId", "sourceLineId")`,
     `CREATE INDEX IF NOT EXISTS "BankLineObservation_bankLineId_idx" ON "BankLineObservation" ("bankLineId")`,
     `CREATE INDEX IF NOT EXISTS "BankLineObservation_account_postedDate_idx" ON "BankLineObservation" ("account", "postedDate")`,
@@ -439,7 +446,7 @@ const expectedConstraints = [
     { name: "StatementImport_account_periodStart_periodEnd_key", table: "StatementImport" },
     { name: "StatementImport_status_check", table: "StatementImport" },
     { name: "BankLine_state_check", table: "BankLine" },
-    { name: "BankLineObservation_source_account_sourceDocumentId_sourceLineId_key", table: "BankLineObservation" },
+    { name: bankLineObservationSourceIdentityIndex, table: "BankLineObservation" },
     { name: "BankLineObservation_source_check", table: "BankLineObservation" },
     { name: "BankLineObservation_source_bankLineId_key", table: "BankLineObservation" },
     { name: "BankLineObservation_source_shape_check", table: "BankLineObservation" },
