@@ -503,7 +503,7 @@ export async function deleteLead(id: string) {
         // guard above and the delete. Nothing was written — report it the same way the guard
         // does instead of surfacing a raw Prisma error.
         if (error?.code === "P2003") {
-            throw new Error("Cannot delete a lead that has a linked project. Delete or detach the project first.");
+            throw new Error("Cannot delete a lead that has a linked project. Delete the project first.");
         }
         throw error;
     }
