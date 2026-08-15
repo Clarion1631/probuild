@@ -1853,12 +1853,20 @@ export async function handleChangeOrderApproved(
             // a structural flag, not an issue), so no filtering is needed.
             const awaitingActualsNeedsLook = outcomeKind === "awaitingActuals" && summary.issues.length > 0;
             const manualNeedsLook = outcomeKind === "manual" && summary.issues.length > 0;
+            // The send itself can succeed while a later step in this same call
+            // (schedule apply, a partial milestone-send error) still lands in
+            // summary.issues — outcomeKind picks "sent" purely off summary.sent,
+            // so without this check that CO gets the clean ✅ subject with no
+            // hint anything needs a look.
+            const sentNeedsLook = outcomeKind === "sent" && summary.issues.length > 0;
             const reviewParagraph = `<p>Review in ProBuild or ChatGPT (list_project_billing shows the state; send_milestone_invoice sends when appropriate).</p>`;
             const subject = {
                 awaitingActuals: awaitingActualsNeedsLook
                     ? `⚠️ Change order approved — awaiting actuals, needs a look — ${coLabel} (${amountLabel})`
                     : `Change order approved — awaiting actuals — ${coLabel} (${amountLabel})`,
-                sent: `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`,
+                sent: sentNeedsLook
+                    ? `⚠️ Change order approved & payment link sent — needs a look — ${coLabel} (${amountLabel})`
+                    : `✅ Change order approved & payment link sent — ${coLabel} (${amountLabel})`,
                 manual: manualNeedsLook
                     ? `⚠️ Change order manually approved — needs a look — ${coLabel} (${amountLabel})`
                     : `✅ Change order manually approved by staff — ${coLabel} (${amountLabel})`,
@@ -1866,7 +1874,7 @@ export async function handleChangeOrderApproved(
             }[outcomeKind];
             const detail = {
                 awaitingActuals: `<p>${isManualApproval ? `Staff (<strong>${esc(manualApprovedBy)}</strong>) manually approved` : "The customer approved"} the cost-plus scope and markup terms. No payment is due yet. Tag actual time and expenses to this change order, then run Bill actuals.</p>${awaitingActualsNeedsLook ? `<ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
-                sent: `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>`,
+                sent: `<p>The customer signed and the QuickBooks payment link for <strong>${esc(amountLabel)}</strong> was emailed to <strong>${esc(sentTo)}</strong> automatically.</p>${sentNeedsLook ? `<ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
                 manual: `<p>${esc(coLabel)} was manually approved by staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} — no client ever signed this change order. Billing was created on the invoice as usual.${summary.clientEmailSuppressed ? " No payment email was sent to the client." : ""}</p>${manualNeedsLook ? `<ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}` : ""}`,
                 needsLook: isManualApproval
                     ? `<p>Staff${manualApprovedBy ? ` (<strong>${esc(manualApprovedBy)}</strong>)` : ""} manually approved this change order (no client signature), but the automation did not complete cleanly:</p><ul>${summary.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>${reviewParagraph}`

@@ -48,7 +48,12 @@ export async function GET(request: Request) {
             continue;
         }
         const outcome = await handleChangeOrderApproved(co.id);
-        results.push({ code: co.code, action: outcome.sent ? "billed + sent" : `alerted: ${outcome.issues.join("; ")}` });
+        const action = outcome.sent
+            ? "billed + sent"
+            : outcome.clientEmailSuppressed
+                ? `billed; client email suppressed${outcome.issues.length ? `: ${outcome.issues.join("; ")}` : ""}`
+                : `alerted: ${outcome.issues.join("; ")}`;
+        results.push({ code: co.code, action });
     }
 
     if (results.some(r => !r.action.startsWith("skipped"))) {

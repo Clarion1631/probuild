@@ -8903,43 +8903,48 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
     });
     if (!estimate) throw new Error("Estimate not found");
 
-    const changeOrder = await prisma.changeOrder.create({
-        data: {
-            title: `Change Order for ${estimate.title}`,
-            projectId,
-            estimateId,
-            code: "CO-TEMP",
-            status: "Draft",
-        }
+    // Section headers carry their children's rolled-up total, and ChangeOrderItem is flat,
+    // so copying a header alongside its children would bill the section twice. Selecting a
+    // header means "bill this whole phase" — it resolves to the leaves underneath it.
+    const selectedItems = itemIds && itemIds.length > 0
+        ? selectedBillableRows(estimate.items, itemIds)
+        : [];
+
+    // Parent creation + code patch + item creation are one atomic transaction — a two-step
+    // create-then-populate left a window where staff could observe a half-copied Draft, or
+    // an item insert queued behind manual-approval's row lock could add scope to an
+    // already-Approved CO without bumping its revision. Creation always starts at
+    // revision 0, so no bump is needed once this is atomic.
+    const changeOrder = await prisma.$transaction(async (tx) => {
+        const created = await tx.changeOrder.create({
+            data: {
+                title: `Change Order for ${estimate.title}`,
+                projectId,
+                estimateId,
+                code: "CO-TEMP",
+                status: "Draft",
+                items: selectedItems.length > 0 ? {
+                    create: selectedItems.map((item) => ({
+                        name: item.name,
+                        description: item.description,
+                        type: item.type,
+                        quantity: item.quantity,
+                        baseCost: item.baseCost,
+                        markupPercent: item.markupPercent,
+                        unitCost: item.unitCost,
+                        total: item.total,
+                        order: item.order,
+                        costCodeId: item.costCodeId,
+                        costTypeId: item.costTypeId,
+                    }))
+                } : undefined,
+            }
+        });
+        return tx.changeOrder.update({
+            where: { id: created.id },
+            data: { code: `CO-${String(created.number).padStart(5, "0")}` },
+        });
     });
-
-    const coCode = `CO-${String(changeOrder.number).padStart(5, "0")}`;
-    await prisma.changeOrder.update({ where: { id: changeOrder.id }, data: { code: coCode } });
-
-    if (itemIds && itemIds.length > 0) {
-        // Section headers carry their children's rolled-up total, and ChangeOrderItem is flat,
-        // so copying a header alongside its children would bill the section twice. Selecting a
-        // header means "bill this whole phase" — it resolves to the leaves underneath it.
-        const selectedItems = selectedBillableRows(estimate.items, itemIds);
-        for (const item of selectedItems) {
-            await prisma.changeOrderItem.create({
-                data: {
-                    changeOrderId: changeOrder.id,
-                    name: item.name,
-                    description: item.description,
-                    type: item.type,
-                    quantity: item.quantity,
-                    baseCost: item.baseCost,
-                    markupPercent: item.markupPercent,
-                    unitCost: item.unitCost,
-                    total: item.total,
-                    order: item.order,
-                    costCodeId: item.costCodeId,
-                    costTypeId: item.costTypeId,
-                }
-            });
-        }
-    }
 
     revalidatePath(`/projects/${projectId}/change-orders`);
     return { id: changeOrder.id };

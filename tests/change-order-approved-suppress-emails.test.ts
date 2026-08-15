@@ -98,6 +98,14 @@ let handleChangeOrderApproved: (
     dependencies?: { billChangeOrder?: (...args: any[]) => any; sendMilestoneInvoices?: (...args: any[]) => any },
 ) => Promise<{ billed: boolean; sent: boolean; issues: string[]; awaitingActuals?: boolean; clientEmailSuppressed?: boolean }>;
 
+// Captured via dynamic import inside before() — AFTER the require patch below is
+// installed — so this resolves to the exact same cached schedule-core.ts module
+// instance that handleChangeOrderApproved's own internal `await import("./schedule-core")`
+// later returns. A static top-level import here would load schedule-core.ts (and bind
+// its internal `@/lib/prisma` require) before the patch exists, permanently wiring it to
+// the REAL prisma client instead of fakePrisma and breaking every other test in this file.
+let CoSchedulePreconditionError: new (...args: any[]) => Error;
+
 const PRISMA_SPECIFIER = "@/lib/prisma";
 const EMAIL_SPECIFIER = "./email";
 
@@ -136,6 +144,16 @@ before(async () => {
         );
     }
     handleChangeOrderApproved = mod.handleChangeOrderApproved as typeof handleChangeOrderApproved;
+
+    // Same reason this runs after the patch install: schedule-core.ts must load (and
+    // bind its @/lib/prisma require to fakePrisma) no earlier than any other test's
+    // load of it, so every test — including this one's real applyChangeOrderToSchedule
+    // exercise — shares one consistently-mocked module instance.
+    const scheduleMod: { CoSchedulePreconditionError?: unknown } = await import("../src/lib/schedule-core");
+    if (typeof scheduleMod.CoSchedulePreconditionError !== "function") {
+        throw new Error("change-order-approved-suppress-emails.test.ts: CoSchedulePreconditionError export not found on schedule-core");
+    }
+    CoSchedulePreconditionError = scheduleMod.CoSchedulePreconditionError as typeof CoSchedulePreconditionError;
 });
 
 beforeEach(() => {
@@ -231,6 +249,7 @@ test("explicit suppressClientEmails:true suppresses the send even for a portal-s
 
 test("default path (portal-signed CO, no option passed) still calls the milestone-send function", async () => {
     state.changeOrder = portalApprovedCo();
+    state.companySettings = { notificationEmail: "team@example.com", companyName: "GTR", email: null };
     let sendCallCount = 0;
     let sendArgs: any[] = [];
     const billChangeOrder = async () => freshBillResult();
@@ -252,6 +271,46 @@ test("default path (portal-signed CO, no option passed) still calls the mileston
     assert.equal(summary.billed, true);
     assert.equal(summary.sent, true);
     assert.equal(summary.clientEmailSuppressed, undefined);
+    assert.deepEqual(summary.issues, []);
+
+    // Clean sent path unchanged: no issues means the plain ✅ subject, not the ⚠️ variant.
+    assert.equal(sentEmails.length, 1);
+    const email = sentEmails[0];
+    assert.match(email.subject, /^✅ Change order approved & payment link sent —/);
+    assert.doesNotMatch(email.subject, /needs a look/);
+});
+
+test("email block: sent=true with a nonempty issue (schedule apply failed after a successful send) gets the needs-a-look ⚠️ sent subject, not the clean ✅", async () => {
+    // outcomeKind picks "sent" purely off summary.sent — this proves the round-4-style fix
+    // reaches that branch too: a portal approval whose send genuinely succeeded but whose
+    // freshlyApproved schedule-apply hook failed must not get the clean ✅ subject with no
+    // hint anything needs a look.
+    state.changeOrder = portalApprovedCo();
+    state.companySettings = { notificationEmail: "team@example.com", companyName: "GTR", email: null };
+    scheduleTransactionImpl = async () => {
+        throw new Error("schedule transaction failed: connection reset");
+    };
+    const billChangeOrder = async () => freshBillResult();
+    const sendMilestoneInvoices = async () => ({ results: [{ sentTo: "client@example.com", error: undefined }] });
+
+    const summary = await handleChangeOrderApproved(
+        "co-1",
+        { freshlyApproved: true },
+        { billChangeOrder, sendMilestoneInvoices },
+    );
+
+    assert.equal(summary.sent, true);
+    assert.ok(
+        summary.issues.some((issue) => issue.includes("schedule transaction failed: connection reset")),
+        "the schedule failure should land in summary.issues even though the send itself succeeded",
+    );
+
+    assert.equal(sentEmails.length, 1);
+    const email = sentEmails[0];
+    assert.match(email.subject, /^⚠️ Change order approved & payment link sent — needs a look —/);
+    assert.match(email.html, /The customer signed and the QuickBooks payment link/);
+    assert.match(email.html, /schedule transaction failed: connection reset/);
+    assert.match(email.html, /Review in ProBuild or ChatGPT/);
 });
 
 test("cron path: a manually-approved CO in the DB suppresses the send even when the caller never passes suppressClientEmails", async () => {
@@ -386,12 +445,13 @@ test("schedule hook failure on a freshly manually-approved CO flips the manual o
     // Real exercise of the schedule hook, not a hand-pushed issue string: freshlyApproved
     // triggers billing-core's dynamic import("./schedule-core"), whose real
     // applyChangeOrderToSchedule (via withTxRetry) calls prisma.$transaction — forced here to
-    // throw a plain (non-precondition) error, which handleChangeOrderApproved must push into
-    // summary.issues rather than swallow.
+    // throw a plain infrastructure error (NOT a CoSchedulePreconditionError — that class is
+    // deliberately suppressed, see the test below), which handleChangeOrderApproved must push
+    // into summary.issues rather than swallow.
     state.changeOrder = manualApprovedCo();
     state.companySettings = { notificationEmail: "team@example.com", companyName: "GTR", email: null };
     scheduleTransactionImpl = async () => {
-        throw new Error("Project has no start date yet");
+        throw new Error("schedule transaction failed: connection reset");
     };
     const billChangeOrder = async () => freshBillResult();
     const sendMilestoneInvoices = async () => {
@@ -407,14 +467,47 @@ test("schedule hook failure on a freshly manually-approved CO flips the manual o
     assert.equal(summary.billed, true);
     assert.equal(summary.clientEmailSuppressed, true);
     assert.ok(
-        summary.issues.some((issue) => issue.includes("Project has no start date yet")),
+        summary.issues.some((issue) => issue.includes("schedule transaction failed: connection reset")),
         "the schedule failure should land in summary.issues",
     );
 
     assert.equal(sentEmails.length, 1);
     const email = sentEmails[0];
     assert.match(email.subject, /^⚠️ Change order manually approved — needs a look —/);
-    assert.match(email.html, /Schedule update failed \(billing unaffected\).*Project has no start date yet/);
+    assert.match(email.html, /Schedule update failed \(billing unaffected\).*schedule transaction failed: connection reset/);
+});
+
+test("schedule hook precondition failure (project has no start date) is suppressed — never surfaces in summary.issues or the email", async () => {
+    // CoSchedulePreconditionError is the REAL error the hook throws when the project
+    // has no start date yet (schedule-core.ts's applyChangeOrderToSchedule) — billing-core
+    // deliberately swallows exactly this class, since it isn't a billing failure, just a
+    // schedule precondition that hasn't been met yet. Constructed via the actual class
+    // (not a lookalike message) so this proves the real suppression path, not a string match.
+    state.changeOrder = manualApprovedCo();
+    state.companySettings = { notificationEmail: "team@example.com", companyName: "GTR", email: null };
+    scheduleTransactionImpl = async () => {
+        throw new CoSchedulePreconditionError(`Project "Mueller Bathroom" has no start date yet — set one on the company dashboard before applying change orders to its schedule.`);
+    };
+    const billChangeOrder = async () => freshBillResult();
+    const sendMilestoneInvoices = async () => {
+        throw new Error("sendMilestoneInvoices must not be called on the suppressed manual-approval path");
+    };
+
+    const summary = await handleChangeOrderApproved(
+        "co-1",
+        { freshlyApproved: true },
+        { billChangeOrder, sendMilestoneInvoices },
+    );
+
+    assert.equal(summary.billed, true);
+    assert.equal(summary.clientEmailSuppressed, true);
+    assert.deepEqual(summary.issues, [], "a precondition failure must never land in summary.issues");
+
+    assert.equal(sentEmails.length, 1);
+    const email = sentEmails[0];
+    assert.match(email.subject, /^✅ Change order manually approved by staff —/);
+    assert.doesNotMatch(email.subject, /needs a look/);
+    assert.doesNotMatch(email.html, /has no start date yet/);
 });
 
 test("schedule hook failure on a freshly-approved cost-plus CO flips the awaitingActuals outcome to needs-a-look and lists the issue", async () => {
@@ -424,7 +517,7 @@ test("schedule hook failure on a freshly-approved cost-plus CO flips the awaitin
     state.changeOrder = portalApprovedCostPlusCo();
     state.companySettings = { notificationEmail: "team@example.com", companyName: "GTR", email: null };
     scheduleTransactionImpl = async () => {
-        throw new Error("Project has no start date yet");
+        throw new Error("schedule transaction failed: connection reset");
     };
     const billChangeOrder = async () => {
         throw new Error("billChangeOrder must not be called for a COST_PLUS change order");
@@ -441,14 +534,14 @@ test("schedule hook failure on a freshly-approved cost-plus CO flips the awaitin
 
     assert.equal(summary.awaitingActuals, true);
     assert.ok(
-        summary.issues.some((issue) => issue.includes("Project has no start date yet")),
+        summary.issues.some((issue) => issue.includes("schedule transaction failed: connection reset")),
         "the schedule failure should land in summary.issues",
     );
 
     assert.equal(sentEmails.length, 1);
     const email = sentEmails[0];
     assert.match(email.subject, /^⚠️ Change order approved — awaiting actuals, needs a look —/);
-    assert.match(email.html, /Schedule update failed \(billing unaffected\).*Project has no start date yet/);
+    assert.match(email.html, /Schedule update failed \(billing unaffected\).*schedule transaction failed: connection reset/);
 });
 
 test("clean cost-plus approval with no schedule hook attempt (freshlyApproved: false) keeps the plain awaiting-actuals subject", async () => {

@@ -104,6 +104,14 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             router.refresh();
         } catch (e: any) {
             toast.error(e?.message || "Failed to mark as approved");
+            // A CAS conflict means initialData.revision is stale — leaving the
+            // confirm dialog open just re-fails the same retry until a manual
+            // reload, since initialData never refreshes on its own. Close it and
+            // refresh so the next attempt picks up the current revision.
+            if (e?.message?.includes("was modified after this page loaded")) {
+                setShowManualApproveConfirm(false);
+                router.refresh();
+            }
         } finally {
             setIsManuallyApproving(false);
         }
