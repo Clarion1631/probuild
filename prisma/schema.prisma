@@ -2678,7 +2678,7 @@ model BankLine {
   id              String   @id @default(cuid())
   account         String // e.g. "WTB-0723"
   postedDate      DateTime @db.Date
-  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition — IMMUTABLE once any RefundEvent references this line (bank_line_amount_immutable_trigger, scripts/apply-bank-ledger.mjs; Codex round-3 should-fix)
+  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition — UNCONDITIONALLY IMMUTABLE once the row exists (bank_line_amount_immutable_trigger, scripts/apply-bank-ledger.mjs; Codex round-4 fix). Amounts come from bank statements; a correction is a new observation/line, never an edit.
   rawDescriptor   String
   normalizedPayee String // "" is a valid but exceptional value — paired with state EXCEPTION, never silently accepted as a real identity
   checkNumber     String?
@@ -2795,10 +2795,18 @@ model BankLineItem {
 // Postgres exception.
 //
 // That trigger only guards RefundEvent write time — a separate parent-side
-// trigger (bank_line_amount_immutable_trigger, Codex round-3 should-fix)
-// rejects any later UPDATE that changes BankLine.amountCents once a
-// RefundEvent references that line, so the sign pairing validated here can't
-// be silently broken afterward by editing the BankLine instead.
+// trigger (bank_line_amount_immutable_trigger, Codex round-4 fix) rejects
+// ANY UPDATE that changes BankLine.amountCents, unconditionally, not just
+// once a RefundEvent references the line. Round-3's version gated the check
+// behind an EXISTS lookup against RefundEvent, which an unlocked MVCC read
+// let race a concurrent RefundEvent insert + amountCents update into both
+// committing — and once every referencing RefundEvent was deleted, the
+// amount became editable again. BankLine.amountCents comes from a bank
+// statement and must never change after the row exists; a correction is a
+// new observation/line, never an edit. Making it unconditional removes that
+// race entirely and means the sign pairing validated by
+// validateRefundEventSigns() can never be silently broken afterward by
+// editing the BankLine instead.
 model RefundEvent {
   id                 String    @id @default(cuid())
   originalBankLineId String?

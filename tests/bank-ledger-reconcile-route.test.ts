@@ -27,7 +27,7 @@ function makeHandlers(overrides: Partial<BankLedgerReconcileHandlerDependencies>
         findCandidateBankLines: async () => [],
         persistLinks: async (links): Promise<PersistedReconciliation> => {
             persistLinksCalls.push(links);
-            return { linked: links.map(l => l.observationId), exceptions: [], chunkErrors: [] };
+            return { linked: links.map(l => l.observationId), exceptions: [], chunkErrors: [], remaining: 0 };
         },
     };
     const handlers = createBankLedgerReconcileHandlers({ ...defaults, ...overrides });
@@ -150,7 +150,7 @@ test("bank-ledger reconcile: happy path", async t => {
         const { handlers, persistLinksCalls } = makeHandlers();
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [] });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 
@@ -167,7 +167,7 @@ test("bank-ledger reconcile: happy path", async t => {
         });
         const res = await handlers.POST(makeRequest({ all: true }));
         assert.equal(res.status, 200);
-        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], chunkErrors: [] });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 1, linked: 1, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 1);
         assert.deepEqual(persistLinksCalls[0], [{ observationId: "obs1", bankLineId: "bl1" }]);
     });
@@ -184,7 +184,7 @@ test("bank-ledger reconcile: happy path", async t => {
             }],
         });
         const res = await handlers.POST(makeRequest({ all: true }));
-        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [] });
+        assert.deepEqual(await res.json(), { ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: [], chunkErrors: [], remaining: 0 });
         assert.equal(persistLinksCalls.length, 0);
     });
 
@@ -268,6 +268,7 @@ test("bank-ledger reconcile: unique-index conflict path", async t => {
                 linked: [links[0].observationId],
                 exceptions: [{ observationId: links[1].observationId, bankLineId: links[1].bankLineId, reason: "bank-line-already-claimed" }],
                 chunkErrors: [],
+                remaining: 0,
             }),
         });
         const res = await handlers.POST(makeRequest({ all: true }));
@@ -294,6 +295,7 @@ test("bank-ledger reconcile: chunk errors surface in the response (Codex round-3
                 linked: [],
                 exceptions: [],
                 chunkErrors: [{ chunkIndex: 0, linkCount: 1, error: "transaction timeout" }],
+                remaining: 0,
             }),
         });
         const res = await handlers.POST(makeRequest({ all: true }));
@@ -302,6 +304,41 @@ test("bank-ledger reconcile: chunk errors surface in the response (Codex round-3
         assert.equal(body.ok, true);
         assert.equal(body.linked, 0);
         assert.deepEqual(body.chunkErrors, [{ chunkIndex: 0, linkCount: 1, error: "transaction timeout" }]);
+    });
+});
+
+test("bank-ledger reconcile: remaining count is relayed to the caller (Codex round-4 fix 3)", async t => {
+    await t.test("a nonzero remaining from persistLinks is passed straight through to the response", async () => {
+        const { handlers } = makeHandlers({
+            findUnlinkedQboObservations: async () => [
+                { id: "obs1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null, bankLineId: null },
+            ],
+            findCandidateBankLines: async () => [
+                { id: "bl1", account: "WTB-0723", postedDate: "2026-07-16", amountCents: -7400, normalizedPayee: "US MARKET", checkNumber: null },
+            ],
+            persistLinks: async () => ({
+                linked: [],
+                exceptions: [],
+                chunkErrors: [],
+                // Simulates RECONCILE_MAX_CHUNKS_PER_INVOCATION being reached
+                // before every proposed link was attempted — the caller must
+                // re-invoke (same scope) to resume the rest.
+                remaining: 450,
+            }),
+        });
+        const res = await handlers.POST(makeRequest({ all: true }));
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.ok, true);
+        assert.equal(body.remaining, 450);
+    });
+
+    await t.test("proposed: 0 (nothing to reconcile) always reports remaining: 0", async () => {
+        const { handlers } = makeHandlers();
+        const res = await handlers.POST(makeRequest({ all: true }));
+        const body = await res.json();
+        assert.equal(body.proposed, 0);
+        assert.equal(body.remaining, 0);
     });
 });
 
@@ -365,6 +402,64 @@ test("persistLinksInChunks (Codex round-3 new blocker: bounded, isolated chunks)
             return { linked: [], exceptions: [] };
         });
         assert.equal(calls, 0);
-        assert.deepEqual(result, { linked: [], exceptions: [], chunkErrors: [] });
+        assert.deepEqual(result, { linked: [], exceptions: [], chunkErrors: [], remaining: 0 });
+    });
+
+    await t.test("no maxChunks passed: every chunk runs in one call and remaining is 0", async () => {
+        const links = [link("o1", "b1"), link("o2", "b2"), link("o3", "b3"), link("o4", "b4"), link("o5", "b5")];
+        const result = await persistLinksInChunks(links, 2, async chunk => ({ linked: chunk.map(l => l.observationId), exceptions: [] }));
+        assert.deepEqual(result.linked, ["o1", "o2", "o3", "o4", "o5"]);
+        assert.equal(result.remaining, 0);
+    });
+});
+
+test("persistLinksInChunks maxChunks cap (Codex round-4 fix 3: bound one invocation's duration)", async t => {
+    function link(observationId: string, bankLineId: string): ReconcileLink {
+        return { observationId, bankLineId };
+    }
+
+    await t.test("stops after maxChunks chunks and reports the untouched links as remaining", async () => {
+        const links = [link("o1", "b1"), link("o2", "b2"), link("o3", "b3"), link("o4", "b4"), link("o5", "b5")];
+        const chunksSeen: ReconcileLink[][] = [];
+        const result = await persistLinksInChunks(links, 2, async chunk => {
+            chunksSeen.push(chunk);
+            return { linked: chunk.map(l => l.observationId), exceptions: [] };
+        }, 2);
+        // 5 links, chunk size 2, cap 2 chunks -> only the first 4 links (2
+        // chunks of 2) are attempted; the 5th link is never touched.
+        assert.deepEqual(chunksSeen, [
+            [link("o1", "b1"), link("o2", "b2")],
+            [link("o3", "b3"), link("o4", "b4")],
+        ]);
+        assert.deepEqual(result.linked, ["o1", "o2", "o3", "o4"]);
+        assert.equal(result.remaining, 1);
+    });
+
+    await t.test("remaining is 0 when the link count fits within maxChunks chunks", async () => {
+        const links = [link("o1", "b1"), link("o2", "b2"), link("o3", "b3"), link("o4", "b4")];
+        const result = await persistLinksInChunks(links, 2, async chunk => ({ linked: chunk.map(l => l.observationId), exceptions: [] }), 2);
+        assert.deepEqual(result.linked, ["o1", "o2", "o3", "o4"]);
+        assert.equal(result.remaining, 0);
+    });
+
+    await t.test("a chunk error still counts toward the cap, and un-run links after it are remaining, not chunkErrors", async () => {
+        const links = [link("o1", "b1"), link("o2", "b2"), link("o3", "b3"), link("o4", "b4"), link("o5", "b5"), link("o6", "b6")];
+        const result = await persistLinksInChunks(links, 2, async (chunk, chunkIndex) => {
+            if (chunkIndex === 1) throw new Error("transaction timeout");
+            return { linked: chunk.map(l => l.observationId), exceptions: [] };
+        }, 2);
+        // chunk 0 succeeds (o1,o2), chunk 1 throws (o3,o4) — both count
+        // toward the cap of 2, so chunk 2 (o5,o6) is never attempted and is
+        // reported as remaining, not as a third chunk error.
+        assert.deepEqual(result.linked, ["o1", "o2"]);
+        assert.deepEqual(result.chunkErrors, [{ chunkIndex: 1, linkCount: 2, error: "transaction timeout" }]);
+        assert.equal(result.remaining, 2);
+    });
+
+    await t.test("chunks already run before the cap stay in the result even though later links are deferred — committed work is never undone by the cap", async () => {
+        const links = [link("o1", "b1"), link("o2", "b2"), link("o3", "b3"), link("o4", "b4")];
+        const result = await persistLinksInChunks(links, 1, async chunk => ({ linked: chunk.map(l => l.observationId), exceptions: [] }), 1);
+        assert.deepEqual(result.linked, ["o1"]);
+        assert.equal(result.remaining, 3);
     });
 });

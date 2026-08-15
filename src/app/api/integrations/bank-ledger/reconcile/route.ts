@@ -33,6 +33,19 @@ export const maxDuration = 60;
  * loss, anything not already handled per-link below) is reported as a
  * per-chunk error WITHOUT rolling back chunks that already committed.
  *
+ * A single invocation only RUNS a bounded number of those chunks (Codex
+ * round-4 fix 3) — sequential chunks at 20s each could otherwise still run
+ * long enough for the platform to kill the request (maxDuration = 60) after
+ * some chunks already committed, silently dropping chunkErrors and any
+ * links past the kill point from the response entirely. Capping chunks per
+ * invocation keeps worst case (RECONCILE_MAX_CHUNKS_PER_INVOCATION *
+ * RECONCILE_TX_TIMEOUT_MS) comfortably inside the platform's budget, so a
+ * response — success, exceptions, or chunkErrors — is always returned.
+ * Links beyond the cap are reported back as `remaining` (never attempted
+ * this invocation, not a failure) so the caller can re-invoke to resume;
+ * chunks already committed in this or an earlier invocation stay committed
+ * either way.
+ *
  * Within a chunk, each link is wrapped in its own SAVEPOINT: a unique-index
  * violation on one link (the partial unique index caps each canonical
  * BankLine at one linked observation per source — see prisma/schema.prisma)
@@ -59,6 +72,13 @@ const MAX_ACCOUNT_LEN = 64;
 const RECONCILE_CHUNK_SIZE = 200;
 const RECONCILE_TX_TIMEOUT_MS = 20_000;
 
+// Codex round-4 fix 3: bounds how many chunks a SINGLE invocation runs, so
+// worst case (2 * 20s = 40s) stays comfortably under maxDuration = 60 even
+// with sequential chunks and no early platform kill. Links beyond the cap
+// are reported as `remaining` for the caller to resume with another call —
+// never silently dropped or half-processed without a returned response.
+const RECONCILE_MAX_CHUNKS_PER_INVOCATION = 2;
+
 export interface ReconcileExceptionResult {
     observationId: string;
     bankLineId: string;
@@ -75,6 +95,8 @@ export interface PersistedReconciliation {
     linked: string[];
     exceptions: ReconcileExceptionResult[];
     chunkErrors: ReconcileChunkError[];
+    /** Links not yet attempted this invocation because RECONCILE_MAX_CHUNKS_PER_INVOCATION was reached (Codex round-4 fix 3) — never a failure, just work the caller should re-invoke to resume. 0 when every proposed link was attempted. */
+    remaining: number;
 }
 
 /**
@@ -88,17 +110,26 @@ export interface PersistedReconciliation {
  * its links actually persisted; reporting them as linked/excepted here would
  * lie about what's in the database. Chunks that already succeeded are
  * unaffected by a later chunk's failure.
+ *
+ * `maxChunks` (Codex round-4 fix 3) stops the loop after that many chunks
+ * have been RUN (attempted — success or chunkError both count), regardless
+ * of how many links remain; the un-run links are reported back via
+ * `remaining` rather than attempted. Defaults to unbounded so any other
+ * caller/test that doesn't pass it keeps running every chunk in one call.
  */
 export async function persistLinksInChunks(
     links: ReconcileLink[],
     chunkSize: number,
     runChunk: (chunk: ReconcileLink[], chunkIndex: number) => Promise<{ linked: string[]; exceptions: ReconcileExceptionResult[] }>,
+    maxChunks: number = Infinity,
 ): Promise<PersistedReconciliation> {
     const linked: string[] = [];
     const exceptions: ReconcileExceptionResult[] = [];
     const chunkErrors: ReconcileChunkError[] = [];
 
-    for (let start = 0; start < links.length; start += chunkSize) {
+    let attempted = 0;
+    let chunksRun = 0;
+    for (let start = 0; start < links.length && chunksRun < maxChunks; start += chunkSize) {
         const chunk = links.slice(start, start + chunkSize);
         const chunkIndex = Math.floor(start / chunkSize);
         try {
@@ -112,9 +143,11 @@ export async function persistLinksInChunks(
                 error: error instanceof Error ? error.message : String(error),
             });
         }
+        attempted += chunk.length;
+        chunksRun++;
     }
 
-    return { linked, exceptions, chunkErrors };
+    return { linked, exceptions, chunkErrors, remaining: links.length - attempted };
 }
 
 export interface BankLedgerReconcileHandlerDependencies {
@@ -126,7 +159,7 @@ export interface BankLedgerReconcileHandlerDependencies {
     /** Candidate canonical BankLines with no QBO_REGISTER observation linked yet, optionally scoped to one account. */
     findCandidateBankLines(account: string | null): Promise<ReconcileBankLine[]>;
 
-    /** Writes every link in bounded chunks (see the module comment); a per-link unique-index conflict is caught and reported as an exception, and a whole-chunk failure is reported as a chunk error — neither fails the whole run. */
+    /** Writes links in bounded chunks, up to RECONCILE_MAX_CHUNKS_PER_INVOCATION per call (see the module comment); a per-link unique-index conflict is caught and reported as an exception, a whole-chunk failure is reported as a chunk error, and any links past the per-invocation cap are reported in `remaining` — none of these fail the whole run. */
     persistLinks(links: ReconcileLink[]): Promise<PersistedReconciliation>;
 }
 
@@ -206,7 +239,7 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
 
             const { links: proposed, ambiguous } = reconcileObservations(observations, bankLines);
             if (proposed.length === 0) {
-                return NextResponse.json({ ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: ambiguousForResponse(ambiguous), chunkErrors: [] });
+                return NextResponse.json({ ok: true, proposed: 0, linked: 0, exceptions: [], ambiguous: ambiguousForResponse(ambiguous), chunkErrors: [], remaining: 0 });
             }
 
             const result = await dependencies.persistLinks(proposed);
@@ -217,6 +250,11 @@ export function createBankLedgerReconcileHandlers(dependencies: BankLedgerReconc
                 exceptions: result.exceptions,
                 ambiguous: ambiguousForResponse(ambiguous),
                 chunkErrors: result.chunkErrors,
+                // Codex round-4 fix 3: links not attempted this invocation
+                // because RECONCILE_MAX_CHUNKS_PER_INVOCATION was reached — the
+                // caller should re-invoke (same scope) to resume; 0 means every
+                // proposed link was attempted (linked, excepted, or chunk-errored).
+                remaining: result.remaining,
             });
         },
     };
@@ -307,7 +345,7 @@ const handlers = createBankLedgerReconcileHandlers({
             }, { timeout: RECONCILE_TX_TIMEOUT_MS });
 
             return { linked: chunkLinked, exceptions: chunkExceptions };
-        });
+        }, RECONCILE_MAX_CHUNKS_PER_INVOCATION);
     },
 });
 

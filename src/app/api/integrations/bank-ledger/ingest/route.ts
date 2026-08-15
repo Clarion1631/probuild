@@ -148,6 +148,21 @@ function validateQboLine(raw: IngestLineInput, index: number): { ok: true; value
 /** Thrown by createStatementImport when a concurrent request wins the (account, periodStart, periodEnd) unique constraint first. */
 export class StatementImportRaceError extends Error {}
 
+/**
+ * Thrown by createQboObservations — from INSIDE its own create+recheck
+ * transaction (Codex round-4 fix 2) — when the post-insert re-read finds a
+ * concurrent writer's stored content for `qbTxnId` that differs from what
+ * this request tried to insert. Throwing from inside that transaction rolls
+ * back every row THIS call attempted to insert, not just the conflicting
+ * one, so a 409 built from this error always means nothing from the request
+ * was persisted.
+ */
+export class QboIngestConflictError extends Error {
+    constructor(public readonly qbTxnId: string) {
+        super(`qbo-txn-conflict: ${qbTxnId}`);
+    }
+}
+
 export interface ExistingQboObservation {
     postedDate: string;
     amountCents: number;
@@ -187,6 +202,19 @@ export interface BankLedgerIngestHandlerDependencies {
     /** Returns the currently-stored content for each already-seen qbTxnId (whatever is present in the input list), keyed by qbTxnId — used to detect a retried id with DIFFERENT content. */
     findExistingQboObservations(account: string, qbTxnIds: string[]): Promise<Map<string, ExistingQboObservation>>;
 
+    /**
+     * Inserts `rows` via createMany(skipDuplicates), then — for any row that
+     * createMany silently skipped because a concurrent request won the race
+     * for the same qbTxnId — re-reads that qbTxnId's stored content and
+     * compares. Codex round-4 fix 2: the insert, the re-read, and the
+     * compare must all run inside ONE transaction, and a content mismatch
+     * must throw QboIngestConflictError from INSIDE it (never return a
+     * count and let the caller 409 afterward) — otherwise a mixed batch can
+     * commit its non-conflicting rows before the conflict is discovered,
+     * and a 409 response would be lying about what's in the database. The
+     * caller (handleQboRegister below) treats any throw here as "nothing
+     * from this call was persisted."
+     */
     createQboObservations(rows: Array<{
         account: string;
         postedDate: string;
@@ -332,31 +360,22 @@ export function createBankLedgerIngestHandlers(dependencies: BankLedgerIngestHan
             });
         }
 
-        const inserted = rows.length > 0 ? await dependencies.createQboObservations(rows) : 0;
-        const existingCount = validated.length - inserted;
-
-        if (rows.length > 0 && inserted < rows.length) {
-            // Race (Codex round-3, defect 7a): between the pre-insert
-            // findExistingQboObservations() check above and this createMany,
-            // a concurrent request for the SAME qbTxnId could have been
-            // inserted first — createMany(skipDuplicates: true) silently
-            // drops our row in that case rather than erroring, and
-            // `inserted` alone can't tell us whether the winner's content
-            // matched ours. Re-read every id we attempted and compare
-            // content: a stored hash that differs from what THIS request
-            // tried to insert means the concurrent writer's content was
-            // genuinely different, and that must 409 like any other
-            // qbo-txn-conflict — never a silent 200.
-            const attemptedIds = rows.map(row => row.qbTxnId);
-            const postInsert = await dependencies.findExistingQboObservations(account, attemptedIds);
-            for (const row of rows) {
-                const stored = postInsert.get(row.qbTxnId);
-                if (!stored) continue;
-                if (computeQboLineContentHash(stored) !== computeQboLineContentHash(row)) {
-                    return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: row.qbTxnId }, { status: 409 });
+        let inserted = 0;
+        if (rows.length > 0) {
+            try {
+                inserted = await dependencies.createQboObservations(rows);
+            } catch (error) {
+                if (error instanceof QboIngestConflictError) {
+                    // Codex round-4 fix 2: createQboObservations threw from
+                    // inside its own create+recheck transaction, so nothing
+                    // this call attempted to insert was persisted — return a
+                    // plain 409 with no partial inserted/existing counts.
+                    return NextResponse.json({ ok: false, reason: "qbo-txn-conflict", qbTxnId: error.qbTxnId }, { status: 409 });
                 }
+                throw error;
             }
         }
+        const existingCount = validated.length - inserted;
 
         return NextResponse.json({ ok: true, inserted, existing: existingCount });
     }
@@ -498,20 +517,62 @@ const handlers = createBankLedgerIngestHandlers({
     },
 
     createQboObservations: async rows => {
-        const result = await prisma.bankLineObservation.createMany({
-            data: rows.map(row => ({
-                source: "QBO_REGISTER",
-                account: row.account,
-                sourceDocumentId: "QBO_REGISTER",
-                sourceLineId: row.qbTxnId,
-                postedDate: new Date(row.postedDate),
-                amountCents: row.amountCents,
-                rawDescriptor: row.rawDescriptor,
-                checkNumber: row.checkNumber,
-            })),
-            skipDuplicates: true,
+        // Codex round-4 fix 2: create, re-read, and compare all run inside
+        // ONE transaction. If any attempted qbTxnId turns out to have been
+        // won by a concurrent writer with DIFFERENT content, the thrown
+        // QboIngestConflictError aborts this transaction — rolling back
+        // every row THIS call inserted, not just the conflicting one — so a
+        // 409 built from it always means nothing from this request persisted.
+        return prisma.$transaction(async tx => {
+            const result = await tx.bankLineObservation.createMany({
+                data: rows.map(row => ({
+                    source: "QBO_REGISTER",
+                    account: row.account,
+                    sourceDocumentId: "QBO_REGISTER",
+                    sourceLineId: row.qbTxnId,
+                    postedDate: new Date(row.postedDate),
+                    amountCents: row.amountCents,
+                    rawDescriptor: row.rawDescriptor,
+                    checkNumber: row.checkNumber,
+                })),
+                skipDuplicates: true,
+            });
+
+            if (result.count < rows.length) {
+                // Race (Codex round-3, defect 7a): between the pre-insert
+                // findExistingQboObservations() check and this createMany, a
+                // concurrent request for the SAME qbTxnId could have been
+                // inserted first — createMany(skipDuplicates: true) silently
+                // drops our row in that case rather than erroring, and
+                // `result.count` alone can't tell us whether the winner's
+                // content matched ours. Re-read every id we attempted, in
+                // the SAME transaction, and compare content.
+                const account = rows[0]?.account;
+                const attemptedIds = rows.map(row => row.qbTxnId);
+                const postInsertRows = await tx.bankLineObservation.findMany({
+                    where: { source: "QBO_REGISTER", account, sourceDocumentId: "QBO_REGISTER", sourceLineId: { in: attemptedIds } },
+                    select: { sourceLineId: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+                });
+                const postInsert = new Map<string, ExistingQboObservation>();
+                for (const row of postInsertRows) {
+                    postInsert.set(row.sourceLineId, {
+                        postedDate: row.postedDate.toISOString().slice(0, 10),
+                        amountCents: row.amountCents,
+                        rawDescriptor: row.rawDescriptor,
+                        checkNumber: row.checkNumber,
+                    });
+                }
+                for (const row of rows) {
+                    const stored = postInsert.get(row.qbTxnId);
+                    if (!stored) continue;
+                    if (computeQboLineContentHash(stored) !== computeQboLineContentHash(row)) {
+                        throw new QboIngestConflictError(row.qbTxnId);
+                    }
+                }
+            }
+
+            return result.count;
         });
-        return result.count;
     },
 });
 

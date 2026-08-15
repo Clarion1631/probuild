@@ -100,7 +100,12 @@ async function verifyDatabaseIdentity() {
     console.log(`Verified target database identity: "${actual.db}" (host=${check.host} port=${check.port})`);
 }
 
-const statements = [
+// Exported (Codex round-4 fix 1) so a unit test can assert on the generated
+// trigger SQL text itself — DB triggers can't run inside `tsx --test`, so
+// the SQL string is the only pure surface available to verify that
+// check_bank_line_amount_immutable() rejects unconditionally rather than
+// gating on a RefundEvent EXISTS lookup (see tests/apply-bank-ledger.test.ts).
+export const statements = [
     `CREATE TABLE IF NOT EXISTS "StatementImport" (
        "id"            TEXT NOT NULL,
        "account"       TEXT NOT NULL,
@@ -376,23 +381,33 @@ const statements = [
 
     `ALTER TABLE "RefundEvent" ENABLE ROW LEVEL SECURITY`,
 
-    // Codex round-3 should-fix: refund sign integrity (the trigger above)
-    // only guards RefundEvent write time — nothing stopped BankLine.amountCents
-    // itself from being mutated afterward, which could silently flip a debit
-    // a RefundEvent already pointed to as its "original" into a credit (or
-    // vice versa) without re-validating the pairing. This mirrors that same
-    // rule from the parent side: once ANY RefundEvent references a BankLine
-    // (as either original or refund), that line's amountCents becomes
-    // immutable.
+    // Codex round-3 should-fix, made unconditional in round-4 (defect: race):
+    // refund sign integrity (the trigger above) only guards RefundEvent
+    // write time — nothing stopped BankLine.amountCents itself from being
+    // mutated afterward, which could silently flip a debit a RefundEvent
+    // already pointed to as its "original" into a credit (or vice versa)
+    // without re-validating the pairing.
+    //
+    // Round-3 gated this behind `IF EXISTS (SELECT 1 FROM "RefundEvent"
+    // WHERE ...)` — an unlocked MVCC read. A concurrent RefundEvent INSERT
+    // and this UPDATE could both commit (the EXISTS check in the UPDATE's
+    // snapshot doesn't see the not-yet-committed RefundEvent row, and
+    // nothing locks BankLine against it), and once every referencing
+    // RefundEvent was deleted the amount became editable again — neither
+    // behavior is acceptable for a value that comes from a bank statement.
+    //
+    // Round-4 fix (Codex round-4, defect 7): drop the RefundEvent
+    // conditional entirely. BankLine.amountCents (and its debit/credit side
+    // identity, which IS amountCents' sign here — there is no separate
+    // signed-side column) is UNCONDITIONALLY immutable once the row exists.
+    // Bank statement amounts are observations, not editable state — a
+    // correction is always a NEW BankLine/observation, never an edit to an
+    // existing one. This removes the race entirely: no query against
+    // another table, so nothing to race.
     `CREATE OR REPLACE FUNCTION check_bank_line_amount_immutable() RETURNS TRIGGER AS $BODY$
      BEGIN
        IF NEW."amountCents" <> OLD."amountCents" THEN
-         IF EXISTS (
-           SELECT 1 FROM "RefundEvent"
-            WHERE "originalBankLineId" = OLD."id" OR "refundBankLineId" = OLD."id"
-         ) THEN
-           RAISE EXCEPTION 'BankLine.amountCents cannot change once a RefundEvent references this line (id %)', OLD."id";
-         END IF;
+         RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited — insert a new BankLine/observation instead', OLD."id";
        END IF;
        RETURN NEW;
      END;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createBankLedgerIngestHandlers, type BankLedgerIngestHandlerDependencies } from "../src/app/api/integrations/bank-ledger/ingest/route";
+import { createBankLedgerIngestHandlers, QboIngestConflictError, type BankLedgerIngestHandlerDependencies } from "../src/app/api/integrations/bank-ledger/ingest/route";
 import { computeStatementContentHash } from "../src/lib/bank-ledger";
 
 const SECRET = "test-secret";
@@ -353,17 +353,16 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         assert.equal(createQboObservationsCalls.length, 1);
     });
 
-    await t.test("Codex round-3 defect 7a: a concurrent request that wins the createMany(skipDuplicates) race with DIFFERENT content 409s, never a silent 200", async () => {
-        let findExistingCalls = 0;
+    await t.test("Codex round-3 defect 7a / round-4 fix 2: a concurrent request that wins the createMany(skipDuplicates) race with DIFFERENT content 409s, never a silent 200", async () => {
         const { handlers } = makeHandlers({
-            findExistingQboObservations: async () => {
-                findExistingCalls++;
-                if (findExistingCalls === 1) return new Map(); // pre-insert check: nothing stored yet
-                // Post-insert re-check: a concurrent request won the race and
-                // inserted DIFFERENT content under the same qbTxnId.
-                return new Map([["qb-1", { postedDate: "2026-07-16", amountCents: -9999, rawDescriptor: "OTHER VENDOR", checkNumber: null }]]);
+            findExistingQboObservations: async () => new Map(), // pre-insert check: nothing stored yet
+            // Real implementation: create + re-read + compare run inside ONE
+            // transaction, and a content mismatch throws QboIngestConflictError
+            // from INSIDE it (Codex round-4 fix 2) — the route never sees a
+            // plain "0 inserted" return for this case, only the throw.
+            createQboObservations: async () => {
+                throw new QboIngestConflictError("qb-1");
             },
-            createQboObservations: async () => 0, // simulate skipDuplicates silently skipping our row
         });
         const res = await handlers.POST(makeRequest(qboBody([
             { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
@@ -372,18 +371,16 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         const body = await res.json();
         assert.equal(body.reason, "qbo-txn-conflict");
         assert.equal(body.qbTxnId, "qb-1");
-        assert.equal(findExistingCalls, 2);
+        assert.equal("inserted" in body, false, "a conflict response must never carry a partial-success inserted count");
     });
 
     await t.test("Codex round-3 defect 7a: a lost race with IDENTICAL content is a benign no-op, not a 409", async () => {
-        let findExistingCalls = 0;
         const { handlers } = makeHandlers({
-            findExistingQboObservations: async () => {
-                findExistingCalls++;
-                if (findExistingCalls === 1) return new Map();
-                // The concurrent winner inserted the SAME content we tried to.
-                return new Map([["qb-1", { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: null }]]);
-            },
+            findExistingQboObservations: async () => new Map(),
+            // The concurrent winner inserted the SAME content we tried to —
+            // createQboObservations detects that internally and returns the
+            // real inserted count (0, since our row wasn't the one that
+            // landed) instead of throwing.
             createQboObservations: async () => 0,
         });
         const res = await handlers.POST(makeRequest(qboBody([
@@ -393,6 +390,33 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         const body = await res.json();
         assert.equal(body.inserted, 0);
         assert.equal(body.existing, 1);
+    });
+
+    await t.test("Codex round-4 fix 2: a conflict rolls back the whole batch — no partial-success fields leak into the 409 response for a mixed batch", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers({
+            findExistingQboObservations: async () => new Map(), // pre-insert check: neither id stored yet
+            createQboObservations: async rows => {
+                createQboObservationsCalls.push(...rows);
+                // Simulates the real create+recheck+compare transaction: BOTH
+                // rows are attempted together in ONE call, and a conflict on
+                // EITHER one throws for the whole call — there is no code path
+                // where the route could report qb-1 as inserted while qb-2
+                // 409s, because the DB implementation's transaction rolls
+                // both back together.
+                throw new QboIngestConflictError("qb-2");
+            },
+        });
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-17", amountCents: -5000, rawDescriptor: "OTHER VENDOR", qbTxnId: "qb-2" },
+        ])));
+        assert.equal(res.status, 409);
+        const body = await res.json();
+        assert.deepEqual(body, { ok: false, reason: "qbo-txn-conflict", qbTxnId: "qb-2" });
+        // Both rows were attempted together in the one createQboObservations
+        // call — proving the route hands the whole batch to a single
+        // atomic operation rather than inserting row-by-row.
+        assert.equal(createQboObservationsCalls.length, 2);
     });
 
     await t.test("Codex round-3 defect 7b: a representation-only difference (whitespace, empty-string checkNumber) does NOT 409", async () => {
