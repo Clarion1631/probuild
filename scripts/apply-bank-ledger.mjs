@@ -406,7 +406,7 @@ export const statements = [
     // another table, so nothing to race.
     `CREATE OR REPLACE FUNCTION check_bank_line_amount_immutable() RETURNS TRIGGER AS $BODY$
      BEGIN
-       IF NEW."amountCents" <> OLD."amountCents" THEN
+       IF NEW."amountCents" IS DISTINCT FROM OLD."amountCents" THEN
          RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited — insert a new BankLine/observation instead', OLD."id";
        END IF;
        RETURN NEW;

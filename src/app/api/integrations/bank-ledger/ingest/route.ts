@@ -564,7 +564,14 @@ const handlers = createBankLedgerIngestHandlers({
                 }
                 for (const row of rows) {
                     const stored = postInsert.get(row.qbTxnId);
-                    if (!stored) continue;
+                    if (!stored) {
+                        // An id we attempted is neither inserted by us nor
+                        // readable now (concurrent delete or key-changing
+                        // update). We can't prove the skip was benign, so
+                        // abort the whole request — a 409 must mean nothing
+                        // from this request was written (Codex round-5).
+                        throw new QboIngestConflictError(row.qbTxnId);
+                    }
                     if (computeQboLineContentHash(stored) !== computeQboLineContentHash(row)) {
                         throw new QboIngestConflictError(row.qbTxnId);
                     }

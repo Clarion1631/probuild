@@ -80,7 +80,9 @@ test("check_bank_line_amount_immutable trigger SQL (Codex round-4 fix 1: uncondi
 
     await t.test("the trigger function raises unconditionally whenever amountCents changes — rejected with no references AND with references, because there is no query to distinguish the two anymore", () => {
         const fn = findStatement("CREATE OR REPLACE FUNCTION check_bank_line_amount_immutable()");
-        assert.match(fn, /IF NEW\."amountCents" <> OLD\."amountCents" THEN\s+RAISE EXCEPTION/);
+        // IS DISTINCT FROM, not <>: NULL-safe, so a non-NULL -> NULL change
+        // still raises inside the trigger itself (Codex round-5).
+        assert.match(fn, /IF NEW\."amountCents" IS DISTINCT FROM OLD\."amountCents" THEN\s+RAISE EXCEPTION/);
     });
 
     await t.test("the trigger fires BEFORE UPDATE on BankLine, not gated behind any other table", () => {
