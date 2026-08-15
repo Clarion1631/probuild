@@ -70,6 +70,7 @@
     "googleapis": "^171.4.0",
     "html-to-image": "^1.11.13",
     "html2canvas": "^1.4.1",
+    "isomorphic-dompurify": "^3.19.0",
     "jose": "^6.2.2",
     "jspdf": "^4.2.1",
     "lucide-react": "^0.577.0",
