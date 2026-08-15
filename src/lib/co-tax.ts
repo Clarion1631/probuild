@@ -14,6 +14,38 @@ export type EstimateTaxInfo = {
     taxRateName?: string | null;
 } | null | undefined;
 
+export type CoTaxSnapshot = {
+    approvedTaxExempt?: boolean | null;
+    approvedTaxRateName?: string | null;
+    approvedTaxRatePercent?: number | string | { toString(): string } | null;
+} | null | undefined;
+
+/**
+ * The single place that decides snapshot-vs-live tax for a change order.
+ *
+ * approveChangeOrderCore and manuallyApproveChangeOrderCore snapshot the linked
+ * Estimate's tax fields onto approvedTaxExempt/approvedTaxRateName/approvedTaxRatePercent
+ * in the same transaction as the status flip to Approved — a CO's tax treatment is frozen
+ * the moment it is signed, so an estimate edited afterward can never change what an
+ * already-signed document says or what billing actually charges. Billing (billChangeOrderCore)
+ * and approved-CO rendering (the CO PDF, the portal signature page) must call this instead of
+ * reading `estimate` directly.
+ *
+ * approvedTaxExempt is null only for a CO approved before this snapshot existed ("legacy") —
+ * those fall back to the estimate's live tax, the only thing there is to read for them. Draft
+ * and Sent COs are never passed a snapshot by their callers (sendChangeOrderToClientCore, the
+ * editor, the MCP send preview) and always read the estimate live — correct and intentional,
+ * since the estimate can still move before a CO is signed.
+ */
+export function effectiveCoTaxInfo(co: CoTaxSnapshot, estimate: EstimateTaxInfo): EstimateTaxInfo {
+    if (co?.approvedTaxExempt == null) return estimate;
+    return {
+        taxExempt: co.approvedTaxExempt,
+        taxRatePercent: co.approvedTaxRatePercent ?? null,
+        taxRateName: co.approvedTaxRateName ?? null,
+    };
+}
+
 export function coTaxRate(estimate: EstimateTaxInfo): number {
     if (estimate?.taxExempt) return 0;
     const pct = estimate?.taxRatePercent != null ? Number(estimate.taxRatePercent) : NaN;

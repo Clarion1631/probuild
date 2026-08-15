@@ -16,7 +16,7 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames, effectiveCoTaxInfo } from "./co-tax";
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "./co-approval";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -1225,6 +1225,7 @@ export async function previewCostPlusChangeOrderCore(
         select: {
             id: true, code: true, title: true, status: true, pricingType: true, markupPercent: true,
             projectId: true, estimateId: true,
+            approvedTaxExempt: true, approvedTaxRateName: true, approvedTaxRatePercent: true,
             estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
         },
     });
@@ -1234,7 +1235,8 @@ export async function previewCostPlusChangeOrderCore(
     const invoice = await prisma.$transaction((tx) => findChangeOrderInvoice(tx, co));
     if (!invoice) throw new Error("This project has no invoice yet — create the invoice first, then bill actuals.");
     const markupPercent = co.markupPercent ?? 10;
-    const taxRate = coTaxRate(co.estimate);
+    const taxInfo = effectiveCoTaxInfo(co, co.estimate);
+    const taxRate = coTaxRate(taxInfo);
     const actuals = await prisma.$transaction((tx) => loadCostPlusActuals(tx, co.id, endAt, markupPercent, taxRate));
     return {
         ...actuals,
@@ -1248,7 +1250,7 @@ export async function previewCostPlusChangeOrderCore(
         invoiceCode: invoice.code,
         markupPercent,
         taxRate,
-        taxLabel: coTaxLabel(co.estimate),
+        taxLabel: coTaxLabel(taxInfo),
     };
 }
 
@@ -1269,8 +1271,10 @@ export async function billCostPlusChangeOrderCore(
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; pricingType: string;
             markupPercent: number | null; projectId: string; estimateId: string;
+            approvedTaxExempt: boolean | null; approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
         }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "projectId", "estimateId"
+            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "projectId", "estimateId",
+                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) throw new Error("Change order not found");
@@ -1284,7 +1288,8 @@ export async function billCostPlusChangeOrderCore(
         if (!invoice) throw new Error("This project has no invoice yet — create the invoice first, then bill actuals.");
         await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
         const markupPercent = co.markupPercent ?? 10;
-        const taxRate = coTaxRate(estimateTax);
+        const taxInfo = effectiveCoTaxInfo(co, estimateTax);
+        const taxRate = coTaxRate(taxInfo);
         if ((input.expectedInvoiceId && input.expectedInvoiceId !== invoice.id)
             || (input.expectedMarkupPercent != null && input.expectedMarkupPercent !== markupPercent)
             || (input.expectedTaxRate != null && Math.abs(input.expectedTaxRate - taxRate) > 0.0000001)) {
@@ -1392,8 +1397,13 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
     // and concurrent status writers (approve/decline use plain updates) block
     // until this transaction commits, so a just-declined CO can't be billed.
     const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<LegacyBillChangeOrderOutcome> => {
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; totalAmount: unknown; projectId: string; estimateId: string }>>`
-            SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; totalAmount: unknown;
+            projectId: string; estimateId: string; approvedTaxExempt: boolean | null;
+            approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
+        }>>`
+            SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId",
+                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
@@ -1407,8 +1417,9 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
             where: { id: co.estimateId },
             select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
         });
+        const taxInfo = effectiveCoTaxInfo(co, estimateTax);
         const subtotal = Math.round(Number(co.totalAmount) * 100) / 100;
-        const taxAmount = Math.round(subtotal * coTaxRate(estimateTax) * 100) / 100;
+        const taxAmount = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
         const amount = Math.round((subtotal + taxAmount) * 100) / 100;
         if (!(amount > 0)) return { kind: "error", error: `Change order ${co.code} has a $0 total — nothing to bill.` };
 
@@ -1469,7 +1480,7 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
                 ...(nextStatus !== curStatus ? { status: nextStatus } : {}),
             },
         });
-        return { kind: "created", milestoneId: created.id, milestoneName, amount, subtotal, taxAmount, taxLabel: coTaxLabel(estimateTax), invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
+        return { kind: "created", milestoneId: created.id, milestoneName, amount, subtotal, taxAmount, taxLabel: coTaxLabel(taxInfo), invoiceId: invoice.id, invoiceCode: invoice.code, projectId: co.projectId, coCode: co.code };
     }, { timeout: 15_000 }));
 
     if (outcome.kind === "error") return { ok: false as const, error: outcome.error };
@@ -1540,8 +1551,10 @@ export async function billChangeOrderCore(
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; pricingType: string;
             totalAmount: unknown; projectId: string; estimateId: string;
+            approvedTaxExempt: boolean | null; approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
         }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId"
+            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId",
+                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
@@ -1569,7 +1582,8 @@ export async function billChangeOrderCore(
             where: { id: co.estimateId },
             select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
         });
-        const rate = coTaxRate(estimateTax);
+        const taxInfo = effectiveCoTaxInfo(co, estimateTax);
+        const rate = coTaxRate(taxInfo);
         const totalTaxCents = Math.round(subtotalCents * rate);
         const invoice = await findChangeOrderInvoice(tx, co);
         if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
@@ -1687,7 +1701,7 @@ export async function billChangeOrderCore(
             subtotal: subtotalCents / 100,
             taxAmount: totalTaxCents / 100,
             amount: (subtotalCents + totalTaxCents) / 100,
-            taxLabel: coTaxLabel(estimateTax),
+            taxLabel: coTaxLabel(taxInfo),
             invoiceId: invoice.id,
             invoiceCode: invoice.code,
             projectId: co.projectId,

@@ -1552,6 +1552,18 @@ model ChangeOrder {
   approvedBy         String?
   approvedAt         DateTime?
 
+  // Tax treatment frozen at approval — approveChangeOrderCore and manuallyApproveChangeOrderCore
+  // snapshot the linked Estimate's tax fields here in the same transaction as the status flip to
+  // Approved. Billing and approved-CO rendering must read these, never the estimate's live fields
+  // (lib/co-tax.ts effectiveCoTaxInfo is the one place that decides snapshot-vs-live), so editing
+  // the estimate's tax rate after a CO is signed can never change what an already-signed document
+  // says or what billing actually charges. null = legacy pre-snapshot approval — falls back to the
+  // estimate's live tax, the pre-snapshot behavior. Draft/Sent COs never get a snapshot and always
+  // read the estimate live, which is correct — the estimate can still move before a CO is signed.
+  approvedTaxExempt      Boolean?
+  approvedTaxRateName    String?
+  approvedTaxRatePercent Decimal? @db.Decimal
+
   // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
   // Separate fields so countersigning never overwrites the customer's approval/audit trail.
   companySignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)

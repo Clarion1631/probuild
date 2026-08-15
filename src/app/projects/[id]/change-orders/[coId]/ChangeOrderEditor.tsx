@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, effectiveCoTaxInfo } from "@/lib/co-tax";
 
 // handleSave's return type: the server action returns a JSON-serialized Prisma row,
 // but status/revision are the only fields the manual-approval CAS and Send-for-Approval
@@ -33,6 +33,12 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [billingPreview, setBillingPreview] = useState<any | null>(null);
     const [showManualApproveConfirm, setShowManualApproveConfirm] = useState(false);
     const [isManuallyApproving, setIsManuallyApproving] = useState(false);
+    // Tracks the CO's revision across saves so handleSave/handleManualApprove can send
+    // an expectedRevision CAS token that reflects what THIS tab last wrote, not just what
+    // the page loaded with — initialData.revision never updates after mount, since Next
+    // passing fresh server props to an already-mounted client component does not re-run
+    // useState's initializer.
+    const [revision, setRevision] = useState<number>(initialData.revision);
 
     // A signed CO is a contract: title, description, and items are the approved
     // scope and remain immutable after approval. The server enforces the same
@@ -55,9 +61,10 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
     // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const taxInfo = effectiveCoTaxInfo(initialData, initialData.estimate);
+    const tax = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
-    const taxLabel = coTaxLabel(initialData.estimate);
+    const taxLabel = coTaxLabel(taxInfo);
     const unbilledTime = (initialData.timeEntries || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const unbilledExpenses = (initialData.expenses || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const actualHours = unbilledTime.reduce((sum: number, row: any) => sum + Number(row.durationHours || 0), 0);
@@ -91,14 +98,16 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // last saved to the DB instead of what's on screen. Fail closed: a
             // failed save must never reach the approval call. handleSave() already
             // toasts its own failure.
-            // On the scope-locked path we pass the page-load revision, so a
-            // countersign or any other edit since page load fails closed with a refresh message.
-            const saved = isScopeLocked ? { revision: initialData.revision } : await handleSave();
+            // On the scope-locked path we pass the tracked revision (last set by our
+            // own save/approve, defaulting to the page-load value), so a countersign or
+            // any other edit this tab did not itself make fails closed with a refresh message.
+            const saved = isScopeLocked ? { revision } : await handleSave();
             if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
             const updated = await manuallyApproveChangeOrder(initialData.id, saved.revision);
             setStatus(updated.status);
+            setRevision(updated.revision);
             toast.success("Change order marked as approved (manual)");
             setShowManualApproveConfirm(false);
             router.refresh();
@@ -157,13 +166,18 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     dueDate: row.dueDate || null,
                     order: index,
                 })),
+                expectedRevision: revision,
             });
             setStatus(updated.status);
+            setRevision(updated.revision);
             toast.success("Change Order saved");
             router.refresh();
             return updated;
         } catch (e: any) {
             toast.error(e?.message || "Failed to save CO");
+            // A conflict refreshes server-rendered data. This state token remains
+            // stale until a full reload, so retries continue to fail closed.
+            if (e?.message?.includes("was modified after this page loaded")) router.refresh();
             return null;
         } finally {
             setIsSaving(false);

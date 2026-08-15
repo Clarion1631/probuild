@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal, effectiveCoTaxInfo } from "@/lib/co-tax";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -56,6 +56,7 @@ export async function GET(req: Request) {
             id: true, code: true, title: true, status: true, pricingType: true,
             totalAmount: true, balanceDue: true, createdAt: true, updatedAt: true,
             approvedAt: true, sentAt: true,
+            approvedTaxExempt: true, approvedTaxRateName: true, approvedTaxRatePercent: true,
             paymentSchedules: { select: { amount: true } },
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
@@ -77,7 +78,8 @@ export async function GET(req: Request) {
     const rows = cos.map(co => {
         const stored = rc(Number(co.totalAmount));
         const subtotal = coItemsSubtotal(co.items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
-        const rate = coTaxRate(co.estimate);
+        const taxInfo = effectiveCoTaxInfo(co, co.estimate);
+        const rate = coTaxRate(taxInfo);
         const tax = rc(subtotal * rate);
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
         const inflated = rc(stored - subtotal);
@@ -115,7 +117,7 @@ export async function GET(req: Request) {
             sectionRowNames: sectionNames,
             itemSubtotal: subtotal,
             storedLineTotalsSum: rc(co.items.reduce((s, i) => s + Number(i.total), 0)),
-            taxTreatment: coTaxLabel(co.estimate),
+            taxTreatment: coTaxLabel(taxInfo),
             taxRate: rate,
             expectedBilledAmount: expectedBilled,
             storedMinusSubtotal: inflated,

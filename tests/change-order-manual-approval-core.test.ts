@@ -35,6 +35,7 @@ type ChangeOrderRow = {
     companySignedBy: string | null;
     companySignedAt: Date | null;
     companySignatureUrl: string | null;
+    estimateId: string;
     revision: number;
 };
 
@@ -48,14 +49,21 @@ const calls = {
 
 const state: {
     changeOrder: ChangeOrderRow | null;
+    estimateTax: { taxExempt: boolean; taxRateName: string | null; taxRatePercent: number | null };
     items: ItemRow[];
     schedules: Array<{ id: string; name: string; amount: number; dueDate: Date | null; order: number }>;
-} = { changeOrder: null, items: [], schedules: [] };
+} = {
+    changeOrder: null,
+    estimateTax: { taxExempt: false, taxRateName: "Approval rate", taxRatePercent: 8.9 },
+    items: [],
+    schedules: [],
+};
 
 function resetFixture() {
     calls.rowLocks.length = 0;
     calls.changeOrderUpdates.length = 0;
     state.changeOrder = null;
+    state.estimateTax = { taxExempt: false, taxRateName: "Approval rate", taxRatePercent: 8.9 };
     state.items = [];
     state.schedules = [];
 }
@@ -98,6 +106,9 @@ const fakePrisma = {
                 update: async () => { throw new Error("unexpected changeOrderItem.update in this fixture"); },
                 create: async () => { throw new Error("unexpected changeOrderItem.create in this fixture"); },
             },
+            estimate: {
+                findUnique: async () => ({ ...state.estimateTax }),
+            },
             changeOrder: {
                 update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
                     calls.changeOrderUpdates.push(args);
@@ -112,6 +123,10 @@ const fakePrisma = {
 let manuallyApproveChangeOrderCore: (
     id: string,
     approval: { staffName: string; approvedAt: Date; expectedRevision: number },
+) => Promise<{ co: any; transitioned: boolean } | null>;
+let approveChangeOrderCore: (
+    id: string,
+    approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 let updateChangeOrderCore: (id: string, data: Record<string, unknown>) => Promise<any>;
 
@@ -132,7 +147,7 @@ before(async () => {
         return originalRequire.apply(this, arguments as unknown as [string]);
     } as typeof Module.prototype.require;
 
-    let mod: { manuallyApproveChangeOrderCore?: unknown; updateChangeOrderCore?: unknown };
+    let mod: { approveChangeOrderCore?: unknown; manuallyApproveChangeOrderCore?: unknown; updateChangeOrderCore?: unknown };
     try {
         mod = await import("../src/lib/change-order-core");
     } finally {
@@ -147,6 +162,7 @@ before(async () => {
         );
     }
     manuallyApproveChangeOrderCore = mod.manuallyApproveChangeOrderCore as typeof manuallyApproveChangeOrderCore;
+    approveChangeOrderCore = mod.approveChangeOrderCore as typeof approveChangeOrderCore;
     updateChangeOrderCore = mod.updateChangeOrderCore as typeof updateChangeOrderCore;
 });
 
@@ -172,6 +188,7 @@ function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderR
         companySignedBy: null,
         companySignedAt: null,
         companySignatureUrl: null,
+        estimateId: "estimate-1",
         revision: FIXTURE_REVISION,
         ...overrides,
     };
@@ -194,6 +211,9 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     assert.equal(write.data.status, "Approved");
     assert.equal(write.data.approvedBy, "Jane Doe (manual approval — staff)");
     assert.equal(write.data.approvedAt, approvedAt);
+    assert.equal(write.data.approvedTaxExempt, false);
+    assert.equal(write.data.approvedTaxRateName, "Approval rate");
+    assert.equal(write.data.approvedTaxRatePercent, 8.9);
     assert.deepEqual(write.data.revision, { increment: 1 });
     // Manual approval must never write a client signature — that field simply
     // isn't in the update payload at all.
@@ -207,6 +227,25 @@ test("manual approve from Sent also succeeds", async () => {
     const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION });
     assert.ok(result);
     assert.equal(result!.co.status, "Approved");
+});
+
+test("portal approval snapshots the estimate tax fields in the approval update", async () => {
+    state.changeOrder = draftChangeOrder({ status: "Sent" });
+    state.estimateTax = { taxExempt: true, taxRateName: "Exempt certificate", taxRatePercent: null };
+    state.items = oneItem;
+
+    const result = await approveChangeOrderCore("co-1", {
+        signatureName: "Client Signer",
+        clientSignatureUrl: "secure-doc://client-signature.png",
+        approvedAt: new Date("2026-08-15T12:00:00.000Z"),
+    });
+
+    assert.ok(result);
+    const write = calls.changeOrderUpdates[0];
+    assert.equal(write.data.status, "Approved");
+    assert.equal(write.data.approvedTaxExempt, true);
+    assert.equal(write.data.approvedTaxRateName, "Exempt certificate");
+    assert.equal(write.data.approvedTaxRatePercent, null);
 });
 
 test("manual approve is rejected when the change order is already Approved", async () => {
@@ -285,4 +324,24 @@ test("updateChangeOrderCore's parent update includes revision: { increment: 1 }"
     // the fixture's increment semantics actually moved the number, not just
     // that the write payload shape looks right.
     assert.equal(updated.revision, FIXTURE_REVISION + 1);
+});
+
+test("updateChangeOrderCore rejects a stale expectedRevision before any write", async () => {
+    state.changeOrder = draftChangeOrder({ revision: FIXTURE_REVISION + 1 });
+
+    await assert.rejects(
+        () => updateChangeOrderCore("co-1", { title: "Stale overwrite", expectedRevision: FIXTURE_REVISION }),
+        /modified after this page loaded — refresh and try again/,
+    );
+    assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("updateChangeOrderCore preserves existing caller behavior when expectedRevision is omitted", async () => {
+    state.changeOrder = draftChangeOrder({ revision: FIXTURE_REVISION + 5 });
+
+    const updated = await updateChangeOrderCore("co-1", { title: "MCP-compatible update" });
+
+    assert.equal(updated.title, "MCP-compatible update");
+    assert.equal(updated.revision, FIXTURE_REVISION + 6);
+    assert.equal(calls.changeOrderUpdates.length, 1);
 });

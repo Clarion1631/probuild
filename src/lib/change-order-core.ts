@@ -31,6 +31,13 @@ export type ChangeOrderUpdateInput = {
     paymentSchedules?: ChangeOrderScheduleInput[] | unknown;
     status?: unknown;
     items?: ChangeOrderItemInput[] | unknown;
+    // CAS guard against the load/edit/save race, same mechanism as
+    // manuallyApproveChangeOrderCore's expectedRevision: when provided, the
+    // write is refused if the row's revision moved since the caller loaded it.
+    // Optional and undefined by default so existing callers (the MCP
+    // update_change_order tool, any other server caller) keep working
+    // unchanged — the approve-time CAS still guards them regardless.
+    expectedRevision?: number;
     [key: string]: unknown;
 };
 
@@ -106,13 +113,25 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedBy: string | null;
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
+            revision: number;
         }>>`
             SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
-                   "companySignedBy", "companySignedAt", "companySignatureUrl"
+                   "companySignedBy", "companySignedAt", "companySignatureUrl", "revision"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) throw new Error("Change order not found");
+
+        // CAS guard against the load/edit/save race: a stale page loaded before a
+        // concurrent save must not clobber it and inherit a fresh revision that
+        // then passes the manual-approve CAS on the strength of a save that never
+        // saw the other edit. Same mechanism and message as
+        // manuallyApproveChangeOrderCore's expectedRevision check. Undefined
+        // (the MCP update_change_order tool, any other server caller that
+        // doesn't track revision) skips this and behaves exactly as before.
+        if (data.expectedRevision !== undefined && data.expectedRevision !== current.revision) {
+            throw new Error(`Change order ${current.code} was modified after this page loaded — refresh and try again.`);
+        }
 
         // Status transitions are lifecycle operations, never generic field
         // updates. In particular, Draft -> Sent must go through
@@ -367,8 +386,8 @@ export async function approveChangeOrderCore(
         // co-audit repair. Status, item existence, subtotal validation, and the
         // approval write therefore observe one serialized state and commit as a
         // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount"
+        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown; estimateId: string }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -406,6 +425,16 @@ export async function approveChangeOrderCore(
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
 
+        // Freeze the tax treatment at the moment of approval: the customer's
+        // signature is on this amount, so an estimate edited afterward must
+        // never change what the signed document says or what billing charges.
+        // See co-tax.ts's effectiveCoTaxInfo, the one place that reads these
+        // columns back.
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: current.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
@@ -413,6 +442,9 @@ export async function approveChangeOrderCore(
                 approvedBy: approval.signatureName.trim(),
                 approvedAt: approval.approvedAt,
                 clientSignatureUrl: approval.clientSignatureUrl,
+                approvedTaxExempt: estimateTax?.taxExempt ?? false,
+                approvedTaxRateName: estimateTax?.taxRateName ?? null,
+                approvedTaxRatePercent: estimateTax?.taxRatePercent ?? null,
                 revision: { increment: 1 },
             },
         });
@@ -443,9 +475,9 @@ export async function manuallyApproveChangeOrderCore(
         // approval write observe one serialized state.
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
-            clientSignatureUrl: string | null; revision: number;
+            clientSignatureUrl: string | null; revision: number; estimateId: string;
         }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision"
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision", "estimateId"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -494,12 +526,22 @@ export async function manuallyApproveChangeOrderCore(
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
 
+        // Freeze the tax treatment at the moment of approval — same as
+        // approveChangeOrderCore. See co-tax.ts's effectiveCoTaxInfo.
+        const estimateTax = await tx.estimate.findUnique({
+            where: { id: current.estimateId },
+            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+        });
+
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
                 status: "Approved",
                 approvedBy: `${approval.staffName.trim()}${MANUAL_CO_APPROVAL_SUFFIX}`,
                 approvedAt: approval.approvedAt,
+                approvedTaxExempt: estimateTax?.taxExempt ?? false,
+                approvedTaxRateName: estimateTax?.taxRateName ?? null,
+                approvedTaxRatePercent: estimateTax?.taxRatePercent ?? null,
                 revision: { increment: 1 },
             },
         });

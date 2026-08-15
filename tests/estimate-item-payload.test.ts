@@ -13,7 +13,7 @@ import {
     selectedBillableRows,
 } from "../src/lib/estimate-item-payload";
 import { buildQBEstimateLines } from "../src/lib/quickbooks";
-import { billableCoItems, classifyCoTotal, coItemsSubtotal, coSectionRowNames } from "../src/lib/co-tax";
+import { billableCoItems, classifyCoTotal, coItemsSubtotal, coSectionRowNames, effectiveCoTaxInfo } from "../src/lib/co-tax";
 
 type Row = {
     id: string;
@@ -563,6 +563,21 @@ test("billableCoItems drops section rows without guessing at their meaning", () 
     assert.deepEqual(coSectionRowNames(headersOnly), ["Phase 1", "Phase 2"]);
     assert.deepEqual(coSectionRowNames(mixed), ["(unnamed)"]);
     assert.deepEqual(coSectionRowNames([{ type: "Material", name: "Tile" }]), []);
+});
+
+test("effectiveCoTaxInfo uses the approval snapshot even when the estimate later changes", () => {
+    assert.deepEqual(
+        effectiveCoTaxInfo(
+            { approvedTaxExempt: false, approvedTaxRateName: "Approval snapshot", approvedTaxRatePercent: 8.8 },
+            { taxExempt: false, taxRateName: "Live changed rate", taxRatePercent: 10 },
+        ),
+        { taxExempt: false, taxRateName: "Approval snapshot", taxRatePercent: 8.8 },
+    );
+});
+
+test("effectiveCoTaxInfo falls back to the live estimate for legacy null snapshots", () => {
+    const estimate = { taxExempt: false, taxRateName: "Legacy live rate", taxRatePercent: 8.9 };
+    assert.equal(effectiveCoTaxInfo({ approvedTaxExempt: null }, estimate), estimate);
 });
 
 test("every money path refuses a change order carrying section headers", () => {

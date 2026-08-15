@@ -24,6 +24,7 @@ import { reconcileMilestoneToQbo } from "../src/lib/quickbooks-payments";
 import { querySalesTaxData } from "../src/lib/sales-tax-report";
 import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import { dateOnlyInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "../src/lib/company-timezone";
+import { generateChangeOrderPdf } from "../src/lib/pdf";
 
 const prisma = new PrismaClient();
 const run = `cpco-${process.pid}-${Date.now()}`;
@@ -37,12 +38,14 @@ const IDS = {
   estimateA: `${run}-estimate-a`,
   estimateSplit: `${run}-estimate-split`,
   estimateB: `${run}-estimate-b`,
+  estimateSnapshot: `${run}-estimate-snapshot`,
   invoiceA: `${run}-invoice-a`,
   invoiceSplit: `${run}-invoice-split`,
   invoiceTax: `${run}-invoice-tax`,
   invoiceReconcile: `${run}-invoice-reconcile`,
   invoiceB: `${run}-invoice-b`,
   invoiceGuard: `${run}-invoice-guard`,
+  invoiceSnapshot: `${run}-invoice-snapshot`,
   receipt: `${run}-receipt`,
   costPlusZero: `${run}-co-zero`,
   dstCo: `${run}-co-dst`,
@@ -50,6 +53,8 @@ const IDS = {
   splitCo: `${run}-co-split`,
   lumpCo: `${run}-co-lump`,
   deniedCo: `${run}-co-denied`,
+  snapshotFixedCo: `${run}-co-snapshot-fixed`,
+  snapshotCostPlusCo: `${run}-co-snapshot-cost-plus`,
   itemA: `${run}-item-a`,
   itemB: `${run}-item-b`,
 } as const;
@@ -67,6 +72,21 @@ async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
     return "";
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  await import("@napi-rs/canvas").catch(() => null);
+  const pdfParseMod: any = await import("pdf-parse");
+  const PDFParseCtor = pdfParseMod.PDFParse ?? pdfParseMod.default?.PDFParse;
+  const workerMod: any = await import("pdf-parse/worker").catch(() => null);
+  const workerData = workerMod?.getData?.();
+  if (workerData && typeof PDFParseCtor.setWorker === "function") PDFParseCtor.setWorker(workerData);
+  const parser = new PDFParseCtor({ data: buffer });
+  try {
+    return (await parser.getText())?.text ?? "";
+  } finally {
+    await parser.destroy?.();
   }
 }
 
@@ -140,6 +160,18 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
           totalAmount: 0,
           balanceDue: 0,
           taxExempt: true,
+        },
+        {
+          id: IDS.estimateSnapshot,
+          code: `${run}-EST-SNAPSHOT`,
+          title: "Tax snapshot estimate",
+          projectId: IDS.projectA,
+          status: "Approved",
+          totalAmount: 0,
+          balanceDue: 0,
+          taxRateName: "Live changed rate",
+          taxRatePercent: 10,
+          taxExempt: false,
         },
       ],
     });
@@ -220,6 +252,19 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
           totalAmount: 100,
           balanceDue: 100,
         },
+        {
+          id: IDS.invoiceSnapshot,
+          code: `${run}-INV-SNAPSHOT`,
+          projectId: IDS.projectA,
+          clientId: IDS.clientA,
+          estimateId: IDS.estimateSnapshot,
+          status: "Draft",
+          subtotal: 0,
+          taxRate: 8.8,
+          taxAmount: 0,
+          totalAmount: 0,
+          balanceDue: 0,
+        },
       ],
     });
     await prisma.estimateItem.createMany({
@@ -247,15 +292,15 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         where: { changeOrder: { projectId: { in: [IDS.projectA, IDS.projectB] } } },
       });
       await prisma.paymentSchedule.deleteMany({
-        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } },
+        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard, IDS.invoiceSnapshot] } },
       });
       await prisma.timeEntry.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
-      await prisma.expense.deleteMany({ where: { estimateId: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
+      await prisma.expense.deleteMany({ where: { estimateId: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB, IDS.estimateSnapshot] } } });
       await prisma.changeOrder.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
-      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } } });
+      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard, IDS.invoiceSnapshot] } } });
       await prisma.estimateItem.deleteMany({ where: { id: { in: [IDS.itemA, IDS.itemB] } } });
       await prisma.projectFile.deleteMany({ where: { id: IDS.receipt } });
-      await prisma.estimate.deleteMany({ where: { id: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
+      await prisma.estimate.deleteMany({ where: { id: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB, IDS.estimateSnapshot] } } });
       await prisma.project.deleteMany({ where: { id: { in: [IDS.projectA, IDS.projectB] } } });
       await prisma.client.deleteMany({ where: { id: { in: [IDS.clientA, IDS.clientB] } } });
       await prisma.user.deleteMany({ where: { id: IDS.user } });
@@ -757,6 +802,90 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     expect(dollars(invoice.subtotal)).toBe(310);
     expect(dollars(invoice.taxAmount)).toBe(26);
     expect(dollars(invoice.balanceDue)).toBe(336);
+  });
+
+  test("CPCO8A: approved tax snapshots survive later estimate edits in renders and both billing modes", async ({ page }) => {
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.snapshotFixedCo,
+        code: `${run}-CO-SNAPSHOT-FIXED`,
+        title: "Approval tax snapshot fixed",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "FIXED",
+        totalAmount: 100,
+        balanceDue: 100,
+        approvedBy: "Snapshot Client",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        approvedTaxExempt: false,
+        approvedTaxRateName: "Approval snapshot",
+        approvedTaxRatePercent: 8.8,
+        items: { create: { name: "Snapshot fixed work", quantity: 1, unitCost: 100, total: 100 } },
+      },
+    });
+
+    // The linked estimate says 10%, but an approved CO must keep rendering
+    // and billing the 8.8% terms frozen above.
+    await page.goto(`/portal/change-orders/${IDS.snapshotFixedCo}`);
+    await expect.soft(page.getByText("Approval snapshot (8.8%)", { exact: true })).toBeVisible();
+    await expect.soft(page.getByText("$108.80", { exact: true })).toBeVisible();
+
+    const pdfText = await extractPdfText(await generateChangeOrderPdf(IDS.snapshotFixedCo));
+    expect.soft(pdfText).toContain("Approval snapshot (8.8%)");
+    expect.soft(pdfText).toContain("$108.80");
+
+    const fixed = await billChangeOrderCore(IDS.snapshotFixedCo, billingTestDependencies);
+    expect(fixed.ok).toBe(true);
+    if (!fixed.ok) throw new Error(fixed.error);
+    expect.soft(fixed.taxLabel).toBe("Approval snapshot (8.8%)");
+    expect.soft(fixed.taxAmount).toBe(8.8);
+    expect.soft(fixed.amount).toBe(108.8);
+
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.snapshotCostPlusCo,
+        code: `${run}-CO-SNAPSHOT-COST-PLUS`,
+        title: "Approval tax snapshot cost plus",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "COST_PLUS",
+        markupPercent: 0,
+        totalAmount: 0,
+        balanceDue: 0,
+        approvedBy: "Snapshot Client",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        approvedTaxExempt: false,
+        approvedTaxRateName: "Approval snapshot",
+        approvedTaxRatePercent: 8.8,
+      },
+    });
+    await prisma.timeEntry.create({
+      data: {
+        projectId: IDS.projectA,
+        userId: IDS.user,
+        changeOrderId: IDS.snapshotCostPlusCo,
+        startTime: new Date("2026-07-15T10:00:00.000Z"),
+        durationHours: 1,
+        laborCost: 100,
+        burdenCost: 0,
+        isBillable: true,
+      },
+    });
+
+    const preview = await previewCostPlusChangeOrderCore(IDS.snapshotCostPlusCo, { throughDate: "2026-07-15" });
+    expect.soft(preview.taxLabel).toBe("Approval snapshot (8.8%)");
+    expect.soft(preview.taxCents).toBe(880);
+    expect.soft(preview.totalCents).toBe(10_880);
+
+    const billed = await billCostPlusChangeOrderCore(IDS.snapshotCostPlusCo, {
+      throughDate: "2026-07-15",
+      actor: "Playwright tax snapshot",
+      expectedFingerprint: preview.fingerprint,
+    });
+    expect.soft(billed.taxCents).toBe(880);
+    expect.soft(billed.totalCents).toBe(10_880);
   });
 
   test("CPCO9 amendments C/D: backup PDF allows staff and matching client token, rejects cross-client token", async ({ page }) => {

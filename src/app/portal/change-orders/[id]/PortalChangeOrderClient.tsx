@@ -6,7 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems, effectiveCoTaxInfo } from "@/lib/co-tax";
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 import { buildPdf } from "@/lib/build-pdf";
 
@@ -100,9 +100,10 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     // customers pay none) — the amount shown here is what the customer signs
     // AND what billing charges, to the cent.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const taxInfo = effectiveCoTaxInfo(initialData, initialData.estimate);
+    const tax = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
-    const taxLabel = coTaxLabel(initialData.estimate);
+    const taxLabel = coTaxLabel(taxInfo);
     const isCostPlus = initialData.pricingType === "COST_PLUS";
     const schedules = initialData.paymentSchedules || [];
 
