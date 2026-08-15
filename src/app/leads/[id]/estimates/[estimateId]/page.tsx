@@ -2,6 +2,8 @@ import { getEstimate, getLead, getCompanySettings, getEstimateActivity } from "@
 import { notFound } from "next/navigation";
 import EstimateEditor from "@/app/projects/[id]/estimates/[estimateId]/EstimateEditor";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { parseSalesTaxes } from "@/lib/sales-tax";
+import { sanitizeCompanySalesTaxes } from "@/lib/estimate-tax-options";
 
 export const dynamic = "force-dynamic";
 
@@ -26,10 +28,9 @@ export default async function LeadEstimatePage({ params }: { params: Promise<{ i
         );
     }
 
-    let salesTaxes: { id?: string; name: string; rate: number; isDefault: boolean }[] = [];
-    try {
-        salesTaxes = settings.salesTaxes ? JSON.parse(settings.salesTaxes) : [];
-    } catch { /* ignore parse errors */ }
+    // parseSalesTaxes, not a hand-rolled JSON.parse: the stored value can be "null" or "{}" (both
+    // parse fine and are not arrays) or an array holding nulls, and the editor maps over this.
+    const salesTaxes = sanitizeCompanySalesTaxes(parseSalesTaxes(settings.salesTaxes));
 
     return (
         <div className="flex-1 flex h-full overflow-hidden">

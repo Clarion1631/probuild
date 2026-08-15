@@ -175,7 +175,7 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct, marginPatchForRate, marginIsSettable } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
-import { buildTaxOptions, resolveActiveTax, taxFieldsForSave } from "@/lib/estimate-tax-options";
+import { EXEMPT_TAX_KEY, buildTaxOptions, reconcileTaxKey, resolveActiveTax, taxFieldsForSave, type TaxOption } from "@/lib/estimate-tax-options";
 import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
 // Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
@@ -334,10 +334,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const [processingFeeMarkup, setProcessingFeeMarkup] = useState<number>(Number(initialEstimate.processingFeeMarkup) || 0);
     const [hideProcessingFee, setHideProcessingFee] = useState<boolean>(initialEstimate.hideProcessingFee ?? true);
     const [taxExempt, setTaxExempt] = useState<boolean>(initialEstimate.taxExempt ?? false);
-    // Options are identified by KEY, not by display name — resolving tax by name silently
-    // re-quotes the client whenever the estimate's stored name collides with a company tax at a
-    // different rate (the takeoff-conversion case), or when the rate was stored with no name at
-    // all. See src/lib/estimate-tax-options.ts.
+    // Options are identified by an opaque generated KEY, never by display name — resolving tax by
+    // name silently re-quotes the client whenever two company rows share a name, whenever the
+    // estimate's stored name collides with a company tax at a different rate (the
+    // takeoff-conversion case), or when the rate was stored with no name at all.
+    // See src/lib/estimate-tax-options.ts.
     const taxOptionSet = useMemo(
         () => buildTaxOptions(salesTaxes, { name: initialEstimate.taxRateName, percent: initialEstimate.taxRatePercent }),
         [salesTaxes, initialEstimate.taxRateName, initialEstimate.taxRatePercent],
@@ -345,6 +346,19 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     const taxOptions = taxOptionSet.options;
     const defaultTaxRate = taxOptionSet.defaultOption;
     const [selectedTaxKey, setSelectedTaxKey] = useState<string | null>(taxOptionSet.initialKey);
+
+    // `selectedTaxKey` is seeded ONCE, but the option set is rebuilt every time fresh props
+    // arrive (a settings edit, the router refresh after a save). Keys are positional, so a
+    // rebuild can drop the selected key — or repoint it at a different tax — and the editor
+    // would then fall through to the company default and re-quote the client on the next save.
+    // reconcileTaxKey re-establishes identity by (name, rate); it returns the same key when
+    // nothing meaningful changed, so React bails out of the re-render.
+    const prevTaxOptionsRef = useRef<TaxOption[]>(taxOptionSet.options);
+    useEffect(() => {
+        const previousOptions = prevTaxOptionsRef.current;
+        prevTaxOptionsRef.current = taxOptionSet.options;
+        setSelectedTaxKey(prev => reconcileTaxKey(prev, previousOptions, taxOptionSet));
+    }, [taxOptionSet]);
     const [isAiFilling, setIsAiFilling] = useState(false);
     const [isAiAssigningPhases, setIsAiAssigningPhases] = useState(false);
     const [targetMargin, setTargetMargin] = useState<string>(String(initialEstimate.targetMarginPercent ?? 25));
@@ -3682,9 +3696,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                     {viewMode === "internal" && taxOptions.length > 0 && (
                                         <div className="flex items-center gap-2 text-xs text-slate-500">
                                             <select
-                                                value={taxExempt ? "__exempt__" : (selectedTaxKey || "")}
+                                                value={taxExempt ? EXEMPT_TAX_KEY : (selectedTaxKey || "")}
                                                 onChange={(e) => {
-                                                    if (e.target.value === "__exempt__") {
+                                                    if (e.target.value === EXEMPT_TAX_KEY) {
                                                         setTaxExempt(true);
                                                         setSelectedTaxKey(null);
                                                     } else {
@@ -3699,7 +3713,9 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                         {t.label} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){t.orphaned ? " — not in settings" : ""}
                                                     </option>
                                                 ))}
-                                                <option value="__exempt__">Tax Exempt</option>
+                                                {/* Reserved key: company options key on `company:<index>`, so no
+                                                    configured tax row can ever mint this value. */}
+                                                <option value={EXEMPT_TAX_KEY}>Tax Exempt</option>
                                             </select>
                                         </div>
                                     )}

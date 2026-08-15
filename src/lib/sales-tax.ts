@@ -18,7 +18,13 @@ export function parseSalesTaxes(raw: string | null | undefined): ConfiguredSales
         const parsed = JSON.parse(raw);
         // JSON.parse("null") and JSON.parse("{}") both succeed without being an array, and a
         // subsequent .find/.filter would throw at the call site.
-        return Array.isArray(parsed) ? (parsed as ConfiguredSalesTax[]) : [];
+        if (!Array.isArray(parsed)) return [];
+        // The array's ELEMENTS are equally unvalidated: `[null, 5, "x"]` parses fine and then
+        // every caller's `row.rate` throws or reads undefined. Callers may only assume they got
+        // objects; whether a given object is a usable tax row is theirs to decide.
+        return parsed.filter(
+            (row): row is ConfiguredSalesTax => !!row && typeof row === "object" && !Array.isArray(row),
+        );
     } catch {
         return [];
     }
