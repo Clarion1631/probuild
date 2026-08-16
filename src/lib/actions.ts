@@ -32,7 +32,7 @@ import { postDailyLogSummary } from "./chat-webhook";
 import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { recordPaymentCore } from "./payment-record-core";
-import { deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
+import { ChangeOrderRevisionConflictError, deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
@@ -9076,7 +9076,18 @@ export async function getChangeOrderForPortal(id: string) {
     });
 }
 
-export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput) {
+type SerializedChangeOrder = {
+    id: string;
+    projectId: string;
+    status: string;
+    revision: number;
+} & Record<string, unknown>;
+
+type ChangeOrderMutationActionResult =
+    | { success: true; changeOrder: SerializedChangeOrder }
+    | { success: false; code: "REVISION_CONFLICT" };
+
+export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput): Promise<ChangeOrderMutationActionResult> {
     "use server";
     // Money-path: this is a remotely invokable server action — gate it like
     // sendChangeOrderToClient and whitelist fields so callers can't write
@@ -9088,12 +9099,23 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
     if (!target) throw new Error("Change order not found");
     if (!canAccessProject(user, target.projectId)) throw new Error("Forbidden");
 
-    const co = await updateChangeOrderCore(id, data);
+    let co: Awaited<ReturnType<typeof updateChangeOrderCore>>;
+    try {
+        co = await updateChangeOrderCore(id, data);
+    } catch (error) {
+        if (error instanceof ChangeOrderRevisionConflictError) {
+            return { success: false, code: "REVISION_CONFLICT" };
+        }
+        throw error;
+    }
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
-    return JSON.parse(JSON.stringify(co));
+    return {
+        success: true,
+        changeOrder: JSON.parse(JSON.stringify(co)) as SerializedChangeOrder,
+    };
 }
 
 export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
@@ -9310,7 +9332,7 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 // path, except the client-facing milestone payment email is suppressed (see
 // handleChangeOrderApproved's suppressClientEmails option and its own
 // DB-derived backstop for callers, like the cron sweep, that don't pass it).
-export async function manuallyApproveChangeOrder(id: string, expectedRevision: number) {
+export async function manuallyApproveChangeOrder(id: string, expectedRevision: number): Promise<ChangeOrderMutationActionResult> {
     "use server";
     const user = await assertActiveStaff();
     if (user.role !== "ADMIN" && user.role !== "MANAGER") throw new Error("Forbidden");
@@ -9324,11 +9346,19 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     }
 
     const staffName = (user.name || user.email || "").trim();
-    const approval = await manuallyApproveChangeOrderCore(id, {
-        staffName,
-        approvedAt: new Date(),
-        expectedRevision,
-    });
+    let approval: Awaited<ReturnType<typeof manuallyApproveChangeOrderCore>>;
+    try {
+        approval = await manuallyApproveChangeOrderCore(id, {
+            staffName,
+            approvedAt: new Date(),
+            expectedRevision,
+        });
+    } catch (error) {
+        if (error instanceof ChangeOrderRevisionConflictError) {
+            return { success: false, code: "REVISION_CONFLICT" };
+        }
+        throw error;
+    }
     if (!approval) throw new Error("Change order not found");
     const { co, transitioned } = approval;
 
@@ -9354,7 +9384,10 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
     // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
-    return JSON.parse(JSON.stringify(co));
+    return {
+        success: true,
+        changeOrder: JSON.parse(JSON.stringify(co)) as SerializedChangeOrder,
+    };
 }
 
 export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string; revision: number } | { success: false; error: string }> {

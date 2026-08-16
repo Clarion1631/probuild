@@ -11,12 +11,15 @@ const IDS = {
     sendCo: `${run}-send-co`,
     countersignCo: `${run}-countersign-co`,
     conflictCo: `${run}-conflict-co`,
+    manualConflictCo: `${run}-manual-conflict-co`,
 } as const;
 
 const SEND_TITLE = "Revision adoption after send";
 const COUNTERSIGN_TITLE = "Revision adoption after countersign";
 const CONFLICT_TITLE = "Revision conflict original";
 const EXTERNAL_TITLE = "Revision conflict server copy";
+const MANUAL_CONFLICT_TITLE = "Manual approval conflict original";
+const MANUAL_EXTERNAL_TITLE = "Manual approval conflict server copy";
 
 async function readCo(id: string) {
     return prisma.changeOrder.findUniqueOrThrow({
@@ -99,12 +102,29 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
                 items: { create: { name: "Conflict flow item", type: "Other", quantity: 1, unitCost: 100, total: 100 } },
             },
         });
+        await prisma.changeOrder.create({
+            data: {
+                id: IDS.manualConflictCo,
+                code: `${run}-MANUAL-CONFLICT`,
+                title: MANUAL_CONFLICT_TITLE,
+                projectId: IDS.project,
+                estimateId: IDS.estimate,
+                status: "Sent",
+                sentAt: new Date(),
+                pricingType: "FIXED",
+                totalAmount: 100,
+                balanceDue: 100,
+                companySignedBy: "Existing Company Signer",
+                companySignedAt: new Date(),
+                items: { create: { name: "Manual conflict item", type: "Labor", quantity: 1, unitCost: 100, total: 100 } },
+            },
+        });
     });
 
     test.afterAll(async () => {
         try {
             await prisma.notification.deleteMany({ where: { projectId: IDS.project } });
-            await prisma.changeOrder.deleteMany({ where: { id: { in: [IDS.sendCo, IDS.countersignCo, IDS.conflictCo] } } });
+            await prisma.changeOrder.deleteMany({ where: { id: { in: [IDS.sendCo, IDS.countersignCo, IDS.conflictCo, IDS.manualConflictCo] } } });
             await prisma.estimate.deleteMany({ where: { id: IDS.estimate } });
             await prisma.project.deleteMany({ where: { id: IDS.project } });
             await prisma.client.deleteMany({ where: { id: IDS.client } });
@@ -113,7 +133,7 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
         }
     });
 
-    test("same tab adopts send/countersign revisions and hard-reloads a genuine conflict", async ({ page }) => {
+    test("same tab adopts revisions returned by send and countersign", async ({ page }) => {
         test.setTimeout(120_000);
 
         // Save -> send -> save -> manual approve. The send owns the second
@@ -146,7 +166,9 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
         await page.getByRole("button", { name: "Mark as Approved (manual)" }).click();
         await page.getByRole("button", { name: "Confirm approval" }).click();
         await expect.poll(async () => (await readCo(IDS.countersignCo)).status).toBe("Approved");
+    });
 
+    test("Save conflict hard-reloads every controlled field from the server copy", async ({ page }) => {
         // A genuinely stale form must be replaced wholesale. router.refresh()
         // alone updates props but preserves the controlled title/revision state,
         // so the old implementation left this input on the stale local value.
@@ -160,5 +182,27 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
         await title.fill("Stale local copy");
         await page.getByRole("button", { name: "Save", exact: true }).click();
         await expect(title).toHaveValue(EXTERNAL_TITLE, { timeout: 15_000 });
+    });
+
+    test("scope-locked Manual Approve conflict hard-reloads the full server copy", async ({ page }) => {
+        // The company signature locks scope, so handleManualApprove intentionally
+        // skips Save and submits this tab's page-load revision directly to the
+        // manual-approval action. A concurrent writer then makes that token stale.
+        await page.goto(`/projects/${IDS.project}/change-orders/${IDS.manualConflictCo}`, { waitUntil: "networkidle" });
+        const title = page.getByPlaceholder("Change Order Title");
+        await expect(title).toHaveValue(MANUAL_CONFLICT_TITLE);
+        await expect(title).toBeDisabled();
+
+        await prisma.changeOrder.update({
+            where: { id: IDS.manualConflictCo },
+            data: { title: MANUAL_EXTERNAL_TITLE, revision: { increment: 1 } },
+        });
+
+        await page.getByRole("button", { name: "Details & Signatures" }).click();
+        await page.getByRole("button", { name: "Mark as Approved (manual)" }).click();
+        await page.getByRole("button", { name: "Confirm approval" }).click();
+
+        await expect(title).toHaveValue(MANUAL_EXTERNAL_TITLE, { timeout: 15_000 });
+        await expect.poll(async () => (await readCo(IDS.manualConflictCo)).status).toBe("Sent");
     });
 });

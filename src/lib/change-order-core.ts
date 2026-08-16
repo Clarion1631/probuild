@@ -3,6 +3,18 @@ import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone"
 import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
 import { MANUAL_CO_APPROVAL_SUFFIX } from "./co-approval";
 
+/**
+ * Internal CAS sentinel. Permission-gated Server Actions catch only this
+ * class and return a fixed, serializable conflict code; every other error
+ * stays on Next's normal thrown/redacted path.
+ */
+export class ChangeOrderRevisionConflictError extends Error {
+    constructor(changeOrderCode: string) {
+        super(`Change order ${changeOrderCode} was modified after this page loaded — refresh and try again.`);
+        this.name = "ChangeOrderRevisionConflictError";
+    }
+}
+
 type ChangeOrderItemInput = {
     id?: string;
     name?: string;
@@ -130,7 +142,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
         // (the MCP update_change_order tool, any other server caller that
         // doesn't track revision) skips this and behaves exactly as before.
         if (data.expectedRevision !== undefined && data.expectedRevision !== current.revision) {
-            throw new Error(`Change order ${current.code} was modified after this page loaded — refresh and try again.`);
+            throw new ChangeOrderRevisionConflictError(current.code);
         }
 
         // Status transitions are lifecycle operations, never generic field
@@ -496,7 +508,7 @@ export async function manuallyApproveChangeOrderCore(
         // (items, schedules, pricing, status, signatures) — a mismatch means
         // the row changed underneath the caller since it loaded the page.
         if (current.revision !== approval.expectedRevision) {
-            throw new Error(`Change order ${current.code} was modified after this page loaded — refresh and try again.`);
+            throw new ChangeOrderRevisionConflictError(current.code);
         }
 
         if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");

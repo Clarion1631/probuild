@@ -64,7 +64,32 @@ test("the canAccessProject mechanism itself correctly rejects an out-of-scope ro
     assert.equal(canAccessProject(user, "project-b"), false);
 });
 
-let coreCallCount = 0;
+const actionUser = {
+    role: "MANAGER",
+    email: "manager@example.com",
+    name: "Off-Project Manager",
+    projectAccess: [],
+    assignedProjects: [],
+};
+let projectAccessAllowed = false;
+let changeOrderPermissionAllowed = true;
+let coreOutcome: "unexpected" | "conflict" | "generic" = "unexpected";
+const coreCalls = { update: 0, manualApprove: 0 };
+
+class FakeChangeOrderRevisionConflictError extends Error {
+    constructor() {
+        super("Change order CO-001 was modified after this page loaded — refresh and try again.");
+        this.name = "ChangeOrderRevisionConflictError";
+    }
+}
+
+function throwConfiguredCoreOutcome(operation: "update" | "manualApprove"): never {
+    coreCalls[operation] += 1;
+    if (coreOutcome === "conflict") throw new FakeChangeOrderRevisionConflictError();
+    if (coreOutcome === "generic") throw new Error(`${operation} validation failed`);
+    throw new Error(`${operation} core must not be reached in this test`);
+}
+
 const fakePrisma = {
     changeOrder: {
         findUnique: async () => ({ projectId: "project-out-of-scope" }),
@@ -75,20 +100,13 @@ const fakePermissions = {
     // The user the shared loader (assertActiveStaff -> currentStaffUserOrNull) resolves to:
     // a MANAGER, which passes manuallyApproveChangeOrder's own role gate, so the request
     // reaches the canAccessProject check this test exists to prove is wired in.
-    currentStaffUserOrNull: async () => ({
-        role: "MANAGER",
-        email: "manager@example.com",
-        name: "Off-Project Manager",
-        projectAccess: [],
-        assignedProjects: [],
-    }),
-    getCurrentUserWithPermissions: async () => null,
+    currentStaffUserOrNull: async () => actionUser,
+    getCurrentUserWithPermissions: async () => actionUser,
     getUserWithPermissionsByEmail: async () => null,
-    hasPermission: () => false,
-    // Faked to deny outright — the real canAccessProject/accessibleProjectIds logic is
-    // already covered by Tests 1-2 above; this test only needs to prove the ACTION calls it
-    // and respects a "no" before touching the core.
-    canAccessProject: () => false,
+    hasPermission: () => changeOrderPermissionAllowed,
+    // Controllable at the action boundary — the real canAccessProject/
+    // accessibleProjectIds logic is already covered by Tests 1-2 above.
+    canAccessProject: () => projectAccessAllowed,
     canAccessEstimate: () => false,
     canCreateContractFor: () => false,
     canAccessContract: () => false,
@@ -99,15 +117,14 @@ const fakePermissions = {
     PortalAuthError: class extends Error {},
 };
 const fakeChangeOrderCore = {
+    ChangeOrderRevisionConflictError: FakeChangeOrderRevisionConflictError,
     deleteChangeOrderCore: async () => { throw new Error("deleteChangeOrderCore should not be called by this test"); },
-    updateChangeOrderCore: async () => { throw new Error("updateChangeOrderCore should not be called by this test"); },
-    manuallyApproveChangeOrderCore: async () => {
-        coreCallCount += 1;
-        throw new Error("manuallyApproveChangeOrderCore must not be reached when canAccessProject denies");
-    },
+    updateChangeOrderCore: async () => throwConfiguredCoreOutcome("update"),
+    manuallyApproveChangeOrderCore: async () => throwConfiguredCoreOutcome("manualApprove"),
 };
 
 let manuallyApproveChangeOrder: (id: string, expectedRevision: number) => Promise<unknown>;
+let updateChangeOrder: (id: string, data: Record<string, unknown>) => Promise<unknown>;
 
 before(async () => {
     const originalRequire = Module.prototype.require;
@@ -122,21 +139,81 @@ before(async () => {
         return originalRequire.apply(this, arguments as unknown as [string]);
     } as typeof Module.prototype.require;
 
-    const mod: { manuallyApproveChangeOrder?: unknown } = await import("../src/lib/actions");
-    if (typeof mod.manuallyApproveChangeOrder !== "function") {
+    const mod: { manuallyApproveChangeOrder?: unknown; updateChangeOrder?: unknown } = await import("../src/lib/actions");
+    if (typeof mod.manuallyApproveChangeOrder !== "function" || typeof mod.updateChangeOrder !== "function") {
         throw new Error(
             `change-order-manual-approval-scope.test.ts: mock of "./permissions"/"./prisma"/"./change-order-core" did not apply — ` +
-                `manuallyApproveChangeOrder export is ${typeof mod.manuallyApproveChangeOrder}.`,
+                `action exports are manual=${typeof mod.manuallyApproveChangeOrder}, update=${typeof mod.updateChangeOrder}.`,
         );
     }
     manuallyApproveChangeOrder = mod.manuallyApproveChangeOrder as typeof manuallyApproveChangeOrder;
+    updateChangeOrder = mod.updateChangeOrder as typeof updateChangeOrder;
 });
 
 test("manuallyApproveChangeOrder throws Forbidden and never reaches the core when the resolved user cannot access the change order's project", async () => {
-    coreCallCount = 0;
+    projectAccessAllowed = false;
+    changeOrderPermissionAllowed = true;
+    coreOutcome = "unexpected";
+    coreCalls.manualApprove = 0;
     await assert.rejects(
         () => manuallyApproveChangeOrder("co-1", 0),
         /Forbidden/,
     );
-    assert.equal(coreCallCount, 0, "manuallyApproveChangeOrderCore must not be invoked before the project-scope check passes");
+    assert.equal(coreCalls.manualApprove, 0, "manuallyApproveChangeOrderCore must not be invoked before the project-scope check passes");
+});
+
+test("updateChangeOrder returns only the explicit conflict code for a typed core revision conflict", async () => {
+    projectAccessAllowed = true;
+    changeOrderPermissionAllowed = true;
+    coreOutcome = "conflict";
+    coreCalls.update = 0;
+
+    const result = await updateChangeOrder("co-1", { title: "Stale update", expectedRevision: 0 });
+
+    assert.deepEqual(result, { success: false, code: "REVISION_CONFLICT" });
+    assert.equal(coreCalls.update, 1);
+});
+
+test("manuallyApproveChangeOrder returns only the explicit conflict code for a typed core revision conflict", async () => {
+    projectAccessAllowed = true;
+    coreOutcome = "conflict";
+    coreCalls.manualApprove = 0;
+
+    const result = await manuallyApproveChangeOrder("co-1", 0);
+
+    assert.deepEqual(result, { success: false, code: "REVISION_CONFLICT" });
+    assert.equal(coreCalls.manualApprove, 1);
+});
+
+test("updateChangeOrder preserves thrown validation and unexpected core failures", async () => {
+    projectAccessAllowed = true;
+    changeOrderPermissionAllowed = true;
+    coreOutcome = "generic";
+
+    await assert.rejects(
+        () => updateChangeOrder("co-1", { title: "Invalid update" }),
+        /update validation failed/,
+    );
+});
+
+test("manuallyApproveChangeOrder preserves thrown validation and unexpected core failures", async () => {
+    projectAccessAllowed = true;
+    coreOutcome = "generic";
+
+    await assert.rejects(
+        () => manuallyApproveChangeOrder("co-1", 0),
+        /manualApprove validation failed/,
+    );
+});
+
+test("manuallyApproveChangeOrder keeps invalid revision input on the thrown validation path", async () => {
+    projectAccessAllowed = true;
+    coreOutcome = "unexpected";
+    coreCalls.manualApprove = 0;
+
+    await assert.rejects(
+        () => manuallyApproveChangeOrder("co-1", -1),
+        /modified after this page loaded/,
+    );
+    assert.equal(coreCalls.manualApprove, 0);
 });

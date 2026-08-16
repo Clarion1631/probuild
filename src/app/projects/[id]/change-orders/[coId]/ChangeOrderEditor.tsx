@@ -106,7 +106,18 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
-            const updated = await manuallyApproveChangeOrder(initialData.id, saved.revision);
+            const result = await manuallyApproveChangeOrder(initialData.id, saved.revision);
+            if (!result.success) {
+                if (result.code === "REVISION_CONFLICT") {
+                    // Next redacts thrown Server Action errors in production.
+                    // This fixed code is the only conflict detail crossing the
+                    // permission-gated action boundary.
+                    setShowManualApproveConfirm(false);
+                    window.location.reload();
+                }
+                return;
+            }
+            const updated = result.changeOrder;
             setStatus(updated.status);
             setRevision(updated.revision);
             toast.success("Change order marked as approved (manual)");
@@ -114,13 +125,6 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             router.refresh();
         } catch (e: any) {
             toast.error(e?.message || "Failed to mark as approved");
-            // A CAS conflict means the entire controlled form is a stale
-            // snapshot, not just its revision token. Replace it wholesale;
-            // router.refresh() preserves this component's useState values.
-            if (e?.message?.includes("was modified after this page loaded")) {
-                setShowManualApproveConfirm(false);
-                window.location.reload();
-            }
         } finally {
             setIsManuallyApproving(false);
         }
@@ -153,7 +157,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // tax-inclusive total here is what inflated billed amounts before.
             // Status is never sent: sendChangeOrderToClientCore owns Draft -> Sent,
             // and Approved/Declined belong to the signature flows.
-            const updated = await updateChangeOrder(initialData.id, {
+            const result = await updateChangeOrder(initialData.id, {
                 title,
                 description,
                 items: mappedItems,
@@ -168,6 +172,16 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                 })),
                 expectedRevision: revision,
             });
+            if (!result.success) {
+                if (result.code === "REVISION_CONFLICT") {
+                    // A genuine conflict invalidates every controlled field. A
+                    // hard reload adopts the full server copy; router.refresh()
+                    // alone would preserve stale form and revision state.
+                    window.location.reload();
+                }
+                return null;
+            }
+            const updated = result.changeOrder;
             setStatus(updated.status);
             setRevision(updated.revision);
             toast.success("Change Order saved");
@@ -175,10 +189,6 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             return updated;
         } catch (e: any) {
             toast.error(e?.message || "Failed to save CO");
-            // A genuine conflict invalidates every controlled field. A hard
-            // reload adopts the full server copy; router.refresh() alone would
-            // preserve the stale form and stale revision state.
-            if (e?.message?.includes("was modified after this page loaded")) window.location.reload();
             return null;
         } finally {
             setIsSaving(false);

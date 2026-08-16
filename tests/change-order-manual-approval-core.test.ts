@@ -129,6 +129,19 @@ let approveChangeOrderCore: (
     approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 let updateChangeOrderCore: (id: string, data: Record<string, unknown>) => Promise<any>;
+let revisionConflictErrorConstructor: unknown;
+
+function assertTypedRevisionConflict(error: unknown): boolean {
+    assert.equal(
+        typeof revisionConflictErrorConstructor,
+        "function",
+        "change-order-core must export a dedicated ChangeOrderRevisionConflictError class",
+    );
+    const ConflictError = revisionConflictErrorConstructor as new (...args: never[]) => Error;
+    assert.ok(error instanceof ConflictError, "revision mismatch must throw ChangeOrderRevisionConflictError");
+    assert.match((error as Error).message, /modified after this page loaded — refresh and try again/);
+    return true;
+}
 
 const PRISMA_SPECIFIER = "./prisma";
 
@@ -147,7 +160,12 @@ before(async () => {
         return originalRequire.apply(this, arguments as unknown as [string]);
     } as typeof Module.prototype.require;
 
-    let mod: { approveChangeOrderCore?: unknown; manuallyApproveChangeOrderCore?: unknown; updateChangeOrderCore?: unknown };
+    let mod: {
+        approveChangeOrderCore?: unknown;
+        manuallyApproveChangeOrderCore?: unknown;
+        updateChangeOrderCore?: unknown;
+        ChangeOrderRevisionConflictError?: unknown;
+    };
     try {
         mod = await import("../src/lib/change-order-core");
     } finally {
@@ -164,6 +182,7 @@ before(async () => {
     manuallyApproveChangeOrderCore = mod.manuallyApproveChangeOrderCore as typeof manuallyApproveChangeOrderCore;
     approveChangeOrderCore = mod.approveChangeOrderCore as typeof approveChangeOrderCore;
     updateChangeOrderCore = mod.updateChangeOrderCore as typeof updateChangeOrderCore;
+    revisionConflictErrorConstructor = mod.ChangeOrderRevisionConflictError;
 });
 
 beforeEach(() => {
@@ -286,7 +305,7 @@ test("manual approve is rejected when expectedRevision doesn't match the locked 
             approvedAt: new Date(),
             expectedRevision: FIXTURE_REVISION,
         }),
-        /modified after this page loaded — refresh and try again/,
+        assertTypedRevisionConflict,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
 });
@@ -331,7 +350,7 @@ test("updateChangeOrderCore rejects a stale expectedRevision before any write", 
 
     await assert.rejects(
         () => updateChangeOrderCore("co-1", { title: "Stale overwrite", expectedRevision: FIXTURE_REVISION }),
-        /modified after this page loaded — refresh and try again/,
+        assertTypedRevisionConflict,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
 });
