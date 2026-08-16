@@ -1923,7 +1923,7 @@ export async function sendChangeOrderToClientCore(
         logActivity?: typeof logActivityLazy;
         revalidatePath?: typeof revalidatePath;
     } = {},
-): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+): Promise<{ success: true; sentTo: string; revision: number } | { success: false; error: string }> {
     // Read, amount math, and the Draft/Sent -> Sent flip run inside ONE
     // transaction holding a row lock on the CO (SELECT ... FOR UPDATE, same
     // pattern as billChangeOrderCore): a concurrent writer (editor save,
@@ -1938,6 +1938,7 @@ export async function sendChangeOrderToClientCore(
             clientId: string; clientName: string; clientEmail: string; additionalEmail: string | null;
             coSubtotal: number; coTaxAmount: number; coRevisedAmount: number; taxLabel: string;
             pricingType: string; markupPercent: number; updatedAt: Date;
+            revision: number;
             schedules: Array<{ name: string; amount: number; dueDate: Date | null }>;
         };
     const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
@@ -2006,7 +2007,7 @@ export async function sendChangeOrderToClientCore(
         const sentCo = await tx.changeOrder.update({
             where: { id: changeOrderId },
             data: { status: "Sent", sentAt: new Date(), revision: { increment: 1 } },
-            select: { updatedAt: true },
+            select: { updatedAt: true, revision: true },
         });
 
         return {
@@ -2017,6 +2018,7 @@ export async function sendChangeOrderToClientCore(
             pricingType: co.pricingType,
             markupPercent: co.markupPercent ?? 10,
             updatedAt: sentCo.updatedAt,
+            revision: sentCo.revision,
             schedules: schedules.map((row) => ({ ...row, amount: Number(row.amount) })),
         };
     }, { timeout: 15_000 });
@@ -2096,7 +2098,7 @@ export async function sendChangeOrderToClientCore(
 
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders/${changeOrderId}`);
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders`);
-    return { success: true, sentTo: client.email };
+    return { success: true, sentTo: client.email, revision: outcome.revision };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

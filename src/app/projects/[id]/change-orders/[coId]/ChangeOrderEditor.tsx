@@ -79,7 +79,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         try {
             // Company countersignature — writes only the company fields and never
             // touches the customer's approval (see countersignChangeOrderAsCompany).
-            await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            const updated = await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            setRevision(updated.revision);
             toast.success("Change order countersigned");
             setShowSignModal(false);
             router.refresh();
@@ -113,13 +114,12 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             router.refresh();
         } catch (e: any) {
             toast.error(e?.message || "Failed to mark as approved");
-            // A CAS conflict means initialData.revision is stale — leaving the
-            // confirm dialog open just re-fails the same retry until a manual
-            // reload, since initialData never refreshes on its own. Close it and
-            // refresh so the next attempt picks up the current revision.
+            // A CAS conflict means the entire controlled form is a stale
+            // snapshot, not just its revision token. Replace it wholesale;
+            // router.refresh() preserves this component's useState values.
             if (e?.message?.includes("was modified after this page loaded")) {
                 setShowManualApproveConfirm(false);
-                router.refresh();
+                window.location.reload();
             }
         } finally {
             setIsManuallyApproving(false);
@@ -175,9 +175,10 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             return updated;
         } catch (e: any) {
             toast.error(e?.message || "Failed to save CO");
-            // A conflict refreshes server-rendered data. This state token remains
-            // stale until a full reload, so retries continue to fail closed.
-            if (e?.message?.includes("was modified after this page loaded")) router.refresh();
+            // A genuine conflict invalidates every controlled field. A hard
+            // reload adopts the full server copy; router.refresh() alone would
+            // preserve the stale form and stale revision state.
+            if (e?.message?.includes("was modified after this page loaded")) window.location.reload();
             return null;
         } finally {
             setIsSaving(false);
@@ -343,6 +344,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 const result = await sendChangeOrderToClient(initialData.id);
                                 if (result.success) {
                                     setStatus("Sent");
+                                    setRevision(result.revision);
                                     toast.success(`Change order sent to ${result.sentTo}`);
                                     router.refresh();
                                 } else {

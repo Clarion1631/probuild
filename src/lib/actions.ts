@@ -9252,11 +9252,13 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         }
     };
 
-    // Atomic idempotency guard — updateMany only matches rows where companySignedAt IS NULL,
-    // so two concurrent requests can't both succeed (eliminates TOCTOU race).
-    let result;
+    // Atomic idempotency guard — the extended unique filter only matches the id
+    // while companySignedAt is still NULL and status is signable, so two
+    // concurrent requests cannot both succeed. `update` also returns the exact
+    // post-write revision for the editor's next same-tab CAS operation.
+    let updated: { revision: number };
     try {
-        result = await prisma.changeOrder.updateMany({
+        updated = await prisma.changeOrder.update({
             where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
             data: {
                 companySignedBy: signerName.trim(),
@@ -9264,8 +9266,15 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
                 companySignatureUrl,
                 revision: { increment: 1 },
             },
+            select: { revision: true },
         });
     } catch (error) {
+        if ((error as { code?: string })?.code === "P2025") {
+            // Deterministic: the conditional update matched nothing, so this
+            // upload never landed anywhere.
+            await discardCompanySignature();
+            throw new Error("Change order already countersigned by company");
+        }
         // Ambiguous outcome (could be a genuine failed write, or a PgBouncer connection
         // drop after commit) — probe before deleting. See discardSignatureUnlessReferenced.
         await discardSignatureUnlessReferenced(
@@ -9279,16 +9288,10 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         );
         throw error;
     }
-    if (result.count === 0) {
-        // Deterministic: the updateMany itself reported zero rows matched — this upload
-        // never landed anywhere.
-        await discardCompanySignature();
-        throw new Error("Change order already countersigned by company");
-    }
 
     revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${existing.projectId}/change-orders`);
-    return { success: true };
+    return { success: true, revision: updated.revision };
 }
 
 // Staff-side manual approval. Distinct from approveChangeOrder (the customer's
@@ -9354,7 +9357,7 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     return JSON.parse(JSON.stringify(co));
 }
 
-export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string } | { success: false; error: string }> {
+export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string; revision: number } | { success: false; error: string }> {
     "use server";
     // Customer-facing send from the UI — require the changeOrders permission
     // (this export is a remotely invokable server action). Core logic lives in
