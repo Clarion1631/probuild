@@ -5,6 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
+import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -124,6 +125,32 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         return NextResponse.json({ error: "endTime must be after startTime" }, { status: 400 });
     }
 
+    // Logistics jobs carry no cost-code/estimate-item context on the entry, so
+    // notes are the only record of what was actually done — require one
+    // (already on the entry, or supplied in this request) before the entry can
+    // be clocked out.
+    const settingEndTime = body.endTime !== undefined && body.endTime !== null;
+    let projectIsLogistics = false;
+    if (settingEndTime) {
+        const entryProject = await prisma.project.findUnique({
+            where: { id: existing.projectId },
+            select: { isLogistics: true },
+        });
+        projectIsLogistics = entryProject?.isLogistics ?? false;
+    }
+    const logisticsCheck = checkLogisticsClockOutNotes({
+        isLogistics: projectIsLogistics,
+        settingEndTime,
+        existingNotes: existing.notes,
+        suppliedNotes: typeof body.notes === "string" ? body.notes : undefined,
+    });
+    if (!logisticsCheck.ok) {
+        return NextResponse.json(
+            { error: "Notes are required to clock out of a logistics job", code: "LOGISTICS_NOTES_REQUIRED" },
+            { status: 400 }
+        );
+    }
+
     // Owner's labor + burden rates drive cost. A manager editing a field crew's
     // punch must NOT stamp manager rates onto the entry.
     const owner = isOwner
@@ -144,6 +171,23 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         editNotes: body.editNotes.trim(),
         isEdited: true,
     };
+    if (logisticsCheck.notes !== undefined) {
+        data.notes = logisticsCheck.notes;
+    }
+
+    // WA meal-break voluntary waiver attestation — same rule as the PUT
+    // clock-out path (src/app/api/time-entries/route.ts): applies only when
+    // this PATCH is actually setting endTime (a clock-out), never on a plain
+    // edit. Defense in depth for a call site mobile doesn't currently use for
+    // this flag (see PUT), same posture as the notes check above.
+    Object.assign(
+        data,
+        applyMealSkippedWaiver({
+            mealSkipped: body.mealSkipped,
+            settingEndTime,
+            existingReviewReason: existing.reviewReason,
+        })
+    );
 
     // Capture the as-clocked values exactly once. Subsequent edits update the latest
     // times but never overwrite the original snapshot.
