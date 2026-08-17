@@ -2623,3 +2623,214 @@ model ReviewAlertEpisode {
   @@unique([issueId, generation])
   @@index([batchId])
 }
+
+// ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
+// docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
+// Codex peer-review round-1 amendments (2026-08-14): BankLine is the
+// canonical transaction ledger, and the bank STATEMENT is true north — a
+// canonical BankLine is only ever minted from a STATEMENT observation, never
+// from QBO. BankLineObservation holds one row per source sighting (a
+// statement line, a QBO register row, ...), uniquely identified by its own
+// source locator, so two sources reporting the "same" transaction both stay
+// on record instead of one silently overwriting the other via a hash
+// collision. Cross-source dedup is an explicit reconcile step
+// (reconcileObservations in src/lib/bank-ledger.ts, exposed via
+// POST /api/integrations/bank-ledger/reconcile) that links an observation to
+// a canonical BankLine by EXACT account+postedDate+amountCents+
+// normalizedPayee match (plus checkNumber agreement whenever either side
+// carries one) — never a side effect of ingest, and never on
+// amount+date/rails alone (see the Chevron/Cash App wrong-match lesson in
+// that doc — amount+date alone is zero confidence). Immutable source
+// identity, mutable workflow state: BankLine/BankLineObservation/
+// StatementImport rows are never overwritten; BankLine.state and the
+// validation columns change as automation progresses. The /automation
+// dashboard becomes a report over these tables instead of a live in-memory
+// merge.
+//
+// Codex peer-review round-2 amendments (2026-08-14): reconciliation links
+// are written by a transactional persistence function (see the reconcile
+// route) that uses a SAVEPOINT per proposed link inside one transaction, so
+// a unique-index conflict on one link (a concurrent run already claimed
+// that BankLine, or that Observation) rolls back only that link and is
+// reported back to the caller — it never fails the whole batch.
+//
+// Pseudo-enum columns stay Prisma `String` (repo convention) — allowed
+// values are documented on each field and enforced by a Postgres CHECK
+// constraint of the same name in scripts/apply-bank-ledger.mjs, since Prisma
+// writes (and raw SQL) bypass anything short of a DB constraint.
+
+model StatementImport {
+  id           String   @id @default(cuid())
+  account      String // e.g. "WTB-0723"
+  periodStart  DateTime @db.Date
+  periodEnd    DateTime @db.Date
+  openingCents Int
+  closingCents Int
+  // sha256(JSON.stringify([1, account, periodStart, periodEnd, openingCents,
+  // closingCents, lines])) — computeStatementContentHash() in
+  // src/lib/bank-ledger.ts. An identical re-post of the same statement
+  // reproduces this hash exactly, which is what makes re-ingesting a
+  // statement content-addressed and safe to retry: same hash for the same
+  // account+period is a no-op, a different hash is a conflict (HTTP 409),
+  // never a silent overwrite.
+  contentHash  String   @unique
+  status       String   @default("FINALIZED") // PENDING, FINALIZED, FAILED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  observations BankLineObservation[]
+
+  @@unique([account, periodStart, periodEnd])
+}
+
+model BankLine {
+  id              String   @id @default(cuid())
+  account         String // e.g. "WTB-0723"
+  postedDate      DateTime @db.Date
+  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition — UNCONDITIONALLY IMMUTABLE once the row exists (bank_line_amount_immutable_trigger, scripts/apply-bank-ledger.mjs; Codex round-4 fix). Amounts come from bank statements; a correction is a new observation/line, never an edit.
+  rawDescriptor   String
+  normalizedPayee String // "" is a valid but exceptional value — paired with state EXCEPTION, never silently accepted as a real identity
+  checkNumber     String?
+  state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
+  exceptionReason String?
+
+  // Validation columns
+  qbTxnId           String?
+  qbBankMatched     Boolean  @default(false)
+  probuildExpenseId String?
+  projectName       String?
+  projectValidated  Boolean  @default(false)
+  receiptUrl        String?
+  taxValidated      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  observations      BankLineObservation[]
+  items             BankLineItem[]
+  refundsAsOriginal RefundEvent[]         @relation("RefundEventOriginal")
+  refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
+
+  @@index([account, postedDate])
+  @@index([qbTxnId])
+}
+
+// NOTE: two invariants live ONLY in raw SQL, applied by
+// scripts/apply-bank-ledger.mjs — Prisma cannot express either in schema.prisma:
+//   1. A partial UNIQUE index caps each canonical BankLine at ONE linked
+//      observation PER SOURCE, so a canonical line can never accumulate two
+//      QBO observations (or two STATEMENT observations) across separate
+//      reconciliation/ingest runs:
+//        CREATE UNIQUE INDEX ... ON "BankLineObservation" ("source", "bankLineId")
+//          WHERE "bankLineId" IS NOT NULL
+//   2. A source-dependent CHECK constraint enforces each source's own shape —
+//      STATEMENT rows always carry both statementImportId and bankLineId
+//      (minted together at ingest); QBO_REGISTER rows must never carry a
+//      statementImportId (there is no per-import document for that source):
+//        CHECK (
+//          (source = 'STATEMENT' AND "statementImportId" IS NOT NULL AND "bankLineId" IS NOT NULL)
+//          OR (source = 'QBO_REGISTER' AND "statementImportId" IS NULL)
+//        )
+model BankLineObservation {
+  id     String @id @default(cuid())
+  source String // STATEMENT, QBO_REGISTER
+  account String
+
+  // StatementImport.id for STATEMENT; the constant "QBO_REGISTER" for
+  // QBO_REGISTER (there is no per-import document there — the register is
+  // one ongoing stream identified by sourceLineId alone).
+  sourceDocumentId String
+  // The durable per-source line identity that replaced request-local
+  // occurrenceIndex hashing: a 0-based sequence position within the
+  // statement import (STATEMENT) or the QBO transaction id (QBO_REGISTER).
+  sourceLineId     String
+
+  postedDate    DateTime @db.Date
+  amountCents   Int
+  rawDescriptor String
+  checkNumber   String?
+
+  // Reconciliation target (see the reconcile route). NULL until an explicit
+  // reconcileObservations() link is persisted; STATEMENT rows get theirs at
+  // ingest time (the canonical line minted alongside them). At most one
+  // observation per (source, bankLineId) — see the partial unique index note
+  // above.
+  //
+  // onDelete: Restrict, not SetNull (Codex round-3 should-fix) — the
+  // source-shape CHECK above requires STATEMENT rows to carry BOTH
+  // bankLineId and statementImportId, so nulling either one on a parent
+  // delete would violate that CHECK. Restrict makes the deletion policy
+  // explicit (delete/reassign the observation first) instead of failing
+  // confusingly, or, for QBO_REGISTER rows, silently dropping a link.
+  bankLineId String?
+  bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: Restrict)
+
+  statementImportId String?
+  statementImport   StatementImport? @relation(fields: [statementImportId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@unique([source, account, sourceDocumentId, sourceLineId], map: "BankLineObservation_source_account_sourceDocumentId_sourceLineI")
+  @@index([bankLineId])
+  @@index([account, postedDate])
+}
+
+model BankLineItem {
+  id             String   @id @default(cuid())
+  bankLineId     String
+  bankLine       BankLine @relation(fields: [bankLineId], references: [id], onDelete: Cascade)
+  description    String
+  qty            Decimal?
+  unitPriceCents Int?
+  lineTotalCents Int?
+  source         String // RECEIPT_AI, LOWES_CSV, AMAZON_APP, MANUAL
+  jobHint        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([bankLineId])
+}
+
+// NOTE: originalBankLineId must point to a DEBIT BankLine (amountCents < 0)
+// and refundBankLineId to a CREDIT BankLine (amountCents > 0) — a refund
+// pairs the original outgoing charge with the credit that reverses it, and
+// swapping them silently produces a RefundEvent that means the opposite of
+// what it says. Prisma can't express a cross-table CHECK, so this is
+// enforced two ways: a BEFORE INSERT/UPDATE trigger
+// (refund_event_signs_trigger, applied by scripts/apply-bank-ledger.mjs) as
+// the DB-level backstop, and validateRefundEventSigns() in
+// src/lib/bank-ledger.ts, which any future write path MUST call first so a
+// bad pairing surfaces as a normal validation error rather than a raised
+// Postgres exception.
+//
+// That trigger only guards RefundEvent write time — a separate parent-side
+// trigger (bank_line_amount_immutable_trigger, Codex round-4 fix) rejects
+// ANY UPDATE that changes BankLine.amountCents, unconditionally, not just
+// once a RefundEvent references the line. Round-3's version gated the check
+// behind an EXISTS lookup against RefundEvent, which an unlocked MVCC read
+// let race a concurrent RefundEvent insert + amountCents update into both
+// committing — and once every referencing RefundEvent was deleted, the
+// amount became editable again. BankLine.amountCents comes from a bank
+// statement and must never change after the row exists; a correction is a
+// new observation/line, never an edit. Making it unconditional removes that
+// race entirely and means the sign pairing validated by
+// validateRefundEventSigns() can never be silently broken afterward by
+// editing the BankLine instead.
+model RefundEvent {
+  id                 String    @id @default(cuid())
+  originalBankLineId String?
+  originalBankLine   BankLine? @relation("RefundEventOriginal", fields: [originalBankLineId], references: [id], onDelete: SetNull)
+  refundBankLineId   String?
+  refundBankLine     BankLine? @relation("RefundEventRefund", fields: [refundBankLineId], references: [id], onDelete: SetNull)
+  vendorRefundRef    String?
+  amountCents        Int       // positive magnitude, never signed — CHECK (amountCents > 0)
+  taxCents           Int       @default(0) // CHECK (taxCents >= 0 AND taxCents <= amountCents)
+  status             String    @default("EXPECTED") // EXPECTED, CREDIT_SEEN, PAIRED, POSTED
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([originalBankLineId])
+  @@index([refundBankLineId])
+}
