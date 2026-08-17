@@ -51,19 +51,18 @@ jobs:
       - name: Apply committed migrations to the throwaway database
         run: npx prisma migrate deploy
 
+      # The schema gap the baseline recorded is now closed by
+      # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
+      # produces the final shape and there is no separate gap file to apply.
+      # prisma/EXPECTED_SCHEMA_GAP.sql was deleted with that migration; an
+      # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
-      # prisma/EXPECTED_SCHEMA_GAP.sql is intended to become the NEXT migration,
-      # so its executability is part of its contract. Running it here catches the
-      # class of error that would otherwise only surface against production —
-      # e.g. an index whose name the baseline already used.
-      - name: Apply the recorded schema gap
-        run: npx prisma db execute --file prisma/EXPECTED_SCHEMA_GAP.sql --schema prisma/schema.prisma
-
-      - name: Assert the gap actually closes the gap
-        run: node scripts/check-migrations-match.mjs --gap-applied
-
+      # The gap-file steps that sat here are gone with the file: this branch's
+      # migration closes the recorded gap, so `migrate deploy` now reproduces
+      # production's shape directly and the assertion above is the whole check.
+      #
       # The focused integration regression deliberately drifts the disposable
       # database's function and trigger after proving the checker recognizes
       # the production snapshot. It therefore runs last in this job.

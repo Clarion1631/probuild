@@ -173,9 +173,11 @@ canonical recipe, kept in one place so a second copy here can't drift from it.
 - The baseline was generated **from production** (`migrate diff --from-empty --to-schema-datasource`),
   not from `schema.prisma` — Prisma's own documented baselining flow. It records what prod *is*, so
   `migrate resolve --applied` is a true statement rather than a wish.
-- `schema.prisma` is deliberately a little **ahead** of prod. That gap is checked in verbatim at
-  `prisma/EXPECTED_SCHEMA_GAP.sql` and asserted by CI. Closing it means applying it as a real
-  migration and deleting the file — not editing the baseline.
+- `schema.prisma` was deliberately a little **ahead** of prod when the baseline was taken (seven
+  foreign keys and three indexes it declared that prod never had). That gap was checked in verbatim
+  at `prisma/EXPECTED_SCHEMA_GAP.sql`; `20260814120000_missing_fk_indexes` closed it and the file is
+  gone. If a gap is ever reopened, record it the same way — a real migration plus deleting the
+  file — and never by editing the baseline.
 - **Prisma's diff engine cannot represent partial indexes and silently drops them.** Prod has seven,
   three of them UNIQUE constraints carrying real invariants. They are appended by hand at the end of
   the baseline. If you ever regenerate that file, re-append the block, or CI's

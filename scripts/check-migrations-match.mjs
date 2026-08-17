@@ -5,16 +5,20 @@
 // applied. Never point it at production.
 //
 //   node scripts/check-migrations-match.mjs            # after migrate deploy
-//   node scripts/check-migrations-match.mjs --gap-applied
-//       # after additionally applying prisma/EXPECTED_SCHEMA_GAP.sql, which
-//       # proves that file is executable and really does close the gap
 //
 // Two independent assertions, because neither alone is sufficient:
 //
 //  1. DIFF SET. The database's `migrate diff` to schema.prisma must equal
-//     EXPECTED_SCHEMA_GAP.sql + PRISMA_PHANTOM_DIFF.sql, statement for
-//     statement. Production's diff to schema.prisma is the same set, so
-//     matching it means matching production's shape as far as Prisma can see.
+//     PRISMA_PHANTOM_DIFF.sql, statement for statement. Production's diff to
+//     schema.prisma is the same set, so matching it means matching production's
+//     shape as far as Prisma can see.
+//
+//     Until 20260814120000_missing_fk_indexes there was a second expected file,
+//     prisma/EXPECTED_SCHEMA_GAP.sql: the seven foreign keys and three indexes
+//     schema.prisma declared but production never had. That migration closed the
+//     gap and the file was deleted, so the phantom diff is now the whole of it.
+//     If a deliberate gap is ever reopened, restore the file and add it back to
+//     `expected` below rather than loosening these assertions.
 //
 //  2. BLIND SPOTS. Prisma's diff engine cannot represent partial indexes, check
 //     constraints, row-level security, stored functions, or triggers, and omits
@@ -34,10 +38,8 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const GAP_FILE = path.join(ROOT, 'prisma', 'EXPECTED_SCHEMA_GAP.sql')
 const PHANTOM_FILE = path.join(ROOT, 'prisma', 'PRISMA_PHANTOM_DIFF.sql')
 const SNAPSHOT = path.join(ROOT, 'prisma', 'prisma-blind-spots.json')
-const gapApplied = process.argv.includes('--gap-applied')
 
 const url = process.env.DIRECT_URL || process.env.DATABASE_URL
 if (!url) {
@@ -90,10 +92,7 @@ function multisetDiff(a, b) {
 }
 
 const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '')
-const expected = [
-  ...(gapApplied ? [] : statements(read(GAP_FILE))),
-  ...statements(read(PHANTOM_FILE)),
-]
+const expected = statements(read(PHANTOM_FILE))
 
 const actualRaw = execFileSync(
   process.platform === 'win32' ? 'npx.cmd' : 'npx',
@@ -123,9 +122,10 @@ if (unexpected.length) {
 }
 if (missing.length) {
   fail(
-    `${missing.length} expected statement(s) no longer appear in the diff. If the gap was closed,\n` +
-      `  apply it as a real migration and delete prisma/EXPECTED_SCHEMA_GAP.sql rather than\n` +
-      `  leaving it stale:`
+    `${missing.length} expected statement(s) no longer appear in the diff. These come from\n` +
+      `  prisma/PRISMA_PHANTOM_DIFF.sql, which is permanent — if one really did stop being a\n` +
+      `  phantom (Prisma gained partial-index support, or the schema stopped relying on one),\n` +
+      `  remove it from that file rather than leaving it stale:`
   )
   for (const s of missing) console.error('    - ' + s)
 }
@@ -253,7 +253,6 @@ await db.$disconnect()
 if (failed) process.exit(1)
 console.log(
   `✓ migrations reproduce production` +
-    (gapApplied ? ' with EXPECTED_SCHEMA_GAP.sql applied' : '') +
     `: ${actual.length} diff statement(s) all accounted for; ` +
     `${snap.partialIndexes.length} partial indexes, ${snap.checkConstraints.length} check constraints, ` +
     `${snap.rlsTables.length} RLS tables, ${snap.functions.length} functions, and ` +
