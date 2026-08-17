@@ -33,8 +33,8 @@ type Job = {
 
 const NOW = new Date("2026-08-16T18:00:00.000Z");
 const EXACT_MILESTONE_STATES = [
-    { id: "m-1", name: "Deposit", amount: 500, status: "Pending", qbInvoiceSentAt: null, qbInvoiceId: "qb-1", qbInvoiceLink: "https://qbo.test/1", qbSyncError: null },
-    { id: "m-2", name: "Progress", amount: 750, status: "Pending", qbInvoiceSentAt: null, qbInvoiceId: "qb-2", qbInvoiceLink: "https://qbo.test/2", qbSyncError: null },
+    { id: "m-1", name: "Deposit", amount: 500, status: "Pending", qbInvoiceSentAt: null, qbInvoiceId: "qb-1", qbInvoiceLink: "https://qbo.test/1", qbSyncError: null, qbCreateGeneration: 1, qbCreateRequestId: "req-1", qbCreateFingerprint: "fp-1" },
+    { id: "m-2", name: "Progress", amount: 750, status: "Pending", qbInvoiceSentAt: null, qbInvoiceId: "qb-2", qbInvoiceLink: "https://qbo.test/2", qbSyncError: null, qbCreateGeneration: 1, qbCreateRequestId: "req-2", qbCreateFingerprint: "fp-2" },
 ];
 const EXACT_MILESTONE_FINGERPRINT = JSON.stringify({
     invoiceId: "invoice-1",
@@ -107,8 +107,8 @@ function memoryDatabase(seed: Job[]) {
         },
     };
     const milestoneRows = new Map([
-        ["m-1", { id: "m-1", invoiceId: invoice.id, name: "Deposit", amount: 500, status: "Pending", qbInvoiceSentAt: null as Date | null, qbInvoiceId: "qb-1", qbInvoiceLink: "https://qbo.test/1", qbSyncError: null as string | null }],
-        ["m-2", { id: "m-2", invoiceId: invoice.id, name: "Progress", amount: 750, status: "Pending", qbInvoiceSentAt: null as Date | null, qbInvoiceId: "qb-2", qbInvoiceLink: "https://qbo.test/2", qbSyncError: null as string | null }],
+        ["m-1", { id: "m-1", invoiceId: invoice.id, name: "Deposit", amount: 500, status: "Pending", qbInvoiceSentAt: null as Date | null, qbInvoiceId: "qb-1", qbInvoiceLink: "https://qbo.test/1", qbSyncError: null as string | null, qbCreateGeneration: 1, qbCreateRequestId: "req-1" as string | null, qbCreateFingerprint: "fp-1" as string | null }],
+        ["m-2", { id: "m-2", invoiceId: invoice.id, name: "Progress", amount: 750, status: "Pending", qbInvoiceSentAt: null as Date | null, qbInvoiceId: "qb-2", qbInvoiceLink: "https://qbo.test/2", qbSyncError: null as string | null, qbCreateGeneration: 1, qbCreateRequestId: "req-2" as string | null, qbCreateFingerprint: "fp-2" as string | null }],
     ]);
     let invoiceEmailAttempt: Record<string, unknown> | null = null;
     const settings = {

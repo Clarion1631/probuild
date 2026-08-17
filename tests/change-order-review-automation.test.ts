@@ -188,8 +188,11 @@ test("first review attempt locks settings after Client/Estimate and before job/p
     const jobLock = preflight.indexOf('FROM "ChangeOrderAutomationJob"');
     const durableCheckpoint = preflight.indexOf("checkpointChangeOrderAutomationProviderDispatch(tx");
     const provider = delivery.indexOf("await send(payload.dispatch");
-    assert.ok(clientLock >= 0 && estimateLock > clientLock && settingsLock > estimateLock,
-        "canonical review lock order must reach CompanySettings after Client/Estimate");
+    // Estimate is locked FIRST (before Project/CO/Client) — the repo-wide
+    // money lock order (Codex round 7); CompanySettings still comes last of
+    // the shared locks.
+    assert.ok(estimateLock >= 0 && clientLock > estimateLock && settingsLock > clientLock,
+        "canonical review lock order must lock Estimate first and reach CompanySettings after Client");
     assert.ok(jobLock > settingsLock && durableCheckpoint > jobLock,
         "live settings must be fenced before committing the first-provider checkpoint");
     assert.ok(provider >= 0 && !delivery.includes('FROM "CompanySettings"'),

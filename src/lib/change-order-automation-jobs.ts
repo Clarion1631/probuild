@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ChangeOrderAutomationJob as PrismaChangeOrderAutomationJob, Prisma, PrismaClient } from "@prisma/client";
 import {
+    APPROVAL_JOB_KINDS,
     approvalJobKinds,
     providerIdempotencyKey,
     type ChangeOrderApprovalJobKind,
@@ -243,7 +244,14 @@ export function legacyApprovedRecoveryPlan(input: {
     pricingType: ChangeOrderPricingType;
     approvalMode: ChangeOrderApprovalMode;
     hasExistingMilestones: boolean;
+    /** isApprovedWithinAutomationCutover() — false parks billing rather than auto-billing history (Codex round 7). */
+    approvedWithinCutover: boolean;
 }): Partial<Record<ChangeOrderApprovalJobKind, LegacyApprovedRecoveryStatus>> {
+    // Billing runs automatically ONLY for deploy-window approvals with no
+    // recognized milestone. Historic/undated approvals and rows that already
+    // carry milestones are parked for a human — never guessed, never billed.
+    const bill: LegacyApprovedRecoveryStatus =
+        input.approvedWithinCutover && !input.hasExistingMilestones ? "PENDING" : "NEEDS_ATTENTION";
     if (input.pricingType === "COST_PLUS") {
         return {
             APPROVAL_SCHEDULE: "PENDING",
@@ -252,13 +260,13 @@ export function legacyApprovedRecoveryPlan(input: {
     }
     return input.approvalMode === "CLIENT"
         ? {
-            APPROVAL_BILL: input.hasExistingMilestones ? "NEEDS_ATTENTION" : "PENDING",
+            APPROVAL_BILL: bill,
             APPROVAL_CLIENT_EMAIL: "SKIPPED",
             APPROVAL_SCHEDULE: "PENDING",
             APPROVAL_TEAM_EMAIL: "SKIPPED",
         }
         : {
-            APPROVAL_BILL: input.hasExistingMilestones ? "NEEDS_ATTENTION" : "PENDING",
+            APPROVAL_BILL: bill,
             APPROVAL_SCHEDULE: "PENDING",
             APPROVAL_TEAM_EMAIL: "SKIPPED",
         };
@@ -269,19 +277,36 @@ type LegacyRecoveryDatabase = Pick<
     "changeOrder" | "changeOrderAutomationJob" | "paymentSchedule" | "$transaction"
 >;
 
-// Recover the complete legacy backlog, not only a moving deploy window. The
-// seeder is bounded and idempotent, and every historic email is terminally
-// suppressed, so older Approved rows cannot remain permanently invisible.
-export const CHANGE_ORDER_AUTOMATION_CUTOVER_AT = new Date(0);
+// The outbox deployment cutover. Approvals at/after this instant were made in
+// the deploy window by a build (old or new) whose billing state is known, so
+// their recovered APPROVAL_BILL may run automatically. Approvals BEFORE it —
+// and imported rows with no approvedAt at all — are historic: their money was
+// handled through legacy/manual paths this seeder cannot see, so recovery
+// still creates their bookkeeping rows but parks billing in NEEDS_ATTENTION
+// instead of auto-billing history (Codex round 7; the previous new Date(0)
+// cutover auto-billed every historic Approved CO without a recognized
+// milestone).
+export const CHANGE_ORDER_AUTOMATION_CUTOVER_AT = new Date("2026-08-16T00:00:00Z");
 
 export function isLegacyApprovedRecoveryCandidate(
     approvedAt: Date | null,
     cutoverAt: Date,
 ): boolean {
-    // Imported/pre-outbox Approved rows can legitimately lack approvedAt. They
-    // are recovered as MANUAL and all historic emails remain suppressed, so
-    // including them is safer than leaving their billing/schedule work unseen.
-    return approvedAt === null || approvedAt.getTime() >= cutoverAt.getTime();
+    // Candidacy is deliberately unrestricted by date: every Approved CO with
+    // no approval jobs gets bookkeeping rows (emails terminally suppressed).
+    // The cutover decides how its BILLING job is seeded, not whether the row
+    // is recovered — see legacyApprovedRecoveryPlan's approvedWithinCutover.
+    void approvedAt;
+    void cutoverAt;
+    return true;
+}
+
+/** Approved at/after the cutover with a real timestamp — the only rows whose recovered billing may run automatically. */
+export function isApprovedWithinAutomationCutover(
+    approvedAt: Date | null,
+    cutoverAt: Date,
+): boolean {
+    return approvedAt !== null && approvedAt.getTime() >= cutoverAt.getTime();
 }
 
 /**
@@ -297,11 +322,16 @@ export async function seedLegacyApprovedChangeOrderAutomationJobs(
     const db = dependencies.db ?? (await import("./prisma")).prisma;
     const limit = Math.max(1, Math.min(input.limit ?? 25, 100));
     const cutoverAt = input.cutoverAt ?? CHANGE_ORDER_AUTOMATION_CUTOVER_AT;
+    // No date filter: EVERY Approved CO without approval jobs is recovered
+    // (billing for historic rows is parked, not run — see the plan). The
+    // `none` filter is scoped to APPROVAL kinds (Codex round 7): during a
+    // rolling deploy a CO can already carry a new-build REVIEW_EMAIL job yet
+    // be approved by an old instance with no approval jobs — an unscoped
+    // `none: {}` would skip that CO forever.
     const candidates = await db.changeOrder.findMany({
         where: {
             status: "Approved",
-            OR: [{ approvedAt: { gte: cutoverAt } }, { approvedAt: null }],
-            automationJobs: { none: {} },
+            automationJobs: { none: { kind: { in: [...APPROVAL_JOB_KINDS] } } },
         },
         select: { id: true },
         orderBy: [{ approvedAt: "asc" }, { id: "asc" }],
@@ -328,7 +358,12 @@ export async function seedLegacyApprovedChangeOrderAutomationJobs(
                 || current.status !== "Approved"
                 || !isLegacyApprovedRecoveryCandidate(current.approvedAt, cutoverAt)
             ) return false;
-            if (await tx.changeOrderAutomationJob.count({ where: { changeOrderId: current.id } }) > 0) return false;
+            // Approval kinds only (Codex round 7): a REVIEW_EMAIL job from the
+            // new build must not hide an approval that still has no
+            // bill/schedule/email jobs.
+            if (await tx.changeOrderAutomationJob.count({
+                where: { changeOrderId: current.id, kind: { in: [...APPROVAL_JOB_KINDS] } },
+            }) > 0) return false;
 
             const pricingType: ChangeOrderPricingType = current.pricingType === "COST_PLUS" ? "COST_PLUS" : "FIXED";
             // A preserved client signature is the only safe legacy proof of a
@@ -364,10 +399,12 @@ export async function seedLegacyApprovedChangeOrderAutomationJobs(
                     APPROVAL_TEAM_EMAIL: { ...frozenEvent },
                 },
             });
+            const approvedWithinCutover = isApprovedWithinAutomationCutover(current.approvedAt, cutoverAt);
             const plan = legacyApprovedRecoveryPlan({
                 pricingType,
                 approvalMode,
                 hasExistingMilestones: Boolean(existingMilestone),
+                approvedWithinCutover,
             });
             const now = dependencies.now?.() ?? new Date();
             for (const job of jobs) {
@@ -375,7 +412,9 @@ export async function seedLegacyApprovedChangeOrderAutomationJobs(
                 if (!status || status === "PENDING") continue;
                 const reason = status === "SKIPPED"
                     ? "Legacy approval recovery never sends historic customer/team email"
-                    : "Legacy approval already has billing milestones; verify the retained billing before recovery";
+                    : existingMilestone
+                        ? "Legacy approval already has billing milestones; verify the retained billing before recovery"
+                        : "Approved before the automation cutover (or missing approvedAt); verify and bill this historic approval manually";
                 const terminalResult = { reason, recoveredLegacyApproval: true } satisfies Prisma.InputJsonObject;
                 await tx.changeOrderAutomationJob.updateMany({
                     where: observedStateWhere(job),

@@ -849,8 +849,10 @@ test("dedicated approval enqueue cannot omit or add jobs for manual/cost-plus mo
 
 test("legacy Approved recovery never auto-emails and parks ambiguous existing billing", async () => {
     assert.equal(typeof jobsModule.legacyApprovedRecoveryPlan, "function");
+    // Deploy-window approval with no recognized milestone: the only shape
+    // allowed to auto-bill (Codex round 7).
     assert.deepEqual(
-        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "FIXED", approvalMode: "CLIENT", hasExistingMilestones: false }),
+        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "FIXED", approvalMode: "CLIENT", hasExistingMilestones: false, approvedWithinCutover: true }),
         {
             APPROVAL_BILL: "PENDING",
             APPROVAL_CLIENT_EMAIL: "SKIPPED",
@@ -859,7 +861,18 @@ test("legacy Approved recovery never auto-emails and parks ambiguous existing bi
         },
     );
     assert.deepEqual(
-        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "FIXED", approvalMode: "CLIENT", hasExistingMilestones: true }),
+        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "FIXED", approvalMode: "CLIENT", hasExistingMilestones: true, approvedWithinCutover: true }),
+        {
+            APPROVAL_BILL: "NEEDS_ATTENTION",
+            APPROVAL_CLIENT_EMAIL: "SKIPPED",
+            APPROVAL_SCHEDULE: "PENDING",
+            APPROVAL_TEAM_EMAIL: "SKIPPED",
+        },
+    );
+    // Historic / undated approval: billing PARKS even with no recognized
+    // milestone — auto-billing history is never allowed (Codex round 7).
+    assert.deepEqual(
+        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "FIXED", approvalMode: "CLIENT", hasExistingMilestones: false, approvedWithinCutover: false }),
         {
             APPROVAL_BILL: "NEEDS_ATTENTION",
             APPROVAL_CLIENT_EMAIL: "SKIPPED",
@@ -868,7 +881,7 @@ test("legacy Approved recovery never auto-emails and parks ambiguous existing bi
         },
     );
     assert.deepEqual(
-        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "COST_PLUS", approvalMode: "MANUAL", hasExistingMilestones: false }),
+        jobsModule.legacyApprovedRecoveryPlan({ pricingType: "COST_PLUS", approvalMode: "MANUAL", hasExistingMilestones: false, approvedWithinCutover: false }),
         {
             APPROVAL_SCHEDULE: "PENDING",
             APPROVAL_TEAM_EMAIL: "SKIPPED",
@@ -877,15 +890,24 @@ test("legacy Approved recovery never auto-emails and parks ambiguous existing bi
 });
 
 test("legacy Approved recovery includes imported Approved rows without approvedAt", () => {
+    // Candidacy is date-unrestricted: EVERY Approved CO without approval jobs
+    // gets bookkeeping rows; the cutover only decides whether its billing may
+    // run automatically (Codex round 7).
     assert.equal(typeof jobsModule.isLegacyApprovedRecoveryCandidate, "function");
     const cutover = new Date("2026-08-16T00:00:00.000Z");
     assert.equal(jobsModule.isLegacyApprovedRecoveryCandidate(null, cutover), true);
     assert.equal(
-        jobsModule.isLegacyApprovedRecoveryCandidate(new Date("2026-08-16T00:00:00.000Z"), cutover),
+        jobsModule.isLegacyApprovedRecoveryCandidate(new Date("2026-08-15T23:59:59.999Z"), cutover),
+        true,
+    );
+    assert.equal(typeof jobsModule.isApprovedWithinAutomationCutover, "function");
+    assert.equal(jobsModule.isApprovedWithinAutomationCutover(null, cutover), false);
+    assert.equal(
+        jobsModule.isApprovedWithinAutomationCutover(new Date("2026-08-16T00:00:00.000Z"), cutover),
         true,
     );
     assert.equal(
-        jobsModule.isLegacyApprovedRecoveryCandidate(new Date("2026-08-15T23:59:59.999Z"), cutover),
+        jobsModule.isApprovedWithinAutomationCutover(new Date("2026-08-15T23:59:59.999Z"), cutover),
         false,
     );
 });

@@ -146,7 +146,11 @@ const fakePrisma = {
             changeOrder: {
                 findUnique: async (args: { where: { id: string } }) =>
                     state.changeOrder?.id === args.where.id
-                        ? { id: state.changeOrder.id, projectId: state.changeOrder.projectId }
+                        ? {
+                            id: state.changeOrder.id,
+                            projectId: state.changeOrder.projectId,
+                            estimateId: state.changeOrder.estimateId,
+                        }
                         : null,
                 update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
                     calls.changeOrderUpdates.push(args);
@@ -344,7 +348,10 @@ test("manual approve from Sent preserves the sent terms tuple instead of re-read
     assert.ok(result);
     assert.equal(result!.co.status, "Approved");
     assert.equal(result!.co.termsTaxRatePercent, 7.25);
-    assert.equal(calls.estimateTaxReads, 0);
+    // Exactly one Estimate read: the unconditional FOR SHARE lock taken for
+    // deadlock-safe ordering. Its VALUE must go unused on this path — the
+    // write assertions below prove the sent tuple was preserved untouched.
+    assert.equal(calls.estimateTaxReads, 1);
     const write = calls.changeOrderUpdates[0].data;
     assert.equal(Object.prototype.hasOwnProperty.call(write, "termsTaxExempt"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(write, "termsTaxRatePercent"), false);
@@ -374,7 +381,8 @@ test("portal approval requires the loaded revision and preserves the exact sent 
     assert.equal(write.data.status, "Approved");
     assert.equal(Object.prototype.hasOwnProperty.call(write.data, "termsTaxExempt"), false);
     assert.equal(result!.co.termsTaxRatePercent, 8.875);
-    assert.equal(calls.estimateTaxReads, 0);
+    // One read: the ordering lock (see the Sent manual-approve test above).
+    assert.equal(calls.estimateTaxReads, 1);
     assert.deepEqual(
         calls.automationJobUpserts.map(call => call.create.kind),
         ["APPROVAL_BILL", "APPROVAL_CLIENT_EMAIL", "APPROVAL_SCHEDULE", "APPROVAL_TEAM_EMAIL"],
@@ -427,10 +435,13 @@ test("legacy Sent portal approval bootstraps live terms atomically when the disp
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxExempt, false);
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxRateName, "Legacy displayed terms");
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxRatePercent, 9.125);
+    // Estimate FIRST, then Project, then ChangeOrder — the repo-wide money
+    // lock order (Codex round 7; holding Project/CO while acquiring Estimate
+    // deadlocks against restoreEstimateItemAssociations).
     const projectLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "Project"'));
     const changeOrderLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "ChangeOrder"'));
     const estimateLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "Estimate"'));
-    assert.ok(projectLock >= 0 && changeOrderLock > projectLock && estimateLock > changeOrderLock);
+    assert.ok(estimateLock >= 0 && projectLock > estimateLock && changeOrderLock > projectLock);
 });
 
 test("portal approval fails closed when Project ownership changes after the action precheck", async () => {

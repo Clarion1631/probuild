@@ -948,6 +948,26 @@ export async function linkMilestoneQboCreateResult(
         : { decision: "compensate-conflict" };
 }
 
+// Durable delete-pending checkpoint (Codex round 7): written onto
+// qbCreateFingerprint BEFORE a compensating provider delete, so a crash
+// between the successful delete and the generation reset leaves a marker a
+// retry can recover from — instead of an intact requestid checkpoint pointing
+// at a deleted invoice, whose cached idempotent response a replay would
+// resurrect. The marker deliberately fails readMilestoneQboCreateAttempt's
+// fingerprint shape check, so every path except the recovery below fails
+// closed on it.
+const MILESTONE_QBO_COMPENSATION_PENDING_PREFIX = "compensation-pending:";
+
+export function milestoneQboCompensationPendingMarker(qbInvoiceId: string): string {
+    return `${MILESTONE_QBO_COMPENSATION_PENDING_PREFIX}${qbInvoiceId}`;
+}
+
+export function milestoneQboCompensationPendingQbId(fingerprint: string | null): string | null {
+    if (!fingerprint?.startsWith(MILESTONE_QBO_COMPENSATION_PENDING_PREFIX)) return null;
+    const qbId = fingerprint.slice(MILESTONE_QBO_COMPENSATION_PENDING_PREFIX.length);
+    return qbId || null;
+}
+
 async function resetMilestoneQboCreateAttemptAfterAuthoritativeDelete(
     client: Prisma.TransactionClient,
     paymentScheduleId: string,
@@ -1177,11 +1197,48 @@ export async function pushMilestoneToQuickBooks(
         if (current.invoice.clientId !== invoice.clientId) {
             throw new Error("This invoice's client changed while resolving QuickBooks; refresh and retry.");
         }
+
+        // Interrupted-compensation recovery (Codex round 7): a prior
+        // compensating delete checkpointed its marker, deleted the QBO
+        // invoice, and crashed before the generation reset. Confirm the
+        // provider state, finish the reset, and only then reserve a fresh
+        // attempt — replaying the old requestid could resurrect the deleted
+        // invoice's cached response.
+        let reservationGeneration = current.qbCreateGeneration;
+        const pendingCompensationQbId = milestoneQboCompensationPendingQbId(current.qbCreateFingerprint);
+        if (pendingCompensationQbId) {
+            const probe = await probeQBInvoice(tokens, pendingCompensationQbId);
+            if (probe.state === "error") {
+                throw new Error("QuickBooks could not confirm an interrupted compensating deletion for this milestone; retry once QuickBooks is reachable.");
+            }
+            if (probe.state !== "voided" && probe.state !== "notFound") {
+                const deleted = await deleteQBInvoice(tokens, pendingCompensationQbId).catch(() => false);
+                if (!deleted) {
+                    throw new Error(`QuickBooks invoice ${pendingCompensationQbId} from an interrupted compensation is still live and could not be deleted — remove it in QuickBooks, then retry.`);
+                }
+            }
+            const finished = await resetMilestoneQboCreateAttemptAfterAuthoritativeDelete(tx, schedule.id, {
+                generation: current.qbCreateGeneration,
+                requestId: current.qbCreateRequestId!,
+                fingerprint: current.qbCreateFingerprint!,
+                startedAt: current.qbCreateStartedAt!,
+            } as ReservedMilestoneQboCreateAttempt);
+            if (!finished) {
+                throw new Error("This milestone changed while finishing an interrupted QuickBooks compensation; refresh and retry.");
+            }
+            const refreshed = await tx.paymentSchedule.findUnique({
+                where: { id: schedule.id },
+                select: { qbCreateGeneration: true },
+            });
+            if (!refreshed) throw new Error("Payment milestone not found");
+            reservationGeneration = refreshed.qbCreateGeneration;
+        }
+
         const lockedInput = buildMilestoneQboCreateInput(
             current,
             current.invoice.client.qbCustomerId ?? customerId,
             itemId,
-            buildMilestoneInvoiceDocNumber(current.id, current.qbCreateGeneration),
+            buildMilestoneInvoiceDocNumber(current.id, reservationGeneration),
         );
         const attempt = await reserveMilestoneQboCreateAttempt(
             tx,
@@ -1189,7 +1246,7 @@ export async function pushMilestoneToQuickBooks(
             freezeMilestoneQboCreatePayload(lockedInput),
         );
         return { attempt, createInput: lockedInput };
-    }));
+    }, { timeout: 70_000 }));
     const { attempt, createInput } = reservation;
     const docNumber = createInput.docNumber;
 
@@ -1311,6 +1368,34 @@ export async function pushMilestoneToQuickBooks(
         throw new Error("This milestone changed while staging its QuickBooks invoice; its existing QuickBooks invoice was preserved — refresh and try again.");
     }
     if (linkOutcome.decision === "compensate-conflict") {
+        // Checkpoint the pending compensation BEFORE the provider delete
+        // (Codex round 7): if the process dies between a successful delete
+        // and the generation reset, the marker (not an intact requestid
+        // checkpoint pointing at a deleted invoice) is what a retry finds,
+        // and the reservation transaction's recovery finishes the reset
+        // before allowing another create.
+        const marker = milestoneQboCompensationPendingMarker(qbId);
+        const markerWritten = await withTxRetry(() => prisma.$transaction(async (tx) => {
+            await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
+            const staged = await tx.paymentSchedule.updateMany({
+                where: {
+                    id: schedule.id,
+                    status: "Pending",
+                    qbPaymentId: null,
+                    qbInvoiceId: null,
+                    qbCreateGeneration: attempt.generation,
+                    qbCreateRequestId: attempt.requestId,
+                    qbCreateFingerprint: attempt.fingerprint,
+                    qbCreateStartedAt: attempt.startedAt,
+                },
+                data: { qbCreateFingerprint: marker },
+            });
+            return staged.count === 1;
+        }));
+        if (!markerWritten) {
+            console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push before its compensation checkpoint; QBO invoice ${qbId} (${createInput.docNumber}) was left in place — reconcile it manually`);
+            throw new Error(`This milestone changed while staging its QuickBooks invoice; QuickBooks invoice ${createInput.docNumber} (id ${qbId}) was left in place — reconcile it in QuickBooks, then retry.`);
+        }
         const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
         if (!compensated) {
             console.error(`[quickbooks-payments] milestone ${schedule.id} changed mid-push and compensating delete of QBO invoice ${qbId} (${createInput.docNumber}) failed — delete it in QuickBooks manually`);
@@ -1318,7 +1403,7 @@ export async function pushMilestoneToQuickBooks(
         }
         await withTxRetry(() => prisma.$transaction(async (tx) => {
             await lockMoneyParents(tx, { invoiceId: schedule.invoiceId });
-            await resetMilestoneQboCreateAttemptAfterAuthoritativeDelete(tx, schedule.id, attempt);
+            await resetMilestoneQboCreateAttemptAfterAuthoritativeDelete(tx, schedule.id, { ...attempt, fingerprint: marker });
         }));
         throw new Error("This milestone changed while staging its QuickBooks invoice — refresh and try again.");
     }

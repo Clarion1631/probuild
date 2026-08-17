@@ -450,14 +450,23 @@ export async function approveChangeOrderCore(
     },
 ) {
     return prisma.$transaction(async (tx) => {
-        // Project-scoped writers use Project -> ChangeOrder -> Estimate. The
-        // unlocked lookup is only a routing hint; both ownership and routing are
-        // re-read after the parent and child locks are held.
+        // Lock order: Estimate -> Project -> ChangeOrder — the repo-wide money
+        // order (restoreEstimateItemAssociations and
+        // createInvoiceFromEstimateCore both hold Estimate before Project;
+        // holding Project or the CO while acquiring Estimate deadlocks
+        // against them — Codex round 7). The unlocked lookup is only a
+        // routing hint; ownership and routing are re-read after every lock
+        // is held.
         const coRef = await tx.changeOrder.findUnique({
             where: { id },
-            select: { projectId: true },
+            select: { projectId: true, estimateId: true },
         });
         if (!coRef) return null;
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
         const [project] = await tx.$queryRaw<Array<{ id: string; clientId: string | null }>>`
             SELECT "id", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
         if (!project) return null;
@@ -471,18 +480,22 @@ export async function approveChangeOrderCore(
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
-        if (current.projectId !== project.id) {
+        if (current.projectId !== project.id || current.estimateId !== coRef.estimateId) {
             throw new ChangeOrderRevisionConflictError(current.code);
         }
         if (!approval.expectedClientId || project.clientId !== approval.expectedClientId) {
             throw new Error(`Change order ${current.code} no longer belongs to the authenticated portal client.`);
         }
 
-        if (current.status !== "Sent") {
-            throw new Error(`Change order ${current.code} must be Sent before it can be approved.`);
-        }
+        // Revision FIRST, status second (Codex round 7): a concurrent edit
+        // that un-sent the CO (Sent -> Draft) bumped its revision, and the
+        // caller must see the fixed REVISION_CONFLICT code (reload-and-review
+        // behavior), not a generic status error.
         if (current.revision !== approval.expectedRevision) {
             throw new ChangeOrderRevisionConflictError(current.code);
+        }
+        if (current.status !== "Sent") {
+            throw new Error(`Change order ${current.code} must be Sent before it can be approved.`);
         }
         if (!approval.signatureName.trim() || !approval.clientSignatureUrl) {
             throw new Error("A client name and persisted signature is required to approve a change order.");
@@ -529,11 +542,11 @@ export async function approveChangeOrderCore(
         // between the comparison and the approval write.
         let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
         if (current.termsTaxExempt === null) {
-            const [estimateTax] = await tx.$queryRaw<Array<{
-                taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
-            }>>`
-                SELECT "taxExempt", "taxRatePercent", "taxRateName"
-                FROM "Estimate" WHERE "id" = ${current.estimateId} FOR SHARE`;
+            // estimateTax was read under FOR SHARE at the TOP of this
+            // transaction (lock order Estimate -> Project -> CO), so a
+            // tax-only edit either committed before that lock or waits for
+            // this transaction — same guarantee, correct lock order.
+            if (!estimateTax) throw new ChangeOrderTaxTermsConflictError(current.code);
             if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
                 throw new ChangeOrderTaxTermsConflictError(current.code);
             }
@@ -590,9 +603,20 @@ export async function manuallyApproveChangeOrderCore(
     approval: { staffName: string; approvedAt: Date; expectedRevision: number; expectedTaxFingerprint: string },
 ) {
     return prisma.$transaction(async (tx) => {
-        // Same parent-row lock as approveChangeOrderCore/updateChangeOrderCore/
-        // billing — status, item existence, subtotal validation, and the
-        // approval write observe one serialized state.
+        // Lock order: Estimate FIRST, then the CO parent-row lock (repo-wide
+        // money order — holding the CO while acquiring Estimate deadlocks
+        // against Estimate-first flows; Codex round 7). The unlocked lookup
+        // is only a routing hint, revalidated after the CO lock is held.
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id },
+            select: { estimateId: true },
+        });
+        if (!coRef) return null;
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
             clientSignatureUrl: string | null; revision: number; estimateId: string;
@@ -604,22 +628,27 @@ export async function manuallyApproveChangeOrderCore(
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
+        if (current.estimateId !== coRef.estimateId) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
+
+        // CAS guard FIRST, status second (Codex round 7): the client does
+        // save (request 1) then approve (request 2), and a concurrent edit
+        // between them must not bill stale values. revision is a monotonic
+        // counter bumped by every transaction that changes billing inputs
+        // (items, schedules, pricing, status, signatures) — a mismatch means
+        // the row changed underneath the caller since it loaded the page, and
+        // the caller must see the fixed REVISION_CONFLICT code even when that
+        // change also moved the status.
+        if (current.revision !== approval.expectedRevision) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
 
         if (current.status !== "Draft" && current.status !== "Sent") {
             throw new Error(`Change order ${current.code} must be Draft or Sent to be manually approved.`);
         }
         if (current.clientSignatureUrl) {
             throw new Error(`Change order ${current.code} already has a client signature — use the portal approval flow.`);
-        }
-
-        // CAS guard against the save/approve two-request race: the client does
-        // save (request 1) then approve (request 2), and a concurrent edit
-        // between them must not bill stale values. revision is a monotonic
-        // counter bumped by every transaction that changes billing inputs
-        // (items, schedules, pricing, status, signatures) — a mismatch means
-        // the row changed underneath the caller since it loaded the page.
-        if (current.revision !== approval.expectedRevision) {
-            throw new ChangeOrderRevisionConflictError(current.code);
         }
 
         if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");
@@ -659,11 +688,10 @@ export async function manuallyApproveChangeOrderCore(
 
         let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
         if (current.status === "Draft" || current.termsTaxExempt === null) {
-            const [estimateTax] = await tx.$queryRaw<Array<{
-                taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
-            }>>`
-                SELECT "taxExempt", "taxRatePercent", "taxRateName"
-                FROM "Estimate" WHERE "id" = ${current.estimateId} FOR SHARE`;
+            // estimateTax was read under FOR SHARE at the TOP of this
+            // transaction (Estimate before CO), so a tax-only edit either
+            // committed before that lock or waits for this transaction.
+            if (!estimateTax) throw new ChangeOrderTaxTermsConflictError(current.code);
             if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
                 throw new ChangeOrderTaxTermsConflictError(current.code);
             }

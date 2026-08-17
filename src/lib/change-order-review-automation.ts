@@ -74,6 +74,11 @@ export type ReviewEmailAutomationPayload = {
     expectedSubtotalCents: number;
     companyName: string;
     expectedSettings: ReviewEmailSettingsExpectation;
+    // The Client/Project rows the frozen portalUrl was signed for (Codex
+    // round 7): addresses alone can't prove identity. null only for jobs
+    // enqueued before these fields shipped — those skip the id check.
+    expectedClientId: string | null;
+    expectedProjectId: string | null;
 };
 
 export function newChangeOrderReviewGeneration(): string {
@@ -211,6 +216,8 @@ export function parseReviewEmailAutomationPayload(value: unknown): ReviewEmailAu
         expectedSubtotalCents: row.expectedSubtotalCents,
         companyName: row.companyName,
         expectedSettings,
+        expectedClientId: typeof row.expectedClientId === "string" && row.expectedClientId ? row.expectedClientId : null,
+        expectedProjectId: typeof row.expectedProjectId === "string" && row.expectedProjectId ? row.expectedProjectId : null,
     };
 }
 
@@ -252,19 +259,41 @@ async function checkpointReviewEmailFirstAttemptLocked(
 ): Promise<FirstAttemptCheckpointResult> {
     try {
         return await prisma.$transaction(async (tx): Promise<FirstAttemptCheckpointResult> => {
-            // Canonical project-scoped order: Project -> ChangeOrder -> Client
-            // -> Estimate (when needed) -> CompanySettings -> job.
-            // The first-provider checkpoint is committed while these shared
-            // locks are still held. A crash after that commit is therefore a
-            // frozen retry, never an unvalidated first attempt.
+            // Canonical money order: Estimate -> Project -> ChangeOrder ->
+            // Client -> CompanySettings -> job. Estimate comes FIRST (Codex
+            // round 7): Estimate-first flows (restoreEstimateItemAssociations,
+            // createInvoiceFromEstimateCore) would deadlock against a
+            // transaction holding Project/CO while acquiring Estimate. The
+            // unlocked coRef read is a routing hint, revalidated after the CO
+            // lock. The first-provider checkpoint is committed while these
+            // shared locks are still held. A crash after that commit is
+            // therefore a frozen retry, never an unvalidated first attempt.
             const coRef = await tx.changeOrder.findUnique({
                 where: { id: job.changeOrderId },
-                select: { projectId: true },
+                select: { projectId: true, estimateId: true },
             });
             if (!coRef) return conflict("REVISION_CONFLICT", "Change order no longer exists");
+            const [estimateTax] = await tx.$queryRaw<Array<{
+                taxExempt: boolean;
+                taxRatePercent: Prisma.Decimal | null;
+                taxRateName: string | null;
+            }>>`
+                SELECT "taxExempt", "taxRatePercent", "taxRateName"
+                FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
             const [project] = await tx.$queryRaw<Array<{ id: string; clientId: string | null }>>`
                 SELECT "id", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
             if (!project) return conflict("REVISION_CONFLICT", "Change-order project no longer exists");
+            // Identity binding (Codex round 7): the frozen dispatch's portalUrl
+            // was signed for a specific Client row. Matching addresses alone
+            // would let a project reassigned to a same-email Client pass every
+            // recipient/settings check while the token authenticates the OLD
+            // client's scope.
+            if (payload.expectedProjectId !== null && project.id !== payload.expectedProjectId) {
+                return conflict("REVISION_CONFLICT", "The change order moved projects after its review email was frozen.");
+            }
+            if (payload.expectedClientId !== null && project.clientId !== payload.expectedClientId) {
+                return conflict("RECIPIENT_CONFLICT", "The project's client changed after this review email was frozen; preview and send again for the current client.");
+            }
             const [co] = await tx.$queryRaw<Array<{
                 id: string;
                 code: string;
@@ -282,7 +311,7 @@ async function checkpointReviewEmailFirstAttemptLocked(
                        "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
                 FROM "ChangeOrder" WHERE "id" = ${job.changeOrderId} FOR UPDATE`;
             if (!co) return conflict("REVISION_CONFLICT", "Change order no longer exists");
-            if (co.projectId !== project.id) {
+            if (co.projectId !== project.id || co.estimateId !== coRef.estimateId) {
                 return conflict("REVISION_CONFLICT", `Change order ${co.code} moved projects before delivery.`);
             }
             if ((co.status !== "Draft" && co.status !== "Sent") || co.revision !== payload.expectedRevision) {
@@ -310,14 +339,10 @@ async function checkpointReviewEmailFirstAttemptLocked(
                 });
             const mustSnapshotTerms = co.status === "Draft" || terms === null;
             if (mustSnapshotTerms) {
-                const [estimateTax] = await tx.$queryRaw<Array<{
-                    taxExempt: boolean;
-                    taxRatePercent: Prisma.Decimal | null;
-                    taxRateName: string | null;
-                }>>`
-                    SELECT "taxExempt", "taxRatePercent", "taxRateName"
-                    FROM "Estimate" WHERE "id" = ${co.estimateId} FOR SHARE`;
-                terms = canonicalCoTaxTerms(estimateTax);
+                // estimateTax was read under FOR SHARE at the TOP of this
+                // transaction (Estimate before Project/CO) and stays locked
+                // through the checkpoint commit.
+                terms = estimateTax ? canonicalCoTaxTerms(estimateTax) : null;
             }
             if (!terms || coTaxFingerprint(terms) !== payload.expectedTaxFingerprint) {
                 return conflict("TAX_TERMS_CONFLICT", `Change order ${co.code} tax terms changed before delivery.`);

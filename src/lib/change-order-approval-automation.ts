@@ -108,9 +108,16 @@ type MilestoneState = {
     amount: number;
     status: string;
     qbInvoiceSentAt: string | null;
-    qbInvoiceId: string;
+    qbInvoiceId: string | null;
     qbInvoiceLink: string | null;
     qbSyncError: string | null;
+    // QBO-create fence state (Codex round 7): a create attempt that starts
+    // between preflight and the provider locks changes these even when the
+    // visible invoice fields do not — the frozen payment request must not
+    // survive it.
+    qbCreateGeneration: number;
+    qbCreateRequestId: string | null;
+    qbCreateFingerprint: string | null;
 };
 
 function milestoneStateFingerprint(invoiceId: string, milestones: MilestoneState[]): string {
@@ -129,6 +136,9 @@ function milestoneStatesFromRows(rows: Array<{
     qbInvoiceId: string | null;
     qbInvoiceLink: string | null;
     qbSyncError: string | null;
+    qbCreateGeneration: number;
+    qbCreateRequestId: string | null;
+    qbCreateFingerprint: string | null;
 }>): MilestoneState[] {
     return rows.map((row): MilestoneState => ({
         id: row.id,
@@ -136,9 +146,12 @@ function milestoneStatesFromRows(rows: Array<{
         amount: Number(row.amount),
         status: row.status,
         qbInvoiceSentAt: row.qbInvoiceSentAt?.toISOString() ?? null,
-        qbInvoiceId: row.qbInvoiceId ?? "",
+        qbInvoiceId: row.qbInvoiceId,
         qbInvoiceLink: row.qbInvoiceLink,
         qbSyncError: row.qbSyncError,
+        qbCreateGeneration: row.qbCreateGeneration,
+        qbCreateRequestId: row.qbCreateRequestId,
+        qbCreateFingerprint: row.qbCreateFingerprint,
     })).sort((a, b) => a.id.localeCompare(b.id));
 }
 
@@ -150,9 +163,12 @@ function milestoneStatesFromJson(value: unknown): MilestoneState[] | null {
         || typeof (state as Record<string, unknown>).amount !== "number"
         || typeof (state as Record<string, unknown>).status !== "string"
         || ((state as Record<string, unknown>).qbInvoiceSentAt !== null && typeof (state as Record<string, unknown>).qbInvoiceSentAt !== "string")
-        || typeof (state as Record<string, unknown>).qbInvoiceId !== "string"
+        || ((state as Record<string, unknown>).qbInvoiceId !== null && typeof (state as Record<string, unknown>).qbInvoiceId !== "string")
         || ((state as Record<string, unknown>).qbInvoiceLink !== null && typeof (state as Record<string, unknown>).qbInvoiceLink !== "string")
         || ((state as Record<string, unknown>).qbSyncError !== null && typeof (state as Record<string, unknown>).qbSyncError !== "string")
+        || typeof (state as Record<string, unknown>).qbCreateGeneration !== "number"
+        || ((state as Record<string, unknown>).qbCreateRequestId !== null && typeof (state as Record<string, unknown>).qbCreateRequestId !== "string")
+        || ((state as Record<string, unknown>).qbCreateFingerprint !== null && typeof (state as Record<string, unknown>).qbCreateFingerprint !== "string")
     ))) return null;
     return value as MilestoneState[];
 }
@@ -223,7 +239,22 @@ async function lockChangeOrderAndClaim(
     tx: Prisma.TransactionClient,
     job: ApprovalJob,
 ): Promise<ChangeOrderAutomationJobRecord> {
-    await lockChangeOrderRow(tx, job);
+    // Project FIRST, then ChangeOrder (Codex round 7): completion
+    // transactions insert ActivityLog rows whose Project FK takes a KEY SHARE
+    // lock on Project — taking it only after the CO lock inverts project
+    // deletion's Project -> ChangeOrder order and can deadlock against it.
+    // The unlocked projectId read is a routing hint; lockChangeOrderRow
+    // re-reads projectId under the CO lock and the mismatch throws below.
+    const coRef = await tx.changeOrder.findUnique({
+        where: { id: job.changeOrderId },
+        select: { projectId: true },
+    });
+    if (!coRef) throw new AutomationFenceLostError(job.id);
+    await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE
+    `;
+    const changeOrder = await lockChangeOrderRow(tx, job);
+    if (changeOrder.projectId !== coRef.projectId) throw new AutomationFenceLostError(job.id);
     return lockClaimedJob(tx, job);
 }
 
@@ -238,14 +269,18 @@ async function lockClientDeliveryParentsAndClaim(
 ): Promise<void> {
     // This first read is a routing hint only. Every routing/recipient value is
     // re-read after its owning row is locked. The global order is:
-    // Project -> ChangeOrder -> Estimate -> Invoice -> InvoiceEmailAttempt
-    // -> Invoice Client -> CompanySettings -> automation job.
+    // Estimate -> Project -> ChangeOrder -> Invoice -> InvoiceEmailAttempt
+    // -> Invoice Client -> CompanySettings -> automation job. Estimate comes
+    // FIRST (Codex round 7): restoreEstimateItemAssociations and
+    // createInvoiceFromEstimateCore hold Estimate before Project, so holding
+    // Project while acquiring Estimate deadlocks against them.
     const routing = await tx.invoice.findUnique({
         where: { id: invoiceId },
         select: { estimateId: true, projectId: true, clientId: true },
     });
     if (!routing) throw new Error("Invoice disappeared before client delivery");
 
+    await lockMoneyParents(tx, { estimateId: routing.estimateId });
     const [project] = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT "id" FROM "Project" WHERE "id" = ${routing.projectId} FOR SHARE
     `;
@@ -255,7 +290,6 @@ async function lockClientDeliveryParentsAndClaim(
         throw new Error("Change order and invoice no longer belong to the same project");
     }
     await lockMoneyParents(tx, {
-        estimateId: routing.estimateId,
         invoiceId,
         allowInvoiceEmailAttemptKey: options.allowInvoiceEmailAttemptKey,
     });
@@ -541,7 +575,7 @@ async function deliverClientFrozenDispatch(input: {
         });
         const liveRows = await tx.paymentSchedule.findMany({
             where: { invoiceId: input.invoiceId, id: { in: input.milestoneIds } },
-            select: { id: true, name: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbInvoiceLink: true, qbSyncError: true },
+            select: { id: true, name: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbInvoiceLink: true, qbSyncError: true, qbCreateGeneration: true, qbCreateRequestId: true, qbCreateFingerprint: true },
         });
         if (liveRows.length !== input.milestoneIds.length
             || milestoneStateFingerprint(input.invoiceId, milestoneStatesFromRows(liveRows)) !== input.milestoneFingerprint) {
@@ -602,7 +636,7 @@ async function deliverClientFrozenDispatch(input: {
             }
             const liveRows = await tx.paymentSchedule.findMany({
                 where: { invoiceId: input.invoiceId, id: { in: input.milestoneIds } },
-                select: { id: true, name: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbInvoiceLink: true, qbSyncError: true },
+                select: { id: true, name: true, amount: true, status: true, qbInvoiceSentAt: true, qbInvoiceId: true, qbInvoiceLink: true, qbSyncError: true, qbCreateGeneration: true, qbCreateRequestId: true, qbCreateFingerprint: true },
             });
             if (liveRows.length !== input.milestoneIds.length
                 || milestoneStateFingerprint(input.invoiceId, milestoneStatesFromRows(liveRows)) !== input.milestoneFingerprint) {
@@ -780,9 +814,14 @@ async function executeClientEmail(
     const sendMilestoneInvoices = dependencies.sendMilestoneInvoices ??
         (await import("./billing-core")).sendMilestoneInvoicesCore;
 
+    // Declared OUTSIDE the try (Codex round 7): completeAfterDelivery records
+    // its real outcome here and then throws to abort billing-core's flow; the
+    // catch below must return that recorded outcome (which can carry
+    // needs-attention and payload-retention decisions), never flatten it into
+    // a generic retry.
+    let stagedDispatch: FrozenNotification | null = null;
+    let providerOutcome: ChangeOrderAutomationExecutionResult | null = null;
     try {
-        let stagedDispatch: FrozenNotification | null = null;
-        let providerOutcome: ChangeOrderAutomationExecutionResult | null = null;
         const delivery = await sendMilestoneInvoices(
             invoiceId,
             [...milestoneIds],
@@ -871,6 +910,9 @@ async function executeClientEmail(
             error: delivery.error || errors.join("; ") || "Client payment request did not complete",
         };
     } catch (error) {
+        // A recorded provider outcome always wins over the generic wrapper
+        // error — it carries the true terminal/retention semantics.
+        if (providerOutcome) return providerOutcome;
         return { kind: "retry", error: errorText(error) };
     }
 }

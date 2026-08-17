@@ -48,7 +48,13 @@ export default function PortalChangeOrderClient({
                 initialData.revision,
                 coTaxFingerprint(taxInfo),
             );
-            if (result && "success" in result && !result.success) {
+            // null means the approval core refused silently (expired portal
+            // authorization, internal identity, lost ownership). Never show
+            // success for it (Codex round 7).
+            if (!result || ("success" in result && !result.success)) {
+                if (!result) {
+                    toast.error("Your session or access to this change order changed. Reloading\u2026");
+                }
                 window.location.reload();
                 return;
             }

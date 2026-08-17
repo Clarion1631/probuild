@@ -232,10 +232,15 @@ export function buildMilestoneSendPreviewPayload(input: {
 
 export function milestoneSendFinancialFingerprint(input: {
     invoiceId: string;
+    // Invoice identity/state is bound too (Codex round 7): a token minted
+    // against one invoice code/status must not survive the invoice being
+    // renamed or canceled between preview and confirmation.
+    invoice: { code: string; status: string };
     milestones: Array<[string, string, number, string, string | null]>;
 }): string {
     return JSON.stringify({
         invoiceId: input.invoiceId,
+        invoice: input.invoice,
         milestones: [...input.milestones].sort((a, b) => a[0].localeCompare(b[0])),
     });
 }
@@ -243,15 +248,17 @@ export function milestoneSendFinancialFingerprint(input: {
 export function milestoneFinancialConflictError(input: {
     expected?: string;
     invoiceId: string;
+    invoice: { code: string; status: string };
     milestones: Array<[string, string, number, string, string | null]>;
 }): string | null {
     if (!input.expected) return null;
     return input.expected === milestoneSendFinancialFingerprint({
         invoiceId: input.invoiceId,
+        invoice: input.invoice,
         milestones: input.milestones,
     })
         ? null
-        : "Payment-request milestones changed after the preview; review the fresh names, amounts, statuses, and prior-send markers before sending.";
+        : "Payment-request milestones or their invoice changed after the preview; review the fresh invoice, names, amounts, statuses, and prior-send markers before sending.";
 }
 
 export type InvoiceSendFinancialState = {
@@ -267,6 +274,11 @@ export type InvoiceSendFinancialState = {
         status: string;
         dueDate: string | null;
         qbInvoiceSentAt: string | null;
+        // QBO identity and health are bound (Codex round 7): an unlink,
+        // recreate, or newly recorded sync failure after confirmation must
+        // invalidate delivery. The refreshable pay link itself stays excluded.
+        qbInvoiceId: string | null;
+        qbSyncError: string | null;
     }>;
 };
 
@@ -301,6 +313,10 @@ export function buildInvoiceResendPreviewPayload(input: {
         name: string;
         amount: number;
         status: string;
+        // Bound so a due-date edit between preview and confirmation
+        // invalidates the token (Codex round 7) — the confirm-side financial
+        // fingerprint already covers dueDate; the preview token must too.
+        dueDate: string | null;
         qbInvoiceId: string | null;
         qbInvoiceSentAt: string | null;
         qbSyncError: string | null;
@@ -359,9 +375,19 @@ export type MilestoneAttemptState = {
     amount: number;
     status: string;
     qbInvoiceSentAt: string | null;
-    qbInvoiceId: string;
+    // null is preserved end-to-end (never coerced to "") — the automation
+    // module CASes on this value in a Prisma `where`, and "" can never match
+    // a SQL NULL column (Codex round 7).
+    qbInvoiceId: string | null;
     qbInvoiceLink: string | null;
     qbSyncError: string | null;
+    // QBO-create fence state (Codex round 7): a create attempt that starts
+    // between preflight and the provider locks changes these even when the
+    // visible invoice fields do not — the frozen payment request must not
+    // survive it.
+    qbCreateGeneration: number;
+    qbCreateRequestId: string | null;
+    qbCreateFingerprint: string | null;
 };
 
 export function milestoneDeliveryFingerprint(invoiceId: string, milestones: MilestoneAttemptState[]): string {
@@ -425,9 +451,12 @@ function parseMilestoneInvoiceEmailAttemptPayload(value: unknown): MilestoneInvo
             || typeof (state as Record<string, unknown>).amount !== "number"
             || typeof (state as Record<string, unknown>).status !== "string"
             || ((state as Record<string, unknown>).qbInvoiceSentAt !== null && typeof (state as Record<string, unknown>).qbInvoiceSentAt !== "string")
-            || typeof (state as Record<string, unknown>).qbInvoiceId !== "string"
+            || ((state as Record<string, unknown>).qbInvoiceId !== null && typeof (state as Record<string, unknown>).qbInvoiceId !== "string")
             || ((state as Record<string, unknown>).qbInvoiceLink !== null && typeof (state as Record<string, unknown>).qbInvoiceLink !== "string")
-            || ((state as Record<string, unknown>).qbSyncError !== null && typeof (state as Record<string, unknown>).qbSyncError !== "string"))
+            || ((state as Record<string, unknown>).qbSyncError !== null && typeof (state as Record<string, unknown>).qbSyncError !== "string")
+            || typeof (state as Record<string, unknown>).qbCreateGeneration !== "number"
+            || ((state as Record<string, unknown>).qbCreateRequestId !== null && typeof (state as Record<string, unknown>).qbCreateRequestId !== "string")
+            || ((state as Record<string, unknown>).qbCreateFingerprint !== null && typeof (state as Record<string, unknown>).qbCreateFingerprint !== "string"))
         || !Array.isArray(record.resultMilestones)
         || record.resultMilestones.length !== record.milestoneIds.length
         || record.resultMilestones.some(result => !result || typeof result !== "object" || Array.isArray(result)
@@ -685,6 +714,30 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         if (estimate.projectId !== projectId) {
             throw new Error("Estimate project changed while creating its invoice; reload and retry");
         }
+
+        // Under the Estimate lock concurrent conversions are fully
+        // serialized, so a winner that beat us to the lock has already
+        // committed and is visible HERE. Adopt it instead of inserting a twin
+        // (Codex round 7): the post-create compensation path can misjudge a
+        // freshly cloned duplicate as "interacted with", because the
+        // audit-evidence fields it inspects (Paid status,
+        // stripePaymentIntentId, QBO ids) are copied from the estimate into
+        // the clone itself — leaving the loser in place to double-represent
+        // paid money. Checking under the lock makes that judgment unnecessary.
+        const raceWinner = await tx.invoice.findFirst({
+            where: { estimateId },
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }], // same tie-break as the guarded wrapper
+            select: { id: true },
+        });
+        if (raceWinner) {
+            return {
+                id: raceWinner.id,
+                projectId,
+                createdPaymentIds: [] as string[],
+                adoptedExisting: true,
+            };
+        }
+
         const project = await tx.project.findUnique({ where: { id: projectId } });
         if (!project) throw new Error("Project not found");
 
@@ -770,6 +823,7 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
             id: invoice.id,
             projectId,
             createdPaymentIds,
+            adoptedExisting: false,
         };
     }));
 
@@ -780,6 +834,8 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
         // Internal compensation token: the guarded wrapper may delete a losing
         // concurrent duplicate only while these remain its exact child set.
         createdPaymentIds: created.createdPaymentIds,
+        /** True when the in-transaction winner check adopted an existing invoice instead of creating one. */
+        adoptedExisting: created.adoptedExisting,
     };
 }
 
@@ -837,6 +893,24 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     // old, milestones cascade) and return the winner. Deterministic: earliest
     // createdAt wins, id breaks ties.
     const created = await createInvoiceFromEstimateCore(estimateId);
+    if (created.adoptedExisting) {
+        // The in-transaction winner check adopted a concurrently created
+        // invoice under the Estimate lock — nothing of ours exists to
+        // compensate away.
+        const adopted = await prisma.invoice.findUnique({
+            where: { id: created.id },
+            select: { id: true, code: true, status: true, balanceDue: true },
+        });
+        return {
+            ok: true as const,
+            alreadyExisted: true,
+            invoiceId: created.id,
+            invoiceCode: adopted?.code ?? "",
+            status: adopted?.status ?? "Draft",
+            balanceDue: Number(adopted?.balanceDue ?? 0),
+            note: "A concurrent request created this estimate's invoice first — returning that one.",
+        };
+    }
 
     const all = await prisma.invoice.findMany({
         where: { estimateId },
@@ -974,7 +1048,9 @@ export async function sendInvoiceToClientCore(
                         amount: true,
                         status: true,
                         dueDate: true,
+                        qbInvoiceId: true,
                         qbInvoiceSentAt: true,
+                        qbSyncError: true,
                     },
                 },
             },
@@ -1051,6 +1127,8 @@ export async function sendInvoiceToClientCore(
                 status: payment.status,
                 dueDate: payment.dueDate?.toISOString() ?? null,
                 qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                qbInvoiceId: payment.qbInvoiceId,
+                qbSyncError: payment.qbSyncError,
             })),
         });
         if (expectation.expectedFinancialFingerprint
@@ -1253,7 +1331,7 @@ export async function sendInvoiceToClientCore(
                 client: true,
                 payments: {
                     orderBy: { id: "asc" },
-                    select: { id: true, name: true, amount: true, status: true, dueDate: true, qbInvoiceSentAt: true },
+                    select: { id: true, name: true, amount: true, status: true, dueDate: true, qbInvoiceId: true, qbInvoiceSentAt: true, qbSyncError: true },
                 },
             },
         });
@@ -1283,6 +1361,8 @@ export async function sendInvoiceToClientCore(
                 status: payment.status,
                 dueDate: payment.dueDate?.toISOString() ?? null,
                 qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                qbInvoiceId: payment.qbInvoiceId,
+                qbSyncError: payment.qbSyncError,
             })),
         });
         if (completeRecipientConflict
@@ -1463,6 +1543,7 @@ export async function resendInvoiceCore(
                     dueDate: true,
                     qbInvoiceId: true,
                     qbInvoiceSentAt: true,
+                    qbSyncError: true,
                 },
             },
         },
@@ -1498,6 +1579,8 @@ export async function resendInvoiceCore(
             status: payment.status,
             dueDate: payment.dueDate?.toISOString() ?? null,
             qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+            qbInvoiceId: payment.qbInvoiceId,
+            qbSyncError: payment.qbSyncError,
         })),
     });
     if (expectation.expectedFinancialFingerprint
@@ -2054,6 +2137,7 @@ export async function sendMilestoneInvoicesCore(
         const milestoneConflict = milestoneFinancialConflictError({
             expected: opts?.expectedMilestoneFingerprint,
             invoiceId,
+            invoice: { code: invoice.code, status: invoice.status },
             milestones: selectedPayments.map((payment): [string, string, number, string, string | null] => [
                 payment.id,
                 payment.name,
@@ -2132,6 +2216,27 @@ export async function sendMilestoneInvoicesCore(
                         skipped: 0,
                         results: [],
                         error: `Automatic change-order approval delivery is ${automaticDelivery.status.toLowerCase().replace(/_/g, " ")}; wait for or reconcile that durable job instead of sending a duplicate payment request.`,
+                    };
+                }
+                // Manual staff approval suppresses ALL client emails —
+                // permanently, not merely while an automation job owns the CO.
+                // The approval-client job for a manual approval is terminally
+                // SKIPPED, so the job check above deliberately cannot see it;
+                // the approval itself is the durable fact to check, and it is
+                // enforced HERE in the core, not only in MCP preflight
+                // (Codex round 7).
+                const manualCo = (await prisma.changeOrder.findMany({
+                    where: { id: { in: sourceChangeOrderIds } },
+                    select: { code: true, status: true, approvedBy: true, clientSignatureUrl: true },
+                })).find(co => isManualCoApproval(co));
+                if (manualCo) {
+                    return {
+                        success: false,
+                        sent: 0,
+                        failed: 0,
+                        skipped: 0,
+                        results: [],
+                        error: `Change order ${manualCo.code} was manually approved by staff — client payment-request emails are permanently suppressed for its milestones. Share the portal link directly if the client needs it.`,
                     };
                 }
             }
@@ -2352,6 +2457,29 @@ export async function sendMilestoneInvoicesCore(
         // every queued milestone is marked failed (nothing was communicated), and
         // nothing is stamped as sent.
         let manualDurableDelivery = false;
+        if (sendable.length > 0 && automation?.expectedScheduleIds) {
+            // The preflight equality check ran before any QBO work; a selected
+            // milestone can since have failed QBO verification, been skipped,
+            // or entered driftReview — leaving `sendable` a strict SUBSET. An
+            // automation delivery must be all-or-nothing: a partial email
+            // silently under-requests money (Codex round 7). Re-check
+            // immediately before freezing/sending and abort the whole
+            // delivery on any shortfall.
+            const sendableIds = sendable.map(candidate => candidate.schedule.id).sort();
+            const expected = [...automation.expectedScheduleIds].sort();
+            const exact = sendableIds.length === expected.length
+                && sendableIds.every((id, index) => id === expected[index]);
+            if (!exact) {
+                return {
+                    success: false,
+                    sent: 0,
+                    failed: sendable.length,
+                    skipped: 0,
+                    results: results.map(result => ({ ...result })),
+                    error: "Not every expected milestone survived QBO verification; the automation payment request was aborted rather than sent partially. Review the failed/drifted milestones and retry.",
+                };
+            }
+        }
         if (sendable.length > 0) {
             // Refresh each milestone's live QBO pay link so the portal Pay Now
             // never hands the client a stale link (best-effort — the portal
@@ -2434,6 +2562,9 @@ export async function sendMilestoneInvoicesCore(
                     qbInvoiceId: true,
                     qbInvoiceLink: true,
                     qbSyncError: true,
+                    qbCreateGeneration: true,
+                    qbCreateRequestId: true,
+                    qbCreateFingerprint: true,
                 },
             });
             const verifiedById = new Map(sendable.map(candidate => [candidate.schedule.id, candidate]));
@@ -2454,9 +2585,12 @@ export async function sendMilestoneInvoicesCore(
                 amount: Number(row.amount),
                 status: row.status,
                 qbInvoiceSentAt: row.qbInvoiceSentAt?.toISOString() ?? null,
-                qbInvoiceId: row.qbInvoiceId!,
+                qbInvoiceId: row.qbInvoiceId,
                 qbInvoiceLink: row.qbInvoiceLink,
                 qbSyncError: row.qbSyncError,
+                qbCreateGeneration: row.qbCreateGeneration,
+                qbCreateRequestId: row.qbCreateRequestId,
+                qbCreateFingerprint: row.qbCreateFingerprint,
             })).sort((a, b) => a.id.localeCompare(b.id));
             const deliveryMilestoneFingerprint = milestoneDeliveryFingerprint(invoiceId, deliveryMilestoneStates);
             let emailFailed = false;
@@ -2559,6 +2693,9 @@ export async function sendMilestoneInvoicesCore(
                                 qbInvoiceId: true,
                                 qbInvoiceLink: true,
                                 qbSyncError: true,
+                                qbCreateGeneration: true,
+                                qbCreateRequestId: true,
+                                qbCreateFingerprint: true,
                             },
                         });
                         const liveById = new Map(livePayments.map(payment => [payment.id, payment]));
@@ -2580,9 +2717,12 @@ export async function sendMilestoneInvoicesCore(
                             amount: Number(payment.amount),
                             status: payment.status,
                             qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
-                            qbInvoiceId: payment.qbInvoiceId!,
+                            qbInvoiceId: payment.qbInvoiceId,
                             qbInvoiceLink: payment.qbInvoiceLink,
                             qbSyncError: payment.qbSyncError,
+                            qbCreateGeneration: payment.qbCreateGeneration,
+                            qbCreateRequestId: payment.qbCreateRequestId,
+                            qbCreateFingerprint: payment.qbCreateFingerprint,
                         })).sort((a, b) => a.id.localeCompare(b.id));
                         const portalUrl = await milestonePortalUrl(lockedInvoice, emailMilestones, liveRecipients.to[0] ?? "");
                         const dispatch = buildMilestoneFrozenNotification({
@@ -3797,14 +3937,24 @@ export async function sendChangeOrderToClientCore(
             revision: number;
             schedules: Array<{ name: string; amount: number; dueDate: Date | null }>;
         };
-    const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
+    const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
         const coRef = await tx.changeOrder.findUnique({
             where: { id: changeOrderId },
-            select: { projectId: true },
+            select: { projectId: true, estimateId: true },
         });
         if (!coRef) return { kind: "error", error: "Change order not found" };
-        // Project-scoped workers and parent deletion use Project -> CO -> job.
-        // This unlocked routing read is revalidated after both locks are held.
+        // Lock order: Estimate -> Project -> ChangeOrder — the repo-wide money
+        // order (restoreEstimateItemAssociations and
+        // createInvoiceFromEstimateCore both hold Estimate before Project, so
+        // holding Project while acquiring Estimate here would deadlock against
+        // them; Codex round 7). The Estimate FOR SHARE also holds the tax
+        // terms stable through the snapshot commit below. These unlocked
+        // routing reads are revalidated after every lock is held.
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: Prisma.Decimal | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
         const [project] = await tx.$queryRaw<Array<{ id: string; name: string; clientId: string | null }>>`
             SELECT "id", "name", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
         if (!project) return { kind: "error", error: "Change-order project not found" };
@@ -3819,7 +3969,7 @@ export async function sendChangeOrderToClientCore(
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
-        if (co.projectId !== project.id) {
+        if (co.projectId !== project.id || co.estimateId !== coRef.estimateId) {
             return { kind: "error", code: "REVISION_CONFLICT", error: `Change order ${co.code} moved projects — reload before sending.` };
         }
         // Only Draft/Sent may be (re)sent — a CO that flipped to Approved/Declined
@@ -3894,14 +4044,15 @@ export async function sendChangeOrderToClientCore(
             });
         const mustSnapshotTerms = co.status === "Draft" || terms === null;
         if (mustSnapshotTerms) {
-            // Hold a shared lock through the status+snapshot commit. A tax-only
-            // Estimate edit does not bump CO.revision, so an ordinary read here
-            // would leave a race between fingerprint validation and snapshot.
-            const [estimateTax] = await tx.$queryRaw<Array<{
-                taxExempt: boolean; taxRatePercent: Prisma.Decimal | null; taxRateName: string | null;
-            }>>`
-                SELECT "taxExempt", "taxRatePercent", "taxRateName"
-                FROM "Estimate" WHERE "id" = ${co.estimateId} FOR SHARE`;
+            // The Estimate FOR SHARE lock was taken at the TOP of this
+            // transaction (lock order Estimate -> Project -> CO) and holds
+            // through the status+snapshot commit. A tax-only Estimate edit
+            // does not bump CO.revision, so it must either have committed
+            // before that lock (and is exactly what was read) or wait for
+            // this transaction to finish.
+            if (!estimateTax) {
+                return { kind: "error", error: `Change order ${co.code} estimate could not be found — reload before sending.` };
+            }
             terms = canonicalCoTaxTerms(estimateTax);
         }
         if (!terms) {
@@ -3940,7 +4091,7 @@ export async function sendChangeOrderToClientCore(
             revision: co.revision,
             schedules: customerSchedules.map((row) => ({ ...row, amount: row.grossCents / 100 })),
         };
-    }, { timeout: 15_000 });
+    }, { timeout: 15_000 }));
 
     if (outcome.kind === "error") {
         return { success: false, error: outcome.error, ...(outcome.code ? { code: outcome.code } : {}) };
@@ -4040,6 +4191,14 @@ export async function sendChangeOrderToClientCore(
                     expectedSubtotalCents: Math.round(coSubtotal * 100),
                     companyName,
                     expectedSettings,
+                    // The portalUrl inside `dispatch` is signed for THIS client
+                    // row. Recipient addresses alone can't prove identity — a
+                    // project reassigned to a different Client with the same
+                    // normalized emails would pass every address check while
+                    // the token authenticates the old client's scope (Codex
+                    // round 7). The checkpoint revalidates both ids.
+                    expectedClientId: client.id,
+                    expectedProjectId: projectId,
                 },
             });
         }, { timeout: 15_000 });
@@ -4188,6 +4347,9 @@ async function deliverManualMilestoneAttempt(
                     qbInvoiceId: true,
                     qbInvoiceLink: true,
                     qbSyncError: true,
+                    qbCreateGeneration: true,
+                    qbCreateRequestId: true,
+                    qbCreateFingerprint: true,
                 },
             });
             const currentStates = current.map((payment): MilestoneAttemptState => ({
@@ -4196,9 +4358,12 @@ async function deliverManualMilestoneAttempt(
                 amount: Number(payment.amount),
                 status: payment.status,
                 qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
-                qbInvoiceId: payment.qbInvoiceId ?? "",
+                qbInvoiceId: payment.qbInvoiceId,
                 qbInvoiceLink: payment.qbInvoiceLink,
                 qbSyncError: payment.qbSyncError,
+                qbCreateGeneration: payment.qbCreateGeneration,
+                qbCreateRequestId: payment.qbCreateRequestId,
+                qbCreateFingerprint: payment.qbCreateFingerprint,
             }));
             const stateConflict = milestoneDeliveryStateConflictError({
                 expectedFingerprint: payload.financialFingerprint,

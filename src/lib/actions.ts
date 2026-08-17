@@ -9648,7 +9648,15 @@ export async function approveChangeOrder(
 // and leaves status untouched (the customer's approval still drives Approved).
 // Auth mirrors signContractAsContractor; signatureDataUrl is optional because the
 // editor's "Sign Now" flow captures a typed name rather than a drawn signature.
-export async function countersignChangeOrderAsCompany(id: string, signerName: string, signatureDataUrl?: string) {
+export async function countersignChangeOrderAsCompany(
+    id: string,
+    signerName: string,
+    signatureDataUrl?: string,
+    // Optional so MCP/legacy callers are unaffected; the editor always passes
+    // its tracked revision (Codex round 7): without it, a stale editor could
+    // attach the company signature to terms edited and resent by someone else.
+    expectedRevision?: number,
+) {
     "use server";
     // The canonical staff loader rejects DISABLED users before the role gate.
     const user = await assertActiveStaff();
@@ -9687,17 +9695,25 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
     // Lock the CO before its review jobs (the canonical lock order shared by
     // editor/audit/send). This prevents a countersignature from landing while a
     // frozen review dispatch is in-flight or ambiguous.
-    let updated: { revision: number; projectId: string };
+    let updated: { revision: number; projectId: string } | { conflict: true };
     try {
         updated = await prisma.$transaction(async (tx) => {
             const [locked] = await tx.$queryRaw<Array<{
                 projectId: string;
                 status: string;
+                revision: number;
                 companySignedAt: Date | null;
             }>>`
-                SELECT "projectId", "status", "companySignedAt"
+                SELECT "projectId", "status", "revision", "companySignedAt"
                 FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
             if (!locked) throw new Error("Change order not found");
+            // Revision CAS under the row lock, BEFORE any signature write
+            // (Codex round 7): another staff member editing and resending the
+            // CO bumps revision, and a stale editor must get the fixed
+            // conflict result — never sign terms it hasn't seen.
+            if (expectedRevision !== undefined && locked.revision !== expectedRevision) {
+                return { conflict: true as const };
+            }
             if (locked.status !== "Sent" && locked.status !== "Approved") {
                 throw new Error("Change order must be Sent before it can be countersigned");
             }
@@ -9736,9 +9752,19 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         throw error;
     }
 
+    if ("conflict" in updated) {
+        // Nothing was written; release the pre-staged signature upload.
+        await discardCompanySignature();
+        return {
+            success: false as const,
+            code: "REVISION_CONFLICT" as const,
+            error: "This change order was modified after this page loaded — reload and review it before countersigning.",
+        };
+    }
+
     revalidatePath(`/projects/${updated.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${updated.projectId}/change-orders`);
-    return { success: true, revision: updated.revision };
+    return { success: true as const, revision: updated.revision };
 }
 
 // Staff-side manual approval. Distinct from approveChangeOrder (the customer's

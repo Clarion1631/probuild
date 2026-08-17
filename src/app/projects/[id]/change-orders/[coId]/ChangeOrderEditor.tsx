@@ -87,7 +87,20 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         try {
             // Company countersignature — writes only the company fields and never
             // touches the customer's approval (see countersignChangeOrderAsCompany).
-            const updated = await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            // The tracked revision rides along so a stale editor can never sign
+            // terms another staff member edited and resent (Codex round 7).
+            const updated = await countersignChangeOrderAsCompany(
+                initialData.id,
+                signName.trim(),
+                undefined,
+                revision,
+            );
+            if (!updated.success) {
+                toast.error(updated.error);
+                setShowSignModal(false);
+                router.refresh();
+                return;
+            }
             setRevision(updated.revision);
             toast.success("Change order countersigned");
             setShowSignModal(false);

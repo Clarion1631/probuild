@@ -101,11 +101,13 @@ type BillingCoreContract = {
     }) => string;
     milestoneSendFinancialFingerprint?: (input: {
         invoiceId: string;
+        invoice: { code: string; status: string };
         milestones: Array<[string, string, number, string, string | null]>;
     }) => string;
     milestoneFinancialConflictError?: (input: {
         expected?: string;
         invoiceId: string;
+        invoice: { code: string; status: string };
         milestones: Array<[string, string, number, string, string | null]>;
     }) => string | null;
     manualMilestoneAttemptAdoptionError?: (input: {
@@ -455,10 +457,12 @@ test("the confirmed milestone fingerprint rejects name, amount, status, and prio
     const base: Array<[string, string, number, string, string | null]> = [
         ["milestone-1", "Deposit", 1250, "Pending", null],
     ];
-    const expected = contract.milestoneSendFinancialFingerprint({ invoiceId: "invoice-1", milestones: base });
+    const invoiceIdentity = { code: "INV-00001", status: "Issued" };
+    const expected = contract.milestoneSendFinancialFingerprint({ invoiceId: "invoice-1", invoice: invoiceIdentity, milestones: base });
     assert.equal(contract.milestoneFinancialConflictError({
         expected,
         invoiceId: "invoice-1",
+        invoice: invoiceIdentity,
         milestones: base,
     }), null);
     for (const changed of [
@@ -470,8 +474,22 @@ test("the confirmed milestone fingerprint rejects name, amount, status, and prio
         assert.match(contract.milestoneFinancialConflictError({
             expected,
             invoiceId: "invoice-1",
+            invoice: invoiceIdentity,
             milestones: changed,
-        }) || "", /milestones changed after the preview/i);
+        }) || "", /milestones or their invoice changed after the preview/i);
+    }
+    // Invoice identity/state drift (rename or cancel between preview and
+    // confirmation) invalidates the token too (Codex round 7).
+    for (const changedInvoice of [
+        { code: "INV-00002", status: "Issued" },
+        { code: "INV-00001", status: "Canceled" },
+    ]) {
+        assert.match(contract.milestoneFinancialConflictError({
+            expected,
+            invoiceId: "invoice-1",
+            invoice: changedInvoice,
+            milestones: base,
+        }) || "", /milestones or their invoice changed after the preview/i);
     }
 
     const source = readFileSync("src/lib/billing-core.ts", "utf8");

@@ -6,6 +6,14 @@ export type ChangeOrderApprovalJobKind =
     | "APPROVAL_SCHEDULE"
     | "APPROVAL_TEAM_EMAIL";
 
+/** Every approval-side kind (REVIEW_EMAIL excluded) — the set legacy recovery scopes its "has jobs already?" checks to. */
+export const APPROVAL_JOB_KINDS: readonly ChangeOrderApprovalJobKind[] = [
+    "APPROVAL_BILL",
+    "APPROVAL_CLIENT_EMAIL",
+    "APPROVAL_SCHEDULE",
+    "APPROVAL_TEAM_EMAIL",
+];
+
 const PROVIDER_IDEMPOTENCY_HORIZON_MS = 24 * 60 * 60_000;
 
 /** The immutable job graph enqueued in the same transaction as approval. */
@@ -162,7 +170,21 @@ export async function drainChangeOrderAutomationJobs(
                 jobId: candidate.id,
                 now: clock(),
             });
-            if (!claimed?.claimToken) continue;
+            if (!claimed?.claimToken) {
+                // The claim itself terminally parks an exhausted job
+                // (attempts >= maxAttempts -> NEEDS_ATTENTION) and returns
+                // null. That transition IS progress — it can unblock
+                // dependents — so it must be counted, or the until-idle
+                // wrapper sees an all-zero pass and stops with newly eligible
+                // work still pending (Codex round 7).
+                if (candidate.attempts >= candidate.maxAttempts) {
+                    const current = await db.changeOrderAutomationJob.findUnique({ where: { id: candidate.id } });
+                    if (current?.status === "NEEDS_ATTENTION" && current.claimToken === null) {
+                        result.needsAttention++;
+                    }
+                }
+                continue;
+            }
             claimedCount++;
 
             let outcome: ChangeOrderAutomationExecutionResult;

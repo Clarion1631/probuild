@@ -15,6 +15,7 @@ import {
     coTaxRate,
     effectiveCoTaxInfo,
 } from "@/lib/co-tax";
+import { isManualCoApproval } from "@/lib/co-approval";
 import {
     buildChangeOrderSendPreviewPayload,
     canonicalChangeOrderRecipients,
@@ -771,6 +772,17 @@ function createHandler(actor: RouteMcpActor) {
                 const automaticByChangeOrder = new Map(
                     automaticDeliveries.map(job => [job.changeOrderId, job.status]),
                 );
+                // Manual staff approval suppresses ALL client emails,
+                // permanently — its approval-client job is terminally SKIPPED,
+                // so the job query above deliberately cannot represent it
+                // (Codex round 7). The core enforces this again under the
+                // invoice lock; this preflight exists to explain it.
+                const manualApprovalCos = sourceChangeOrderIds.length > 0
+                    ? (await prisma.changeOrder.findMany({
+                        where: { id: { in: sourceChangeOrderIds } },
+                        select: { id: true, code: true, status: true, approvedBy: true, clientSignatureUrl: true },
+                    })).filter(co => isManualCoApproval(co))
+                    : [];
                 const requiresResendConfirmation = selected.some(payment => payment.qbInvoiceSentAt !== null) && allowResend !== true;
                 const milestoneStates = selected.map((payment): [string, string, number, string, string | null] => [
                     payment.id,
@@ -781,6 +793,7 @@ function createHandler(actor: RouteMcpActor) {
                 ]).sort((a, b) => a[0].localeCompare(b[0]));
                 const milestoneFingerprint = milestoneSendFinancialFingerprint({
                     invoiceId,
+                    invoice: { code: invoice.code, status: invoice.status },
                     milestones: milestoneStates,
                 });
 
@@ -798,7 +811,7 @@ function createHandler(actor: RouteMcpActor) {
                 });
 
                 if (!verifyPreviewToken(confirmToken, payload)) {
-                    const blocked = automaticDeliveries.length > 0;
+                    const blocked = automaticDeliveries.length > 0 || manualApprovalCos.length > 0;
                     return textResult({
                         preview: true,
                         blocked: blocked || requiresResendConfirmation,
@@ -816,12 +829,20 @@ function createHandler(actor: RouteMcpActor) {
                         recipient: recipients.to[0] || "(no client email on file — provide overrideEmail)",
                         invoice: { code: invoice.code, status: invoice.status },
                         confirmToken: blocked || requiresResendConfirmation ? null : mintPreviewToken(payload),
-                        instruction: blocked
-                            ? "Automatic change-order approval delivery owns one or more selected milestones. Wait for or reconcile that durable job; do not send manually."
-                            : requiresResendConfirmation
-                                ? "One or more payment requests were already sent. Ask whether the user explicitly wants a resend, then request a fresh preview with allowResend=true."
-                                : "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
+                        instruction: manualApprovalCos.length > 0
+                            ? `Change order ${manualApprovalCos.map(co => co.code).join(", ")} was manually approved by staff — client payment-request emails are permanently suppressed for its milestones. Share the portal link directly instead.`
+                            : blocked
+                                ? "Automatic change-order approval delivery owns one or more selected milestones. Wait for or reconcile that durable job; do not send manually."
+                                : requiresResendConfirmation
+                                    ? "One or more payment requests were already sent. Ask whether the user explicitly wants a resend, then request a fresh preview with allowResend=true."
+                                    : "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
+                }
+                if (manualApprovalCos.length > 0) {
+                    return {
+                        ...textResult({ error: `Change order ${manualApprovalCos.map(co => co.code).join(", ")} was manually approved by staff — client payment-request emails are permanently suppressed for its milestones.` }),
+                        isError: true,
+                    };
                 }
                 if (automaticDeliveries.length > 0) {
                     return {
@@ -899,6 +920,8 @@ function createHandler(actor: RouteMcpActor) {
                         status: payment.status,
                         dueDate: payment.dueDate?.toISOString() ?? null,
                         qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                        qbInvoiceId: payment.qbInvoiceId,
+                        qbSyncError: payment.qbSyncError,
                     })),
                 });
                 const payload = buildInvoiceResendPreviewPayload({
@@ -916,6 +939,7 @@ function createHandler(actor: RouteMcpActor) {
                         name: payment.name,
                         amount: Number(payment.amount),
                         status: payment.status,
+                        dueDate: payment.dueDate?.toISOString() ?? null,
                         qbInvoiceId: payment.qbInvoiceId,
                         qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
                         qbSyncError: payment.qbSyncError,
@@ -1235,20 +1259,31 @@ function createHandler(actor: RouteMcpActor) {
                     return { ...textResult({ error: `Change order ${co.code} is "${co.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
                 }
                 const suppliedConfirmation = parseChangeOrderConfirmToken(confirmToken);
-                const preview = previewFor(
-                    co,
-                    suppliedConfirmation?.generation ?? newChangeOrderReviewGeneration(),
-                );
-                if (!preview.recipient) {
-                    return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
-                }
-
+                // Verify against the SUPPLIED generation, but on ANY failure
+                // respond with a preview minted under a NEW generation (Codex
+                // round 7): returning a fresh signature for a caller-supplied
+                // generation would let a stale/invalid token revive a
+                // generation already tied to a canceled or completed frozen
+                // email job, defeating the A→B→A fence.
+                const verification = suppliedConfirmation
+                    ? previewFor(co, suppliedConfirmation.generation)
+                    : null;
                 // The revision covers all guarded CO writes. The canonical tax
                 // tuple additionally covers tax-only Estimate edits, which do
                 // not bump the CO revision while it is still Draft (or legacy
                 // Sent/null). Confirmation re-reads both before verifying and
                 // the locked core checks them again before changing status.
-                if (!suppliedConfirmation || !verifyPreviewToken(suppliedConfirmation.signature, preview.payload)) {
+                const verified = Boolean(
+                    suppliedConfirmation && verification
+                    && verifyPreviewToken(suppliedConfirmation.signature, verification.payload),
+                );
+                const preview = verified && verification
+                    ? verification
+                    : previewFor(co, newChangeOrderReviewGeneration());
+                if (!preview.recipient) {
+                    return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
+                }
+                if (!verified) {
                     return preview.response;
                 }
                 const result = await sendChangeOrderToClientCore(changeOrderId, {
