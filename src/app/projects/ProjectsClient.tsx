@@ -32,7 +32,7 @@ function getStatusDot(status: string, statuses: ProjectStatus[]) {
     return statuses.find(s => s.value === status)?.dot || "bg-slate-400";
 }
 
-export default function ProjectsClient({ projects: initialProjects, initialStatuses, revenueIsComplete }: { projects: any[], initialStatuses?: ProjectStatus[] | null, revenueIsComplete: boolean }) {
+export default function ProjectsClient({ projects: initialProjects, initialStatuses, revenueIsComplete, canDeleteProjects }: { projects: any[], initialStatuses?: ProjectStatus[] | null, revenueIsComplete: boolean, canDeleteProjects: boolean }) {
     const router = useRouter();
     const [projects, setProjects] = useState(initialProjects);
     const [statuses, setStatuses] = useState<ProjectStatus[]>(initialStatuses || DEFAULT_PROJECT_STATUSES);
@@ -69,7 +69,11 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
     async function handleDeleteProject(projectId: string) {
         if (!confirm("Are you sure you want to delete this project?")) return;
         try {
-            await deleteProjects([projectId]);
+            const result = await deleteProjects([projectId]);
+            if (!result.success) {
+                toast.error(result.error);
+                return;
+            }
             setProjects((prev: any) => prev.filter((p: any) => p.id !== projectId));
             toast.success("Project deleted");
         } catch {
@@ -113,7 +117,11 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
         if (!confirm(`Are you sure you want to delete ${selectedIds.length} projects?`)) return;
         setIsDeleting(true);
         try {
-            await deleteProjects(selectedIds);
+            const result = await deleteProjects(selectedIds);
+            if (!result.success) {
+                toast.error(result.error);
+                return;
+            }
             setProjects((prev: any) => prev.filter((p: any) => !selectedIds.includes(p.id)));
             setSelectedIds([]);
             toast.success("Projects deleted successfully");
@@ -190,7 +198,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
 
     return (
         <div className="max-w-screen-2xl mx-auto px-4 md:px-8 pb-10">
-            {viewMode === "list" && (
+            {viewMode === "list" && canDeleteProjects && (
                 <BulkActionBar
                     count={selectedIds.length}
                     onClear={() => setSelectedIds([])}
@@ -360,8 +368,8 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                         <table className="w-full text-left bg-white text-sm">
                             <thead>
                                 <tr className="border-b border-slate-200">
-                                    <th className="py-3 px-4 w-10 text-center">
-                                        <input 
+                                    {canDeleteProjects && <th className="py-3 px-4 w-10 text-center">
+                                        <input
                                             type="checkbox" 
                                             className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                                             checked={selectedIds.length === filteredProjects.length && filteredProjects.length > 0}
@@ -370,7 +378,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                                 else setSelectedIds([]);
                                             }}
                                         />
-                                    </th>
+                                    </th>}
                                     {SORTABLE_COLUMNS.map(col => (
                                         <th key={col.key} className="py-3 px-4 font-normal text-slate-500 whitespace-nowrap">
                                             <button
@@ -397,8 +405,8 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                             <tbody className="divide-y divide-slate-100">
                                 {sortedProjects.map((project: any) => (
                                     <tr key={project.id} className={`hover:bg-slate-50/70 transition-colors group ${selectedIds.includes(project.id) ? "bg-indigo-50/30" : ""}`}>
-                                        <td className="py-4 px-4 text-center">
-                                            <input 
+                                        {canDeleteProjects && <td className="py-4 px-4 text-center">
+                                            <input
                                                 type="checkbox" 
                                                 className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                                                 checked={selectedIds.includes(project.id)}
@@ -407,7 +415,7 @@ export default function ProjectsClient({ projects: initialProjects, initialStatu
                                                     else setSelectedIds(selectedIds.filter(id => id !== project.id));
                                                 }}
                                             />
-                                        </td>
+                                        </td>}
                                         <td className="py-4 px-4">
                                             <div className="flex items-center gap-3">
                                                 <div className="w-1.5 h-6 rounded-full" style={{ backgroundColor: project.color || getStatusColor(project.status || "In Progress", statuses).replace("bg-", "").split("-")[0] }} />

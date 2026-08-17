@@ -290,6 +290,56 @@ test.describe.serial("deleteInvoiceMilestoneCore", () => {
         expect(row).not.toBeNull(); // not deleted
     });
 
+    test("preserves an ambiguous QBO create checkpoint even before qbInvoiceId is linked", async () => {
+        await ensureClientAndProject();
+        const suffix = "qb-create-ambiguous";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const ps = `${PFX}-ps-${suffix}`;
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Draft", totalAmount: 500, balanceDue: 500 },
+        });
+        await prisma.paymentSchedule.create({
+            data: {
+                id: ps,
+                invoiceId,
+                name: "Extra",
+                amount: 500,
+                status: "Pending",
+                qbCreateRequestId: `${PFX}-request-delete`,
+                qbCreateFingerprint: "opaque-create-fingerprint",
+                qbCreateStartedAt: new Date(),
+            },
+        });
+
+        await expect(deleteInvoiceMilestoneCore(ps)).rejects.toThrow(/QuickBooks.*create|provider.*attempt/i);
+        expect(await prisma.paymentSchedule.findUnique({ where: { id: ps } })).not.toBeNull();
+    });
+
+    test("preserves a milestone allocated to a Draft progress billing", async () => {
+        await ensureClientAndProject();
+        const suffix = "progress-allocation-delete";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const ps = `${PFX}-ps-${suffix}`;
+        const billingId = `${PFX}-pb-${suffix}`;
+        const lineId = `${PFX}-pbl-${suffix}`;
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Draft", totalAmount: 500, balanceDue: 500 },
+        });
+        await prisma.paymentSchedule.create({
+            data: { id: ps, invoiceId, name: "Allocated extra", amount: 500, status: "Pending" },
+        });
+        await prisma.progressBilling.create({
+            data: { id: billingId, invoiceId, code: `INV-MR-${suffix}-P1`, description: "Draft allocation", status: "Draft", subtotal: 500, total: 500 },
+        });
+        await prisma.progressBillingLine.create({
+            data: { id: lineId, billingId, scheduleId: ps, description: "Allocated extra", amount: 500, splitAmount: 500 },
+        });
+
+        await expect(deleteInvoiceMilestoneCore(ps)).rejects.toThrow(/allocated to a progress billing/i);
+        expect(await prisma.paymentSchedule.findUnique({ where: { id: ps } })).not.toBeNull();
+        expect(await prisma.progressBillingLine.findUnique({ where: { id: lineId } })).not.toBeNull();
+    });
+
     test("deletes a pending extra and decrements the invoice total/balance", async () => {
         await ensureClientAndProject();
         const suffix = "delete-success";
@@ -381,5 +431,57 @@ test.describe.serial("splitInvoiceMilestonesCore partially-paid total fix", () =
         const remaining = await prisma.paymentSchedule.findMany({ where: { invoiceId, status: "Pending" } });
         expect(remaining.length).toBe(2);
         expect(remaining.reduce((sum, r) => sum + num(r.amount), 0)).toBe(700);
+    });
+
+    test("does not re-split away an ambiguous QBO create checkpoint", async () => {
+        await ensureClientAndProject();
+        const suffix = "split-qb-create-ambiguous";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const ps = `${PFX}-ps-${suffix}`;
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Draft", totalAmount: 500, balanceDue: 500 },
+        });
+        await prisma.paymentSchedule.create({
+            data: {
+                id: ps,
+                invoiceId,
+                name: "Pending create",
+                amount: 500,
+                status: "Pending",
+                qbCreateRequestId: `${PFX}-request-split`,
+                qbCreateFingerprint: "opaque-create-fingerprint",
+                qbCreateStartedAt: new Date(),
+            },
+        });
+
+        await expect(splitInvoiceMilestonesCore(invoiceId, [{ name: "Replacement", amount: 500 }]))
+            .rejects.toThrow(/payment.*progress|QuickBooks.*create|provider.*attempt/i);
+        expect(await prisma.paymentSchedule.findUnique({ where: { id: ps } })).not.toBeNull();
+    });
+
+    test("does not re-split a milestone allocated to a Draft progress billing", async () => {
+        await ensureClientAndProject();
+        const suffix = "progress-allocation-split";
+        const invoiceId = `${PFX}-inv-${suffix}`;
+        const ps = `${PFX}-ps-${suffix}`;
+        const billingId = `${PFX}-pb-${suffix}`;
+        const lineId = `${PFX}-pbl-${suffix}`;
+        await prisma.invoice.create({
+            data: { id: invoiceId, code: `INV-MR-${suffix}`, projectId: `${PFX}-project`, clientId: `${PFX}-client`, status: "Draft", totalAmount: 500, balanceDue: 500 },
+        });
+        await prisma.paymentSchedule.create({
+            data: { id: ps, invoiceId, name: "Allocated pending", amount: 500, status: "Pending" },
+        });
+        await prisma.progressBilling.create({
+            data: { id: billingId, invoiceId, code: `INV-MR-${suffix}-P1`, description: "Draft allocation", status: "Draft", subtotal: 500, total: 500 },
+        });
+        await prisma.progressBillingLine.create({
+            data: { id: lineId, billingId, scheduleId: ps, description: "Allocated pending", amount: 500, splitAmount: 500 },
+        });
+
+        await expect(splitInvoiceMilestonesCore(invoiceId, [{ name: "Replacement", amount: 500 }]))
+            .rejects.toThrow(/allocated to a progress billing/i);
+        expect(await prisma.paymentSchedule.findUnique({ where: { id: ps } })).not.toBeNull();
+        expect(await prisma.progressBillingLine.findUnique({ where: { id: lineId } })).not.toBeNull();
     });
 });

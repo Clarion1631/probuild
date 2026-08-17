@@ -1,6 +1,6 @@
 import { revalidatePath as nextRevalidatePath } from "next/cache";
 import { createHash, randomUUID } from "crypto";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
 // Cache revalidation is best-effort: it throws outside a Next request context
 // (e.g. verification scripts), and a stale cache page is never worth failing a
@@ -14,7 +14,13 @@ function revalidatePath(path: string) {
 }
 import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
-import { sendNotification } from "./email";
+import {
+    CLIENT_DOC_COPY_EMAIL,
+    buildFrozenNotification,
+    sendFrozenNotification as defaultSendFrozenNotification,
+    sendNotification,
+    type FrozenNotification,
+} from "./email";
 import { formatCurrency } from "./utils";
 import {
     allocateCoScheduleGross,
@@ -27,10 +33,26 @@ import {
     coTaxLabel,
     coTaxRate,
     effectiveCoTaxInfo,
+    fixedCoScheduleValidationError,
 } from "./co-tax";
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "./co-approval";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
+import {
+    canonicalChangeOrderRecipients,
+    type ChangeOrderRecipientSet,
+} from "./change-order-send-preview";
+import { canRetryProviderAttempt, drainChangeOrderAutomationJobs } from "./change-order-automation";
+import {
+    enqueueReviewEmailAutomationJob,
+    prepareChangeOrderReviewJobsForMutation,
+    ChangeOrderReviewDeliveryUnresolvedError,
+} from "./change-order-automation-jobs";
+import {
+    executeReviewEmailAutomationJob,
+    newChangeOrderReviewGeneration,
+    reviewEmailSettingsExpectation,
+} from "./change-order-review-automation";
 
 // Session-free cores of the billing flows, shared by the permission-gated server
 // actions in actions.ts and the MCP connector (whose auth is the shared secret at
@@ -55,6 +77,372 @@ function buildCc(primaryEmail: string, ...candidates: (string | null | undefined
         out.push(e);
     }
     return out.length ? out : undefined;
+}
+
+export type MilestoneRecipientSet = {
+    to: string[];
+    cc: string[];
+};
+
+/** Provider-visible recipient set shared by MCP preview, CAS, and delivery. */
+export function canonicalMilestoneRecipients(
+    primaryEmail: string | null | undefined,
+    additionalEmail: string | null | undefined,
+): MilestoneRecipientSet {
+    const primary = (primaryEmail ?? "").trim().toLowerCase();
+    const additional = (additionalEmail ?? "").trim().toLowerCase();
+    return {
+        to: primary ? [primary] : [],
+        cc: additional && additional !== primary ? [additional] : [],
+    };
+}
+
+export function milestoneRecipientConflictError(input: {
+    expected?: MilestoneRecipientSet;
+    current: MilestoneRecipientSet;
+}): string | null {
+    if (!input.expected) return null;
+    return JSON.stringify(input.expected) === JSON.stringify(input.current)
+        ? null
+        : "Payment-request recipients changed after the preview; review the fresh To/CC list before sending.";
+}
+
+export type CompleteEmailRecipientSet = MilestoneRecipientSet & {
+    bcc: string[];
+    /** Exact normalized provider envelope sender derived from companyName. */
+    from: string;
+    /** Exact normalized provider Reply-To derived from CompanySettings.email. */
+    replyTo: string;
+};
+
+/**
+ * Canonical provider-visible routing/settings envelope. Destination
+ * ordering/casing do not create drift; sender headers retain the exact value
+ * that buildFrozenNotification will give the provider.
+ */
+export function completeFrozenRecipientSet(input: {
+    to?: string[];
+    cc?: string[];
+    bcc?: string[];
+    /** A previously frozen provider envelope sender. */
+    from?: string;
+    /** Live CompanySettings.companyName used to derive the provider sender. */
+    fromName?: string;
+    replyTo?: string;
+}): CompleteEmailRecipientSet {
+    const normalized = buildFrozenNotification({
+        to: input.to ?? [],
+        cc: input.cc,
+        bcc: input.bcc,
+        fromName: input.fromName,
+        replyTo: input.replyTo,
+        subject: "recipient-fence",
+        html: "recipient-fence",
+    });
+    const canonical = (values: string[] | undefined) => (values ?? [])
+        .map(value => value.trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+    return {
+        to: canonical(normalized.to),
+        cc: canonical(normalized.cc),
+        bcc: canonical(normalized.bcc),
+        from: input.from?.replace(/[\r\n]+/g, " ").trim() || normalized.from,
+        replyTo: normalized.replyTo,
+    };
+}
+
+export function completeFrozenRecipientConflictError(input: {
+    expected: Pick<FrozenNotification, "to" | "cc" | "bcc" | "from" | "replyTo">;
+    current: CompleteEmailRecipientSet;
+}): string | null {
+    return JSON.stringify(completeFrozenRecipientSet(input.expected)) === JSON.stringify(input.current)
+        ? null
+        : "Invoice email recipients or internal notification copies changed, or reply-to/sender settings changed before provider delivery; review the fresh provider-visible email settings before sending.";
+}
+
+function internalNotificationCopies(notificationEmail: string | null | undefined): string[] {
+    return (notificationEmail?.trim() || CLIENT_DOC_COPY_EMAIL)
+        .split(",")
+        .map(email => email.trim())
+        .filter(Boolean);
+}
+
+/**
+ * Final first-provider recipient read. Callers already hold canonical money
+ * parents; the complete lock order is Estimate -> Invoice -> Client ->
+ * CompanySettings. FOR SHARE makes ordinary Client/settings UPDATEs wait until
+ * providerStarted commits, closing the read/checkpoint TOCTOU without changing
+ * byte-identical recovery: callers skip this helper once providerStarted exists.
+ */
+export async function lockInvoiceDeliveryRecipientSet(
+    tx: Pick<Prisma.TransactionClient, "$queryRaw">,
+    input: { clientId: string; overrideEmail?: string | null },
+): Promise<{ visible: MilestoneRecipientSet; complete: CompleteEmailRecipientSet }> {
+    const clients = await tx.$queryRaw<Array<{
+        id: string;
+        email: string | null;
+        additionalEmail: string | null;
+    }>>`
+        SELECT "id", "email", "additionalEmail"
+        FROM "Client"
+        WHERE "id" = ${input.clientId}
+        FOR SHARE
+    `;
+    const client = clients[0];
+    if (!client) throw new Error("Invoice client not found");
+    const settings = await tx.$queryRaw<Array<{
+        notificationEmail: string | null;
+        email: string | null;
+        companyName: string | null;
+    }>>`
+        SELECT "notificationEmail", "email", "companyName"
+        FROM "CompanySettings"
+        WHERE "id" = 'singleton'
+        FOR SHARE
+    `;
+    const visible = canonicalMilestoneRecipients(
+        input.overrideEmail || client.email,
+        client.additionalEmail,
+    );
+    return {
+        visible,
+        complete: completeFrozenRecipientSet({
+            to: visible.to,
+            cc: visible.cc,
+            bcc: internalNotificationCopies(settings[0]?.notificationEmail),
+            fromName: settings[0]?.companyName || "Your Contractor",
+            replyTo: settings[0]?.email || undefined,
+        }),
+    };
+}
+
+export function buildMilestoneSendPreviewPayload(input: {
+    invoiceId: string;
+    ids: string[];
+    recipients: MilestoneRecipientSet;
+    amounts: Array<[string, number]>;
+    sentAt: Array<[string, string | null]>;
+    milestones: Array<[string, string, number, string, string | null]>;
+    reconcile: Array<[string, number]>;
+    allowResend: boolean;
+}): string {
+    return JSON.stringify(input);
+}
+
+export function milestoneSendFinancialFingerprint(input: {
+    invoiceId: string;
+    milestones: Array<[string, string, number, string, string | null]>;
+}): string {
+    return JSON.stringify({
+        invoiceId: input.invoiceId,
+        milestones: [...input.milestones].sort((a, b) => a[0].localeCompare(b[0])),
+    });
+}
+
+export function milestoneFinancialConflictError(input: {
+    expected?: string;
+    invoiceId: string;
+    milestones: Array<[string, string, number, string, string | null]>;
+}): string | null {
+    if (!input.expected) return null;
+    return input.expected === milestoneSendFinancialFingerprint({
+        invoiceId: input.invoiceId,
+        milestones: input.milestones,
+    })
+        ? null
+        : "Payment-request milestones changed after the preview; review the fresh names, amounts, statuses, and prior-send markers before sending.";
+}
+
+export type InvoiceSendFinancialState = {
+    invoiceId: string;
+    code: string;
+    status: string;
+    totalAmount: number;
+    balanceDue: number;
+    payments: Array<{
+        id: string;
+        name: string;
+        amount: number;
+        status: string;
+        dueDate: string | null;
+        qbInvoiceSentAt: string | null;
+    }>;
+};
+
+/**
+ * Stable money/request-state CAS for a whole-invoice email. QBO link metadata is
+ * deliberately excluded because resend refreshes it; everything that changes
+ * what the customer is being asked to pay remains bound to the confirmation.
+ */
+export function invoiceSendFinancialFingerprint(input: InvoiceSendFinancialState): string {
+    return JSON.stringify({
+        invoiceId: input.invoiceId,
+        code: input.code,
+        status: input.status,
+        totalAmount: input.totalAmount,
+        balanceDue: input.balanceDue,
+        payments: [...input.payments].sort((a, b) => a.id.localeCompare(b.id)),
+    });
+}
+
+export function buildInvoiceResendPreviewPayload(input: {
+    invoiceId: string;
+    recipients: MilestoneRecipientSet;
+    invoice: {
+        code: string;
+        status: string;
+        total: number;
+        balanceDue: number;
+        sentAt: string | null;
+    };
+    milestones: Array<{
+        id: string;
+        name: string;
+        amount: number;
+        status: string;
+        qbInvoiceId: string | null;
+        qbInvoiceSentAt: string | null;
+        qbSyncError: string | null;
+    }>;
+}): string {
+    return JSON.stringify({
+        ...input,
+        milestones: [...input.milestones].sort((a, b) => a.id.localeCompare(b.id)),
+    });
+}
+
+export type InvoiceSendExpectation = {
+    expectedRecipients?: MilestoneRecipientSet;
+    expectedFinancialFingerprint?: string;
+};
+
+type InvoiceEmailAttemptPayload = {
+    dispatch: FrozenNotification;
+    recipients: MilestoneRecipientSet;
+    financialFingerprint: string;
+};
+
+function parseInvoiceEmailAttemptPayload(value: unknown): InvoiceEmailAttemptPayload | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    const dispatch = record.dispatch;
+    const recipients = record.recipients;
+    if (!dispatch || typeof dispatch !== "object" || Array.isArray(dispatch)
+        || !recipients || typeof recipients !== "object" || Array.isArray(recipients)
+        || typeof record.financialFingerprint !== "string") return null;
+    const frozen = dispatch as Record<string, unknown>;
+    const recipientSet = recipients as Record<string, unknown>;
+    const stringArray = (candidate: unknown): candidate is string[] => (
+        Array.isArray(candidate) && candidate.every(item => typeof item === "string" && item.trim().length > 0)
+    );
+    if (typeof frozen.from !== "string" || !stringArray(frozen.to)
+        || typeof frozen.replyTo !== "string" || typeof frozen.subject !== "string"
+        || typeof frozen.html !== "string" || typeof frozen.text !== "string"
+        || (frozen.cc !== undefined && !stringArray(frozen.cc))
+        || (frozen.bcc !== undefined && !stringArray(frozen.bcc))
+        || !stringArray(recipientSet.to) || !Array.isArray(recipientSet.cc)
+        || recipientSet.cc.some(item => typeof item !== "string" || !item.trim())) return null;
+    return {
+        dispatch: frozen as unknown as FrozenNotification,
+        recipients: {
+            to: recipientSet.to,
+            cc: recipientSet.cc as string[],
+        },
+        financialFingerprint: record.financialFingerprint,
+    };
+}
+
+export type MilestoneAttemptState = {
+    id: string;
+    name: string;
+    amount: number;
+    status: string;
+    qbInvoiceSentAt: string | null;
+    qbInvoiceId: string;
+    qbInvoiceLink: string | null;
+    qbSyncError: string | null;
+};
+
+export function milestoneDeliveryFingerprint(invoiceId: string, milestones: MilestoneAttemptState[]): string {
+    return JSON.stringify({
+        invoiceId,
+        milestones: [...milestones].sort((a, b) => a.id.localeCompare(b.id)),
+    });
+}
+
+export function milestoneDeliveryStateConflictError(input: {
+    expectedFingerprint: string;
+    invoiceId: string;
+    current: MilestoneAttemptState[];
+}): string | null {
+    return milestoneDeliveryFingerprint(input.invoiceId, input.current) === input.expectedFingerprint
+        ? null
+        : "Payment-request milestone money, status, or QuickBooks identity changed after the frozen checkpoint; review it again.";
+}
+
+export function manualMilestoneAttemptAdoptionError(input: {
+    requestedIds: readonly string[];
+    requestedRecipients: MilestoneRecipientSet;
+    frozenIds: readonly string[];
+    frozenRecipients: MilestoneRecipientSet;
+    providerStarted: boolean;
+}): string | null {
+    const requested = [...new Set(input.requestedIds)].sort();
+    const frozen = [...new Set(input.frozenIds)].sort();
+    if (requested.length !== frozen.length || requested.some((id, index) => id !== frozen[index])) {
+        return "A different frozen milestone request already owns this invoice; reconcile that exact attempt before sending another set.";
+    }
+    if (!input.providerStarted && milestoneRecipientConflictError({
+        expected: input.frozenRecipients,
+        current: input.requestedRecipients,
+    })) {
+        return "Payment-request recipients changed before the provider attempt; review the fresh To/CC list before sending.";
+    }
+    return null;
+}
+
+type MilestoneInvoiceEmailAttemptPayload = InvoiceEmailAttemptPayload & {
+    overrideEmail: string | null;
+    milestoneIds: string[];
+    milestones: MilestoneAttemptState[];
+    resultMilestones: Array<{ id: string; name: string; wasReconciled: boolean }>;
+};
+
+function parseMilestoneInvoiceEmailAttemptPayload(value: unknown): MilestoneInvoiceEmailAttemptPayload | null {
+    const base = parseInvoiceEmailAttemptPayload(value);
+    if (!base || !value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if ((record.overrideEmail !== null && typeof record.overrideEmail !== "string")
+        || !Array.isArray(record.milestoneIds)
+        || record.milestoneIds.length === 0
+        || record.milestoneIds.some(id => typeof id !== "string" || !id.trim())
+        || !Array.isArray(record.milestones)
+        || record.milestones.length !== record.milestoneIds.length
+        || record.milestones.some(state => !state || typeof state !== "object" || Array.isArray(state)
+            || typeof (state as Record<string, unknown>).id !== "string"
+            || typeof (state as Record<string, unknown>).name !== "string"
+            || typeof (state as Record<string, unknown>).amount !== "number"
+            || typeof (state as Record<string, unknown>).status !== "string"
+            || ((state as Record<string, unknown>).qbInvoiceSentAt !== null && typeof (state as Record<string, unknown>).qbInvoiceSentAt !== "string")
+            || typeof (state as Record<string, unknown>).qbInvoiceId !== "string"
+            || ((state as Record<string, unknown>).qbInvoiceLink !== null && typeof (state as Record<string, unknown>).qbInvoiceLink !== "string")
+            || ((state as Record<string, unknown>).qbSyncError !== null && typeof (state as Record<string, unknown>).qbSyncError !== "string"))
+        || !Array.isArray(record.resultMilestones)
+        || record.resultMilestones.length !== record.milestoneIds.length
+        || record.resultMilestones.some(result => !result || typeof result !== "object" || Array.isArray(result)
+            || typeof (result as Record<string, unknown>).id !== "string"
+            || typeof (result as Record<string, unknown>).name !== "string"
+            || typeof (result as Record<string, unknown>).wasReconciled !== "boolean")) {
+        return null;
+    }
+    return {
+        ...base,
+        overrideEmail: record.overrideEmail as string | null,
+        milestoneIds: record.milestoneIds as string[],
+        milestones: record.milestones as MilestoneAttemptState[],
+        resultMilestones: record.resultMilestones as Array<{ id: string; name: string; wasReconciled: boolean }>,
+    };
 }
 
 async function logActivityLazy(entry: Parameters<typeof import("./activity-log").logActivity>[0]) {
@@ -235,8 +623,10 @@ export async function sendArDigest() {
 // bypass the staff-session guard on actions.ts's public wrapper.
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
+async function getDefaultSalesTaxRate(
+    client: Pick<Prisma.TransactionClient, "companySettings"> = prisma,
+): Promise<number> {
+    const settings = await client.companySettings.findUnique({
         where: { id: "singleton" },
         select: { salesTaxes: true },
     });
@@ -252,69 +642,65 @@ async function getDefaultSalesTaxRate(): Promise<number> {
 }
 
 export async function createInvoiceFromEstimateCore(estimateId: string) {
-    const estimate = await prisma.estimate.findUnique({ where: { id: estimateId } });
-    if (!estimate) throw new Error("Estimate not found");
-
-    const project = await prisma.project.findUnique({ where: { id: estimate.projectId! } });
-    if (!project) throw new Error("Project not found");
-
-    const total = toNum(estimate.totalAmount || 0);
-    const rate = estimate.taxRatePercent != null
-        ? Number(estimate.taxRatePercent)
-        : await getDefaultSalesTaxRate();
-    const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
-
-    const invoice = await prisma.invoice.create({
-        data: {
-            code: "INV-TEMP",
-            projectId: estimate.projectId!,
-            clientId: project.clientId,
-            estimateId: estimate.id,
-            status: "Draft",
-            totalAmount: total,
-            balanceDue: total,
-            subtotal: tax.subtotal,
-            taxRate: tax.taxRate,
-            taxAmount: tax.taxAmount,
-        },
+    const estimateHint = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true },
     });
+    if (!estimateHint) throw new Error("Estimate not found");
+    if (!estimateHint.projectId) throw new Error("Project not found");
+    const projectId = estimateHint.projectId;
 
-    const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
-    await prisma.invoice.update({ where: { id: invoice.id }, data: { code: invoiceCode } });
+    // Project -> Estimate is the shared creation/target-selection mutex. Keep
+    // both locks through the Invoice insert, every cloned milestone, and the
+    // final balance/status write. A CO biller that acquires the Estimate lock
+    // and re-selects its target therefore sees either all of this invoice or
+    // none of it—never the older project invoice during a half-created B.
+    const created = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
 
-    // Clone the estimate's milestones into invoice-side PaymentSchedules. The
-    // source read + clone inserts run in ONE transaction that first takes the
-    // same Project row lock setProjectStartDate uses: a start-date move can
-    // then never slip between our read of the source dueDates and the clone
-    // inserts (which would leave the new clones on pre-shift dates while their
-    // EPS rows and the project's tasks moved -- a partially shifted mirror
-    // group). Lock order is parent-before-child (Project before its Estimate/
-    // Invoice children), matching the canonical money-lock direction in
-    // tx-retry.ts; withTxRetry covers residual serialization failures.
-    // (Lock + scheduleTaskId propagation ported from c250526 during the
-    // feat/company-pipeline-dashboard merge.)
-    const paidAmount = await withTxRetry(() => prisma.$transaction(async (tx) => {
-        // Lead-owned estimates (no projectId) need no lock -- start-date
-        // moves only target projects.
-        if (estimate.projectId) {
-            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${estimate.projectId} FOR UPDATE`;
+        const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
+        if (!estimate) throw new Error("Estimate not found");
+        if (estimate.projectId !== projectId) {
+            throw new Error("Estimate project changed while creating its invoice; reload and retry");
         }
+        const project = await tx.project.findUnique({ where: { id: projectId } });
+        if (!project) throw new Error("Project not found");
 
+        const total = toNum(estimate.totalAmount || 0);
+        const rate = estimate.taxRatePercent != null
+            ? Number(estimate.taxRatePercent)
+            : await getDefaultSalesTaxRate(tx);
+        const tax = deriveInvoiceTaxFields(total, rate, !!estimate.taxExempt);
+        const invoice = await tx.invoice.create({
+            data: {
+                code: "INV-TEMP",
+                projectId,
+                clientId: project.clientId,
+                estimateId: estimate.id,
+                status: "Draft",
+                totalAmount: total,
+                balanceDue: total,
+                subtotal: tax.subtotal,
+                taxRate: tax.taxRate,
+                taxAmount: tax.taxAmount,
+            },
+        });
+        const invoiceCode = `INV-${String(invoice.number).padStart(5, "0")}`;
         const schedules = await tx.estimatePaymentSchedule.findMany({
             where: { estimateId },
             orderBy: { order: "asc" },
         });
 
         let paidAmount = 0;
+        const createdPaymentIds: string[] = [];
         if (schedules.length > 0) {
             for (const schedule of schedules) {
                 if (schedule.status === "Paid") paidAmount += toNum(schedule.amount);
-                await tx.paymentSchedule.create({
+                const createdPayment = await tx.paymentSchedule.create({
                     data: {
                         invoiceId: invoice.id,
                         sourceScheduleId: schedule.id,
-                        // Keep the schedule-task link on the invoice-side clone so
-                        // start-date moves can shift both milestone mirrors together.
                         scheduleTaskId: schedule.scheduleTaskId || null,
                         name: schedule.name,
                         amount: schedule.amount,
@@ -328,33 +714,69 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
                         referenceNumber: schedule.referenceNumber || null,
                         notes: schedule.notes || null,
                     },
+                    select: { id: true },
                 });
+                createdPaymentIds.push(createdPayment.id);
             }
         } else {
-            await tx.paymentSchedule.create({
+            const createdPayment = await tx.paymentSchedule.create({
                 data: {
                     invoiceId: invoice.id,
                     name: "Initial Payment",
                     amount: estimate.totalAmount || 0,
                     status: "Pending",
                 },
+                select: { id: true },
             });
+            createdPaymentIds.push(createdPayment.id);
         }
-        return paidAmount;
+
+        const newBalanceDue = Math.max(0, total - paidAmount);
+        const invoiceStatus = paidAmount > 0
+            ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
+            : "Draft";
+        await tx.invoice.update({
+            where: { id: invoice.id },
+            data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
+        });
+        return {
+            id: invoice.id,
+            projectId,
+            createdPaymentIds,
+        };
     }));
 
-    const newBalanceDue = Math.max(0, total - paidAmount);
-    const invoiceStatus = paidAmount > 0
-        ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")
-        : "Draft";
+    revalidatePath(`/projects/${created.projectId}/invoices`);
+    return {
+        id: created.id,
+        projectId: created.projectId,
+        // Internal compensation token: the guarded wrapper may delete a losing
+        // concurrent duplicate only while these remain its exact child set.
+        createdPaymentIds: created.createdPaymentIds,
+    };
+}
 
-    await prisma.invoice.update({
-        where: { id: invoice.id },
-        data: { code: invoiceCode, balanceDue: newBalanceDue, status: invoiceStatus },
-    });
-
-    revalidatePath(`/projects/${estimate.projectId}/invoices`);
-    return { id: invoice.id, projectId: estimate.projectId };
+export function invoiceCompensationSnapshotMatches(input: {
+    estimateId: string;
+    createdPaymentIds: readonly string[];
+    invoice: {
+        estimateId?: string | null;
+        status: string;
+        sentAt?: Date | null;
+        viewedAt?: Date | null;
+        qbInvoiceId?: string | null;
+        qbSyncedAt?: Date | null;
+        hasEmailAttempt?: boolean;
+        progressBillingCount?: number;
+        payments: Array<Parameters<typeof paymentScheduleHasProviderOrPaymentEvidence>[0] & { id: string }>;
+    };
+}): boolean {
+    if (input.invoice.estimateId !== input.estimateId) return false;
+    if (invoiceHasAuditEvidence(input.invoice)) return false;
+    const expectedIds = [...input.createdPaymentIds].sort();
+    const actualIds = input.invoice.payments.map((payment) => payment.id).sort();
+    return expectedIds.length === actualIds.length
+        && expectedIds.every((id, index) => id === actualIds[index]);
 }
 
 export async function createInvoiceFromEstimateGuarded(estimateId: string) {
@@ -396,13 +818,33 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
     });
     const winner = all[0];
     if (winner && winner.id !== created.id) {
-        // Conditional delete: only remove OUR seconds-old invoice if it's still an
-        // untouched draft. If anything already interacted with it, keep both and
-        // let the duplicate surface for human review rather than destroy state.
-        const removed = await prisma.invoice.deleteMany({
-            where: { id: created.id, estimateId, status: "Draft", sentAt: null },
-        });
-        if (removed.count === 1) {
+        // Lock the exact losing parent before checking its relations. The parent
+        // row lock serializes FK child inserts, and exact child-id comparison
+        // ensures the compensating cascade can remove only the schedules this
+        // invocation created — never concurrent provider/audit state.
+        const removed = await withTxRetry(() => prisma.$transaction(async (tx) => {
+            await lockMoneyParents(tx, { estimateId, invoiceId: created.id });
+            const candidate = await tx.invoice.findUnique({
+                where: { id: created.id },
+                include: {
+                    payments: true,
+                    progressBillings: { select: { id: true } },
+                    emailAttempt: { select: { invoiceId: true } },
+                },
+            });
+            if (!candidate || !invoiceCompensationSnapshotMatches({
+                estimateId,
+                createdPaymentIds: created.createdPaymentIds,
+                invoice: {
+                    ...candidate,
+                    hasEmailAttempt: Boolean(candidate.emailAttempt),
+                    progressBillingCount: candidate.progressBillings.length,
+                },
+            })) return false;
+            await tx.invoice.delete({ where: { id: created.id } });
+            return true;
+        }));
+        if (removed) {
             return {
                 ok: true as const,
                 alreadyExisted: true,
@@ -431,126 +873,541 @@ export async function createInvoiceFromEstimateGuarded(estimateId: string) {
 // Invoice email (ProBuild-native portal link). Moved verbatim from actions.ts.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?: string) {
-    const invoice = await prisma.invoice.findUnique({
+type InvoiceDeliveryDatabase = Pick<Prisma.TransactionClient, "invoice" | "changeOrderAutomationJob">;
+
+export async function activeApprovalClientDeliveryForInvoice(
+    invoiceId: string,
+    db: InvoiceDeliveryDatabase = prisma,
+) {
+    const invoice = await db.invoice.findUnique({
         where: { id: invoiceId },
-        include: {
-            project: { include: { client: true } },
-            client: true,
-        },
+        select: { estimateId: true, projectId: true },
     });
-    if (!invoice) throw new Error("Invoice not found");
+    if (!invoice) return null;
+    return db.changeOrderAutomationJob.findFirst({
+        where: {
+            kind: "APPROVAL_CLIENT_EMAIL",
+            // SUCCEEDED is no longer concurrent; a deliberate resend may proceed.
+            // NEEDS_ATTENTION remains blocked because delivery can be ambiguous.
+            status: { in: ["PENDING", "PROCESSING", "NEEDS_ATTENTION"] },
+            changeOrder: {
+                OR: [
+                    { projectId: invoice.projectId },
+                    ...(invoice.estimateId ? [{ estimateId: invoice.estimateId }] : []),
+                ],
+            },
+        },
+        select: { id: true, status: true },
+        orderBy: { createdAt: "asc" },
+    });
+}
 
-    const recipientEmail = overrideEmail || invoice.client?.email;
-    if (!recipientEmail) throw new Error("No email address provided");
+function activeApprovalDeliveryMessage(status: string): string {
+    return status === "NEEDS_ATTENTION"
+        ? "Automatic change-order payment delivery has an unresolved provider outcome. Verify that durable job before sending this invoice again."
+        : "Automatic change-order payment delivery is still in progress. Wait for it to finish before sending this invoice.";
+}
 
-    if (invoice.status === "Draft") {
-        await prisma.invoice.update({
+export async function sendInvoiceToClientCore(
+    invoiceId: string,
+    overrideEmail?: string,
+    expectation: InvoiceSendExpectation = {},
+) {
+    const [invoiceRef, attemptRef] = await Promise.all([
+        prisma.invoice.findUnique({
             where: { id: invoiceId },
-            data: { status: "Issued", issueDate: new Date(), sentAt: new Date() },
+            select: { estimateId: true },
+        }),
+        prisma.invoiceEmailAttempt.findUnique({
+            where: { invoiceId },
+            select: { attemptKey: true },
+        }),
+    ]);
+    if (!invoiceRef) throw new Error("Invoice not found");
+
+    // Phase one freezes the complete first payload and provider key in a short,
+    // committed transaction. A process crash or ambiguous provider outcome can
+    // therefore retry byte-identically without inventing a second delivery.
+    const prepared = await prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, {
+            estimateId: invoiceRef.estimateId,
+            invoiceId,
+            allowInvoiceEmailAttemptKey: attemptRef?.attemptKey,
         });
-    } else {
-        await prisma.invoice.update({
+        const invoice = await tx.invoice.findUnique({
             where: { id: invoiceId },
-            data: { sentAt: new Date() },
+            include: {
+                project: { include: { client: true } },
+                client: true,
+                payments: {
+                    orderBy: { id: "asc" },
+                    select: {
+                        id: true,
+                        name: true,
+                        amount: true,
+                        status: true,
+                        dueDate: true,
+                        qbInvoiceSentAt: true,
+                    },
+                },
+            },
         });
-    }
+        if (!invoice) throw new Error("Invoice not found");
 
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
-    const clientId = invoice.clientId || invoice.project?.clientId;
-    let portalUrl: string;
-    if (clientId) {
-        const { signClientPortalToken } = await import("./client-portal-auth");
-        const token = await signClientPortalToken(clientId, recipientEmail.toLowerCase());
-        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/invoices/${invoiceId}`)}`;
-    } else {
-        portalUrl = `${appUrl}/portal/invoices/${invoiceId}`;
-    }
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Your Contractor";
+        const existingRow = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+        const providerStartedAttempt = parseInvoiceEmailAttemptPayload(existingRow?.payload);
+        if (existingRow?.providerStartedAt) {
+            if (existingRow.kind !== "WHOLE_INVOICE"
+                || !providerStartedAttempt
+                || !canRetryProviderAttempt(existingRow.startedAt, new Date())) {
+                return {
+                    kind: "error" as const,
+                    result: {
+                        success: false as const,
+                        code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                        error: "A provider-started invoice email cannot be retried safely. Verify delivery before any new send.",
+                        sentTo: undefined,
+                    },
+                };
+            }
+            // Once the provider fence exists, later approval jobs or Client
+            // edits cannot replace/veto this attempt. Resume its byte-identical
+            // payload/key; all money writers remain blocked on the Invoice.
+            return {
+                kind: "ready" as const,
+                attemptKey: existingRow.attemptKey,
+                attempt: providerStartedAttempt,
+            };
+        }
 
-    const invoiceAdditionalEmail = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
-    const invoiceCc = buildCc(recipientEmail, invoiceAdditionalEmail);
-    const emailResult = await sendNotification(
-        recipientEmail,
-        `${companyName} sent you an invoice — ${invoice.code}`,
-        `<!DOCTYPE html>
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
-            <div style="text-align: center; margin-bottom: 32px;">
-                <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
-            </div>
-            <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
-                <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
-                <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || 'there'},</p>
-                <p style="color: #666; line-height: 1.6;">
-                    ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
-                    Please click the button below to view the details and make a payment.
-                </p>
-                <div style="text-align: center; margin: 32px 0;">
-                    <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-                        View & Pay Invoice
-                    </a>
+        const automaticDelivery = await activeApprovalClientDeliveryForInvoice(invoiceId, tx);
+        if (automaticDelivery) {
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    error: activeApprovalDeliveryMessage(automaticDelivery.status),
+                    sentTo: undefined,
+                },
+            };
+        }
+
+        const currentRecipients = canonicalMilestoneRecipients(
+            overrideEmail || invoice.client?.email || invoice.project?.client?.email,
+            invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail,
+        );
+        const recipientConflict = milestoneRecipientConflictError({
+            expected: expectation.expectedRecipients,
+            current: currentRecipients,
+        });
+        if (recipientConflict) {
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    code: "RECIPIENT_CONFLICT" as const,
+                    error: recipientConflict,
+                    sentTo: undefined,
+                },
+            };
+        }
+        const currentFinancialFingerprint = invoiceSendFinancialFingerprint({
+            invoiceId: invoice.id,
+            code: invoice.code,
+            status: invoice.status,
+            totalAmount: Number(invoice.totalAmount),
+            balanceDue: Number(invoice.balanceDue),
+            payments: invoice.payments.map(payment => ({
+                id: payment.id,
+                name: payment.name,
+                amount: Number(payment.amount),
+                status: payment.status,
+                dueDate: payment.dueDate?.toISOString() ?? null,
+                qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+            })),
+        });
+        if (expectation.expectedFinancialFingerprint
+            && expectation.expectedFinancialFingerprint !== currentFinancialFingerprint) {
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    code: "INVOICE_STATE_CONFLICT" as const,
+                    error: "Invoice amount or payment state changed after the preview; review the fresh invoice before sending.",
+                    sentTo: undefined,
+                },
+            };
+        }
+
+        if (existingRow) {
+            if (existingRow.kind !== "WHOLE_INVOICE") {
+                return {
+                    kind: "error" as const,
+                    result: {
+                        success: false as const,
+                        code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                        error: "A milestone email attempt is unresolved; verify it before sending the whole invoice.",
+                        sentTo: undefined,
+                    },
+                };
+            }
+            const existing = parseInvoiceEmailAttemptPayload(existingRow.payload);
+            if (!existing) {
+                if (!existingRow.providerStartedAt) {
+                    await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+                } else {
+                    return {
+                        kind: "error" as const,
+                        result: {
+                            success: false as const,
+                            code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                            error: "This invoice has an incomplete prior email checkpoint. Verify delivery before sending again.",
+                            sentTo: undefined,
+                        },
+                    };
+                }
+            } else if (milestoneRecipientConflictError({ expected: existing.recipients, current: currentRecipients })
+                || existing.financialFingerprint !== currentFinancialFingerprint
+                || !canRetryProviderAttempt(existingRow.startedAt, new Date())) {
+                if (!existingRow.providerStartedAt) {
+                    // No provider boundary was crossed; replacing this stale
+                    // checkpoint is safe and avoids permanently wedging billing.
+                    await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+                } else {
+                    return {
+                        kind: "error" as const,
+                        result: {
+                            success: false as const,
+                            code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                            error: "A prior invoice email has a provider-started unresolved outcome and no longer matches the current invoice. Verify delivery before any new send.",
+                            sentTo: undefined,
+                        },
+                    };
+                }
+            } else {
+                return {
+                    kind: "ready" as const,
+                    attemptKey: existingRow.attemptKey,
+                    attempt: existing,
+                };
+            }
+        }
+
+        const recipientEmail = currentRecipients.to[0];
+        if (!recipientEmail) throw new Error("No email address provided");
+        const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+        const clientId = invoice.clientId || invoice.project?.clientId;
+        let portalUrl: string;
+        if (clientId) {
+            const { signClientPortalToken } = await import("./client-portal-auth");
+            const token = await signClientPortalToken(clientId, recipientEmail);
+            portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(`/portal/invoices/${invoiceId}`)}`;
+        } else {
+            portalUrl = `${appUrl}/portal/invoices/${invoiceId}`;
+        }
+        const settings = await tx.companySettings.findUnique({ where: { id: "singleton" } });
+        const companyName = settings?.companyName || "Your Contractor";
+        const invoiceCc = currentRecipients.cc.length ? currentRecipients.cc : undefined;
+        const internalCopies = (settings?.notificationEmail?.trim() || CLIENT_DOC_COPY_EMAIL)
+            .split(",")
+            .map(email => email.trim())
+            .filter(Boolean);
+        const dispatch = buildFrozenNotification({
+            to: [recipientEmail],
+            subject: `${companyName} sent you an invoice — ${invoice.code}`,
+            html: `<!DOCTYPE html>
+            <html>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
+                <div style="text-align: center; margin-bottom: 32px;">
+                    <h1 style="font-size: 24px; font-weight: 700; margin: 0;">${companyName}</h1>
                 </div>
-                <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
-                    <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
-                    <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(invoice.balanceDue)}</div>
+                <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
+                    <h2 style="font-size: 20px; margin: 0 0 8px;">Invoice ${invoice.code}</h2>
+                    <p style="color: #666; margin: 0 0 24px;">Hi ${invoice.client?.name || invoice.project?.client?.name || "there"},</p>
+                    <p style="color: #666; line-height: 1.6;">
+                        ${companyName} has sent you an invoice for <strong>${formatCurrency(invoice.totalAmount)}</strong>.
+                        Please click the button below to view the details and make a payment.
+                    </p>
+                    <div style="text-align: center; margin: 32px 0;">
+                        <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600; font-size: 15px;">
+                            View & Pay Invoice
+                        </a>
+                    </div>
+                    <div style="background: #f9fafb; border-radius: 8px; padding: 16px; text-align: center;">
+                        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">Amount Due</div>
+                        <div style="font-size: 24px; font-weight: 700; color: #111;">${formatCurrency(invoice.balanceDue)}</div>
+                    </div>
+                    <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
+                        Or copy this link: ${portalUrl}
+                    </p>
                 </div>
-                <p style="color: #999; font-size: 13px; text-align: center; margin-top: 16px;">
-                    Or copy this link: ${portalUrl}
+                <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
+                    Sent via ProBuild • ${companyName}
                 </p>
-            </div>
-            <p style="text-align: center; color: #aaa; font-size: 12px; margin-top: 32px;">
-                Sent via ProBuild • ${companyName}
-            </p>
-        </body>
-        </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: invoiceCc, copyToInternal: true }
-    );
+            </body>
+            </html>`,
+            fromName: companyName,
+            replyTo: settings?.email || undefined,
+            cc: invoiceCc,
+            bcc: internalCopies,
+        });
+        const attemptKey = `invoice-send/${invoiceId}/${randomUUID()}`;
+        const attempt: InvoiceEmailAttemptPayload = {
+            dispatch,
+            recipients: currentRecipients,
+            financialFingerprint: currentFinancialFingerprint,
+        };
+        await tx.invoiceEmailAttempt.create({
+            data: {
+                invoiceId,
+                kind: "WHOLE_INVOICE",
+                attemptKey,
+                payload: JSON.parse(JSON.stringify(attempt)) as Prisma.InputJsonValue,
+                startedAt: new Date(),
+            },
+        });
+        return {
+            kind: "ready" as const,
+            attemptKey,
+            attempt,
+        };
+    }, { timeout: 15_000 });
 
-    // Requested-marker stamp, gated on the email actually going out — a failed
-    // send must never leave the portal claiming a payment is due.
-    if (!emailResult?.success) {
-        return { success: false as const, error: "The invoice email could not be sent — please try again.", sentTo: undefined };
-    }
+    if (prepared.kind === "error") return prepared.result;
 
-    // A whole-invoice email asks the client for everything unpaid, so every
-    // Pending milestone becomes "requested". qbInvoiceSentAt doubles as the
-    // rail-neutral request marker: the portal only shows Pay buttons and due
-    // amounts for requested milestones. (Covers resendInvoiceCore too — it
-    // delegates here after refreshing QBO links.) Delivered-but-not-recorded
-    // must not read as a send failure — the email DID go out, and reporting
-    // failure here would invite a duplicate send — so the stamp is fail-soft
-    // and loud, same pattern as the milestone path.
-    try {
-        await prisma.paymentSchedule.updateMany({
+    // Commit the provider-start fence before crossing the external boundary.
+    // Every money writer checks this row after acquiring the Invoice lock; once
+    // this timestamp exists it must wait until the same stable attempt resolves.
+    const providerFence = await prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, {
+            estimateId: invoiceRef.estimateId,
+            invoiceId,
+            allowInvoiceEmailAttemptKey: prepared.attemptKey,
+        });
+        const attemptRow = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+        const attempt = parseInvoiceEmailAttemptPayload(attemptRow?.payload);
+        if (attemptRow?.attemptKey !== prepared.attemptKey
+            || attemptRow.kind !== "WHOLE_INVOICE"
+            || !attempt) {
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                    error: "The durable invoice email checkpoint changed before provider delivery. Reload before sending.",
+                    sentTo: undefined,
+                },
+            };
+        }
+        if (attemptRow.providerStartedAt) {
+            return { kind: "ready" as const };
+        }
+        const automaticDelivery = await activeApprovalClientDeliveryForInvoice(invoiceId, tx);
+        if (automaticDelivery) {
+            if (!attemptRow.providerStartedAt) {
+                await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+            }
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                    error: attemptRow.providerStartedAt
+                        ? `${activeApprovalDeliveryMessage(automaticDelivery.status)} A provider-started whole-invoice attempt also needs reconciliation.`
+                        : activeApprovalDeliveryMessage(automaticDelivery.status),
+                    sentTo: undefined,
+                },
+            };
+        }
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            include: {
+                project: { include: { client: true } },
+                client: true,
+                payments: {
+                    orderBy: { id: "asc" },
+                    select: { id: true, name: true, amount: true, status: true, dueDate: true, qbInvoiceSentAt: true },
+                },
+            },
+        });
+        if (!invoice) throw new Error("Invoice not found");
+        // Canonical first-attempt lock order is Estimate -> Invoice -> Client ->
+        // CompanySettings. This final read, not the earlier routing snapshot,
+        // owns the decision to cross the provider boundary.
+        const lockedDestinations = await lockInvoiceDeliveryRecipientSet(tx, {
+            clientId: invoice.clientId,
+            overrideEmail,
+        });
+        const currentRecipients = lockedDestinations.visible;
+        const completeRecipientConflict = completeFrozenRecipientConflictError({
+            expected: attempt.dispatch,
+            current: lockedDestinations.complete,
+        });
+        const currentFinancialFingerprint = invoiceSendFinancialFingerprint({
+            invoiceId: invoice.id,
+            code: invoice.code,
+            status: invoice.status,
+            totalAmount: Number(invoice.totalAmount),
+            balanceDue: Number(invoice.balanceDue),
+            payments: invoice.payments.map(payment => ({
+                id: payment.id,
+                name: payment.name,
+                amount: Number(payment.amount),
+                status: payment.status,
+                dueDate: payment.dueDate?.toISOString() ?? null,
+                qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+            })),
+        });
+        if (completeRecipientConflict
+            || milestoneRecipientConflictError({ expected: attempt.recipients, current: currentRecipients })
+            || attempt.financialFingerprint !== currentFinancialFingerprint) {
+            if (!attemptRow.providerStartedAt) {
+                await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+            }
+            return {
+                kind: "error" as const,
+                result: {
+                    success: false as const,
+                    code: attemptRow.providerStartedAt
+                        ? "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const
+                        : "INVOICE_STATE_CONFLICT" as const,
+                    error: attemptRow.providerStartedAt
+                        ? "A provider-started invoice email no longer matches current recipients or money state. Verify delivery before any new send."
+                        : completeRecipientConflict
+                            || "Invoice recipients or money state changed before provider delivery. Review the fresh invoice before sending.",
+                    sentTo: undefined,
+                },
+            };
+        }
+        if (!attemptRow.providerStartedAt) {
+            await tx.invoiceEmailAttempt.update({
+                where: { invoiceId },
+                data: { providerStartedAt: new Date() },
+            });
+        }
+        return { kind: "ready" as const };
+    }, { timeout: 15_000 });
+    if (providerFence.kind === "error") return providerFence.result;
+
+    // Phase three locks the money parents, revalidates the durable checkpoint,
+    // then keeps the Invoice lock through provider delivery and bookkeeping.
+    // The external call is bounded and idempotent; this transaction is never
+    // auto-retried. If its commit is lost, phase one's checkpoint survives and
+    // the next request repeats the exact same payload/key.
+    const outcome = await prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, {
+            estimateId: invoiceRef.estimateId,
+            invoiceId,
+            allowInvoiceEmailAttemptKey: prepared.attemptKey,
+        });
+        const invoice = await tx.invoice.findUnique({
+            where: { id: invoiceId },
+            select: { id: true, status: true, projectId: true, code: true },
+        });
+        if (!invoice) throw new Error("Invoice not found");
+        const attemptRow = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+        const persistedAttempt = parseInvoiceEmailAttemptPayload(attemptRow?.payload);
+        if (attemptRow?.attemptKey !== prepared.attemptKey
+            || attemptRow.kind !== "WHOLE_INVOICE"
+            || !persistedAttempt
+            || !attemptRow.providerStartedAt) {
+            return {
+                result: {
+                    success: false as const,
+                    code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                    error: "The durable invoice email attempt changed or already completed. Reload before any further send.",
+                    sentTo: undefined,
+                },
+                audit: null,
+            };
+        }
+        // Phase two is the final live-state validation. Once providerStartedAt
+        // commits, the Invoice row lock/fence makes this frozen attempt the sole
+        // permitted money writer. A later approval enqueue or Client edit must
+        // not veto it here: doing so would retain a provider-started checkpoint
+        // that blocks both the approval BILL job and every retry indefinitely.
+        if (!canRetryProviderAttempt(attemptRow.startedAt, new Date())) {
+            return {
+                result: {
+                    success: false as const,
+                    code: "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const,
+                    error: "The frozen invoice email exceeded the provider idempotency window. Verify delivery before any new send.",
+                    sentTo: undefined,
+                },
+                audit: null,
+            };
+        }
+
+        const providerResult = await defaultSendFrozenNotification(
+            persistedAttempt.dispatch,
+            attemptRow.attemptKey,
+        );
+        if (!providerResult.success) {
+            if (!providerResult.ambiguous) {
+                await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+            }
+            return {
+                result: {
+                    success: false as const,
+                    code: providerResult.ambiguous
+                        ? "INVOICE_EMAIL_ATTEMPT_UNRESOLVED" as const
+                        : "INVOICE_EMAIL_PROVIDER_REJECTED" as const,
+                    error: providerResult.ambiguous
+                        ? "The invoice email provider outcome is ambiguous. Retry only this same frozen attempt; do not create a new send."
+                        : "The invoice email provider rejected the request; no email was recorded.",
+                    sentTo: undefined,
+                },
+                audit: null,
+            };
+        }
+
+        const sentAt = new Date();
+        await tx.invoice.update({
+            where: { id: invoiceId },
+            data: {
+                ...(invoice.status === "Draft"
+                    ? { status: "Issued", issueDate: sentAt, sentAt }
+                    : { sentAt }),
+            },
+        });
+        // This broad stamp is safe only while the Invoice parent lock is held:
+        // approval BILL workers must acquire the same lock before inserting.
+        await tx.paymentSchedule.updateMany({
             where: { invoiceId, status: "Pending" },
-            data: { qbInvoiceSentAt: new Date() },
+            data: { qbInvoiceSentAt: sentAt },
         });
-    } catch (stampErr) {
-        console.error(`[sendInvoiceToClientCore] Email sent but the request stamp failed for invoice ${invoice.code} — portal will show nothing due until a resend:`, stampErr);
-    }
+        await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+        return {
+            result: { success: true as const, sentTo: persistedAttempt.recipients.to[0] },
+            audit: {
+                projectId: invoice.projectId,
+                companyName: persistedAttempt.dispatch.from.replace(/\s*<[^>]+>\s*$/, "") || "Your Contractor",
+                invoiceCode: invoice.code,
+            },
+        };
+    }, { timeout: 20_000 });
 
-    // Log to activity feed (project-scoped only)
-    if (invoice.projectId) {
-        await logActivityLazy({
-            projectId: invoice.projectId,
-            actorType: "TEAM",
-            actorName: companyName,
-            action: "sent_invoice",
-            entityType: "invoice",
-            entityId: invoiceId,
-            entityName: `Invoice ${invoice.code}`,
-        });
+    if (outcome.audit?.projectId) {
+        try {
+            await logActivityLazy({
+                projectId: outcome.audit.projectId,
+                actorType: "TEAM",
+                actorName: outcome.audit.companyName,
+                action: "sent_invoice",
+                entityType: "invoice",
+                entityId: invoiceId,
+                entityName: `Invoice ${outcome.audit.invoiceCode}`,
+            });
+            revalidatePath(`/projects/${outcome.audit.projectId}/invoices`);
+            revalidatePath(`/projects/${outcome.audit.projectId}/invoices/${invoiceId}`);
+        } catch (error) {
+            // The provider + money state already committed. Reporting failure here
+            // would invite a new attempt/key and a duplicate customer email.
+            console.error("[sendInvoiceToClientCore] Post-send audit/cache refresh failed:", error);
+        }
     }
-
-    if (invoice.projectId) {
-        revalidatePath(`/projects/${invoice.projectId}/invoices`);
-        revalidatePath(`/projects/${invoice.projectId}/invoices/${invoiceId}`);
-    }
-    revalidatePath(`/invoices`);
-    return { success: true as const, sentTo: recipientEmail };
+    if (outcome.result.success) revalidatePath("/invoices");
+    return outcome.result;
 }
 
 /**
@@ -559,18 +1416,110 @@ export async function sendInvoiceToClientCore(invoiceId: string, overrideEmail?:
  * possible), then send the ProBuild invoice email with its always-current portal
  * link. QuickBooks being disconnected downgrades to a plain resend, not a failure.
  */
-export async function resendInvoiceCore(invoiceId: string, overrideEmail?: string) {
+export async function resendInvoiceCore(
+    invoiceId: string,
+    overrideEmail?: string,
+    expectation: InvoiceSendExpectation = {},
+) {
     const invoice = await prisma.invoice.findUnique({
         where: { id: invoiceId },
-        include: { payments: { select: { id: true, name: true, qbInvoiceId: true, status: true } } },
+        include: {
+            client: true,
+            project: { include: { client: true } },
+            payments: {
+                orderBy: { id: "asc" },
+                select: {
+                    id: true,
+                    name: true,
+                    amount: true,
+                    status: true,
+                    dueDate: true,
+                    qbInvoiceId: true,
+                    qbInvoiceSentAt: true,
+                },
+            },
+        },
     });
     if (!invoice) return { success: false as const, error: "Invoice not found" };
 
+    const currentRecipients = canonicalMilestoneRecipients(
+        overrideEmail || invoice.client?.email || invoice.project?.client?.email,
+        invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail,
+    );
+    const recipientConflict = milestoneRecipientConflictError({
+        expected: expectation.expectedRecipients,
+        current: currentRecipients,
+    });
+    if (recipientConflict) {
+        return {
+            success: false as const,
+            code: "RECIPIENT_CONFLICT" as const,
+            error: recipientConflict,
+            linkRefresh: [],
+        };
+    }
+    const currentFinancialFingerprint = invoiceSendFinancialFingerprint({
+        invoiceId: invoice.id,
+        code: invoice.code,
+        status: invoice.status,
+        totalAmount: Number(invoice.totalAmount),
+        balanceDue: Number(invoice.balanceDue),
+        payments: invoice.payments.map(payment => ({
+            id: payment.id,
+            name: payment.name,
+            amount: Number(payment.amount),
+            status: payment.status,
+            dueDate: payment.dueDate?.toISOString() ?? null,
+            qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+        })),
+    });
+    if (expectation.expectedFinancialFingerprint
+        && expectation.expectedFinancialFingerprint !== currentFinancialFingerprint) {
+        return {
+            success: false as const,
+            code: "INVOICE_STATE_CONFLICT" as const,
+            error: "Invoice amount or payment state changed after the preview; review the fresh invoice before refreshing payment links.",
+            linkRefresh: [],
+        };
+    }
+
+    const existingEmailAttempt = await prisma.invoiceEmailAttempt.findUnique({
+        where: { invoiceId },
+        select: { kind: true },
+    });
+    if (existingEmailAttempt) {
+        if (existingEmailAttempt.kind !== "WHOLE_INVOICE") {
+            return {
+                success: false as const,
+                error: "A milestone email attempt is unresolved; verify it before resending the whole invoice.",
+                linkRefresh: [],
+            };
+        }
+        const retried = await sendInvoiceToClientCore(invoiceId, overrideEmail, expectation);
+        return { ...retried, linkRefresh: [] };
+    }
+
+    // Stop before token refresh, QBO reads, or any provider-visible work. The
+    // send core rechecks immediately before delivery after link refresh too.
+    const automaticDelivery = await activeApprovalClientDeliveryForInvoice(invoiceId);
+    if (automaticDelivery) {
+        return {
+            success: false as const,
+            error: activeApprovalDeliveryMessage(automaticDelivery.status),
+            linkRefresh: [],
+        };
+    }
+
     const linkRefresh: Array<{ milestone: string; refreshed: boolean; payLink?: string; error?: string }> = [];
+    let linkRefreshConflict: string | null = null;
     const qbMilestones = invoice.payments.filter(p => p.qbInvoiceId && p.status !== "Paid" && p.status !== "Canceled");
     if (qbMilestones.length > 0) {
         try {
-            const { getFreshQBTokens, pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
+            const {
+                getFreshQBTokens,
+                pushMilestoneToQuickBooks,
+                refreshExistingMilestoneQboStateUnderInvoiceLock,
+            } = await import("./quickbooks-payments");
             const { getQBInvoicePaymentLink } = await import("./quickbooks");
             const tokens = await getFreshQBTokens();
             for (const m of qbMilestones) {
@@ -581,10 +1530,41 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
                     const res = await pushMilestoneToQuickBooks(m.id, tokens);
                     let payLink = res.payLink || undefined;
                     if (res.qbInvoiceId) {
+                        const snapshot = await prisma.paymentSchedule.findUnique({
+                            where: { id: m.id },
+                            select: {
+                                invoiceId: true,
+                                status: true,
+                                qbInvoiceId: true,
+                                qbCreateGeneration: true,
+                                qbInvoiceLink: true,
+                                qbSyncError: true,
+                            },
+                        });
+                        if (!snapshot || snapshot.invoiceId !== invoiceId || snapshot.qbInvoiceId !== res.qbInvoiceId) {
+                            linkRefreshConflict = "A milestone changed QuickBooks identity while its payment link was being refreshed; reload before resending.";
+                            break;
+                        }
                         const liveLink = await getQBInvoicePaymentLink(tokens, res.qbInvoiceId);
                         if (liveLink) {
-                            if (liveLink !== payLink) {
-                                await prisma.paymentSchedule.update({ where: { id: m.id }, data: { qbInvoiceLink: liveLink } });
+                            if (liveLink !== snapshot.qbInvoiceLink) {
+                                const write = await withTxRetry(() => prisma.$transaction(tx => (
+                                    refreshExistingMilestoneQboStateUnderInvoiceLock(tx, {
+                                        scheduleId: m.id,
+                                        invoiceId,
+                                        expectedStatus: snapshot.status,
+                                        expectedQbInvoiceId: res.qbInvoiceId,
+                                        expectedGeneration: snapshot.qbCreateGeneration,
+                                        expectedQbInvoiceLink: snapshot.qbInvoiceLink,
+                                        expectedQbSyncError: snapshot.qbSyncError,
+                                        payLink: liveLink,
+                                        providerReachable: true,
+                                    })
+                                )));
+                                if (write === "stale") {
+                                    linkRefreshConflict = "A milestone changed while its QuickBooks payment link was being refreshed; reload before resending.";
+                                    break;
+                                }
                             }
                             payLink = liveLink;
                         }
@@ -593,13 +1573,23 @@ export async function resendInvoiceCore(invoiceId: string, overrideEmail?: strin
                 } catch (err: any) {
                     linkRefresh.push({ milestone: m.name, refreshed: false, error: err?.message || "refresh failed" });
                 }
+                if (linkRefreshConflict) break;
             }
         } catch {
             linkRefresh.push({ milestone: "(all)", refreshed: false, error: "QuickBooks not connected — portal link still works" });
         }
     }
 
-    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail);
+    if (linkRefreshConflict) {
+        return {
+            success: false as const,
+            code: "INVOICE_STATE_CONFLICT" as const,
+            error: linkRefreshConflict,
+            linkRefresh,
+        };
+    }
+
+    const sent = await sendInvoiceToClientCore(invoiceId, overrideEmail, expectation);
     return { ...sent, linkRefresh };
 }
 
@@ -681,29 +1671,222 @@ export function buildMilestoneRequestEmail(input: {
     return { subject, html };
 }
 
-async function sendMilestoneRequestEmail(
-    invoice: {
-        id: string;
-        code: string;
-        clientId: string | null;
-        client: { name: string | null; email: string | null; additionalEmail: string | null } | null;
-        project: { name: string; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
+export function buildMilestoneFrozenNotification(input: {
+    companyName: string;
+    companyEmail?: string | null;
+    notificationEmail?: string | null;
+    clientName?: string | null;
+    projectName?: string | null;
+    invoiceCode: string;
+    milestones: Array<{ name: string; amount: number }>;
+    portalUrl: string;
+    recipients: MilestoneRecipientSet;
+}): FrozenNotification {
+    const { subject, html } = buildMilestoneRequestEmail({
+        companyName: input.companyName,
+        clientName: input.clientName,
+        projectName: input.projectName,
+        invoiceCode: input.invoiceCode,
+        milestones: input.milestones,
+        portalUrl: input.portalUrl,
+    });
+    const internalCopies = (input.notificationEmail?.trim() || CLIENT_DOC_COPY_EMAIL)
+        .split(",")
+        .map(email => email.trim())
+        .filter(Boolean);
+
+    return buildFrozenNotification({
+        to: input.recipients.to,
+        subject,
+        html,
+        fromName: input.companyName,
+        replyTo: input.companyEmail || undefined,
+        cc: input.recipients.cc,
+        bcc: internalCopies,
+    });
+}
+
+export type MilestoneAutomationDelivery = {
+    idempotencyKey: string;
+    /** Exact billing result this job is allowed to deliver. */
+    expectedScheduleIds?: readonly string[];
+    /** Heartbeat the fenced claim immediately before each external side effect. */
+    renewBeforeSideEffect?: () => Promise<boolean>;
+    /** The byte-identical dispatch loaded from the durable job on a retry. */
+    frozenNotification?: FrozenNotification;
+    /**
+     * Persist the first dispatch and provider-attempt checkpoint before sending.
+     * The returned value is authoritative: if another attempt already froze the
+     * payload, it returns that immutable winner rather than the candidate.
+     */
+    persistFrozenNotification: (candidate: FrozenNotification) => Promise<FrozenNotification>;
+    sendFrozenNotification?: (
+        dispatch: FrozenNotification,
+        idempotencyKey: string,
+    ) => Promise<{ success: boolean; id?: string; ambiguous?: boolean }>;
+    /** Owns the atomic milestone stamps, invoice transition/activity, and job completion. */
+    completeAfterDelivery: (input: {
+        invoiceId: string;
+        scheduleIds: string[];
+        recipient: string;
+        sentAt: Date;
+        providerMessageId?: string;
+        milestoneFingerprint?: string;
+        milestones?: MilestoneAttemptState[];
+    }) => Promise<void>;
+};
+
+export type MilestoneFrozenDeliveryResult = {
+    delivered: boolean;
+    recorded: boolean;
+    deliveredButUnrecorded?: boolean;
+    deliveryAmbiguous?: boolean;
+    providerMessageId?: string;
+    error?: string;
+};
+
+export function milestoneAutomationPreflightError(input: {
+    requestedIds: readonly string[];
+    expectedIds: readonly string[];
+    milestones: Array<{ id: string; status: string; qbInvoiceSentAt: Date | null }>;
+    recipient: string;
+}): string | null {
+    const canonical = (ids: readonly string[]) => [...new Set(ids)].sort();
+    const requested = canonical(input.requestedIds);
+    const expected = canonical(input.expectedIds);
+    const found = canonical(input.milestones.map(milestone => milestone.id));
+    if (
+        requested.length !== input.requestedIds.length
+        || expected.length !== input.expectedIds.length
+        || requested.length !== expected.length
+        || requested.some((id, index) => id !== expected[index])
+        || found.length !== expected.length
+        || found.some((id, index) => id !== expected[index])
+    ) {
+        return "Billing preflight did not preserve the exact billed milestone set; no QuickBooks or email action was attempted.";
+    }
+    if (!input.recipient.trim()) return "Client has no email on file";
+    if (input.milestones.some(milestone => milestone.status === "Paid" || milestone.status === "Canceled")) {
+        return "The exact billed milestone set contains a milestone that is already paid or canceled.";
+    }
+    if (input.milestones.some(milestone => milestone.qbInvoiceSentAt !== null)) {
+        return "The exact billed milestone set contains a payment request that was already sent; automatic delivery stopped to prevent a duplicate email.";
+    }
+    return null;
+}
+
+/**
+ * Durable provider boundary for approval-driven milestone requests. The
+ * persist callback always runs first, even when the caller supplied a frozen
+ * retry payload, so it can fence the claim and record the provider-idempotency
+ * horizon immediately before every attempt.
+ */
+export async function deliverMilestoneFrozenNotification(
+    candidate: FrozenNotification,
+    context: {
+        invoiceId: string;
+        scheduleIds: string[];
+        recipient: string;
+        milestoneFingerprint?: string;
+        milestones?: MilestoneAttemptState[];
     },
-    milestones: Array<{ id: string; name: string; amount: number }>,
+    automation: MilestoneAutomationDelivery,
+): Promise<MilestoneFrozenDeliveryResult> {
+    let dispatch: FrozenNotification;
+    try {
+        dispatch = await automation.persistFrozenNotification(
+            automation.frozenNotification ?? candidate,
+        );
+    } catch (error: any) {
+        return {
+            delivered: false,
+            recorded: false,
+            error: `Could not persist the frozen payment request (${error?.message || "unknown error"})`,
+        };
+    }
+
+    const send = automation.sendFrozenNotification ?? defaultSendFrozenNotification;
+    let providerResult: { success: boolean; id?: string; ambiguous?: boolean };
+    try {
+        providerResult = await send(dispatch, automation.idempotencyKey);
+    } catch (error: any) {
+        return {
+            delivered: false,
+            recorded: false,
+            error: `Email provider failed to send the payment request (${error?.message || "unknown error"})`,
+        };
+    }
+    if (!providerResult.success) {
+        if (providerResult.ambiguous) {
+            return {
+                delivered: false,
+                recorded: false,
+                deliveryAmbiguous: true,
+                error: "Email provider outcome is ambiguous — do not resend; recover the same automation job with its existing idempotency key.",
+            };
+        }
+        return {
+            delivered: false,
+            recorded: false,
+            error: "Email provider failed to send the payment request",
+        };
+    }
+
+    try {
+        await automation.completeAfterDelivery({
+            ...context,
+            scheduleIds: [...context.scheduleIds],
+            sentAt: new Date(),
+            ...(providerResult.id ? { providerMessageId: providerResult.id } : {}),
+        });
+    } catch (error: any) {
+        return {
+            delivered: true,
+            recorded: false,
+            deliveredButUnrecorded: true,
+            ...(providerResult.id ? { providerMessageId: providerResult.id } : {}),
+            error: `Email delivered, but durable recording failed (${error?.message || "unknown error"}) — do not resend; recover the same automation job with its existing idempotency key.`,
+        };
+    }
+
+    return {
+        delivered: true,
+        recorded: true,
+        ...(providerResult.id ? { providerMessageId: providerResult.id } : {}),
+    };
+}
+
+type MilestoneEmailInvoice = {
+    id: string;
+    code: string;
+    clientId: string | null;
+    client: { name: string | null; email: string | null; additionalEmail: string | null } | null;
+    project: { name: string; clientId: string | null; client: { additionalEmail: string | null } | null } | null;
+};
+
+async function milestonePortalUrl(
+    invoice: MilestoneEmailInvoice,
+    milestones: Array<{ id: string }>,
     recipient: string,
-    companyName: string,
-): Promise<void> {
+): Promise<string> {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
     const clientId = invoice.clientId || invoice.project?.clientId;
     const nextPath = `/portal/invoices/${invoice.id}?milestone=${milestones.map(m => m.id).join(",")}`;
-    let portalUrl: string;
-    if (clientId) {
-        const { signClientPortalToken } = await import("./client-portal-auth");
-        const token = await signClientPortalToken(clientId, recipient.toLowerCase());
-        portalUrl = `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(nextPath)}`;
-    } else {
-        portalUrl = `${appUrl}${nextPath}`;
-    }
+    if (!clientId) return `${appUrl}${nextPath}`;
+
+    const { signClientPortalToken } = await import("./client-portal-auth");
+    const token = await signClientPortalToken(clientId, recipient.toLowerCase());
+    return `${appUrl}/api/portal/verify?token=${encodeURIComponent(token)}&next=${encodeURIComponent(nextPath)}`;
+}
+
+async function sendMilestoneRequestEmail(
+    invoice: MilestoneEmailInvoice,
+    milestones: Array<{ id: string; name: string; amount: number }>,
+    recipients: MilestoneRecipientSet,
+    companyName: string,
+): Promise<void> {
+    const recipient = recipients.to[0] ?? "";
+    const portalUrl = await milestonePortalUrl(invoice, milestones, recipient);
 
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const { subject, html } = buildMilestoneRequestEmail({
@@ -723,7 +1906,7 @@ async function sendMilestoneRequestEmail(
         {
             fromName: sanitizeHeaderValue(companyName),
             replyTo: settings?.email || undefined,
-            cc: buildCc(recipient, invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null),
+            cc: recipients.cc,
             copyToInternal: true,
         }
     );
@@ -749,8 +1932,14 @@ export async function sendMilestoneInvoicesCore(
     // Per-milestone reconcile intents the user explicitly confirmed in the review
     // step: scheduleId -> the QBO total they saw and approved. Doubles as an
     // optimistic-lock token (we only reconcile if the live QBO total still matches).
-    opts: { reconcile?: Record<string, number> } | undefined,
+    opts: {
+        reconcile?: Record<string, number>;
+        allowResend?: boolean;
+        expectedRecipients?: MilestoneRecipientSet;
+        expectedMilestoneFingerprint?: string;
+    } | undefined,
     actorName: string,
+    automation?: MilestoneAutomationDelivery,
 ): Promise<{
     success: boolean;
     sent: number;
@@ -760,8 +1949,11 @@ export async function sendMilestoneInvoicesCore(
     // the modal flips into the side-by-side review step using driftReview.
     needsReview?: boolean;
     driftReview?: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }>;
+    deliveredButUnrecorded?: boolean;
+    deliveryAmbiguous?: boolean;
     results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>;
     error?: string;
+    code?: "RECIPIENT_CONFLICT" | "MILESTONE_STATE_CONFLICT" | "QBO_CREATE_FINGERPRINT_MISMATCH";
 }> {
     try {
         const invoice = await prisma.invoice.findUnique({
@@ -773,18 +1965,197 @@ export async function sendMilestoneInvoicesCore(
             },
         });
         if (!invoice) return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "Invoice not found" };
+        const activeInvoiceEmailAttempt = await prisma.invoiceEmailAttempt.findUnique({
+            where: { invoiceId },
+            select: { kind: true, providerStartedAt: true, payload: true },
+        });
+        if (activeInvoiceEmailAttempt) {
+            const milestoneAttempt = activeInvoiceEmailAttempt.kind === "MILESTONE"
+                ? parseMilestoneInvoiceEmailAttemptPayload(activeInvoiceEmailAttempt.payload)
+                : null;
+            const requested = [...new Set(paymentScheduleIds)].sort();
+            const frozenIds = milestoneAttempt ? [...milestoneAttempt.milestoneIds].sort() : [];
+            const requestedRecipients = canonicalMilestoneRecipients(
+                overrideEmail || invoice.client?.email || invoice.project?.client?.email || "",
+                invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null,
+            );
+            const adoptionError = milestoneAttempt ? manualMilestoneAttemptAdoptionError({
+                requestedIds: requested,
+                requestedRecipients,
+                frozenIds,
+                frozenRecipients: milestoneAttempt.recipients,
+                providerStarted: activeInvoiceEmailAttempt.providerStartedAt !== null,
+            }) : "The frozen milestone attempt is invalid.";
+            const exactSet = milestoneAttempt
+                && requested.length === frozenIds.length
+                && requested.every((id, index) => id === frozenIds[index]);
+            if (!automation && milestoneAttempt && exactSet) {
+                const resumed = await deliverManualMilestoneAttempt(invoiceId, requestedRecipients);
+                const resultRows = milestoneAttempt.resultMilestones.map(milestone => ({
+                    id: milestone.id,
+                    name: milestone.name,
+                    status: milestone.wasReconciled ? "reconciled" as const : "sent" as const,
+                    ...(resumed.delivered ? { sentTo: milestoneAttempt.recipients.to[0] } : {}),
+                    ...(resumed.error ? { error: resumed.error } : {}),
+                }));
+                return {
+                    success: resumed.delivered,
+                    sent: resumed.delivered ? resultRows.length : 0,
+                    failed: resumed.delivered ? 0 : resultRows.length,
+                    skipped: 0,
+                    ...(resumed.deliveredButUnrecorded ? { deliveredButUnrecorded: true } : {}),
+                    ...(resumed.deliveryAmbiguous ? { deliveryAmbiguous: true } : {}),
+                    results: resultRows,
+                    ...(resumed.delivered ? {} : { error: resumed.error }),
+                };
+            }
+            return {
+                success: false,
+                sent: 0,
+                failed: 0,
+                skipped: 0,
+                results: [],
+                error: adoptionError || `A ${activeInvoiceEmailAttempt.kind.toLowerCase().replace(/_/g, " ")} email has an unresolved ${activeInvoiceEmailAttempt.providerStartedAt ? "provider" : "pre-provider"} outcome. Verify that frozen attempt before sending any milestone request.`,
+            };
+        }
 
         const allPayments = invoice.payments;
         const selectedPayments = allPayments.filter(p => paymentScheduleIds.includes(p.id));
         if (selectedPayments.length === 0) {
             return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: "No milestones selected" };
         }
+        const milestoneConflict = milestoneFinancialConflictError({
+            expected: opts?.expectedMilestoneFingerprint,
+            invoiceId,
+            milestones: selectedPayments.map((payment): [string, string, number, string, string | null] => [
+                payment.id,
+                payment.name,
+                Number(payment.amount),
+                payment.status,
+                payment.qbInvoiceSentAt?.toISOString() ?? null,
+            ]),
+        });
+        if (milestoneConflict) {
+            return {
+                success: false,
+                sent: 0,
+                failed: 0,
+                skipped: 0,
+                results: [],
+                code: "MILESTONE_STATE_CONFLICT",
+                error: milestoneConflict,
+            };
+        }
 
-        const { getFreshQBTokens, pushMilestoneToQuickBooks, reconcileMilestoneToQbo } = await import("./quickbooks-payments");
+        const primaryRecipient = overrideEmail || invoice.client?.email || invoice.project?.client?.email || "";
+        const additionalRecipient = invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null;
+        // This is the second read after an MCP preview/confirm request. Compare
+        // before loading QuickBooks, then use only this immutable snapshot for
+        // the provider payload so a later contact edit cannot alter the send.
+        const recipients = canonicalMilestoneRecipients(primaryRecipient, additionalRecipient);
+        const recipient = recipients.to[0] ?? "";
+        const recipientConflict = milestoneRecipientConflictError({
+            expected: opts?.expectedRecipients,
+            current: recipients,
+        });
+        if (recipientConflict) {
+            return {
+                success: false,
+                sent: 0,
+                failed: 0,
+                skipped: 0,
+                results: [],
+                code: "RECIPIENT_CONFLICT",
+                error: recipientConflict,
+            };
+        }
+        if (automation) {
+            const preflightError = milestoneAutomationPreflightError({
+                requestedIds: paymentScheduleIds,
+                expectedIds: automation.expectedScheduleIds ?? paymentScheduleIds,
+                milestones: selectedPayments,
+                recipient,
+            });
+            if (preflightError) {
+                return { success: false, sent: 0, failed: 0, skipped: 0, results: [], error: preflightError };
+            }
+        } else {
+            // Approval creates this job before its BILL worker creates milestones.
+            // Refuse every manual/MCP send while durable approval delivery owns a
+            // selected source CO; this closes the manual-vs-cron duplicate race.
+            const sourceChangeOrderIds = [...new Set(
+                selectedPayments
+                    .map(payment => payment.sourceChangeOrderId)
+                    .filter((id): id is string => Boolean(id)),
+            )];
+            if (sourceChangeOrderIds.length > 0) {
+                const automaticDelivery = await prisma.changeOrderAutomationJob.findFirst({
+                    where: {
+                        changeOrderId: { in: sourceChangeOrderIds },
+                        kind: "APPROVAL_CLIENT_EMAIL",
+                        status: { notIn: ["SKIPPED", "CANCELED"] },
+                    },
+                    select: { id: true, status: true },
+                });
+                if (automaticDelivery) {
+                    return {
+                        success: false,
+                        sent: 0,
+                        failed: 0,
+                        skipped: 0,
+                        results: [],
+                        error: `Automatic change-order approval delivery is ${automaticDelivery.status.toLowerCase().replace(/_/g, " ")}; wait for or reconcile that durable job instead of sending a duplicate payment request.`,
+                    };
+                }
+            }
+        }
+
+        const renewBeforeSideEffect = async () => automation?.renewBeforeSideEffect
+            ? automation.renewBeforeSideEffect()
+            : true;
+        const leaseLostResult = () => ({
+            success: false,
+            sent: 0,
+            failed: 0,
+            skipped: 0,
+            results: [] as Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }>,
+            error: "The automation claim lease was lost before a QuickBooks side effect; no further work was attempted.",
+        });
+
+        const {
+            getFreshQBTokens,
+            getMilestoneQboCreatePayloadMismatch,
+            pushMilestoneToQuickBooks,
+            reconcileMilestoneToQbo,
+            refreshExistingMilestoneQboStateUnderInvoiceLock,
+        } = await import("./quickbooks-payments");
         const { getQBInvoiceStatus, getQBInvoicePaymentLink } = await import("./quickbooks");
+
+        for (const schedule of selectedPayments) {
+            const mismatch = await getMilestoneQboCreatePayloadMismatch(schedule.id);
+            if (mismatch) {
+                return {
+                    success: false,
+                    sent: 0,
+                    failed: 0,
+                    skipped: selectedPayments.length,
+                    code: "QBO_CREATE_FINGERPRINT_MISMATCH",
+                    results: selectedPayments.map(payment => ({
+                        id: payment.id,
+                        name: payment.name,
+                        status: "skipped" as const,
+                        error: payment.id === schedule.id
+                            ? `The frozen QuickBooks create payload no longer matches current billing fields (${mismatch.changedFields.length ? mismatch.changedFields.join(", ") : "fingerprint changed"}). Review before any QBO read or client delivery.`
+                            : "The batch stopped before QuickBooks because another selected milestone requires review.",
+                    })),
+                    error: "A selected milestone's durable QuickBooks create payload changed; review and explicitly reconcile it before sending.",
+                };
+            }
+        }
 
         let tokens;
         try {
+            if (!(await renewBeforeSideEffect())) return leaseLostResult();
             tokens = await getFreshQBTokens();
         } catch (qbErr: any) {
             return {
@@ -804,13 +2175,21 @@ export async function sendMilestoneInvoicesCore(
         let failedCount = 0;
         let skippedCount = 0;
         let reconciledEstimate = false;
+        let deliveredButUnrecorded = false;
+        let deliveryAmbiguous = false;
+        let qboLinkRefreshConflict: string | null = null;
         const results: Array<{ id: string; name: string; status: "sent" | "skipped" | "failed" | "reconciled"; error?: string; sentTo?: string }> = [];
         const driftReview: Array<{ id: string; name: string; probuildAmount: number; qbTotal: number; direction: "higher" | "lower" }> = [];
         // Milestones that cleared every guard, queued for the single request email
         // that goes out after the loop (one email per batch, not one per milestone).
         // effectiveAmount is the verified QuickBooks total — after a reconcile this
         // is the NEW amount, so the email never quotes the stale pre-reconcile one.
-        const sendable: Array<{ schedule: (typeof selectedPayments)[number]; wasReconciled: boolean; effectiveAmount: number }> = [];
+        const sendable: Array<{
+            schedule: (typeof selectedPayments)[number];
+            wasReconciled: boolean;
+            effectiveAmount: number;
+            verifiedQbInvoiceId: string;
+        }> = [];
 
         for (const schedule of selectedPayments) {
             if (schedule.status === "Paid" || schedule.status === "Canceled") {
@@ -819,7 +2198,17 @@ export async function sendMilestoneInvoicesCore(
                 continue;
             }
 
-            const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+            if (!automation && schedule.qbInvoiceSentAt && !opts?.allowResend) {
+                skippedCount++;
+                results.push({
+                    id: schedule.id,
+                    name: schedule.name,
+                    status: "skipped",
+                    error: `Payment request was already sent at ${schedule.qbInvoiceSentAt.toISOString()}; explicit resend confirmation is required`,
+                });
+                continue;
+            }
+
             if (!recipient) {
                 skippedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "skipped", error: "Client has no email on file" });
@@ -827,6 +2216,7 @@ export async function sendMilestoneInvoicesCore(
             }
 
             try {
+                if (!(await renewBeforeSideEffect())) return leaseLostResult();
                 let qbInvoiceId = schedule.qbInvoiceId;
                 let qbTotal: number | undefined;
 
@@ -889,6 +2279,7 @@ export async function sendMilestoneInvoicesCore(
                     }
 
                     // Phase 2: authorized + confirmed + still current → reconcile ProBuild to QBO.
+                    if (!(await renewBeforeSideEffect())) return leaseLostResult();
                     const recon = await reconcileMilestoneToQbo(schedule.id, qbTotal);
                     if (!recon.ok) {
                         failedCount++;
@@ -922,7 +2313,7 @@ export async function sendMilestoneInvoicesCore(
                 // after the loop, instead of Intuit's own invoice email — the client
                 // is asked for exactly these milestone amounts (never the whole
                 // invoice balance) and the view is tracked on the ProBuild portal.
-                sendable.push({ schedule, wasReconciled, effectiveAmount: qbTotal });
+                sendable.push({ schedule, wasReconciled, effectiveAmount: qbTotal, verifiedQbInvoiceId: qbInvoiceId });
             } catch (err: any) {
                 failedCount++;
                 results.push({ id: schedule.id, name: schedule.name, status: "failed", error: err?.message || "Unexpected error during send" });
@@ -933,35 +2324,290 @@ export async function sendMilestoneInvoicesCore(
         // the guards, with a portal link focused on them. If the email itself fails,
         // every queued milestone is marked failed (nothing was communicated), and
         // nothing is stamped as sent.
+        let manualDurableDelivery = false;
         if (sendable.length > 0) {
-            const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
-
             // Refresh each milestone's live QBO pay link so the portal Pay Now
             // never hands the client a stale link (best-effort — the portal
             // still works when a link can't be fetched).
-            for (const { schedule } of sendable) {
-                if (!schedule.qbInvoiceId) continue;
+            for (const { schedule, verifiedQbInvoiceId } of sendable) {
                 try {
-                    const liveLink = await getQBInvoicePaymentLink(tokens, schedule.qbInvoiceId);
-                    if (liveLink && liveLink !== schedule.qbInvoiceLink) {
-                        await prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceLink: liveLink } });
+                    if (!(await renewBeforeSideEffect())) return leaseLostResult();
+                    const snapshot = await prisma.paymentSchedule.findUnique({
+                        where: { id: schedule.id },
+                        select: {
+                            invoiceId: true,
+                            status: true,
+                            qbInvoiceId: true,
+                            qbCreateGeneration: true,
+                            qbInvoiceLink: true,
+                            qbSyncError: true,
+                        },
+                    });
+                    if (!snapshot || snapshot.invoiceId !== invoiceId || snapshot.qbInvoiceId !== verifiedQbInvoiceId) {
+                        qboLinkRefreshConflict = "A selected milestone changed QuickBooks identity while its payment link was being refreshed; reload before sending.";
+                        break;
+                    }
+                    const liveLink = await getQBInvoicePaymentLink(tokens, verifiedQbInvoiceId);
+                    if (liveLink && liveLink !== snapshot.qbInvoiceLink) {
+                        const write = await withTxRetry(() => prisma.$transaction(tx => (
+                            refreshExistingMilestoneQboStateUnderInvoiceLock(tx, {
+                                scheduleId: schedule.id,
+                                invoiceId,
+                                expectedStatus: snapshot.status,
+                                expectedQbInvoiceId: verifiedQbInvoiceId,
+                                expectedGeneration: snapshot.qbCreateGeneration,
+                                expectedQbInvoiceLink: snapshot.qbInvoiceLink,
+                                expectedQbSyncError: snapshot.qbSyncError,
+                                payLink: liveLink,
+                                providerReachable: true,
+                            })
+                        )));
+                        if (write === "stale") {
+                            qboLinkRefreshConflict = "A selected milestone changed while its QuickBooks payment link was being refreshed; reload before sending.";
+                            break;
+                        }
                     }
                 } catch { /* link refresh is best-effort */ }
             }
 
-            let emailFailed = false;
-            try {
-                await sendMilestoneRequestEmail(
-                    invoice,
-                    sendable.map(s => ({ id: s.schedule.id, name: s.schedule.name, amount: s.effectiveAmount })),
-                    recipient,
-                    companyName,
-                );
-            } catch (emailErr: any) {
-                emailFailed = true;
+            if (qboLinkRefreshConflict) {
                 for (const { schedule } of sendable) {
                     failedCount++;
-                    results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to send request email" });
+                    results.push({
+                        id: schedule.id,
+                        name: schedule.name,
+                        status: "failed",
+                        error: qboLinkRefreshConflict,
+                    });
+                }
+                return {
+                    success: false,
+                    sent: 0,
+                    failed: failedCount,
+                    skipped: skippedCount,
+                    code: "MILESTONE_STATE_CONFLICT",
+                    results,
+                    error: qboLinkRefreshConflict,
+                };
+            }
+
+            const emailMilestones = sendable.map(s => ({
+                id: s.schedule.id,
+                name: s.schedule.name,
+                amount: s.effectiveAmount,
+            }));
+            const liveDeliveryRows = await prisma.paymentSchedule.findMany({
+                where: { invoiceId, id: { in: sendable.map(candidate => candidate.schedule.id) } },
+                select: {
+                    id: true,
+                    name: true,
+                    amount: true,
+                    status: true,
+                    qbInvoiceSentAt: true,
+                    qbInvoiceId: true,
+                    qbInvoiceLink: true,
+                    qbSyncError: true,
+                },
+            });
+            const verifiedById = new Map(sendable.map(candidate => [candidate.schedule.id, candidate]));
+            if (liveDeliveryRows.length !== sendable.length || liveDeliveryRows.some(row => {
+                const verified = verifiedById.get(row.id);
+                return !verified
+                    || row.qbInvoiceId !== verified.verifiedQbInvoiceId
+                    || row.qbSyncError !== null
+                    || Math.abs(Number(row.amount) - verified.effectiveAmount) > 0.005
+                    || row.status === "Paid"
+                    || row.status === "Canceled";
+            })) {
+                throw new Error("A selected milestone's verified QuickBooks invoice identity or health changed before delivery; review and verify it again.");
+            }
+            const deliveryMilestoneStates = liveDeliveryRows.map((row): MilestoneAttemptState => ({
+                id: row.id,
+                name: row.name,
+                amount: Number(row.amount),
+                status: row.status,
+                qbInvoiceSentAt: row.qbInvoiceSentAt?.toISOString() ?? null,
+                qbInvoiceId: row.qbInvoiceId!,
+                qbInvoiceLink: row.qbInvoiceLink,
+                qbSyncError: row.qbSyncError,
+            })).sort((a, b) => a.id.localeCompare(b.id));
+            const deliveryMilestoneFingerprint = milestoneDeliveryFingerprint(invoiceId, deliveryMilestoneStates);
+            let emailFailed = false;
+            let recordingError: string | null = null;
+            if (automation) {
+                try {
+                    const candidate = automation.frozenNotification ?? buildMilestoneFrozenNotification({
+                        companyName,
+                        companyEmail: settings?.email,
+                        notificationEmail: settings?.notificationEmail,
+                        clientName: invoice.client?.name,
+                        projectName: invoice.project?.name,
+                        invoiceCode: invoice.code,
+                        milestones: emailMilestones,
+                        portalUrl: await milestonePortalUrl(invoice, emailMilestones, recipient),
+                        recipients,
+                    });
+                    const delivery = await deliverMilestoneFrozenNotification(
+                        candidate,
+                        {
+                            invoiceId,
+                            scheduleIds: emailMilestones.map(milestone => milestone.id),
+                            recipient,
+                            milestoneFingerprint: deliveryMilestoneFingerprint,
+                            milestones: deliveryMilestoneStates,
+                        },
+                        automation,
+                    );
+                    emailFailed = !delivery.delivered;
+                    deliveredButUnrecorded = delivery.deliveredButUnrecorded === true;
+                    deliveryAmbiguous = delivery.deliveryAmbiguous === true;
+                    recordingError = delivery.delivered && !delivery.recorded
+                        ? (delivery.error || "Email delivered, but durable recording failed — do not resend")
+                        : null;
+                    if (emailFailed) {
+                        for (const { schedule } of sendable) {
+                            failedCount++;
+                            results.push({
+                                id: schedule.id,
+                                name: schedule.name,
+                                status: "failed",
+                                error: delivery.error || "Failed to send request email",
+                            });
+                        }
+                    }
+                } catch (emailErr: any) {
+                    emailFailed = true;
+                    for (const { schedule } of sendable) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to prepare request email" });
+                    }
+                }
+            } else {
+                try {
+                    const prepared = await prisma.$transaction(async tx => {
+                        await lockMoneyParents(tx, { estimateId: invoice.estimateId, invoiceId });
+                        const existing = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+                        if (existing) {
+                            const payload = existing.kind === "MILESTONE"
+                                ? parseMilestoneInvoiceEmailAttemptPayload(existing.payload)
+                                : null;
+                            if (!payload) throw new Error("Another invoice email has an unresolved outcome; verify it before sending a milestone request.");
+                            const adoptionError = manualMilestoneAttemptAdoptionError({
+                                requestedIds: emailMilestones.map(milestone => milestone.id),
+                                requestedRecipients: recipients,
+                                frozenIds: payload.milestoneIds,
+                                frozenRecipients: payload.recipients,
+                                providerStarted: existing.providerStartedAt !== null,
+                            });
+                            if (adoptionError) throw new Error(adoptionError);
+                            return payload;
+                        }
+
+                        const lockedInvoice = await tx.invoice.findUnique({
+                            where: { id: invoiceId },
+                            include: {
+                                project: { include: { client: true } },
+                                client: true,
+                            },
+                        });
+                        if (!lockedInvoice) throw new Error("Invoice not found");
+                        if (lockedInvoice.estimateId !== invoice.estimateId) {
+                            throw new Error("Invoice estimate linkage changed before delivery; review the milestone request again.");
+                        }
+                        const liveRecipients = canonicalMilestoneRecipients(
+                            overrideEmail || lockedInvoice.client?.email || lockedInvoice.project?.client?.email || "",
+                            lockedInvoice.client?.additionalEmail || lockedInvoice.project?.client?.additionalEmail || null,
+                        );
+                        const recipientError = milestoneRecipientConflictError({ expected: recipients, current: liveRecipients });
+                        if (recipientError) throw new Error(recipientError);
+
+                        const livePayments = await tx.paymentSchedule.findMany({
+                            where: { invoiceId, id: { in: emailMilestones.map(milestone => milestone.id) } },
+                            select: {
+                                id: true,
+                                name: true,
+                                amount: true,
+                                status: true,
+                                qbInvoiceSentAt: true,
+                                qbInvoiceId: true,
+                                qbInvoiceLink: true,
+                                qbSyncError: true,
+                            },
+                        });
+                        const liveById = new Map(livePayments.map(payment => [payment.id, payment]));
+                        for (const candidate of sendable) {
+                            const live = liveById.get(candidate.schedule.id);
+                            if (!live
+                                || live.name !== candidate.schedule.name
+                                || Math.abs(Number(live.amount) - candidate.effectiveAmount) > 0.005
+                                || live.status === "Paid"
+                                || live.status === "Canceled"
+                                || live.qbInvoiceId !== candidate.verifiedQbInvoiceId
+                                || live.qbSyncError !== null) {
+                                throw new Error("A selected milestone changed after QuickBooks verification; review the fresh milestone state before sending.");
+                            }
+                        }
+                        const milestoneStates = livePayments.map((payment): MilestoneAttemptState => ({
+                            id: payment.id,
+                            name: payment.name,
+                            amount: Number(payment.amount),
+                            status: payment.status,
+                            qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                            qbInvoiceId: payment.qbInvoiceId!,
+                            qbInvoiceLink: payment.qbInvoiceLink,
+                            qbSyncError: payment.qbSyncError,
+                        })).sort((a, b) => a.id.localeCompare(b.id));
+                        const portalUrl = await milestonePortalUrl(lockedInvoice, emailMilestones, liveRecipients.to[0] ?? "");
+                        const dispatch = buildMilestoneFrozenNotification({
+                            companyName,
+                            companyEmail: settings?.email,
+                            notificationEmail: settings?.notificationEmail,
+                            clientName: lockedInvoice.client?.name,
+                            projectName: lockedInvoice.project?.name,
+                            invoiceCode: lockedInvoice.code,
+                            milestones: emailMilestones,
+                            portalUrl,
+                            recipients: liveRecipients,
+                        });
+                        const payload: MilestoneInvoiceEmailAttemptPayload = {
+                            dispatch,
+                            recipients: liveRecipients,
+                            overrideEmail: overrideEmail?.trim().toLowerCase() || null,
+                            milestoneIds: milestoneStates.map(state => state.id),
+                            milestones: milestoneStates,
+                            financialFingerprint: milestoneDeliveryFingerprint(invoiceId, milestoneStates),
+                            resultMilestones: sendable.map(({ schedule, wasReconciled }) => ({
+                                id: schedule.id,
+                                name: schedule.name,
+                                wasReconciled,
+                            })),
+                        };
+                        await tx.invoiceEmailAttempt.create({
+                            data: {
+                                invoiceId,
+                                kind: "MILESTONE",
+                                attemptKey: `invoice-milestone/${invoiceId}/${randomUUID()}`,
+                                payload: payload as unknown as Prisma.InputJsonObject,
+                                startedAt: new Date(),
+                            },
+                        });
+                        return payload;
+                    }, { timeout: 15_000 });
+                    const delivery = await deliverManualMilestoneAttempt(invoiceId, recipients);
+                    manualDurableDelivery = true;
+                    emailFailed = !delivery.delivered;
+                    deliveredButUnrecorded = delivery.deliveredButUnrecorded === true;
+                    deliveryAmbiguous = delivery.deliveryAmbiguous === true;
+                    recordingError = delivery.delivered && !delivery.recorded
+                        ? (delivery.error || "Email delivered, but durable recording failed — do not resend")
+                        : null;
+                    if (emailFailed) throw new Error(delivery.error || `Failed to send frozen payment request for ${prepared.milestoneIds.join(", ")}`);
+                } catch (emailErr: any) {
+                    emailFailed = true;
+                    for (const { schedule } of sendable) {
+                        failedCount++;
+                        results.push({ id: schedule.id, name: schedule.name, status: "failed", error: emailErr?.message || "Failed to send request email" });
+                    }
                 }
             }
 
@@ -971,17 +2617,21 @@ export async function sendMilestoneInvoicesCore(
             // stamp fails, milestones still report "sent" with the recording error
             // attached so staff know to verify, not resend.
             if (!emailFailed) {
-                const stampedAt = new Date();
                 let stampError: string | null = null;
-                try {
-                    await prisma.$transaction(
-                        sendable.map(({ schedule }) =>
-                            prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
-                        )
-                    );
-                } catch (e: any) {
-                    stampError = e?.message || "unknown error";
-                    console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
+                if (automation) {
+                    stampError = recordingError;
+                } else if (!manualDurableDelivery) {
+                    const stampedAt = new Date();
+                    try {
+                        await prisma.$transaction(
+                            sendable.map(({ schedule }) =>
+                                prisma.paymentSchedule.update({ where: { id: schedule.id }, data: { qbInvoiceSentAt: stampedAt } })
+                            )
+                        );
+                    } catch (e: any) {
+                        stampError = e?.message || "unknown error";
+                        console.error("[sendMilestoneInvoices] email delivered but recording the send failed:", e);
+                    }
                 }
                 for (const { schedule, wasReconciled } of sendable) {
                     sentCount++;
@@ -990,12 +2640,18 @@ export async function sendMilestoneInvoicesCore(
                         name: schedule.name,
                         status: wasReconciled ? "reconciled" : "sent",
                         sentTo: recipient,
-                        ...(stampError ? { error: `Email delivered, but recording the send failed (${stampError}) — verify in QuickBooks before resending` } : {}),
+                        ...(stampError
+                            ? {
+                                error: automation
+                                    ? stampError
+                                    : `Email delivered, but recording the send failed (${stampError}) — verify in QuickBooks before resending`,
+                            }
+                            : {}),
                     });
 
                     // Log activity per sent milestone (best-effort — never flips a
                     // delivered send to "failed")
-                    if (invoice.projectId) {
+                    if (!automation && invoice.projectId) {
                         try {
                             await logActivityLazy({
                                 projectId: invoice.projectId,
@@ -1019,10 +2675,10 @@ export async function sendMilestoneInvoicesCore(
         // Post-delivery bookkeeping: a failure here must NOT fall into the
         // global catch and report success:false for an email the client
         // already received — log it and let the sent results stand.
-        if (sentCount > 0 && invoice.status === "Draft") {
+        if (!automation && !manualDurableDelivery && sentCount > 0 && invoice.status === "Draft") {
             try {
-                await prisma.invoice.update({
-                    where: { id: invoiceId },
+                await prisma.invoice.updateMany({
+                    where: { id: invoiceId, status: "Draft" },
                     data: { status: "Issued", issueDate: new Date() },
                 });
             } catch (e) {
@@ -1053,6 +2709,8 @@ export async function sendMilestoneInvoicesCore(
             skipped: skippedCount,
             needsReview: driftReview.length > 0,
             driftReview: driftReview.length > 0 ? driftReview : undefined,
+            ...(deliveredButUnrecorded ? { deliveredButUnrecorded: true } : {}),
+            ...(deliveryAmbiguous ? { deliveryAmbiguous: true } : {}),
             results,
         };
     } catch (globalErr: any) {
@@ -1088,6 +2746,19 @@ async function findChangeOrderInvoice(
         orderBy: { createdAt: "desc" },
         select: { id: true, code: true, status: true },
     }));
+}
+
+/**
+ * Shared target-selection side of createInvoiceFromEstimateCore's Estimate
+ * mutex. The SELECT runs only after the lock is granted, so a just-committed
+ * estimate invoice wins over the project's older fallback invoice.
+ */
+export async function findChangeOrderInvoiceUnderEstimateLock(
+    tx: Prisma.TransactionClient,
+    co: { estimateId: string; projectId: string },
+): Promise<CoInvoiceTarget | null> {
+    await lockMoneyParents(tx, { estimateId: co.estimateId });
+    return findChangeOrderInvoice(tx, co);
 }
 
 type CostPlusActuals = {
@@ -1208,10 +2879,10 @@ async function loadCostPlusActuals(
     const markupCents = Math.round((laborCents + expenseCents) * markupPercent / 100);
     const pretaxCents = laborCents + expenseCents + markupCents;
     const taxCents = Math.round(pretaxCents * taxRate);
-    const fingerprintRows = [
-        ...timeEntries.map((row) => `time:${row.id}:${row.totalCents}`),
-        ...expenses.map((row) => `expense:${row.id}:${row.amountCents}`),
-    ].sort();
+    // Bind confirmation to every customer-visible backup field, not only the
+    // dollars. A note/vendor/date/receipt edit can materially change what the
+    // customer receives even when the total stays identical.
+    const fingerprintPayload = JSON.stringify({ timeEntries, expenses });
     return {
         laborCents,
         expenseCents,
@@ -1219,7 +2890,7 @@ async function loadCostPlusActuals(
         taxCents,
         pretaxCents,
         totalCents: pretaxCents + taxCents,
-        fingerprint: createHash("sha256").update(fingerprintRows.join("|")).digest("hex"),
+        fingerprint: createHash("sha256").update(fingerprintPayload).digest("hex"),
         timeEntries,
         expenses,
     };
@@ -1291,13 +2962,18 @@ export async function billCostPlusChangeOrderCore(
         if (!co) throw new Error("Change order not found");
         if (co.pricingType !== "COST_PLUS") throw new Error(`${co.code} is fixed price — use bill_change_order`);
         if (co.status !== "Approved") throw new Error(`${co.code} must be Approved before actuals can be billed`);
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
-        const invoice = await findChangeOrderInvoice(tx, co);
+        // Always take the same Estimate mutex as invoice creation, then select
+        // the target from the post-wait snapshot. This also fences the legacy
+        // fallback tax read below.
+        const invoice = await findChangeOrderInvoiceUnderEstimateLock(tx, co);
+        const estimateTax = co.termsTaxExempt === null
+            ? await tx.estimate.findUnique({
+                where: { id: co.estimateId },
+                select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+            })
+            : null;
         if (!invoice) throw new Error("This project has no invoice yet — create the invoice first, then bill actuals.");
-        await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
+        await lockMoneyParents(tx, { invoiceId: invoice.id });
         const markupPercent = co.markupPercent ?? 10;
         const taxInfo = effectiveCoTaxInfo(co, estimateTax);
         const taxRate = coTaxRate(taxInfo);
@@ -1383,6 +3059,18 @@ export async function billCostPlusChangeOrderCore(
                 ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
             },
         });
+        if (co.termsTaxExempt === null) {
+            const frozenTerms = canonicalCoTaxTerms(taxInfo);
+            await tx.changeOrder.update({
+                where: { id: co.id },
+                data: {
+                    termsTaxExempt: frozenTerms.taxExempt,
+                    termsTaxRateName: frozenTerms.taxRateName,
+                    termsTaxRatePercent: frozenTerms.taxRatePercent,
+                    revision: { increment: 1 },
+                },
+            });
+        }
         return {
             ...actuals,
             billingId: billing.id,
@@ -1554,6 +3242,88 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
 // a silent stall. Never throws: the customer's approval must stand regardless.
 // ─────────────────────────────────────────────────────────────────────────────
 
+export function matchExistingChangeOrderMilestones(
+    plans: ReadonlyArray<{
+        sourceCoScheduleId: string | null;
+        name: string;
+        totalCents: number;
+    }>,
+    existing: ReadonlyArray<{
+        id: string;
+        sourceCoScheduleId: string | null;
+        name: string;
+        amount: unknown;
+    }>,
+): { ok: true; existingIds: Array<string | null> } | { ok: false; error: string } {
+    const existingIds: Array<string | null> = plans.map(() => null);
+    const usedExistingIndexes = new Set<number>();
+    const seenPlanSourceIds = new Set<string>();
+    const cents = (amount: unknown) => Math.round(Number(amount) * 100);
+
+    // Resolve every durable source identity before considering legacy rows. A
+    // same-name legacy milestone must never steal a plan whose exact row is
+    // already present later in either array.
+    for (const [planIndex, plan] of plans.entries()) {
+        if (!plan.sourceCoScheduleId) continue;
+        if (seenPlanSourceIds.has(plan.sourceCoScheduleId)) {
+            return { ok: false, error: "The signed change-order schedule contains a duplicate source identity. Reconcile it before billing." };
+        }
+        seenPlanSourceIds.add(plan.sourceCoScheduleId);
+        const exactIndexes = existing
+            .map((row, index) => ({ row, index }))
+            .filter(({ row }) => row.sourceCoScheduleId === plan.sourceCoScheduleId)
+            .map(({ index }) => index);
+        if (exactIndexes.length > 1) {
+            return { ok: false, error: `Multiple existing milestones claim signed schedule ${plan.sourceCoScheduleId}. Reconcile them before billing.` };
+        }
+        if (exactIndexes.length === 0) continue;
+        const existingIndex = exactIndexes[0];
+        const row = existing[existingIndex];
+        if (cents(row.amount) !== plan.totalCents) {
+            return { ok: false, error: `Existing milestone "${row.name}" does not match the signed change-order amount` };
+        }
+        usedExistingIndexes.add(existingIndex);
+        existingIds[planIndex] = row.id;
+    }
+
+    // Legacy rows have no durable schedule identity. Match only an unconsumed,
+    // unlinked row with the exact frozen display name. Amount can disambiguate
+    // distinct same-name plans, but equal-name/equal-amount candidates are not
+    // honestly assignable and must stop for reconciliation.
+    for (const [planIndex, plan] of plans.entries()) {
+        if (existingIds[planIndex]) continue;
+        const namedCandidates = existing
+            .map((row, index) => ({ row, index }))
+            .filter(({ row, index }) => !usedExistingIndexes.has(index)
+                && row.sourceCoScheduleId === null
+                && row.name === plan.name);
+        if (namedCandidates.length === 0) continue;
+        const amountCandidates = namedCandidates.filter(({ row }) => cents(row.amount) === plan.totalCents);
+        if (amountCandidates.length !== 1) {
+            if (namedCandidates.length === 1) {
+                return { ok: false, error: `Existing milestone "${namedCandidates[0].row.name}" does not match the signed change-order amount` };
+            }
+            return { ok: false, error: `Legacy milestones named "${plan.name}" are ambiguous. Reconcile them before retrying automatic billing.` };
+        }
+        const chosen = amountCandidates[0];
+        usedExistingIndexes.add(chosen.index);
+        existingIds[planIndex] = chosen.row.id;
+    }
+
+    const unexpected = existing.filter((_, index) => !usedExistingIndexes.has(index));
+    if (unexpected.length > 0) {
+        return {
+            ok: false,
+            error: "Existing change-order milestones do not match the current signed schedule set. Reconcile the old or extra split rows before billing.",
+        };
+    }
+    if (new Set(existingIds.filter((id): id is string => Boolean(id))).size
+        !== existingIds.filter(Boolean).length) {
+        return { ok: false, error: "An existing change-order milestone was matched more than once. Reconcile it before billing." };
+    }
+    return { ok: true, existingIds };
+}
+
 export async function billChangeOrderCore(
     changeOrderId: string,
     dependencies: { logActivity?: typeof logActivityLazy; revalidatePath?: typeof revalidatePath } = {},
@@ -1589,25 +3359,65 @@ export async function billChangeOrderCore(
 
         const subtotalCents = Math.round(Number(co.totalAmount) * 100);
         if (subtotalCents <= 0) return { ok: false as const, error: `Change order ${co.code} has a $0 total — nothing to bill.` };
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
+        // Always serialize target selection with createInvoiceFromEstimateCore.
+        // Its Invoice B either commits before this Estimate lock (and is
+        // selected here) or waits until this billing transaction finishes.
+        const selectedInvoice = await findChangeOrderInvoiceUnderEstimateLock(tx, co);
+        const estimateTax = co.termsTaxExempt === null
+            ? await tx.estimate.findUnique({
+                where: { id: co.estimateId },
+                select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
+            })
+            : null;
         const taxInfo = effectiveCoTaxInfo(co, estimateTax);
         const totalTaxCents = Math.round(subtotalCents * coTaxRate(taxInfo));
-        const invoice = await findChangeOrderInvoice(tx, co);
+        const existingRefs = await tx.paymentSchedule.findMany({
+            where: {
+                invoice: { projectId: co.projectId },
+                status: { not: "Canceled" },
+                OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
+            },
+            select: { invoiceId: true },
+        });
+        const existingInvoiceIds = [...new Set(existingRefs.map(row => row.invoiceId))];
+        if (existingInvoiceIds.length > 1) {
+            return {
+                ok: false as const,
+                error: `Existing ${co.code} milestones are split across multiple invoices. Reconcile them before retrying automatic billing.`,
+            };
+        }
+        // A retry must finish on the same invoice that owns its already-created
+        // source milestones. Choosing a newer project invoice here would return
+        // a mismatched invoiceId/milestoneIds pair and permanently park CLIENT.
+        const invoice = existingInvoiceIds[0]
+            ? await tx.invoice.findUnique({
+                where: { id: existingInvoiceIds[0] },
+                select: { id: true, code: true, status: true },
+            })
+            : selectedInvoice;
         if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
-        await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
+        await lockMoneyParents(tx, { invoiceId: invoice.id });
         const lockedInvoice = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        const existing = await tx.paymentSchedule.findMany({
+            where: {
+                invoice: { projectId: co.projectId },
+                status: { not: "Canceled" },
+                OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
+            },
+        });
+        if (existing.some(row => row.invoiceId !== invoice.id)) {
+            return {
+                ok: false as const,
+                error: `Existing ${co.code} milestones changed invoices while billing. Reload and reconcile them before retrying.`,
+            };
+        }
 
         const schedules = await tx.changeOrderPaymentSchedule.findMany({
             where: { changeOrderId },
-            orderBy: [{ order: "asc" }, { createdAt: "asc" }],
+            orderBy: [{ order: "asc" }, { id: "asc" }],
         });
-        if (schedules.length === 1) return { ok: false as const, error: "Fixed change-order splits require at least two schedule rows" };
-        if (schedules.some((row) => Math.round(Number(row.amount) * 100) <= 0)) {
-            return { ok: false as const, error: "Every fixed change-order schedule amount must be greater than zero" };
-        }
+        const scheduleError = fixedCoScheduleValidationError(subtotalCents, schedules);
+        if (scheduleError) return { ok: false as const, error: scheduleError };
         const grossSchedules = allocateCoScheduleGross(subtotalCents / 100, schedules, taxInfo);
         const plans = schedules.length
             ? grossSchedules.map((row) => ({
@@ -1626,20 +3436,6 @@ export async function billChangeOrderCore(
                 taxCents: totalTaxCents,
                 totalCents: subtotalCents + totalTaxCents,
             }];
-        if (plans.some((plan) => plan.pretaxCents <= 0)) {
-            return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
-        }
-        if (schedules.length) {
-            const storedCents = schedules.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
-            if (storedCents !== subtotalCents) return { ok: false as const, error: "Change-order schedule amounts are out of sync with the signed subtotal" };
-        }
-        const existing = await tx.paymentSchedule.findMany({
-            where: {
-                invoice: { projectId: co.projectId },
-                status: { not: "Canceled" },
-                OR: [{ sourceChangeOrderId: co.id }, { name: { startsWith: `${co.code} — ` } }],
-            },
-        });
         const milestones: Array<{
             id: string; name: string; amount: number; pretaxAmount: number; taxAmount: number;
             status: string; created: boolean;
@@ -1647,14 +3443,13 @@ export async function billChangeOrderCore(
         let newPretaxCents = 0;
         let newTaxCents = 0;
         let newTotalCents = 0;
-        for (const plan of plans) {
-            const prior = plan.sourceCoScheduleId
-                ? existing.find((row) => row.sourceCoScheduleId === plan.sourceCoScheduleId || row.name === plan.name)
-                : existing.find((row) => !row.sourceCoScheduleId);
+        const existingMatch = matchExistingChangeOrderMilestones(plans, existing);
+        if (!existingMatch.ok) return existingMatch;
+        const existingById = new Map(existing.map((row) => [row.id, row]));
+        for (const [planIndex, plan] of plans.entries()) {
+            const priorId = existingMatch.existingIds[planIndex];
+            const prior = priorId ? existingById.get(priorId) : undefined;
             if (prior) {
-                if (Math.round(Number(prior.amount) * 100) !== plan.totalCents) {
-                    return { ok: false as const, error: `Existing milestone "${prior.name}" does not match the signed change-order amount` };
-                }
                 milestones.push({
                     id: prior.id,
                     name: prior.name,
@@ -1701,6 +3496,18 @@ export async function billChangeOrderCore(
                     totalAmount: { increment: newTotalCents / 100 },
                     balanceDue: { increment: newTotalCents / 100 },
                     ...(lockedInvoice?.status === "Paid" ? { status: "Partially Paid" } : {}),
+                },
+            });
+        }
+        if (co.termsTaxExempt === null) {
+            const frozenTerms = canonicalCoTaxTerms(taxInfo);
+            await tx.changeOrder.update({
+                where: { id: co.id },
+                data: {
+                    termsTaxExempt: frozenTerms.taxExempt,
+                    termsTaxRateName: frozenTerms.taxRateName,
+                    termsTaxRatePercent: frozenTerms.taxRatePercent,
+                    revision: { increment: 1 },
                 },
             });
         }
@@ -1931,33 +3738,49 @@ export async function sendChangeOrderToClientCore(
     dependencies: {
         expectedRevision?: number;
         expectedTaxFingerprint?: string;
+        expectedRecipients?: ChangeOrderRecipientSet;
+        previewGeneration?: string;
         sendNotification?: typeof sendNotification;
+        sendFrozenNotification?: typeof defaultSendFrozenNotification;
         logActivity?: typeof logActivityLazy;
         revalidatePath?: typeof revalidatePath;
         buildClientPortalUrl?: (clientId: string, email: string, path: string) => Promise<string>;
     } = {},
 ): Promise<
     | { success: true; sentTo: string; revision: number }
-    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
+    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" | "RECIPIENT_CONFLICT" }
 > {
-    // Read, amount math, and the Draft/Sent -> Sent flip run inside ONE
+    // Read and amount math run under the CO lock. The durable REVIEW_EMAIL job
+    // performs the actual Draft/Sent -> Sent transition only after its frozen
+    // provider delivery succeeds inside a second CO-locked transaction.
     // transaction holding a row lock on the CO (SELECT ... FOR UPDATE, same
     // pattern as billChangeOrderCore): a concurrent writer (editor save,
     // co-audit repair) blocks until commit, so the amount emailed is exactly
     // the amount that was on the row when it was marked Sent. The email
     // itself stays outside the transaction.
     type SendCoOutcome =
-        | { kind: "error"; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
+        | { kind: "error"; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" | "RECIPIENT_CONFLICT" }
         | {
             kind: "ok";
             code: string; title: string; projectId: string; projectName: string;
             clientId: string; clientName: string; clientEmail: string; additionalEmail: string | null;
             coSubtotal: number; coTaxAmount: number; coRevisedAmount: number; taxLabel: string;
             pricingType: string; markupPercent: number; taxFingerprint: string;
+            taxTerms: { taxExempt: boolean; taxRatePercent: number; taxRateName: string | null };
             revision: number;
             schedules: Array<{ name: string; amount: number; dueDate: Date | null }>;
         };
     const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id: changeOrderId },
+            select: { projectId: true },
+        });
+        if (!coRef) return { kind: "error", error: "Change order not found" };
+        // Project-scoped workers and parent deletion use Project -> CO -> job.
+        // This unlocked routing read is revalidated after both locks are held.
+        const [project] = await tx.$queryRaw<Array<{ id: string; name: string; clientId: string | null }>>`
+            SELECT "id", "name", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
+        if (!project) return { kind: "error", error: "Change-order project not found" };
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; pricingType: string;
             markupPercent: number | null; totalAmount: unknown; projectId: string; estimateId: string;
@@ -1969,6 +3792,9 @@ export async function sendChangeOrderToClientCore(
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
+        if (co.projectId !== project.id) {
+            return { kind: "error", code: "REVISION_CONFLICT", error: `Change order ${co.code} moved projects — reload before sending.` };
+        }
         // Only Draft/Sent may be (re)sent — a CO that flipped to Approved/Declined
         // since the caller checked must not get a signature request.
         if (co.status !== "Draft" && co.status !== "Sent") {
@@ -2009,12 +3835,25 @@ export async function sendChangeOrderToClientCore(
             return { kind: "error", error: `Change order ${co.code} pricing is out of sync with its items — save it before sending.` };
         }
 
-        const project = await tx.project.findUnique({
-            where: { id: co.projectId },
-            select: { name: true, client: { select: { id: true, name: true, email: true, additionalEmail: true } } },
-        });
-        const client = project?.client;
+        // Lock the remaining recipient owner before comparing the MCP-confirmed set and
+        // before transitioning to Sent. A client/contact edit that raced the
+        // preview must either commit first (and conflict) or wait until this
+        // exact confirmed set is durably attached to the transition.
+        const [client] = project?.clientId
+            ? await tx.$queryRaw<Array<{ id: string; name: string; email: string | null; additionalEmail: string | null }>>`
+                SELECT "id", "name", "email", "additionalEmail"
+                FROM "Client" WHERE "id" = ${project.clientId} FOR SHARE`
+            : [];
         if (!client?.email) return { kind: "error", error: "Client has no email address" };
+        const recipients = canonicalChangeOrderRecipients(client.email, client.additionalEmail);
+        if (dependencies.expectedRecipients
+            && JSON.stringify(recipients) !== JSON.stringify(dependencies.expectedRecipients)) {
+            return {
+                kind: "error",
+                code: "RECIPIENT_CONFLICT",
+                error: `Change order ${co.code} recipients changed after the preview — review the fresh recipient list before sending.`,
+            };
+        }
 
         // co.totalAmount is the PRE-TAX subtotal (same semantic as billChangeOrderCore).
         // The email must show the tax-inclusive Revised Amount — the number on the
@@ -2055,21 +3894,10 @@ export async function sendChangeOrderToClientCore(
         if (co.pricingType === "COST_PLUS" && schedules.length > 0) {
             return { kind: "error", error: "Cost-plus change orders cannot have a fixed payment schedule." };
         }
-
-        const sentCo = await tx.changeOrder.update({
-            where: { id: changeOrderId },
-            data: {
-                status: "Sent",
-                sentAt: new Date(),
-                ...(mustSnapshotTerms ? {
-                    termsTaxExempt: terms.taxExempt,
-                    termsTaxRateName: terms.taxRateName,
-                    termsTaxRatePercent: terms.taxRatePercent,
-                } : {}),
-                revision: { increment: 1 },
-            },
-            select: { revision: true },
-        });
+        if (co.pricingType !== "COST_PLUS") {
+            const scheduleError = fixedCoScheduleValidationError(storedSubtotalCents, schedules);
+            if (scheduleError) return { kind: "error", error: scheduleError };
+        }
 
         const customerSchedules = allocateCoScheduleGross(coSubtotal, schedules, terms);
 
@@ -2081,7 +3909,8 @@ export async function sendChangeOrderToClientCore(
             pricingType: co.pricingType,
             markupPercent: co.markupPercent ?? 10,
             taxFingerprint: coTaxFingerprint(terms),
-            revision: sentCo.revision,
+            taxTerms: terms,
+            revision: co.revision,
             schedules: customerSchedules.map((row) => ({ ...row, amount: row.grossCents / 100 })),
         };
     }, { timeout: 15_000 });
@@ -2098,42 +3927,8 @@ export async function sendChangeOrderToClientCore(
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
-    // The row lock released at commit, so a writer that was queued behind it
-    // (editor save, co-audit repair) can land an edit while the portal URL and
-    // settings were being built above. The send is external and can't be rolled
-    // back — re-check the row last and abort on drift instead of emailing a
-    // number that no longer matches the portal. FOR UPDATE (not findUnique):
-    // the recheck must WAIT for any in-flight writer to commit before reading,
-    // or it would read the pre-update row and pass while stale.
-    const recheckRows = await prisma.$queryRaw<Array<{
-        status: string; totalAmount: unknown; revision: number; termsTaxExempt: boolean | null;
-        termsTaxRateName: string | null; termsTaxRatePercent: Prisma.Decimal | null;
-    }>>`
-        SELECT "status", "totalAmount", "revision", "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
-        FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
-    const recheck = recheckRows[0];
-    const recheckTaxFingerprint = recheck?.termsTaxExempt === null
-        ? null
-        : coTaxFingerprint({
-            taxExempt: recheck?.termsTaxExempt,
-            taxRateName: recheck?.termsTaxRateName,
-            taxRatePercent: recheck?.termsTaxRatePercent,
-        });
-    if (!recheck || recheck.status !== "Sent" || recheck.revision !== outcome.revision
-        || Math.round(Number(recheck.totalAmount) * 100) !== Math.round(coSubtotal * 100)
-        || recheckTaxFingerprint !== outcome.taxFingerprint) {
-        return {
-            success: false,
-            code: "REVISION_CONFLICT",
-            error: `Change order ${code} was modified while the email was being prepared — review it and send again.`,
-        };
-    }
-
     const changeOrderCc = buildCc(client.email, client.additionalEmail);
-    await (dependencies.sendNotification ?? sendNotification)(
-        client.email,
-        `${companyName} sent you a change order to review`,
-        `<!DOCTYPE html>
+    const reviewHtml = `<!DOCTYPE html>
         <html>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; color: #333;">
             <div style="background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px;">
@@ -2162,25 +3957,323 @@ export async function sendChangeOrderToClientCore(
                 Sent via ProBuild &bull; ${escapeHtml(companyName)}
             </p>
         </body>
-        </html>`,
-        undefined,
-        { fromName: companyName, replyTo: settings?.email || undefined, cc: changeOrderCc, copyToInternal: true }
-    );
-
-    // Log activity
-    await (dependencies.logActivity ?? logActivityLazy)({
-        projectId,
-        actorType: "TEAM",
-        actorName: companyName,
-        action: "sent_change_order",
-        entityType: "change_order",
-        entityId: changeOrderId,
-        entityName: `Change Order ${code || title}`,
+        </html>`;
+    const internalCopies = (settings?.notificationEmail?.trim() || CLIENT_DOC_COPY_EMAIL)
+        .split(",")
+        .map(email => email.trim())
+        .filter(Boolean);
+    const dispatch = buildFrozenNotification({
+        to: [client.email],
+        subject: `${companyName} sent you a change order to review`,
+        html: reviewHtml,
+        fromName: companyName,
+        replyTo: settings?.email || undefined,
+        cc: changeOrderCc,
+        bcc: internalCopies,
     });
+    const expectedSettings = reviewEmailSettingsExpectation({
+        recipients: canonicalChangeOrderRecipients(client.email, client.additionalEmail),
+        notificationEmail: settings?.notificationEmail,
+        email: settings?.email,
+        companyName: settings?.companyName,
+    });
+    const previewGeneration = dependencies.previewGeneration?.trim() || newChangeOrderReviewGeneration();
+    if (previewGeneration.length > 200) {
+        return { success: false, error: "Change-order review generation is invalid — reload and try again." };
+    }
+
+    let reviewJob: { id: string };
+    try {
+        reviewJob = await prisma.$transaction(async (tx) => {
+            const [locked] = await tx.$queryRaw<Array<{
+                status: string;
+                revision: number;
+                totalAmount: unknown;
+            }>>`
+                SELECT "status", "revision", "totalAmount"
+                FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+            if (!locked || (locked.status !== "Draft" && locked.status !== "Sent")
+                || locked.revision !== outcome.revision
+                || Math.round(Number(locked.totalAmount) * 100) !== Math.round(coSubtotal * 100)) {
+                throw new Error("REVIEW_PREP_REVISION_CONFLICT");
+            }
+            // CO -> review jobs is the global lock order. This cancels only
+            // never-attempted older previews and blocks an ambiguous delivery.
+            await prepareChangeOrderReviewJobsForMutation(tx, changeOrderId);
+            return enqueueReviewEmailAutomationJob(tx, {
+                changeOrderId,
+                eventRevision: outcome.revision,
+                generationKey: previewGeneration,
+                dispatch,
+                payload: {
+                    expectedRevision: outcome.revision,
+                    expectedTaxFingerprint: outcome.taxFingerprint,
+                    expectedTaxTerms: outcome.taxTerms,
+                    expectedRecipients: canonicalChangeOrderRecipients(client.email, client.additionalEmail),
+                    expectedSubtotalCents: Math.round(coSubtotal * 100),
+                    companyName,
+                    expectedSettings,
+                },
+            });
+        }, { timeout: 15_000 });
+    } catch (error) {
+        const detail = error instanceof ChangeOrderReviewDeliveryUnresolvedError
+            ? error.message
+            : `Change order ${code} was modified while the email was being prepared — review it and send again.`;
+        return { success: false, code: "REVISION_CONFLICT", error: detail };
+    }
+
+    const injectedFrozenSender = dependencies.sendFrozenNotification
+        ?? (dependencies.sendNotification
+            ? async (frozen: FrozenNotification, _idempotencyKey: string) => {
+                const sent = await dependencies.sendNotification!(
+                    frozen.to.join(","),
+                    frozen.subject,
+                    frozen.html,
+                    undefined,
+                    {
+                        fromName: companyName,
+                        replyTo: frozen.replyTo,
+                        cc: frozen.cc,
+                        bcc: frozen.bcc,
+                    },
+                );
+                if (!sent.success) return { success: false as const, ambiguous: false };
+                if (!sent.id) return { success: false as const, ambiguous: true };
+                return { success: true as const, id: sent.id };
+            }
+            : undefined);
+    await drainChangeOrderAutomationJobs(
+        { jobId: reviewJob.id, limit: 1 },
+        {
+            executeJob: job => executeReviewEmailAutomationJob(job, {
+                ...(injectedFrozenSender ? { sendFrozenNotification: injectedFrozenSender } : {}),
+            }),
+        },
+    );
+    const finalJob = await prisma.changeOrderAutomationJob.findUnique({
+        where: { id: reviewJob.id },
+        select: { status: true, result: true, lastError: true },
+    });
+    const finalResult = finalJob?.result && typeof finalJob.result === "object" && !Array.isArray(finalJob.result)
+        ? finalJob.result as Record<string, unknown>
+        : null;
+    if (finalJob?.status !== "SUCCEEDED") {
+        const conflictCode = finalResult?.code;
+        const codeValue = conflictCode === "REVISION_CONFLICT"
+            || conflictCode === "TAX_TERMS_CONFLICT"
+            || conflictCode === "RECIPIENT_CONFLICT"
+            ? conflictCode
+            : undefined;
+        return {
+            success: false,
+            ...(codeValue ? { code: codeValue } : {}),
+            error: typeof finalResult?.error === "string"
+                ? finalResult.error
+                : (finalJob?.lastError || "The review email is queued for safe retry; the change order remains unsent."),
+        };
+    }
+    const finalRevision = Number(finalResult?.revision);
+    if (!Number.isSafeInteger(finalRevision) || finalRevision < 0) {
+        return { success: false, error: "Review email delivered but its durable result is incomplete; verify before resending." };
+    }
 
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders/${changeOrderId}`);
     (dependencies.revalidatePath ?? revalidatePath)(`/projects/${projectId}/change-orders`);
-    return { success: true, sentTo: client.email, revision: outcome.revision };
+    return { success: true, sentTo: client.email, revision: finalRevision };
+}
+
+type ManualMilestoneAttemptResult = {
+    delivered: boolean;
+    recorded: boolean;
+    deliveryAmbiguous?: boolean;
+    deliveredButUnrecorded?: boolean;
+    error?: string;
+    payload?: MilestoneInvoiceEmailAttemptPayload;
+};
+
+async function deliverManualMilestoneAttempt(
+    invoiceId: string,
+    requestedRecipients?: MilestoneRecipientSet,
+): Promise<ManualMilestoneAttemptResult> {
+    const attemptRef = await prisma.invoiceEmailAttempt.findUnique({
+        where: { invoiceId },
+        select: { attemptKey: true },
+    });
+    if (!attemptRef) return { delivered: false, recorded: false, error: "The frozen milestone email attempt no longer exists." };
+    const invoiceRef = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+    if (!invoiceRef) return { delivered: false, recorded: false, error: "Invoice not found" };
+
+    const checkpoint = await prisma.$transaction(async tx => {
+        await lockMoneyParents(tx, {
+            estimateId: invoiceRef.estimateId,
+            invoiceId,
+            allowInvoiceEmailAttemptKey: attemptRef.attemptKey,
+        });
+        const row = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+        const payload = row?.kind === "MILESTONE"
+            ? parseMilestoneInvoiceEmailAttemptPayload(row.payload)
+            : null;
+        if (!row || !payload || row.attemptKey !== attemptRef.attemptKey) {
+            return { ok: false as const, error: "The frozen milestone email attempt is missing or invalid; verify delivery before retrying." };
+        }
+        if (!canRetryProviderAttempt(row.startedAt, new Date())) {
+            return { ok: false as const, error: "The frozen milestone email exceeded the provider idempotency window. Verify delivery before any new send." };
+        }
+
+        if (!row.providerStartedAt) {
+            const liveInvoice = await tx.invoice.findUnique({
+                where: { id: invoiceId },
+                include: {
+                    project: { include: { client: true } },
+                    client: true,
+                },
+            });
+            if (!liveInvoice) return { ok: false as const, error: "Invoice not found" };
+            // Same first-attempt order as whole-invoice delivery: Estimate ->
+            // Invoice -> Client -> CompanySettings. A provider-started retry
+            // never enters this branch and remains byte-identically frozen.
+            const lockedDestinations = await lockInvoiceDeliveryRecipientSet(tx, {
+                clientId: liveInvoice.clientId,
+                overrideEmail: payload.overrideEmail,
+            });
+            const liveRecipients = lockedDestinations.visible;
+            const completeRecipientConflict = completeFrozenRecipientConflictError({
+                expected: payload.dispatch,
+                current: lockedDestinations.complete,
+            });
+            const recipientConflict = milestoneRecipientConflictError({
+                expected: payload.recipients,
+                current: liveRecipients,
+            });
+            const requestedRecipientConflict = milestoneRecipientConflictError({
+                expected: payload.recipients,
+                current: requestedRecipients ?? payload.recipients,
+            });
+            const current = await tx.paymentSchedule.findMany({
+                where: { invoiceId, id: { in: payload.milestoneIds } },
+                select: {
+                    id: true,
+                    name: true,
+                    amount: true,
+                    status: true,
+                    qbInvoiceSentAt: true,
+                    qbInvoiceId: true,
+                    qbInvoiceLink: true,
+                    qbSyncError: true,
+                },
+            });
+            const currentStates = current.map((payment): MilestoneAttemptState => ({
+                id: payment.id,
+                name: payment.name,
+                amount: Number(payment.amount),
+                status: payment.status,
+                qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                qbInvoiceId: payment.qbInvoiceId ?? "",
+                qbInvoiceLink: payment.qbInvoiceLink,
+                qbSyncError: payment.qbSyncError,
+            }));
+            const stateConflict = milestoneDeliveryStateConflictError({
+                expectedFingerprint: payload.financialFingerprint,
+                invoiceId,
+                current: currentStates,
+            });
+            if (completeRecipientConflict || recipientConflict || requestedRecipientConflict
+                || current.length !== payload.milestoneIds.length || stateConflict) {
+                await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+                return {
+                    ok: false as const,
+                    error: completeRecipientConflict || recipientConflict || requestedRecipientConflict || stateConflict
+                        || "The selected milestone set changed before provider delivery; review it again.",
+                };
+            }
+            await tx.invoiceEmailAttempt.update({
+                where: { invoiceId },
+                data: { providerStartedAt: new Date() },
+            });
+        }
+        return { ok: true as const, attemptKey: row.attemptKey, payload };
+    }, { timeout: 15_000 });
+    if (!checkpoint.ok) return { delivered: false, recorded: false, error: checkpoint.error };
+
+    let providerAccepted = false;
+    try {
+        return await prisma.$transaction(async tx => {
+        await lockMoneyParents(tx, {
+            estimateId: invoiceRef.estimateId,
+            invoiceId,
+            allowInvoiceEmailAttemptKey: checkpoint.attemptKey,
+        });
+        const row = await tx.invoiceEmailAttempt.findUnique({ where: { invoiceId } });
+        const payload = row?.kind === "MILESTONE"
+            ? parseMilestoneInvoiceEmailAttemptPayload(row.payload)
+            : null;
+        if (!row || !payload || row.attemptKey !== checkpoint.attemptKey || !row.providerStartedAt) {
+            return { delivered: false, recorded: false, error: "The frozen milestone provider checkpoint is missing or invalid; verify delivery before retrying." };
+        }
+        if (!canRetryProviderAttempt(row.startedAt, new Date())) {
+            return { delivered: false, recorded: false, error: "The frozen milestone email exceeded the provider idempotency window. Verify delivery before any new send.", payload };
+        }
+
+        const provider = await defaultSendFrozenNotification(payload.dispatch, row.attemptKey);
+        if (!provider.success) {
+            if (!provider.ambiguous) await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+            return {
+                delivered: false,
+                recorded: false,
+                ...(provider.ambiguous ? { deliveryAmbiguous: true } : {}),
+                error: provider.ambiguous
+                    ? "Email provider outcome is ambiguous — retry only this frozen milestone attempt/key; do not create a new send."
+                    : "Email provider rejected the payment request.",
+                payload,
+            };
+        }
+        providerAccepted = true;
+
+        const sentAt = new Date();
+        for (const state of payload.milestones) {
+            const stamped = await tx.paymentSchedule.updateMany({
+                where: {
+                    id: state.id,
+                    invoiceId,
+                    name: state.name,
+                    amount: state.amount,
+                    status: state.status,
+                    qbInvoiceSentAt: state.qbInvoiceSentAt ? new Date(state.qbInvoiceSentAt) : null,
+                    qbInvoiceId: state.qbInvoiceId,
+                    qbInvoiceLink: state.qbInvoiceLink,
+                    qbSyncError: state.qbSyncError,
+                },
+                data: { qbInvoiceSentAt: sentAt },
+            });
+            if (stamped.count !== 1) {
+                throw new Error("the exact milestone state could not be stamped");
+            }
+        }
+        await tx.invoice.updateMany({
+            where: { id: invoiceId, status: "Draft" },
+            data: { status: "Issued", issueDate: sentAt },
+        });
+        await tx.invoiceEmailAttempt.delete({ where: { invoiceId } });
+        return { delivered: true, recorded: true, payload };
+        }, { timeout: 45_000 });
+    } catch (error: any) {
+        if (providerAccepted) {
+            return {
+                delivered: true,
+                recorded: false,
+                deliveredButUnrecorded: true,
+                error: `Email delivered, but atomic milestone bookkeeping failed (${error?.message || "unknown error"}). Keep this frozen attempt and verify delivery; do not resend.`,
+                payload: checkpoint.payload,
+            };
+        }
+        return {
+            delivered: false,
+            recorded: false,
+            error: error?.message || "Email provider failed before milestone bookkeeping.",
+            payload: checkpoint.payload,
+        };
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2291,7 +4384,7 @@ export async function createChangeOrderDraft(input: ChangeOrderDraftInput) {
                 name: schedule.name?.trim() || `Payment ${index + 1}`,
                 amount: amountCents / 100,
                 dueDate,
-                order: schedule.order ?? index,
+                order: index,
             };
         });
     } catch (error: any) {
@@ -2542,33 +4635,26 @@ export async function updatePendingMilestoneAmountsCore(
     const warnings: string[] = [];
     if (qbAffected.length > 0) {
         try {
-            const { getFreshQBTokens, pushMilestoneToQuickBooks, claimQBInvoiceUnlink } = await import("./quickbooks-payments");
-            const { deleteQBInvoice, probeQBInvoice } = await import("./quickbooks");
+            const {
+                getFreshQBTokens,
+                pushMilestoneToQuickBooks,
+                unlinkQBInvoiceAfterProviderConfirmation,
+            } = await import("./quickbooks-payments");
             const tokens = await getFreshQBTokens();
             for (const row of qbAffected) {
                 try {
-                    const probe = await probeQBInvoice(tokens, row.oldQbInvoiceId);
-                    if (probe.state === "error") {
-                        warnings.push(`"${row.name}": couldn't reach QuickBooks to replace the staged invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
-                        continue;
-                    }
-                    if (probe.state === "ok" && (probe.paymentTxnIds.length > 0 || Math.abs(probe.balance - probe.total) > 0.005)) {
-                        // A payment landed on the old QBO invoice in the seconds since
-                        // the preflight passed. Do NOT delete or unlink — leave the link
-                        // so the poller settles it — but the local amount has already
-                        // changed, so tell the user to reconcile this milestone now.
-                        warnings.push(`"${row.name}": a payment just landed on its old QuickBooks invoice, but the milestone amount here already changed — run "Refresh QB payments" and reconcile this milestone before sending anything.`);
-                        continue;
-                    }
-                    const alreadyGone = probe.state === "voided" || probe.state === "notFound";
-                    if (!alreadyGone && !(await deleteQBInvoice(tokens, row.oldQbInvoiceId))) {
-                        warnings.push(`"${row.name}": couldn't delete the old QuickBooks invoice — it still shows the old details. Retry, or use "Break QB Link" and re-stage.`);
-                        continue;
-                    }
-                    // Old QBO invoice is confirmed gone — now clear the link, atomically
-                    // (a concurrent settle still wins the claim and we stop here).
-                    if (!(await claimQBInvoiceUnlink(prisma, row.scheduleId, row.oldQbInvoiceId))) {
-                        warnings.push(`"${row.name}": milestone changed while replacing its QuickBooks invoice — refresh and review before re-staging.`);
+                    const unlinked = await unlinkQBInvoiceAfterProviderConfirmation(
+                        prisma,
+                        tokens,
+                        {
+                            paymentScheduleId: row.scheduleId,
+                            invoiceId,
+                            qbInvoiceId: row.oldQbInvoiceId,
+                            deleteInQBO: true,
+                        },
+                    );
+                    if (!unlinked.ok) {
+                        warnings.push(`"${row.name}": ${unlinked.error}`);
                         continue;
                     }
                     await pushMilestoneToQuickBooks(row.scheduleId, tokens);
@@ -2612,11 +4698,20 @@ export async function deleteInvoiceMilestoneCore(
         if (locked.sourceScheduleId) {
             throw new Error("This milestone is linked to the estimate — remove it from the estimate's payment schedule instead");
         }
-        if (locked.qbInvoiceId) {
-            throw new Error(`This milestone has a QuickBooks invoice staged — break the QuickBooks link first, then delete.`);
+        if (paymentScheduleHasProviderOrPaymentEvidence(locked)) {
+            throw new Error(`This milestone has a QuickBooks invoice staged or create/provider/payment evidence — reconcile or break the authoritative link before deleting.`);
         }
-        if (locked.stripeSessionId || locked.stripePaymentIntentId) {
-            throw new Error("A payment is in progress on this milestone — wait for it to finish or void it before deleting");
+        // ProgressBillingLine.scheduleId is intentionally not a foreign key, so
+        // a cascade cannot protect this allocation. Progress-billing writers
+        // take the same Invoice lock; checking beneath it prevents either side
+        // from creating an orphaned line that could make this money billable a
+        // second time.
+        const progressBillingAllocation = await tx.progressBillingLine.findFirst({
+            where: { scheduleId },
+            select: { id: true },
+        });
+        if (progressBillingAllocation) {
+            throw new Error("This milestone is allocated to a progress billing and cannot be deleted. Void or reconcile that billing first.");
         }
 
         await tx.paymentSchedule.delete({ where: { id: scheduleId } });
@@ -2649,6 +4744,51 @@ export async function deleteInvoiceMilestoneCore(
 
         return { success: true as const, projectId: invoice.projectId, invoiceId: invoice.id };
     }));
+}
+
+export function paymentScheduleHasProviderOrPaymentEvidence(row: {
+    status?: string | null;
+    paidAt?: Date | null;
+    paymentDate?: Date | null;
+    receiptSentAt?: Date | null;
+    lastReminderAt?: Date | null;
+    paymentMethod?: string | null;
+    referenceNumber?: string | null;
+    qbInvoiceId?: string | null;
+    qbInvoiceLink?: string | null;
+    qbPaymentId?: string | null;
+    qbSyncedAt?: Date | null;
+    qbInvoiceSentAt?: Date | null;
+    qbSyncError?: string | null;
+    qbCreateRequestId?: string | null;
+    qbCreateFingerprint?: string | null;
+    qbCreateStartedAt?: Date | null;
+    stripeSessionId?: string | null;
+    stripePaymentIntentId?: string | null;
+}): boolean {
+    return (row.status != null && row.status !== "Pending")
+        || Boolean(row.paidAt || row.paymentDate
+            || row.receiptSentAt || row.lastReminderAt || row.paymentMethod || row.referenceNumber
+            || row.qbInvoiceId || row.qbInvoiceLink || row.qbPaymentId || row.qbSyncedAt
+            || row.qbInvoiceSentAt || row.qbSyncError
+            || row.qbCreateRequestId || row.qbCreateFingerprint || row.qbCreateStartedAt
+            || row.stripeSessionId || row.stripePaymentIntentId);
+}
+
+export function invoiceHasAuditEvidence(input: {
+    status: string;
+    sentAt?: Date | null;
+    viewedAt?: Date | null;
+    qbInvoiceId?: string | null;
+    qbSyncedAt?: Date | null;
+    hasEmailAttempt?: boolean;
+    progressBillingCount?: number;
+    payments: Array<Parameters<typeof paymentScheduleHasProviderOrPaymentEvidence>[0]>;
+}): boolean {
+    return input.status !== "Draft"
+        || Boolean(input.sentAt || input.viewedAt || input.qbInvoiceId || input.qbSyncedAt || input.hasEmailAttempt)
+        || (input.progressBillingCount ?? 0) > 0
+        || input.payments.some(paymentScheduleHasProviderOrPaymentEvidence);
 }
 
 /**
@@ -2722,6 +4862,14 @@ export async function splitInvoiceMilestonesCore(
                     { stripeSessionId: { not: null } },
                     { stripePaymentIntentId: { not: null } },
                     { qbInvoiceId: { not: null } },
+                    { qbInvoiceLink: { not: null } },
+                    { qbPaymentId: { not: null } },
+                    { qbSyncedAt: { not: null } },
+                    { qbInvoiceSentAt: { not: null } },
+                    { qbSyncError: { not: null } },
+                    { qbCreateRequestId: { not: null } },
+                    { qbCreateFingerprint: { not: null } },
+                    { qbCreateStartedAt: { not: null } },
                 ],
             },
             select: { name: true },
@@ -2733,6 +4881,25 @@ export async function splitInvoiceMilestonesCore(
         }
 
         await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "re-split");
+
+        // Freeze the exact destructive set under the Invoice lock. Allocation
+        // rows use scheduleId as an audit reference without a database FK, so
+        // deleting even a Draft billing's schedule would orphan billed money
+        // and permit it to be selected again.
+        const destructiveSchedules = await tx.paymentSchedule.findMany({
+            where: { invoiceId, status: { not: "Paid" } },
+            select: { id: true },
+        });
+        const destructiveScheduleIds = destructiveSchedules.map((schedule) => schedule.id);
+        const progressBillingAllocation = destructiveScheduleIds.length > 0
+            ? await tx.progressBillingLine.findFirst({
+                where: { scheduleId: { in: destructiveScheduleIds } },
+                select: { id: true },
+            })
+            : null;
+        if (progressBillingAllocation) {
+            throw new Error("Cannot re-split milestones allocated to a progress billing. Void or reconcile that billing first.");
+        }
 
         // Recalculate: the paid portion survives untouched, and only the pending
         // portion is replaced. totalAmount must keep counting the surviving paid
@@ -2750,7 +4917,7 @@ export async function splitInvoiceMilestonesCore(
             : paidAmount > 0 ? "Partially Paid"
             : "Issued";
 
-        await tx.paymentSchedule.deleteMany({ where: { invoiceId, status: { not: "Paid" } } });
+        await tx.paymentSchedule.deleteMany({ where: { id: { in: destructiveScheduleIds } } });
         // NOTE: this drops sourceScheduleId links on any replaced row — see the
         // KNOWN LIMITATION above. Rebalancing amounts in place (without touching
         // links) should go through updatePendingMilestoneAmountsCore instead.

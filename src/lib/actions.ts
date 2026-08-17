@@ -21,7 +21,7 @@ import { isHttpUrl } from "./url-safety";
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
-import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, accessibleProjectIds, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
 import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
@@ -32,8 +32,13 @@ import { postDailyLogSummary } from "./chat-webhook";
 import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { recordPaymentCore } from "./payment-record-core";
-import { ChangeOrderRevisionConflictError, ChangeOrderTaxTermsConflictError, deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
+import { ChangeOrderRevisionConflictError, ChangeOrderTaxTermsConflictError, approveChangeOrderCore, deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
+import {
+    ChangeOrderParentDeleteBlockedError,
+    prepareChangeOrderReviewJobsForMutation,
+    prepareChangeOrdersForParentDelete,
+} from "./change-order-automation-jobs";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
 import type { ChangeOrderUpdateInput } from "./change-order-core";
@@ -2726,7 +2731,8 @@ export async function approveEstimate(estimateId: string, signatureName: string,
 }
 
 export async function deleteInvoice(invoiceId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
 
     // Guard failures return { error } instead of throwing: production masks
     // thrown server-action messages, so the client would never see the reason.
@@ -2735,16 +2741,27 @@ export async function deleteInvoice(invoiceId: string) {
         await lockMoneyParents(tx, { invoiceId });
         const invoice = await tx.invoice.findUnique({
             where: { id: invoiceId },
-            include: { payments: true },
+            include: {
+                payments: true,
+                progressBillings: { select: { id: true } },
+                emailAttempt: { select: { invoiceId: true } },
+            },
         });
         if (!invoice) throw new Error("Invoice not found");
 
-        const hasPaidPayments = invoice.payments.some((p) => p.status === "Paid");
-        if (hasPaidPayments) throw new Error("Cannot delete an invoice with recorded payments");
-        if (invoice.status === "Paid" || invoice.status === "Partially Paid") {
-            throw new Error("Cannot delete a paid or partially paid invoice");
+        const { assertInvoiceHasNoChangeOrderBilling, invoiceHasAuditEvidence } = await import("./billing-core");
+        if (invoiceHasAuditEvidence({
+            status: invoice.status,
+            sentAt: invoice.sentAt,
+            viewedAt: invoice.viewedAt,
+            qbInvoiceId: invoice.qbInvoiceId,
+            qbSyncedAt: invoice.qbSyncedAt,
+            hasEmailAttempt: Boolean(invoice.emailAttempt),
+            progressBillingCount: invoice.progressBillings.length,
+            payments: invoice.payments,
+        })) {
+            throw new Error("Cannot delete an invoice with financial, provider, send, or progress-billing history");
         }
-        const { assertInvoiceHasNoChangeOrderBilling } = await import("./billing-core");
         await assertInvoiceHasNoChangeOrderBilling(tx, invoiceId, "delete");
 
         await tx.invoice.delete({ where: { id: invoiceId } });
@@ -2758,7 +2775,8 @@ export async function deleteInvoice(invoiceId: string) {
     }
 }
 export async function updateInvoiceNotes(invoiceId: string, notes: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: { notes },
@@ -2771,7 +2789,8 @@ export async function sendInvoiceToClient(invoiceId: string, overrideEmail?: str
     // Customer-facing send from the UI — require the invoices permission (this
     // export is a remotely invokable server action). Core logic lives in
     // billing-core.ts so the shared-secret-gated MCP connector can reuse it.
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
     const { sendInvoiceToClientCore } = await import("./billing-core");
     return sendInvoiceToClientCore(invoiceId, overrideEmail);
 }
@@ -2782,11 +2801,12 @@ export async function sendMilestoneInvoices(
     overrideEmail?: string,
     // Per-milestone reconcile intents the user explicitly confirmed in the review
     // step: scheduleId -> the QBO total they saw and approved.
-    opts?: { reconcile?: Record<string, number> },
+    opts?: { reconcile?: Record<string, number>; allowResend?: boolean },
 ) {
     // Permission gate stays here (remotely invokable server action); the send
     // logic lives in billing-core.ts, shared with the MCP connector.
     const actor = await assertInvoicePermission();
+    await assertInvoicePaymentsAccess(invoiceId, paymentScheduleIds, actor);
     const { sendMilestoneInvoicesCore } = await import("./billing-core");
     return sendMilestoneInvoicesCore(invoiceId, paymentScheduleIds, overrideEmail, opts, actor.name || "");
 }
@@ -2990,9 +3010,14 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
 export async function emailInvoiceCopyToMe(
     invoiceId: string
 ): Promise<{ success: boolean; sentTo?: string; error?: string }> {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) return { success: false, error: "Unauthorized" };
-    if (!hasPermission(user, "invoices")) return { success: false, error: "Forbidden" };
+    let user: any;
+    try {
+        user = await assertInvoicePermission();
+        await assertInvoiceAccess(invoiceId, user);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Forbidden";
+        return { success: false, error: message };
+    }
     if (!user.email) return { success: false, error: "Your account has no email address" };
 
     const invoice = await prisma.invoice.findUnique({
@@ -3488,7 +3513,8 @@ export async function createOneOffInvoice(
     projectId: string,
     items: { name: string; amount: number; dueDate?: string | null }[],
 ) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceProjectAccess(projectId, invoiceUser);
 
     if (!items.length) throw new Error("At least one line item is required");
 
@@ -3538,7 +3564,8 @@ export async function createOneOffInvoice(
 }
 
 export async function createInvoiceFromTimeEntries(projectId: string, timeEntryIds: string[]) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceProjectAccess(projectId, invoiceUser);
     if (!timeEntryIds.length) throw new Error("No time entries selected");
 
     const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
@@ -3613,7 +3640,8 @@ export async function createInvoiceFromTimeEntries(projectId: string, timeEntryI
     return result;
 }
 export async function getInvoice(id: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(id, invoiceUser);
     const invoice = await prisma.invoice.findUnique({
         where: { id },
         include: {
@@ -3669,7 +3697,8 @@ export async function recordPayment(
         notes?: string | null;
     },
 ) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(paymentId, invoiceUser, invoiceId);
 
     const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
@@ -3730,7 +3759,8 @@ export async function updateMonthlyOverhead(amount: number) {
 
 /** Create (or fetch) the QuickBooks invoice + hosted pay link for one milestone. */
 export async function createQBPaymentLink(paymentId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(paymentId, invoiceUser);
     try {
         const { pushMilestoneToQuickBooks } = await import("./quickbooks-payments");
         const res = await pushMilestoneToQuickBooks(paymentId);
@@ -3749,7 +3779,8 @@ export async function createQBPaymentLink(paymentId: string) {
 
 /** Pull settled QuickBooks payments for one invoice right now (on-view refresh). */
 export async function refreshQBPayments(invoiceId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
     const { syncQuickBooksPayments } = await import("./quickbooks-payments");
     const result = await syncQuickBooksPayments({ invoiceId });
     if (result.settled > 0) {
@@ -3770,15 +3801,16 @@ export async function refreshQBPayments(invoiceId: string) {
  * clearing these fields on a Pending milestone changes no status, fires no
  * notifyMilestonePaid, and doesn't touch the estimate mirror (which has no QB fields).
  *
- * `deleteInQBO` is wired for a future "also delete in QuickBooks" toggle but defaults
- * OFF — we never issue a destructive QBO write (voided invoices are often kept as a
- * deliberate audit record; a deleted one is already gone).
+ * `deleteInQBO` defaults OFF. In that mode QuickBooks must already report the
+ * invoice voided/deleted; a live invoice remains linked and fenced. When true,
+ * provider deletion must succeed before the local generation can advance.
  */
 export async function breakQBInvoiceLink(
     paymentId: string,
     opts?: { deleteInQBO?: boolean },
 ): Promise<{ success: true; warning?: string } | { success: false; error: string }> {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(paymentId, invoiceUser);
 
     const schedule = await prisma.paymentSchedule.findUnique({
         where: { id: paymentId },
@@ -3798,33 +3830,40 @@ export async function breakQBInvoiceLink(
         return { success: false, error: "This milestone has no QuickBooks link to break." };
     }
 
-    // Claim the unlink atomically via the shared helper (also used by
-    // updatePendingMilestoneAmountsCore) — see its doc comment for the race it closes.
-    const { claimQBInvoiceUnlink } = await import("./quickbooks-payments");
-    const cleared = await claimQBInvoiceUnlink(prisma, schedule.id, schedule.qbInvoiceId);
-    if (!cleared) {
-        return { success: false, error: "This milestone changed while unlinking (it may have just been paid or re-synced). Refresh and try again." };
+    // Provider-first: never clear/rotate locally while the old collectible QBO
+    // invoice may still exist. The helper probes, optionally deletes, re-probes a
+    // failed delete, and only then runs the guarded final local CAS.
+    let unlinkResult;
+    try {
+        const {
+            getFreshQBTokens,
+            unlinkQBInvoiceAfterProviderConfirmation,
+        } = await import("./quickbooks-payments");
+        const tokens = await getFreshQBTokens();
+        unlinkResult = await unlinkQBInvoiceAfterProviderConfirmation(
+            prisma,
+            tokens,
+            {
+                paymentScheduleId: schedule.id,
+                invoiceId: schedule.invoiceId,
+                qbInvoiceId: schedule.qbInvoiceId,
+                deleteInQBO: opts?.deleteInQBO === true,
+            },
+        );
+    } catch {
+        return {
+            success: false,
+            error: "QuickBooks is unavailable, so the link and replacement-create identity were left unchanged.",
+        };
     }
-
-    // Only after we've claimed the local unlink do we (optionally) clean up QBO.
-    // Default OFF — we never issue a destructive QBO write unless asked.
-    let warning: string | undefined;
-    if (opts?.deleteInQBO === true) {
-        try {
-            const { getFreshQBTokens } = await import("./quickbooks-payments");
-            const { deleteQBInvoice } = await import("./quickbooks");
-            const tokens = await getFreshQBTokens();
-            const deleted = await deleteQBInvoice(tokens, schedule.qbInvoiceId);
-            if (!deleted) warning = "Link cleared in ProBuild, but the QuickBooks invoice could not be deleted (it may already be gone, or has a linked payment — check QuickBooks).";
-        } catch {
-            warning = "Link cleared in ProBuild, but QuickBooks delete could not be attempted (QuickBooks unavailable).";
-        }
+    if (!unlinkResult.ok) {
+        return { success: false, error: unlinkResult.error };
     }
 
     revalidatePath(`/projects/${schedule.invoice.projectId}/invoices/${schedule.invoiceId}`);
     revalidatePath(`/invoices`);
     revalidatePath(`/portal`);
-    return { success: true, warning };
+    return { success: true };
 }
 
 export async function recordEstimatePayment(
@@ -4007,7 +4046,8 @@ export async function recordEstimatePayment(
 }
 
 export async function sendPaymentReceipt(paymentScheduleId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(paymentScheduleId, invoiceUser);
     const { sendInvoicePaymentReceiptOnly } = await import("./payment-notifications");
     const result = await sendInvoicePaymentReceiptOnly(paymentScheduleId);
 
@@ -4190,6 +4230,85 @@ async function assertEstimatePermission() {
 
 async function assertInvoicePermission() {
     return assertStaffPermission("invoices");
+}
+
+/** Horizontal scope paired with the result of the action's invoices-permission gate. */
+async function assertInvoiceProjectAccess(projectId: string, user: any) {
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+/** Resolve an invoice's owner from the database; caller-supplied parent ids are not proof. */
+async function invoiceOwnerOrThrow(invoiceId: string) {
+    const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: { projectId: true },
+    });
+    if (!invoice?.projectId) throw new Error("Invoice not found");
+    return invoice;
+}
+
+/** Resolve an existing invoice's owner and apply the caller's project scope. */
+async function assertInvoiceAccess(invoiceId: string, user: any) {
+    const invoice = await invoiceOwnerOrThrow(invoiceId);
+    if (!canAccessProject(user, invoice.projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+/**
+ * Resolve a PaymentSchedule through its real Invoice owner before any provider,
+ * email, or mutation core is reached. When an action accepts both ids, bind the
+ * child to that exact invoice rather than trusting the caller-supplied parent.
+ */
+async function assertInvoicePaymentAccess(paymentScheduleId: string, user: any, expectedInvoiceId?: string) {
+    const schedule = await prisma.paymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: {
+            invoiceId: true,
+            invoice: { select: { projectId: true } },
+        },
+    });
+    if (!schedule?.invoice?.projectId) throw new Error("Payment not found");
+    if (!canAccessProject(user, schedule.invoice.projectId)) throw new Error("Forbidden");
+    if (expectedInvoiceId !== undefined && schedule.invoiceId !== expectedInvoiceId) {
+        throw new Error("Payment/invoice mismatch");
+    }
+    return user;
+}
+
+/** Scope an invoice plus every PaymentSchedule child supplied to a bulk action. */
+async function assertInvoicePaymentsAccess(invoiceId: string, paymentScheduleIds: string[], user: any) {
+    const invoice = await invoiceOwnerOrThrow(invoiceId);
+    if (!canAccessProject(user, invoice.projectId)) throw new Error("Forbidden");
+
+    const uniqueIds = Array.from(new Set(paymentScheduleIds));
+    if (uniqueIds.length === 0) return user;
+    const schedules = await prisma.paymentSchedule.findMany({
+        where: { id: { in: uniqueIds } },
+        select: {
+            id: true,
+            invoiceId: true,
+            invoice: { select: { projectId: true } },
+        },
+    });
+    if (schedules.length !== uniqueIds.length) throw new Error("Payment not found");
+    for (const schedule of schedules) {
+        if (!schedule.invoice?.projectId) throw new Error("Payment not found");
+        if (!canAccessProject(user, schedule.invoice.projectId)) throw new Error("Forbidden");
+        if (schedule.invoiceId !== invoiceId) throw new Error("Payment/invoice mismatch");
+    }
+    return user;
+}
+
+/** Resolve an existing retainer's owner and apply the caller's project scope. */
+async function assertRetainerAccess(retainerId: string, user: any) {
+    const retainer = await prisma.retainer.findUnique({
+        where: { id: retainerId },
+        select: { projectId: true },
+    });
+    if (!retainer?.projectId) throw new Error("Retainer not found");
+    if (!canAccessProject(user, retainer.projectId)) throw new Error("Forbidden");
+    return user;
 }
 
 async function assertChangeOrderPermission() {
@@ -4661,7 +4780,8 @@ export async function addInvoiceMilestone(
     invoiceId: string,
     input: { name: string; amount: number; dueDate?: string | null },
 ) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
 
     const name = (input.name || "").trim();
     const amount = Number(input.amount);
@@ -4704,7 +4824,8 @@ export async function splitInvoiceMilestones(
     invoiceId: string,
     milestones: { name: string; amount: number; dueDate?: string | null }[],
 ) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
 
     // Guard failures return { error } instead of throwing: production masks
     // thrown server-action messages, so the client would never see the reason.
@@ -4732,7 +4853,8 @@ export async function updatePendingMilestoneAmounts(
     invoiceId: string,
     rows: { scheduleId: string; name: string; amount: number; dueDate?: string | null }[],
 ) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentsAccess(invoiceId, rows.map((row) => row.scheduleId), invoiceUser);
 
     const { updatePendingMilestoneAmountsCore } = await import("./billing-core");
     const result = await updatePendingMilestoneAmountsCore(invoiceId, rows);
@@ -4754,7 +4876,8 @@ export async function updatePendingMilestoneAmounts(
  * Break QB Link first; this action is DB-only.
  */
 export async function deleteInvoiceMilestone(scheduleId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(scheduleId, invoiceUser);
 
     const { deleteInvoiceMilestoneCore } = await import("./billing-core");
     const result = await deleteInvoiceMilestoneCore(scheduleId);
@@ -4769,7 +4892,8 @@ export async function deleteInvoiceMilestone(scheduleId: string) {
 }
 
 export async function unrecordPayment(paymentId: string, invoiceId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoicePaymentAccess(paymentId, invoiceUser, invoiceId);
 
     const projectId = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. This flow releases the invoice
@@ -4881,7 +5005,8 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
 }
 
 export async function getProjectInvoices(projectId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceProjectAccess(projectId, invoiceUser);
     return await prisma.invoice.findMany({
         where: { projectId },
         orderBy: { createdAt: "desc" },
@@ -4890,8 +5015,10 @@ export async function getProjectInvoices(projectId: string) {
 }
 
 export async function getAllInvoices() {
-    await assertInvoicePermission();
+    const user = await assertInvoicePermission();
+    const projectIds = accessibleProjectIds(user);
     return await prisma.invoice.findMany({
+        where: projectIds === "ALL" ? undefined : { projectId: { in: projectIds } },
         orderBy: { createdAt: "desc" },
         include: {
             project: { select: { id: true, name: true } },
@@ -4901,7 +5028,8 @@ export async function getAllInvoices() {
 }
 
 export async function issueInvoice(invoiceId: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceAccess(invoiceId, invoiceUser);
     const invoice = await prisma.invoice.update({
         where: { id: invoiceId },
         data: {
@@ -5094,54 +5222,201 @@ export async function saveCompanySettings(data: any) {
     return { success: true };
 }
 
-export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
-    await assertEstimateAccess(estimateId);
-    const estimate = await prisma.estimate.findUnique({
-        where: { id: estimateId },
-        select: { projectId: true, leadId: true, status: true },
-    });
-    if (!estimate) return { success: false, error: "Estimate not found" };
-    const PROTECTED_STATUSES = new Set(["Approved", "Invoiced", "Partially Paid", "Paid"]);
-    if (PROTECTED_STATUSES.has(estimate.status)) return { success: false, error: `${estimate.status} estimates cannot be deleted` };
+class EstimateDeleteRejectedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "EstimateDeleteRejectedError";
+    }
+}
 
-    // Check if there are any linked Expenses or TimeEntries
-    const expenseCount = await prisma.expense.count({
-        where: { estimateId }
-    });
-    const timeEntryCount = await prisma.timeEntry.count({
-        where: {
-            estimateItem: {
-                estimateId
+export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
+    const { user } = await assertEstimateAccess(estimateId);
+    const PROTECTED_STATUSES = new Set(["Approved", "Invoiced", "Partially Paid", "Paid"]);
+
+    let deletion: { projectId: string | null; leadId: string | null };
+    try {
+        deletion = await prisma.$transaction(async tx => {
+            // Billing locks ChangeOrder before Estimate, so preserve that canonical
+            // order while reconciling every existing CO/job. Any rejection below is
+            // thrown (not returned), ensuring this helper's safe-job deletions roll
+            // back together with the refused parent deletion.
+            const discoveredChangeOrders = await tx.changeOrder.findMany({
+                where: { estimateId },
+                select: { id: true },
+                orderBy: { id: "asc" },
+            });
+            const prepared = await prepareChangeOrdersForParentDelete(tx, { estimateIds: [estimateId] });
+
+            // Lock and re-read the parent before any destructive write. Concurrent
+            // estimate saves that committed after authorization are visible here;
+            // later FK-backed child inserts must now serialize with this transaction.
+            const locked = await tx.$queryRaw<Array<{
+                id: string;
+                projectId: string | null;
+                leadId: string | null;
+                status: string;
+                sentAt: Date | null;
+                viewedAt: Date | null;
+                approvedAt: Date | null;
+                signatureUrl: string | null;
+                termsAndConditions: string | null;
+                qbEstimateId: string | null;
+                qbSyncedAt: Date | null;
+                contractId: string | null;
+            }>>`
+                SELECT "id", "projectId", "leadId", "status", "sentAt", "viewedAt",
+                       "approvedAt", "signatureUrl", "termsAndConditions", "qbEstimateId", "qbSyncedAt", "contractId"
+                FROM "Estimate"
+                WHERE "id" = ${estimateId}
+                FOR UPDATE`;
+            const estimate = locked[0];
+            if (!estimate) {
+                throw new EstimateDeleteRejectedError("Estimate not found");
+            }
+
+            // Ownership can move between the authorization lookup and this lock.
+            // Reapply the same scope decision to the canonical locked row.
+            assertEstimateScope(user, estimate);
+            if (PROTECTED_STATUSES.has(estimate.status)) {
+                throw new EstimateDeleteRejectedError(`${estimate.status} estimates cannot be deleted`);
+            }
+            if (estimate.sentAt || estimate.viewedAt || estimate.approvedAt
+                || estimate.signatureUrl || estimate.termsAndConditions || estimate.qbEstimateId
+                || estimate.qbSyncedAt || estimate.contractId) {
+                throw new EstimateDeleteRejectedError(
+                    "Sent or externally processed estimates must be archived, not deleted",
+                );
+            }
+
+            // A CO insert/delete can win either discovery gap before this parent
+            // lock. The lock freezes further inserts; compare stable identities as
+            // well as the helper count so even an equal-count replacement is refused
+            // rather than removed by cascade without reconciliation.
+            const currentChangeOrders = await tx.changeOrder.findMany({
+                where: { estimateId },
+                select: { id: true },
+                orderBy: { id: "asc" },
+            });
+            const unchangedChangeOrderSet = prepared.changeOrders === discoveredChangeOrders.length
+                && currentChangeOrders.length === discoveredChangeOrders.length
+                && currentChangeOrders.every((row, index) => row.id === discoveredChangeOrders[index]?.id);
+            if (!unchangedChangeOrderSet) {
+                throw new EstimateDeleteRejectedError(
+                    "Estimate change orders changed during deletion. Please try again.",
+                );
+            }
+
+            // TimeEntry references EstimateItem rather than Estimate. Lock all item
+            // parents in a stable order before counting so an in-flight/new entry
+            // either becomes visible to this count or waits until deletion commits.
+            await tx.$queryRaw<Array<{ id: string }>>`
+                SELECT "id"
+                FROM "EstimateItem"
+                WHERE "estimateId" = ${estimateId}
+                ORDER BY "id"
+                FOR UPDATE`;
+            await tx.$queryRaw<Array<{ id: string }>>`
+                SELECT "id"
+                FROM "EstimatePaymentSchedule"
+                WHERE "estimateId" = ${estimateId}
+                ORDER BY "id"
+                FOR UPDATE`;
+
+            const expenseCount = await tx.expense.count({ where: { estimateId } });
+            const timeEntryCount = await tx.timeEntry.count({
+                where: { estimateItem: { estimateId } },
+            });
+            if (expenseCount > 0 || timeEntryCount > 0) {
+                const parts = [];
+                if (expenseCount > 0) parts.push(`${expenseCount} expense(s)`);
+                if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
+                throw new EstimateDeleteRejectedError(
+                    `Cannot delete estimate because it has linked ${parts.join(" and ")}. Please delete these entries first.`,
+                );
+            }
+            const [
+                fileCount,
+                providerScheduleCount,
+                invoiceCount,
+                budgetCount,
+                generatedScheduleCount,
+                takeoffCount,
+                manuallyLinkedScheduleCount,
+                legacyPurchaseOrderLinkCount,
+                purchaseOrderJoinCount,
+            ] = await Promise.all([
+                tx.estimateFile.count({ where: { estimateId } }),
+                tx.estimatePaymentSchedule.count({
+                    where: {
+                        estimateId,
+                        OR: [
+                            { status: { not: "Pending" } },
+                            { stripeSessionId: { not: null } },
+                            { stripePaymentIntentId: { not: null } },
+                            { receiptSentAt: { not: null } },
+                            { paidAt: { not: null } },
+                            { paymentDate: { not: null } },
+                        ],
+                    },
+                }),
+                tx.invoice.count({ where: { estimateId } }),
+                tx.budget.count({ where: { estimateId } }),
+                tx.scheduleTask.count({ where: { generatedFromEstimateId: estimateId } }),
+                tx.takeoff.count({ where: { estimateId } }),
+                tx.scheduleTask.count({ where: { estimateItem: { estimateId } } }),
+                tx.estimateItem.count({
+                    where: { estimateId, purchaseOrderId: { not: null } },
+                }),
+                tx.estimateItemPurchaseOrder.count({
+                    where: { estimateItem: { estimateId } },
+                }),
+            ]);
+            if (fileCount > 0 || providerScheduleCount > 0) {
+                throw new EstimateDeleteRejectedError(
+                    "Estimate files or payment-provider history must be archived, not deleted",
+                );
+            }
+            if (invoiceCount > 0 || budgetCount > 0 || generatedScheduleCount > 0 || takeoffCount > 0
+                || manuallyLinkedScheduleCount > 0 || legacyPurchaseOrderLinkCount > 0 || purchaseOrderJoinCount > 0) {
+                throw new EstimateDeleteRejectedError(
+                    "Estimate billing, budget, schedule, takeoff, or procurement history must be archived, not deleted",
+                );
+            }
+
+            // Every destructive child write remains in this transaction, after the
+            // canonical locks and rechecks above.
+            await tx.budget.deleteMany({ where: { estimateId } });
+            await tx.estimateItem.deleteMany({ where: { estimateId } });
+            await tx.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
+            await tx.expense.deleteMany({ where: { estimateId } });
+            await tx.estimate.delete({ where: { id: estimateId } });
+            return { projectId: estimate.projectId, leadId: estimate.leadId };
+        });
+    } catch (error: any) {
+        if (error instanceof EstimateDeleteRejectedError) {
+            return { success: false, error: error.message };
+        }
+        if (error instanceof ChangeOrderParentDeleteBlockedError) {
+            return { success: false, error: error.message };
+        }
+        // A new child/job can appear after candidate discovery. PostgreSQL's FK
+        // serialization still prevents data loss; translate that race only when
+        // retained automation history is now present.
+        if (error?.code === "P2003") {
+            const automationRows = await prisma.changeOrderAutomationJob.count({
+                where: { changeOrder: { estimateId } },
+            });
+            if (automationRows > 0) {
+                return { success: false, error: new ChangeOrderParentDeleteBlockedError().message };
             }
         }
-    });
-
-    if (expenseCount > 0 || timeEntryCount > 0) {
-        const parts = [];
-        if (expenseCount > 0) parts.push(`${expenseCount} expense(s)`);
-        if (timeEntryCount > 0) parts.push(`${timeEntryCount} time entry/entries`);
-        return {
-            success: false,
-            error: `Cannot delete estimate because it has linked ${parts.join(" and ")}. Please delete these entries first.`
-        };
+        throw error;
     }
 
-    // Delete related Budget
-    const budget = await prisma.budget.findUnique({ where: { estimateId } });
-    if (budget) {
-        await prisma.budget.delete({ where: { id: budget.id } });
-    }
-
-    // Delete related items, schedules, expenses, and the estimate itself
-    await prisma.estimateItem.deleteMany({ where: { estimateId } });
-    await prisma.estimatePaymentSchedule.deleteMany({ where: { estimateId } });
-    await prisma.expense.deleteMany({ where: { estimateId } });
-    await prisma.estimate.delete({ where: { id: estimateId } });
-
-    if (estimate.projectId) {
-        revalidatePath(`/projects/${estimate.projectId}/estimates`);
-    } else if (estimate.leadId) {
-        revalidatePath(`/leads/${estimate.leadId}`);
+    if (deletion.projectId) {
+        revalidatePath(`/projects/${deletion.projectId}/estimates`);
+    } else if (deletion.leadId) {
+        revalidatePath(`/leads/${deletion.leadId}`);
     } else {
         revalidatePath("/estimates");
     }
@@ -8550,13 +8825,103 @@ export async function updateProjectLocation(projectId: string, location: string)
     return { success: true };
 }
 
-export async function deleteProjects(projectIds: string[]) {
-    await assertActiveStaff();
-    await prisma.project.deleteMany({
-        where: { id: { in: projectIds } }
-    });
+class ProjectAuditHistoryDeleteBlockedError extends Error {
+    constructor() {
+        super("Project financial or legal history must be archived, not hard-deleted");
+        this.name = "ProjectAuditHistoryDeleteBlockedError";
+    }
+}
+
+export async function deleteProjects(projectIds: string[]): Promise<{ success: true; deleted: number } | { success: false; error: string }> {
+    const caller = await assertActiveStaff();
+    if (!["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
+    const ids = [...new Set(projectIds.map(id => id.trim()).filter(Boolean))];
+    if (ids.length === 0) return { success: true, deleted: 0 };
+    let deleted = 0;
+    try {
+        deleted = await prisma.$transaction(async tx => {
+            // Project-scoped automation (schedule/review) locks Project before
+            // ChangeOrder. Lock every requested parent in a stable order before
+            // descendant reconciliation so bulk delete cannot deadlock it.
+            const sortedProjectIds = [...ids].sort();
+            for (const projectId of sortedProjectIds) {
+                await tx.$queryRaw<Array<{ id: string }>>`
+                    SELECT "id" FROM "Project" WHERE "id" = ${projectId} FOR UPDATE
+                `;
+            }
+
+            // Hard-delete is deliberately shell-only. Project owns a broad mix
+            // of CASCADE and SET NULL relations; inferring safety from mutable
+            // legacy statuses can erase payroll, customer communications,
+            // provider recovery keys, legal documents, or orphan an Estimate.
+            // The Project lock above fences every new direct FK child while this
+            // fresh query runs. Pure access/config rows (crew, ProjectAccess,
+            // PortalVisibility) may still cascade; any business/audit row must
+            // be deleted or archived through its own guarded workflow first.
+            const protectedProject = await tx.project.findFirst({
+                where: {
+                    id: { in: ids },
+                    OR: [
+                        { qbProjectId: { not: null } },
+                        { qbSyncedAt: { not: null } },
+                        { googleChatSpaceId: { not: null } },
+                        { chatWebhookUrl: { not: null } },
+                        { clientNextSteps: { not: null } },
+                        { clientNextStepsAt: { not: null } },
+                        { estimates: { some: {} } },
+                        { invoices: { some: {} } },
+                        { budgets: { some: {} } },
+                        { timeEntries: { some: {} } },
+                        { roomDesigns: { some: {} } },
+                        { contracts: { some: {} } },
+                        { scheduleTasks: { some: {} } },
+                        { files: { some: {} } },
+                        { folders: { some: {} } },
+                        { subcontractorAccess: { some: {} } },
+                        { takeoffs: { some: {} } },
+                        { messageThreads: { some: {} } },
+                        { clientMessages: { some: {} } },
+                        { changeOrders: { some: {} } },
+                        { purchaseOrders: { some: {} } },
+                        { selectionBoards: { some: {} } },
+                        { dailyLogs: { some: {} } },
+                        { moodBoards: { some: {} } },
+                        { retainers: { some: {} } },
+                        { bidPackages: { some: {} } },
+                        { teamMessages: { some: {} } },
+                        { activityLogs: { some: {} } },
+                        { productFavorites: { some: {} } },
+                        { selectionProposals: { some: {} } },
+                        { decisions: { some: {} } },
+                        { permits: { some: {} } },
+                    ],
+                },
+                select: { id: true },
+            });
+            if (protectedProject) {
+                throw new ProjectAuditHistoryDeleteBlockedError();
+            }
+            return (await tx.project.deleteMany({ where: { id: { in: ids } } })).count;
+        });
+    } catch (error: any) {
+        if (error instanceof ChangeOrderParentDeleteBlockedError) {
+            return { success: false, error: error.message };
+        }
+        if (error instanceof ProjectAuditHistoryDeleteBlockedError) {
+            return { success: false, error: error.message };
+        }
+        if (error?.code === "P2003") {
+            const automationRows = await prisma.changeOrderAutomationJob.count({
+                where: { changeOrder: { projectId: { in: ids } } },
+            });
+            if (automationRows > 0) {
+                return { success: false, error: new ChangeOrderParentDeleteBlockedError().message };
+            }
+        }
+        throw error;
+    }
     revalidatePath(`/projects`);
-    return { success: true };
+    return { success: true, deleted };
 }
 
 export async function updateCompanyProjectStatuses(statuses: string) {
@@ -9035,7 +9400,7 @@ export async function getChangeOrder(id: string) {
             project: { include: { client: true } },
             estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
-            paymentSchedules: { orderBy: { order: "asc" } },
+            paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }] },
             timeEntries: { include: { user: { select: { name: true, email: true } } }, orderBy: { startTime: "desc" } },
             expenses: { orderBy: { createdAt: "desc" } },
             billings: { include: { paymentSchedule: { select: { id: true, name: true, amount: true, status: true } } }, orderBy: { createdAt: "desc" } },
@@ -9043,16 +9408,33 @@ export async function getChangeOrder(id: string) {
     });
 }
 
+const INTERNAL_PORTAL_SESSION_ROLES = new Set(["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]);
+
 export async function getChangeOrderForPortal(id: string) {
     "use server";
-    // Staff (ADMIN/MANAGER) may preview any change order — mirrors getInvoiceForPortal.
-    const staffSession = await getServerSession(authOptions);
-    const isStaff = ["ADMIN", "MANAGER"].includes((staffSession?.user as any)?.role);
+    // The live User table, not a JWT role or a matching Client email, decides
+    // whether this is an internal identity. ADMIN/MANAGER get a read-only staff
+    // preview; every other live, disabled, or stale internal identity fails
+    // closed instead of falling through to client-by-email authorization.
+    const session = await getServerSession(authOptions);
+    const sessionRole = (session?.user as { role?: string } | undefined)?.role;
+    const sessionEmail = session?.user?.email?.trim();
+    const internalIdentity = sessionEmail
+        ? await prisma.user.findFirst({
+            where: { email: { equals: sessionEmail, mode: "insensitive" } },
+            select: { id: true },
+        })
+        : null;
+    const staffViewer = internalIdentity ? await currentStaffUserOrNull() : null;
+    const isStaffPreview = Boolean(staffViewer && ["ADMIN", "MANAGER"].includes(staffViewer.role));
+    if ((internalIdentity || (sessionRole && INTERNAL_PORTAL_SESSION_ROLES.has(sessionRole))) && !isStaffPreview) {
+        return null;
+    }
 
     // IDOR-4 fix: portal clients are gated by their session's clientId
     let clientFilter = {};
     let lifecycleFilter = {};
-    if (!isStaff) {
+    if (!isStaffPreview) {
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
         clientFilter = { project: { clientId: sessionClientId } };
@@ -9061,7 +9443,7 @@ export async function getChangeOrderForPortal(id: string) {
         lifecycleFilter = { status: { in: ["Sent", "Approved", "Declined"] } };
     }
 
-    return await prisma.changeOrder.findFirst({
+    const changeOrder = await prisma.changeOrder.findFirst({
         where: {
             id,
             ...clientFilter,
@@ -9071,9 +9453,12 @@ export async function getChangeOrderForPortal(id: string) {
             project: { include: { client: true } },
             estimate: { select: { title: true, code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
             items: { orderBy: { order: "asc" } },
-            paymentSchedules: { orderBy: { order: "asc" } }
+            paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }] }
         }
     });
+    return changeOrder
+        ? { ...changeOrder, portalViewerMode: isStaffPreview ? "STAFF_PREVIEW" as const : "CLIENT" as const }
+        : null;
 }
 
 type SerializedChangeOrder = {
@@ -9176,25 +9561,30 @@ export async function approveChangeOrder(
     expectedTaxFingerprint: string,
 ) {
     "use server";
-    // Auth: internal admins skip ownership check; portal clients must prove ownership.
+    // This action records the CLIENT's legal signature. Staff portal access is
+    // preview-only; internal staff must use manuallyApproveChangeOrder so the
+    // audit trail cannot claim that a client signed when staff acted instead.
     const session = await getServerSession(authOptions);
-    let isAdmin = false;
+    const sessionRole = (session?.user as { role?: string } | undefined)?.role;
+    if (sessionRole && INTERNAL_PORTAL_SESSION_ROLES.has(sessionRole)) return null;
+
+    // Defense in depth for an older/stale session whose token has no role (or
+    // the wrong one) but whose email still belongs to an internal staff row.
     if (session?.user?.email) {
-        const internalUser = await prisma.user.findUnique({
-            where: { email: session.user.email },
-            select: { role: true },
-        });
-        isAdmin = !!internalUser && ["ADMIN", "MANAGER"].includes(internalUser.role);
-    }
-    if (!isAdmin) {
-        const sessionClientId = await resolveSessionClientId();
-        if (!sessionClientId) return null;
-        const owned = await prisma.changeOrder.findFirst({
-            where: { id, project: { clientId: sessionClientId } },
+        const internalUser = await prisma.user.findFirst({
+            where: { email: { equals: session.user.email, mode: "insensitive" } },
             select: { id: true },
         });
-        if (!owned) return null;
+        if (internalUser) return null;
     }
+
+    const sessionClientId = await resolveSessionClientId();
+    if (!sessionClientId) return null;
+    const owned = await prisma.changeOrder.findFirst({
+        where: { id, project: { clientId: sessionClientId } },
+        select: { id: true },
+    });
+    if (!owned) return null;
 
     const normalizedSignatureName = signatureName.trim();
     if (!normalizedSignatureName) throw new Error("Your full legal name is required");
@@ -9215,6 +9605,11 @@ export async function approveChangeOrder(
             approvedAt,
             expectedRevision,
             expectedTaxFingerprint,
+        }, {
+            approveCore: (approvalId, approvalInput) => approveChangeOrderCore(approvalId, {
+                ...approvalInput,
+                expectedClientId: sessionClientId,
+            }),
         });
     } catch (error) {
         // The owned upload has already been discarded by the signature helper.
@@ -9231,16 +9626,18 @@ export async function approveChangeOrder(
     if (!approval) return null;
     const { co, transitioned } = approval;
 
-    // Exactly-once post-approval automation: bill the CO onto the invoice and send
-    // the payment link (the signature on the exact amount is the approval), with a
-    // team notification either way. Scheduled AFTER the response so the customer's
-    // signing screen never waits on QuickBooks; falls back to inline best-effort
-    // outside a request context.
+    // The durable job graph was committed atomically with approval. Drain only
+    // this event after the response for low latency; the cron route permanently
+    // backs up every pending/stale job if this process is interrupted.
     if (transitioned) {
         const runAutomation = async () => {
             try {
-                const { handleChangeOrderApproved } = await import("./billing-core");
-                await handleChangeOrderApproved(id, { freshlyApproved: true });
+                const { drainChangeOrderAutomationUntilIdle } = await import("./change-order-automation");
+                await drainChangeOrderAutomationUntilIdle({
+                    changeOrderId: id,
+                    eventRevision: co.revision,
+                    limit: 10,
+                });
             } catch (err) {
                 console.error("[approveChangeOrder] post-approval automation failed:", err);
             }
@@ -9266,12 +9663,9 @@ export async function approveChangeOrder(
 // editor's "Sign Now" flow captures a typed name rather than a drawn signature.
 export async function countersignChangeOrderAsCompany(id: string, signerName: string, signatureDataUrl?: string) {
     "use server";
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) throw new Error("Not authenticated");
-
-    // Role gate — only ADMIN/MANAGER can countersign on behalf of the company.
-    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } });
-    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+    // The canonical staff loader rejects DISABLED users before the role gate.
+    const user = await assertActiveStaff();
+    if (user.role !== "ADMIN" && user.role !== "MANAGER") throw new Error("Forbidden");
 
     if (!signerName.trim()) throw new Error("Signer name is required");
 
@@ -9303,22 +9697,37 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         }
     };
 
-    // Atomic idempotency guard — the extended unique filter only matches the id
-    // while companySignedAt is still NULL and status is signable, so two
-    // concurrent requests cannot both succeed. `update` also returns the exact
-    // post-write revision for the editor's next same-tab CAS operation.
-    let updated: { revision: number };
+    // Lock the CO before its review jobs (the canonical lock order shared by
+    // editor/audit/send). This prevents a countersignature from landing while a
+    // frozen review dispatch is in-flight or ambiguous.
+    let updated: { revision: number; projectId: string };
     try {
-        updated = await prisma.changeOrder.update({
-            where: { id, companySignedAt: null, status: { in: ["Sent", "Approved"] } },
-            data: {
-                companySignedBy: signerName.trim(),
-                companySignedAt: new Date(),
-                companySignatureUrl,
-                revision: { increment: 1 },
-            },
-            select: { revision: true },
-        });
+        updated = await prisma.$transaction(async (tx) => {
+            const [locked] = await tx.$queryRaw<Array<{
+                projectId: string;
+                status: string;
+                companySignedAt: Date | null;
+            }>>`
+                SELECT "projectId", "status", "companySignedAt"
+                FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
+            if (!locked) throw new Error("Change order not found");
+            if (locked.status !== "Sent" && locked.status !== "Approved") {
+                throw new Error("Change order must be Sent before it can be countersigned");
+            }
+            if (locked.companySignedAt) throw new Error("Change order already countersigned by company");
+            await prepareChangeOrderReviewJobsForMutation(tx, id);
+            const saved = await tx.changeOrder.update({
+                where: { id },
+                data: {
+                    companySignedBy: signerName.trim(),
+                    companySignedAt: new Date(),
+                    companySignatureUrl,
+                    revision: { increment: 1 },
+                },
+                select: { revision: true },
+            });
+            return { ...saved, projectId: locked.projectId };
+        }, { timeout: 15_000 });
     } catch (error) {
         if ((error as { code?: string })?.code === "P2025") {
             // Deterministic: the conditional update matched nothing, so this
@@ -9340,8 +9749,8 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
         throw error;
     }
 
-    revalidatePath(`/projects/${existing.projectId}/change-orders/${id}`);
-    revalidatePath(`/projects/${existing.projectId}/change-orders`);
+    revalidatePath(`/projects/${updated.projectId}/change-orders/${id}`);
+    revalidatePath(`/projects/${updated.projectId}/change-orders`);
     return { success: true, revision: updated.revision };
 }
 
@@ -9357,10 +9766,8 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 // lookup), so canAccessProject below has something real to check — same
 // project-scope pattern as the tag/type/code actions
 // (updateProjectTags/updateProjectType via assertProjectMemberStaff). The
-// post-approval billing automation runs exactly as it does for the portal
-// path, except the client-facing milestone payment email is suppressed (see
-// handleChangeOrderApproved's suppressClientEmails option and its own
-// DB-derived backstop for callers, like the cron sweep, that don't pass it).
+// approval transaction structurally omits the client-email job for this path;
+// the shared durable drainer handles the remaining bill/schedule/team graph.
 export async function manuallyApproveChangeOrder(id: string, expectedRevision: number, expectedTaxFingerprint: string): Promise<ChangeOrderMutationActionResult> {
     "use server";
     const user = await assertActiveStaff();
@@ -9398,14 +9805,17 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     if (!approval) throw new Error("Change order not found");
     const { co, transitioned } = approval;
 
-    // Exactly-once post-approval automation, same as approveChangeOrder — bill
-    // onto the invoice and notify the team, with client emails suppressed since
-    // no client ever saw or signed this change order.
+    // Drain the durable manual-approval graph. It contains no client-email row,
+    // so suppression is structural rather than a best-effort runtime flag.
     if (transitioned) {
         const runAutomation = async () => {
             try {
-                const { handleChangeOrderApproved } = await import("./billing-core");
-                await handleChangeOrderApproved(id, { freshlyApproved: true, suppressClientEmails: true });
+                const { drainChangeOrderAutomationUntilIdle } = await import("./change-order-automation");
+                await drainChangeOrderAutomationUntilIdle({
+                    changeOrderId: id,
+                    eventRevision: co.revision,
+                    limit: 10,
+                });
             } catch (err) {
                 console.error("[manuallyApproveChangeOrder] post-approval automation failed:", err);
             }
@@ -9430,9 +9840,10 @@ export async function sendChangeOrderToClient(
     changeOrderId: string,
     expectedRevision: number,
     expectedTaxFingerprint: string,
+    previewGeneration: string,
 ): Promise<
     | { success: true; sentTo: string; revision: number }
-    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
+    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" | "RECIPIENT_CONFLICT" }
 > {
     "use server";
     // Customer-facing send from the UI — require the changeOrders permission
@@ -9445,7 +9856,7 @@ export async function sendChangeOrderToClient(
     if (!target) return { success: false, error: "Change order not found" };
     if (!canAccessProject(user, target.projectId)) return { success: false, error: "Forbidden" };
     const { sendChangeOrderToClientCore } = await import("./billing-core");
-    return sendChangeOrderToClientCore(changeOrderId, { expectedRevision, expectedTaxFingerprint });
+    return sendChangeOrderToClientCore(changeOrderId, { expectedRevision, expectedTaxFingerprint, previewGeneration });
 }
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {
@@ -13487,7 +13898,8 @@ export async function createRetainer(projectId: string, data: {
     notes?: string;
     dueDate?: string;
 }) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertInvoiceProjectAccess(projectId, invoiceUser);
     const project = await prisma.project.findUnique({
         where: { id: projectId },
         select: { clientId: true },
@@ -13523,7 +13935,8 @@ export async function updateRetainer(id: string, data: {
     dueDate?: string | null;
     status?: string;
 }) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertRetainerAccess(id, invoiceUser);
     const existing = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true, amountPaid: true } });
     if (!existing) throw new Error("Retainer not found");
 
@@ -13547,7 +13960,8 @@ export async function updateRetainer(id: string, data: {
 }
 
 export async function deleteRetainer(id: string) {
-    await assertInvoicePermission();
+    const invoiceUser = await assertInvoicePermission();
+    await assertRetainerAccess(id, invoiceUser);
     const retainer = await prisma.retainer.findUnique({ where: { id }, select: { projectId: true } });
     if (!retainer) return { success: false };
 

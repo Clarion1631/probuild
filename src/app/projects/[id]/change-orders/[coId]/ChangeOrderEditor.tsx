@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { coTaxFingerprint, coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 
 // handleSave's return type: the server action returns a JSON-serialized Prisma row,
 // but status/revision are the only fields the manual-approval CAS and Send-for-Approval
@@ -54,6 +55,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     );
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
+    const isManualApproval = isManualCoApproval({ ...initialData, status });
+    const manualApprovedByName = staffNameFromManualApprovedBy(initialData.approvedBy);
     const canManuallyApprove = context.canManuallyApprove
         && (status === "Draft" || status === "Sent")
         && !initialData.clientSignatureUrl;
@@ -368,6 +371,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     initialData.id,
                                     saved.revision,
                                     coTaxFingerprint(sendTaxInfo),
+                                    crypto.randomUUID(),
                                 );
                                 if (result.success) {
                                     setStatus("Sent");
@@ -700,12 +704,25 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <span className={`px-2 py-0.5 rounded text-xs border ${
                                     initialData.approvedBy ? "bg-green-100 text-green-800 border-green-200" :
                                     "bg-slate-100 text-slate-600 border-slate-200"
-                                }`}>{initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
+                                }`}>{isManualApproval ? "Approved manually" : initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
                             </div>
                             <div className="p-6 grid grid-cols-2 gap-8">
                                 <div className="border border-slate-200 rounded-lg p-6 bg-slate-50/50">
-                                    <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">Client Signature</h4>
-                                    {initialData.approvedBy ? (
+                                    <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">
+                                        {isManualApproval ? "Staff Approval" : "Client Signature"}
+                                    </h4>
+                                    {isManualApproval ? (
+                                        <div className="space-y-4">
+                                            <div className="bg-amber-50 p-4 border border-amber-200 rounded min-h-[100px] flex flex-col items-center justify-center text-center">
+                                                <p className="text-sm font-semibold text-amber-900">Approved without a client signature</p>
+                                                <p className="text-xs text-amber-700 mt-1">Recorded by authorized staff.</p>
+                                            </div>
+                                            <div className="text-sm text-slate-600">
+                                                <p><strong>Approved By:</strong> {manualApprovedByName}</p>
+                                                <p><strong>Approved At:</strong> {new Date(initialData.approvedAt).toLocaleString()}</p>
+                                            </div>
+                                        </div>
+                                    ) : initialData.approvedBy ? (
                                         <div className="space-y-4">
                                             <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
                                                 {initialData.clientSignatureUrl ? (

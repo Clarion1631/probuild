@@ -1194,7 +1194,7 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         where: { id: coId },
         include: {
             items: { orderBy: { order: 'asc' } },
-            paymentSchedules: { orderBy: { order: 'asc' } },
+            paymentSchedules: { orderBy: [{ order: 'asc' }, { id: 'asc' }] },
             project: { include: { client: true } },
             estimate: true,
         },

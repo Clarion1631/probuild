@@ -10,7 +10,15 @@ import { allocateCoScheduleGross, coTaxFingerprint, coTaxRate, coTaxLabel, coLin
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 import { buildPdf } from "@/lib/build-pdf";
 
-export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
+export default function PortalChangeOrderClient({
+    initialData,
+    companySettings,
+    isStaffPreview,
+}: {
+    initialData: any;
+    companySettings?: any;
+    isStaffPreview: boolean;
+}) {
     const [isApproving, setIsApproving] = useState(false);
     const [signature, setSignature] = useState("");
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
@@ -191,8 +199,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         )}
                         {isDownloading ? "Generating..." : "Download PDF"}
                     </button>
-                    <Link data-pdf-skip="true" href={`/portal/projects/${initialData.projectId}`} className="text-sm text-blue-600 hover:underline">
-                        Back to Portal
+                    <Link
+                        data-pdf-skip="true"
+                        href={isStaffPreview
+                            ? `/projects/${initialData.projectId}/change-orders/${initialData.id}`
+                            : `/portal/projects/${initialData.projectId}`}
+                        className="text-sm text-blue-600 hover:underline"
+                    >
+                        {isStaffPreview ? "Back to Staff Change Order" : "Back to Portal"}
                     </Link>
                     {isApproved && (
                         <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">{isManualApproval ? "✓ Approved" : "✓ Approved & Signed"}</span>
@@ -422,7 +436,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                     </div>
 
                     {/* Signature / Approval Area */}
-                    {isSent && (
+                    {isSent && !isStaffPreview && (
                         <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
@@ -489,6 +503,22 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                         </div>
                                     )}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+                    {isSent && isStaffPreview && (
+                        <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
+                            <div className="border-t-2 border-slate-200 pt-8 text-center">
+                                <h3 className="text-lg font-bold text-slate-800 mb-2">Staff Preview — Read Only</h3>
+                                <p className="text-sm text-slate-500 max-w-xl mx-auto mb-5">
+                                    Client signature controls are disabled in staff preview. To record an approval on the client&apos;s behalf, use Manual Approve from the staff change-order editor so the audit trail identifies it as a staff action.
+                                </p>
+                                <Link
+                                    href={`/projects/${initialData.projectId}/change-orders/${initialData.id}`}
+                                    className="hui-btn hui-btn-secondary inline-flex"
+                                >
+                                    Open Staff Change Order for Manual Approve
+                                </Link>
                             </div>
                         </div>
                     )}

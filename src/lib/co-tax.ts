@@ -93,9 +93,9 @@ export function coSignedAmount(totalAmount: number, estimate: EstimateTaxInfo): 
 
 /**
  * Convert staff/storage pre-tax schedule rows to the customer/billing gross
- * rows. This is the fixed billing allocator: earlier rows round their own tax,
- * and the final row absorbs both the pre-tax and tax cent remainder so the
- * gross rows sum exactly to subtotal + tax.
+ * rows. This is the fixed billing allocator: tax is rounded cumulatively, and
+ * the final row absorbs both the pre-tax and tax cent remainder so every row is
+ * nonnegative and the gross rows sum exactly to subtotal + tax.
  */
 export function allocateCoScheduleGross<T extends { amount?: number | string | { toString(): string } | null }>(
     subtotal: number,
@@ -108,18 +108,57 @@ export function allocateCoScheduleGross<T extends { amount?: number | string | {
     const totalTaxCents = Math.round(subtotalCents * rate);
     let allocatedPretaxCents = 0;
     let allocatedTaxCents = 0;
-    return rows.map((row, index) => {
+    const allocated = rows.map((row, index) => {
         const isLast = index === rows.length - 1;
         const pretaxCents = isLast
             ? subtotalCents - allocatedPretaxCents
             : Math.round((Number(row.amount) || 0) * 100);
-        const taxCents = isLast
-            ? totalTaxCents - allocatedTaxCents
-            : Math.round(pretaxCents * rate);
+        if (pretaxCents < 0) {
+            throw new Error("Change-order schedule rows exceed the signed subtotal.");
+        }
+        // Round tax on the cumulative pre-tax amount, then subtract what prior
+        // rows already received. Independent per-row rounding can over-allocate
+        // many sub-cent tax amounts and force a negative final-row remainder.
+        const cumulativeTaxCents = isLast
+            ? totalTaxCents
+            : Math.round((allocatedPretaxCents + pretaxCents) * rate);
+        const taxCents = cumulativeTaxCents - allocatedTaxCents;
+        if (taxCents < 0) {
+            throw new Error("Change-order schedule tax allocation produced a negative row.");
+        }
         allocatedPretaxCents += pretaxCents;
         allocatedTaxCents += taxCents;
         return { ...row, pretaxCents, taxCents, grossCents: pretaxCents + taxCents };
     });
+    if (allocatedPretaxCents !== subtotalCents || allocatedTaxCents !== totalTaxCents) {
+        throw new Error("Change-order schedule allocation does not match the signed total.");
+    }
+    return allocated;
+}
+
+export type CoScheduleAmount = {
+    amount?: number | string | { toString(): string } | null;
+};
+
+/**
+ * One fixed-schedule invariant shared by send, both approval paths, and billing.
+ * No rows means one ordinary invoice milestone; a split requires 2+ positive
+ * rows whose rounded cents sum exactly to the signed pre-tax subtotal.
+ */
+export function fixedCoScheduleValidationError(
+    subtotalCents: number,
+    rows: readonly CoScheduleAmount[],
+): string | null {
+    if (rows.length === 0) return null;
+    if (rows.length === 1) return "Fixed change-order splits require at least two schedule rows";
+    const rowCents = rows.map((row) => Math.round(Number(row.amount) * 100));
+    if (rowCents.some((cents) => !Number.isSafeInteger(cents) || cents <= 0)) {
+        return "Every fixed change-order schedule amount must be greater than zero";
+    }
+    if (!Number.isSafeInteger(subtotalCents) || rowCents.reduce((sum, cents) => sum + cents, 0) !== subtotalCents) {
+        return "Change-order schedule amounts are out of sync with the signed subtotal";
+    }
+    return null;
 }
 
 // Integer-cents line math shared by the CO editor, the portal signature page,

@@ -191,6 +191,10 @@ jobs:
       # against the throwaway DB — so unlike the provider secrets above it's a
       # literal here rather than a repo secret (there's nothing to rotate).
       DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+      # Disposable key for the MCP route confirmation regressions. It is not a
+      # production credential and is inherited by both Playwright and Next's
+      # webServer process on the throwaway CI database.
+      MCP_SECRET: "e2e-ci-mcp-secret"
       # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
       # its deterministic keyword fallback instead of calling Gemini, so
       # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
@@ -206,7 +210,9 @@ jobs:
       STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_PUBLISHABLE_KEY }}
       NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_PUBLISHABLE_KEY }}
       STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
-      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      # Intentionally no RESEND_API_KEY: browser tests exercise successful CO
+      # send/approval flows and must use email.ts's deterministic local delivery
+      # instead of contacting the real customer-email provider.
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}

@@ -618,6 +618,9 @@ const approvalInput = (signatureName: string) => ({
   expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
 });
 
+const approveAsInvariantPortalClient: typeof approveChangeOrderCore = (changeOrderId, approval) =>
+  approveChangeOrderCore(changeOrderId, { ...approval, expectedClientId: COI.client });
+
 test.describe.serial("Money pipeline: change-order lifecycle invariants", () => {
   test.beforeAll(async () => {
     await coInvariantPrisma.client.upsert({
@@ -651,6 +654,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       COI.driftApproval, COI.approvedDelete, COI.unsigned, COI.companySigned,
       COI.noOpSent, COI.legacySignedDraft,
     ];
+    await coInvariantPrisma.changeOrderAutomationJob.deleteMany({ where: { changeOrderId: { in: ids } } });
     await coInvariantPrisma.changeOrder.deleteMany({ where: { id: { in: ids } } });
 
     async function createChangeOrder(id: string, status: string, totalAmount: number, withItem: boolean, itemId?: string) {
@@ -722,6 +726,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
 
   test.afterAll(async () => {
     try {
+      await coInvariantPrisma.changeOrderAutomationJob.deleteMany({ where: { changeOrder: { projectId: COI.project } } });
       await coInvariantPrisma.changeOrder.deleteMany({ where: { projectId: COI.project } });
       await coInvariantPrisma.estimate.deleteMany({ where: { id: COI.estimate } });
       await coInvariantPrisma.project.deleteMany({ where: { id: COI.project } });
@@ -732,7 +737,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
   });
 
   test("CO1: generic updates cannot perform Draft -> Sent", async () => {
-    const message = await rejectionMessage(updateChangeOrderCore(COI.rawDraft, { status: "Sent" }));
+    const message = await rejectionMessage(updateChangeOrderCore(COI.rawDraft, { status: "Sent", expectedRevision: 0 }));
     expect(message).toContain("Send for Approval");
     const co = await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.rawDraft } });
     expect(co.status).toBe("Draft");
@@ -744,7 +749,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const message = await rejectionMessage(approveChangeOrderWithSignature(
       COI.draftApproval,
       approvalInput("Invariant Signer"),
-      { persistSignature: approvalSignatures.persistSignature },
+      { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     ));
     expect(message).toContain("must be Sent");
     expect(approvalSignatures.objects).toEqual(new Set());
@@ -752,7 +757,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
   });
 
   test("CO3: approval requires at least one item", async () => {
-    const message = await rejectionMessage(approveChangeOrderCore(COI.emptySent, {
+    const message = await rejectionMessage(approveAsInvariantPortalClient(COI.emptySent, {
       signatureName: "Invariant Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
@@ -768,7 +773,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const message = await rejectionMessage(approveChangeOrderWithSignature(
       COI.zeroSent,
       approvalInput("Zero Signer"),
-      { persistSignature: approvalSignatures.persistSignature },
+      { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     ));
     expect(message).toContain("positive subtotal");
     expect(approvalSignatures.objects).toEqual(new Set());
@@ -781,12 +786,12 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       approveChangeOrderWithSignature(
         COI.validSent,
         approvalInput("First Signer"),
-        { persistSignature: approvalSignatures.persistSignature },
+        { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
       ),
       approveChangeOrderWithSignature(
         COI.validSent,
         approvalInput("Second Signer"),
-        { persistSignature: approvalSignatures.persistSignature },
+        { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
       ),
     ]);
 
@@ -804,7 +809,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const first = await approveChangeOrderWithSignature(
       COI.replaySent,
       approvalInput("Original Signer"),
-      { persistSignature: approvalSignatures.persistSignature },
+      { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     );
     expect(first?.transitioned).toBe(true);
     const committed = await coInvariantPrisma.changeOrder.findUniqueOrThrow({
@@ -815,7 +820,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const message = await rejectionMessage(approveChangeOrderWithSignature(
       COI.replaySent,
       approvalInput("Replay Signer"),
-      { persistSignature: approvalSignatures.persistSignature },
+      { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     ));
 
     expect(message).toContain("must be Sent");
@@ -850,7 +855,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     const result = await approveChangeOrderWithSignature(
       "co-invariant-missing",
       approvalInput("Missing Signer"),
-      { persistSignature: approvalSignatures.persistSignature },
+      { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     );
     expect(result).toBeNull();
     expect(approvalSignatures.objects).toEqual(new Set());
@@ -927,11 +932,12 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       where: { id: COI.approved },
       include: { items: true },
     });
-    const titleMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { title: "Mutated signed title" }));
+    const titleMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { title: "Mutated signed title", expectedRevision: original.revision }));
     expect(titleMessage).toContain("signed scope is locked");
-    const descriptionMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { description: "Mutated signed description" }));
+    const descriptionMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, { description: "Mutated signed description", expectedRevision: original.revision }));
     expect(descriptionMessage).toContain("signed scope is locked");
     const itemsMessage = await rejectionMessage(updateChangeOrderCore(COI.approved, {
+      expectedRevision: original.revision,
       items: [{ id: original.items[0].id, name: "Mutated item", quantity: 2, unitCost: 100, order: 0 }],
     }));
     expect(itemsMessage).toContain("signed scope is locked");
@@ -960,7 +966,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     }, { timeout: 15_000 });
 
     await writerHasLock;
-    const approval = approveChangeOrderCore(COI.race, {
+    const approval = approveAsInvariantPortalClient(COI.race, {
       signatureName: "Racing Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
@@ -995,6 +1001,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
 
   test("CO8: duplicate item IDs cannot inflate the stored subtotal", async () => {
     const message = await rejectionMessage(updateChangeOrderCore(COI.duplicate, {
+      expectedRevision: 0,
       items: [
         { id: COI.duplicateItem, name: "Invariant item", quantity: 1, unitCost: 100, order: 0 },
         { id: COI.duplicateItem, name: "Invariant item", quantity: 1, unitCost: 100, order: 1 },
@@ -1014,6 +1021,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
 
   test("CO9: editing Sent scope demotes it to Draft and invalidates a stale approval", async () => {
     const updated = await updateChangeOrderCore(COI.stale, {
+      expectedRevision: 0,
       title: "Repriced after client render",
       items: [{ id: COI.staleItem, name: "Invariant item", quantity: 1, unitCost: 200, order: 0 }],
     });
@@ -1021,7 +1029,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
     expect(updated.sentAt).toBeNull();
     expect(Number(updated.totalAmount)).toBe(200);
 
-    const message = await rejectionMessage(approveChangeOrderCore(COI.stale, {
+    const message = await rejectionMessage(approveAsInvariantPortalClient(COI.stale, {
       signatureName: "Stale-page Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
@@ -1042,7 +1050,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
   });
 
   test("CO11: approval rejects stored subtotal drift from rendered items", async () => {
-    const message = await rejectionMessage(approveChangeOrderCore(COI.driftApproval, {
+    const message = await rejectionMessage(approveAsInvariantPortalClient(COI.driftApproval, {
       signatureName: "Drift Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
@@ -1060,7 +1068,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
   });
 
   test("CO13: approval requires a persisted client signature", async () => {
-    const message = await rejectionMessage(approveChangeOrderCore(COI.unsigned, {
+    const message = await rejectionMessage(approveAsInvariantPortalClient(COI.unsigned, {
       signatureName: "Unsigned Signer",
       clientSignatureUrl: null,
       approvedAt: new Date(),
@@ -1073,6 +1081,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
 
   test("CO14: company-countersigned scope is immutable before client approval", async () => {
     const message = await rejectionMessage(updateChangeOrderCore(COI.companySigned, {
+      expectedRevision: 0,
       items: [{ id: COI.companySignedItem, name: "Mutated after company signature", quantity: 1, unitCost: 200, order: 0 }],
     }));
     expect(message).toContain("signed scope is locked");
@@ -1087,6 +1096,7 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       include: { items: true },
     });
     const updated = await updateChangeOrderCore(COI.noOpSent, {
+      expectedRevision: before.revision,
       title: before.title,
       description: before.description,
       items: before.items.map((item) => ({

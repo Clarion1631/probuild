@@ -39,6 +39,7 @@ type ChangeOrderRow = {
     termsTaxExempt: boolean | null;
     termsTaxRateName: string | null;
     termsTaxRatePercent: number | null;
+    projectId: string;
     estimateId: string;
     revision: number;
 };
@@ -49,16 +50,22 @@ const calls = {
     /** SELECT ... FOR UPDATE row locks taken, in order. */
     rowLocks: [] as string[],
     changeOrderUpdates: [] as Array<{ where: { id: string }; data: Record<string, unknown> }>,
+    automationJobUpserts: [] as Array<Record<string, any>>,
+    automationJobUpdates: [] as Array<Record<string, any>>,
     estimateTaxReads: 0,
 };
 
 const state: {
     changeOrder: ChangeOrderRow | null;
+    project: { id: string; clientId: string | null } | null;
+    reassignClientBeforeProjectLock: string | null;
     estimateTax: { taxExempt: boolean; taxRateName: string | null; taxRatePercent: number | null };
     items: ItemRow[];
     schedules: Array<{ id: string; name: string; amount: number; dueDate: Date | null; order: number }>;
 } = {
     changeOrder: null,
+    project: { id: "project-1", clientId: "client-1" },
+    reassignClientBeforeProjectLock: null,
     estimateTax: { taxExempt: false, taxRateName: "Approval rate", taxRatePercent: 8.9 },
     items: [],
     schedules: [],
@@ -67,8 +74,12 @@ const state: {
 function resetFixture() {
     calls.rowLocks.length = 0;
     calls.changeOrderUpdates.length = 0;
+    calls.automationJobUpserts.length = 0;
+    calls.automationJobUpdates.length = 0;
     calls.estimateTaxReads = 0;
     state.changeOrder = null;
+    state.project = { id: "project-1", clientId: "client-1" };
+    state.reassignClientBeforeProjectLock = null;
     state.estimateTax = { taxExempt: false, taxRateName: "Approval rate", taxRatePercent: 8.9 };
     state.items = [];
     state.schedules = [];
@@ -97,6 +108,15 @@ const fakePrisma = {
             $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
                 const sql = strings.join("?").trim();
                 calls.rowLocks.push(sql + ` [${values.join(",")}]`);
+                if (sql.includes('FROM "Project"')) {
+                    if (state.reassignClientBeforeProjectLock) {
+                        state.project = state.project
+                            ? { ...state.project, clientId: state.reassignClientBeforeProjectLock }
+                            : null;
+                        state.reassignClientBeforeProjectLock = null;
+                    }
+                    return state.project && state.project.id === values[0] ? [{ ...state.project }] : [];
+                }
                 if (sql.includes('FROM "Estimate"')) {
                     calls.estimateTaxReads++;
                     return values[0] === state.changeOrder?.estimateId ? [{ ...state.estimateTax }] : [];
@@ -124,9 +144,38 @@ const fakePrisma = {
                 },
             },
             changeOrder: {
+                findUnique: async (args: { where: { id: string } }) =>
+                    state.changeOrder?.id === args.where.id
+                        ? { id: state.changeOrder.id, projectId: state.changeOrder.projectId }
+                        : null,
                 update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
                     calls.changeOrderUpdates.push(args);
                     return applyUpdateData(state.changeOrder!, args.data);
+                },
+            },
+            changeOrderAutomationJob: {
+                findMany: async () => [],
+                upsert: async (args: Record<string, any>) => {
+                    calls.automationJobUpserts.push(args);
+                    return {
+                        attempts: 0,
+                        maxAttempts: 8,
+                        nextAttemptAt: null,
+                        firstProviderAttemptAt: null,
+                        processingStartedAt: null,
+                        claimToken: null,
+                        providerMessageId: null,
+                        lastError: null,
+                        completedAt: null,
+                        result: null,
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                        ...args.create,
+                    };
+                },
+                updateMany: async (args: Record<string, any>) => {
+                    calls.automationJobUpdates.push(args);
+                    return { count: 0 };
                 },
             },
         };
@@ -146,6 +195,7 @@ let approveChangeOrderCore: (
         approvedAt: Date;
         expectedRevision: number;
         expectedTaxFingerprint: string;
+        expectedClientId: string;
     },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 let updateChangeOrderCore: (id: string, data: Record<string, unknown>) => Promise<any>;
@@ -230,6 +280,7 @@ function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderR
         termsTaxExempt: null,
         termsTaxRateName: null,
         termsTaxRatePercent: null,
+        projectId: "project-1",
         estimateId: "estimate-1",
         revision: FIXTURE_REVISION,
         ...overrides,
@@ -265,6 +316,13 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     // Manual approval must never write a client signature — that field simply
     // isn't in the update payload at all.
     assert.equal(Object.prototype.hasOwnProperty.call(write.data, "clientSignatureUrl"), false);
+    assert.deepEqual(
+        calls.automationJobUpserts.map(call => call.create.kind),
+        ["APPROVAL_BILL", "APPROVAL_SCHEDULE", "APPROVAL_TEAM_EMAIL"],
+    );
+    assert.ok(calls.automationJobUpserts.every(call => call.create.approvalMode === "MANUAL"));
+    assert.ok(calls.automationJobUpserts.every(call => call.create.eventRevision === FIXTURE_REVISION + 1));
+    assert.equal(calls.automationJobUpserts.some(call => call.create.kind === "APPROVAL_CLIENT_EMAIL"), false);
 });
 
 test("manual approve from Sent preserves the sent terms tuple instead of re-reading live estimate tax", async () => {
@@ -308,6 +366,7 @@ test("portal approval requires the loaded revision and preserves the exact sent 
         approvedAt: new Date("2026-08-15T12:00:00.000Z"),
         expectedRevision: FIXTURE_REVISION,
         expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Sent exact rate", taxRatePercent: 8.875 }),
+        expectedClientId: "client-1",
     });
 
     assert.ok(result);
@@ -316,6 +375,12 @@ test("portal approval requires the loaded revision and preserves the exact sent 
     assert.equal(Object.prototype.hasOwnProperty.call(write.data, "termsTaxExempt"), false);
     assert.equal(result!.co.termsTaxRatePercent, 8.875);
     assert.equal(calls.estimateTaxReads, 0);
+    assert.deepEqual(
+        calls.automationJobUpserts.map(call => call.create.kind),
+        ["APPROVAL_BILL", "APPROVAL_CLIENT_EMAIL", "APPROVAL_SCHEDULE", "APPROVAL_TEAM_EMAIL"],
+    );
+    assert.ok(calls.automationJobUpserts.every(call => call.create.approvalMode === "CLIENT"));
+    assert.ok(calls.automationJobUpserts.every(call => call.create.eventRevision === FIXTURE_REVISION + 1));
 });
 
 test("portal approval rejects a stale revision before writing the uploaded signature URL", async () => {
@@ -335,6 +400,7 @@ test("portal approval rejects a stale revision before writing the uploaded signa
             approvedAt: new Date(),
             expectedRevision: FIXTURE_REVISION,
             expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true, taxRateName: "Exempt", taxRatePercent: 0 }),
+            expectedClientId: "client-1",
         }),
         assertTypedRevisionConflict,
     );
@@ -352,6 +418,7 @@ test("legacy Sent portal approval bootstraps live terms atomically when the disp
         approvedAt: new Date(),
         expectedRevision: FIXTURE_REVISION,
         expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
+        expectedClientId: "client-1",
     });
 
     assert.ok(result);
@@ -360,6 +427,40 @@ test("legacy Sent portal approval bootstraps live terms atomically when the disp
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxExempt, false);
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxRateName, "Legacy displayed terms");
     assert.equal(calls.changeOrderUpdates[0].data.termsTaxRatePercent, 9.125);
+    const projectLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "Project"'));
+    const changeOrderLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "ChangeOrder"'));
+    const estimateLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "Estimate"'));
+    assert.ok(projectLock >= 0 && changeOrderLock > projectLock && estimateLock > changeOrderLock);
+});
+
+test("portal approval fails closed when Project ownership changes after the action precheck", async () => {
+    state.changeOrder = draftChangeOrder({
+        status: "Sent",
+        termsTaxExempt: false,
+        termsTaxRateName: "Sent terms",
+        termsTaxRatePercent: 8.875,
+    });
+    state.items = oneItem;
+    state.reassignClientBeforeProjectLock = "client-2";
+
+    await assert.rejects(
+        () => approveChangeOrderCore("co-1", {
+            signatureName: "Stale Portal Client",
+            clientSignatureUrl: "secure-doc://must-be-discarded.png",
+            approvedAt: new Date("2026-08-16T12:00:00.000Z"),
+            expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Sent terms", taxRatePercent: 8.875 }),
+            expectedClientId: "client-1",
+        }),
+        /no longer belongs to the authenticated portal client/i,
+    );
+
+    const projectLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "Project"'));
+    const changeOrderLock = calls.rowLocks.findIndex(sql => sql.includes('FROM "ChangeOrder"'));
+    assert.ok(projectLock >= 0 && changeOrderLock > projectLock, "approval must lock Project before ChangeOrder");
+    assert.equal(calls.changeOrderUpdates.length, 0, "ownership drift must not approve or write signature fields");
+    assert.equal(calls.automationJobUpserts.length, 0, "ownership drift must not enqueue approval jobs");
+    assert.equal(calls.automationJobUpdates.length, 0, "ownership drift must not mutate review jobs");
 });
 
 test("legacy Sent portal approval rejects a changed live tax fingerprint before storing the signature", async () => {
@@ -374,6 +475,7 @@ test("legacy Sent portal approval rejects a changed live tax fingerprint before 
             approvedAt: new Date(),
             expectedRevision: FIXTURE_REVISION,
             expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Old displayed terms", taxRatePercent: 8.875 }),
+            expectedClientId: "client-1",
         }),
         /tax terms changed/i,
     );
@@ -502,7 +604,7 @@ test("updateChangeOrderCore's parent update includes revision: { increment: 1 }"
     state.items = [];
     state.schedules = [];
 
-    const updated = await updateChangeOrderCore("co-1", { title: "New Title" });
+    const updated = await updateChangeOrderCore("co-1", { title: "New Title", expectedRevision: FIXTURE_REVISION });
 
     assert.equal(updated.title, "New Title");
     assert.equal(calls.changeOrderUpdates.length, 1);
@@ -524,7 +626,7 @@ test("a Sent scope edit returns to Draft and atomically clears the sent terms tu
         termsTaxRatePercent: 8.875,
     });
 
-    const updated = await updateChangeOrderCore("co-1", { title: "Changed sent scope" });
+    const updated = await updateChangeOrderCore("co-1", { title: "Changed sent scope", expectedRevision: FIXTURE_REVISION });
 
     assert.equal(updated.status, "Draft");
     assert.equal(updated.termsTaxExempt, null);
@@ -547,12 +649,12 @@ test("updateChangeOrderCore rejects a stale expectedRevision before any write", 
     assert.equal(calls.changeOrderUpdates.length, 0);
 });
 
-test("updateChangeOrderCore preserves existing caller behavior when expectedRevision is omitted", async () => {
+test("updateChangeOrderCore rejects a missing expectedRevision before any write", async () => {
     state.changeOrder = draftChangeOrder({ revision: FIXTURE_REVISION + 5 });
 
-    const updated = await updateChangeOrderCore("co-1", { title: "MCP-compatible update" });
-
-    assert.equal(updated.title, "MCP-compatible update");
-    assert.equal(updated.revision, FIXTURE_REVISION + 6);
-    assert.equal(calls.changeOrderUpdates.length, 1);
+    await assert.rejects(
+        () => updateChangeOrderCore("co-1", { title: "unguarded update" } as any),
+        assertTypedRevisionConflict,
+    );
+    assert.equal(calls.changeOrderUpdates.length, 0);
 });

@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { prepareChangeOrderReviewJobsForMutation } from "@/lib/change-order-automation-jobs";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -165,14 +166,28 @@ export async function POST(req: Request) {
             totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string;
             termsTaxExempt: boolean | null; termsTaxRateName: string | null;
             termsTaxRatePercent: { toString(): string } | null;
+            clientSignatureUrl: string | null; approvedBy: string | null; approvedAt: Date | null;
+            companySignatureUrl: string | null; companySignedBy: string | null; companySignedAt: Date | null;
         }>>`
             SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId",
-                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent",
+                   "clientSignatureUrl", "approvedBy", "approvedAt",
+                   "companySignatureUrl", "companySignedBy", "companySignedAt"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
         if (co.status !== "Draft" && co.status !== "Sent") {
             return { ok: false as const, error: `${co.code} is "${co.status}" — only Draft/Sent change orders may be auto-corrected. Approved rows need human review (billed milestone).` };
+        }
+        if ([
+            co.clientSignatureUrl,
+            co.approvedBy,
+            co.approvedAt,
+            co.companySignatureUrl,
+            co.companySignedBy,
+            co.companySignedAt,
+        ].some(value => value != null)) {
+            return { ok: false as const, error: `${co.code} has signature or approval audit data — automated repair is forbidden. Review the signed scope by hand.` };
         }
         const stored = rc(Number(co.totalAmount));
         if (Math.abs(stored - expectedTotalAmount) > 0.005) {
@@ -253,6 +268,7 @@ export async function POST(req: Request) {
                 return { ok: false as const, error: `${co.code} has a payment schedule row of $0.00 or less. Billing refuses those after signature, so fix the schedule in the editor before resetting the total here.` };
             }
         }
+        await prepareChangeOrderReviewJobsForMutation(tx, changeOrderId);
         await tx.changeOrder.update({
             where: { id: changeOrderId },
             data: {

@@ -4,9 +4,9 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, estimateToPhases, CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "@/lib/gpt-estimate";
-import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
+import { activeApprovalClientDeliveryForInvoice, buildInvoiceResendPreviewPayload, buildMilestoneSendPreviewPayload, canonicalMilestoneRecipients, getProjectBilling, invoiceSendFinancialFingerprint, milestoneSendFinancialFingerprint, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
-import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
+import { ChangeOrderRevisionConflictError, updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
 import {
     allocateCoScheduleGross,
     canonicalCoTaxTerms,
@@ -15,8 +15,17 @@ import {
     coTaxRate,
     effectiveCoTaxInfo,
 } from "@/lib/co-tax";
-import { buildChangeOrderSendPreviewPayload } from "@/lib/change-order-send-preview";
-import { mintPreviewToken, verifyPreviewToken } from "@/lib/mcp-preview-token";
+import {
+    buildChangeOrderSendPreviewPayload,
+    canonicalChangeOrderRecipients,
+    formatChangeOrderConfirmToken,
+    parseChangeOrderConfirmToken,
+} from "@/lib/change-order-send-preview";
+import { newChangeOrderReviewGeneration } from "@/lib/change-order-review-automation";
+import {
+    mintPreviewToken as mintPreviewTokenWithSecret,
+    verifyPreviewToken as verifyPreviewTokenWithSecret,
+} from "@/lib/mcp-preview-token";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
 import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
@@ -437,6 +446,14 @@ function wrapWriteTools(server: { registerTool: (...args: any[]) => unknown }, a
 }
 
 function createHandler(actor: RouteMcpActor) {
+    // Every confirmation token is keyed by the secret that authenticated this
+    // request. In a Richard-only deployment MCP_SECRET can be absent while
+    // MCP_SECRET_RICHARD is valid; never fall back to an empty HMAC key.
+    const actorPreviewSecret = () => secretForActor(actor.actorLabel);
+    const mintPreviewToken = (payload: string) => mintPreviewTokenWithSecret(payload, actorPreviewSecret());
+    const verifyPreviewToken = (token: string | undefined, payload: string) => (
+        verifyPreviewTokenWithSecret(token, payload, actorPreviewSecret())
+    );
     return createMcpHandler(
     server => {
         wrapWriteTools(server, actor);
@@ -711,8 +728,10 @@ function createHandler(actor: RouteMcpActor) {
                     "Emails the customer a payment request listing ONLY the selected milestones (name + amount, never the whole invoice balance), with a portal link " +
                     "that opens their invoice focused on exactly those payments and a Pay Now button. QuickBooks is still the money rail: each milestone is pushed/verified " +
                     "against QBO before anything is emailed. TWO-STEP: call without confirmToken to get a preview " +
-                    "(what will be sent, to whom, amounts) plus a confirmToken; show the preview to the user, then call again with the confirmToken only after they approve. " +
-                    "The token is bound to the exact milestones/recipient/amounts and expires in ~5 minutes. " +
+                    "(what will be sent, the complete To/CC recipient set, amounts) plus a confirmToken; show the preview to the user, then call again with the confirmToken only after they approve. " +
+                    "The token is bound to the exact milestones/To/CC recipients/amounts and expires in ~5 minutes. " +
+                    "Fixed-price change-order approval automatically bills and delivers its payment request; when automaticApprovalDelivery is present, wait for/reconcile that job and do not use this tool. " +
+                    "A milestone with qbInvoiceSentAt requires allowResend=true plus a fresh preview and explicit user confirmation. " +
                     "If QuickBooks amounts have drifted, the result returns needsReview + driftReview — show the user the amounts and, if they approve reconciling, " +
                     "get a fresh preview with reconcile: { <milestoneId>: <approved QB total> } and confirm that.",
                 inputSchema: {
@@ -720,10 +739,11 @@ function createHandler(actor: RouteMcpActor) {
                     paymentScheduleIds: z.array(z.string().max(50)).min(1).max(20).describe("Milestone ids from list_project_billing"),
                     overrideEmail: z.string().email().optional().describe("Only to send to a different address than the client on file"),
                     reconcile: z.record(z.string(), z.number()).optional().describe("Only after user approves a drift review: milestoneId -> approved QuickBooks total"),
-                    confirmToken: z.string().max(40).optional().describe("Token from the preview response; supplying it executes the send"),
+                    allowResend: z.boolean().optional().describe("Set true only after the user explicitly asks to resend milestones whose qbInvoiceSentAt is already set; never bypass automaticApprovalDelivery"),
+                    confirmToken: z.string().max(80).optional().describe("Token from the preview response; supplying it executes the send"),
                 },
             },
-            async ({ invoiceId, paymentScheduleIds, overrideEmail, reconcile, confirmToken }) => {
+            async ({ invoiceId, paymentScheduleIds, overrideEmail, reconcile, allowResend, confirmToken }) => {
                 const invoice = await prisma.invoice.findUnique({
                     where: { id: invoiceId },
                     include: { client: true, project: { include: { client: true } }, payments: true },
@@ -731,32 +751,94 @@ function createHandler(actor: RouteMcpActor) {
                 if (!invoice) return { ...textResult({ error: "Invoice not found" }), isError: true };
                 const selected = invoice.payments.filter(p => paymentScheduleIds.includes(p.id));
                 const recipient = (overrideEmail || invoice.client?.email || invoice.project?.client?.email || "").trim();
+                const recipients = canonicalMilestoneRecipients(
+                    recipient,
+                    invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail || null,
+                );
+                const sourceChangeOrderIds = [...new Set(
+                    selected.map(payment => payment.sourceChangeOrderId).filter((id): id is string => Boolean(id)),
+                )];
+                const automaticDeliveries = sourceChangeOrderIds.length > 0
+                    ? await prisma.changeOrderAutomationJob.findMany({
+                        where: {
+                            changeOrderId: { in: sourceChangeOrderIds },
+                            kind: "APPROVAL_CLIENT_EMAIL",
+                            status: { notIn: ["SKIPPED", "CANCELED"] },
+                        },
+                        select: { changeOrderId: true, status: true },
+                    })
+                    : [];
+                const automaticByChangeOrder = new Map(
+                    automaticDeliveries.map(job => [job.changeOrderId, job.status]),
+                );
+                const requiresResendConfirmation = selected.some(payment => payment.qbInvoiceSentAt !== null) && allowResend !== true;
+                const milestoneStates = selected.map((payment): [string, string, number, string, string | null] => [
+                    payment.id,
+                    payment.name,
+                    Number(payment.amount),
+                    payment.status,
+                    payment.qbInvoiceSentAt?.toISOString() ?? null,
+                ]).sort((a, b) => a[0].localeCompare(b[0]));
+                const milestoneFingerprint = milestoneSendFinancialFingerprint({
+                    invoiceId,
+                    milestones: milestoneStates,
+                });
 
                 // Token payload pins ids, recipient, live amounts and the reconcile map —
                 // any drift between preview and confirm invalidates the token.
-                const payload = JSON.stringify({
+                const payload = buildMilestoneSendPreviewPayload({
                     invoiceId,
                     ids: [...paymentScheduleIds].sort(),
-                    recipient,
-                    amounts: selected.map(p => [p.id, Number(p.amount)]).sort(),
+                    recipients,
+                    amounts: selected.map((p): [string, number] => [p.id, Number(p.amount)]).sort(),
+                    sentAt: selected.map((p): [string, string | null] => [p.id, p.qbInvoiceSentAt?.toISOString() ?? null]).sort(),
+                    milestones: milestoneStates,
                     reconcile: Object.entries(reconcile ?? {}).sort(),
+                    allowResend: allowResend === true,
                 });
 
                 if (!verifyPreviewToken(confirmToken, payload)) {
+                    const blocked = automaticDeliveries.length > 0;
                     return textResult({
                         preview: true,
-                        wouldSend: selected.map(p => ({ id: p.id, name: p.name, amount: Number(p.amount), status: p.status })),
-                        recipient: recipient || "(no client email on file — provide overrideEmail)",
+                        blocked: blocked || requiresResendConfirmation,
+                        wouldSend: selected.map(p => ({
+                            id: p.id,
+                            name: p.name,
+                            amount: Number(p.amount),
+                            status: p.status,
+                            qbInvoiceSentAt: p.qbInvoiceSentAt,
+                            automaticApprovalDelivery: p.sourceChangeOrderId
+                                ? (automaticByChangeOrder.get(p.sourceChangeOrderId) ?? null)
+                                : null,
+                        })),
+                        recipients,
+                        recipient: recipients.to[0] || "(no client email on file — provide overrideEmail)",
                         invoice: { code: invoice.code, status: invoice.status },
-                        confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
+                        confirmToken: blocked || requiresResendConfirmation ? null : mintPreviewToken(payload),
+                        instruction: blocked
+                            ? "Automatic change-order approval delivery owns one or more selected milestones. Wait for or reconcile that durable job; do not send manually."
+                            : requiresResendConfirmation
+                                ? "One or more payment requests were already sent. Ask whether the user explicitly wants a resend, then request a fresh preview with allowResend=true."
+                                : "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
+                }
+                if (automaticDeliveries.length > 0) {
+                    return {
+                        ...textResult({ error: "Automatic change-order approval delivery owns one or more selected milestones; wait for or reconcile that durable job instead of sending a duplicate." }),
+                        isError: true,
+                    };
                 }
                 const result = await sendMilestoneInvoicesCore(
                     invoiceId,
                     paymentScheduleIds,
                     overrideEmail,
-                    { reconcile },
+                    {
+                        reconcile,
+                        allowResend: allowResend === true,
+                        expectedRecipients: recipients,
+                        expectedMilestoneFingerprint: milestoneFingerprint,
+                    },
                     `SYSTEM:${actor.actorLabel}`,
                 );
                 return textResult(result);
@@ -770,7 +852,8 @@ function createHandler(actor: RouteMcpActor) {
                 description:
                     "Repairs stale QuickBooks payment links on an invoice's unpaid milestones, then re-emails the customer the invoice with its pay-online portal link " +
                     "(the portal link is minted fresh on every send, so it never goes stale). Fresh QuickBooks pay links are also returned in the result if the user wants to share one directly. " +
-                    "Use when a customer says the payment link doesn't work. TWO-STEP: call without confirmToken for a preview + token, then echo the confirmToken after the user approves.",
+                    "Use when a customer says the payment link doesn't work. TWO-STEP: call without confirmToken for a preview of the exact To/CC recipients and money state, " +
+                    "then echo the confirmToken after the user approves. If automaticApprovalDelivery is present, wait for/reconcile that durable job instead of resending.",
                 inputSchema: {
                     invoiceId: z.string().max(50).describe("Invoice id from list_project_billing"),
                     overrideEmail: z.string().email().optional(),
@@ -780,24 +863,93 @@ function createHandler(actor: RouteMcpActor) {
             async ({ invoiceId, overrideEmail, confirmToken }) => {
                 const invoice = await prisma.invoice.findUnique({
                     where: { id: invoiceId },
-                    include: { client: true, payments: { select: { name: true, amount: true, status: true, qbSyncError: true } } },
+                    include: {
+                        client: true,
+                        project: { include: { client: true } },
+                        payments: {
+                            orderBy: { id: "asc" },
+                            select: {
+                                id: true,
+                                name: true,
+                                amount: true,
+                                status: true,
+                                dueDate: true,
+                                qbInvoiceId: true,
+                                qbInvoiceSentAt: true,
+                                qbSyncError: true,
+                            },
+                        },
+                    },
                 });
                 if (!invoice) return { ...textResult({ error: "Invoice not found" }), isError: true };
-                const recipient = (overrideEmail || invoice.client?.email || "").trim();
-
-                const payload = JSON.stringify({ invoiceId, recipient, balanceDue: Number(invoice.balanceDue) });
+                const recipients = canonicalMilestoneRecipients(
+                    overrideEmail || invoice.client?.email || invoice.project?.client?.email,
+                    invoice.client?.additionalEmail || invoice.project?.client?.additionalEmail,
+                );
+                const financialFingerprint = invoiceSendFinancialFingerprint({
+                    invoiceId: invoice.id,
+                    code: invoice.code,
+                    status: invoice.status,
+                    totalAmount: Number(invoice.totalAmount),
+                    balanceDue: Number(invoice.balanceDue),
+                    payments: invoice.payments.map(payment => ({
+                        id: payment.id,
+                        name: payment.name,
+                        amount: Number(payment.amount),
+                        status: payment.status,
+                        dueDate: payment.dueDate?.toISOString() ?? null,
+                        qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                    })),
+                });
+                const payload = buildInvoiceResendPreviewPayload({
+                    invoiceId,
+                    recipients,
+                    invoice: {
+                        code: invoice.code,
+                        status: invoice.status,
+                        total: Number(invoice.totalAmount),
+                        balanceDue: Number(invoice.balanceDue),
+                        sentAt: invoice.sentAt?.toISOString() ?? null,
+                    },
+                    milestones: invoice.payments.map(payment => ({
+                        id: payment.id,
+                        name: payment.name,
+                        amount: Number(payment.amount),
+                        status: payment.status,
+                        qbInvoiceId: payment.qbInvoiceId,
+                        qbInvoiceSentAt: payment.qbInvoiceSentAt?.toISOString() ?? null,
+                        qbSyncError: payment.qbSyncError,
+                    })),
+                });
+                const automaticDelivery = await activeApprovalClientDeliveryForInvoice(invoiceId);
                 if (!verifyPreviewToken(confirmToken, payload)) {
                     return textResult({
                         preview: true,
+                        blocked: Boolean(automaticDelivery),
                         invoice: { code: invoice.code, status: invoice.status, total: Number(invoice.totalAmount), balanceDue: Number(invoice.balanceDue) },
-                        milestones: invoice.payments.map(p => ({ name: p.name, amount: Number(p.amount), status: p.status, staleLink: !!p.qbSyncError })),
-                        recipient: recipient || "(no client email on file — provide overrideEmail)",
-                        confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user. Call again with this confirmToken ONLY after they explicitly approve.",
+                        milestones: invoice.payments.map(p => ({ id: p.id, name: p.name, amount: Number(p.amount), status: p.status, qbInvoiceSentAt: p.qbInvoiceSentAt, staleLink: !!p.qbSyncError })),
+                        recipients,
+                        recipient: recipients.to[0] || "(no client email on file — provide overrideEmail)",
+                        automaticApprovalDelivery: automaticDelivery
+                            ? { id: automaticDelivery.id, status: automaticDelivery.status }
+                            : null,
+                        confirmToken: automaticDelivery ? null : mintPreviewToken(payload),
+                        instruction: automaticDelivery
+                            ? "Automatic change-order approval delivery owns this invoice. Wait for or reconcile that durable job; do not resend manually."
+                            : "Show this exact invoice, money state, and To/CC list to the user. Call again with this confirmToken ONLY after they explicitly approve.",
                     });
                 }
+                if (automaticDelivery) {
+                    return {
+                        ...textResult({ error: "Automatic change-order approval delivery owns this invoice; wait for or reconcile that durable job instead of sending a duplicate." }),
+                        isError: true,
+                    };
+                }
                 try {
-                    const result = await resendInvoiceCore(invoiceId, overrideEmail);
+                    const result = await resendInvoiceCore(invoiceId, overrideEmail, {
+                        expectedRecipients: recipients,
+                        expectedFinancialFingerprint: financialFingerprint,
+                    });
                     return textResult(result);
                 } catch (err: any) {
                     return { ...textResult({ error: err?.message || "Resend failed" }), isError: true };
@@ -833,7 +985,7 @@ function createHandler(actor: RouteMcpActor) {
                         name: z.string().min(1).max(300),
                         amount: z.number().positive().max(10_000_000),
                         dueDate: z.string().optional(),
-                        order: z.number().int().min(0).optional(),
+                        order: z.number().int().min(0).optional().describe("Accepted for compatibility; the array position is persisted as the canonical order"),
                     })).max(20).optional(),
                 },
             },
@@ -860,6 +1012,7 @@ function createHandler(actor: RouteMcpActor) {
                     "Approved/signed change orders are locked; status cannot be changed here.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Change order id from list_change_orders or list_project_billing"),
+                    expectedRevision: z.number().int().min(0).describe("Current revision from list_change_orders; stale replacements are rejected without mutation"),
                     title: z.string().min(1).max(300).optional(),
                     description: z.string().max(2000).optional().describe("Empty string clears the description"),
                     pricingType: z.enum(["FIXED", "COST_PLUS"]).optional(),
@@ -882,7 +1035,7 @@ function createHandler(actor: RouteMcpActor) {
                     })).max(20).optional().describe("Full replacement: two or more payments, or an empty array to remove the schedule. The final payment is adjusted so the schedule sums to the subtotal."),
                 },
             },
-            async ({ changeOrderId, ...args }) => {
+            async ({ changeOrderId, expectedRevision, ...args }) => {
                 // Advisory prefetch: existence check, id-strip warnings, and the
                 // reverted-to-Draft note. All authoritative merge decisions
                 // (keep-prior fields, signed-scope lock, status) happen inside
@@ -892,14 +1045,14 @@ function createHandler(actor: RouteMcpActor) {
                 const before = await prisma.changeOrder.findUnique({
                     where: { id: changeOrderId },
                     select: {
-                        code: true, status: true, projectId: true,
+                        code: true, status: true, projectId: true, revision: true,
                         items: { select: { id: true } },
                     },
                 });
                 if (!before) return { ...textResult({ error: "Change order not found" }), isError: true };
 
                 const warnings: string[] = [];
-                const data: ChangeOrderUpdateInput = {};
+                const data: ChangeOrderUpdateInput = { expectedRevision };
                 if (args.title !== undefined) data.title = args.title;
                 if (args.description !== undefined) data.description = args.description;
                 if (args.pricingType !== undefined) data.pricingType = args.pricingType;
@@ -963,7 +1116,7 @@ function createHandler(actor: RouteMcpActor) {
                         // undefined passes through: the core keeps the stored due
                         // date on a matching row; "" or null clears it.
                         dueDate: row.dueDate,
-                        order: row.order ?? idx,
+                        order: idx,
                     }));
                 }
 
@@ -971,6 +1124,9 @@ function createHandler(actor: RouteMcpActor) {
                 try {
                     updated = await updateChangeOrderCore(changeOrderId, data);
                 } catch (error: any) {
+                    if (error instanceof ChangeOrderRevisionConflictError) {
+                        return { ...textResult({ error: error.message, code: "REVISION_CONFLICT" }), isError: true };
+                    }
                     return { ...textResult({ error: error?.message || "Failed to update change order" }), isError: true };
                 }
                 revalidatePath(`/projects/${updated.projectId}/change-orders/${changeOrderId}`);
@@ -983,6 +1139,7 @@ function createHandler(actor: RouteMcpActor) {
                     pricingType: updated.pricingType,
                     markupPercent: updated.markupPercent,
                     subtotal: Number(updated.totalAmount),
+                    revision: updated.revision,
                     warnings,
                     ...(revertedToDraft ? { note: "Scope changed on a Sent change order — it is back in Draft and must be re-sent (send_change_order) before the customer can sign." } : {}),
                     url: `https://probuild.goldentouchremodeling.com/projects/${updated.projectId}/change-orders/${changeOrderId}`,
@@ -997,10 +1154,13 @@ function createHandler(actor: RouteMcpActor) {
                 description:
                     "Emails the customer a portal link to review and SIGN a Draft (or re-sends a Sent) change order — they approve or decline on their phone. " +
                     "TWO-STEP: call without confirmToken for a preview + token, show the user what will be sent and to whom, then echo the confirmToken after they approve. " +
-                    "Once the customer signs (status Approved), bill_change_order puts it on the invoice.",
+                    "Fixed-price approval automatically bills and sends the first payment request through durable automation. COST_PLUS approval records actuals for later bill_change_order batches.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Change order id from list_project_billing"),
-                    confirmToken: z.string().max(40).optional().describe("Token from the preview response; supplying it executes the send"),
+                    // CO tokens carry a UUID preview generation plus the HMAC
+                    // so repeated A→B→A previews at one revision cannot revive
+                    // a canceled frozen email job.
+                    confirmToken: z.string().max(80).optional().describe("Token from the preview response; supplying it executes the send"),
                 },
             },
             async ({ changeOrderId, confirmToken }) => {
@@ -1009,19 +1169,21 @@ function createHandler(actor: RouteMcpActor) {
                     select: {
                         code: true, title: true, status: true, pricingType: true, markupPercent: true, totalAmount: true,
                         revision: true, termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
-                        paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true, order: true } },
+                        paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }], select: { id: true, name: true, amount: true, dueDate: true, order: true } },
                         estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
-                        project: { select: { name: true, client: { select: { name: true, email: true } } } },
+                        project: { select: { name: true, client: { select: { name: true, email: true, additionalEmail: true } } } },
                     },
                 });
                 type SendState = NonNullable<Awaited<ReturnType<typeof loadSendState>>>;
-                const previewFor = (state: SendState) => {
+                const previewFor = (state: SendState, generation: string) => {
                     const recipient = state.project?.client?.email ?? "";
+                    const recipients = canonicalChangeOrderRecipients(recipient, state.project?.client?.additionalEmail);
                     const taxInfo = effectiveCoTaxInfo(state, state.estimate);
                     const taxTerms = canonicalCoTaxTerms(taxInfo);
                     const payload = buildChangeOrderSendPreviewPayload({
                         changeOrderId,
-                        recipient,
+                        generation,
+                        recipients,
                         code: state.code,
                         title: state.title,
                         pricingType: state.pricingType,
@@ -1037,6 +1199,7 @@ function createHandler(actor: RouteMcpActor) {
                     const customerSchedules = allocateCoScheduleGross(subtotal, state.paymentSchedules, taxInfo);
                     return {
                         recipient,
+                        recipients,
                         payload,
                         taxTerms,
                         response: textResult({
@@ -1058,9 +1221,11 @@ function createHandler(actor: RouteMcpActor) {
                             },
                             project: state.project?.name,
                             recipient,
-                            confirmToken: mintPreviewToken(payload),
+                            cc: recipients.additional,
+                            confirmToken: formatChangeOrderConfirmToken(generation, mintPreviewToken(payload)),
                             instruction: "Show this to the user including the tax breakdown — the customer signs (and is later billed) the revised amount. Call again with this confirmToken ONLY after they explicitly approve.",
                         }),
+                        generation,
                     };
                 };
 
@@ -1069,7 +1234,11 @@ function createHandler(actor: RouteMcpActor) {
                 if (co.status !== "Draft" && co.status !== "Sent") {
                     return { ...textResult({ error: `Change order ${co.code} is "${co.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
                 }
-                const preview = previewFor(co);
+                const suppliedConfirmation = parseChangeOrderConfirmToken(confirmToken);
+                const preview = previewFor(
+                    co,
+                    suppliedConfirmation?.generation ?? newChangeOrderReviewGeneration(),
+                );
                 if (!preview.recipient) {
                     return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
                 }
@@ -1079,12 +1248,16 @@ function createHandler(actor: RouteMcpActor) {
                 // not bump the CO revision while it is still Draft (or legacy
                 // Sent/null). Confirmation re-reads both before verifying and
                 // the locked core checks them again before changing status.
-                if (!verifyPreviewToken(confirmToken, preview.payload)) return preview.response;
+                if (!suppliedConfirmation || !verifyPreviewToken(suppliedConfirmation.signature, preview.payload)) {
+                    return preview.response;
+                }
                 const result = await sendChangeOrderToClientCore(changeOrderId, {
                     expectedRevision: co.revision,
                     expectedTaxFingerprint: coTaxFingerprint(preview.taxTerms),
+                    expectedRecipients: preview.recipients,
+                    previewGeneration: preview.generation,
                 });
-                if (!result.success && (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT")) {
+                if (!result.success && (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT" || result.code === "RECIPIENT_CONFLICT")) {
                     // Token verification and the locked core check are separate
                     // operations. If a writer lands in that narrow interval,
                     // never reuse the pre-lock snapshot: return a new preview and
@@ -1094,14 +1267,14 @@ function createHandler(actor: RouteMcpActor) {
                     if (fresh.status !== "Draft" && fresh.status !== "Sent") {
                         return { ...textResult({ error: `Change order ${fresh.code} is "${fresh.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
                     }
-                    const refreshedPreview = previewFor(fresh);
+                    const refreshedPreview = previewFor(fresh, newChangeOrderReviewGeneration());
                     if (!refreshedPreview.recipient) {
                         return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
                     }
                     return refreshedPreview.response;
                 }
                 if (!result.success) return { ...textResult({ error: result.error }), isError: true };
-                return textResult({ ...result, note: "Customer will sign via the portal link. Once status shows Approved in list_project_billing, use bill_change_order." });
+                return textResult({ ...result, note: "Customer will sign via the portal link. Fixed-price approval automatically bills and delivers the payment request; do not manually bill/send it. For COST_PLUS, log actuals and use bill_change_order for later batches." });
             },
         );
 
@@ -1313,7 +1486,7 @@ function createHandler(actor: RouteMcpActor) {
                         timeEntries: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { durationHours: true, laborCost: true, burdenCost: true } },
                         expenses: { where: { isBillable: true, invoiceId: null, invoicedAt: null }, select: { amount: true } },
                         billings: { select: { totalCents: true, laborCents: true, expenseCents: true, markupCents: true, taxCents: true } },
-                        paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true } },
+                        paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }], select: { id: true, name: true, amount: true, dueDate: true } },
                     },
                 });
                 return textResult(orders.map((co) => ({
@@ -1321,6 +1494,7 @@ function createHandler(actor: RouteMcpActor) {
                     code: co.code,
                     title: co.title,
                     status: co.status,
+                    revision: co.revision,
                     items: co.items.map((item) => ({
                         id: item.id,
                         name: item.name,
@@ -1431,9 +1605,9 @@ function createHandler(actor: RouteMcpActor) {
                 title: "Bill an approved change order",
                 annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                 description:
-                    "Bills an APPROVED change order. Fixed-price orders bill immediately. COST_PLUS uses a bound TWO-STEP preview: call with throughDate, show the itemized totals, then echo confirmToken. " +
-                    "Nothing is emailed by this tool; it returns the milestone id so you can then run send_milestone_invoice (preview → user approval → confirm) " +
-                    "to email the customer the QuickBooks payment link. Find change order ids and statuses via list_project_billing.",
+                    "Bills an APPROVED change order. Fixed-price approval normally bills and sends its first payment request automatically; use this tool for COST_PLUS actuals or an explicitly diagnosed recovery, not the normal fixed flow. " +
+                    "COST_PLUS uses a bound TWO-STEP preview: call with throughDate, show the itemized totals, then echo confirmToken. Nothing is emailed by this tool. " +
+                    "Before offering send_milestone_invoice, inspect qbInvoiceSentAt and automaticApprovalDelivery in its preview; never duplicate an automatic or prior send. Find change order ids and statuses via list_project_billing.",
                 inputSchema: {
                     changeOrderId: z.string().max(50).describe("Change order id from list_project_billing (status must be Approved)"),
                     throughDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Required for cost-plus: local company date through which actuals are included"),
@@ -2674,8 +2848,9 @@ function createHandler(actor: RouteMcpActor) {
             + "To locate a job or estimate you only know by name/number (and don't know if it's still a lead or already a project), use find_job — it searches leads AND projects including closed/won ones, plus estimates by code. " +
             "BILLING: list_project_billing shows a project's invoices/milestones/estimates. send_milestone_invoice, resend_invoice and send_estimate EMAIL THE CUSTOMER — " +
             "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
-            "Change-order lifecycle: create_change_order (draft, including cost-plus and fixed milestone schedules) → send_change_order (preview + user approval; customer signs via portal) → " +
-            "once Approved, log_time/log_expense record cost-plus actuals and bill_change_order previews then bills them; fixed orders bill directly → send_milestone_invoice emails the payment link and T&M backup. " +
+            "Change-order lifecycle: create_change_order (draft, including cost-plus and fixed milestone schedules) → send_change_order (preview + user approval; customer signs via portal). " +
+            "Fixed-price approval automatically bills and delivers the first payment request through durable automation—do not call bill_change_order/send_milestone_invoice for that normal path. " +
+            "For COST_PLUS, log_time/log_expense, use bill_change_order for each actuals batch, then preview send_milestone_invoice only when no automaticApprovalDelivery owns it and qbInvoiceSentAt shows it was not already sent. " +
             "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
             "PROJECT MANAGEMENT: use find_job to resolve the project/lead; standard project folders are ensured implicitly by list_project_files and upload_files when needed. " +

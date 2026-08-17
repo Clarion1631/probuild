@@ -4,6 +4,129 @@ import { prisma } from './prisma';
 const resendApiKey = process.env.RESEND_API_KEY || 're_dummy_fallback';
 const resend = new Resend(resendApiKey);
 
+export type FrozenNotification = {
+    from: string;
+    to: string[];
+    replyTo: string;
+    subject: string;
+    html: string;
+    text: string;
+    cc?: string[];
+    bcc?: string[];
+};
+
+type FrozenNotificationSendResult = {
+    data?: { id?: string } | null;
+    error?: unknown;
+};
+
+type FrozenNotificationDependencies = {
+    send: (
+        payload: FrozenNotification,
+        options: { idempotencyKey: string },
+    ) => Promise<FrozenNotificationSendResult>;
+};
+
+function sanitizeEmailHeader(value: string): string {
+    return value.replace(/[\r\n]+/g, " ").trim();
+}
+
+function uniqueRecipients(values: string[] | undefined, excluded = new Set<string>()): string[] {
+    const byKey = new Map<string, string>();
+    for (const raw of values ?? []) {
+        const value = raw.trim();
+        const key = value.toLowerCase();
+        if (value && !excluded.has(key) && !byKey.has(key)) byKey.set(key, value);
+    }
+    return [...byKey.values()];
+}
+
+function htmlToPlainText(html: string): string {
+    return html
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+/**
+ * Build the complete byte-stable, JSON-serializable payload used by durable
+ * email jobs. All dynamic recipients/settings must be resolved by the caller
+ * before this function is called; retries reuse the returned object verbatim.
+ */
+export function buildFrozenNotification(input: {
+    to: string[];
+    subject: string;
+    html: string;
+    fromName?: string;
+    replyTo?: string;
+    cc?: string[];
+    bcc?: string[];
+}): FrozenNotification {
+    const to = uniqueRecipients(input.to);
+    const toKeys = new Set(to.map(value => value.toLowerCase()));
+    const cc = uniqueRecipients(input.cc, toKeys);
+    const visibleKeys = new Set([...toKeys, ...cc.map(value => value.toLowerCase())]);
+    const bcc = uniqueRecipients(input.bcc, visibleKeys);
+    const displayName = sanitizeEmailHeader(input.fromName || "Golden Touch Remodeling") || "Golden Touch Remodeling";
+    const subject = sanitizeEmailHeader(input.subject);
+    const replyTo = sanitizeEmailHeader(input.replyTo || "jadkins@goldentouchremodeling.com");
+    return {
+        from: `${displayName} <notifications@goldentouchremodeling.com>`,
+        to,
+        ...(cc.length ? { cc } : {}),
+        ...(bcc.length ? { bcc } : {}),
+        replyTo,
+        subject,
+        html: input.html,
+        text: htmlToPlainText(input.html),
+    };
+}
+
+/** Send an already-frozen payload with one stable Resend idempotency key. */
+export async function sendFrozenNotification(
+    dispatch: FrozenNotification,
+    idempotencyKey: string,
+    dependencies?: FrozenNotificationDependencies,
+): Promise<{ success: true; id: string } | { success: false; ambiguous: boolean }> {
+    if (dispatch.to.length === 0 || !idempotencyKey.trim()) return { success: false, ambiguous: false };
+    // Preserve sendNotification's established local/test behavior. Calling the
+    // Resend SDK with the dummy fallback would turn every local durable job
+    // into a retry (and would still make an unwanted outbound HTTP request).
+    // Explicit injected dependencies remain authoritative in focused tests.
+    if (!dependencies && resendApiKey === 're_dummy_fallback') {
+        return { success: true, id: "mock_resend_id_123" };
+    }
+    const provider = dependencies ?? {
+        send: (payload: FrozenNotification, options: { idempotencyKey: string }) => resend.emails.send(payload, options),
+    };
+    try {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const response = await Promise.race([
+            provider.send(dispatch, { idempotencyKey }),
+            new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => reject(new Error("Email provider request timed out")), 8_000);
+            }),
+        ]).finally(() => {
+            if (timeout) clearTimeout(timeout);
+        });
+        if (response.error) {
+            console.error("Resend API returned error:", response.error);
+            return { success: false, ambiguous: false };
+        }
+        if (!response.data?.id) {
+            console.error("Resend API returned no message id");
+            return { success: false, ambiguous: true };
+        }
+        return { success: true, id: response.data.id };
+    } catch (error) {
+        console.error("Failed to send Resend email:", error);
+        // A connection error or timeout may happen after the provider accepted
+        // the request. Callers must retry only with this same payload/key.
+        return { success: false, ambiguous: true };
+    }
+}
+
 // Fallback internal-copy address for client-facing documents. Used only when the
 // editable "System Notification Email" setting (Settings → Company) is unset.
 // BCC'd so the client never sees the internal address. Override via env var.
@@ -39,11 +162,7 @@ export async function sendNotification(
     }
 
     // Strip HTML tags for plain text version (improves deliverability)
-    const textContent = htmlContent
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    const textContent = htmlToPlainText(htmlContent);
 
     const displayName = options?.fromName || 'Golden Touch Remodeling';
 

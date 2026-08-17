@@ -6,12 +6,14 @@ import { resolveDocUrl } from "@/lib/secure-storage";
 
 export default async function PortalChangeOrderPage({ params }: { params: Promise<{ id: string }> }) {
     const resolvedParams = await params;
-    const changeOrder = await getChangeOrderForPortal(resolvedParams.id);
+    const portalChangeOrder = await getChangeOrderForPortal(resolvedParams.id);
     const settings = await getPublicCompanySettings();
 
-    if (!changeOrder) {
+    if (!portalChangeOrder) {
         return notFound();
     }
+    const { portalViewerMode, ...changeOrder } = portalChangeOrder;
+    const isStaffPreview = portalViewerMode === "STAFF_PREVIEW";
 
     if (changeOrder.projectId) {
         const visibility = await getPortalVisibility(changeOrder.projectId);
@@ -39,5 +41,11 @@ export default async function PortalChangeOrderPage({ params }: { params: Promis
         companySignatureUrl: await resolveDocUrl((changeOrder as any).companySignatureUrl),
     };
 
-    return <PortalChangeOrderClient initialData={initialData} companySettings={settings} />;
+    return (
+        <PortalChangeOrderClient
+            initialData={initialData}
+            companySettings={settings}
+            isStaffPreview={isStaffPreview}
+        />
+    );
 }

@@ -9,7 +9,7 @@
 //
 //   partialIndexes  – 7, three of them UNIQUE and carrying real invariants
 //   checkConstraints – 6, two of them XOR ownership invariants
-//   rlsTables       – 26 tables with RLS enabled (and no policies)
+//   rlsTables       – tables with RLS enabled (and no policies)
 //
 // The baseline migration ends with a generated block built from this file, and
 // scripts/check-migrations-match.mjs asserts a migrated database matches it

@@ -192,7 +192,7 @@ compareDefs(
   'Prisma has no check-constraint concept; the baseline tail block creates these.'
 )
 
-// FORCE matters, not just ENABLE: these 26 tables have zero policies, so the
+// FORCE matters, not just ENABLE: these tables have zero policies, so the
 // application only reads them because owners bypass RLS. FORCE removes that
 // bypass and would deny the owner too — a silent empty-result failure. Assert
 // the flag, not merely the table name.

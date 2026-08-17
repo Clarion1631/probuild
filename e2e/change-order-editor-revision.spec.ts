@@ -8,6 +8,7 @@ const IDS = {
     client: `${run}-client`,
     project: `${run}-project`,
     estimate: `${run}-estimate`,
+    invoice: `${run}-invoice`,
     sendCo: `${run}-send-co`,
     countersignCo: `${run}-countersign-co`,
     conflictCo: `${run}-conflict-co`,
@@ -26,6 +27,14 @@ async function readCo(id: string) {
         where: { id },
         select: { status: true, revision: true, title: true, companySignedBy: true },
     });
+}
+
+async function approvalJobsAreTerminal(changeOrderId: string) {
+    const jobs = await prisma.changeOrderAutomationJob.findMany({
+        where: { changeOrderId },
+        select: { status: true },
+    });
+    return jobs.length > 0 && jobs.every(job => ["SUCCEEDED", "SKIPPED", "CANCELED", "NEEDS_ATTENTION"].includes(job.status));
 }
 
 test.describe.serial("Change-order editor revision adoption (real DB + browser)", () => {
@@ -56,6 +65,19 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
                 totalAmount: 300,
                 balanceDue: 300,
                 taxExempt: true,
+            },
+        });
+        // Fixed-price approval automation bills onto an existing project invoice.
+        // Keep this browser fixture faithful to the signed-estimate lifecycle so
+        // its durable approval graph can reach terminal states before cleanup.
+        await prisma.invoice.create({
+            data: {
+                id: IDS.invoice,
+                code: `${run}-INV`,
+                projectId: IDS.project,
+                clientId: IDS.client,
+                estimateId: IDS.estimate,
+                status: "Draft",
             },
         });
 
@@ -124,7 +146,9 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
     test.afterAll(async () => {
         try {
             await prisma.notification.deleteMany({ where: { projectId: IDS.project } });
+            await prisma.changeOrderAutomationJob.deleteMany({ where: { changeOrderId: { in: [IDS.sendCo, IDS.countersignCo, IDS.conflictCo, IDS.manualConflictCo] } } });
             await prisma.changeOrder.deleteMany({ where: { id: { in: [IDS.sendCo, IDS.countersignCo, IDS.conflictCo, IDS.manualConflictCo] } } });
+            await prisma.invoice.deleteMany({ where: { id: IDS.invoice } });
             await prisma.estimate.deleteMany({ where: { id: IDS.estimate } });
             await prisma.project.deleteMany({ where: { id: IDS.project } });
             await prisma.client.deleteMany({ where: { id: IDS.client } });
@@ -166,6 +190,10 @@ test.describe.serial("Change-order editor revision adoption (real DB + browser)"
         await page.getByRole("button", { name: "Mark as Approved (manual)" }).click();
         await page.getByRole("button", { name: "Confirm approval" }).click();
         await expect.poll(async () => (await readCo(IDS.countersignCo)).status).toBe("Approved");
+        // Next's after() drain can finish after the action response. Keep fixture
+        // cleanup from deleting durable rows out from under an active worker.
+        await expect.poll(async () => approvalJobsAreTerminal(IDS.sendCo), { timeout: 30_000 }).toBe(true);
+        await expect.poll(async () => approvalJobsAreTerminal(IDS.countersignCo), { timeout: 30_000 }).toBe(true);
     });
 
     test("Save conflict hard-reloads every controlled field from the server copy", async ({ page }) => {

@@ -843,7 +843,7 @@ async function runShiftNotStartedTasks(
                     scheduleTaskId: { in: shiftedTaskIds },
                     dueDate: { not: null },
                 },
-                orderBy: { id: "asc" },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
                 select: { id: true, name: true },
             });
             for (const milestone of estimateMilestones) {

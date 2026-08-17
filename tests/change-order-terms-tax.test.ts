@@ -7,6 +7,7 @@ import {
     coTaxFingerprint,
     coTaxLabel,
     effectiveCoTaxInfo,
+    fixedCoScheduleValidationError,
 } from "../src/lib/co-tax";
 
 test("canonical tax terms normalize effective percent and name for a stable fingerprint", () => {
@@ -73,7 +74,38 @@ test("gross schedule allocation matches fixed billing and leaves the cent remain
     );
 
     assert.deepEqual(rows.map((row) => row.pretaxCents), [333, 333, 334]);
-    assert.deepEqual(rows.map((row) => row.taxCents), [30, 30, 29]);
-    assert.deepEqual(rows.map((row) => row.grossCents), [363, 363, 363]);
+    assert.deepEqual(rows.map((row) => row.taxCents), [30, 29, 30]);
+    assert.deepEqual(rows.map((row) => row.grossCents), [363, 362, 364]);
     assert.equal(rows.reduce((sum, row) => sum + row.grossCents, 0), 1089);
+});
+
+test("gross schedule tax allocation is cumulative so every row stays nonnegative and totals stay exact", () => {
+    const rows = allocateCoScheduleGross(
+        1,
+        Array.from({ length: 20 }, (_, index) => ({ id: `row-${index}`, amount: 0.05 })),
+        { taxExempt: false, taxRatePercent: 10, taxRateName: "Ten percent" },
+    );
+
+    assert.equal(rows.reduce((sum, row) => sum + row.pretaxCents, 0), 100);
+    assert.equal(rows.reduce((sum, row) => sum + row.taxCents, 0), 10);
+    assert.equal(rows.reduce((sum, row) => sum + row.grossCents, 0), 110);
+    assert.equal(rows.every((row) => row.pretaxCents >= 0 && row.taxCents >= 0 && row.grossCents >= 0), true);
+    assert.deepEqual(rows.map((row) => row.taxCents).slice(0, 4), [1, 0, 1, 0]);
+});
+
+test("fixed schedule validation centrally rejects one row, nonpositive rows, and cent sum drift", () => {
+    assert.equal(fixedCoScheduleValidationError(1_000, []), null);
+    assert.equal(
+        fixedCoScheduleValidationError(1_000, [{ amount: 10 }]),
+        "Fixed change-order splits require at least two schedule rows",
+    );
+    assert.equal(
+        fixedCoScheduleValidationError(1_000, [{ amount: 10 }, { amount: 0 }]),
+        "Every fixed change-order schedule amount must be greater than zero",
+    );
+    assert.equal(
+        fixedCoScheduleValidationError(1_000, [{ amount: 4 }, { amount: 5.99 }]),
+        "Change-order schedule amounts are out of sync with the signed subtotal",
+    );
+    assert.equal(fixedCoScheduleValidationError(1_000, [{ amount: 4 }, { amount: 6 }]), null);
 });

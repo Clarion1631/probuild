@@ -1,7 +1,13 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { billableCoItems, canonicalCoTaxTerms, coLineCents, coSectionRowError, coSectionRowNames, coTaxFingerprint } from "./co-tax";
+import { billableCoItems, canonicalCoTaxTerms, coLineCents, coSectionRowError, coSectionRowNames, coTaxFingerprint, fixedCoScheduleValidationError } from "./co-tax";
 import { MANUAL_CO_APPROVAL_SUFFIX } from "./co-approval";
+import type { ChangeOrderApprovalMode } from "./change-order-automation";
+import {
+    enqueueApprovalAutomationJobs,
+    prepareChangeOrderReviewJobsForMutation,
+    removeSafeReviewJobsForDraftDelete,
+} from "./change-order-automation-jobs";
 
 /**
  * Internal CAS sentinel. Permission-gated Server Actions catch only this
@@ -50,15 +56,41 @@ export type ChangeOrderUpdateInput = {
     paymentSchedules?: ChangeOrderScheduleInput[] | unknown;
     status?: unknown;
     items?: ChangeOrderItemInput[] | unknown;
-    // CAS guard against the load/edit/save race, same mechanism as
-    // manuallyApproveChangeOrderCore's expectedRevision: when provided, the
-    // write is refused if the row's revision moved since the caller loaded it.
-    // Optional and undefined by default so existing callers (the MCP
-    // update_change_order tool, any other server caller) keep working
-    // unchanged — the approve-time CAS still guards them regardless.
-    expectedRevision?: number;
+    // Mandatory CAS guard against every load/edit/save race. Replacement lists
+    // delete omitted children, so allowing any caller to skip this would let a
+    // stale connector/editor silently erase a concurrent scope update.
+    expectedRevision: number;
     [key: string]: unknown;
 };
+
+async function enqueueApprovalAutomation(
+    tx: Parameters<typeof enqueueApprovalAutomationJobs>[0],
+    input: {
+        changeOrderId: string;
+        eventRevision: number;
+        pricingType: string;
+        approvalMode: ChangeOrderApprovalMode;
+    },
+) {
+    const pricingType = input.pricingType === "COST_PLUS" ? "COST_PLUS" : "FIXED";
+    const frozenEvent = {
+        changeOrderId: input.changeOrderId,
+        eventRevision: input.eventRevision,
+        approvalMode: input.approvalMode,
+    };
+    await enqueueApprovalAutomationJobs(tx, {
+        changeOrderId: input.changeOrderId,
+        eventRevision: input.eventRevision,
+        pricingType,
+        approvalMode: input.approvalMode,
+        payloads: {
+            APPROVAL_BILL: { ...frozenEvent },
+            APPROVAL_CLIENT_EMAIL: { ...frozenEvent },
+            APPROVAL_SCHEDULE: { ...frozenEvent },
+            APPROVAL_TEAM_EMAIL: { ...frozenEvent },
+        },
+    });
+}
 
 function normalizedPricingType(value: unknown, fallback: string): "FIXED" | "COST_PLUS" {
     const pricingType = value ?? fallback;
@@ -97,7 +129,10 @@ function normalizeSchedules(
         priorCents += amountCents;
         const name = schedule.name?.trim() || `Payment ${index + 1}`;
         const dueDate = dateInputInTimeZone(schedule.dueDate, timeZone, `Due date for ${name}`);
-        return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: schedule.order ?? index };
+        // A replacement list is already ordered. Persist that array position as
+        // the canonical sequence so stale/duplicate caller-supplied order values
+        // cannot make different consumers attach residual cents to different rows.
+        return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: index };
     });
 }
 
@@ -149,10 +184,9 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
         // concurrent save must not clobber it and inherit a fresh revision that
         // then passes the manual-approve CAS on the strength of a save that never
         // saw the other edit. Same mechanism and message as
-        // manuallyApproveChangeOrderCore's expectedRevision check. Undefined
-        // (the MCP update_change_order tool, any other server caller that
-        // doesn't track revision) skips this and behaves exactly as before.
-        if (data.expectedRevision !== undefined && data.expectedRevision !== current.revision) {
+        // manuallyApproveChangeOrderCore's expectedRevision check.
+        if (!Number.isInteger(data.expectedRevision) || data.expectedRevision < 0
+            || data.expectedRevision !== current.revision) {
             throw new ChangeOrderRevisionConflictError(current.code);
         }
 
@@ -399,6 +433,7 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             scalarData.termsTaxRatePercent = null;
         }
 
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
         return tx.changeOrder.update({ where: { id }, data: { ...scalarData, revision: { increment: 1 } } });
     }, { timeout: 15_000 });
 }
@@ -411,23 +446,37 @@ export async function approveChangeOrderCore(
         approvedAt: Date;
         expectedRevision: number;
         expectedTaxFingerprint: string;
+        expectedClientId?: string;
     },
 ) {
     return prisma.$transaction(async (tx) => {
-        // The same parent-row lock is taken by editing, sending, billing, and
-        // co-audit repair. Status, item existence, subtotal validation, and the
-        // approval write therefore observe one serialized state and commit as a
-        // single invariant-preserving transition.
+        // Project-scoped writers use Project -> ChangeOrder -> Estimate. The
+        // unlocked lookup is only a routing hint; both ownership and routing are
+        // re-read after the parent and child locks are held.
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id },
+            select: { projectId: true },
+        });
+        if (!coRef) return null;
+        const [project] = await tx.$queryRaw<Array<{ id: string; clientId: string | null }>>`
+            SELECT "id", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
+        if (!project) return null;
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
-            estimateId: string; revision: number; termsTaxExempt: boolean | null;
+            projectId: string; estimateId: string; revision: number; termsTaxExempt: boolean | null;
             termsTaxRateName: string | null; termsTaxRatePercent: { toString(): string } | null;
         }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId", "revision",
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "projectId", "estimateId", "revision",
                    "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
+        if (current.projectId !== project.id) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
+        if (!approval.expectedClientId || project.clientId !== approval.expectedClientId) {
+            throw new Error(`Change order ${current.code} no longer belongs to the authenticated portal client.`);
+        }
 
         if (current.status !== "Sent") {
             throw new Error(`Change order ${current.code} must be Sent before it can be approved.`);
@@ -439,9 +488,13 @@ export async function approveChangeOrderCore(
             throw new Error("A client name and persisted signature is required to approve a change order.");
         }
 
-        if (current.pricingType === "COST_PLUS") {
-            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
-            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        const paymentSchedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: id },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { amount: true },
+        });
+        if (current.pricingType === "COST_PLUS" && paymentSchedules.length > 0) {
+            throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
         }
 
         const items = await tx.changeOrderItem.findMany({
@@ -462,6 +515,10 @@ export async function approveChangeOrderCore(
         }
         if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
+        }
+        if (current.pricingType !== "COST_PLUS") {
+            const scheduleError = fixedCoScheduleValidationError(storedSubtotalCents, paymentSchedules);
+            if (scheduleError) throw new Error(scheduleError);
         }
 
         // Every current Sent row already owns an immutable terms tuple. Legacy
@@ -489,6 +546,7 @@ export async function approveChangeOrderCore(
             throw new ChangeOrderTaxTermsConflictError(current.code);
         }
 
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
@@ -503,6 +561,12 @@ export async function approveChangeOrderCore(
                 } : {}),
                 revision: { increment: 1 },
             },
+        });
+        await enqueueApprovalAutomation(tx, {
+            changeOrderId: id,
+            eventRevision: co.revision,
+            pricingType: current.pricingType,
+            approvalMode: "CLIENT",
         });
         return { co, transitioned: true };
     }, { timeout: 15_000 });
@@ -560,9 +624,13 @@ export async function manuallyApproveChangeOrderCore(
 
         if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");
 
-        if (current.pricingType === "COST_PLUS") {
-            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
-            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        const paymentSchedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: id },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { amount: true },
+        });
+        if (current.pricingType === "COST_PLUS" && paymentSchedules.length > 0) {
+            throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
         }
 
         const items = await tx.changeOrderItem.findMany({
@@ -584,6 +652,10 @@ export async function manuallyApproveChangeOrderCore(
         if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
+        if (current.pricingType !== "COST_PLUS") {
+            const scheduleError = fixedCoScheduleValidationError(storedSubtotalCents, paymentSchedules);
+            if (scheduleError) throw new Error(scheduleError);
+        }
 
         let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
         if (current.status === "Draft" || current.termsTaxExempt === null) {
@@ -604,6 +676,7 @@ export async function manuallyApproveChangeOrderCore(
             throw new ChangeOrderTaxTermsConflictError(current.code);
         }
 
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
@@ -617,6 +690,12 @@ export async function manuallyApproveChangeOrderCore(
                 } : {}),
                 revision: { increment: 1 },
             },
+        });
+        await enqueueApprovalAutomation(tx, {
+            changeOrderId: id,
+            eventRevision: co.revision,
+            pricingType: current.pricingType,
+            approvalMode: "MANUAL",
         });
         return { co, transitioned: true };
     }, { timeout: 15_000 });
@@ -657,6 +736,7 @@ export async function deleteChangeOrderCore(id: string) {
         if (current.status !== "Draft" || hasSignatureAudit) {
             throw new Error("Only unsigned Draft change orders can be deleted. Sent and signed records must remain in the audit trail.");
         }
+        await removeSafeReviewJobsForDraftDelete(tx, id);
         await tx.changeOrder.delete({ where: { id } });
         return current;
     }, { timeout: 15_000 });

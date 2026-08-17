@@ -2,14 +2,14 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import { PrismaClient, type Prisma } from "@prisma/client";
 
 import { billChangeOrderCore, sendChangeOrderToClientCore } from "../src/lib/billing-core";
-import { approveChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
+import { approveChangeOrderCore, manuallyApproveChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { approveChangeOrderWithSignature } from "../src/lib/change-order-approval";
 import {
     canonicalCoTaxTerms,
     coTaxFingerprint,
     effectiveCoTaxInfo,
 } from "../src/lib/co-tax";
-import { buildChangeOrderSendPreviewPayload } from "../src/lib/change-order-send-preview";
+import { buildChangeOrderSendPreviewPayload, canonicalChangeOrderRecipients, parseChangeOrderConfirmToken } from "../src/lib/change-order-send-preview";
 import { verifyPreviewToken } from "../src/lib/mcp-preview-token";
 import { generateChangeOrderPdf } from "../src/lib/pdf";
 import { applyChangeOrderToSchedule, getChangeOrderOverlayRows } from "../src/lib/schedule-core";
@@ -27,6 +27,15 @@ const ids = {
     mcpStaleDraft: `${run}-mcp-stale-draft`,
     mcpTaxCoreRace: `${run}-mcp-tax-race`,
     mcpRevisionCoreRace: `${run}-mcp-rev-race`,
+    mcpRecipientCoreRace: `${run}-mcp-recipient-race`,
+    mcpStaleUpdate: `${run}-mcp-stale-update`,
+    invalidSendSchedule: `${run}-invalid-send-schedule`,
+    invalidPortalSchedule: `${run}-invalid-portal-schedule`,
+    invalidManualSchedule: `${run}-invalid-manual-schedule`,
+    invalidBillSchedule: `${run}-invalid-bill-schedule`,
+    canonicalArrayOrder: `${run}-canonical-array-order`,
+    duplicateOrder: `${run}-duplicate-order`,
+    legacyBillRace: `${run}-legacy-bill-race`,
     resendLifecycle: `${run}-resend-lifecycle`,
     customerFlow: `${run}-customer-flow`,
     legacySent: `${run}-legacy-sent`,
@@ -34,9 +43,13 @@ const ids = {
     scheduled: `${run}-scheduled`,
     zeroSchedule: `${run}-zero-schedule`,
     auditSent: `${run}-audit-sent`,
+    auditCountersigned: `${run}-audit-countersigned`,
     manualHeader: `${run}-manual-header`,
     roleVisibility: `${run}-role-visibility`,
 } as const;
+
+const approveAsOwningPortalClient: typeof approveChangeOrderCore = (changeOrderId, approval) =>
+    approveChangeOrderCore(changeOrderId, { ...approval, expectedClientId: ids.client });
 
 const sentTerms = {
     taxExempt: false,
@@ -162,6 +175,26 @@ async function waitForBlockedChangeOrderCore(timeoutMs = 10_000) {
     throw new Error("Timed out waiting for the MCP send core to block on the ChangeOrder row lock");
 }
 
+async function waitForBlockedEstimateLockOrEarlySettlement(isSettled: () => boolean, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (isSettled()) throw new Error("Billing settled before it acquired the locked Estimate tax row");
+        const [row] = await prisma.$queryRaw<Array<{ waiting: number }>>`
+            SELECT COUNT(*)::int AS waiting
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND state = 'active'
+              AND wait_event_type = 'Lock'
+              AND query LIKE '%FROM "Estimate"%'
+              AND query LIKE '%FOR UPDATE%'
+        `;
+        if (Number(row?.waiting ?? 0) > 0) return;
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    throw new Error("Timed out waiting for billing to lock the Estimate tax row");
+}
+
 async function callMcpConfirmAcrossLockedRace(
     request: APIRequestContext,
     rpcId: number,
@@ -197,20 +230,21 @@ async function callMcpConfirmAcrossLockedRace(
     }
 }
 
-async function currentMcpSendPayload(changeOrderId: string) {
+async function currentMcpSendPayload(changeOrderId: string, generation: string) {
     const co = await prisma.changeOrder.findUniqueOrThrow({
         where: { id: changeOrderId },
         select: {
             code: true, title: true, status: true, pricingType: true, markupPercent: true, totalAmount: true,
             revision: true, termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
-            paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true, order: true } },
+            paymentSchedules: { orderBy: [{ order: "asc" }, { id: "asc" }], select: { id: true, name: true, amount: true, dueDate: true, order: true } },
             estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
-            project: { select: { client: { select: { email: true } } } },
+            project: { select: { client: { select: { email: true, additionalEmail: true } } } },
         },
     });
     return buildChangeOrderSendPreviewPayload({
         changeOrderId,
-        recipient: co.project.client.email ?? "",
+        generation,
+        recipients: canonicalChangeOrderRecipients(co.project.client.email, co.project.client.additionalEmail),
         code: co.code,
         title: co.title,
         pricingType: co.pricingType,
@@ -282,6 +316,7 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
             await prisma.changeOrderBilling.deleteMany({ where: { changeOrder: { projectId: ids.project } } });
             await prisma.paymentSchedule.deleteMany({ where: { invoiceId: ids.invoice } });
             await prisma.scheduleTask.deleteMany({ where: { projectId: ids.project } });
+            await prisma.changeOrderAutomationJob.deleteMany({ where: { changeOrder: { projectId: ids.project } } });
             await prisma.changeOrder.deleteMany({ where: { projectId: ids.project } });
             await prisma.invoice.deleteMany({ where: { id: ids.invoice } });
             await prisma.estimate.deleteMany({ where: { id: ids.estimate } });
@@ -443,7 +478,9 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
             },
         });
         expect(raced.confirmToken).not.toBe(preview.confirmToken);
-        expect(verifyPreviewToken(raced.confirmToken, await currentMcpSendPayload(ids.mcpTaxCoreRace))).toBe(true);
+        const taxRaceToken = parseChangeOrderConfirmToken(raced.confirmToken);
+        expect(taxRaceToken).not.toBeNull();
+        expect(verifyPreviewToken(taxRaceToken!.signature, await currentMcpSendPayload(ids.mcpTaxCoreRace, taxRaceToken!.generation))).toBe(true);
         expect(await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.mcpTaxCoreRace } })).toMatchObject({
             status: "Draft",
             revision: 0,
@@ -493,7 +530,9 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
             },
         });
         expect(raced.confirmToken).not.toBe(preview.confirmToken);
-        expect(verifyPreviewToken(raced.confirmToken, await currentMcpSendPayload(ids.mcpRevisionCoreRace))).toBe(true);
+        const revisionRaceToken = parseChangeOrderConfirmToken(raced.confirmToken);
+        expect(revisionRaceToken).not.toBeNull();
+        expect(verifyPreviewToken(revisionRaceToken!.signature, await currentMcpSendPayload(ids.mcpRevisionCoreRace, revisionRaceToken!.generation))).toBe(true);
         expect(await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.mcpRevisionCoreRace } })).toMatchObject({
             title: "Post-token revision race",
             status: "Draft",
@@ -512,6 +551,146 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
             "mcp_preview_send_change_order",
             "mcp_preview_send_change_order",
         ]);
+    });
+
+    test("MCP returns a fresh full-recipient preview when additional email changes after token verification", async ({ request }) => {
+        await prisma.estimate.update({ where: { id: ids.estimate }, data: sentTerms });
+        await prisma.client.update({ where: { id: ids.client }, data: { additionalEmail: `${run}-old-cc@example.test` } });
+        await createFixedCo(ids.mcpRecipientCoreRace);
+        await prisma.activityLog.deleteMany({ where: { projectId: ids.project } });
+        const notificationsBefore = await prisma.notification.count({ where: { projectId: ids.project } });
+        const preview = await callMcpTool(request, 30, "send_change_order", { changeOrderId: ids.mcpRecipientCoreRace });
+        expect(preview).toMatchObject({
+            preview: true,
+            recipient: `${run}@example.test`,
+            cc: [`${run}-old-cc@example.test`],
+        });
+
+        const raced = await callMcpConfirmAcrossLockedRace(
+            request,
+            31,
+            ids.mcpRecipientCoreRace,
+            preview.confirmToken,
+            tx => tx.client.update({
+                where: { id: ids.client },
+                data: { additionalEmail: `${run}-new-cc@example.test` },
+            }),
+        );
+
+        expect(raced).toMatchObject({
+            preview: true,
+            recipient: `${run}@example.test`,
+            cc: [`${run}-new-cc@example.test`],
+            changeOrder: { status: "Draft" },
+        });
+        expect(raced.confirmToken).not.toBe(preview.confirmToken);
+        const recipientRaceToken = parseChangeOrderConfirmToken(raced.confirmToken);
+        expect(recipientRaceToken).not.toBeNull();
+        expect(verifyPreviewToken(recipientRaceToken!.signature, await currentMcpSendPayload(ids.mcpRecipientCoreRace, recipientRaceToken!.generation))).toBe(true);
+        expect(await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.mcpRecipientCoreRace } })).toMatchObject({
+            status: "Draft",
+            revision: 0,
+            sentAt: null,
+        });
+        expect(await prisma.notification.count({ where: { projectId: ids.project } })).toBe(notificationsBefore);
+        expect((await prisma.activityLog.findMany({
+            where: { projectId: ids.project },
+            orderBy: { createdAt: "asc" },
+            select: { action: true },
+        })).map(row => row.action)).toEqual([
+            "mcp_preview_send_change_order",
+            "mcp_preview_send_change_order",
+        ]);
+        await prisma.client.update({ where: { id: ids.client }, data: { additionalEmail: null } });
+    });
+
+    test("MCP full-replacement update requires the listed revision and a stale call mutates nothing", async ({ request }) => {
+        await createFixedCo(ids.mcpStaleUpdate);
+        const listed = await callMcpTool(request, 32, "list_change_orders", { projectId: ids.project });
+        const listedCo = listed.find((row: { id: string }) => row.id === ids.mcpStaleUpdate);
+        expect(listedCo).toMatchObject({ id: ids.mcpStaleUpdate, revision: 0 });
+        const original = await prisma.changeOrder.findUniqueOrThrow({
+            where: { id: ids.mcpStaleUpdate },
+            include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
+        });
+        await prisma.changeOrder.update({
+            where: { id: ids.mcpStaleUpdate },
+            data: { title: "Concurrent current title", revision: { increment: 1 } },
+        });
+
+        const stale = await callMcpTool(request, 33, "update_change_order", {
+            changeOrderId: ids.mcpStaleUpdate,
+            expectedRevision: listedCo.revision,
+            title: "Stale replacement title",
+            items: [{ name: "Stale replacement item", quantity: 1, unitCost: 99 }],
+        });
+        expect(stale).toMatchObject({ code: "REVISION_CONFLICT" });
+        expect(stale.error).toMatch(/modified after this page loaded/i);
+
+        const after = await prisma.changeOrder.findUniqueOrThrow({
+            where: { id: ids.mcpStaleUpdate },
+            include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
+        });
+        expect(after).toMatchObject({ title: "Concurrent current title", revision: 1, totalAmount: original.totalAmount });
+        expect(after.items.map(row => ({ id: row.id, name: row.name, total: Number(row.total) }))).toEqual(
+            original.items.map(row => ({ id: row.id, name: row.name, total: Number(row.total) })),
+        );
+    });
+
+    test("send, portal approval, manual approval, and billing share fixed-schedule validation", async () => {
+        await prisma.estimate.update({ where: { id: ids.estimate }, data: sentTerms });
+        await createFixedCo(ids.invalidSendSchedule, {
+            paymentSchedules: { create: [{ name: "Only row", amount: 10, order: 0 }] },
+        });
+        const sendGuard = await readRevisionAndDisplayedFingerprint(ids.invalidSendSchedule);
+        const send = await sendChangeOrderToClientCore(ids.invalidSendSchedule, {
+            expectedRevision: sendGuard.revision,
+            expectedTaxFingerprint: sendGuard.fingerprint,
+            sendNotification: async () => ({ success: true, id: "must-not-send" }),
+            ...coreDependencies,
+        });
+        expect(send).toMatchObject({ success: false, error: "Fixed change-order splits require at least two schedule rows" });
+
+        await createFixedCo(ids.invalidPortalSchedule, {
+            status: "Sent",
+            sentAt: new Date(),
+            termsTaxExempt: false,
+            termsTaxRateName: sentTerms.taxRateName,
+            termsTaxRatePercent: sentTerms.taxRatePercent,
+            paymentSchedules: { create: [{ name: "Positive", amount: 10, order: 0 }, { name: "Zero", amount: 0, order: 1 }] },
+        });
+        await expect(approveChangeOrderCore(ids.invalidPortalSchedule, {
+            signatureName: "Schedule signer",
+            clientSignatureUrl: `secure-doc://${run}/schedule.png`,
+            approvedAt: new Date(),
+            expectedRevision: 0,
+            expectedTaxFingerprint: coTaxFingerprint(sentTerms),
+            expectedClientId: ids.client,
+        })).rejects.toThrow("Every fixed change-order schedule amount must be greater than zero");
+
+        await createFixedCo(ids.invalidManualSchedule, {
+            paymentSchedules: { create: [{ name: "First", amount: 4, order: 0 }, { name: "Drift", amount: 5.99, order: 1 }] },
+        });
+        await expect(manuallyApproveChangeOrderCore(ids.invalidManualSchedule, {
+            staffName: "Schedule manager",
+            approvedAt: new Date(),
+            expectedRevision: 0,
+            expectedTaxFingerprint: coTaxFingerprint(sentTerms),
+        })).rejects.toThrow("Change-order schedule amounts are out of sync with the signed subtotal");
+
+        await createFixedCo(ids.invalidBillSchedule, {
+            status: "Approved",
+            approvedBy: "Legacy signer",
+            approvedAt: new Date(),
+            termsTaxExempt: false,
+            termsTaxRateName: sentTerms.taxRateName,
+            termsTaxRatePercent: sentTerms.taxRatePercent,
+            paymentSchedules: { create: [{ name: "Only row", amount: 10, order: 0 }] },
+        });
+        expect(await billChangeOrderCore(ids.invalidBillSchedule, coreDependencies)).toMatchObject({
+            ok: false,
+            error: "Fixed change-order splits require at least two schedule rows",
+        });
     });
 
     test("a Sent scope save clears old terms and the next guarded send freezes current terms", async () => {
@@ -568,6 +747,98 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         await prisma.estimate.update({ where: { id: ids.estimate }, data: sentTerms });
     });
 
+    test("duplicate schedule order values keep each cumulative-tax residual attached across consumers", async () => {
+        const scheduleIds = {
+            first: `${ids.duplicateOrder}-schedule-a`,
+            second: `${ids.duplicateOrder}-schedule-b`,
+            final: `${ids.duplicateOrder}-schedule-c`,
+        };
+        await createFixedCo(ids.duplicateOrder, {
+            paymentSchedules: {
+                create: [
+                    // createdAt is deliberately the inverse of id order. Any reader
+                    // that uses creation time (or no tie-breaker) disagrees with the
+                    // canonical (order,id) sequence and moves residual cents.
+                    { id: scheduleIds.first, name: "Canonical first", amount: 3.33, order: 7, createdAt: new Date("2026-08-03T12:00:00.000Z") },
+                    { id: scheduleIds.second, name: "Canonical second", amount: 3.33, order: 7, createdAt: new Date("2026-08-02T12:00:00.000Z") },
+                    { id: scheduleIds.final, name: "Canonical residual", amount: 3.34, order: 7, createdAt: new Date("2026-08-01T12:00:00.000Z") },
+                ],
+            },
+        });
+
+        const guard = await readRevisionAndDisplayedFingerprint(ids.duplicateOrder);
+        let sentHtml = "";
+        const sent = await sendChangeOrderToClientCore(ids.duplicateOrder, {
+            expectedRevision: guard.revision,
+            expectedTaxFingerprint: guard.fingerprint,
+            sendNotification: async (_to, _subject, html) => {
+                sentHtml = html;
+                return { success: true, id: `${run}-duplicate-order-email` };
+            },
+            ...coreDependencies,
+        });
+        expect(sent.success).toBe(true);
+        if (!sent.success) throw new Error(sent.error);
+        expect(sentHtml).toContain("<span>Canonical first</span><span>$3.63</span>");
+        expect(sentHtml).toContain("<span>Canonical second</span><span>$3.62</span>");
+        expect(sentHtml).toContain("<span>Canonical residual</span><span>$3.64</span>");
+
+        const pdfText = (await extractPdfText(await generateChangeOrderPdf(ids.duplicateOrder))).replace(/\s+/g, " ");
+        expect(pdfText).toMatch(/Canonical first\s*\$3\.63/);
+        expect(pdfText).toMatch(/Canonical second\s*\$3\.62/);
+        expect(pdfText).toMatch(/Canonical residual\s*\$3\.64/);
+
+        const approved = await manuallyApproveChangeOrderCore(ids.duplicateOrder, {
+            staffName: "Canonical schedule reviewer",
+            approvedAt: new Date("2026-08-04T12:00:00.000Z"),
+            expectedRevision: sent.revision,
+            expectedTaxFingerprint: coTaxFingerprint(sentTerms),
+        });
+        expect(approved?.co).toMatchObject({ status: "Approved" });
+
+        const actor = { type: "TEAM" as const, name: "Canonical schedule test" };
+        await applyChangeOrderToSchedule({ changeOrderId: ids.duplicateOrder, actor });
+        const projected = (await getChangeOrderOverlayRows(
+            new Date("2025-01-01T00:00:00.000Z"),
+            new Date("2030-01-01T00:00:00.000Z"),
+        )).filter(row => row.changeOrderId === ids.duplicateOrder);
+        expect(projected.map(row => ({ name: row.name, amount: row.amount }))).toEqual([
+            { name: "Canonical first", amount: 3.63 },
+            { name: "Canonical second", amount: 3.62 },
+            { name: "Canonical residual", amount: 3.64 },
+        ]);
+
+        const billed = await billChangeOrderCore(ids.duplicateOrder, coreDependencies);
+        expect(billed.ok).toBe(true);
+        if (!billed.ok) throw new Error(billed.error);
+        expect(billed.milestones.map(row => ({ name: row.name, amount: row.amount }))).toEqual([
+            { name: `${ids.duplicateOrder.slice(-36)} — Canonical first`, amount: 3.63 },
+            { name: `${ids.duplicateOrder.slice(-36)} — Canonical second`, amount: 3.62 },
+            { name: `${ids.duplicateOrder.slice(-36)} — Canonical residual`, amount: 3.64 },
+        ]);
+    });
+
+    test("a full schedule replacement persists the supplied array order as canonical indices", async () => {
+        await createFixedCo(ids.canonicalArrayOrder);
+        await updateChangeOrderCore(ids.canonicalArrayOrder, {
+            expectedRevision: 0,
+            paymentSchedules: [
+                { id: `${ids.canonicalArrayOrder}-schedule-b`, name: "Array first", amount: 4, order: 9 },
+                { id: `${ids.canonicalArrayOrder}-schedule-a`, name: "Array second", amount: 6, order: 9 },
+            ],
+        });
+
+        const stored = await prisma.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: ids.canonicalArrayOrder },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { name: true, order: true },
+        });
+        expect(stored).toEqual([
+            { name: "Array first", order: 0 },
+            { name: "Array second", order: 1 },
+        ]);
+    });
+
     test("send freezes terms and email, portal, PDF, and billing share gross schedule cents after estimate edits", async ({ page }) => {
         await createFixedCo(ids.customerFlow, {}, true);
         const loaded = await readRevisionAndDisplayedFingerprint(ids.customerFlow);
@@ -584,7 +855,9 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         expect(sent.success).toBe(true);
         if (!sent.success) throw new Error(sent.error);
         expect(sentHtml).toContain("Seattle exact rate (8.875%)");
-        expect(sentHtml.match(/\$3\.63/g)?.length).toBe(3);
+        expect(sentHtml).toContain("$3.63");
+        expect(sentHtml).toContain("$3.62");
+        expect(sentHtml).toContain("$3.64");
         expect(sentHtml).toContain("$10.89");
 
         const sentRow = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.customerFlow } });
@@ -604,12 +877,16 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         await page.goto(`/portal/change-orders/${ids.customerFlow}`, { waitUntil: "networkidle" });
         await expect(page.getByText("Seattle exact rate (8.875%)", { exact: true })).toBeVisible();
         await expect(page.getByText("$10.89", { exact: true })).toBeVisible();
-        await expect(page.getByText("$3.63", { exact: true })).toHaveCount(3);
+        await expect(page.getByText("$3.63", { exact: true })).toBeVisible();
+        await expect(page.getByText("$3.62", { exact: true })).toBeVisible();
+        await expect(page.getByText("$3.64", { exact: true })).toBeVisible();
 
         const pdfText = await extractPdfText(await generateChangeOrderPdf(ids.customerFlow));
         expect(pdfText).toContain("Seattle exact rate (8.875%)");
         expect(pdfText).toContain("$10.89");
-        expect(pdfText.match(/\$3\.63/g)?.length).toBeGreaterThanOrEqual(3);
+        expect(pdfText).toContain("$3.63");
+        expect(pdfText).toContain("$3.62");
+        expect(pdfText).toContain("$3.64");
 
         const firstPortalRevision = sent.revision;
         const resendGuard = await readRevisionAndDisplayedFingerprint(ids.customerFlow);
@@ -634,7 +911,7 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
                 url: `secure-doc://${run}/stale-client-signature.png`,
                 discard: async () => { discarded++; },
             }),
-            approveCore: approveChangeOrderCore,
+            approveCore: approveAsOwningPortalClient,
         })).rejects.toThrow(/modified after this page loaded/i);
         expect(discarded).toBe(1);
         expect(await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.customerFlow } })).toMatchObject({
@@ -651,7 +928,7 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
             expectedTaxFingerprint: coTaxFingerprint(sentTerms),
         }, {
             persistSignature: async () => ({ url: `secure-doc://${run}/current-client-signature.png`, discard: async () => undefined }),
-            approveCore: approveChangeOrderCore,
+            approveCore: approveAsOwningPortalClient,
         });
         expect(approved?.co).toMatchObject({ status: "Approved", termsTaxRateName: "Seattle exact rate" });
         expect(Number(approved?.co.termsTaxRatePercent)).toBe(8.875);
@@ -660,7 +937,7 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         expect(billed.ok).toBe(true);
         if (!billed.ok) throw new Error(billed.error);
         expect(billed.amount).toBe(10.89);
-        expect(billed.milestones.map(row => row.amount)).toEqual([3.63, 3.63, 3.63]);
+        expect(billed.milestones.map(row => row.amount)).toEqual([3.63, 3.62, 3.64]);
     });
 
     test("legacy Sent/null bootstraps only through the guard and legacy Approved/null deliberately uses live fallback", async ({ page }) => {
@@ -696,6 +973,48 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         await expect(page.getByText("$11.25", { exact: true })).toBeVisible();
     });
 
+    test("legacy Approved/null fixed billing locks Estimate tax and snapshots the committed terms on success", async () => {
+        await prisma.estimate.update({ where: { id: ids.estimate }, data: sentTerms });
+        await createFixedCo(ids.legacyBillRace, {
+            status: "Approved",
+            approvedBy: "Legacy signer",
+            approvedAt: new Date(),
+            termsTaxExempt: null,
+            termsTaxRateName: null,
+            termsTaxRatePercent: null,
+        });
+
+        let lockReady!: () => void;
+        let release!: () => void;
+        const locked = new Promise<void>(resolve => { lockReady = resolve; });
+        const releaseGate = new Promise<void>(resolve => { release = resolve; });
+        const blocker = prisma.$transaction(async tx => {
+            await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ids.estimate} FOR UPDATE`;
+            lockReady();
+            await releaseGate;
+            await tx.estimate.update({
+                where: { id: ids.estimate },
+                data: { taxExempt: false, taxRatePercent: 12.5, taxRateName: "Locked race winner" },
+            });
+        }, { timeout: 15_000 });
+
+        await locked;
+        let settled = false;
+        const billing = billChangeOrderCore(ids.legacyBillRace, coreDependencies).finally(() => { settled = true; });
+        try {
+            await waitForBlockedEstimateLockOrEarlySettlement(() => settled);
+        } finally {
+            release();
+        }
+        await blocker;
+        const billed = await billing;
+        expect(billed).toMatchObject({ ok: true, taxAmount: 1.25, amount: 11.25, taxLabel: "Locked race winner (12.5%)" });
+        const stored = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.legacyBillRace } });
+        expect(stored).toMatchObject({ termsTaxExempt: false, termsTaxRateName: "Locked race winner" });
+        expect(Number(stored.termsTaxRatePercent)).toBe(12.5);
+        await prisma.estimate.update({ where: { id: ids.estimate }, data: sentTerms });
+    });
+
     test("schedule overlays and zero-row apply/regenerate notes stay on stored terms after estimate changes", async () => {
         await createFixedCo(ids.scheduled, {
             status: "Approved",
@@ -722,7 +1041,7 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         const from = new Date("2026-01-01T00:00:00.000Z");
         const to = new Date("2027-12-31T00:00:00.000Z");
         const before = await getChangeOrderOverlayRows(from, to);
-        expect(before.filter(row => row.changeOrderId === ids.scheduled).map(row => row.amount)).toEqual([3.63, 3.63, 3.63]);
+        expect(before.filter(row => row.changeOrderId === ids.scheduled).map(row => row.amount)).toEqual([3.63, 3.62, 3.64]);
         expect(before.find(row => row.changeOrderId === ids.zeroSchedule)?.amount).toBe(10.89);
 
         await prisma.estimate.update({ where: { id: ids.estimate }, data: { taxRatePercent: 17.125, taxRateName: "Later live edit" } });
@@ -730,47 +1049,98 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         const zeroRegenerated = await applyChangeOrderToSchedule({ changeOrderId: ids.zeroSchedule, mode: "regenerate", actor });
         expect(zeroRegenerated.notes.join(" ")).toContain("$10.89 projected");
         const after = await getChangeOrderOverlayRows(from, to);
-        expect(after.filter(row => row.changeOrderId === ids.scheduled).map(row => row.amount)).toEqual([3.63, 3.63, 3.63]);
+        expect(after.filter(row => row.changeOrderId === ids.scheduled).map(row => row.amount)).toEqual([3.63, 3.62, 3.64]);
         expect(after.find(row => row.changeOrderId === ids.zeroSchedule)?.amount).toBe(10.89);
     });
 
     test("co-audit repair of Sent scope returns Draft and clears the sent terms tuple", async () => {
-        await createFixedCo(ids.auditSent, {
+        const priorEstimateTax = await prisma.estimate.findUniqueOrThrow({
+            where: { id: ids.estimate },
+            select: { taxExempt: true, taxRateName: true, taxRatePercent: true },
+        });
+        await prisma.estimate.update({
+            where: { id: ids.estimate },
+            data: { taxExempt: false, taxRateName: "Divergent live audit rate", taxRatePercent: 17.125 },
+        });
+        try {
+            await createFixedCo(ids.auditSent, {
+                status: "Sent",
+                sentAt: new Date(),
+                totalAmount: 10.89,
+                balanceDue: 10.89,
+                termsTaxExempt: false,
+                termsTaxRateName: "Seattle exact rate",
+                termsTaxRatePercent: 8.875,
+            });
+            const priorSecret = process.env.CO_AUDIT_SECRET;
+            process.env.CO_AUDIT_SECRET = `${run}-audit-secret`;
+            try {
+                const response = await repairChangeOrder(new Request("http://localhost/api/integrations/co-audit", {
+                    method: "POST",
+                    headers: { "content-type": "application/json", "x-audit-key": process.env.CO_AUDIT_SECRET },
+                    body: JSON.stringify({ changeOrderId: ids.auditSent, expectedTotalAmount: 10.89 }),
+                }));
+                expect(response.status).toBe(200);
+                expect(await response.json()).toMatchObject({ ok: true, changed: true });
+            } finally {
+                if (priorSecret === undefined) delete process.env.CO_AUDIT_SECRET;
+                else process.env.CO_AUDIT_SECRET = priorSecret;
+            }
+            const row = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.auditSent } });
+            expect(row).toMatchObject({
+                status: "Draft",
+                sentAt: null,
+                viewedAt: null,
+                termsTaxExempt: null,
+                termsTaxRateName: null,
+                termsTaxRatePercent: null,
+                revision: 1,
+            });
+        } finally {
+            await prisma.estimate.update({
+                where: { id: ids.estimate },
+                data: priorEstimateTax,
+            });
+        }
+    });
+
+    test("co-audit refuses a countersigned Sent change order without mutating it", async () => {
+        const signedAt = new Date("2026-08-16T13:00:00.000Z");
+        await createFixedCo(ids.auditCountersigned, {
             status: "Sent",
-            sentAt: new Date(),
+            sentAt: new Date("2026-08-16T12:00:00.000Z"),
             totalAmount: 10.89,
             balanceDue: 10.89,
             termsTaxExempt: false,
             termsTaxRateName: "Seattle exact rate",
             termsTaxRatePercent: 8.875,
+            companySignedBy: "Company Signer",
+            companySignedAt: signedAt,
+            companySignatureUrl: `secure-doc://${run}/company-signature.png`,
+            revision: 7,
         });
+        const before = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.auditCountersigned } });
         const priorSecret = process.env.CO_AUDIT_SECRET;
         process.env.CO_AUDIT_SECRET = `${run}-audit-secret`;
         try {
             const response = await repairChangeOrder(new Request("http://localhost/api/integrations/co-audit", {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-audit-key": process.env.CO_AUDIT_SECRET },
-                body: JSON.stringify({ changeOrderId: ids.auditSent, expectedTotalAmount: 10.89 }),
+                body: JSON.stringify({ changeOrderId: ids.auditCountersigned, expectedTotalAmount: 10.89, force: true }),
             }));
-            expect(response.status).toBe(200);
-            expect(await response.json()).toMatchObject({ ok: true, changed: true });
+            expect(response.status).toBe(409);
+            expect(await response.json()).toMatchObject({ ok: false });
         } finally {
             if (priorSecret === undefined) delete process.env.CO_AUDIT_SECRET;
             else process.env.CO_AUDIT_SECRET = priorSecret;
         }
-        const row = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.auditSent } });
-        expect(row).toMatchObject({
-            status: "Draft",
-            sentAt: null,
-            viewedAt: null,
-            termsTaxExempt: null,
-            termsTaxRateName: null,
-            termsTaxRatePercent: null,
-            revision: 1,
-        });
+        const after = await prisma.changeOrder.findUniqueOrThrow({ where: { id: ids.auditCountersigned } });
+        expect(after).toEqual(before);
+        expect(await prisma.activityLog.count({ where: { entityId: ids.auditCountersigned } })).toBe(0);
     });
 
     test("manual Approved header is honest and non-privileged change-order staff never see manual approval", async ({ page, browser }) => {
+        test.setTimeout(120_000);
         await createFixedCo(ids.manualHeader, {
             status: "Approved",
             approvedBy: "Manager Name (manual approval — staff)",
@@ -782,6 +1152,14 @@ test.describe.serial("change-order sent terms are a stable guarded contract", ()
         await page.goto(`/portal/change-orders/${ids.manualHeader}`, { waitUntil: "networkidle" });
         await expect(page.getByText("✓ Approved", { exact: true })).toBeVisible();
         await expect(page.getByText("✓ Approved & Signed", { exact: true })).toHaveCount(0);
+
+        await page.goto(`/projects/${ids.project}/change-orders/${ids.manualHeader}`, { waitUntil: "networkidle" });
+        await page.getByRole("button", { name: "Details & Signatures" }).click();
+        await expect(page.getByText("Approved manually", { exact: true })).toBeVisible();
+        await expect(page.getByText("Signed", { exact: true })).toHaveCount(0);
+        await expect(page.getByRole("heading", { name: "Staff Approval", exact: true })).toBeVisible();
+        await expect(page.getByRole("heading", { name: "Client Signature", exact: true })).toHaveCount(0);
+        await expect(page.getByText("Approved without a client signature", { exact: true })).toBeVisible();
 
         await createFixedCo(ids.roleVisibility, {
             status: "Sent",
