@@ -31,7 +31,12 @@ test("addCalendarDaysInTimeZone advances 7 CALENDAR days, not a fixed 168 hours,
 
     assert.equal(dayKeyInTimeZone(nextWeekStart, TZ), "2026-11-02");
     // Still exactly local midnight, not shifted by the DST hour.
-    const parts = new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false }).format(nextWeekStart);
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: TZ,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+    }).format(nextWeekStart);
     assert.equal(parts, "00:00");
 
     const spanHours = (nextWeekStart.getTime() - weekStart.getTime()) / 3_600_000;
