@@ -294,6 +294,19 @@ test("bank-ledger ingest: QBO_REGISTER", async t => {
         assert.equal(createQboObservationsCalls.length, 1);
     });
 
+    await t.test("normalizes blank check numbers to null before persistence", async () => {
+        const { handlers, createQboObservationsCalls } = makeHandlers();
+        const res = await handlers.POST(makeRequest(qboBody([
+            { postedDate: "2026-07-16", amountCents: -7400, rawDescriptor: "US MARKET", checkNumber: "", qbTxnId: "qb-1" },
+            { postedDate: "2026-07-17", amountCents: -5100, rawDescriptor: "OTHER VENDOR", checkNumber: "   ", qbTxnId: "qb-2" },
+        ])));
+
+        assert.equal(res.status, 200);
+        const persisted = createQboObservationsCalls as Array<{ checkNumber: string | null }>;
+        assert.equal(persisted[0].checkNumber, null);
+        assert.equal(persisted[1].checkNumber, null);
+    });
+
     await t.test("400 invalid-line when qbTxnId is missing", async () => {
         const { handlers } = makeHandlers();
         const res = await handlers.POST(makeRequest(qboBody([

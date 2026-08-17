@@ -32,12 +32,19 @@ test(
             });
             for (const sql of statements) await db.$executeRawUnsafe(sql);
 
+            const snapshotEnv = {
+                ...env,
+                NODE_OPTIONS: [process.env.NODE_OPTIONS, "--require=./tests/fixed-date-preload.cjs"]
+                    .filter(Boolean)
+                    .join(" "),
+            };
             execFileSync("node", ["scripts/snapshot-prisma-blind-spots.mjs", "--write"], {
                 cwd: root,
-                env,
+                env: snapshotEnv,
                 stdio: "pipe",
             });
             const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+            assert.equal(snapshot.capturedAt, "2031-04-05", "snapshot provenance must use the capture date");
 
             // A production regression that removes either query from the
             // snapshotter leaves these undefined. The assertions are catalog

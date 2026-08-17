@@ -127,7 +127,7 @@ function validateCommonFields(raw: IngestLineInput, index: number): { ok: true; 
             postedDate: raw.postedDate,
             amountCents: raw.amountCents,
             rawDescriptor: raw.rawDescriptor,
-            checkNumber: typeof raw.checkNumber === "string" ? raw.checkNumber : null,
+            checkNumber: typeof raw.checkNumber === "string" && raw.checkNumber.trim() !== "" ? raw.checkNumber : null,
         },
     };
 }
