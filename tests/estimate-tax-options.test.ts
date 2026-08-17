@@ -14,14 +14,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     EXEMPT_TAX_KEY,
+    LEGACY_FALLBACK_TAX_RATE,
     SAVED_TAX_KEY,
+    UNRATED_TAX_KEY,
     buildTaxOptions,
     companyTaxKey,
+    deriveEffectiveTaxRate,
+    isRepresentableTaxRate,
     reconcileTaxKey,
     resolveActiveTax,
     sanitizeCompanySalesTaxes,
     taxFieldsForSave,
+    taxFractionFor,
     type CompanySalesTax,
+    type StoredSellMoney,
     type TaxOption,
     type TaxOptionSet,
 } from "../src/lib/estimate-tax-options";
@@ -33,7 +39,7 @@ const SUBTOTAL = 10_000;
 /** The editor's own money math (`computeSellTotals` in EstimateEditor.tsx), to the cent. */
 const rm = (n: number) => Math.round(n * 100) / 100;
 function sellTotals(subtotal: number, activeTax: TaxOption | null, taxExempt: boolean, processingFeeMarkup = 0) {
-    const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+    const taxRate = taxFractionFor(activeTax, taxExempt);
     const processingFee = processingFeeMarkup > 0 ? rm(subtotal * (processingFeeMarkup / 100)) : 0;
     const tax = rm(subtotal * taxRate);
     return { tax, totalAmount: rm(subtotal + tax + processingFee) };
@@ -51,14 +57,31 @@ function sellTotals(subtotal: number, activeTax: TaxOption | null, taxExempt: bo
 function openAndSave(
     salesTaxes: CompanySalesTax[] | null | undefined,
     stored: { name: string | null; percent: number | string | null },
-    opts: { taxExempt?: boolean; selectKey?: string | null; subtotal?: number } = {},
+    opts: {
+        taxExempt?: boolean;
+        selectKey?: string | null;
+        subtotal?: number;
+        processingFeeMarkup?: number;
+        /**
+         * The `totalAmount` already on the row. Supplying it turns on rate DERIVATION, which is
+         * the whole point of the round-3 ruling: without a stored total there is nothing to
+         * preserve and the editor legitimately adopts the company default.
+         */
+        storedTotal?: number | string | null;
+    } = {},
 ) {
-    const set = buildTaxOptions(salesTaxes, { name: stored.name, percent: stored.percent });
+    const subtotal = opts.subtotal ?? SUBTOTAL;
+    const processingFeeMarkup = opts.processingFeeMarkup ?? 0;
+    const storedMoney: StoredSellMoney | undefined =
+        "storedTotal" in opts
+            ? { subtotal, totalAmount: opts.storedTotal, processingFeeMarkup, taxExempt: !!opts.taxExempt }
+            : undefined;
+    const set = buildTaxOptions(salesTaxes, { name: stored.name, percent: stored.percent }, storedMoney);
     const key = "selectKey" in opts ? opts.selectKey! : set.initialKey;
     const activeTax = resolveActiveTax(set.options, key, set.defaultOption);
     const taxExempt = !!opts.taxExempt;
     const written = taxFieldsForSave(activeTax, taxExempt);
-    const money = sellTotals(opts.subtotal ?? SUBTOTAL, activeTax, taxExempt);
+    const money = sellTotals(subtotal, activeTax, taxExempt, processingFeeMarkup);
     const snapshot = JSON.stringify({ taxExempt, ...written, totalAmount: money.totalAmount });
     return { set, key, activeTax, written, ...money, snapshot };
 }
@@ -381,10 +404,42 @@ test("STALE KEY: a refresh that changes nothing is a no-op, so the user's pick s
     assert.equal(openedAfter.snapshot, openedBefore.snapshot);
 });
 
-test("STALE KEY: exempt (a null key) stays exempt across a rebuild", () => {
-    const first = buildTaxOptions([{ name: "Sales Tax", rate: 8.8, isDefault: true }], { name: null, percent: null });
-    const second = buildTaxOptions([{ name: "Clark County", rate: 7.7, isDefault: true }], { name: null, percent: null });
-    assert.equal(reconcileTaxKey(null, first.options, second), null);
+test("ROUND-2 FINDING 1: a null key is repaired, because null never meant exempt", () => {
+    // Exemption lives in `taxExempt`, a separate column and a separate piece of editor state; the
+    // picker's EXEMPT_TAX_KEY is a <select> value that is never stored in `selectedTaxKey`. The
+    // old code short-circuited `key === null` as "exempt", so a NON-exempt estimate that opened
+    // against empty settings kept a null key forever once settings were populated — the <select>
+    // rendered the first row while resolveActiveTax quietly used defaultOption.
+    const empty = buildTaxOptions([], { name: null, percent: null });
+    assert.equal(empty.initialKey, null, "nothing configured, so nothing to select");
+
+    const populated = buildTaxOptions(
+        [{ name: "Clark County", rate: 7.7 }, { name: "WA Sales Tax", rate: 8.8, isDefault: true }],
+        { name: null, percent: null },
+    );
+    const repaired = reconcileTaxKey(null, empty.options, populated);
+
+    assert.equal(repaired, populated.initialKey);
+    assert.equal(repaired, keyOf(populated, "WA Sales Tax", 8.8), "the DEFAULT row, not the first one");
+    // The bug in one assertion: the rendered <select> and the priced rate must agree.
+    const rendered = populated.options[0];
+    const resolved = resolveActiveTax(populated.options, repaired, populated.defaultOption);
+    assert.equal(resolved!.key, repaired);
+    assert.notEqual(rendered.key, populated.initialKey, "first row != default row, so a null key WOULD have diverged");
+});
+
+test("ROUND-2 FINDING 1: exemption survives a rebuild via taxExempt, not via the key", () => {
+    // An exempt estimate keeps whatever key it was on. Both columns still clear on save, and
+    // un-exempting returns the user to that rate rather than to the company default.
+    const first = buildTaxOptions([{ name: "Sales Tax", rate: 8.8, isDefault: true }], { name: "Sales Tax", percent: 8.8 });
+    const second = buildTaxOptions([{ name: "Other", rate: 5 }, { name: "Sales Tax", rate: 8.8 }], { name: "Sales Tax", percent: 8.8 });
+
+    const carried = reconcileTaxKey(first.initialKey, first.options, second);
+    assert.equal(carried, keyOf(second, "Sales Tax", 8.8), "identity re-matched by (name, rate) across the reorder");
+
+    const active = resolveActiveTax(second.options, carried, second.defaultOption);
+    assert.deepEqual(taxFieldsForSave(active, true), { taxRateName: null, taxRatePercent: null }, "still exempt");
+    assert.deepEqual(taxFieldsForSave(active, false), { taxRateName: "Sales Tax", taxRatePercent: 8.8 }, "un-exempt restores it");
 });
 
 test("STALE KEY: a key from nowhere resolves to a real option rather than sticking", () => {
@@ -641,4 +696,341 @@ test("an unknown selected key falls back to the company default rather than drop
     const { options, defaultOption } = buildTaxOptions(salesTaxes, { name: null, percent: null });
 
     assert.equal(resolveActiveTax(options, "deleted-tax", defaultOption)?.rate, 8.8);
+});
+
+// ─── THE RULING (round 3): a rateless estimate keeps the tax it already effectively has ──────
+//
+// The round-2 BLOCKER: rateless estimates were re-rated to the company default, which need not
+// equal the legacy 8.8% the editor had already baked into `totalAmount`. The round-2 tests hid it
+// by comparing default-to-default. Every test below therefore asserts against STORED money — a
+// literal dollar figure a save produced with the legacy fallback — and every company default here
+// is deliberately NOT 8.8.
+
+/** A company whose default (9.15%) differs from the legacy fallback. Re-rating shows up as money. */
+const NON_88_SETTINGS: CompanySalesTax[] = [
+    { name: "WA Sales Tax", rate: 9.15, isDefault: true },
+    { name: "Clark County", rate: 7.7 },
+];
+
+/** What the editor stored when it last saved a rateless estimate at the legacy 8.8%. */
+function legacyStoredTotal(subtotal: number, processingFeeMarkup = 0) {
+    return sellTotals(subtotal, null, false, processingFeeMarkup).totalAmount;
+}
+
+test("THE RULING: the review's worked example — $11,080 stays $11,080, not $11,115", () => {
+    // $10,000 subtotal + 2% processing fee, saved at the legacy 8.8%.
+    const stored = legacyStoredTotal(10_000, 2);
+    assert.equal(stored, 11_080, "the legacy fallback's own arithmetic, stated as a number");
+    // What re-rating to the company default would have produced, so the assertion below is not
+    // vacuously true.
+    assert.equal(sellTotals(10_000, { rate: 9.15 } as TaxOption, false, 2).totalAmount, 11_115);
+
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal: 10_000, processingFeeMarkup: 2, storedTotal: stored,
+    });
+
+    assert.equal(opened.totalAmount, 11_080, "the client's total must not move");
+    assert.equal(opened.key, SAVED_TAX_KEY, "on the estimate's own derived rate, not a settings row");
+    assert.deepEqual(opened.written, { taxRateName: null, taxRatePercent: 8.8 },
+        "the derived rate is written, so the columns finally agree with the total");
+});
+
+test("THE RULING: the derived total holds to the cent across THREE save cycles", () => {
+    // Three cycles, because the first save is what changes `taxRatePercent` from null to 8.8 —
+    // cycles two and three prove the new value is a fixed point rather than a one-step drift.
+    const subtotal = 10_000;
+    const feeMarkup = 2;
+    let stored: { name: string | null; percent: number | string | null } = { name: null, percent: null };
+    let total = legacyStoredTotal(subtotal, feeMarkup);
+
+    for (const cycle of [1, 2, 3]) {
+        const run = openAndSave(NON_88_SETTINGS, stored, {
+            subtotal, processingFeeMarkup: feeMarkup, storedTotal: total,
+        });
+        assert.equal(run.totalAmount, 11_080, `cycle ${cycle}: the total moved`);
+        stored = reopen(run.written);
+        total = run.totalAmount;
+    }
+    assert.deepEqual(stored, { name: null, percent: 8.8 }, "and it settled on the rate it always had");
+});
+
+test("THE RULING: an awkward subtotal still round-trips to the cent", () => {
+    // 8.8% of $7,432.19 is $654.03 (rounded), so the derived rate is not exactly 8.8 — this is
+    // where a naive (total - subtotal) / subtotal would drift a cent on the way back.
+    const subtotal = 7_432.19;
+    const stored = legacyStoredTotal(subtotal, 3);
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal, processingFeeMarkup: 3, storedTotal: stored,
+    });
+
+    assert.equal(opened.totalAmount, stored, "to the cent");
+    assert.notEqual(opened.written.taxRatePercent, 9.15, "and not the company default");
+    // Re-saving what cycle one wrote reproduces the same money from the STORED rate.
+    const again = openAndSave(NON_88_SETTINGS, reopen(opened.written), {
+        subtotal, processingFeeMarkup: 3, storedTotal: opened.totalAmount,
+    });
+    assert.equal(again.totalAmount, stored);
+});
+
+test("THE RULING: a stored NAME with no rate keeps its name and gains its own rate", () => {
+    // Before the ruling this landed on the same-named company row (nameOnlyMatch) and re-rated
+    // 8.8 -> 9.15. The name is preserved either way; the money is what changed.
+    const subtotal = 10_000;
+    const stored = legacyStoredTotal(subtotal);
+    const opened = openAndSave(NON_88_SETTINGS, { name: "WA Sales Tax", percent: null }, {
+        subtotal, storedTotal: stored,
+    });
+
+    assert.equal(opened.totalAmount, 10_880);
+    assert.deepEqual(opened.written, { taxRateName: "WA Sales Tax", taxRatePercent: 8.8 });
+    assert.equal(opened.set.savedOption?.orphaned, true, "the picker flags it as not a settings row");
+});
+
+test("THE RULING: a derived rate settings DO carry lands on the company row, not a synthetic one", () => {
+    // The company's default happens to be 8.8 under the name the estimate stored, so the derived
+    // rate IS that row. No synthetic option: the picker stays a plain list of settings.
+    const settings: CompanySalesTax[] = [{ name: "WA Sales Tax", rate: 8.8, isDefault: true }];
+    const opened = openAndSave(settings, { name: "WA Sales Tax", percent: null }, {
+        subtotal: 10_000, storedTotal: legacyStoredTotal(10_000),
+    });
+
+    assert.equal(opened.set.savedOption, null);
+    assert.equal(opened.key, keyOf(opened.set, "WA Sales Tax", 8.8));
+    assert.equal(opened.totalAmount, 10_880);
+});
+
+test("THE RULING: a derived rate never invents a taxRateName", () => {
+    // 8.8 is on file under "Clark County" here. Matching the derived RATE alone would select it
+    // and write that name onto an estimate that never carried it.
+    const settings: CompanySalesTax[] = [
+        { name: "WA Sales Tax", rate: 9.15, isDefault: true },
+        { name: "Clark County", rate: 8.8 },
+    ];
+    const opened = openAndSave(settings, { name: null, percent: null }, {
+        subtotal: 10_000, storedTotal: legacyStoredTotal(10_000),
+    });
+
+    assert.equal(opened.key, SAVED_TAX_KEY);
+    assert.deepEqual(opened.written, { taxRateName: null, taxRatePercent: 8.8 });
+    assert.equal(opened.totalAmount, 10_880);
+});
+
+test("THE RULING: a derived rate never RENAMES an estimate that already has a name", () => {
+    // The null-name case above cannot reach the name-matching branch at all (it is guarded on
+    // `savedName === null`), so it does not actually prove the pair-match. This one does: the
+    // estimate stores "Legacy Tax", the derived rate is 8.8, and settings carry 8.8 under a
+    // DIFFERENT name. Matching on the rate alone would rewrite `taxRateName` to "Clark County" —
+    // a column change on a client-facing document that nobody asked for.
+    const settings: CompanySalesTax[] = [
+        { name: "WA Sales Tax", rate: 9.15, isDefault: true },
+        { name: "Clark County", rate: 8.8 },
+    ];
+    const opened = openAndSave(settings, { name: "Legacy Tax", percent: null }, {
+        subtotal: 10_000, storedTotal: legacyStoredTotal(10_000),
+    });
+
+    assert.equal(opened.key, SAVED_TAX_KEY, "a synthetic option, not the same-rate company row");
+    assert.deepEqual(opened.written, { taxRateName: "Legacy Tax", taxRatePercent: 8.8 });
+    assert.equal(opened.set.savedOption?.label, "Legacy Tax");
+    assert.equal(opened.totalAmount, 10_880);
+});
+
+test("THE RULING: an EXEMPT estimate is not given a derived 0% rate", () => {
+    // An exempt row stores null/null legitimately and prices at the subtotal, so derivation would
+    // "recover" 0% and pin it there — un-exempting would then quote 0% instead of the default.
+    const subtotal = 10_000;
+    const exempt = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal, storedTotal: subtotal, taxExempt: true,
+    });
+    assert.deepEqual(exempt.written, { taxRateName: null, taxRatePercent: null });
+    assert.equal(exempt.totalAmount, subtotal);
+
+    // Un-exempting is a UI toggle, not a reload: the option set was built from the STORED
+    // `taxExempt: true`, so derivation stayed off and the selection is still the company default.
+    // Flipping the checkbox therefore quotes 9.15%, not a 0% recovered from an exempt total.
+    const set = buildTaxOptions(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal, totalAmount: subtotal, processingFeeMarkup: 0, taxExempt: true,
+    });
+    const active = resolveActiveTax(set.options, set.initialKey, set.defaultOption);
+    assert.equal(set.initialKey, keyOf(set, "WA Sales Tax", 9.15));
+    assert.deepEqual(taxFieldsForSave(active, false), { taxRateName: "WA Sales Tax", taxRatePercent: 9.15 });
+    assert.equal(sellTotals(subtotal, active, false).totalAmount, 10_915);
+});
+
+test("THE RULING: total == subtotal on a NON-exempt estimate derives a real 0%", () => {
+    // The mirror image of the test above, and the reason exemption has to be read from the stored
+    // row rather than inferred: a non-exempt estimate billed at its bare subtotal is carrying 0%
+    // tax, and re-rating it to 9.15% would add $915 the client never agreed to.
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal: 10_000, storedTotal: 10_000,
+    });
+    assert.equal(opened.written.taxRatePercent, 0, "a derived 0 is an answer, not an absence");
+    assert.equal(opened.totalAmount, 10_000);
+});
+
+// ─── The degenerate branch: columns and money left untouched ─────────────────────────────────
+
+test("DEGENERATE: an underivable total leaves BOTH tax columns and the money untouched", () => {
+    // A $10,000 job stored at $9,000 cannot be explained by any rate in 0..100 (it implies -12%).
+    // Writing a rate here would rewrite the client's total; the only safe move is to change
+    // nothing at all and keep pricing at the legacy fallback.
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal: 10_000, storedTotal: 9_000,
+    });
+
+    assert.equal(opened.key, UNRATED_TAX_KEY);
+    assert.equal(opened.activeTax?.rate, null, "no rate is claimed");
+    assert.deepEqual(opened.written, { taxRateName: null, taxRatePercent: null }, "columns untouched");
+    assert.equal(opened.totalAmount, 10_880, "priced at the legacy fallback, exactly as before");
+    assertInitialKeyIsSelectable(opened.set, "underivable");
+});
+
+test("DEGENERATE: the unrated option preserves a stored NAME while still writing no rate", () => {
+    const opened = openAndSave(NON_88_SETTINGS, { name: "Old City Tax", percent: null }, {
+        subtotal: 10_000, storedTotal: 9_000,
+    });
+    assert.equal(opened.key, UNRATED_TAX_KEY);
+    assert.deepEqual(opened.written, { taxRateName: "Old City Tax", taxRatePercent: null });
+    assert.equal(opened.set.options.at(-1)!.label, "Old City Tax");
+});
+
+test("DEGENERATE: a missing/garbage stored total is underivable, not a licence to re-rate", () => {
+    for (const total of [null, undefined, "", "abc", Number.NaN, Number.POSITIVE_INFINITY]) {
+        const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+            subtotal: 10_000, storedTotal: total as any,
+        });
+        assert.equal(opened.key, UNRATED_TAX_KEY, `total=${String(total)}`);
+        assert.deepEqual(opened.written, { taxRateName: null, taxRatePercent: null }, `total=${String(total)}`);
+        assert.equal(opened.totalAmount, 10_880, `total=${String(total)}`);
+    }
+});
+
+test("DEGENERATE: a total implying MORE than 100% tax is refused", () => {
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+        subtotal: 10_000, storedTotal: 30_000,
+    });
+    assert.equal(opened.key, UNRATED_TAX_KEY);
+    assert.equal(opened.written.taxRatePercent, null);
+});
+
+test("DEGENERATE: no subtotal means no money at risk, so the default applies as it always has", () => {
+    // A brand-new estimate has no items. No rate can move its total off zero, so there is nothing
+    // to preserve and nothing to refuse — pinning it to the legacy fallback here would regress
+    // every new estimate away from the company's configured default.
+    for (const subtotal of [0, -50]) {
+        const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, {
+            subtotal, storedTotal: 0,
+        });
+        assert.equal(opened.key, keyOf(opened.set, "WA Sales Tax", 9.15), `subtotal=${subtotal}`);
+        assert.deepEqual(opened.written, { taxRateName: "WA Sales Tax", taxRatePercent: 9.15 });
+    }
+});
+
+test("DEGENERATE: with no company settings at all, an underivable estimate still changes nothing", () => {
+    const opened = openAndSave([], { name: "Old City Tax", percent: null }, {
+        subtotal: 10_000, storedTotal: 9_000,
+    });
+    assert.equal(opened.key, UNRATED_TAX_KEY, "the unrated option is the ONLY option");
+    assert.equal(opened.set.options.length, 1);
+    assert.deepEqual(opened.written, { taxRateName: "Old City Tax", taxRatePercent: null });
+    assert.equal(opened.totalAmount, 10_880);
+});
+
+test("deriveEffectiveTaxRate returns only rates that reproduce the stored total to the cent", () => {
+    const cases: { money: StoredSellMoney; expect: number | null }[] = [
+        { money: { subtotal: 10_000, totalAmount: 11_080, processingFeeMarkup: 2 }, expect: 8.8 },
+        { money: { subtotal: 10_000, totalAmount: 10_880, processingFeeMarkup: 0 }, expect: 8.8 },
+        { money: { subtotal: 10_000, totalAmount: 10_000, processingFeeMarkup: 0 }, expect: 0 },
+        { money: { subtotal: 10_000, totalAmount: "10880", processingFeeMarkup: "0" }, expect: 8.8 },
+        { money: { subtotal: 10_000, totalAmount: 9_000, processingFeeMarkup: 0 }, expect: null },
+        { money: { subtotal: 0, totalAmount: 0, processingFeeMarkup: 0 }, expect: null },
+        { money: { subtotal: 10_000, totalAmount: null, processingFeeMarkup: 0 }, expect: null },
+        { money: { subtotal: 10_000, totalAmount: 10_880, processingFeeMarkup: 0, taxExempt: true }, expect: null },
+    ];
+    for (const { money, expect } of cases) {
+        assert.equal(deriveEffectiveTaxRate(money), expect, JSON.stringify(money));
+    }
+    assert.equal(deriveEffectiveTaxRate(null), null);
+    assert.equal(deriveEffectiveTaxRate(undefined), null);
+
+    // The property the whole rule rests on: whatever comes back re-prices the job to the stored
+    // total exactly. Swept across subtotals and fee markups that all land on awkward cents.
+    for (const subtotal of [123.45, 999.99, 7_432.19, 10_000, 88_888.88]) {
+        for (const markup of [0, 2, 3.25]) {
+            const total = legacyStoredTotal(subtotal, markup);
+            const derived = deriveEffectiveTaxRate({ subtotal, totalAmount: total, processingFeeMarkup: markup });
+            assert.notEqual(derived, null, `no rate derived for ${subtotal} @ ${markup}%`);
+            const repriced = sellTotals(subtotal, { rate: derived } as TaxOption, false, markup).totalAmount;
+            assert.equal(repriced, total, `${subtotal} @ ${markup}% repriced to ${repriced}, stored ${total}`);
+        }
+    }
+});
+
+test("THE RULING: a 4-dp rate is preferred, but only when it still reproduces the total", () => {
+    // The picker displays rates to 4 decimals, so a tidy 4-dp value is what we want to write. On a
+    // big enough job that rounding costs cents: $100,000 carrying $97.13 of tax implies
+    // 0.09713%, and the 4-dp 0.0971% reprices it to $100,097.10 — three cents light. The
+    // reproduction gate catches that and keeps full precision instead.
+    const subtotal = 100_000;
+    const storedTotal = 100_097.13;
+    assert.equal(sellTotals(subtotal, { rate: 0.0971 } as TaxOption, false).totalAmount, 100_097.10,
+        "the 4-dp rate really does miss, so this test is not vacuous");
+
+    const derived = deriveEffectiveTaxRate({ subtotal, totalAmount: storedTotal, processingFeeMarkup: 0 });
+    assert.notEqual(derived, null);
+    assert.notEqual(derived, 0.0971, "the lossy 4-dp value was rejected");
+    assert.equal(sellTotals(subtotal, { rate: derived } as TaxOption, false).totalAmount, storedTotal);
+
+    const opened = openAndSave(NON_88_SETTINGS, { name: null, percent: null }, { subtotal, storedTotal });
+    assert.equal(opened.totalAmount, storedTotal, "to the cent");
+});
+
+// ─── Rate range at the sanitizer (round-2 real issue 2) ──────────────────────────────────────
+
+test("RANGE: sanitizeCompanySalesTaxes drops rates outside 0..100", () => {
+    // /settings/sales-taxes puts min="0" max="100" on the input, but handleAdd reads
+    // parseFloat(newRate) and never calls checkValidity(), so those attributes gate nothing.
+    const rows = sanitizeCompanySalesTaxes([
+        { name: "Negative", rate: -5 },
+        { name: "Tiny negative", rate: -0.01 },
+        { name: "Over", rate: 101 },
+        { name: "Absurd", rate: 8800 },
+        { name: "String negative", rate: "-5" },
+        { name: "Zero", rate: 0 },
+        { name: "Hundred", rate: 100 },
+        { name: "Normal", rate: 8.8 },
+    ]);
+    assert.deepEqual(rows.map(r => r.name), ["Zero", "Hundred", "Normal"], "only the representable ones survive");
+});
+
+test("RANGE: a negative default rate cannot become the option the editor prices with", () => {
+    // The end-to-end consequence: a -5% row would bill the client a discount on every estimate.
+    const set = buildTaxOptions([{ name: "Oops", rate: -5, isDefault: true }, { name: "Real", rate: 8.8 }], {
+        name: null, percent: null,
+    });
+    assert.equal(set.options.length, 1);
+    assert.equal(set.defaultOption?.name, "Real");
+    assert.equal(sellTotals(SUBTOTAL, set.defaultOption, false).totalAmount, 10_880);
+});
+
+test("RANGE: isRepresentableTaxRate is the single boundary definition", () => {
+    for (const ok of [0, 0.001, 8.8, 99.9999, 100]) assert.equal(isRepresentableTaxRate(ok), true, String(ok));
+    for (const bad of [-0.0001, -5, 100.0001, 101, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+        assert.equal(isRepresentableTaxRate(bad), false, String(bad));
+    }
+});
+
+test("RANGE: a derived rate is held to the same 0..100 bound as a configured one", () => {
+    // A stored total below the subtotal implies a negative rate; above subtotal+100% implies an
+    // absurd one. Neither may be written, by the same rule that drops such a settings row.
+    assert.equal(deriveEffectiveTaxRate({ subtotal: 100, totalAmount: 99, processingFeeMarkup: 0 }), null);
+    assert.equal(deriveEffectiveTaxRate({ subtotal: 100, totalAmount: 201, processingFeeMarkup: 0 }), null);
+    assert.equal(deriveEffectiveTaxRate({ subtotal: 100, totalAmount: 200, processingFeeMarkup: 0 }), 100);
+});
+
+test("taxFractionFor: null rate prices at the legacy fallback, 0 prices at zero", () => {
+    assert.equal(taxFractionFor({ rate: null } as TaxOption, false), LEGACY_FALLBACK_TAX_RATE / 100);
+    assert.equal(taxFractionFor(null, false), LEGACY_FALLBACK_TAX_RATE / 100);
+    assert.equal(taxFractionFor({ rate: 0 } as TaxOption, false), 0, "a real 0% must not fall through");
+    assert.equal(taxFractionFor({ rate: 8.8 } as TaxOption, true), 0, "exempt beats everything");
 });

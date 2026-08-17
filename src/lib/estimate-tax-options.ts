@@ -25,14 +25,37 @@
  * shifts every key after it, so `company:1` can come to mean a different tax. Anything holding a
  * key across a rebuild must re-establish identity by (name, rate) — see `reconcileTaxKey`.
  *
+ * WHY NOT `company:<row.id>`. It looks like the obvious upgrade — stable across a reorder — and it
+ * is rejected on purpose. /settings/sales-taxes mints ids as `Date.now().toString()` and enforces
+ * uniqueness NOWHERE, so two rows can carry the same id (hand-edited settings JSON, a future bulk
+ * import, a duplicated row). An id-keyed lookup would then make the second row unreachable and land
+ * every selection on the first — precisely the by-name failure this redesign exists to kill, just
+ * with a different collision source. Positional keys are unique BY CONSTRUCTION. The one thing ids
+ * would buy — surviving a reorder — is already bought by `reconcileTaxKey` re-matching on
+ * (name, rate), which additionally works for legacy rows that carry no id at all.
+ *
  * A stored rate of 0 is an answer (rate zero), not an absence — only null means "unset".
+ *
+ * EXEMPTION IS NOT A KEY. `taxExempt` is its own column and its own piece of editor state; the
+ * picker shows `EXEMPT_TAX_KEY` as a row but that value is never stored in `selectedTaxKey`. A
+ * null key therefore means "nothing selected", never "exempt", so `reconcileTaxKey` is free to
+ * repair it. Encoding exemption in the key made a non-exempt estimate whose settings went from
+ * empty to populated keep a null key, render the first row, and price at the company default.
  */
 
 /** Option key for the estimate's own saved rate. Reserved; a company row can never mint it. */
 export const SAVED_TAX_KEY = "__saved__";
 
-/** Option key for the picker's "Tax Exempt" entry. Reserved, same as above. */
+/** Option key for the picker's "Tax Exempt" entry. Reserved, same as above.
+ *  This is a `<select>` VALUE only; it is never held in `selectedTaxKey` (see the module doc). */
 export const EXEMPT_TAX_KEY = "__exempt__";
+
+/**
+ * Option key for "this estimate has a rate we could not name a number for". Reserved, same as
+ * above. Selecting it writes `taxRatePercent: null` and prices at the editor's legacy 8.8%
+ * fallback — i.e. it changes nothing at all, which is the point.
+ */
+export const UNRATED_TAX_KEY = "__unrated__";
 
 /** Company options key on their POSITION, so duplicate names stay individually selectable. */
 export function companyTaxKey(index: number): string {
@@ -47,7 +70,13 @@ export type TaxOption = {
     name: string | null;
     /** Display text for the picker. Never null, unlike `name`. */
     label: string;
-    rate: number;
+    /**
+     * Percent, or null for the `UNRATED_TAX_KEY` option ONLY. Null is not "0%": it means the
+     * estimate carries no rate we can state, so the save must leave `taxRatePercent` null and the
+     * editor must keep applying its legacy 8.8% fallback. Every consumer that divides by 100 has
+     * to branch on it — `taxFieldsForSave`'s `??` already does the right thing.
+     */
+    rate: number | null;
     isDefault: boolean;
     /** True for the estimate's own saved rate when settings no longer carry it. */
     orphaned: boolean;
@@ -95,6 +124,12 @@ function toFiniteRate(value: unknown): number | null {
  * (src/lib/sales-tax.ts) guarantees an array of objects; this adds the per-row rules the editor
  * needs. A malformed row is DROPPED, never repaired into a 0% option — a phantom 0% row could
  * become `defaultOption` and quote the client no tax at all.
+ *
+ * Rates outside 0..100 are malformed and are dropped too. /settings/sales-taxes puts `min="0"
+ * max="100"` on the input, but those attributes only style the spinner and gate form validation —
+ * `handleAdd` is a plain click handler that reads `parseFloat(newRate)` and never consults
+ * `checkValidity()`, so a typed `-5` or `8800` saves today. A negative rate bills the client a
+ * discount; a 8800% rate bills them 88x the job.
  */
 export function sanitizeCompanySalesTaxes(input: unknown): CompanySalesTax[] {
     if (!Array.isArray(input)) return [];
@@ -108,6 +143,7 @@ export function sanitizeCompanySalesTaxes(input: unknown): CompanySalesTax[] {
         if (name === "") continue;
         const rate = toFiniteRate(candidate.rate);
         if (rate === null) continue;
+        if (!isRepresentableTaxRate(rate)) continue;
         rows.push({
             id: typeof candidate.id === "string" ? candidate.id : undefined,
             name,
@@ -118,9 +154,87 @@ export function sanitizeCompanySalesTaxes(input: unknown): CompanySalesTax[] {
     return rows;
 }
 
+/** A sales-tax percent the app is willing to quote. Shared by settings rows and derived rates. */
+export function isRepresentableTaxRate(rate: number): boolean {
+    return Number.isFinite(rate) && rate >= 0 && rate <= 100;
+}
+
+/**
+ * The stored sell-side money an estimate was last saved with, as the editor's `computeSellTotals`
+ * composed it. `subtotal` is the LEAF-ITEM subtotal of the stored items, not `Estimate.totalAmount`
+ * minus anything.
+ */
+export type StoredSellMoney = {
+    subtotal: number | string | null | undefined;
+    totalAmount: number | string | null | undefined;
+    processingFeeMarkup: number | string | null | undefined;
+    /** Exempt estimates legitimately store a null rate; there is no effective rate to recover. */
+    taxExempt?: boolean;
+};
+
+/** The editor's money rounding (`rm` in estimate-item-payload), duplicated to keep this module pure. */
+function roundMoney(n: number): number {
+    return Math.round(n * 100) / 100;
+}
+
+/**
+ * Recover the tax rate an estimate is ALREADY being billed at, from its own stored money.
+ *
+ * Why this exists (Justin's ruling, round 3): when `taxRatePercent` is null the editor still
+ * charges tax — `computeSellTotals` falls back to a hardcoded 8.8% — and that 8.8% is baked into
+ * the stored `totalAmount`. Adopting the company default instead would silently re-quote the
+ * client: at a $10,000 subtotal with a 2% processing fee the estimate reads $11,080 today, and a
+ * 9.15% company default would rewrite it to $11,115. A rateless estimate keeps the tax it already
+ * effectively has.
+ *
+ * The composition inverted here is exactly `computeSellTotals`:
+ *     fee   = markup > 0 ? rm(subtotal * markup/100) : 0
+ *     tax   = rm(subtotal * rate/100)
+ *     total = rm(subtotal + tax + fee)
+ *
+ * Returns null — meaning "leave the tax columns alone" — whenever the stored money cannot name a
+ * rate. The final guard is not a heuristic: a candidate is returned ONLY if re-pricing the job at
+ * it reproduces the stored total to the cent. That makes "never write a rate that contradicts the
+ * stored total" self-enforcing rather than a claim about the arithmetic.
+ */
+export function deriveEffectiveTaxRate(money: StoredSellMoney | null | undefined): number | null {
+    if (!money || money.taxExempt) return null;
+
+    const subtotal = toFiniteRate(money.subtotal);
+    const total = toFiniteRate(money.totalAmount);
+    // A zero or negative subtotal carries no tax at any rate, so there is no effective rate to
+    // recover — and, just as importantly, nothing at risk: every candidate rate re-prices such an
+    // estimate to the same total. Callers fall through to their normal selection.
+    if (subtotal === null || total === null || subtotal <= 0) return null;
+
+    const markup = toFiniteRate(money.processingFeeMarkup) ?? 0;
+    const fee = markup > 0 ? roundMoney(subtotal * (markup / 100)) : 0;
+
+    const tax = total - subtotal - fee;
+    const exact = (tax / subtotal) * 100;
+    if (!isRepresentableTaxRate(exact)) return null;
+
+    // Prefer a tidy 4-dp rate (what the picker displays, and what a human would recognise) but
+    // only if it still reproduces the money; otherwise keep full precision. Either way the
+    // reproduction check below is the gate.
+    const reproduces = (rate: number) =>
+        roundMoney(subtotal + roundMoney(subtotal * (rate / 100)) + fee) === total;
+
+    const rounded = Math.round(exact * 10_000) / 10_000;
+    if (isRepresentableTaxRate(rounded) && reproduces(rounded)) return rounded;
+    if (reproduces(exact)) return exact;
+    return null;
+}
+
 export function buildTaxOptions(
     salesTaxes: readonly CompanySalesTax[] | null | undefined,
     saved: { name: string | null | undefined; percent: number | string | null | undefined },
+    /**
+     * The estimate's stored money. OPTIONAL only so the many call sites that have no money to
+     * preserve (tests of the settings-side behaviour) stay readable; the editor always passes it.
+     * Omitting it disables rate derivation, i.e. restores the pre-ruling "adopt the default".
+     */
+    storedMoney?: StoredSellMoney | null,
 ): TaxOptionSet {
     // Typed as CompanySalesTax[] but sourced from JSON.parse at every call site, so the shape is
     // a claim, not a guarantee. Validate at runtime rather than trusting the annotation.
@@ -137,46 +251,111 @@ export function buildTaxOptions(
     const savedName = typeof saved?.name === "string" ? saved.name : null;
     const rate = toFiniteRate(saved?.percent);
 
-    // Settings already carry this exact name+rate PAIR, so the company option IS the saved rate —
-    // no synthetic option needed, and the picker stays a plain list of settings. Matching on the
-    // name alone would hand back a same-named row at a different rate and re-quote the client.
-    const exactMatch =
-        rate === null || savedName === null
+    // THE RULING (round 3): a rateless estimate keeps the tax it already effectively has. With no
+    // stored rate the editor has still been charging its legacy 8.8% fallback and `totalAmount`
+    // was saved WITH that tax in it, so adopting the company default would silently re-quote the
+    // client. Recover the rate the stored money is actually carrying and treat that as the
+    // estimate's rate. `deriveEffectiveTaxRate` returns null unless the candidate provably
+    // reproduces the stored total to the cent.
+    const derivedRate = rate === null ? deriveEffectiveTaxRate(storedMoney) : null;
+
+    // The effective rate the estimate carries, from either source. Below this line the two are
+    // interchangeable: both are "this estimate's own rate", and both outrank the company default.
+    const ownRate = rate ?? derivedRate;
+
+    // Settings already carry this exact name+rate PAIR, so the company option IS this estimate's
+    // rate — no synthetic option needed. For a DERIVED rate the name has to match too: landing on
+    // a same-named row at a different rate is the re-quoting bug, and landing on a differently
+    // named row at the same rate would invent a `taxRateName` the estimate never had.
+    const ownExactMatch =
+        ownRate === null || savedName === null
             ? null
-            : options.find(o => o.name === savedName && o.rate === rate) ?? null;
+            : options.find(o => o.name === savedName && o.rate === ownRate) ?? null;
 
     const savedOption: TaxOption | null =
-        rate === null || exactMatch
+        ownRate === null || ownExactMatch
             ? null
             : {
                   key: SAVED_TAX_KEY,
                   // Opening the editor must not give a stored rate a name it never had.
                   name: savedName,
-                  label: savedName || "Saved rate",
-                  rate,
+                  label: savedName || (derivedRate !== null ? "Estimated Tax" : "Saved rate"),
+                  rate: ownRate,
                   isDefault: false,
                   orphaned: true,
               };
 
-    // A stored NAME with no usable rate is not a quote — there is no money to preserve, and no
-    // option can write `{ name, percent: null }` without leaving `totalAmount` (which already
-    // includes the fallback rate) contradicting the columns. The closest honest selection is the
+    // Nothing stored, nothing derivable, but there IS a subtotal whose total we must not disturb:
+    // the stored money is incoherent (no total on file, or a total no rate in 0..100 explains).
+    // The only safe selection writes the tax columns back exactly as they are — name preserved,
+    // percent still null — and leaves the editor on its 8.8% fallback, so the save is a true
+    // no-op. Never guess a rate here; a guess that misses rewrites the client's total.
+    const needsUnrated = ownRate === null && hasMoneyAtRisk(storedMoney);
+
+    const unratedOption: TaxOption | null = needsUnrated
+        ? {
+              key: UNRATED_TAX_KEY,
+              name: savedName,
+              label: savedName || "Estimated Tax",
+              rate: null,
+              isDefault: false,
+              orphaned: true,
+          }
+        : null;
+
+    // A stored NAME with no usable rate and no money at risk. The closest honest selection is the
     // company row carrying that name, which keeps `taxRateName` byte-for-byte and only fills in
-    // the rate the editor was applying anyway. With no such row we fall to the company default:
-    // same money, and the columns stop lying about it.
+    // the rate the editor was applying anyway. With no such row we fall to the company default.
     const nameOnlyMatch =
-        rate !== null || savedName === null
+        ownRate !== null || unratedOption || savedName === null
             ? null
             : options.find(o => o.name === savedName) ?? null;
 
+    const extra = savedOption ?? unratedOption;
     return {
-        options: savedOption ? [...options, savedOption] : options,
+        options: extra ? [...options, extra] : options,
         savedOption,
         defaultOption,
-        // The saved rate wins whenever it exists, so the quoted rate survives a round trip
-        // through the editor untouched. Every branch yields a key that IS in `options`.
-        initialKey: savedOption?.key ?? exactMatch?.key ?? nameOnlyMatch?.key ?? defaultOption?.key ?? null,
+        // The estimate's own rate wins whenever it exists, so the quoted rate survives a round
+        // trip through the editor untouched. Every branch yields a key that IS in `options`.
+        initialKey:
+            savedOption?.key ??
+            ownExactMatch?.key ??
+            unratedOption?.key ??
+            nameOnlyMatch?.key ??
+            defaultOption?.key ??
+            null,
     };
+}
+
+/**
+ * Is there stored money a wrong rate could damage? Only a positive stored subtotal can carry tax,
+ * so anything else (a brand-new estimate with no items, a zeroed-out one) is free to take the
+ * company default the way it always has — no rate choice moves its total off zero. Keeping this
+ * carve-out narrow is what stops the derivation rule from regressing every new estimate into the
+ * legacy 8.8% fallback.
+ */
+function hasMoneyAtRisk(money: StoredSellMoney | null | undefined): boolean {
+    if (!money || money.taxExempt) return false;
+    const subtotal = toFiniteRate(money.subtotal);
+    return subtotal !== null && subtotal > 0;
+}
+
+/**
+ * The rate the editor charges when no option names one. This is LEGACY: it predates the tax picker
+ * and is why rateless estimates have real tax baked into `totalAmount` at all. It is not a default
+ * anyone configured, so nothing may ever WRITE it to `taxRatePercent` — it only prices.
+ */
+export const LEGACY_FALLBACK_TAX_RATE = 8.8;
+
+/**
+ * The tax fraction to price a job at. One function so the editor's render, its `computeSellTotals`
+ * and the tests cannot drift on what a null rate means.
+ */
+export function taxFractionFor(activeTax: TaxOption | null | undefined, taxExempt: boolean): number {
+    if (taxExempt) return 0;
+    // `?? LEGACY_FALLBACK`, not `|| `: a resolved rate of 0 is a real 0% and must not fall through.
+    return (activeTax?.rate ?? LEGACY_FALLBACK_TAX_RATE) / 100;
 }
 
 /** Resolve the active option by KEY, falling back to the company default. */
@@ -210,8 +389,13 @@ export function reconcileTaxKey(
     previousOptions: readonly TaxOption[],
     next: TaxOptionSet,
 ): string | null {
-    // null is the picker's "Tax Exempt" state, not a stale key.
-    if (key === null) return null;
+    // A null key is "nothing selected", NOT "exempt" — exemption lives in `taxExempt` and never
+    // touches this key (see the module doc). It used to short-circuit here, which meant a
+    // non-exempt estimate opened against EMPTY settings (null key, no options) kept its null key
+    // once settings were populated: the `<select>` rendered the first row while `resolveActiveTax`
+    // fell through to `defaultOption`, and the next save wrote whichever of the two the user was
+    // not looking at. Repair it like any other unusable key.
+    if (key === null) return next.initialKey;
 
     const was = previousOptions.find(o => o.key === key) ?? null;
     if (!was) {

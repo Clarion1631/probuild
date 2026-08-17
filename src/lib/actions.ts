@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 
 import { getServerSession } from "next-auth";
 import { prisma } from "./prisma";
+import { isRepresentableTaxRate } from "./estimate-tax-options";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
 import { after } from "next/server";
 import { cache } from "react";
@@ -5036,8 +5037,45 @@ export async function getPublicCompanySettings() {
     return getCachedPublicCompanySettings();
 }
 
+/**
+ * Reject a sales-tax table carrying a rate outside 0..100 BEFORE it reaches the column.
+ *
+ * /settings/sales-taxes puts `min="0" max="100"` on the rate input, but `handleAdd` is a plain
+ * click handler reading `parseFloat(newRate)` — it never consults `checkValidity()`, so those
+ * attributes gate nothing. A negative rate bills the client a discount and a 8800% rate bills them
+ * 88x the job, on every estimate the row is default for.
+ *
+ * This THROWS rather than silently dropping the row: the client's `saveTaxes` shows "Failed to
+ * save", so a bad rate is visibly rejected instead of vanishing from a table the user believes
+ * they just edited. (The read side, `sanitizeCompanySalesTaxes`, drops such rows defensively —
+ * this stops new ones being written at all.)
+ */
+function assertValidSalesTaxesJson(raw: unknown): void {
+    if (raw === undefined || raw === null) return;
+    if (typeof raw !== "string") throw new Error("Sales taxes must be a JSON string");
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        throw new Error("Sales taxes are not valid JSON");
+    }
+    if (!Array.isArray(parsed)) throw new Error("Sales taxes must be a list");
+    for (const row of parsed) {
+        if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+        const rate = (row as Record<string, unknown>).rate;
+        // A missing/unparseable rate is the read side's problem to drop; an out-of-RANGE number is
+        // a value the user typed and must be told about.
+        const numeric = typeof rate === "number" ? rate : (typeof rate === "string" && rate.trim() !== "" ? Number(rate) : NaN);
+        if (!Number.isFinite(numeric)) continue;
+        if (!isRepresentableTaxRate(numeric)) {
+            throw new Error(`Sales tax rate must be between 0 and 100 (got ${numeric})`);
+        }
+    }
+}
+
 export async function saveCompanySettings(data: any) {
     await assertCompanySettingsPermission();
+    assertValidSalesTaxesJson(data.salesTaxes);
     await prisma.companySettings.update({
         where: { id: "singleton" },
         data: {

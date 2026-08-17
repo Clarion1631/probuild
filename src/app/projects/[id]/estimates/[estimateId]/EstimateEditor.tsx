@@ -175,7 +175,7 @@ const UndoPaymentModal = dynamic(() => import("@/components/UndoPaymentModal"), 
 
 import { internalBudget, derivedMarginPct, marginPatchForRate, marginIsSettable } from "@/lib/budget-math";
 import { normalizeItemPoLinks } from "@/lib/estimate-item-po-links";
-import { EXEMPT_TAX_KEY, buildTaxOptions, reconcileTaxKey, resolveActiveTax, taxFieldsForSave, type TaxOption } from "@/lib/estimate-tax-options";
+import { EXEMPT_TAX_KEY, LEGACY_FALLBACK_TAX_RATE, buildTaxOptions, reconcileTaxKey, resolveActiveTax, taxFieldsForSave, taxFractionFor, type TaxOption } from "@/lib/estimate-tax-options";
 import { formatMoneyDate, isDateOnly } from "@/lib/payment-date";
 
 // Prompt the user copies into ChatGPT so its output imports cleanly via "Import from ChatGPT".
@@ -339,9 +339,28 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     // estimate's stored name collides with a company tax at a different rate (the
     // takeoff-conversion case), or when the rate was stored with no name at all.
     // See src/lib/estimate-tax-options.ts.
+    // The stored money is passed in so a RATELESS estimate keeps the tax it already effectively
+    // has: with `taxRatePercent` null the editor has been charging its legacy 8.8% fallback and
+    // `totalAmount` was saved with that tax inside it, so adopting the company default would
+    // silently re-quote the client (a $10,000 + 2% fee job reads $11,080 today; a 9.15% default
+    // would rewrite it to $11,115). buildTaxOptions derives the effective rate from exactly these
+    // three numbers — see deriveEffectiveTaxRate.
     const taxOptionSet = useMemo(
-        () => buildTaxOptions(salesTaxes, { name: initialEstimate.taxRateName, percent: initialEstimate.taxRatePercent }),
-        [salesTaxes, initialEstimate.taxRateName, initialEstimate.taxRatePercent],
+        () => buildTaxOptions(
+            salesTaxes,
+            { name: initialEstimate.taxRateName, percent: initialEstimate.taxRatePercent },
+            {
+                subtotal: computeEstimateSubtotal(initialEstimate.items || []),
+                totalAmount: initialEstimate.totalAmount,
+                processingFeeMarkup: initialEstimate.processingFeeMarkup,
+                taxExempt: initialEstimate.taxExempt ?? false,
+            },
+        ),
+        [
+            salesTaxes, initialEstimate.taxRateName, initialEstimate.taxRatePercent,
+            initialEstimate.items, initialEstimate.totalAmount, initialEstimate.processingFeeMarkup,
+            initialEstimate.taxExempt,
+        ],
     );
     const taxOptions = taxOptionSet.options;
     const defaultTaxRate = taxOptionSet.defaultOption;
@@ -1150,11 +1169,15 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     // Subtotal from leaf items only (sections would double-count)
     const subtotal = computeEstimateSubtotal(items);
     const activeTax = resolveActiveTax(taxOptions, selectedTaxKey, defaultTaxRate);
-    const taxRate = taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
-    const taxRateDisplay = activeTax ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
+    const taxRate = taxFractionFor(activeTax, taxExempt);
+    // null for the UNRATED option too, not just for "no option": that option exists precisely
+    // because we cannot state this estimate's rate, so the line falls back to the legacy wording.
+    const taxRateDisplay = activeTax && activeTax.rate !== null ? Number(parseFloat(String(activeTax.rate)).toFixed(4)) : null;
     // This line is client-facing, so a rate stored without a name reads as a plain tax line
     // rather than the picker's internal "Saved rate" wording.
-    const taxName = taxExempt ? "Tax Exempt" : (activeTax ? `${activeTax.name || "Estimated Tax"} (${taxRateDisplay}%)` : "Estimated Tax (8.8%)");
+    const taxName = taxExempt
+        ? "Tax Exempt"
+        : (taxRateDisplay !== null ? `${activeTax!.name || "Estimated Tax"} (${taxRateDisplay}%)` : `Estimated Tax (${LEGACY_FALLBACK_TAX_RATE}%)`);
     // WA DOR: exempt sales need a reseller permit / exemption certificate on the client record
     const taxCertStatus = getTaxCertStatus({ url: context.clientTaxExemptCertUrl, expiresAt: context.clientTaxExemptCertExpiresAt });
     const showTaxCertWarning = taxExempt && taxCertStatus !== "valid";
@@ -1204,7 +1227,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
     function computeSellTotals(sourceItems: any[], f: typeof fieldsRef.current) {
         const sourceSubtotal = computeEstimateSubtotal(sourceItems);
         const activeTax = resolveActiveTax(taxOptions, f.selectedTaxKey, defaultTaxRate);
-        const sourceTaxRate = f.taxExempt ? 0 : (activeTax ? activeTax.rate / 100 : 0.088);
+        const sourceTaxRate = taxFractionFor(activeTax, !!f.taxExempt);
         const sourceProcessingFee = f.processingFeeMarkup > 0 ? rm(sourceSubtotal * (f.processingFeeMarkup / 100)) : 0;
         const sourceTax = rm(sourceSubtotal * sourceTaxRate);
         return { activeTax, subtotal: sourceSubtotal, total: rm(sourceSubtotal + sourceTax + sourceProcessingFee) };
@@ -3699,8 +3722,11 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                                 value={taxExempt ? EXEMPT_TAX_KEY : (selectedTaxKey || "")}
                                                 onChange={(e) => {
                                                     if (e.target.value === EXEMPT_TAX_KEY) {
+                                                        // Exemption lives in `taxExempt` ONLY. The key is left
+                                                        // alone so un-exempting returns to the rate this estimate
+                                                        // was on, and so a null key can never be read as "exempt"
+                                                        // by reconcileTaxKey.
                                                         setTaxExempt(true);
-                                                        setSelectedTaxKey(null);
                                                     } else {
                                                         setTaxExempt(false);
                                                         setSelectedTaxKey(e.target.value);
@@ -3710,7 +3736,7 @@ export default function EstimateEditor({ context, initialEstimate, salesTaxes = 
                                             >
                                                 {taxOptions.map(t => (
                                                     <option key={t.key} value={t.key}>
-                                                        {t.label} ({Number(parseFloat(String(t.rate)).toFixed(4))}%){t.orphaned ? " — not in settings" : ""}
+                                                        {t.label}{t.rate === null ? "" : ` (${Number(parseFloat(String(t.rate)).toFixed(4))}%)`}{t.orphaned ? " — not in settings" : ""}
                                                     </option>
                                                 ))}
                                                 {/* Reserved key: company options key on `company:<index>`, so no
