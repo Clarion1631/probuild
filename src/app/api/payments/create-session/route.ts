@@ -1,7 +1,37 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
+import type Stripe from "stripe";
 import { stripe } from "@/lib/stripe";
+
+/**
+ * Create a checkout session, stepping past an idempotency key that has already
+ * been spent on a session which is no longer payable.
+ *
+ * Stripe replays a create carrying a previously-used key by returning the
+ * ORIGINAL object, and keys live for 24 hours. The key below is deliberately
+ * stable across double-taps (schedule + method + amount), which is what we want
+ * while a checkout is still open. But a milestone that was paid, refunded (or
+ * undone) and re-billed inside that 24h window recomputes the SAME key, so the
+ * replay hands back the COMPLETED session — whose `url` is null, giving the
+ * client a dead redirect and no way to pay again.
+ *
+ * The successor key is derived from the burned session's id rather than from a
+ * nonce, so two concurrent taps that both replay the same completed session
+ * derive the same successor and still dedupe to one new checkout.
+ */
+async function createPayableSession(
+    params: Stripe.Checkout.SessionCreateParams,
+    idempotencyKey: string,
+) {
+    let key = idempotencyKey;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const session = await stripe.checkout.sessions.create(params, { idempotencyKey: key });
+        if (session.url) return session;
+        key = `${idempotencyKey}:after:${session.id}`;
+    }
+    throw new Error("Couldn't open a payment page for this milestone — please try again in a moment.");
+}
 
 export async function POST(req: Request) {
     const requestId = Math.random().toString(36).slice(2, 10);
@@ -131,7 +161,7 @@ export async function POST(req: Request) {
             ];
             if (feeLineItem) lineItems.push(feeLineItem);
 
-            const stripeSession = await stripe.checkout.sessions.create({
+            const stripeSession = await createPayableSession({
                 payment_method_types: paymentMethodTypes,
                 line_items: lineItems,
                 mode: "payment",
@@ -148,7 +178,7 @@ export async function POST(req: Request) {
                     estimatePaymentScheduleId: schedule.id,
                     projectId: estimate.projectId || "none",
                 },
-            }, { idempotencyKey });
+            }, idempotencyKey);
 
             await prisma.estimatePaymentSchedule.update({
                 where: { id: schedule.id },
@@ -224,7 +254,7 @@ export async function POST(req: Request) {
         ];
         if (feeLineItem) lineItems.push(feeLineItem);
 
-        const stripeSession = await stripe.checkout.sessions.create({
+        const stripeSession = await createPayableSession({
             payment_method_types: paymentMethodTypes,
             line_items: lineItems,
             mode: "payment",
@@ -241,7 +271,7 @@ export async function POST(req: Request) {
                 paymentScheduleId: paymentSchedule.id,
                 projectId: projectId || "none",
             },
-        }, { idempotencyKey });
+        }, idempotencyKey);
 
         await prisma.paymentSchedule.update({
             where: { id: paymentSchedule.id },

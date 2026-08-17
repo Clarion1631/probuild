@@ -10,6 +10,7 @@ import {
 } from "../src/lib/signature-storage";
 import { mirrorInvoiceSettleToEstimate } from "../src/lib/payment-mirror";
 import { resolveChargeGroup, unwindRefundedCharge } from "../src/lib/refund-group";
+import { settleStripeEstimatePayment } from "../src/lib/stripe-estimate-settlement";
 import {
   approveChangeOrderWithSignature,
   type ChangeOrderApprovalDependencies,
@@ -1165,6 +1166,13 @@ const S = {
   estSib: "mp3-e2e-eps-sib",
   invSibCharge: "mp3-e2e-ps-sib-charge",
   invSibNull: "mp3-e2e-ps-sib-null",
+  // S13: the full re-bill cycle. Starts UNPAID, unlike every fixture above,
+  // because the point is to walk bill -> pay -> refund -> re-bill -> pay again
+  // on one mirrored pair and prove the milestone is collectible both times.
+  estimate8: "mp3-e2e-estimate-8",
+  invoice8: "mp3-e2e-invoice-8",
+  estCycle: "mp3-e2e-eps-cycle",
+  invCycle: "mp3-e2e-ps-cycle",
 };
 const S_NAME = "Stripe Mirror Drill - MP3TEST";
 const sPrisma = new PrismaClient();
@@ -1178,6 +1186,10 @@ const MIXED_INTENT = "pi_mp3_e2e_mixed_intent";
 const LEGACY_INTENT = "pi_mp3_e2e_legacy_intent";
 const PRELINK_INTENT = "pi_mp3_e2e_prelink_intent";
 const SIBLING_INTENT = "pi_mp3_e2e_sibling_intent";
+// S13 pays the SAME milestone twice, so it needs two distinct charges — a
+// re-bill after a refund is new money, not a replay of the refunded one.
+const CYCLE_INTENT_1 = "pi_mp3_e2e_cycle_intent_1";
+const CYCLE_INTENT_2 = "pi_mp3_e2e_cycle_intent_2";
 
 test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
   test.beforeAll(async () => {
@@ -1475,17 +1487,65 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
         status: "Paid", sourceScheduleId: S.estSib, paymentMethod: "check",
       },
     });
+
+    // Eighth fixture (S13): an ordinary unpaid mirrored pair, $800.
+    await sPrisma.estimate.upsert({
+      where: { id: S.estimate8 },
+      update: { status: "Invoiced", totalAmount: 800, balanceDue: 800, statusBeforePayment: null },
+      create: {
+        id: S.estimate8, title: `${S_NAME} 8`, code: "EST-MP3TEST-8", projectId: S.project,
+        status: "Invoiced", taxExempt: true, totalAmount: 800, balanceDue: 800,
+      },
+    });
+    await sPrisma.invoice.upsert({
+      where: { id: S.invoice8 },
+      update: { status: "Issued", totalAmount: 800, balanceDue: 800 },
+      create: {
+        id: S.invoice8, code: "INV-MP3TEST-8", projectId: S.project, clientId: S.client,
+        estimateId: S.estimate8, status: "Issued", totalAmount: 800, balanceDue: 800,
+        issueDate: new Date(),
+      },
+    });
+    await sPrisma.estimatePaymentSchedule.upsert({
+      where: { id: S.estCycle },
+      update: {
+        status: "Pending", stripeSessionId: null, stripePaymentIntentId: null,
+        paidAt: null, paymentDate: null,
+      },
+      create: {
+        id: S.estCycle, estimateId: S.estimate8, name: "MP3 Cycle", amount: 800,
+        status: "Pending", order: 1,
+      },
+    });
+    await sPrisma.paymentSchedule.upsert({
+      where: { id: S.invCycle },
+      update: {
+        status: "Pending", stripeSessionId: null, stripePaymentIntentId: null,
+        paidAt: null, paymentDate: null,
+      },
+      create: {
+        id: S.invCycle, invoiceId: S.invoice8, name: "MP3 Cycle", amount: 800,
+        status: "Pending", sourceScheduleId: S.estCycle,
+      },
+    });
+    await sPrisma.paymentNotification.deleteMany({
+      where: { scheduleId: { in: [S.estCycle, S.invCycle] } },
+    });
   });
 
   test.afterAll(async () => {
     try {
       const invoiceIds = [
         S.invoice, S.invoice2, S.invoice3a, S.invoice3b, S.invoice4a, S.invoice4b,
-        S.invoice5, S.invoice6, S.invoice7a, S.invoice7b,
+        S.invoice5, S.invoice6, S.invoice7a, S.invoice7b, S.invoice8,
       ];
       const estimateIds = [
-        S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5, S.estimate6, S.estimate7,
+        S.estimate, S.estimate2, S.estimate3, S.estimate4, S.estimate5, S.estimate6,
+        S.estimate7, S.estimate8,
       ];
+      await sPrisma.paymentNotification.deleteMany({
+        where: { scheduleId: { in: [S.estCycle, S.invCycle] } },
+      });
       await sPrisma.paymentSchedule.deleteMany({ where: { invoiceId: { in: invoiceIds } } });
       await sPrisma.invoice.deleteMany({ where: { id: { in: invoiceIds } } });
       await sPrisma.estimatePaymentSchedule.deleteMany({ where: { estimateId: { in: estimateIds } } });
@@ -1551,7 +1611,7 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(Number(after.balanceDue)).toBe(Number(before.balanceDue));
   });
 
-  test("S3: a full refund unwinds both sides of the charge and keeps its Stripe ids", async () => {
+  test("S3: a full refund unwinds both sides of the charge and clears its Stripe rails", async () => {
     const unwound = await unwindRefundedCharge(sPrisma, INTENT);
 
     expect(unwound.estimateSchedules.map((r) => r.id), "the estimate copy was released").toEqual([S.estDeposit]);
@@ -1560,10 +1620,15 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(estCopy.status).toBe("Pending");
     const invCopy = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invDeposit } });
     expect(invCopy.status).toBe("Pending");
-    // The Stripe ids MUST survive the reset: they are how a redelivered refund
-    // re-finds this exact row. Clearing them would let a duplicate delivery land
-    // on a different clone sharing the intent and unset a real payment.
-    expect(estCopy.stripePaymentIntentId, "the charge link survives the reset").toBe(INTENT);
+    // The Stripe rails MUST be cleared. Every path that would re-collect this
+    // milestone treats a non-null rail id on a non-Paid row as "a payment is in
+    // flight — refuse", so a released row still naming the charge is Pending but
+    // permanently un-billable. Redelivery safety does not depend on them:
+    // resolveChargeGroup only matches rows that are still Paid (S8).
+    expect(estCopy.stripePaymentIntentId, "the dead charge link is cleared").toBeNull();
+    expect(estCopy.stripeSessionId, "and so is the dead checkout session").toBeNull();
+    expect(invCopy.stripePaymentIntentId, "on the invoice side too").toBeNull();
+    expect(invCopy.stripeSessionId).toBeNull();
 
     const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate } });
     expect(Number(estimate.balanceDue), "estimate balance restored in full").toBe(1000);
@@ -1611,7 +1676,10 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     // the ordinary settled pair. (S5 already released the estimate side.)
     await sPrisma.estimatePaymentSchedule.update({
       where: { id: S.estOther },
-      data: { status: "Paid", paidAt: new Date(), paymentDate: new Date() },
+      // The intent is re-set explicitly: S5's unwind cleared it, and without it
+      // this row would be a null-intent partner (the S10 shape) rather than the
+      // ordinary settled pair this test is about.
+      data: { status: "Paid", paidAt: new Date(), paymentDate: new Date(), stripePaymentIntentId: PAIR2_INTENT },
     });
     await sPrisma.paymentSchedule.update({
       where: { id: S.invOtherCharge },
@@ -1644,7 +1712,7 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
 
     const rows = await sPrisma.paymentSchedule.findMany({ where: { id: { in: [S.invGroupA, S.invGroupB] } } });
     expect(rows.every((r) => r.status === "Pending"), "no clone is left claiming the refunded money").toBe(true);
-    expect(rows.every((r) => r.stripePaymentIntentId === GROUP_INTENT), "charge links survive the reset").toBe(true);
+    expect(rows.every((r) => r.stripePaymentIntentId === null), "no clone is left un-billable by a dead charge link").toBe(true);
 
     for (const id of [S.invoice3a, S.invoice3b]) {
       const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id } });
@@ -1761,5 +1829,126 @@ test.describe.serial("Money pipeline: Stripe rails mirror both sides", () => {
     expect(untouched.status, "and neither is written").toBe("Paid");
     const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estSib } });
     expect(est.status).toBe("Paid");
+  });
+
+  test("S13: bill → pay → refund → re-bill → pay again, both sides, one notification per real payment", async () => {
+    // The bug this pins: #389 restored `status` on a refund but left the Stripe
+    // rail ids on the released rows. Every path that would collect the milestone
+    // again reads a non-null rail id on a non-Paid row as "a payment is in
+    // flight — refuse", so the milestone came back Pending and permanently
+    // un-billable. The money could only be re-collected by editing the row.
+    const notificationCount = async () =>
+      sPrisma.paymentNotification.count({ where: { scheduleId: { in: [S.estCycle, S.invCycle] } } });
+    // The exact predicate billing-core's re-split guard uses. It is the honest
+    // test of "is this milestone billable", because it is the production query.
+    const blockedByInFlightRail = async () =>
+      sPrisma.paymentSchedule.findFirst({
+        where: {
+          invoiceId: S.invoice8,
+          status: { not: "Paid" },
+          OR: [
+            { stripeSessionId: { not: null } },
+            { stripePaymentIntentId: { not: null } },
+            { qbInvoiceId: { not: null } },
+          ],
+        },
+        select: { name: true },
+      });
+
+    expect(await blockedByInFlightRail(), "nothing in flight before the first payment").toBeNull();
+    expect(await notificationCount()).toBe(0);
+
+    // ── payment 1 ────────────────────────────────────────────────────────────
+    const paidAt1 = new Date();
+    const settle1 = await settleStripeEstimatePayment({
+      estimateId: S.estimate8,
+      scheduleId: S.estCycle,
+      settlement: {
+        stripeSessionId: "cs_mp3_cycle_1",
+        stripePaymentIntentId: CYCLE_INTENT_1,
+        paymentMethod: "card",
+        paymentDate: paidAt1,
+        paidAt: paidAt1,
+      },
+      enqueueNotification: true,
+    });
+    expect(settle1.estimateClaimed, "the estimate milestone settles").toBe(true);
+    expect(settle1.mirrorClaimed, "and its invoice clone mirrors").toBe(true);
+    expect(settle1.mirroredCopyId).toBe(S.invCycle);
+    expect(await notificationCount(), "exactly one notification for the first payment").toBe(1);
+
+    {
+      const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estCycle } });
+      const inv = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invCycle } });
+      expect([est.status, inv.status], "both sides Paid").toEqual(["Paid", "Paid"]);
+      const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate8 } });
+      const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice8 } });
+      expect(Number(estimate.balanceDue)).toBe(0);
+      expect(Number(invoice.balanceDue)).toBe(0);
+    }
+
+    // ── refund ───────────────────────────────────────────────────────────────
+    const unwound = await unwindRefundedCharge(sPrisma, CYCLE_INTENT_1);
+    expect(unwound.estimateSchedules.map((r) => r.id)).toEqual([S.estCycle]);
+    expect(unwound.invoiceSchedules.map((r) => r.id)).toEqual([S.invCycle]);
+
+    {
+      const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estCycle } });
+      const inv = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invCycle } });
+      expect([est.status, inv.status], "both sides released").toEqual(["Pending", "Pending"]);
+      expect(
+        [est.stripeSessionId, est.stripePaymentIntentId, inv.stripeSessionId, inv.stripePaymentIntentId],
+        "no dead rail id survives on either side",
+      ).toEqual([null, null, null, null]);
+      const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate8 } });
+      const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice8 } });
+      expect(Number(estimate.balanceDue), "estimate balance restored").toBe(800);
+      expect(Number(invoice.balanceDue), "invoice balance restored").toBe(800);
+      expect(estimate.status).toBe("Invoiced");
+      expect(invoice.status).toBe("Issued");
+    }
+    expect(
+      await blockedByInFlightRail(),
+      "THE regression: the released milestone must not read as payment-in-flight",
+    ).toBeNull();
+    expect(await notificationCount(), "a refund enqueues nothing").toBe(1);
+
+    // ── payment 2 (the re-bill) ──────────────────────────────────────────────
+    const paidAt2 = new Date();
+    const settle2 = await settleStripeEstimatePayment({
+      estimateId: S.estimate8,
+      scheduleId: S.estCycle,
+      settlement: {
+        stripeSessionId: "cs_mp3_cycle_2",
+        stripePaymentIntentId: CYCLE_INTENT_2,
+        paymentMethod: "card",
+        paymentDate: paidAt2,
+        paidAt: paidAt2,
+      },
+      enqueueNotification: true,
+    });
+    expect(settle2.estimateClaimed, "the re-billed milestone settles again").toBe(true);
+    expect(settle2.mirrorClaimed, "and mirrors again").toBe(true);
+    expect(await notificationCount(), "two real payments, two notifications — no more, no fewer").toBe(2);
+
+    {
+      const est = await sPrisma.estimatePaymentSchedule.findUniqueOrThrow({ where: { id: S.estCycle } });
+      const inv = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invCycle } });
+      expect([est.status, inv.status]).toEqual(["Paid", "Paid"]);
+      expect(est.stripePaymentIntentId, "the SECOND charge, not the refunded one").toBe(CYCLE_INTENT_2);
+      expect(inv.stripePaymentIntentId).toBe(CYCLE_INTENT_2);
+      const estimate = await sPrisma.estimate.findUniqueOrThrow({ where: { id: S.estimate8 } });
+      const invoice = await sPrisma.invoice.findUniqueOrThrow({ where: { id: S.invoice8 } });
+      expect(Number(estimate.balanceDue)).toBe(0);
+      expect(Number(invoice.balanceDue)).toBe(0);
+    }
+
+    // The refunded charge is spent: re-delivering it must not touch the money
+    // the client has now paid a second time.
+    const replay = await unwindRefundedCharge(sPrisma, CYCLE_INTENT_1);
+    expect(replay.estimateSchedules, "the first charge no longer resolves to anything").toEqual([]);
+    expect(replay.invoiceSchedules).toEqual([]);
+    const stillPaid = await sPrisma.paymentSchedule.findUniqueOrThrow({ where: { id: S.invCycle } });
+    expect(stillPaid.status, "the second payment survives a redelivery of the first refund").toBe("Paid");
   });
 });

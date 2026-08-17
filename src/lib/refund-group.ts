@@ -209,10 +209,24 @@ export type UnwindResult = {
  * locks (`lockMoneyParentsMany`) — `unwindRefundedCharge` is the wrapper that
  * guarantees that.
  *
- * The Stripe ids stay on the released rows, matching the single-row reset this
- * replaces: they are how a redelivered `charge.refunded` re-finds the group.
- * Re-running on an already-unwound group is a no-op, because the group only
- * ever contains Paid rows.
+ * The Stripe rail ids are CLEARED along with the status. A released row is a
+ * milestone the office still has to collect, and every path that would collect
+ * it reads a non-null `stripeSessionId`/`stripePaymentIntentId` on a non-Paid
+ * row as "a payment is in flight on this row, refuse to touch it": the
+ * progress-billing validation and its pinned claim (`progress-billing.ts`), the
+ * rebalance, delete and re-split guards (`billing-core.ts`), the schedule-delete
+ * filter in `saveEstimate` (`actions.ts`), and the portal's pay-in-full
+ * affordance. Leaving a dead charge reference behind therefore left the
+ * milestone Pending but permanently un-billable — the money could not be
+ * re-collected without editing the row by hand.
+ *
+ * Clearing them does NOT weaken redelivery. `resolveChargeGroup` only ever
+ * matches rows whose status is still "Paid", so a second `charge.refunded` for
+ * the same intent already resolved to an empty group and returned before this
+ * function ran — the ids were never what made redelivery safe. What they cost
+ * is provenance: the released row no longer names the charge that settled it.
+ * The refund notification still names every milestone and the intent, and
+ * `paymentMethod`/`referenceNumber`/`notes` are left as they were.
  *
  * Each side resets in ONE statement rather than one per row: the whole unwind
  * shares a single transaction with a bounded timeout, and a wide mirror group
@@ -228,7 +242,8 @@ export async function unwindChargeGroup(tx: Db, group: ChargeGroup): Promise<Omi
         if (ids.length === 0) return new Set<string>();
         const rows = await tx.$queryRaw<{ id: string }[]>`
             UPDATE ${Prisma.raw(`"${table}"`)}
-               SET "status" = 'Pending', "paidAt" = NULL, "paymentDate" = NULL
+               SET "status" = 'Pending', "paidAt" = NULL, "paymentDate" = NULL,
+                   "stripeSessionId" = NULL, "stripePaymentIntentId" = NULL
              WHERE "id" = ANY(${ids}) AND "status" = 'Paid'
          RETURNING "id"`;
         return new Set(rows.map((r) => r.id));

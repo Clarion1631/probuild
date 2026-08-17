@@ -4085,6 +4085,10 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
                 paymentMethod: null,
                 referenceNumber: null,
                 notes: null,
+                // See unrecordPayment: a released milestone that still names a charge
+                // reads as "payment in flight" to every re-billing path.
+                stripeSessionId: null,
+                stripePaymentIntentId: null,
             },
         });
 
@@ -4126,7 +4130,8 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
             if (copy) {
                 await tx.paymentSchedule.update({
                     where: { id: copy.id },
-                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                    // Rail ids cleared for the same reason as the estimate row above.
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null, stripeSessionId: null, stripePaymentIntentId: null },
                 });
                 const allCopies = await tx.paymentSchedule.findMany({ where: { invoiceId: linkedInvoice.id } });
                 const invPaid = allCopies.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
@@ -4799,6 +4804,15 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
                 paymentMethod: null,
                 referenceNumber: null,
                 notes: null,
+                // The Stripe rail ids go with the payment. Every path that would
+                // re-collect this milestone (progress billing, rebalance, delete,
+                // re-split, the portal pay-in-full affordance) reads a non-null id on
+                // a non-Paid row as "a payment is in flight — refuse", so leaving them
+                // behind released the money but left the row permanently un-billable.
+                // Undoing a settled payment means no checkout is open: the modal's own
+                // copy tells the user to refund in Stripe separately.
+                stripeSessionId: null,
+                stripePaymentIntentId: null,
             },
         });
 
@@ -4847,7 +4861,8 @@ export async function unrecordPayment(paymentId: string, invoiceId: string) {
             if (estCopy) {
                 await tx.estimatePaymentSchedule.update({
                     where: { id: estCopy.id },
-                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null },
+                    // Rail ids cleared for the same reason as the invoice row above.
+                    data: { status: "Pending", paymentDate: null, paidAt: null, paymentMethod: null, referenceNumber: null, notes: null, stripeSessionId: null, stripePaymentIntentId: null },
                 });
                 const estimate = await tx.estimate.findUnique({ where: { id: invoice.estimateId } });
                 if (estimate) {
