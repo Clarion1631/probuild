@@ -16,7 +16,18 @@ import { prisma } from "@/lib/prisma";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { sendNotification } from "./email";
 import { formatCurrency } from "./utils";
-import { coTaxRate, coTaxLabel, coLineCents, billableCoItems, coSectionRowError, coSectionRowNames, effectiveCoTaxInfo } from "./co-tax";
+import {
+    allocateCoScheduleGross,
+    billableCoItems,
+    canonicalCoTaxTerms,
+    coLineCents,
+    coSectionRowError,
+    coSectionRowNames,
+    coTaxFingerprint,
+    coTaxLabel,
+    coTaxRate,
+    effectiveCoTaxInfo,
+} from "./co-tax";
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "./co-approval";
 import { deriveInvoiceTaxFields, toNum } from "./prisma-helpers";
 import { dateInputInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
@@ -1225,7 +1236,7 @@ export async function previewCostPlusChangeOrderCore(
         select: {
             id: true, code: true, title: true, status: true, pricingType: true, markupPercent: true,
             projectId: true, estimateId: true,
-            approvedTaxExempt: true, approvedTaxRateName: true, approvedTaxRatePercent: true,
+            termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
             estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
         },
     });
@@ -1271,10 +1282,10 @@ export async function billCostPlusChangeOrderCore(
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; pricingType: string;
             markupPercent: number | null; projectId: string; estimateId: string;
-            approvedTaxExempt: boolean | null; approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null; termsTaxRatePercent: Prisma.Decimal | null;
         }>>`
             SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "projectId", "estimateId",
-                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) throw new Error("Change order not found");
@@ -1399,11 +1410,11 @@ async function billChangeOrderCoreLegacy(changeOrderId: string) {
     const outcome = await withTxRetry(() => prisma.$transaction(async (tx): Promise<LegacyBillChangeOrderOutcome> => {
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; totalAmount: unknown;
-            projectId: string; estimateId: string; approvedTaxExempt: boolean | null;
-            approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
+            projectId: string; estimateId: string; termsTaxExempt: boolean | null;
+            termsTaxRateName: string | null; termsTaxRatePercent: Prisma.Decimal | null;
         }>>`
             SELECT "id", "code", "title", "status", "totalAmount", "projectId", "estimateId",
-                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
@@ -1551,10 +1562,10 @@ export async function billChangeOrderCore(
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; title: string; status: string; pricingType: string;
             totalAmount: unknown; projectId: string; estimateId: string;
-            approvedTaxExempt: boolean | null; approvedTaxRateName: string | null; approvedTaxRatePercent: Prisma.Decimal | null;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null; termsTaxRatePercent: Prisma.Decimal | null;
         }>>`
             SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "projectId", "estimateId",
-                   "approvedTaxExempt", "approvedTaxRateName", "approvedTaxRatePercent"
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
@@ -1583,8 +1594,7 @@ export async function billChangeOrderCore(
             select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
         });
         const taxInfo = effectiveCoTaxInfo(co, estimateTax);
-        const rate = coTaxRate(taxInfo);
-        const totalTaxCents = Math.round(subtotalCents * rate);
+        const totalTaxCents = Math.round(subtotalCents * coTaxRate(taxInfo));
         const invoice = await findChangeOrderInvoice(tx, co);
         if (!invoice) return { ok: false as const, error: "This project has no invoice yet — create the invoice first, then bill the change order." };
         await lockMoneyParents(tx, { estimateId: co.estimateId, invoiceId: invoice.id });
@@ -1598,31 +1608,31 @@ export async function billChangeOrderCore(
         if (schedules.some((row) => Math.round(Number(row.amount) * 100) <= 0)) {
             return { ok: false as const, error: "Every fixed change-order schedule amount must be greater than zero" };
         }
-        const priorCents = schedules.slice(0, -1).reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
-        const pretaxPlans = schedules.length
-            ? schedules.map((row, index) => ({
+        const grossSchedules = allocateCoScheduleGross(subtotalCents / 100, schedules, taxInfo);
+        const plans = schedules.length
+            ? grossSchedules.map((row) => ({
                 sourceCoScheduleId: row.id as string | null,
                 name: `${co.code} — ${row.name}`.slice(0, 300),
                 dueDate: row.dueDate,
-                pretaxCents: index === schedules.length - 1 ? subtotalCents - priorCents : Math.round(Number(row.amount) * 100),
+                pretaxCents: row.pretaxCents,
+                taxCents: row.taxCents,
+                totalCents: row.grossCents,
             }))
-            : [{ sourceCoScheduleId: null as string | null, name: `${co.code} — ${co.title}`.slice(0, 300), dueDate: null as Date | null, pretaxCents: subtotalCents }];
-        if (pretaxPlans.some((plan) => plan.pretaxCents <= 0)) {
+            : [{
+                sourceCoScheduleId: null as string | null,
+                name: `${co.code} — ${co.title}`.slice(0, 300),
+                dueDate: null as Date | null,
+                pretaxCents: subtotalCents,
+                taxCents: totalTaxCents,
+                totalCents: subtotalCents + totalTaxCents,
+            }];
+        if (plans.some((plan) => plan.pretaxCents <= 0)) {
             return { ok: false as const, error: "Fixed change-order schedule rows reach or exceed the subtotal before the final remainder" };
         }
         if (schedules.length) {
             const storedCents = schedules.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0);
             if (storedCents !== subtotalCents) return { ok: false as const, error: "Change-order schedule amounts are out of sync with the signed subtotal" };
         }
-
-        let allocatedTaxCents = 0;
-        const plans = pretaxPlans.map((plan, index) => {
-            const taxCents = index === pretaxPlans.length - 1
-                ? totalTaxCents - allocatedTaxCents
-                : Math.round(plan.pretaxCents * rate);
-            allocatedTaxCents += taxCents;
-            return { ...plan, taxCents, totalCents: plan.pretaxCents + taxCents };
-        });
         const existing = await tx.paymentSchedule.findMany({
             where: {
                 invoice: { projectId: co.projectId },
@@ -1919,11 +1929,17 @@ export async function handleChangeOrderApproved(
 export async function sendChangeOrderToClientCore(
     changeOrderId: string,
     dependencies: {
+        expectedRevision?: number;
+        expectedTaxFingerprint?: string;
         sendNotification?: typeof sendNotification;
         logActivity?: typeof logActivityLazy;
         revalidatePath?: typeof revalidatePath;
+        buildClientPortalUrl?: (clientId: string, email: string, path: string) => Promise<string>;
     } = {},
-): Promise<{ success: true; sentTo: string; revision: number } | { success: false; error: string }> {
+): Promise<
+    | { success: true; sentTo: string; revision: number }
+    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
+> {
     // Read, amount math, and the Draft/Sent -> Sent flip run inside ONE
     // transaction holding a row lock on the CO (SELECT ... FOR UPDATE, same
     // pattern as billChangeOrderCore): a concurrent writer (editor save,
@@ -1931,19 +1947,25 @@ export async function sendChangeOrderToClientCore(
     // the amount that was on the row when it was marked Sent. The email
     // itself stays outside the transaction.
     type SendCoOutcome =
-        | { kind: "error"; error: string }
+        | { kind: "error"; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
         | {
             kind: "ok";
             code: string; title: string; projectId: string; projectName: string;
             clientId: string; clientName: string; clientEmail: string; additionalEmail: string | null;
             coSubtotal: number; coTaxAmount: number; coRevisedAmount: number; taxLabel: string;
-            pricingType: string; markupPercent: number; updatedAt: Date;
+            pricingType: string; markupPercent: number; taxFingerprint: string;
             revision: number;
             schedules: Array<{ name: string; amount: number; dueDate: Date | null }>;
         };
     const outcome = await prisma.$transaction(async (tx): Promise<SendCoOutcome> => {
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; pricingType: string; markupPercent: number | null; totalAmount: unknown; projectId: string; estimateId: string; updatedAt: Date }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "totalAmount", "projectId", "estimateId", "updatedAt"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; pricingType: string;
+            markupPercent: number | null; totalAmount: unknown; projectId: string; estimateId: string;
+            revision: number; termsTaxExempt: boolean | null; termsTaxRateName: string | null;
+            termsTaxRatePercent: Prisma.Decimal | null;
+        }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "markupPercent", "totalAmount", "projectId", "estimateId",
+                   "revision", "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { kind: "error", error: "Change order not found" };
@@ -1951,6 +1973,15 @@ export async function sendChangeOrderToClientCore(
         // since the caller checked must not get a signature request.
         if (co.status !== "Draft" && co.status !== "Sent") {
             return { kind: "error", error: `Change order ${co.code} is no longer in a sendable state (now "${co.status}") — refresh and retry.` };
+        }
+        if (!Number.isInteger(dependencies.expectedRevision) || Number(dependencies.expectedRevision) < 0) {
+            return { kind: "error", code: "REVISION_CONFLICT", error: `Change order ${co.code} must be reloaded before it can be sent.` };
+        }
+        if (co.revision !== dependencies.expectedRevision) {
+            return { kind: "error", code: "REVISION_CONFLICT", error: `Change order ${co.code} was modified after this page loaded — reload and review it before sending.` };
+        }
+        if (typeof dependencies.expectedTaxFingerprint !== "string" || dependencies.expectedTaxFingerprint.length > 500) {
+            return { kind: "error", error: `Change order ${co.code} tax terms are invalid — reload and review them before sending.` };
         }
 
         // An unpriced draft (e.g. an AI-suggested CO the PM hasn't priced yet)
@@ -1988,12 +2019,33 @@ export async function sendChangeOrderToClientCore(
         // co.totalAmount is the PRE-TAX subtotal (same semantic as billChangeOrderCore).
         // The email must show the tax-inclusive Revised Amount — the number on the
         // signature page and the number billing will actually charge.
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
+        let terms = co.termsTaxExempt === null
+            ? null
+            : canonicalCoTaxTerms({
+                taxExempt: co.termsTaxExempt,
+                taxRateName: co.termsTaxRateName,
+                taxRatePercent: co.termsTaxRatePercent,
+            });
+        const mustSnapshotTerms = co.status === "Draft" || terms === null;
+        if (mustSnapshotTerms) {
+            // Hold a shared lock through the status+snapshot commit. A tax-only
+            // Estimate edit does not bump CO.revision, so an ordinary read here
+            // would leave a race between fingerprint validation and snapshot.
+            const [estimateTax] = await tx.$queryRaw<Array<{
+                taxExempt: boolean; taxRatePercent: Prisma.Decimal | null; taxRateName: string | null;
+            }>>`
+                SELECT "taxExempt", "taxRatePercent", "taxRateName"
+                FROM "Estimate" WHERE "id" = ${co.estimateId} FOR SHARE`;
+            terms = canonicalCoTaxTerms(estimateTax);
+        }
+        if (!terms) {
+            return { kind: "error", error: `Change order ${co.code} tax terms could not be resolved.` };
+        }
+        if (coTaxFingerprint(terms) !== dependencies.expectedTaxFingerprint) {
+            return { kind: "error", code: "TAX_TERMS_CONFLICT", error: `Change order ${co.code} tax terms changed after this page loaded — reload and review the exact rate before sending.` };
+        }
         const coSubtotal = Math.round(Number(co.totalAmount) * 100) / 100;
-        const coTaxAmount = Math.round(coSubtotal * coTaxRate(estimateTax) * 100) / 100;
+        const coTaxAmount = Math.round(coSubtotal * coTaxRate(terms) * 100) / 100;
         const coRevisedAmount = Math.round((coSubtotal + coTaxAmount) * 100) / 100;
         const schedules = await tx.changeOrderPaymentSchedule.findMany({
             where: { changeOrderId },
@@ -2006,29 +2058,43 @@ export async function sendChangeOrderToClientCore(
 
         const sentCo = await tx.changeOrder.update({
             where: { id: changeOrderId },
-            data: { status: "Sent", sentAt: new Date(), revision: { increment: 1 } },
-            select: { updatedAt: true, revision: true },
+            data: {
+                status: "Sent",
+                sentAt: new Date(),
+                ...(mustSnapshotTerms ? {
+                    termsTaxExempt: terms.taxExempt,
+                    termsTaxRateName: terms.taxRateName,
+                    termsTaxRatePercent: terms.taxRatePercent,
+                } : {}),
+                revision: { increment: 1 },
+            },
+            select: { revision: true },
         });
+
+        const customerSchedules = allocateCoScheduleGross(coSubtotal, schedules, terms);
 
         return {
             kind: "ok",
             code: co.code, title: co.title, projectId: co.projectId, projectName: project?.name ?? "",
             clientId: client.id, clientName: client.name, clientEmail: client.email, additionalEmail: client.additionalEmail,
-            coSubtotal, coTaxAmount, coRevisedAmount, taxLabel: coTaxLabel(estimateTax),
+            coSubtotal, coTaxAmount, coRevisedAmount, taxLabel: coTaxLabel(terms),
             pricingType: co.pricingType,
             markupPercent: co.markupPercent ?? 10,
-            updatedAt: sentCo.updatedAt,
+            taxFingerprint: coTaxFingerprint(terms),
             revision: sentCo.revision,
-            schedules: schedules.map((row) => ({ ...row, amount: Number(row.amount) })),
+            schedules: customerSchedules.map((row) => ({ ...row, amount: row.grossCents / 100 })),
         };
     }, { timeout: 15_000 });
 
-    if (outcome.kind === "error") return { success: false, error: outcome.error };
+    if (outcome.kind === "error") {
+        return { success: false, error: outcome.error, ...(outcome.code ? { code: outcome.code } : {}) };
+    }
     const { code, title, projectId, projectName, coSubtotal, coTaxAmount, coRevisedAmount, taxLabel, pricingType, markupPercent, schedules } = outcome;
     const client = { id: outcome.clientId, name: outcome.clientName, email: outcome.clientEmail, additionalEmail: outcome.additionalEmail };
 
-    const { buildClientPortalUrl } = await import("./client-portal-auth");
-    const portalUrl = await buildClientPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
+    const buildPortalUrl = dependencies.buildClientPortalUrl
+        ?? (await import("./client-portal-auth")).buildClientPortalUrl;
+    const portalUrl = await buildPortalUrl(client.id, client.email, `/portal/change-orders/${changeOrderId}`);
     const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
     const companyName = settings?.companyName || "Your Contractor";
 
@@ -2039,12 +2105,28 @@ export async function sendChangeOrderToClientCore(
     // number that no longer matches the portal. FOR UPDATE (not findUnique):
     // the recheck must WAIT for any in-flight writer to commit before reading,
     // or it would read the pre-update row and pass while stale.
-    const recheckRows = await prisma.$queryRaw<Array<{ status: string; totalAmount: unknown; updatedAt: Date }>>`
-        SELECT "status", "totalAmount", "updatedAt" FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
+    const recheckRows = await prisma.$queryRaw<Array<{
+        status: string; totalAmount: unknown; revision: number; termsTaxExempt: boolean | null;
+        termsTaxRateName: string | null; termsTaxRatePercent: Prisma.Decimal | null;
+    }>>`
+        SELECT "status", "totalAmount", "revision", "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
+        FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
     const recheck = recheckRows[0];
-    if (!recheck || recheck.status !== "Sent" || recheck.updatedAt.getTime() !== outcome.updatedAt.getTime()
-        || Math.abs(Math.round(Number(recheck.totalAmount) * 100) / 100 - coSubtotal) > 0.005) {
-        return { success: false, error: `Change order ${code} was modified while the email was being prepared — review it and send again.` };
+    const recheckTaxFingerprint = recheck?.termsTaxExempt === null
+        ? null
+        : coTaxFingerprint({
+            taxExempt: recheck?.termsTaxExempt,
+            taxRateName: recheck?.termsTaxRateName,
+            taxRatePercent: recheck?.termsTaxRatePercent,
+        });
+    if (!recheck || recheck.status !== "Sent" || recheck.revision !== outcome.revision
+        || Math.round(Number(recheck.totalAmount) * 100) !== Math.round(coSubtotal * 100)
+        || recheckTaxFingerprint !== outcome.taxFingerprint) {
+        return {
+            success: false,
+            code: "REVISION_CONFLICT",
+            error: `Change order ${code} was modified while the email was being prepared — review it and send again.`,
+        };
     }
 
     const changeOrderCc = buildCc(client.email, client.additionalEmail);

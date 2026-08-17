@@ -15,41 +15,72 @@ export type EstimateTaxInfo = {
 } | null | undefined;
 
 export type CoTaxSnapshot = {
-    approvedTaxExempt?: boolean | null;
-    approvedTaxRateName?: string | null;
-    approvedTaxRatePercent?: number | string | { toString(): string } | null;
+    status?: string | null;
+    termsTaxExempt?: boolean | null;
+    termsTaxRateName?: string | null;
+    termsTaxRatePercent?: number | string | { toString(): string } | null;
 } | null | undefined;
 
+export type CanonicalCoTaxTerms = {
+    taxExempt: boolean;
+    taxRatePercent: number;
+    taxRateName: string | null;
+};
+
+function normalizedFiniteNumber(value: unknown, fallback: number): number {
+    const parsed = value != null ? Number(value) : NaN;
+    if (!Number.isFinite(parsed)) return fallback;
+    // Decimal strings, Prisma.Decimal, and ordinary numbers must fingerprint
+    // identically. Precision(15) removes binary float dust without rounding a
+    // legitimate rate such as 8.875 down to a display-only precision.
+    const normalized = Number(parsed.toPrecision(15));
+    return Object.is(normalized, -0) ? 0 : normalized;
+}
+
+/** Canonical customer terms: exemption + effective numeric percent + trimmed name. */
+export function canonicalCoTaxTerms(info: EstimateTaxInfo): CanonicalCoTaxTerms {
+    const taxExempt = info?.taxExempt === true;
+    const taxRatePercent = taxExempt
+        ? 0
+        : normalizedFiniteNumber(info?.taxRatePercent, 8.8);
+    const normalizedName = typeof info?.taxRateName === "string" ? info.taxRateName.trim() : "";
+    return { taxExempt, taxRatePercent, taxRateName: normalizedName || null };
+}
+
+/** Serializable optimistic guard used by editor sends/manual Draft approval. */
+export function coTaxFingerprint(info: EstimateTaxInfo): string {
+    const terms = canonicalCoTaxTerms(info);
+    return JSON.stringify([terms.taxExempt, terms.taxRatePercent, terms.taxRateName]);
+}
+
 /**
- * The single place that decides snapshot-vs-live tax for a change order.
+ * The single place that decides sent-terms-vs-live tax for a change order.
  *
- * approveChangeOrderCore and manuallyApproveChangeOrderCore snapshot the linked
- * Estimate's tax fields onto approvedTaxExempt/approvedTaxRateName/approvedTaxRatePercent
- * in the same transaction as the status flip to Approved — a CO's tax treatment is frozen
- * the moment it is signed, so an estimate edited afterward can never change what an
- * already-signed document says or what billing actually charges. Billing (billChangeOrderCore)
- * and approved-CO rendering (the CO PDF, the portal signature page) must call this instead of
- * reading `estimate` directly.
+ * Guarded send snapshots the linked Estimate's canonical tax fields onto the
+ * termsTax* tuple in the same transaction as Draft -> Sent. Manual approval
+ * directly from Draft performs the same fingerprint check and snapshot.
  *
- * approvedTaxExempt is null only for a CO approved before this snapshot existed ("legacy") —
- * those fall back to the estimate's live tax, the only thing there is to read for them. Draft
- * and Sent COs are never passed a snapshot by their callers (sendChangeOrderToClientCore, the
- * editor, the MCP send preview) and always read the estimate live — correct and intentional,
- * since the estimate can still move before a CO is signed.
+ * termsTaxExempt is null on legacy rows. Approved/null deliberately falls back
+ * to live estimate tax because there is no reliable historical tuple to backfill.
  */
 export function effectiveCoTaxInfo(co: CoTaxSnapshot, estimate: EstimateTaxInfo): EstimateTaxInfo {
-    if (co?.approvedTaxExempt == null) return estimate;
+    // Drafts normally use the estimate's live terms. A defensive status check
+    // prevents an impossible leftover tuple from changing what a Draft editor
+    // shows; the write path also clears the tuple on Sent -> Draft scope edits.
+    if (co?.status === "Draft") return estimate;
+    // Database-loaded rows always contain this property. Treat undefined like
+    // null for small test/legacy object shapes, while the persisted presence
+    // discriminator remains exactly termsTaxExempt !== null.
+    if (co?.termsTaxExempt === null || co?.termsTaxExempt === undefined) return estimate;
     return {
-        taxExempt: co.approvedTaxExempt,
-        taxRatePercent: co.approvedTaxRatePercent ?? null,
-        taxRateName: co.approvedTaxRateName ?? null,
+        taxExempt: co.termsTaxExempt,
+        taxRatePercent: co.termsTaxRatePercent ?? null,
+        taxRateName: co.termsTaxRateName ?? null,
     };
 }
 
 export function coTaxRate(estimate: EstimateTaxInfo): number {
-    if (estimate?.taxExempt) return 0;
-    const pct = estimate?.taxRatePercent != null ? Number(estimate.taxRatePercent) : NaN;
-    return Number.isFinite(pct) ? pct / 100 : DEFAULT_CO_TAX_RATE;
+    return canonicalCoTaxTerms(estimate).taxRatePercent / 100;
 }
 
 // Match billing-core's invoice math exactly: totalAmount is the pre-tax signed
@@ -58,6 +89,37 @@ export function coSignedAmount(totalAmount: number, estimate: EstimateTaxInfo): 
     const subtotal = Math.round((Number(totalAmount) || 0) * 100) / 100;
     const taxAmount = Math.round(subtotal * coTaxRate(estimate) * 100) / 100;
     return Math.round((subtotal + taxAmount) * 100) / 100;
+}
+
+/**
+ * Convert staff/storage pre-tax schedule rows to the customer/billing gross
+ * rows. This is the fixed billing allocator: earlier rows round their own tax,
+ * and the final row absorbs both the pre-tax and tax cent remainder so the
+ * gross rows sum exactly to subtotal + tax.
+ */
+export function allocateCoScheduleGross<T extends { amount?: number | string | { toString(): string } | null }>(
+    subtotal: number,
+    rows: readonly T[],
+    taxInfo: EstimateTaxInfo,
+): Array<T & { pretaxCents: number; taxCents: number; grossCents: number }> {
+    if (rows.length === 0) return [];
+    const subtotalCents = Math.round((Number(subtotal) || 0) * 100);
+    const rate = coTaxRate(taxInfo);
+    const totalTaxCents = Math.round(subtotalCents * rate);
+    let allocatedPretaxCents = 0;
+    let allocatedTaxCents = 0;
+    return rows.map((row, index) => {
+        const isLast = index === rows.length - 1;
+        const pretaxCents = isLast
+            ? subtotalCents - allocatedPretaxCents
+            : Math.round((Number(row.amount) || 0) * 100);
+        const taxCents = isLast
+            ? totalTaxCents - allocatedTaxCents
+            : Math.round(pretaxCents * rate);
+        allocatedPretaxCents += pretaxCents;
+        allocatedTaxCents += taxCents;
+        return { ...row, pretaxCents, taxCents, grossCents: pretaxCents + taxCents };
+    });
 }
 
 // Integer-cents line math shared by the CO editor, the portal signature page,
@@ -181,9 +243,10 @@ export function classifyCoTotal(
 }
 
 export function coTaxLabel(estimate: EstimateTaxInfo): string {
-    if (estimate?.taxExempt) return "Tax Exempt";
-    const pctDisplay = (coTaxRate(estimate) * 100).toFixed(1).replace(/\.0$/, "");
-    return estimate?.taxRateName
-        ? `${estimate.taxRateName} (${pctDisplay}%)`
+    const terms = canonicalCoTaxTerms(estimate);
+    if (terms.taxExempt) return "Tax Exempt";
+    const pctDisplay = String(terms.taxRatePercent);
+    return terms.taxRateName
+        ? `${terms.taxRateName} (${pctDisplay}%)`
         : `Estimated Tax (${pctDisplay}%)`;
 }

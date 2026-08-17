@@ -11,6 +11,7 @@ import {
 } from "../src/lib/billing-core";
 import { approveChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { approveChangeOrderWithSignature } from "../src/lib/change-order-approval";
+import { coTaxFingerprint, effectiveCoTaxInfo } from "../src/lib/co-tax";
 import {
   calculateCrewTimeCosts,
   createExpenseCore,
@@ -324,8 +325,15 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     if (!draft.ok) throw new Error(draft.error);
     costPlusId = draft.changeOrderId;
 
+    const sendGuard = await prisma.changeOrder.findUniqueOrThrow({
+      where: { id: costPlusId },
+      include: { estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } } },
+    });
+
     let sentHtml = "";
     const sent = await sendChangeOrderToClientCore(costPlusId, {
+      expectedRevision: sendGuard.revision,
+      expectedTaxFingerprint: coTaxFingerprint(effectiveCoTaxInfo(sendGuard, sendGuard.estimate)),
       sendNotification: async (_to, _subject, html) => {
         sentHtml = html;
         return { success: true, id: "playwright-mock-email" };
@@ -353,6 +361,8 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
       signatureName: "Client A",
       signatureDataUrl: capturedSignature,
       approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+      expectedRevision: sent.success ? sent.revision : -1,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRatePercent: 10, taxRateName: "Test 10%" }),
     }, {
       persistSignature: async (value) => ({ url: value, discard: async () => undefined }),
       approveCore: approveChangeOrderCore,
@@ -378,6 +388,8 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
       signatureName: "Client A",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date("2026-07-15T12:01:00.000Z"),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRatePercent: 10, taxRateName: "Test 10%" }),
     });
     expect(zeroApproval?.co.status).toBe("Approved");
   });
@@ -818,9 +830,9 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         balanceDue: 100,
         approvedBy: "Snapshot Client",
         approvedAt: new Date("2026-07-15T12:00:00.000Z"),
-        approvedTaxExempt: false,
-        approvedTaxRateName: "Approval snapshot",
-        approvedTaxRatePercent: 8.8,
+        termsTaxExempt: false,
+        termsTaxRateName: "Approval snapshot",
+        termsTaxRatePercent: 8.8,
         items: { create: { name: "Snapshot fixed work", quantity: 1, unitCost: 100, total: 100 } },
       },
     });
@@ -856,9 +868,9 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         balanceDue: 0,
         approvedBy: "Snapshot Client",
         approvedAt: new Date("2026-07-15T12:00:00.000Z"),
-        approvedTaxExempt: false,
-        approvedTaxRateName: "Approval snapshot",
-        approvedTaxRatePercent: 8.8,
+        termsTaxExempt: false,
+        termsTaxRateName: "Approval snapshot",
+        termsTaxRatePercent: 8.8,
       },
     });
     await prisma.timeEntry.create({

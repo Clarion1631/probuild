@@ -32,7 +32,7 @@ import { postDailyLogSummary } from "./chat-webhook";
 import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
 import { recordPaymentCore } from "./payment-record-core";
-import { ChangeOrderRevisionConflictError, deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
+import { ChangeOrderRevisionConflictError, ChangeOrderTaxTermsConflictError, deleteChangeOrderCore, updateChangeOrderCore, manuallyApproveChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
 import type { ShiftNotStartedTasksResult } from "./schedule-core";
@@ -9085,7 +9085,7 @@ type SerializedChangeOrder = {
 
 type ChangeOrderMutationActionResult =
     | { success: true; changeOrder: SerializedChangeOrder }
-    | { success: false; code: "REVISION_CONFLICT" };
+    | { success: false; code: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" };
 
 export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput): Promise<ChangeOrderMutationActionResult> {
     "use server";
@@ -9167,7 +9167,14 @@ export async function deleteChangeOrder(id: string) {
 // signature flow and the approval automation. Rebuild with auth + the approval hook
 // if a raw status setter is ever actually needed.
 
-export async function approveChangeOrder(id: string, signatureName: string, userAgent: string, signatureDataUrl?: string) {
+export async function approveChangeOrder(
+    id: string,
+    signatureName: string,
+    userAgent: string,
+    signatureDataUrl: string | undefined,
+    expectedRevision: number,
+    expectedTaxFingerprint: string,
+) {
     "use server";
     // Auth: internal admins skip ownership check; portal clients must prove ownership.
     const session = await getServerSession(authOptions);
@@ -9192,13 +9199,35 @@ export async function approveChangeOrder(id: string, signatureName: string, user
     const normalizedSignatureName = signatureName.trim();
     if (!normalizedSignatureName) throw new Error("Your full legal name is required");
     if (!signatureDataUrl) throw new Error("A drawn signature is required");
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+        throw new Error("This change order changed after the page loaded. Reload and review it before signing.");
+    }
+    if (typeof expectedTaxFingerprint !== "string" || expectedTaxFingerprint.length > 500) {
+        throw new Error("This change order's tax terms are invalid. Reload and review it before signing.");
+    }
 
     const approvedAt = new Date();
-    const approval = await approveChangeOrderWithSignature(id, {
-        signatureName: normalizedSignatureName,
-        signatureDataUrl,
-        approvedAt,
-    });
+    let approval: Awaited<ReturnType<typeof approveChangeOrderWithSignature>>;
+    try {
+        approval = await approveChangeOrderWithSignature(id, {
+            signatureName: normalizedSignatureName,
+            signatureDataUrl,
+            approvedAt,
+            expectedRevision,
+            expectedTaxFingerprint,
+        });
+    } catch (error) {
+        // The owned upload has already been discarded by the signature helper.
+        // Return only fixed conflict codes; auth, validation, storage, and all
+        // other failures keep Next's normal thrown/redacted behavior.
+        if (error instanceof ChangeOrderRevisionConflictError) {
+            return { success: false as const, code: "REVISION_CONFLICT" as const };
+        }
+        if (error instanceof ChangeOrderTaxTermsConflictError) {
+            return { success: false as const, code: "TAX_TERMS_CONFLICT" as const };
+        }
+        throw error;
+    }
     if (!approval) return null;
     const { co, transitioned } = approval;
 
@@ -9332,7 +9361,7 @@ export async function countersignChangeOrderAsCompany(id: string, signerName: st
 // path, except the client-facing milestone payment email is suppressed (see
 // handleChangeOrderApproved's suppressClientEmails option and its own
 // DB-derived backstop for callers, like the cron sweep, that don't pass it).
-export async function manuallyApproveChangeOrder(id: string, expectedRevision: number): Promise<ChangeOrderMutationActionResult> {
+export async function manuallyApproveChangeOrder(id: string, expectedRevision: number, expectedTaxFingerprint: string): Promise<ChangeOrderMutationActionResult> {
     "use server";
     const user = await assertActiveStaff();
     if (user.role !== "ADMIN" && user.role !== "MANAGER") throw new Error("Forbidden");
@@ -9344,6 +9373,9 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
         throw new Error("Change order was modified after this page loaded — refresh and try again.");
     }
+    if (typeof expectedTaxFingerprint !== "string" || expectedTaxFingerprint.length > 500) {
+        throw new Error("Change order tax terms are invalid — reload and try again.");
+    }
 
     const staffName = (user.name || user.email || "").trim();
     let approval: Awaited<ReturnType<typeof manuallyApproveChangeOrderCore>>;
@@ -9352,10 +9384,14 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
             staffName,
             approvedAt: new Date(),
             expectedRevision,
+            expectedTaxFingerprint,
         });
     } catch (error) {
         if (error instanceof ChangeOrderRevisionConflictError) {
             return { success: false, code: "REVISION_CONFLICT" };
+        }
+        if (error instanceof ChangeOrderTaxTermsConflictError) {
+            return { success: false, code: "TAX_TERMS_CONFLICT" };
         }
         throw error;
     }
@@ -9390,7 +9426,14 @@ export async function manuallyApproveChangeOrder(id: string, expectedRevision: n
     };
 }
 
-export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ success: true; sentTo: string; revision: number } | { success: false; error: string }> {
+export async function sendChangeOrderToClient(
+    changeOrderId: string,
+    expectedRevision: number,
+    expectedTaxFingerprint: string,
+): Promise<
+    | { success: true; sentTo: string; revision: number }
+    | { success: false; error: string; code?: "REVISION_CONFLICT" | "TAX_TERMS_CONFLICT" }
+> {
     "use server";
     // Customer-facing send from the UI — require the changeOrders permission
     // (this export is a remotely invokable server action). Core logic lives in
@@ -9402,7 +9445,7 @@ export async function sendChangeOrderToClient(changeOrderId: string): Promise<{ 
     if (!target) return { success: false, error: "Change order not found" };
     if (!canAccessProject(user, target.projectId)) return { success: false, error: "Forbidden" };
     const { sendChangeOrderToClientCore } = await import("./billing-core");
-    return sendChangeOrderToClientCore(changeOrderId);
+    return sendChangeOrderToClientCore(changeOrderId, { expectedRevision, expectedTaxFingerprint });
 }
 
 export async function uploadSubcontractorCOI(subcontractorId: string, formData: FormData) {

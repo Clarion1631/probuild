@@ -2,6 +2,7 @@ import { getChangeOrder, getProject } from "@/lib/actions";
 import { notFound } from "next/navigation";
 import ChangeOrderEditor from "./ChangeOrderEditor";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { currentStaffUserOrNull } from "@/lib/permissions";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,7 @@ export default async function ChangeOrderPage({
     const resolvedParams = await params;
     const project = await getProject(resolvedParams.id);
     const co = await getChangeOrder(resolvedParams.coId);
+    const viewer = await currentStaffUserOrNull();
 
     if (!project) return <div>Project not found</div>;
     if (!co) {
@@ -36,7 +38,8 @@ export default async function ChangeOrderPage({
                         projectName: project.name,
                         clientName: project.client.name,
                         clientEmail: project.client.email || undefined,
-                        location: project.location || undefined
+                        location: project.location || undefined,
+                        canManuallyApprove: viewer?.role === "ADMIN" || viewer?.role === "MANAGER",
                     }}
                     initialData={initialData}
                 />

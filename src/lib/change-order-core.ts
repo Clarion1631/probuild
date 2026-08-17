@@ -1,6 +1,6 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { billableCoItems, canonicalCoTaxTerms, coLineCents, coSectionRowError, coSectionRowNames, coTaxFingerprint } from "./co-tax";
 import { MANUAL_CO_APPROVAL_SUFFIX } from "./co-approval";
 
 /**
@@ -12,6 +12,13 @@ export class ChangeOrderRevisionConflictError extends Error {
     constructor(changeOrderCode: string) {
         super(`Change order ${changeOrderCode} was modified after this page loaded — refresh and try again.`);
         this.name = "ChangeOrderRevisionConflictError";
+    }
+}
+
+export class ChangeOrderTaxTermsConflictError extends Error {
+    constructor(changeOrderCode: string) {
+        super(`Change order ${changeOrderCode} tax terms changed after this page loaded — reload and review the exact rate before continuing.`);
+        this.name = "ChangeOrderTaxTermsConflictError";
     }
 }
 
@@ -125,11 +132,15 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedBy: string | null;
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
+            termsTaxExempt: boolean | null;
+            termsTaxRateName: string | null;
+            termsTaxRatePercent: unknown | null;
             revision: number;
         }>>`
             SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
-                   "companySignedBy", "companySignedAt", "companySignatureUrl", "revision"
+                   "companySignedBy", "companySignedAt", "companySignatureUrl",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent", "revision"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) throw new Error("Change order not found");
@@ -383,6 +394,9 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             scalarData.status = "Draft";
             scalarData.sentAt = null;
             scalarData.viewedAt = null;
+            scalarData.termsTaxExempt = null;
+            scalarData.termsTaxRateName = null;
+            scalarData.termsTaxRatePercent = null;
         }
 
         return tx.changeOrder.update({ where: { id }, data: { ...scalarData, revision: { increment: 1 } } });
@@ -391,15 +405,26 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
 
 export async function approveChangeOrderCore(
     id: string,
-    approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
+    approval: {
+        signatureName: string;
+        clientSignatureUrl: string | null;
+        approvedAt: Date;
+        expectedRevision: number;
+        expectedTaxFingerprint: string;
+    },
 ) {
     return prisma.$transaction(async (tx) => {
         // The same parent-row lock is taken by editing, sending, billing, and
         // co-audit repair. Status, item existence, subtotal validation, and the
         // approval write therefore observe one serialized state and commit as a
         // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown; estimateId: string }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
+            estimateId: string; revision: number; termsTaxExempt: boolean | null;
+            termsTaxRateName: string | null; termsTaxRatePercent: { toString(): string } | null;
+        }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "estimateId", "revision",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -407,7 +432,9 @@ export async function approveChangeOrderCore(
         if (current.status !== "Sent") {
             throw new Error(`Change order ${current.code} must be Sent before it can be approved.`);
         }
-
+        if (current.revision !== approval.expectedRevision) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
         if (!approval.signatureName.trim() || !approval.clientSignatureUrl) {
             throw new Error("A client name and persisted signature is required to approve a change order.");
         }
@@ -437,15 +464,30 @@ export async function approveChangeOrderCore(
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
 
-        // Freeze the tax treatment at the moment of approval: the customer's
-        // signature is on this amount, so an estimate edited afterward must
-        // never change what the signed document says or what billing charges.
-        // See co-tax.ts's effectiveCoTaxInfo, the one place that reads these
-        // columns back.
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: current.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
+        // Every current Sent row already owns an immutable terms tuple. Legacy
+        // Sent/null rows predate that invariant, so preserve outstanding portal
+        // links by bootstrapping from the live Estimate only when it still
+        // matches the exact tuple the customer reviewed. This all runs under
+        // the locked CO transaction; a tax-only edit therefore cannot slip
+        // between the comparison and the approval write.
+        let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
+        if (current.termsTaxExempt === null) {
+            const [estimateTax] = await tx.$queryRaw<Array<{
+                taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+            }>>`
+                SELECT "taxExempt", "taxRatePercent", "taxRateName"
+                FROM "Estimate" WHERE "id" = ${current.estimateId} FOR SHARE`;
+            if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
+                throw new ChangeOrderTaxTermsConflictError(current.code);
+            }
+            approvalTerms = canonicalCoTaxTerms(estimateTax);
+        } else if (coTaxFingerprint({
+            taxExempt: current.termsTaxExempt,
+            taxRateName: current.termsTaxRateName,
+            taxRatePercent: current.termsTaxRatePercent,
+        }) !== approval.expectedTaxFingerprint) {
+            throw new ChangeOrderTaxTermsConflictError(current.code);
+        }
 
         const co = await tx.changeOrder.update({
             where: { id },
@@ -454,9 +496,11 @@ export async function approveChangeOrderCore(
                 approvedBy: approval.signatureName.trim(),
                 approvedAt: approval.approvedAt,
                 clientSignatureUrl: approval.clientSignatureUrl,
-                approvedTaxExempt: estimateTax?.taxExempt ?? false,
-                approvedTaxRateName: estimateTax?.taxRateName ?? null,
-                approvedTaxRatePercent: estimateTax?.taxRatePercent ?? null,
+                ...(approvalTerms ? {
+                    termsTaxExempt: approvalTerms.taxExempt,
+                    termsTaxRateName: approvalTerms.taxRateName,
+                    termsTaxRatePercent: approvalTerms.taxRatePercent,
+                } : {}),
                 revision: { increment: 1 },
             },
         });
@@ -479,7 +523,7 @@ export async function approveChangeOrderCore(
  */
 export async function manuallyApproveChangeOrderCore(
     id: string,
-    approval: { staffName: string; approvedAt: Date; expectedRevision: number },
+    approval: { staffName: string; approvedAt: Date; expectedRevision: number; expectedTaxFingerprint: string },
 ) {
     return prisma.$transaction(async (tx) => {
         // Same parent-row lock as approveChangeOrderCore/updateChangeOrderCore/
@@ -488,8 +532,11 @@ export async function manuallyApproveChangeOrderCore(
         const locked = await tx.$queryRaw<Array<{
             id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
             clientSignatureUrl: string | null; revision: number; estimateId: string;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null;
+            termsTaxRatePercent: { toString(): string } | null;
         }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision", "estimateId"
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision", "estimateId",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
@@ -538,12 +585,24 @@ export async function manuallyApproveChangeOrderCore(
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
 
-        // Freeze the tax treatment at the moment of approval — same as
-        // approveChangeOrderCore. See co-tax.ts's effectiveCoTaxInfo.
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: current.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
+        let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
+        if (current.status === "Draft" || current.termsTaxExempt === null) {
+            const [estimateTax] = await tx.$queryRaw<Array<{
+                taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+            }>>`
+                SELECT "taxExempt", "taxRatePercent", "taxRateName"
+                FROM "Estimate" WHERE "id" = ${current.estimateId} FOR SHARE`;
+            if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
+                throw new ChangeOrderTaxTermsConflictError(current.code);
+            }
+            approvalTerms = canonicalCoTaxTerms(estimateTax);
+        } else if (coTaxFingerprint({
+            taxExempt: current.termsTaxExempt,
+            taxRateName: current.termsTaxRateName,
+            taxRatePercent: current.termsTaxRatePercent,
+        }) !== approval.expectedTaxFingerprint) {
+            throw new ChangeOrderTaxTermsConflictError(current.code);
+        }
 
         const co = await tx.changeOrder.update({
             where: { id },
@@ -551,9 +610,11 @@ export async function manuallyApproveChangeOrderCore(
                 status: "Approved",
                 approvedBy: `${approval.staffName.trim()}${MANUAL_CO_APPROVAL_SUFFIX}`,
                 approvedAt: approval.approvedAt,
-                approvedTaxExempt: estimateTax?.taxExempt ?? false,
-                approvedTaxRateName: estimateTax?.taxRateName ?? null,
-                approvedTaxRatePercent: estimateTax?.taxRatePercent ?? null,
+                ...(approvalTerms ? {
+                    termsTaxExempt: approvalTerms.taxExempt,
+                    termsTaxRateName: approvalTerms.taxRateName,
+                    termsTaxRatePercent: approvalTerms.taxRatePercent,
+                } : {}),
                 revision: { increment: 1 },
             },
         });

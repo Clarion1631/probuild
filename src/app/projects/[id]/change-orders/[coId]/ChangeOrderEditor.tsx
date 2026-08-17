@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { coTaxFingerprint, coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, effectiveCoTaxInfo } from "@/lib/co-tax";
 
 // handleSave's return type: the server action returns a JSON-serialized Prisma row,
 // but status/revision are the only fields the manual-approval CAS and Send-for-Approval
@@ -54,14 +54,19 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     );
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
-    const canManuallyApprove = (status === "Draft" || status === "Sent") && !initialData.clientSignatureUrl;
+    const canManuallyApprove = context.canManuallyApprove
+        && (status === "Draft" || status === "Sent")
+        && !initialData.clientSignatureUrl;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.
     // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
     // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
     const subtotal = coItemsSubtotal(items);
-    const taxInfo = effectiveCoTaxInfo(initialData, initialData.estimate);
+    // Status is controlled state: a scope-changing save can atomically return a
+    // formerly Sent CO to Draft. Draft must immediately switch from the frozen
+    // sent tuple to the loaded live Estimate terms for the next guarded action.
+    const taxInfo = effectiveCoTaxInfo({ ...initialData, status }, initialData.estimate);
     const tax = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(taxInfo);
@@ -106,9 +111,14 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             if (!saved) return;
             // Staff-side approval — bills the same as the portal path but never
             // emails the client (see manuallyApproveChangeOrder).
-            const result = await manuallyApproveChangeOrder(initialData.id, saved.revision);
+            const approvalTaxInfo = effectiveCoTaxInfo({ ...initialData, ...saved }, initialData.estimate);
+            const result = await manuallyApproveChangeOrder(
+                initialData.id,
+                saved.revision,
+                coTaxFingerprint(approvalTaxInfo),
+            );
             if (!result.success) {
-                if (result.code === "REVISION_CONFLICT") {
+                if (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT") {
                     // Next redacts thrown Server Action errors in production.
                     // This fixed code is the only conflict detail crossing the
                     // permission-gated action boundary.
@@ -349,9 +359,16 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 // sign amounts that never persisted. The Sent status
                                 // is owned by sendChangeOrderToClientCore; the local
                                 // badge only updates after a confirmed send.
-                                const saved = isScopeLocked ? true : await handleSave();
+                                const saved = isScopeLocked
+                                    ? { ...initialData, status, revision }
+                                    : await handleSave();
                                 if (!saved) return;
-                                const result = await sendChangeOrderToClient(initialData.id);
+                                const sendTaxInfo = effectiveCoTaxInfo({ ...initialData, ...saved }, initialData.estimate);
+                                const result = await sendChangeOrderToClient(
+                                    initialData.id,
+                                    saved.revision,
+                                    coTaxFingerprint(sendTaxInfo),
+                                );
                                 if (result.success) {
                                     setStatus("Sent");
                                     setRevision(result.revision);
@@ -359,6 +376,9 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     router.refresh();
                                 } else {
                                     toast.error(result.error || "Failed to send");
+                                    if (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT") {
+                                        window.location.reload();
+                                    }
                                 }
                             } catch {
                                 toast.error("Failed to send change order");
@@ -529,8 +549,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <div className="border-t border-slate-200 px-8 py-7 bg-white">
                                     <div className="flex items-center justify-between mb-4">
                                         <div>
-                                            <h3 className="font-bold text-slate-800">Payment schedule</h3>
-                                            <p className="text-xs text-slate-500 mt-1">Optional. Use at least two positive payments; the final payment absorbs the cent-exact remainder.</p>
+                                            <h3 className="font-bold text-slate-800">Payment schedule (pre-tax)</h3>
+                                            <p className="text-xs text-slate-500 mt-1">Optional staff inputs are pre-tax. Use at least two positive payments; the final payment absorbs the cent-exact pre-tax remainder.</p>
                                         </div>
                                         {!isScopeLocked && <button type="button" onClick={addSchedule} className="hui-btn hui-btn-secondary text-sm">Add payment</button>}
                                     </div>
@@ -549,7 +569,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     </div>
                                     {paymentSchedules.length > 0 && (
                                         <p className={`text-xs mt-3 ${paymentSchedules.length < 2 || finalScheduleCents <= 0 ? "text-red-600" : "text-emerald-700"}`}>
-                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the subtotal." : `Final payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Schedule sums to ${formatCurrency(subtotal)}.`}
+                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the pre-tax subtotal." : `Final pre-tax payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Pre-tax schedule sums to ${formatCurrency(subtotal)}.`}
                                         </p>
                                     )}
                                 </div>

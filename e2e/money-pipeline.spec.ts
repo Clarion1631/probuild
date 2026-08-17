@@ -19,6 +19,7 @@ import {
   type ChangeOrderApprovalDependencies,
   type ChangeOrderSignatureCleanupEvent,
 } from "../src/lib/change-order-approval";
+import { coTaxFingerprint } from "../src/lib/co-tax";
 
 /**
  * Money-pipeline regression net — born from the June 2026 lifecycle audit.
@@ -613,6 +614,8 @@ const approvalInput = (signatureName: string) => ({
   signatureName,
   signatureDataUrl: "data:image/png;base64,AA==",
   approvedAt: new Date(),
+  expectedRevision: 0,
+  expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
 });
 
 test.describe.serial("Money pipeline: change-order lifecycle invariants", () => {
@@ -663,6 +666,11 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
           totalAmount,
           balanceDue: totalAmount,
           ...(status === "Sent" ? { sentAt: new Date("2026-07-17T12:00:00.000Z") } : {}),
+          ...(status === "Sent" ? {
+            termsTaxExempt: true,
+            termsTaxRateName: null,
+            termsTaxRatePercent: 0,
+          } : {}),
           ...(withItem
             ? {
                 items: {
@@ -748,6 +756,8 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       signatureName: "Invariant Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     }));
     expect(message).toContain("priced item");
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.emptySent } })).status).toBe("Sent");
@@ -954,6 +964,8 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       signatureName: "Racing Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     });
     try {
       await expect.poll(async () => {
@@ -1013,12 +1025,17 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       signatureName: "Stale-page Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     }));
     expect(message).toContain("must be Sent");
   });
 
   test("CO10: guarded send rejects stored subtotal drift from rendered items", async () => {
-    const result = await sendChangeOrderToClientCore(COI.driftSend);
+    const result = await sendChangeOrderToClientCore(COI.driftSend, {
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
+    });
     expect(result.success).toBe(false);
     expect(result.success ? "" : result.error).toContain("out of sync");
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.driftSend } })).status).toBe("Sent");
@@ -1029,6 +1046,8 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       signatureName: "Drift Signer",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date(),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     }));
     expect(message).toContain("out of sync");
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.driftApproval } })).status).toBe("Sent");
@@ -1045,6 +1064,8 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       signatureName: "Unsigned Signer",
       clientSignatureUrl: null,
       approvedAt: new Date(),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     }));
     expect(message).toContain("signature is required");
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({ where: { id: COI.unsigned } })).status).toBe("Sent");

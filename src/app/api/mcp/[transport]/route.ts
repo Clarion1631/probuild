@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
 import { createMcpHandler } from "mcp-handler";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
@@ -7,7 +7,16 @@ import { createEstimateFromPhases, updateEstimateFromPhases, templateToPhases, e
 import { getProjectBilling, sendMilestoneInvoicesCore, resendInvoiceCore, createChangeOrderDraft, billChangeOrderCore, sendChangeOrderToClientCore, listReceivables, createInvoiceFromEstimateGuarded, previewCostPlusChangeOrderCore, billCostPlusChangeOrderCore } from "@/lib/billing-core";
 import { getCompanyPipeline, getStartCalendar, getUnappliedChangeOrders, getCrewConflicts } from "@/lib/schedule-core";
 import { updateChangeOrderCore, type ChangeOrderUpdateInput } from "@/lib/change-order-core";
-import { coTaxRate, coTaxLabel } from "@/lib/co-tax";
+import {
+    allocateCoScheduleGross,
+    canonicalCoTaxTerms,
+    coTaxFingerprint,
+    coTaxLabel,
+    coTaxRate,
+    effectiveCoTaxInfo,
+} from "@/lib/co-tax";
+import { buildChangeOrderSendPreviewPayload } from "@/lib/change-order-send-preview";
+import { mintPreviewToken, verifyPreviewToken } from "@/lib/mcp-preview-token";
 import { ALLOWED_FILE_EXTENSIONS, fileExtension, mimeTypeForFileName, saveProjectFile } from "@/lib/project-files";
 import { calculateCrewTimeCosts, createExpenseCore, createTimeEntryCore, findCrewMatches } from "@/lib/time-expense-core";
 import { downloadDocBytes, resolveDocUrl, isSecureRef, secureRefPath } from "@/lib/secure-storage";
@@ -70,22 +79,6 @@ function textResult(data: unknown) {
 // stateless (not single-use): within the ~5-10 minute window a replay repeats
 // the send (a duplicate email of an already-approved send at worst). True
 // single-use would need a server-side token table — revisit if that risk grows.
-const PREVIEW_BUCKET_MS = 300_000;
-function mintPreviewToken(payload: string): string {
-    const bucket = Math.floor(Date.now() / PREVIEW_BUCKET_MS);
-    return createHmac("sha256", process.env.MCP_SECRET ?? "").update(`${bucket}:${payload}`).digest("hex").slice(0, 20);
-}
-function verifyPreviewToken(token: string | undefined, payload: string): boolean {
-    if (!token) return false;
-    const now = Math.floor(Date.now() / PREVIEW_BUCKET_MS);
-    for (const bucket of [now, now - 1]) {
-        const expect = createHmac("sha256", process.env.MCP_SECRET ?? "").update(`${bucket}:${payload}`).digest("hex").slice(0, 20);
-        const a = Buffer.from(token);
-        const b = Buffer.from(expect);
-        if (a.length === b.length && timingSafeEqual(a, b)) return true;
-    }
-    return false;
-}
 
 const phaseItemSchema = z.object({
     name: z.string().min(1).max(300).describe("Line item name, e.g. 'Demo existing cabinets'"),
@@ -1011,48 +1004,102 @@ function createHandler(actor: RouteMcpActor) {
                 },
             },
             async ({ changeOrderId, confirmToken }) => {
-                const co = await prisma.changeOrder.findUnique({
+                const loadSendState = () => prisma.changeOrder.findUnique({
                     where: { id: changeOrderId },
                     select: {
-                        code: true, title: true, status: true, pricingType: true, markupPercent: true, totalAmount: true, updatedAt: true,
+                        code: true, title: true, status: true, pricingType: true, markupPercent: true, totalAmount: true,
+                        revision: true, termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
                         paymentSchedules: { orderBy: { order: "asc" }, select: { id: true, name: true, amount: true, dueDate: true, order: true } },
                         estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
                         project: { select: { name: true, client: { select: { name: true, email: true } } } },
                     },
                 });
+                type SendState = NonNullable<Awaited<ReturnType<typeof loadSendState>>>;
+                const previewFor = (state: SendState) => {
+                    const recipient = state.project?.client?.email ?? "";
+                    const taxInfo = effectiveCoTaxInfo(state, state.estimate);
+                    const taxTerms = canonicalCoTaxTerms(taxInfo);
+                    const payload = buildChangeOrderSendPreviewPayload({
+                        changeOrderId,
+                        recipient,
+                        code: state.code,
+                        title: state.title,
+                        pricingType: state.pricingType,
+                        markupPercent: state.markupPercent,
+                        total: Number(state.totalAmount),
+                        schedules: state.paymentSchedules.map(row => [row.id, row.name, Number(row.amount), row.dueDate?.toISOString(), row.order]),
+                        status: state.status,
+                        revision: state.revision,
+                        taxTerms,
+                    });
+                    const subtotal = Number(state.totalAmount);
+                    const taxAmount = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
+                    const customerSchedules = allocateCoScheduleGross(subtotal, state.paymentSchedules, taxInfo);
+                    return {
+                        recipient,
+                        payload,
+                        taxTerms,
+                        response: textResult({
+                            preview: true,
+                            changeOrder: {
+                                code: state.code, title: state.title, status: state.status,
+                                pricingType: state.pricingType,
+                                markupPercent: state.markupPercent,
+                                paymentSchedules: customerSchedules.map(row => ({
+                                    id: row.id,
+                                    name: row.name,
+                                    amount: row.grossCents / 100,
+                                    dueDate: row.dueDate,
+                                    order: row.order,
+                                })),
+                                ...(state.pricingType === "COST_PLUS"
+                                    ? { terms: `cost + ${state.markupPercent ?? 10}% + tax, billed from actuals` }
+                                    : { subtotal, tax: taxAmount, taxTreatment: coTaxLabel(taxInfo), revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100 }),
+                            },
+                            project: state.project?.name,
+                            recipient,
+                            confirmToken: mintPreviewToken(payload),
+                            instruction: "Show this to the user including the tax breakdown — the customer signs (and is later billed) the revised amount. Call again with this confirmToken ONLY after they explicitly approve.",
+                        }),
+                    };
+                };
+
+                const co = await loadSendState();
                 if (!co) return { ...textResult({ error: "Change order not found" }), isError: true };
                 if (co.status !== "Draft" && co.status !== "Sent") {
                     return { ...textResult({ error: `Change order ${co.code} is "${co.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
                 }
-                const recipient = co.project?.client?.email ?? "";
-                if (!recipient) {
+                const preview = previewFor(co);
+                if (!preview.recipient) {
                     return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
                 }
 
-                // updatedAt in the payload means any edit to the CO between preview
-                // and confirm (title, items, totals) invalidates the token.
-                const payload = JSON.stringify({ changeOrderId, recipient, code: co.code, title: co.title, pricingType: co.pricingType, markupPercent: co.markupPercent, total: Number(co.totalAmount), schedules: co.paymentSchedules.map(row => [row.id, row.name, Number(row.amount), row.dueDate?.toISOString(), row.order]), status: co.status, updatedAt: co.updatedAt.toISOString() });
-                if (!verifyPreviewToken(confirmToken, payload)) {
-                    const subtotal = Number(co.totalAmount);
-                    const taxAmount = Math.round(subtotal * coTaxRate(co.estimate) * 100) / 100;
-                    return textResult({
-                        preview: true,
-                        changeOrder: {
-                            code: co.code, title: co.title, status: co.status,
-                            pricingType: co.pricingType,
-                            markupPercent: co.markupPercent,
-                            paymentSchedules: co.paymentSchedules.map(row => ({ ...row, amount: Number(row.amount) })),
-                            ...(co.pricingType === "COST_PLUS"
-                                ? { terms: `cost + ${co.markupPercent ?? 10}% + tax, billed from actuals` }
-                                : { subtotal, tax: taxAmount, taxTreatment: coTaxLabel(co.estimate), revisedAmountCustomerSigns: Math.round((subtotal + taxAmount) * 100) / 100 }),
-                        },
-                        project: co.project?.name,
-                        recipient,
-                        confirmToken: mintPreviewToken(payload),
-                        instruction: "Show this to the user including the tax breakdown — the customer signs (and is later billed) the revised amount. Call again with this confirmToken ONLY after they explicitly approve.",
-                    });
+                // The revision covers all guarded CO writes. The canonical tax
+                // tuple additionally covers tax-only Estimate edits, which do
+                // not bump the CO revision while it is still Draft (or legacy
+                // Sent/null). Confirmation re-reads both before verifying and
+                // the locked core checks them again before changing status.
+                if (!verifyPreviewToken(confirmToken, preview.payload)) return preview.response;
+                const result = await sendChangeOrderToClientCore(changeOrderId, {
+                    expectedRevision: co.revision,
+                    expectedTaxFingerprint: coTaxFingerprint(preview.taxTerms),
+                });
+                if (!result.success && (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT")) {
+                    // Token verification and the locked core check are separate
+                    // operations. If a writer lands in that narrow interval,
+                    // never reuse the pre-lock snapshot: return a new preview and
+                    // token minted from a fresh database read, with no send audit.
+                    const fresh = await loadSendState();
+                    if (!fresh) return { ...textResult({ error: "Change order not found" }), isError: true };
+                    if (fresh.status !== "Draft" && fresh.status !== "Sent") {
+                        return { ...textResult({ error: `Change order ${fresh.code} is "${fresh.status}" — only Draft or Sent change orders can be (re)sent for signature.` }), isError: true };
+                    }
+                    const refreshedPreview = previewFor(fresh);
+                    if (!refreshedPreview.recipient) {
+                        return { ...textResult({ error: "The client has no email on file — add one in ProBuild first." }), isError: true };
+                    }
+                    return refreshedPreview.response;
                 }
-                const result = await sendChangeOrderToClientCore(changeOrderId);
                 if (!result.success) return { ...textResult({ error: result.error }), isError: true };
                 return textResult({ ...result, note: "Customer will sign via the portal link. Once status shows Approved in list_project_billing, use bill_change_order." });
             },

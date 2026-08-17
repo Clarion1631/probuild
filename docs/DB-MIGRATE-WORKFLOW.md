@@ -38,7 +38,7 @@ the baseline applied and removing the orphan row... is performed separately"
 — and this follows the same split.
 
 **`prisma/migrations/20260815000000_add_change_order_revision`** (adds
-`ChangeOrder.revision` and the `approvedTax*` snapshot columns) is applied to
+`ChangeOrder.revision` and the `termsTax*` customer-terms columns) is applied to
 production by `scripts/apply-co-revision-schema.mjs`, the same out-of-band
 path. Every statement in that migration is `ADD COLUMN IF NOT EXISTS`, so
 leaving `_prisma_migrations` unreconciled is safe, not just tolerated: the

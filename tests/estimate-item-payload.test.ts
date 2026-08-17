@@ -565,19 +565,19 @@ test("billableCoItems drops section rows without guessing at their meaning", () 
     assert.deepEqual(coSectionRowNames([{ type: "Material", name: "Tile" }]), []);
 });
 
-test("effectiveCoTaxInfo uses the approval snapshot even when the estimate later changes", () => {
+test("effectiveCoTaxInfo uses the sent terms tuple even when the estimate later changes", () => {
     assert.deepEqual(
         effectiveCoTaxInfo(
-            { approvedTaxExempt: false, approvedTaxRateName: "Approval snapshot", approvedTaxRatePercent: 8.8 },
+            { status: "Approved", termsTaxExempt: false, termsTaxRateName: "Sent terms", termsTaxRatePercent: 8.8 },
             { taxExempt: false, taxRateName: "Live changed rate", taxRatePercent: 10 },
         ),
-        { taxExempt: false, taxRateName: "Approval snapshot", taxRatePercent: 8.8 },
+        { taxExempt: false, taxRateName: "Sent terms", taxRatePercent: 8.8 },
     );
 });
 
-test("effectiveCoTaxInfo falls back to the live estimate for legacy null snapshots", () => {
+test("effectiveCoTaxInfo deliberately falls back to the live estimate for legacy Approved null terms", () => {
     const estimate = { taxExempt: false, taxRateName: "Legacy live rate", taxRatePercent: 8.9 };
-    assert.equal(effectiveCoTaxInfo({ approvedTaxExempt: null }, estimate), estimate);
+    assert.equal(effectiveCoTaxInfo({ status: "Approved", termsTaxExempt: null }, estimate), estimate);
 });
 
 test("every money path refuses a change order carrying section headers", () => {

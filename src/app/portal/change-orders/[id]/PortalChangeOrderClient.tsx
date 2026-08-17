@@ -6,7 +6,7 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { allocateCoScheduleGross, coTaxFingerprint, coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems, effectiveCoTaxInfo } from "@/lib/co-tax";
 import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 import { buildPdf } from "@/lib/build-pdf";
 
@@ -32,7 +32,18 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveChangeOrder(initialData.id, signature.trim(), userAgent, signatureDataUrl);
+            const result = await approveChangeOrder(
+                initialData.id,
+                signature.trim(),
+                userAgent,
+                signatureDataUrl,
+                initialData.revision,
+                coTaxFingerprint(taxInfo),
+            );
+            if (result && "success" in result && !result.success) {
+                window.location.reload();
+                return;
+            }
             toast.success("Change Order Approved!");
             window.location.reload();
         } catch (e: any) {
@@ -105,7 +116,8 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const total = Math.round((subtotal + tax) * 100) / 100;
     const taxLabel = coTaxLabel(taxInfo);
     const isCostPlus = initialData.pricingType === "COST_PLUS";
-    const schedules = initialData.paymentSchedules || [];
+    const schedules = allocateCoScheduleGross(subtotal, initialData.paymentSchedules || [], taxInfo)
+        .map((row: any) => ({ ...row, amount: row.grossCents / 100 }));
 
     // Split on blank lines so each paragraph can be its own top-level data-pdf-row —
     // build-pdf.ts hard-slices any row taller than one page, which can cut through a
@@ -183,7 +195,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         Back to Portal
                     </Link>
                     {isApproved && (
-                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
+                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">{isManualApproval ? "✓ Approved" : "✓ Approved & Signed"}</span>
                     )}
                 </div>
             </header>

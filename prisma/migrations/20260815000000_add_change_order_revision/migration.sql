@@ -7,6 +7,6 @@
 -- failing with "column already exists". See docs/DB-MIGRATE-WORKFLOW.md for the reconciliation
 -- note on this specific migration.
 ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "revision" INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxExempt" BOOLEAN;
-ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxRateName" TEXT;
-ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxRatePercent" DECIMAL;
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxExempt" BOOLEAN;
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxRateName" TEXT;
+ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxRatePercent" DECIMAL;

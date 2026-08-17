@@ -1552,17 +1552,14 @@ model ChangeOrder {
   approvedBy         String?
   approvedAt         DateTime?
 
-  // Tax treatment frozen at approval — approveChangeOrderCore and manuallyApproveChangeOrderCore
-  // snapshot the linked Estimate's tax fields here in the same transaction as the status flip to
-  // Approved. Billing and approved-CO rendering must read these, never the estimate's live fields
-  // (lib/co-tax.ts effectiveCoTaxInfo is the one place that decides snapshot-vs-live), so editing
-  // the estimate's tax rate after a CO is signed can never change what an already-signed document
-  // says or what billing actually charges. null = legacy pre-snapshot approval — falls back to the
-  // estimate's live tax, the pre-snapshot behavior. Draft/Sent COs never get a snapshot and always
-  // read the estimate live, which is correct — the estimate can still move before a CO is signed.
-  approvedTaxExempt      Boolean?
-  approvedTaxRateName    String?
-  approvedTaxRatePercent Decimal? @db.Decimal
+  // Customer-visible tax terms frozen at the first guarded send (or an atomic manual approval
+  // directly from Draft). Sent resends, portal/manual approval, rendering, scheduling, and billing
+  // preserve/read this tuple; a Sent scope edit clears it while returning the CO to Draft.
+  // termsTaxExempt !== null is the presence discriminator. null on an Approved legacy row retains
+  // the historical live-estimate fallback because there is no safe source for a backfill.
+  termsTaxExempt      Boolean?
+  termsTaxRateName    String?
+  termsTaxRatePercent Decimal? @db.Decimal
 
   // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
   // Separate fields so countersigning never overwrites the customer's approval/audit trail.

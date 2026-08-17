@@ -19,6 +19,7 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
+import { coTaxFingerprint } from "../src/lib/co-tax";
 
 type ChangeOrderRow = {
     id: string;
@@ -35,6 +36,9 @@ type ChangeOrderRow = {
     companySignedBy: string | null;
     companySignedAt: Date | null;
     companySignatureUrl: string | null;
+    termsTaxExempt: boolean | null;
+    termsTaxRateName: string | null;
+    termsTaxRatePercent: number | null;
     estimateId: string;
     revision: number;
 };
@@ -45,6 +49,7 @@ const calls = {
     /** SELECT ... FOR UPDATE row locks taken, in order. */
     rowLocks: [] as string[],
     changeOrderUpdates: [] as Array<{ where: { id: string }; data: Record<string, unknown> }>,
+    estimateTaxReads: 0,
 };
 
 const state: {
@@ -62,6 +67,7 @@ const state: {
 function resetFixture() {
     calls.rowLocks.length = 0;
     calls.changeOrderUpdates.length = 0;
+    calls.estimateTaxReads = 0;
     state.changeOrder = null;
     state.estimateTax = { taxExempt: false, taxRateName: "Approval rate", taxRatePercent: 8.9 };
     state.items = [];
@@ -89,7 +95,12 @@ const fakePrisma = {
     $transaction: async (fn: (tx: any) => Promise<any>) => {
         const tx = {
             $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-                calls.rowLocks.push(strings.join("?").trim() + ` [${values.join(",")}]`);
+                const sql = strings.join("?").trim();
+                calls.rowLocks.push(sql + ` [${values.join(",")}]`);
+                if (sql.includes('FROM "Estimate"')) {
+                    calls.estimateTaxReads++;
+                    return values[0] === state.changeOrder?.estimateId ? [{ ...state.estimateTax }] : [];
+                }
                 if (!state.changeOrder || state.changeOrder.id !== values[0]) return [];
                 return [{ ...state.changeOrder }];
             },
@@ -107,7 +118,10 @@ const fakePrisma = {
                 create: async () => { throw new Error("unexpected changeOrderItem.create in this fixture"); },
             },
             estimate: {
-                findUnique: async () => ({ ...state.estimateTax }),
+                findUnique: async () => {
+                    calls.estimateTaxReads++;
+                    return { ...state.estimateTax };
+                },
             },
             changeOrder: {
                 update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
@@ -122,11 +136,17 @@ const fakePrisma = {
 
 let manuallyApproveChangeOrderCore: (
     id: string,
-    approval: { staffName: string; approvedAt: Date; expectedRevision: number },
+    approval: { staffName: string; approvedAt: Date; expectedRevision: number; expectedTaxFingerprint: string },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 let approveChangeOrderCore: (
     id: string,
-    approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
+    approval: {
+        signatureName: string;
+        clientSignatureUrl: string | null;
+        approvedAt: Date;
+        expectedRevision: number;
+        expectedTaxFingerprint: string;
+    },
 ) => Promise<{ co: any; transitioned: boolean } | null>;
 let updateChangeOrderCore: (id: string, data: Record<string, unknown>) => Promise<any>;
 let revisionConflictErrorConstructor: unknown;
@@ -207,6 +227,9 @@ function draftChangeOrder(overrides: Partial<ChangeOrderRow> = {}): ChangeOrderR
         companySignedBy: null,
         companySignedAt: null,
         companySignatureUrl: null,
+        termsTaxExempt: null,
+        termsTaxRateName: null,
+        termsTaxRatePercent: null,
         estimateId: "estimate-1",
         revision: FIXTURE_REVISION,
         ...overrides,
@@ -220,7 +243,12 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     state.items = oneItem;
 
     const approvedAt = new Date("2026-08-14T12:00:00.000Z");
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt, expectedRevision: FIXTURE_REVISION });
+    const result = await manuallyApproveChangeOrderCore("co-1", {
+        staffName: "Jane Doe",
+        approvedAt,
+        expectedRevision: FIXTURE_REVISION,
+        expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
+    });
 
     assert.ok(result, "expected a transition result");
     assert.equal(result!.transitioned, true);
@@ -230,41 +258,182 @@ test("manual approve from Draft: sets status Approved, stamps approvedBy with th
     assert.equal(write.data.status, "Approved");
     assert.equal(write.data.approvedBy, "Jane Doe (manual approval — staff)");
     assert.equal(write.data.approvedAt, approvedAt);
-    assert.equal(write.data.approvedTaxExempt, false);
-    assert.equal(write.data.approvedTaxRateName, "Approval rate");
-    assert.equal(write.data.approvedTaxRatePercent, 8.9);
+    assert.equal(write.data.termsTaxExempt, false);
+    assert.equal(write.data.termsTaxRateName, "Approval rate");
+    assert.equal(write.data.termsTaxRatePercent, 8.9);
     assert.deepEqual(write.data.revision, { increment: 1 });
     // Manual approval must never write a client signature — that field simply
     // isn't in the update payload at all.
     assert.equal(Object.prototype.hasOwnProperty.call(write.data, "clientSignatureUrl"), false);
 });
 
-test("manual approve from Sent also succeeds", async () => {
-    state.changeOrder = draftChangeOrder({ status: "Sent" });
+test("manual approve from Sent preserves the sent terms tuple instead of re-reading live estimate tax", async () => {
+    state.changeOrder = draftChangeOrder({
+        status: "Sent",
+        termsTaxExempt: false,
+        termsTaxRateName: "Sent terms",
+        termsTaxRatePercent: 7.25,
+    });
+    state.estimateTax = { taxExempt: false, taxRateName: "Changed live estimate", taxRatePercent: 12.5 };
     state.items = oneItem;
 
-    const result = await manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION });
+    const result = await manuallyApproveChangeOrderCore("co-1", {
+        staffName: "Jane Doe",
+        approvedAt: new Date(),
+        expectedRevision: FIXTURE_REVISION,
+        expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Sent terms", taxRatePercent: 7.25 }),
+    });
     assert.ok(result);
     assert.equal(result!.co.status, "Approved");
+    assert.equal(result!.co.termsTaxRatePercent, 7.25);
+    assert.equal(calls.estimateTaxReads, 0);
+    const write = calls.changeOrderUpdates[0].data;
+    assert.equal(Object.prototype.hasOwnProperty.call(write, "termsTaxExempt"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(write, "termsTaxRatePercent"), false);
 });
 
-test("portal approval snapshots the estimate tax fields in the approval update", async () => {
-    state.changeOrder = draftChangeOrder({ status: "Sent" });
-    state.estimateTax = { taxExempt: true, taxRateName: "Exempt certificate", taxRatePercent: null };
+test("portal approval requires the loaded revision and preserves the exact sent terms tuple", async () => {
+    state.changeOrder = draftChangeOrder({
+        status: "Sent",
+        termsTaxExempt: false,
+        termsTaxRateName: "Sent exact rate",
+        termsTaxRatePercent: 8.875,
+    });
+    state.estimateTax = { taxExempt: true, taxRateName: "Changed after send", taxRatePercent: null };
     state.items = oneItem;
 
     const result = await approveChangeOrderCore("co-1", {
         signatureName: "Client Signer",
         clientSignatureUrl: "secure-doc://client-signature.png",
         approvedAt: new Date("2026-08-15T12:00:00.000Z"),
+        expectedRevision: FIXTURE_REVISION,
+        expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Sent exact rate", taxRatePercent: 8.875 }),
     });
 
     assert.ok(result);
     const write = calls.changeOrderUpdates[0];
     assert.equal(write.data.status, "Approved");
-    assert.equal(write.data.approvedTaxExempt, true);
-    assert.equal(write.data.approvedTaxRateName, "Exempt certificate");
-    assert.equal(write.data.approvedTaxRatePercent, null);
+    assert.equal(Object.prototype.hasOwnProperty.call(write.data, "termsTaxExempt"), false);
+    assert.equal(result!.co.termsTaxRatePercent, 8.875);
+    assert.equal(calls.estimateTaxReads, 0);
+});
+
+test("portal approval rejects a stale revision before writing the uploaded signature URL", async () => {
+    state.changeOrder = draftChangeOrder({
+        status: "Sent",
+        revision: FIXTURE_REVISION + 1,
+        termsTaxExempt: true,
+        termsTaxRateName: "Exempt",
+        termsTaxRatePercent: 0,
+    });
+    state.items = oneItem;
+
+    await assert.rejects(
+        () => approveChangeOrderCore("co-1", {
+            signatureName: "Stale Client",
+            clientSignatureUrl: "secure-doc://owned-stale-signature.png",
+            approvedAt: new Date(),
+            expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true, taxRateName: "Exempt", taxRatePercent: 0 }),
+        }),
+        assertTypedRevisionConflict,
+    );
+    assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("legacy Sent portal approval bootstraps live terms atomically when the displayed fingerprint still matches", async () => {
+    state.changeOrder = draftChangeOrder({ status: "Sent" });
+    state.estimateTax = { taxExempt: false, taxRateName: "Legacy displayed terms", taxRatePercent: 9.125 };
+    state.items = oneItem;
+
+    const result = await approveChangeOrderCore("co-1", {
+        signatureName: "Legacy Portal Client",
+        clientSignatureUrl: "secure-doc://legacy-client-signature.png",
+        approvedAt: new Date(),
+        expectedRevision: FIXTURE_REVISION,
+        expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
+    });
+
+    assert.ok(result);
+    assert.equal(calls.estimateTaxReads, 1);
+    assert.equal(calls.changeOrderUpdates[0].data.status, "Approved");
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxExempt, false);
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxRateName, "Legacy displayed terms");
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxRatePercent, 9.125);
+});
+
+test("legacy Sent portal approval rejects a changed live tax fingerprint before storing the signature", async () => {
+    state.changeOrder = draftChangeOrder({ status: "Sent" });
+    state.estimateTax = { taxExempt: false, taxRateName: "Changed live terms", taxRatePercent: 9.2 };
+    state.items = oneItem;
+
+    await assert.rejects(
+        () => approveChangeOrderCore("co-1", {
+            signatureName: "Legacy Portal Client",
+            clientSignatureUrl: "secure-doc://must-be-discarded.png",
+            approvedAt: new Date(),
+            expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Old displayed terms", taxRatePercent: 8.875 }),
+        }),
+        /tax terms changed/i,
+    );
+    assert.equal(calls.estimateTaxReads, 1);
+    assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("legacy Sent manual approval bootstraps live terms atomically when the displayed fingerprint still matches", async () => {
+    state.changeOrder = draftChangeOrder({ status: "Sent" });
+    state.estimateTax = { taxExempt: true, taxRateName: "Legacy exemption", taxRatePercent: 12.5 };
+    state.items = oneItem;
+
+    const result = await manuallyApproveChangeOrderCore("co-1", {
+        staffName: "Jane Doe",
+        approvedAt: new Date(),
+        expectedRevision: FIXTURE_REVISION,
+        expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
+    });
+
+    assert.ok(result);
+    assert.equal(calls.estimateTaxReads, 1);
+    assert.equal(calls.changeOrderUpdates[0].data.status, "Approved");
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxExempt, true);
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxRateName, "Legacy exemption");
+    assert.equal(calls.changeOrderUpdates[0].data.termsTaxRatePercent, 0);
+});
+
+test("legacy Sent manual approval rejects a changed live tax fingerprint without mutating status", async () => {
+    state.changeOrder = draftChangeOrder({ status: "Sent" });
+    state.estimateTax = { taxExempt: false, taxRateName: "Changed live terms", taxRatePercent: 10.25 };
+    state.items = oneItem;
+
+    await assert.rejects(
+        () => manuallyApproveChangeOrderCore("co-1", {
+            staffName: "Jane Doe",
+            approvedAt: new Date(),
+            expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Old displayed terms", taxRatePercent: 8.875 }),
+        }),
+        /tax terms changed/i,
+    );
+    assert.equal(calls.estimateTaxReads, 1);
+    assert.equal(calls.changeOrderUpdates.length, 0);
+});
+
+test("manual Draft approval rejects a stale displayed tax fingerprint without mutating status", async () => {
+    state.changeOrder = draftChangeOrder();
+    state.items = oneItem;
+    state.estimateTax = { taxExempt: false, taxRateName: "New live rate", taxRatePercent: 9.2 };
+
+    await assert.rejects(
+        () => manuallyApproveChangeOrderCore("co-1", {
+            staffName: "Jane Doe",
+            approvedAt: new Date(),
+            expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRateName: "Old displayed rate", taxRatePercent: 8.875 }),
+        }),
+        /tax terms changed/i,
+    );
+    assert.equal(calls.changeOrderUpdates.length, 0);
 });
 
 test("manual approve is rejected when the change order is already Approved", async () => {
@@ -272,7 +441,7 @@ test("manual approve is rejected when the change order is already Approved", asy
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION, expectedTaxFingerprint: coTaxFingerprint(state.estimateTax) }),
         /must be Draft or Sent/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
@@ -286,7 +455,7 @@ test("manual approve is rejected when a client signature already exists", async 
     state.items = oneItem;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION }),
+        () => manuallyApproveChangeOrderCore("co-1", { staffName: "Jane Doe", approvedAt: new Date(), expectedRevision: FIXTURE_REVISION, expectedTaxFingerprint: coTaxFingerprint(state.estimateTax) }),
         /already has a client signature/,
     );
     assert.equal(calls.changeOrderUpdates.length, 0);
@@ -304,6 +473,7 @@ test("manual approve is rejected when expectedRevision doesn't match the locked 
             staffName: "Jane Doe",
             approvedAt: new Date(),
             expectedRevision: FIXTURE_REVISION,
+            expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
         }),
         assertTypedRevisionConflict,
     );
@@ -319,6 +489,7 @@ test("manual approve succeeds when expectedRevision matches the locked row's rev
         staffName: "Jane Doe",
         approvedAt: new Date(),
         expectedRevision: rowRevision,
+        expectedTaxFingerprint: coTaxFingerprint(state.estimateTax),
     });
     assert.ok(result);
     assert.equal(result!.transitioned, true);
@@ -343,6 +514,27 @@ test("updateChangeOrderCore's parent update includes revision: { increment: 1 }"
     // the fixture's increment semantics actually moved the number, not just
     // that the write payload shape looks right.
     assert.equal(updated.revision, FIXTURE_REVISION + 1);
+});
+
+test("a Sent scope edit returns to Draft and atomically clears the sent terms tuple", async () => {
+    state.changeOrder = draftChangeOrder({
+        status: "Sent",
+        termsTaxExempt: false,
+        termsTaxRateName: "Sent terms",
+        termsTaxRatePercent: 8.875,
+    });
+
+    const updated = await updateChangeOrderCore("co-1", { title: "Changed sent scope" });
+
+    assert.equal(updated.status, "Draft");
+    assert.equal(updated.termsTaxExempt, null);
+    assert.equal(updated.termsTaxRateName, null);
+    assert.equal(updated.termsTaxRatePercent, null);
+    const write = calls.changeOrderUpdates[0].data;
+    assert.equal(write.status, "Draft");
+    assert.equal(write.termsTaxExempt, null);
+    assert.equal(write.termsTaxRateName, null);
+    assert.equal(write.termsTaxRatePercent, null);
 });
 
 test("updateChangeOrderCore rejects a stale expectedRevision before any write", async () => {

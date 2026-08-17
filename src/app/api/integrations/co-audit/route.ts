@@ -56,7 +56,7 @@ export async function GET(req: Request) {
             id: true, code: true, title: true, status: true, pricingType: true,
             totalAmount: true, balanceDue: true, createdAt: true, updatedAt: true,
             approvedAt: true, sentAt: true,
-            approvedTaxExempt: true, approvedTaxRateName: true, approvedTaxRatePercent: true,
+            termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
             paymentSchedules: { select: { amount: true } },
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
@@ -160,8 +160,14 @@ export async function POST(req: Request) {
 
     const result = await prisma.$transaction(async tx => {
         // Row lock so a concurrent approve/send/bill serializes against the fix.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; pricingType: string; totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; pricingType: string;
+            totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null;
+            termsTaxRatePercent: { toString(): string } | null;
+        }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
@@ -185,11 +191,13 @@ export async function POST(req: Request) {
         // nor subtotal+tax) may carry an intentional edit, so it needs an
         // explicit force from a human.
         const subtotal = coItemsSubtotal(items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
-        const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(estimateTax)));
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${co.estimateId} FOR SHARE`;
+        const taxInfo = effectiveCoTaxInfo(co, estimateTax);
+        const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(taxInfo)));
         const sectionNames = coSectionRowNames(items);
         const verdict = classify(stored, subtotal, expectedBilled, items.length, sectionNames.length, co.pricingType);
         // Not repairable here: writing back a subtotal that excludes the headers would leave
@@ -247,7 +255,19 @@ export async function POST(req: Request) {
         }
         await tx.changeOrder.update({
             where: { id: changeOrderId },
-            data: { totalAmount: subtotal, balanceDue: subtotal, revision: { increment: 1 } },
+            data: {
+                totalAmount: subtotal,
+                balanceDue: subtotal,
+                ...(co.status === "Sent" ? {
+                    status: "Draft",
+                    sentAt: null,
+                    viewedAt: null,
+                    termsTaxExempt: null,
+                    termsTaxRateName: null,
+                    termsTaxRatePercent: null,
+                } : {}),
+                revision: { increment: 1 },
+            },
         });
         return {
             ok: true as const, changed: true, code: co.code, title: co.title, projectId: co.projectId, verdict,

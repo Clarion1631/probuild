@@ -5,8 +5,8 @@
 // inputs (items, schedules, pricing, status, signatures); NOT bumped by passive
 // writes like viewedAt.
 //
-// Also adds ChangeOrder.approvedTaxExempt / approvedTaxRateName /
-// approvedTaxRatePercent — the tax treatment frozen at approval (see the
+// Also adds ChangeOrder.termsTaxExempt / termsTaxRateName /
+// termsTaxRatePercent — the customer terms frozen at guarded send (see the
 // column comments in schema.prisma and lib/co-tax.ts's effectiveCoTaxInfo).
 //
 // Idempotent: ADD COLUMN IF NOT EXISTS. Additive only — no deletes, no drops,
@@ -43,9 +43,9 @@ const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE
 
 const statements = [
     `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "revision" INTEGER NOT NULL DEFAULT 0`,
-    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxExempt" BOOLEAN`,
-    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxRateName" TEXT`,
-    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "approvedTaxRatePercent" DECIMAL`,
+    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxExempt" BOOLEAN`,
+    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxRateName" TEXT`,
+    `ALTER TABLE "ChangeOrder" ADD COLUMN IF NOT EXISTS "termsTaxRatePercent" DECIMAL`,
 ];
 
 try {
@@ -53,7 +53,7 @@ try {
         await prisma.$executeRawUnsafe(sql);
         console.log("OK:", sql.split("\n")[0].slice(0, 80));
     }
-    console.log("\nChangeOrder.revision / approvedTax* schema applied successfully.");
+    console.log("\nChangeOrder.revision / termsTax* schema applied successfully.");
     console.log(
         "\nNote: this did not touch _prisma_migrations. Once this environment's DIRECT_URL is\n" +
         "reachable (e.g. running from CI), reconcile prod's migration history for real with:\n" +

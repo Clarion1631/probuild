@@ -4,7 +4,7 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
-import { coTaxRate, coTaxLabel, billableCoItems, effectiveCoTaxInfo } from './co-tax';
+import { allocateCoScheduleGross, coTaxRate, coTaxLabel, billableCoItems, effectiveCoTaxInfo } from './co-tax';
 import { isManualCoApproval } from './co-approval';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 import { isEstimateSectionRow, rm } from './estimate-item-payload';
@@ -1393,6 +1393,7 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
     const coTax = Math.round(coSubtotal * coTaxRate(coTaxInfo) * 100) / 100;
     const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
+    const customerSchedules = allocateCoScheduleGross(coSubtotal, co.paymentSchedules, coTaxInfo);
 
     const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
         page.drawText(label, { x: coLabelX, y, size, font, color });
@@ -1416,9 +1417,9 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         checkNewPage(60 + co.paymentSchedules.length * 18);
         page.drawText('PAYMENT SCHEDULE', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 18;
-        for (const schedule of co.paymentSchedules) {
+        for (const schedule of customerSchedules) {
             page.drawText(`${schedule.name}${schedule.dueDate ? ` · ${new Date(schedule.dueDate).toLocaleDateString('en-US')}` : ''}`, { x: margin, y, size: 9, font: helvetica, color: colors.textMain });
-            const value = formatCurrency(Number(schedule.amount));
+            const value = formatCurrency(schedule.grossCents / 100);
             page.drawText(value, { x: pageWidth - margin - helveticaBold.widthOfTextAtSize(value, 9), y, size: 9, font: helveticaBold, color: colors.textMain });
             y -= 18;
         }

@@ -19,6 +19,8 @@ type ChangeOrderApprovalInput = {
     signatureName: string;
     signatureDataUrl: string;
     approvedAt: Date;
+    expectedRevision: number;
+    expectedTaxFingerprint: string;
 };
 
 function safeIdentifier(value: unknown): string | undefined {
@@ -96,6 +98,8 @@ export async function approveChangeOrderWithSignature(
             signatureName: input.signatureName,
             clientSignatureUrl: owned.url,
             approvedAt: input.approvedAt,
+            expectedRevision: input.expectedRevision,
+            expectedTaxFingerprint: input.expectedTaxFingerprint,
         });
         if (!approval) {
             await discard();

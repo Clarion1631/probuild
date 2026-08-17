@@ -83,6 +83,13 @@ class FakeChangeOrderRevisionConflictError extends Error {
     }
 }
 
+class FakeChangeOrderTaxTermsConflictError extends Error {
+    constructor() {
+        super("Change order CO-001 tax terms changed after this page loaded — reload and try again.");
+        this.name = "ChangeOrderTaxTermsConflictError";
+    }
+}
+
 function throwConfiguredCoreOutcome(operation: "update" | "manualApprove"): never {
     coreCalls[operation] += 1;
     if (coreOutcome === "conflict") throw new FakeChangeOrderRevisionConflictError();
@@ -118,12 +125,13 @@ const fakePermissions = {
 };
 const fakeChangeOrderCore = {
     ChangeOrderRevisionConflictError: FakeChangeOrderRevisionConflictError,
+    ChangeOrderTaxTermsConflictError: FakeChangeOrderTaxTermsConflictError,
     deleteChangeOrderCore: async () => { throw new Error("deleteChangeOrderCore should not be called by this test"); },
     updateChangeOrderCore: async () => throwConfiguredCoreOutcome("update"),
     manuallyApproveChangeOrderCore: async () => throwConfiguredCoreOutcome("manualApprove"),
 };
 
-let manuallyApproveChangeOrder: (id: string, expectedRevision: number) => Promise<unknown>;
+let manuallyApproveChangeOrder: (id: string, expectedRevision: number, expectedTaxFingerprint: string) => Promise<unknown>;
 let updateChangeOrder: (id: string, data: Record<string, unknown>) => Promise<unknown>;
 
 before(async () => {
@@ -156,7 +164,7 @@ test("manuallyApproveChangeOrder throws Forbidden and never reaches the core whe
     coreOutcome = "unexpected";
     coreCalls.manualApprove = 0;
     await assert.rejects(
-        () => manuallyApproveChangeOrder("co-1", 0),
+        () => manuallyApproveChangeOrder("co-1", 0, "[]"),
         /Forbidden/,
     );
     assert.equal(coreCalls.manualApprove, 0, "manuallyApproveChangeOrderCore must not be invoked before the project-scope check passes");
@@ -179,7 +187,7 @@ test("manuallyApproveChangeOrder returns only the explicit conflict code for a t
     coreOutcome = "conflict";
     coreCalls.manualApprove = 0;
 
-    const result = await manuallyApproveChangeOrder("co-1", 0);
+    const result = await manuallyApproveChangeOrder("co-1", 0, "[]");
 
     assert.deepEqual(result, { success: false, code: "REVISION_CONFLICT" });
     assert.equal(coreCalls.manualApprove, 1);
@@ -201,7 +209,7 @@ test("manuallyApproveChangeOrder preserves thrown validation and unexpected core
     coreOutcome = "generic";
 
     await assert.rejects(
-        () => manuallyApproveChangeOrder("co-1", 0),
+        () => manuallyApproveChangeOrder("co-1", 0, "[]"),
         /manualApprove validation failed/,
     );
 });
@@ -212,7 +220,7 @@ test("manuallyApproveChangeOrder keeps invalid revision input on the thrown vali
     coreCalls.manualApprove = 0;
 
     await assert.rejects(
-        () => manuallyApproveChangeOrder("co-1", -1),
+        () => manuallyApproveChangeOrder("co-1", -1, "[]"),
         /modified after this page loaded/,
     );
     assert.equal(coreCalls.manualApprove, 0);
