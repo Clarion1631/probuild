@@ -156,7 +156,7 @@ test("checkRateLimit IS consulted, exactly once, once notes passes validation", 
 // ── createRateLimiter ──────────────────────────────────────────────────
 
 test("createRateLimiter allows up to the cap, then denies further requests within the window", () => {
-    let now = 0;
+    const now = 0;
     const checkRateLimit = createRateLimiter(() => now);
     for (let i = 0; i < 20; i += 1) {
         assert.equal(checkRateLimit("u1"), true, `request ${i + 1} should be allowed`);
@@ -165,7 +165,7 @@ test("createRateLimiter allows up to the cap, then denies further requests withi
 });
 
 test("createRateLimiter tracks each userId independently", () => {
-    let now = 0;
+    const now = 0;
     const checkRateLimit = createRateLimiter(() => now);
     for (let i = 0; i < 20; i += 1) checkRateLimit("u1");
     assert.equal(checkRateLimit("u1"), false);
