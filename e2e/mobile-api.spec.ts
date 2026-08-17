@@ -132,7 +132,8 @@ test.describe.serial("Mobile API contract", () => {
     });
 
     test("POST then PUT — duration/laborCost/burdenCost math", async () => {
-        const start = new Date();
+        const end = new Date();
+        const start = new Date(end.getTime() - 2 * 60 * 60 * 1000);
         const postRes = await api.post("/api/time-entries", {
             data: { projectId: PROJECT_ID, estimateItemId: MOBILE_ITEM_DEMO_ID, startTime: start.toISOString() },
             headers: { authorization: `Bearer ${fieldCrewToken}` },
@@ -141,7 +142,6 @@ test.describe.serial("Mobile API contract", () => {
         const created = await postRes.json();
         createdEntryIds.add(created.id);
 
-        const end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
         const putRes = await api.put("/api/time-entries", {
             data: { id: created.id, endTime: end.toISOString() },
             headers: { authorization: `Bearer ${fieldCrewToken}` },
