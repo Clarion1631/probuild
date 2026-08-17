@@ -17,6 +17,7 @@ import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
+import { parsePaymentDateInput } from "./payment-date";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
@@ -45,6 +46,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import { resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -131,6 +133,13 @@ import {
 import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
+
+// Server runs in UTC; "Viewed at" timestamps in notification emails must render
+// in the company's timezone, not the server's.
+async function formatViewedAt(): Promise<string> {
+    const timeZone = await resolveCompanyTimeZone();
+    return new Date().toLocaleString("en-US", { timeZone });
+}
 
 function isNotificationEnabled(settings: { notificationToggles?: string | null } | null, key: NotificationToggleKey): boolean {
     if (!settings?.notificationToggles) return true;
@@ -2085,7 +2094,7 @@ export async function markEstimateViewed(estimateId: string) {
                     <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #0369a1;">Estimate Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened estimate <strong>${estimate.title || estimate.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -2260,7 +2269,7 @@ export async function markContractViewed(contractId: string, accessToken?: strin
                     <div style="background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #854d0e;">Contract Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened contract <strong>${contract.title}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -3657,35 +3666,8 @@ export async function getInvoice(id: string) {
     return invoice;
 }
 
-/** Parse a payment-date input into a Date.
- *  Accepts:
- *   - `YYYY-MM-DD` (strict — end-anchored, rejects overflow) → interpreted as LOCAL midnight
- *     so the stored value matches the calendar day the user typed.
- *   - A positive epoch-ms number → treated as an absolute instant.
- *   - An ISO-8601 datetime with a time component → `new Date()` (UTC semantics).
- *  Rejects: empty strings, 0/negative numbers, non-strict YYYY-M-D-ish shapes. */
-function parsePaymentDateInput(input: number | string): Date | null {
-    if (typeof input === "number") {
-        if (!Number.isFinite(input) || input <= 0) return null;
-        const d = new Date(input);
-        return isNaN(d.getTime()) ? null : d;
-    }
-    if (typeof input !== "string" || input.trim() === "") return null;
-    // Strict YYYY-MM-DD → local midnight (primary path from the date picker).
-    const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
-    if (ymd) {
-        const y = Number(ymd[1]);
-        const mo = Number(ymd[2]);
-        const d = Number(ymd[3]);
-        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-        const dt = new Date(y, mo - 1, d);
-        if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
-        return dt;
-    }
-    // Accept full ISO datetimes (e.g. "2026-04-20T14:30:00Z") for API callers that pass them.
-    const dt = new Date(input);
-    return isNaN(dt.getTime()) ? null : dt;
-}
+// parsePaymentDateInput lives in lib/payment-date.ts, next to isDateOnly — the
+// calendar-day sentinel's writer and reader have to agree, so they are unit-tested together.
 
 export async function recordPayment(
     paymentId: string,
@@ -3915,6 +3897,11 @@ export async function recordEstimatePayment(
         });
         if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
 
+        // One settle instant for BOTH sides of the mirrored pair, taken AFTER the parent
+        // locks so a contended settle records when it settled, not when it started
+        // queueing — see the fuller note in payment-record-core.ts.
+        const settledAt = new Date();
+
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3946,7 +3933,7 @@ export async function recordEstimatePayment(
                 const mirrorClaim = await t.paymentSchedule.updateMany({
                     where: { id: copy.id, status: { not: "Paid" } },
                     data: {
-                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        status: "Paid", paymentDate, paidAt: settledAt, paymentMethod: method, referenceNumber, notes,
                         // Keep both sides agreeing on what was actually paid when the
                         // recorded amount overrides the milestone amount.
                         ...(input.amount != null && { amount: input.amount }),
@@ -3972,7 +3959,7 @@ export async function recordEstimatePayment(
             data: {
                 status: "Paid",
                 paymentDate,
-                paidAt: new Date(),
+                paidAt: settledAt,
                 paymentMethod: method,
                 referenceNumber,
                 notes,

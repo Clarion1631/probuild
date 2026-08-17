@@ -91,6 +91,37 @@ for (let start = 1; ; start += 100) {
 }
 console.log(`marked purchases in QBO (created since launch): ${purchases.length}`);
 
+// Dedupe by the FULL Drive fileId, never the bare 21-char docNumber prefix —
+// two different fileIds can share a prefix (qbo-receipt-push.ts:477-481), so
+// a prefix-only dedupe check can suppress reconstructing a genuinely
+// different receipt's backfill row. Typed `driveFileId` column first
+// (post-migration, or already backfilled by backfill-review-evidence.mjs);
+// legacy rows that only carry the full id inside `detail` JSON are checked
+// in JS as a fallback so this stays correct regardless of run order relative
+// to that backfill.
+async function findExistingReceiptPushEvent(fileId, docNumber) {
+  const byTypedColumn = await prisma.automationEvent.findFirst({
+    where: { kind: "receipt-push", driveFileId: fileId, status: { in: ["created", "already-exists"] } },
+    select: { id: true },
+  });
+  if (byTypedColumn) return byTypedColumn;
+
+  const candidates = await prisma.automationEvent.findMany({
+    where: { kind: "receipt-push", docNumber, status: { in: ["created", "already-exists"] }, driveFileId: null },
+    select: { id: true, detail: true },
+  });
+  for (const c of candidates) {
+    if (!c.detail) continue;
+    try {
+      const d = JSON.parse(c.detail);
+      if (d && typeof d.fileId === "string" && d.fileId === fileId) return { id: c.id };
+    } catch {
+      // malformed detail — not a match
+    }
+  }
+  return null;
+}
+
 let inserted = 0, skippedExisting = 0, skippedUnparseable = 0;
 for (const p of purchases) {
   const m = (p.PrivateNote ?? "").match(/\[gtr-file:([^\]]+)\]/);
@@ -100,10 +131,7 @@ for (const p of purchases) {
 
   // Skip only when SUCCESSFUL evidence exists — a lone transient "error"
   // event must not block reconstructing the booking the marker proves.
-  const existing = await prisma.automationEvent.findFirst({
-    where: { kind: "receipt-push", docNumber, status: { in: ["created", "already-exists"] } },
-    select: { id: true },
-  });
+  const existing = await findExistingReceiptPushEvent(fileId, docNumber);
   if (existing) { skippedExisting += 1; continue; }
 
   const lines = Array.isArray(p.Line) ? p.Line : [];
@@ -127,6 +155,9 @@ for (const p of purchases) {
       fileName: null,
       amountCents: Number.isFinite(Number(p.TotalAmt)) ? Math.round(Number(p.TotalAmt) * 100) : null,
       taxCents: taxCents > 0 ? taxCents : null,
+      // Typed columns dual-written alongside `detail`, same as logAutomationEvent.
+      qbPurchaseId: p.Id ?? null,
+      driveFileId: fileId,
       detail: JSON.stringify({ fileId, qbPurchaseId: p.Id, backfilled: true, txnDate: p.TxnDate }),
       createdAt: Number.isFinite(createdAt.getTime()) ? createdAt : new Date(),
     },

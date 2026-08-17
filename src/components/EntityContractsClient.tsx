@@ -9,10 +9,11 @@ import {
     createContractFromPdf,
 } from "@/lib/actions";
 import { toast } from "sonner";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import dynamic from "next/dynamic";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 import DocumentSignModal from "@/components/DocumentSignModal";
+import { COMPANY_TIME_ZONE } from "@/lib/company-day";
 
 const ContractWysiwygEditor = dynamic(
     () => import("@/components/ContractWysiwygEditor").then((m) => m.ContractWysiwygEditor),
@@ -61,6 +62,14 @@ export default function EntityContractsClient({
 }) {
     const router = useRouter();
     const context = { type: entity.type, id: entity.id };
+
+    // Deterministic across server (UTC) and client (browser tz) render: this component
+    // now server-renders (see isomorphic-dompurify migration), so bare toLocaleDateString/
+    // toLocaleString would diverge and cause hydration mismatches. No companySettings prop
+    // is passed here, so use the shared constant directly.
+    const tz = COMPANY_TIME_ZONE;
+    const fmtDate = (d: Date | string) => new Date(d).toLocaleDateString("en-US", { timeZone: tz });
+    const fmtDateTime = (d: Date | string) => new Date(d).toLocaleString("en-US", { timeZone: tz });
 
     // ─── CREATE MENU ───
     const [showCreateMenu, setShowCreateMenu] = useState(false);
@@ -139,7 +148,7 @@ export default function EntityContractsClient({
         const escapeHtml = (s: string) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 
         const dateStr = editingContract.approvedAt
-            ? new Date(editingContract.approvedAt).toLocaleDateString()
+            ? fmtDate(editingContract.approvedAt)
             : "";
 
         // Client Signature Block
@@ -172,7 +181,7 @@ export default function EntityContractsClient({
 
         // Contractor Date Block
         const contractorDateStr = editingContract.contractorSignedAt
-            ? new Date(editingContract.contractorSignedAt).toLocaleDateString()
+            ? fmtDate(editingContract.contractorSignedAt)
             : "";
         const contractorDatePattern = /\{\{CONTRACTOR_DATE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_DATE_BLOCK"[^>]*>[^<]*<\/span>/g;
         html = html.replace(contractorDatePattern, contractorDateStr ? `<strong>${contractorDateStr}</strong>` : "");
@@ -940,10 +949,10 @@ export default function EntityContractsClient({
                                             )}
                                         </div>
                                         <div className="flex items-center flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
-                                            <span>Created {new Date(c.createdAt).toLocaleDateString()}</span>
-                                            {c.sentAt && <span>· Sent {new Date(c.sentAt).toLocaleDateString()}</span>}
+                                            <span>Created {fmtDate(c.createdAt)}</span>
+                                            {c.sentAt && <span>· Sent {fmtDate(c.sentAt)}</span>}
                                             {c.approvedBy && c.approvedAt && (
-                                                <span className="text-green-600 font-medium">· Signed by {c.approvedBy} on {new Date(c.approvedAt).toLocaleDateString()}</span>
+                                                <span className="text-green-600 font-medium">· Signed by {c.approvedBy} on {fmtDate(c.approvedAt)}</span>
                                             )}
                                             {c.contractorSignedBy && (
                                                 <span className="text-violet-600 font-medium flex items-center gap-1">
@@ -951,12 +960,12 @@ export default function EntityContractsClient({
                                                     {c.contractorSignatureUrl && <img src={c.contractorSignatureUrl} alt="sig" className="h-5 object-contain ml-1 opacity-80" />}
                                                 </span>
                                             )}
-                                            {c.nextDueDate && <span className="text-indigo-600">· Next due {new Date(c.nextDueDate).toLocaleDateString()}</span>}
+                                            {c.nextDueDate && <span className="text-indigo-600">· Next due {fmtDate(c.nextDueDate)}</span>}
                                             {c.status === "Signed" && c.requiresCountersign && !c.companySignedBy && (
                                                 <span className="text-amber-600 font-medium">· Awaiting company countersignature</span>
                                             )}
                                             {c.companySignedBy && c.companySignedAt && (
-                                                <span className="text-indigo-600 font-medium">· Countersigned by {c.companySignedBy} on {new Date(c.companySignedAt).toLocaleDateString()}</span>
+                                                <span className="text-indigo-600 font-medium">· Countersigned by {c.companySignedBy} on {fmtDate(c.companySignedAt)}</span>
                                             )}
                                         </div>
                                         {c.signingRecords?.length > 0 && (
@@ -1135,12 +1144,12 @@ export default function EntityContractsClient({
                                                         <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${isInvalidation ? "bg-amber-100 text-amber-700" : "bg-green-100 text-green-700"}`}>{isInvalidation ? "!" : signingHistory.length - idx}</span>
                                                         <span className="font-semibold text-sm text-slate-800">{r.signedBy}</span>
                                                     </div>
-                                                    <p className="text-xs text-slate-500 pl-7">{new Date(r.signedAt).toLocaleString()}</p>
+                                                    <p className="text-xs text-slate-500 pl-7">{fmtDateTime(r.signedAt)}</p>
                                                     {isInvalidation && (
                                                         <p className="text-xs text-amber-700 pl-7 mt-0.5">{r.notes}</p>
                                                     )}
                                                     {r.periodStart && r.periodEnd && (
-                                                        <p className="text-xs text-slate-400 pl-7 mt-0.5">Period: {new Date(r.periodStart).toLocaleDateString()} – {new Date(r.periodEnd).toLocaleDateString()}</p>
+                                                        <p className="text-xs text-slate-400 pl-7 mt-0.5">Period: {fmtDate(r.periodStart)} – {fmtDate(r.periodEnd)}</p>
                                                     )}
                                                 </div>
                                                 {r.signatureUrl && <img src={r.signatureUrl} alt="Signature" className="h-8 object-contain opacity-60" />}

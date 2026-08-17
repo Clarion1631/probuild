@@ -1,8 +1,16 @@
 import { expect, test } from "@playwright/test";
+import { PrismaClient } from "@prisma/client";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 import { canWriteDocumentTemplateType, canCreateContractFor, canAccessJobScope, canAccessContract, contractScopeWhere } from "../src/lib/access-rules";
+import {
+  assertBuildIsNotStalerThanSource,
+  behaviouralAuthCasesCanRun,
+  invokeServerAction,
+  productionServerActionManifestExists,
+  resolveServerActionId,
+} from "./helpers/anonymous-server-action";
 
 function exportSource(source: string, name: string): string {
   const marker = new RegExp(`export\\s+(?:async function|const)\\s+${name}\\b`);
@@ -1077,4 +1085,334 @@ test("company settings split public branding from status-aware staff configurati
   expectGuardBeforeDatabase(source, "getCompanySettings", "await assertActiveStaff(");
   expect(source.match(/getCompanySettings\(\)/g)).toHaveLength(1);
   expect(source).toContain("const settings = await getCachedCompanySettings()");
+});
+
+// ===========================================================================
+// BEHAVIOURAL COVERAGE
+// ===========================================================================
+// Everything above proves guards are WRITTEN. The Codex gpt-5.6-sol review of
+// PR #360 named the ceiling exactly: no assertion in this file ever executed a
+// Server Action anonymously to prove no row is created. Invert a condition
+// inside a helper and every string match above still passes.
+//
+// The cases below call the real actions over HTTP as a remote caller would and
+// assert the only thing that cannot be faked: the table is unchanged.
+//
+// The source assertions above are deliberately KEPT rather than replaced —
+// they are cheap, they run everywhere, and they catch outright deletion of a
+// guard even where the behavioural run is skipped.
+
+// This must live OUTSIDE the skipped describe below. Otherwise a CI run whose
+// production build went missing would skip the whole group and report green —
+// the failure mode where a security suite quietly stops being a security suite.
+test("the behavioural auth cases are actually running in CI", () => {
+  if (!process.env.CI) return;
+  expect(
+    productionServerActionManifestExists(),
+    "CI serves `npm run start`, so .next/server/server-reference-manifest.json must exist; "
+    + "without it every behavioural case below silently skips",
+  ).toBe(true);
+});
+
+test.describe.serial("gated server actions reject an unauthenticated caller for real", () => {
+  // `npm run dev` bypasses src/proxy.ts wholesale and compiles actions lazily,
+  // so a dev run would both prove the wrong thing and risk an id that does not
+  // match the running server.
+  //
+  // Gate on CI *and* the manifest, not the manifest alone. Several assertions
+  // below compare row COUNTS, and playwright.config.ts pins
+  // `workers: process.env.CI ? 1 : undefined` off the same variable — so
+  // requiring CI is what actually makes "these tests run alone" true. Keying
+  // only on the manifest would let a local `npm run build` re-enable the group
+  // under the default (parallel) worker count, where another spec creating or
+  // deleting a project moves the baseline underneath them.
+  test.skip(
+    !behaviouralAuthCasesCanRun(),
+    "needs a production build and CI=1 — run `npm run build`, then `CI=1 npx playwright test`",
+  );
+
+  // ...and refuse a build older than the source it claims to cover, which is
+  // the one way the local flow above can report green over a guard that was
+  // edited but not rebuilt. Guarded by the same predicate: this runs at
+  // COLLECTION time, so an unguarded throw would break the whole file for
+  // anyone running the (skipped) suite locally with a stale build lying around.
+  if (behaviouralAuthCasesCanRun()) assertBuildIsNotStalerThanSource();
+
+  const prisma = new PrismaClient();
+
+  // Seeded by data.setup.ts.
+  const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
+  const TEST_CLIENT_ID = "test-client-do-not-delete";
+
+  // Owned by this spec — prefixed so teardown can be exact.
+  const TEMPLATE_ID = "e2e-anon-contract-template";
+  const DENIED_LEAD_ID = "e2e-anon-denied-lead";
+  const CONTROL_LEAD_ID = "e2e-anon-control-lead";
+
+  // EXACT titles, not a `contains` prefix. A substring match would delete rows
+  // belonging to another run or another spec that happened to share the
+  // prefix; an exact allowlist deletes only what this file creates.
+  const BLANK_CONTROL_TITLE = "E2E Anonymous-Auth Blank Control";
+  const TEMPLATE_CONTROL_TITLE = "E2E Anonymous-Auth Template Control";
+  const DENIED_TEMPLATE_TITLE = "E2E Anonymous-Auth Template Should Not Exist";
+  const DENIED_BLANK_TITLE = "E2E Anonymous-Auth Blank Should Not Exist";
+  const OWNED_CONTRACT_TITLES = [
+    BLANK_CONTROL_TITLE, TEMPLATE_CONTROL_TITLE, DENIED_TEMPLATE_TITLE, DENIED_BLANK_TITLE,
+  ];
+
+  // Run identically before AND after. Teardown alone is not enough: a run
+  // killed mid-flight (Ctrl-C, a CI timeout) leaves a control contract behind,
+  // and the next run's `toBe(1)` would then find two rows and fail for a
+  // reason that has nothing to do with authorization.
+  async function removeOwnedContracts() {
+    await prisma.contract.deleteMany({ where: { title: { in: OWNED_CONTRACT_TITLES } } });
+  }
+
+  test.beforeAll(async () => {
+    await removeOwnedContracts();
+
+    await prisma.documentTemplate.upsert({
+      where: { id: TEMPLATE_ID },
+      update: { type: "contract" },
+      create: {
+        id: TEMPLATE_ID,
+        name: "E2E Anonymous-Auth Contract Template",
+        type: "contract",
+        body: "<p>Agreement body for the anonymous-auth harness.</p>",
+      },
+    });
+
+    // Two leads, because the positive control CONSUMES the lead it converts.
+    // Sharing one would let the control's conversion mask a real hole in the
+    // anonymous case (the lead would already be converted either way).
+    for (const id of [DENIED_LEAD_ID, CONTROL_LEAD_ID]) {
+      // DELETE the prior run's converted project before touching the lead, and
+      // in this order for two independent reasons:
+      //
+      //  - Project.leadId is `String? @unique` with onDelete: Restrict, so the
+      //    lead cannot be removed or re-pointed while a project references it.
+      //  - Prisma's `project: { disconnect: true }` would only NULL the link,
+      //    leaving an orphaned project that no longer matches `leadId` and so
+      //    escapes teardown entirely — junk accumulating every run.
+      //
+      // On a reused database a prior run may have left this lead converted;
+      // adopting that state would make "no project was created" vacuously true.
+      await prisma.project.deleteMany({ where: { leadId: id } });
+      await prisma.lead.upsert({
+        where: { id },
+        // Restate what the fixture is DEFINED by rather than using an empty
+        // `update`, which would adopt whatever drift is already there.
+        update: { clientId: TEST_CLIENT_ID, stage: "Won" },
+        create: {
+          id,
+          name: `E2E Anonymous-Auth Lead (${id})`,
+          clientId: TEST_CLIENT_ID,
+          stage: "Won",
+        },
+      });
+    }
+  });
+
+  test.afterAll(async () => {
+    try {
+      await removeOwnedContracts();
+      await prisma.project.deleteMany({ where: { leadId: { in: [DENIED_LEAD_ID, CONTROL_LEAD_ID] } } });
+      await prisma.lead.deleteMany({ where: { id: { in: [DENIED_LEAD_ID, CONTROL_LEAD_ID] } } });
+      await prisma.documentTemplate.deleteMany({ where: { id: TEMPLATE_ID } });
+    } finally {
+      await prisma.$disconnect();
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // POSITIVE CONTROL
+  // -----------------------------------------------------------------------
+  // Without this, every "no row was written" below could be true because the
+  // request never dispatched an action at all — a wrong id, a rejected body
+  // encoding, or Next's Origin/Host CSRF check would all produce a silent pass.
+  // This proves the transport really does reach the action and write a row.
+  // One control PER ACTION. Sharing a single control across both contract
+  // actions would leave a real gap: the denial case for
+  // createContractFromTemplate accepts "dispatched, threw, wrote nothing" as
+  // proof of the guard, and an unrelated fault — a missing template, a merge-
+  // field error, a broken create — produces exactly that same signature. The
+  // unknown-id case only rules out a 404. So a REMOVED guard could be masked
+  // by an independently broken template action unless that action is proven
+  // to work when authorized.
+  for (const [label, actionName, args, title] of [
+    [
+      "createContractBlank",
+      "createContractBlank",
+      [{ type: "project", id: PROJECT_ID }, BLANK_CONTROL_TITLE, "<p>control</p>"],
+      BLANK_CONTROL_TITLE,
+    ],
+    [
+      "createContractFromTemplate",
+      "createContractFromTemplate",
+      [TEMPLATE_ID, { type: "project", id: PROJECT_ID }, TEMPLATE_CONTROL_TITLE],
+      TEMPLATE_CONTROL_TITLE,
+    ],
+  ] as const) {
+    test(`positive control: ${label} DOES create a contract with a real admin session`, async ({ request }) => {
+      const before = await prisma.contract.count({ where: { projectId: PROJECT_ID } });
+
+      const result = await invokeServerAction(request, {
+        actionId: resolveServerActionId(actionName),
+        args: [...args],
+      });
+
+      expect(result.status, `positive control was rejected: ${result.body.slice(0, 400)}`).toBeLessThan(400);
+      expect(
+        await prisma.contract.count({ where: { projectId: PROJECT_ID, title } }),
+        `${label} must be able to create a contract when authorized, or its denial case proves nothing`,
+      ).toBe(1);
+      expect(await prisma.contract.count({ where: { projectId: PROJECT_ID } })).toBe(before + 1);
+    });
+  }
+
+  // An unknown action id is refused with a DISTINCT, recognisable response.
+  // The denial assertions below lean on that: "rejected, and not a 404" is what
+  // separates "the guard threw" from "the request never dispatched an action at
+  // all". Pin it here so that distinction cannot rot silently.
+  test("an unknown action id is refused distinguishably, so the denials below mean something", async ({ playwright }) => {
+    const anonymous = await playwright.request.newContext({ storageState: undefined });
+    try {
+      const result = await invokeServerAction(anonymous, {
+        actionId: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
+        args: [],
+      });
+      expect(result.status).toBe(404);
+      expect(result.body).toContain("Server action not found");
+    } finally {
+      await anonymous.dispose();
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // DENIALS
+  // -----------------------------------------------------------------------
+  // The two variants are refused at DIFFERENT layers, so each asserts its own
+  // shape rather than sharing a vague ">= 400".
+  const DENIAL_VARIANTS = [
+    {
+      label: "anonymous",
+      forgedCookie: false,
+      // No cookie REACHES the action, because src/proxy.ts only interrogates
+      // cookie-bearing requests. Next renders a thrown Server Action as a 500
+      // carrying a React Flight error frame (`1:E{"digest":...}`), so this is
+      // the in-action guard — assertContractContextAccess / assertActiveStaff —
+      // observably firing, not an edge redirect.
+      assertRejected: (result: { status: number; body: string }) => {
+        expect(result.status, "the action should have run and thrown").toBe(500);
+        expect(result.body, "expected a Flight error frame from the thrown guard")
+          .toMatch(/\d+:E\{"digest"/);
+        expect(result.body, "the request never reached the action").not.toContain("Server action not found");
+      },
+    },
+    {
+      label: "forged session cookie",
+      forgedCookie: true,
+      // Defeats the development auth fallback (PR #347). Against the production
+      // server it is stopped EARLIER, by the proxy's stale-cookie check, so it
+      // never reaches the action — a different layer, asserted separately
+      // rather than assumed equivalent.
+      assertRejected: (result: { status: number; body: string }) => {
+        expect(result.status, "the proxy should refuse a stale/forged cookie").toBe(403);
+      },
+    },
+  ];
+
+  for (const { label, forgedCookie, assertRejected } of DENIAL_VARIANTS) {
+    test(`createContractFromTemplate writes nothing for a ${label} caller`, async ({ playwright }) => {
+      const anonymous = await playwright.request.newContext({ storageState: undefined });
+      try {
+        const before = await prisma.contract.count({ where: { projectId: PROJECT_ID } });
+
+        const result = await invokeServerAction(anonymous, {
+          actionId: resolveServerActionId("createContractFromTemplate"),
+          args: [TEMPLATE_ID, { type: "project", id: PROJECT_ID }, DENIED_TEMPLATE_TITLE],
+          forgedCookie,
+        });
+
+        assertRejected(result);
+        expect(await prisma.contract.count({ where: { projectId: PROJECT_ID } })).toBe(before);
+        expect(
+          await prisma.contract.count({ where: { title: DENIED_TEMPLATE_TITLE } }),
+          "an unauthenticated caller created a contract",
+        ).toBe(0);
+      } finally {
+        await anonymous.dispose();
+      }
+    });
+
+    test(`createContractBlank writes nothing for a ${label} caller`, async ({ playwright }) => {
+      const anonymous = await playwright.request.newContext({ storageState: undefined });
+      try {
+        const before = await prisma.contract.count({ where: { projectId: PROJECT_ID } });
+
+        const result = await invokeServerAction(anonymous, {
+          actionId: resolveServerActionId("createContractBlank"),
+          args: [
+            { type: "project", id: PROJECT_ID },
+            DENIED_BLANK_TITLE,
+            "<p>nope</p>",
+          ],
+          forgedCookie,
+        });
+
+        assertRejected(result);
+        expect(await prisma.contract.count({ where: { projectId: PROJECT_ID } })).toBe(before);
+        expect(
+          await prisma.contract.count({ where: { title: DENIED_BLANK_TITLE } }),
+          "an unauthenticated caller created a contract",
+        ).toBe(0);
+      } finally {
+        await anonymous.dispose();
+      }
+    });
+
+    test(`convertLeadToProject writes nothing for a ${label} caller`, async ({ playwright }) => {
+      const anonymous = await playwright.request.newContext({ storageState: undefined });
+      try {
+        const projectsBefore = await prisma.project.count();
+
+        const result = await invokeServerAction(anonymous, {
+          actionId: resolveServerActionId("convertLeadToProject"),
+          args: [DENIED_LEAD_ID],
+          forgedCookie,
+        });
+
+        assertRejected(result);
+        // The conversion's whole effect is a new Project carrying the lead, so
+        // assert on the lead's own linkage as well as the global count — a
+        // conversion that reused an existing row would slip past a bare count.
+        expect(
+          await prisma.project.count({ where: { leadId: DENIED_LEAD_ID } }),
+          "an unauthenticated caller converted a lead into a project",
+        ).toBe(0);
+        expect(await prisma.project.count()).toBe(projectsBefore);
+      } finally {
+        await anonymous.dispose();
+      }
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // POSITIVE CONTROL for the conversion path
+  // -----------------------------------------------------------------------
+  // Runs last (describe.serial) so the denial cases above see an unconverted
+  // fixture. Proves the convertLeadToProject id is live, so its denials are
+  // refusals rather than a request that quietly hit nothing.
+  test("positive control: convertLeadToProject DOES convert with a real admin session", async ({ request }) => {
+    const result = await invokeServerAction(request, {
+      actionId: resolveServerActionId("convertLeadToProject"),
+      args: [CONTROL_LEAD_ID],
+    });
+
+    expect(result.status, `positive control was rejected: ${result.body.slice(0, 400)}`).toBeLessThan(400);
+    expect(
+      await prisma.project.count({ where: { leadId: CONTROL_LEAD_ID } }),
+      "the harness must be able to convert a lead when authorized, or the denial cases prove nothing",
+    ).toBe(1);
+  });
 });

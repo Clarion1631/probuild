@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { approveEstimate, markEstimateViewed, generatePdfUploadToken } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";

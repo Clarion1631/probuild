@@ -797,13 +797,17 @@ test("fixed and cost-plus CO billing select the newest estimate invoice only aft
     const createEnd = source.indexOf("export function invoiceCompensationSnapshotMatches(", createStart);
     const createBody = source.slice(createStart, createEnd);
     const createTx = createBody.indexOf("prisma.$transaction(async (tx)");
-    const projectLock = createBody.indexOf('FROM "Project"', createTx);
-    const estimateLock = createBody.indexOf('FROM "Estimate"', projectLock);
-    const invoiceCreate = createBody.indexOf("tx.invoice.create", estimateLock);
+    // Estimate FIRST (lockMoneyParents' canonical order), then Project —
+    // restoreEstimateItemAssociations holds Estimate before Project, so the
+    // reverse order here would deadlock against it (see the comment in
+    // createInvoiceFromEstimateCore, ported from main's Codex round 2).
+    const estimateLock = createBody.indexOf("lockMoneyParents(tx, { estimateId })", createTx);
+    const projectLock = createBody.indexOf('FROM "Project"', estimateLock);
+    const invoiceCreate = createBody.indexOf("tx.invoice.create", projectLock);
     const milestoneCreate = createBody.indexOf("tx.paymentSchedule.create", invoiceCreate);
-    assert.ok(createTx >= 0 && projectLock > createTx && estimateLock > projectLock
-        && invoiceCreate > estimateLock && milestoneCreate > invoiceCreate,
-    "invoice and cloned milestones must be created while Project→Estimate locks are held");
+    assert.ok(createTx >= 0 && estimateLock > createTx && projectLock > estimateLock
+        && invoiceCreate > projectLock && milestoneCreate > invoiceCreate,
+    "invoice and cloned milestones must be created while Estimate→Project locks are held");
     assert.doesNotMatch(createBody, /prisma\.invoice\.(?:create|update)/,
         "invoice creation must not escape the shared parent transaction");
 
@@ -1153,7 +1157,7 @@ test("whole-invoice delivery freezes a durable payload and stable provider key a
     assert.match(schema, /model InvoiceEmailAttempt/);
     assert.match(schema, /payload\s+Json/);
     assert.match(schema, /providerStartedAt\s+DateTime\?/);
-    const migration = readFileSync("prisma/migrations/20260816000000_add_change_order_automation_jobs/migration.sql", "utf8");
+    const migration = readFileSync("prisma/migrations/20260817000001_add_change_order_automation_jobs/migration.sql", "utf8");
     assert.match(migration, /REVOKE ALL PRIVILEGES ON TABLE "InvoiceEmailAttempt" FROM PUBLIC/);
 });
 

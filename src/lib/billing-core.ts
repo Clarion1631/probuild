@@ -650,14 +650,35 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
     if (!estimateHint.projectId) throw new Error("Project not found");
     const projectId = estimateHint.projectId;
 
-    // Project -> Estimate is the shared creation/target-selection mutex. Keep
-    // both locks through the Invoice insert, every cloned milestone, and the
-    // final balance/status write. A CO biller that acquires the Estimate lock
-    // and re-selects its target therefore sees either all of this invoice or
-    // none of it—never the older project invoice during a half-created B.
+    // The whole creation — Invoice insert, every cloned milestone, and the
+    // final code/balance/status write — runs in ONE transaction, so the
+    // INV-TEMP placeholder is never visible outside it and a failure rolls
+    // the invoice back entirely (no orphan for the guarded wrapper to
+    // misread). A CO biller that acquires the Estimate lock and re-selects
+    // its target therefore sees either all of this invoice or none of it —
+    // never the older project invoice during a half-created B.
+    //
+    // Lock order is Estimate FIRST (lockMoneyParents' canonical order), then
+    // Project — NOT the reverse: restoreEstimateItemAssociations in
+    // actions.ts holds one transaction spanning PurchaseOrder -> Estimate ->
+    // EstimateItem -> Project, so taking Project first here would let that
+    // flow hold Estimate while waiting on Project and this one hold Project
+    // while waiting on Estimate (Codex round 2 of the conversion hardening).
+    // The clone below copies each milestone's status AND its
+    // stripePaymentIntentId, so the Estimate lock also orders conversion
+    // against a `charge.refunded` unwind (see lib/refund-group.ts):
+    // convert-then-refund or refund-then-convert, never a fresh Paid clone of
+    // an already-released charge. The Project lock is the same row lock
+    // setProjectStartDate takes, so a start-date move can never slip between
+    // the source-dueDate read and the clone inserts.
+    //
+    // The INVOICE row is deliberately not locked: deleteProjects'
+    // `onDelete: Cascade` locks Project and then its Invoice children, so the
+    // implicit row lock from the final update lands after Project, giving
+    // Estimate -> Project -> Invoice, which agrees with it (Codex round 3).
     const created = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId });
         await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
-        await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${estimateId} FOR UPDATE`;
 
         const estimate = await tx.estimate.findUnique({ where: { id: estimateId } });
         if (!estimate) throw new Error("Estimate not found");
@@ -730,7 +751,13 @@ export async function createInvoiceFromEstimateCore(estimateId: string) {
             });
             createdPaymentIds.push(createdPayment.id);
         }
-
+        // The derived balance/status is written INSIDE this transaction, under
+        // the same locks the clone inserts hold. It used to run after the
+        // commit, which let a `charge.refunded` unwind slip in between: the
+        // refund would reset the just-cloned Paid milestone and recompute the
+        // invoice to Issued, and this write would then overwrite it back to
+        // Paid/zero-balance from a paidAmount that was already stale. Rows
+        // Pending, invoice claiming nothing was owed (Codex round 2).
         const newBalanceDue = Math.max(0, total - paidAmount);
         const invoiceStatus = paidAmount > 0
             ? (newBalanceDue <= 0 ? "Paid" : "Partially Paid")

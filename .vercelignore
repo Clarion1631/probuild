@@ -41,3 +41,23 @@ coverage
 
 # Local workspace folder (financial exports, not app source)
 gtr-probuild
+
+# Untracked scratch/reference files (not app source; Assets alone is 109MB and
+# its ndjson/scripts crash Tailwind's source scanner on Vercel)
+Assets
+GoldenTouchRemodelingProjectBook.pdf
+_review-round2.diff
+
+# Gitignored locally but uploaded by CLI (Tailwind scans them on Vercel where
+# no .git exists; the mangled Users* dir name has invalid-codepoint chars)
+.agents
+.superpowers
+playwright-report
+_context
+Users*
+*.ndjson
+
+# Leftover one-off automation scripts in repo root; their raw Windows paths
+# (\cbc3d5c2...) parse as out-of-range CSS escapes and crash Tailwind's scanner
+pb6.mjs
+pb7.mjs

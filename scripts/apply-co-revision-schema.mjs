@@ -34,8 +34,8 @@
 // same precedent PR #382 (the migration-history baseline, commit 43b7fcd8) set —
 // its own commit message says the prod write "is deliberately NOT part of this
 // commit and is performed separately". The committed migration.sql for
-// 20260815000000_add_change_order_revision and
-// 20260816000000_add_change_order_automation_jobs are written IF-NOT-EXISTS, so they do
+// 20260817000000_add_change_order_revision and
+// 20260817000001_add_change_order_automation_jobs are written IF-NOT-EXISTS, so they do
 // not actually need that reconciliation step to be safe: whenever `migrate
 // deploy` next runs for real against prod (from an environment that can reach
 // DIRECT_URL, e.g. a CI runner), it will apply as a harmless no-op and record
@@ -177,8 +177,8 @@ try {
         "  npx prisma migrate deploy\n" +
         "(the migrations are IF-NOT-EXISTS, so this safely self-records them) — or, if that\n" +
         "is not available, a manual:\n" +
-        "  npx prisma migrate resolve --applied 20260815000000_add_change_order_revision\n" +
-        "  npx prisma migrate resolve --applied 20260816000000_add_change_order_automation_jobs\n" +
+        "  npx prisma migrate resolve --applied 20260817000000_add_change_order_revision\n" +
+        "  npx prisma migrate resolve --applied 20260817000001_add_change_order_automation_jobs\n" +
         "See docs/DB-MIGRATE-WORKFLOW.md.",
     );
 } catch (e) {

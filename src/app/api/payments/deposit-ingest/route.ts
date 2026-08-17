@@ -6,6 +6,7 @@ import { revalidatePath } from "next/cache";
 import { findBestProjectNameMatches, normalizeWords } from "@/lib/project-match";
 import { toNum } from "@/lib/prisma-helpers";
 import { recordPaymentCore } from "@/lib/payment-record-core";
+import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
 import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
 
@@ -412,7 +413,14 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
     if (!row.settleStartedAt) {
         await prisma.depositIngest.update({ where: { id: row.id }, data: { settleStartedAt: new Date() } });
     }
-    const paymentDate = parseCheckDateLocalMidnight(payload.checkDate!);
+    // checkDate is already validated as strict YYYY-MM-DD by isValidCheckDate before
+    // we get here, so the canonical parser's calendar-day branch always takes it.
+    const paymentDate = parsePaymentDateInput(payload.checkDate!);
+    if (!paymentDate) {
+        // Unreachable given isValidCheckDate upstream; belt-and-braces so a future
+        // change to that gate can never silently store a wrong day.
+        return await finalizeUnmatched(row, `check date could not be parsed: ${payload.checkDate}`);
+    }
     const result = await recordPaymentCore(schedule.id, schedule.invoiceId, {
         paymentDate, method: "check", referenceNumber: payload.checkNumber, notes: payload.memo,
     });
@@ -529,7 +537,7 @@ async function settleAndFinalize(
     schedule: MatchedSchedule,
     ctx: { checkDate: string; checkNumber: string; qbPaymentId: string },
 ): Promise<NextResponse> {
-    const paidAt = new Date(`${ctx.checkDate}T12:00:00`);
+    const paidAt = new Date(`${ctx.checkDate}T12:00:00Z`);
     const settled = await settleMilestoneFromQBPayment({
         paymentScheduleId: schedule.id,
         invoiceId: schedule.invoiceId,
@@ -668,9 +676,7 @@ function isValidCheckDate(value: string | null): value is string {
     return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
-/** Strict YYYY-MM-DD → LOCAL midnight, matching actions.ts's parsePaymentDateInput
- *  (the value is already validated by isValidCheckDate before this is called). */
-function parseCheckDateLocalMidnight(value: string): Date {
-    const [y, mo, d] = value.split("-").map(Number);
-    return new Date(y, mo - 1, d);
-}
+// A local copy of this parser used to live here, building LOCAL midnight. That made
+// this route a SECOND writer of the calendar-day sentinel, disagreeing with
+// lib/payment-date.ts's isDateOnly under any non-UTC runtime. It now shares the one
+// canonical writer, parsePaymentDateInput, so there is genuinely only one.
