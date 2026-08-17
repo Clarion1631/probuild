@@ -1,0 +1,151 @@
+name: Claude PR Gate (Codex review + Gauntlet visual verify + deploy)
+# Triggered on PRs opened by the auto-fix loop (label: claude-fix).
+# Gate 1: Codex (gpt-5.6-sol, xhigh) adversarial code review — must APPROVE.
+# Gate 2: Gauntlet visual verification against the Vercel preview deployment.
+# Then: auto-merge -> Vercel production deploy -> post-deploy visual re-verify.
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  codex-review:
+    if: contains(github.event.pull_request.labels.*.name, 'claude-fix')
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.review.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Codex adversarial review
+        id: review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          codex exec \
+            --model gpt-5.6-sol \
+            -c model_reasoning_effort="xhigh" \
+            --sandbox read-only \
+            "You are a harsh, skeptical code reviewer. Review the diff in /tmp/pr.diff
+             against the PR intent below. Look for bugs, security issues, missed edge
+             cases, and incomplete fixes. End your output with exactly one line:
+             VERDICT: APPROVE  or  VERDICT: REQUEST_CHANGES followed by a numbered
+             list of required changes.
+
+             PR title: ${{ github.event.pull_request.title }}
+             PR body: $(gh pr view ${{ github.event.pull_request.number }} --json body -q .body)" \
+            | tee /tmp/review.txt
+          VERDICT=$(grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' /tmp/review.txt | tail -1)
+          echo "verdict=${VERDICT#VERDICT: }" >> "$GITHUB_OUTPUT"
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/review.txt
+        # Comment always posts; the gate is enforced below.
+
+      - name: Fail gate if changes requested
+        if: steps.review.outputs.verdict != 'APPROVE'
+        run: exit 1
+        # A failed gate triggers the fix-review-feedback job below; its push
+        # re-triggers this workflow, closing the review loop automatically.
+
+  fix-review-feedback:
+    needs: codex-review
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Claude addresses Codex review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Codex reviewed this PR and requested changes (see the newest PR comment
+            containing "VERDICT: REQUEST_CHANGES" — read it with
+            gh pr view ${{ github.event.pull_request.number }} --comments).
+            Address every numbered item, re-run tests, commit and push to this branch.
+            If you believe an item is wrong, explain why in a PR comment instead of
+            changing code, and mark it as disputed.
+          claude_args: |
+            --model claude-opus-5
+            --effort medium
+            --allowedTools "Bash(gh:*),Bash(git:*),Bash(npm:*),Bash(npx:*),Read,Edit,Write,Grep,Glob,Task"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  gauntlet-visual-verify:
+    needs: codex-review
+    if: needs.codex-review.outputs.verdict == 'APPROVE'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for Vercel preview deployment
+        id: preview
+        uses: patrickedqvist/wait-for-vercel-preview@v1.3.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          max_timeout: 600
+
+      - name: Gauntlet visual verification (Claude + Playwright)
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            /gauntlet-verify
+            Preview URL: ${{ steps.preview.outputs.url }}
+            PR number: ${{ github.event.pull_request.number }}
+            The PR body contains the "Visual acceptance criteria" — verify EVERY
+            criterion in a real browser per the gauntlet-verify skill. The fix must
+            be verified 100% or the gate fails.
+          claude_args: |
+            --model claude-opus-5
+            --effort medium
+            --allowedTools "Bash(npx:*),Bash(npm:*),Bash(node:*),Bash(gh:*),Read,Write,Edit,Grep,Glob,Task"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Auth for visual verification WITHOUT automating Google OAuth:
+          # the gauntlet-verify skill mints a Supabase session for the test user.
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+
+  merge-and-deploy:
+    needs: [codex-review, gauntlet-visual-verify]
+    if: needs.codex-review.outputs.verdict == 'APPROVE'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto-merge (production deploy happens via Vercel Git integration)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge ${{ github.event.pull_request.number }} --squash --auto --repo ${{ github.repository }}
+
+      # Optional: apply Supabase migrations on merge to main.
+      # Uncomment and set SUPABASE_ACCESS_TOKEN + SUPABASE_DB_PASSWORD + PROJECT_REF.
+      # - name: Apply Supabase migrations
+      #   run: |
+      #     npx supabase link --project-ref $PROJECT_REF
+      #     npx supabase db push
+
+      - name: Notify (optional Google Chat webhook)
+        if: always()
+        continue-on-error: true
+        env:
+          CHAT_WEBHOOK: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: |
+          [ -z "$CHAT_WEBHOOK" ] && exit 0
+          curl -s -X POST "$CHAT_WEBHOOK" -H 'Content-Type: application/json' \
+            -d "{\"text\": \"✅ Auto-fix PR #${{ github.event.pull_request.number }} passed Codex review + visual gauntlet and is merging: ${{ github.event.pull_request.html_url }}\"}"
