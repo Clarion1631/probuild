@@ -2,6 +2,9 @@ name: Claude Auto-Fix Loop
 # Runs hourly: picks the oldest open issue labeled `auto-fix`,
 # plans with Fable 5 (planner subagent), implements with Opus 5 (medium effort),
 # opens a PR. The PR gate workflow (claude-pr-gate.yml) takes it from there.
+#
+# Auth: Claude Max subscription OAuth token (run `claude setup-token` locally,
+# save as CLAUDE_CODE_OAUTH_TOKEN secret). No API key needed.
 
 on:
   schedule:
@@ -29,7 +32,7 @@ jobs:
       - name: Claude picks and fixes the next issue
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             You are the EXECUTOR in an autonomous fix loop.
 

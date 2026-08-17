@@ -3,6 +3,11 @@ name: Claude PR Gate (Codex review + Gauntlet visual verify + deploy)
 # Gate 1: Codex (gpt-5.6-sol, xhigh) adversarial code review — must APPROVE.
 # Gate 2: Gauntlet visual verification against the Vercel preview deployment.
 # Then: auto-merge -> Vercel production deploy -> post-deploy visual re-verify.
+#
+# Auth: subscriptions only, no API keys.
+# - Claude: CLAUDE_CODE_OAUTH_TOKEN secret (from `claude setup-token`, Max plan)
+# - Codex: CODEX_AUTH_JSON secret (contents of ~/.codex/auth.json after
+#   `codex login` with your ChatGPT Pro account)
 
 on:
   pull_request:
@@ -27,10 +32,17 @@ jobs:
       - name: Install Codex CLI
         run: npm install -g @openai/codex
 
+      - name: Codex auth (ChatGPT Pro subscription — no API key)
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          mkdir -p ~/.codex
+          printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json
+          chmod 600 ~/.codex/auth.json
+
       - name: Codex adversarial review
         id: review
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
@@ -70,7 +82,7 @@ jobs:
       - name: Claude addresses Codex review
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             Codex reviewed this PR and requested changes (see the newest PR comment
             containing "VERDICT: REQUEST_CHANGES" — read it with
@@ -102,7 +114,7 @@ jobs:
       - name: Gauntlet visual verification (Claude + Playwright)
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             /gauntlet-verify
             Preview URL: ${{ steps.preview.outputs.url }}

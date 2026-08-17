@@ -1,7 +1,8 @@
 # Autonomous Fix Loop — Setup Guide
 
 An autonomous pipeline on your GitHub + Vercel + Supabase stack, manageable
-entirely from your phone.
+entirely from your phone. Runs on SUBSCRIPTIONS (Claude Max + ChatGPT Pro) —
+no API keys.
 
 ## The loop
 
@@ -23,18 +24,20 @@ Issue (label: auto-fix)
 1. This kit lives in `.github/workflows/`, `.claude/agents/`, `.claude/skills/`.
 2. Labels `auto-fix` and `claude-fix` must exist (created automatically if this
    was installed by Claude).
-3. Repo secrets (Settings → Secrets and variables → Actions):
-   - `ANTHROPIC_API_KEY` — or install the Claude GitHub App (`/install-github-app`
-     from Claude Code) and use its OAuth token instead.
-   - `OPENAI_API_KEY` — for the Codex reviewer.
-   - `GCHAT_WEBHOOK_URL` — optional, Google Chat space webhook for notifications.
-   - (Optional, for auto-migrations) `SUPABASE_ACCESS_TOKEN`, `SUPABASE_DB_PASSWORD`;
-     uncomment the migration step in `claude-pr-gate.yml`.
-   - For visual verification behind Google login: `SUPABASE_URL`,
-     `SUPABASE_SERVICE_ROLE_KEY`, `TEST_USER_EMAIL` (a seeded test account),
-     and `VERCEL_AUTOMATION_BYPASS_SECRET` if deployment protection is on.
-     CI never touches Google's OAuth UI — it mints the Supabase session
-     directly for the test user (see gauntlet-verify SKILL.md).
+3. Repo secrets (Settings → Secrets and variables → Actions) — subscription
+   auth, no API keys:
+   - `CLAUDE_CODE_OAUTH_TOKEN` — on your PC run `claude setup-token` (use the
+     Max account you want to dedicate to automation) and paste the token.
+   - `CODEX_AUTH_JSON` — on your PC run `codex login` (ChatGPT Pro account),
+     then paste the full contents of `~/.codex/auth.json`
+     (Windows: `C:\\Users\\<you>\\.codex\\auth.json`). Note: tokens rotate;
+     if the review job starts failing auth, re-login locally and re-paste.
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `TEST_USER_EMAIL` — for
+     visual verification behind Google login: CI never touches Google's OAuth
+     UI; it mints the Supabase session directly for a seeded test user (see
+     gauntlet-verify SKILL.md). Copy the Supabase values from Vercel env vars.
+   - Optional: `GCHAT_WEBHOOK_URL` (ship notifications),
+     `VERCEL_AUTOMATION_BYPASS_SECRET` (if deployment protection is on).
 4. Vercel: keep the Git integration on so previews build per-PR and production
    deploys on merge to main. The gate waits for the preview URL automatically.
 5. Branch protection on main: require the `codex-review` and
@@ -47,7 +50,8 @@ Issue (label: auto-fix)
   `auto-fix` label. That's the entire API.
 - To kick it immediately: GitHub app → Actions → Claude Auto-Fix Loop → Run
   workflow.
-- To watch/steer interactively: Claude mobile app → Code tab (cloud sessions).
+- To watch/steer interactively: Claude mobile app → Code tab (cloud sessions,
+  also included in your Max plan).
 - Notifications: GitHub mobile push covers PR/merge events; the Google Chat
   webhook step pings your space on each shipped fix.
 
@@ -60,6 +64,9 @@ Issue (label: auto-fix)
   `claude-pr-gate.yml`.
 - Verification strictness: rounds and criteria rules in
   `.claude/skills/gauntlet-verify/SKILL.md`.
+- Rate limits: the loop consumes your Max plan's usage. With 2× Max accounts,
+  dedicate one account's setup-token to CI and keep the other for your own
+  interactive Claude Code sessions so the loop never starves you.
 
 ## Safety rails baked in
 
