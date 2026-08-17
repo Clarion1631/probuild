@@ -22,6 +22,7 @@ export async function GET(req: Request) {
         geofenceRadiusMeters: true,
         color: true,
         clientId: true,
+        isLogistics: true,
     } as const;
 
     const fullUser = await prisma.user.findUnique({

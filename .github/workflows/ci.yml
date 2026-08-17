@@ -59,6 +59,18 @@ jobs:
       - name: Assert the result matches production's shape
         run: node scripts/check-migrations-match.mjs
 
+      # The gap-file steps that sat here are gone with the file: this branch's
+      # migration closes the recorded gap, so `migrate deploy` now reproduces
+      # production's shape directly and the assertion above is the whole check.
+      #
+      # The focused integration regression deliberately drifts the disposable
+      # database's function and trigger after proving the checker recognizes
+      # the production snapshot. It therefore runs last in this job.
+      - name: Prove the blind-spot checker rejects function and trigger drift
+        run: npx tsx --test tests/migration-history-blind-spots.test.ts
+        env:
+          MIGRATION_HISTORY_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest

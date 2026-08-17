@@ -21,16 +21,17 @@
 //     `expected` below rather than loosening these assertions.
 //
 //  2. BLIND SPOTS. Prisma's diff engine cannot represent partial indexes, check
-//     constraints, or row-level security, and omits them from its output
-//     without comment. Assertion 1 is therefore structurally blind to exactly
-//     the objects most likely to be lost. We compare those directly against
-//     prisma/prisma-blind-spots.json, which was snapshotted from production.
+//     constraints, row-level security, stored functions, or triggers, and omits
+//     them from its output without comment. Assertion 1 is therefore
+//     structurally blind to exactly the objects most likely to be lost. We
+//     compare those directly against prisma/prisma-blind-spots.json, which was
+//     snapshotted from production.
 //
 // What this does NOT prove: object classes absent from both checks. Production
-// currently has no views, no triggers, no stored routines and no RLS policies
-// (verified 2026-08-14, see the snapshot's `policies` array), so the two
-// assertions together do cover it today — but that is a fact about production
-// right now, not a guarantee. Add a class here if one ever appears.
+// currently has no views and no RLS policies (see the snapshot's `policies`
+// array), so the two assertions together do cover it today — but that is a
+// fact about production right now, not a guarantee. Add a class here if one
+// ever appears.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -192,7 +193,7 @@ compareDefs(
   'Prisma has no check-constraint concept; the baseline tail block creates these.'
 )
 
-// FORCE matters, not just ENABLE: these 26 tables have zero policies, so the
+// FORCE matters, not just ENABLE: these 31 tables have zero policies, so the
 // application only reads them because owners bypass RLS. FORCE removes that
 // bypass and would deny the owner too — a silent empty-result failure. Assert
 // the flag, not merely the table name.
@@ -223,6 +224,30 @@ if (actualPolicies.length !== snap.policies.length)
       `Re-snapshot if production changed.`
   )
 
+compareDefs(
+  'function',
+  snap.functions,
+  await q(`SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS name,
+                    pg_get_functiondef(p.oid) AS def
+               FROM pg_proc p
+               JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p')
+              ORDER BY p.proname, pg_get_function_identity_arguments(p.oid)`),
+  'Prisma cannot represent stored functions; the migration must create the exact production definition.'
+)
+
+compareDefs(
+  'trigger',
+  snap.triggers,
+  await q(`SELECT c.relname AS "table", t.tgname AS name, pg_get_triggerdef(t.oid) AS def
+               FROM pg_trigger t
+               JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgconstraint = 0
+              ORDER BY c.relname, t.tgname`),
+  'Prisma cannot represent triggers; the migration must create the exact production definition.'
+)
+
 await db.$disconnect()
 
 if (failed) process.exit(1)
@@ -230,5 +255,6 @@ console.log(
   `✓ migrations reproduce production` +
     `: ${actual.length} diff statement(s) all accounted for; ` +
     `${snap.partialIndexes.length} partial indexes, ${snap.checkConstraints.length} check constraints, ` +
-    `${snap.rlsTables.length} RLS tables all match.`
+    `${snap.rlsTables.length} RLS tables, ${snap.functions.length} functions, and ` +
+    `${snap.triggers.length} triggers all match.`
 )
