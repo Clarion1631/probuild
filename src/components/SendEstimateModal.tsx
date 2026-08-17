@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { sendEstimateToClient, getDocumentTemplates, generatePdfUploadToken } from "@/lib/actions";
 import { toast } from "sonner";
 

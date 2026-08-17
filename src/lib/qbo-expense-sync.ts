@@ -3,6 +3,11 @@ import { getQBPurchaseChangesSince, getQBPurchasesSince } from "./quickbooks";
 import { findBestProjectNameMatches } from "./project-match";
 import { prisma } from "./prisma";
 import { getFreshQBTokens } from "./quickbooks-payments";
+import { after } from "next/server";
+// Shared with the register merge layer (register-merge.ts, Unified Money
+// Register plan §4) so the classification values this module WRITES can
+// never drift from the values that module READS.
+import type { PurchaseClassification } from "./register-merge";
 
 export interface QboPurchaseLineDetail {
     description: string | null;
@@ -672,6 +677,77 @@ export async function deactivateQboExpense(
     });
 }
 
+// ── Purchase classification (Unified Money Register plan §5 step 3) ─────────
+//
+// Persists the NATURE of a Purchase's money — job-costable, overhead, owner
+// draw, or unknown — at the moment the sync has full QBO Purchase detail
+// (customer refs, equity-account lines) in hand. A bank-register GL row never
+// carries that detail, so this is the only point in the whole pipeline where
+// it can be captured; register-merge.ts (plan §4) only ever READS it back by
+// qbPurchaseId.
+
+export interface QboPurchaseClassificationWrite {
+    qbPurchaseId: string;
+    classification: PurchaseClassification;
+    reason: string | null;
+    qbSyncToken: string | null;
+}
+
+export interface QboPurchaseClassificationPersistenceClient {
+    qboPurchaseClassification: {
+        upsert(args: {
+            where: { qbPurchaseId: string };
+            create: { qbPurchaseId: string; classification: string; reason: string | null; qbSyncToken: string | null };
+            update: { classification: string; reason: string | null; qbSyncToken: string | null };
+        }): Promise<unknown>;
+    };
+}
+
+/** Upsert by qbPurchaseId — one classification row per Purchase, last sync wins. */
+export async function upsertQboPurchaseClassification(
+    client: QboPurchaseClassificationPersistenceClient,
+    write: QboPurchaseClassificationWrite,
+): Promise<void> {
+    await client.qboPurchaseClassification.upsert({
+        where: { qbPurchaseId: write.qbPurchaseId },
+        create: {
+            qbPurchaseId: write.qbPurchaseId,
+            classification: write.classification,
+            reason: write.reason,
+            qbSyncToken: write.qbSyncToken,
+        },
+        update: {
+            classification: write.classification,
+            reason: write.reason,
+            qbSyncToken: write.qbSyncToken,
+        },
+    });
+}
+
+/**
+ * Classify a normalized Purchase by the SAME match outcome the import loop
+ * is about to act on — computed once, independent of whether the overhead
+ * triage bucket (`overheadProjectId`) happens to be configured or available
+ * today. A no-customer, non-equity purchase is "overhead" money whether or
+ * not it actually got routed into the triage project this run; a matched
+ * purchase is "job-cost" whether or not the overhead bucket is even in play.
+ */
+function classifyPurchaseOutcome(
+    purchase: Pick<QboPurchaseForImport, "isEquityDraw">,
+    match: ActiveProjectMatch,
+): { classification: PurchaseClassification; reason: string | null } {
+    if (match.kind === "matched") return { classification: "job-cost", reason: null };
+    if (match.reason === "missing-customer") {
+        return purchase.isEquityDraw
+            ? { classification: "owner-draw", reason: "equity-draw" }
+            : { classification: "overhead", reason: "missing-customer" };
+    }
+    // no-active-project / ambiguous-project / no-estimate: has a customer,
+    // but whether it would have job-costed is genuinely undetermined without
+    // guessing — never silently promoted to "overhead" or "job-cost".
+    return { classification: "unknown", reason: match.reason };
+}
+
 export interface QboExpenseSyncDependencies {
     getTokens(): Promise<QBTokens>;
     readPurchases(
@@ -685,6 +761,7 @@ export interface QboExpenseSyncDependencies {
     deactivateExpense(write: QboExpenseRemovalWrite): Promise<QboExpenseRemovalResult>;
     /** Optional: copy the QBO receipt attachment into ProBuild storage for this purchase. */
     attachReceipt?(tokens: QBTokens, qbPurchaseId: string): Promise<void>;
+    upsertPurchaseClassification(write: QboPurchaseClassificationWrite): Promise<void>;
     now(): Date;
 }
 
@@ -763,6 +840,11 @@ function createDefaultSyncDependencies(): QboExpenseSyncDependencies {
             const { attachQboReceipt } = await import("./qbo-receipt-attachments");
             await attachQboReceipt(tokens, qbPurchaseId);
         },
+        upsertPurchaseClassification: write =>
+            upsertQboPurchaseClassification(
+                prisma as unknown as QboPurchaseClassificationPersistenceClient,
+                write,
+            ),
         now: () => new Date(),
     };
 }
@@ -771,7 +853,23 @@ function qboExpenseDescription(
     purchase: QboPurchaseForImport,
     prefix = "[QuickBooks import]",
 ): string {
-    const detail = purchase.memo || purchase.vendor || "Finalized expense";
+    // `memo` (PrivateNote) may already carry OUR OWN [gtr-file:...]
+    // idempotency marker — receipts pushed via the API path write it there
+    // (qbo-receipt-push.ts), and this sync copies memo straight into the
+    // expense description, so the marker rides along. Extract it FIRST and
+    // remove it from the descriptive body, then re-append the complete
+    // marker LAST after truncation, mirroring "truncate the descriptive
+    // prefix, never the marker" in qbo-receipt-push.ts:583-587 — a lost
+    // marker breaks receiptJourneys()'s sync-landing match and this
+    // function's own retry idempotency, which both depend on finding the
+    // FULL marker in the description.
+    const markerMatch = (purchase.memo ?? "").match(/\[gtr-file:[^\]]+\]/);
+    const marker = markerMatch ? markerMatch[0] : "";
+    const memoWithoutMarker = marker
+        ? (purchase.memo ?? "").replace(marker, "").trim()
+        : purchase.memo;
+
+    const detail = memoWithoutMarker || purchase.vendor || "Finalized expense";
     const lineParts = (purchase.lines ?? [])
         .filter(line => line.description)
         .map(line =>
@@ -780,7 +878,10 @@ function qboExpenseDescription(
                 : line.description!,
         );
     const suffix = lineParts.length ? ` | Lines: ${lineParts.join("; ")}` : "";
-    return `${prefix} ${detail}${suffix}`.slice(0, 4000);
+    const body = `${prefix} ${detail}${suffix}`;
+
+    if (!marker) return body.slice(0, 4000);
+    return `${body.slice(0, 4000 - marker.length - 1)} ${marker}`;
 }
 
 function qboTransactionDate(txnDate: string | null): Date | null {
@@ -830,7 +931,49 @@ export async function syncQboExpenses(
         skipped: [...purchaseRead.skipped],
     };
 
+    // Classification writes are additive bookkeeping alongside the existing
+    // sync — a write failure must never abort the Expense import/removal it
+    // rides alongside (same resilience posture as attachReceipt below).
+    const persistClassification = async (write: QboPurchaseClassificationWrite) => {
+        try {
+            await dependencies.upsertPurchaseClassification(write);
+        } catch (error) {
+            console.error(
+                "QBO purchase classification write failed",
+                write.qbPurchaseId,
+                error instanceof Error ? error.name : "UnknownError",
+            );
+        }
+    };
+
+    // Normalization-time skips that never produced a full QboPurchaseForImport
+    // (missing-purchase-id has no real id to key by — skip it; multiple-customers
+    // / mixed-customer-allocation are deactivations, classified in that loop
+    // below to avoid writing the same qbPurchaseId twice).
+    for (const skip of purchaseRead.skipped) {
+        if (skip.qbPurchaseId === "(missing)") continue;
+        if (skip.reason === "multiple-customers" || skip.reason === "mixed-customer-allocation") continue;
+        await persistClassification({
+            qbPurchaseId: skip.qbPurchaseId,
+            classification: "unknown",
+            reason: skip.reason,
+            qbSyncToken: null,
+        });
+    }
+
     for (const removal of [...purchaseRead.removed, ...purchaseRead.deactivations]) {
+        // Removed (deleted/voided/credit-card-refund) or deactivated
+        // (multiple-customers/mixed-customer-allocation) Purchases are no
+        // longer trustworthy job-cost candidates. Their true nature isn't
+        // recoverable from the removal signal alone, so this is "unknown"
+        // with the removal reason recorded — never a guess at overhead vs.
+        // job-cost.
+        await persistClassification({
+            qbPurchaseId: removal.qbPurchaseId,
+            classification: "unknown",
+            reason: removal.reason,
+            qbSyncToken: removal.qbSyncToken,
+        });
         const outcome = await dependencies.deactivateExpense({
             ...removal,
             qbSyncedAt: dependencies.now(),
@@ -869,6 +1012,19 @@ export async function syncQboExpenses(
 
     for (const purchase of purchaseRead.purchases) {
         const match = findActiveProjectForQboPurchase(purchase, projects);
+
+        // Persisted BEFORE anything below acts on the match — the money's
+        // nature (job-cost/overhead/owner-draw/unknown) is written once,
+        // unconditionally, independent of whether the overhead triage bucket
+        // is configured/available or the import itself later fails.
+        const classified = classifyPurchaseOutcome(purchase, match);
+        await persistClassification({
+            qbPurchaseId: purchase.qbPurchaseId,
+            classification: classified.classification,
+            reason: classified.reason,
+            qbSyncToken: purchase.syncToken,
+        });
+
         if (match.kind === "skipped") {
             const isOverheadCandidate =
                 match.reason === "missing-customer" && !purchase.isEquityDraw;
@@ -933,6 +1089,45 @@ export async function syncQboExpenses(
         if (outcome === "imported") result.imported += 1;
         if (outcome === "updated") result.updated += 1;
         await attachReceipt(purchase.qbPurchaseId);
+    }
+
+    // Review-alert evaluation (Unified Money Register plan §5 step 8) is
+    // additive bookkeeping that rides alongside this sync — a failure here
+    // must never fail or block the Expense import/removal above, same
+    // resilience posture as persistClassification/attachReceipt. Ships
+    // disabled (REVIEW_ALERTS_ENABLED unset); the env check happens before
+    // the dynamic import so a disabled deployment never even loads the
+    // register-merge/QBO-register graph this pulls in. Dynamic import
+    // mirrors payment-outbox.ts's `deliver()` — this module is imported by
+    // every sync caller (cron route, manual sync-now, tests), so pulling in
+    // the review-alert machinery unconditionally would widen its footprint
+    // for consumers that never use it.
+    //
+    // Finding 5: this used to be awaited INLINE — a full 90-day QBO register
+    // report fetch plus a per-target evaluation pass, directly extending the
+    // money-sync request/response. Scheduled via `after()` instead (same
+    // established pattern as actions.ts's `autoAssignAfterApprove`) so it
+    // runs AFTER the response is sent and never blocks the sync caller.
+    // `after()` throws synchronously outside a request scope (direct
+    // invocation from a script or a `node:test` file, same as
+    // autoAssignAfterApprove's own comment) — fall back to a caught floating
+    // promise so a disabled/non-request context never fails the sync either.
+    if (process.env.REVIEW_ALERTS_ENABLED === "true") {
+        const runReviewAlerts = () =>
+            import("./review-alert-evaluator")
+                .then(({ evaluateReviewAlertsPostSync }) => evaluateReviewAlertsPostSync())
+                .then(() => undefined)
+                .catch(error => {
+                    console.error(
+                        "review alert post-sync evaluation failed",
+                        error instanceof Error ? error.name : "UnknownError",
+                    );
+                });
+        try {
+            after(runReviewAlerts);
+        } catch {
+            void runReviewAlerts();
+        }
     }
 
     return result;

@@ -54,6 +54,16 @@ const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio
 // accept that tradeoff because they genuinely have anonymous actions, these don't.
 const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
 
+// Test-only action dispatchers that get the proxy bypass below. Explicit, not a
+// prefix match: the proxy checks only the environment gates, never the route's
+// `x-e2e-secret`, so a prefix would silently extend that bypass to any future
+// /api/test-only/* file before anyone reviewed its own gates. Each route here
+// implements the identical four gates internally.
+const TEST_ONLY_DISPATCHER_PATHS = new Set([
+    "/api/test-only/contract-actions",
+    "/api/test-only/portal-estimate-actions",
+]);
+
 export function isPublicProxyBypass(pathname: string) {
     return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
 }
@@ -90,32 +100,40 @@ export default async function proxy(req: any, event: any) {
         }
     }
 
-    // Test-only contract-action dispatcher (src/app/api/test-only/contract-actions).
-    // It exists so an UNAUTHENTICATED request reaches the action and is refused
-    // by assertContractAccess — a proxy redirect to /login would prove nothing
-    // about the action's own gate, which is exactly what
-    // e2e/contract-auth-runtime.spec.ts has to pin.
+    // Test-only action dispatchers (src/app/api/test-only/*/route.ts — currently
+    // contract-actions and portal-estimate-actions). They exist so an
+    // UNAUTHENTICATED (or otherwise-scoped) request reaches the action itself
+    // and is refused by the action's OWN gate — a proxy redirect to /login would
+    // prove nothing about that gate, which is exactly what
+    // e2e/contract-auth-runtime.spec.ts and the portal-estimate-actions runtime
+    // tests in e2e/portal-estimate-access.spec.ts have to pin.
     //
-    // The conditions here MUST stay identical to testOnlyRoutesEnabled() in that
-    // route, and `!isServerAction` is load-bearing on top of them. Codex flagged
-    // the earlier version: it checked only PLAYWRIGHT_TEST_SECRET while the
-    // route also checked VERCEL_ENV, so the two supposedly-matching gates did
-    // not match, and it waved through a request carrying a `next-action` header
-    // that the checks above had deliberately just scrutinised. An anonymous
-    // caller has no session cookie, so the stale-cookie check above does not
-    // cover them. Bypassing the proxy is never allowed to also mean bypassing
-    // the Server Action boundary.
+    // The conditions here MUST stay identical to testOnlyRoutesEnabled() in each
+    // of those routes, and `!isServerAction` is load-bearing on top of them.
+    // Codex flagged the earlier version (contract-actions only): it checked only
+    // PLAYWRIGHT_TEST_SECRET while the route also checked VERCEL_ENV, so the two
+    // supposedly-matching gates did not match, and it waved through a request
+    // carrying a `next-action` header that the checks above had deliberately
+    // just scrutinised. An anonymous caller has no session cookie, so the
+    // stale-cookie check above does not cover them. Bypassing the proxy is
+    // never allowed to also mean bypassing the Server Action boundary.
+    //
+    // An explicit allowlist, NOT a `/api/test-only/` prefix match. The proxy does
+    // not verify `x-e2e-secret` — only the route handlers do — so a prefix match
+    // would pre-authorize any future test-only route the moment someone adds the
+    // file, before it has been reviewed for gates of its own. Adding a route here
+    // is the deliberate step that grants it the bypass.
     if (
         !isServerAction
         && process.env.E2E_TEST_ROUTES === "1"
         && !!process.env.PLAYWRIGHT_TEST_SECRET
         // Affirmative, not merely "not production" — see the same clause in the
-        // route. Every other condition is satisfied by an ABSENT variable, so a
+        // routes. Every other condition is satisfied by an ABSENT variable, so a
         // self-hosted production server (no VERCEL_ENV) passed them all.
         && (process.env.NODE_ENV !== "production" || process.env.CI === "true")
         && process.env.VERCEL_ENV !== "production"
         && typeof pathname === "string"
-        && pathname === "/api/test-only/contract-actions"
+        && TEST_ONLY_DISPATCHER_PATHS.has(pathname)
     ) {
         return NextResponse.next();
     }

@@ -1,7 +1,25 @@
 /**
- * Back-dated payment classification, shared by the server-side notifier
+ * Money-record date semantics, shared by the server-side notifier
  * (payment-notifications.ts) and the client-side RecordPaymentModal. Must stay
  * free of Prisma/server-only imports — it is bundled into client components.
+ *
+ * ## The one invariant this file owns
+ *
+ * `paymentDate` carries DUAL SEMANTICS in a single column: a calendar DAY for
+ * manually entered payments, and a real INSTANT for Stripe/QuickBooks-sourced
+ * ones. The discriminator is a sentinel — a calendar day is stored as exactly
+ * midnight UTC — with `parsePaymentDateInput` as the sole writer and
+ * `isDateOnly` as the sole reader. They must agree or a picked day renders as
+ * the day before to a Pacific viewer.
+ *
+ * The sentinel is anchored to **UTC, not the server's timezone**, so it holds
+ * identically on Vercel (UTC), in local dev (US/Pacific), and in CI. Producing
+ * it with a local-midnight `new Date(y, m, d)` made the discriminator
+ * environment-dependent: correct on Vercel by luck, silently reclassifying every
+ * manual payment as an instant anywhere else.
+ *
+ * Both mirrored sides store this column as `timestamptz(6)`, so copying an
+ * estimate milestone to its invoice twin (and back) is lossless.
  */
 
 /** Receipts stop auto-sending when the payment date is older than this many calendar days. */
@@ -62,10 +80,55 @@ export function isBackdatedPayment(
 const DEFAULT_DAY_OPTS: Intl.DateTimeFormatOptions = { year: "numeric", month: "short", day: "numeric" };
 
 /**
+ * Parse a payment-date input into the value to store. The SOLE writer of the
+ * calendar-day sentinel — `isDateOnly` is its only reader, and the two must agree.
+ *
+ * - `"YYYY-MM-DD"` (the date picker's value) → **midnight UTC** on that day, which
+ *   is what marks it a calendar day. Anchored to UTC rather than the server's zone
+ *   so the classification is identical on Vercel, in dev, and in CI.
+ * - A full ISO datetime **carrying an explicit `Z` or ±HH:MM offset** (API/Stripe/
+ *   QuickBooks callers) → that exact instant, preserved verbatim.
+ *
+ * An offset-LESS datetime like `"2026-08-04T14:30:00"` is REJECTED, not guessed.
+ * ECMAScript parses that form in the host's local zone, so it would store 14:30Z on
+ * Vercel and 21:30Z in Pacific dev — the same environment-dependence this module
+ * exists to eliminate, but silent. Callers must say which zone they mean.
+ *
+ * Returns null for anything unparseable, ambiguous, or out of range, so callers can
+ * reject rather than silently store a wrong day.
+ */
+export function parsePaymentDateInput(input: number | string): Date | null {
+    if (typeof input === "number") {
+        if (!Number.isFinite(input) || input <= 0) return null;
+        const d = new Date(input);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    if (typeof input !== "string" || input.trim() === "") return null;
+    // Strict YYYY-MM-DD → midnight UTC (primary path from the date picker).
+    const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
+    if (ymd) {
+        const y = Number(ymd[1]);
+        const mo = Number(ymd[2]);
+        const d = Number(ymd[3]);
+        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+        const dt = new Date(Date.UTC(y, mo - 1, d));
+        // Rejects overflow like 2026-02-31, which Date.UTC would roll into March.
+        if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+        return dt;
+    }
+    // Accept full ISO datetimes for API callers, but ONLY with an explicit zone —
+    // a trailing Z, or a ±HH:MM / ±HHMM offset. Without one the instant is
+    // host-zone-dependent (see the doc comment), so reject instead of guessing.
+    if (!/^\d{4}-\d{2}-\d{2}[Tt].+([Zz]|[+-]\d{2}:?\d{2})$/.test(input.trim())) return null;
+    const dt = new Date(input);
+    return isNaN(dt.getTime()) ? null : dt;
+}
+
+/**
  * True when the value carries no time-of-day (exactly 00:00:00.000 UTC) — i.e. it is a
- * stored calendar day, not an instant. Manual payments (parsePaymentDateInput → local
- * midnight, UTC on Vercel) land here; Stripe/QuickBooks writes, which store real
- * instants in the same column, do not.
+ * stored calendar day, not an instant. Manual payments (parsePaymentDateInput → midnight
+ * UTC) land here; Stripe/QuickBooks writes, which store real instants in the same
+ * column, do not.
  */
 export function isDateOnly(d: Date): boolean {
     return d.getUTCHours() === 0 && d.getUTCMinutes() === 0

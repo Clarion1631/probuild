@@ -43,7 +43,7 @@ Colors: `text-hui-textMain` (#222), `text-hui-textMuted` (#666), `border-hui-bor
 `createInvoiceFromEstimate` · `getInvoice` · `getProjectInvoices` · `getAllInvoices` · `issueInvoice` · `deleteInvoice` · `updateInvoiceNotes` · `sendInvoiceToClient` · `getInvoiceForPortal` · `markInvoiceViewed` · `recordPayment`
 
 ### Contracts
-`getContracts` · `getContract` · `createContractFromTemplate` · `createContractBlank` · `updateContract` · `deleteContract` · `sendContractToClient` · `approveContract` · `getContractSigningHistory` · `markContractViewed`
+`getContract` · `createContractFromTemplate` · `createContractBlank` · `updateContract` · `deleteContract` · `sendContractToClient` · `approveContract` · `getContractSigningHistory` · `markContractViewed`
 
 ### Schedule
 `getScheduleTasks` · `getAllScheduleTasks` · `createScheduleTask` · `updateScheduleTask` · `deleteScheduleTask` · `linkTasks` · `unlinkTasks` · `importEstimateToSchedule` · `clearAllTasks` · `aiGenerateSchedule`

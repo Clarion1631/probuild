@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { approveContract, markContractViewed } from "@/lib/actions";
 import DocumentSignModal from "@/components/DocumentSignModal";
 import { toast } from "sonner";
@@ -9,6 +9,7 @@ import { buildPdf } from "@/lib/build-pdf";
 import { CONTRACT_PROSE_CLASSES } from "@/lib/contract-styles";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
+import { COMPANY_TIME_ZONE } from "@/lib/company-day";
 
 export default function PortalContractClient({
     initialContract,
@@ -37,6 +38,14 @@ export default function PortalContractClient({
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
     const companyLicense = companySettings?.licenseNumber || "";
+
+    // Deterministic across server (UTC) and client (browser tz) render: this component
+    // now server-renders (see isomorphic-dompurify migration), so bare toLocaleDateString/
+    // toLocaleString would diverge and cause hydration mismatches. companySettings does not
+    // carry a timeZone field (see publicCompanySettingsSelect), so use the shared constant.
+    const tz = COMPANY_TIME_ZONE;
+    const fmtDate = (d: Date | string) => new Date(d).toLocaleDateString("en-US", { timeZone: tz });
+    const fmtDateTime = (d: Date | string) => new Date(d).toLocaleString("en-US", { timeZone: tz });
 
     const contractBodyRef = useRef<HTMLDivElement>(null);
 
@@ -79,20 +88,20 @@ export default function PortalContractClient({
             if (localSig) {
                 const safeUrl = escapeHtml(localSig.image);
                 const safeName = escapeHtml(localSig.name || "Client");
-                const sigDateStr = new Date().toLocaleDateString();
+                const sigDateStr = fmtDate(new Date());
                 const sigDateHtml = `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${sigDateStr}</span>`;
                 return `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Client Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client — ${safeName}</span>${sigDateHtml}</span>`;
             }
             if (isSigned && initialContract.signatureUrl) {
                 const safeUrl = escapeHtml(initialContract.signatureUrl);
                 const safeName = escapeHtml(initialContract.approvedBy || "Client");
-                const sigDateStr = initialContract.approvedAt ? new Date(initialContract.approvedAt).toLocaleDateString() : "";
+                const sigDateStr = initialContract.approvedAt ? fmtDate(initialContract.approvedAt) : "";
                 const sigDateHtml = sigDateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${sigDateStr}</span>` : "";
                 return `<span style="display:inline-block;margin:4px 0;"><img src="${safeUrl}" alt="Client Signature" style="height:48px;object-fit:contain;mix-blend-mode:multiply;" /><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client — ${safeName}</span>${sigDateHtml}</span>`;
             }
             if (isSigned && initialContract.approvedBy) {
                 const safeName = escapeHtml(initialContract.approvedBy);
-                const sigDateStr = initialContract.approvedAt ? new Date(initialContract.approvedAt).toLocaleDateString() : "";
+                const sigDateStr = initialContract.approvedAt ? fmtDate(initialContract.approvedAt) : "";
                 const sigDateHtml = sigDateStr ? `<span style="display:block;font-size:11px;color:#475569;margin-top:2px;">Date: ${sigDateStr}</span>` : "";
                 return `<span style="display:inline-block;border-bottom:1.5px solid #64748b;min-width:200px;padding-bottom:4px;margin:4px 0;"><span style="font-weight:600;color:#0f172a;">${safeName}</span><span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;">Client Signature</span>${sigDateHtml}</span>`;
             }
@@ -114,14 +123,14 @@ export default function PortalContractClient({
 
         // Replace Date Blocks with current date (if not signed) or approved date
         const dateStr = isSigned && initialContract.approvedAt
-            ? new Date(initialContract.approvedAt).toLocaleDateString()
-            : new Date().toLocaleDateString();
+            ? fmtDate(initialContract.approvedAt)
+            : fmtDate(new Date());
 
         html = html.replace(/\{\{DATE_BLOCK\}\}/g, `<strong>${dateStr}</strong>`);
 
         // Contractor date block — resolves to the contractor's signing date
         const contractorDateStr = initialContract.contractorSignedAt
-            ? new Date(initialContract.contractorSignedAt).toLocaleDateString()
+            ? fmtDate(initialContract.contractorSignedAt)
             : "";
         const contractorDatePattern = /\{\{CONTRACTOR_DATE_BLOCK\}\}|<span[^>]*data-merge-field="CONTRACTOR_DATE_BLOCK"[^>]*>[^<]*<\/span>/g;
         html = html.replace(contractorDatePattern, contractorDateStr ? `<strong>${contractorDateStr}</strong>` : "");
@@ -602,7 +611,7 @@ export default function PortalContractClient({
                                         <div>
                                             <h3 className="text-sm font-semibold text-green-800">{awaitingCountersign ? "You've Signed — Awaiting Company Countersignature" : "Document Executed — Electronically Signed"}</h3>
                                             <p className="text-sm text-green-700 mt-0.5">Primary Signer: <strong>{initialContract.approvedBy}</strong></p>
-                                            <p className="text-xs text-green-600 mt-0.5">{new Date(initialContract.approvedAt).toLocaleString()}</p>
+                                            <p className="text-xs text-green-600 mt-0.5">{fmtDateTime(initialContract.approvedAt)}</p>
                                         </div>
                                     </div>
                                 </div>
@@ -668,7 +677,7 @@ export default function PortalContractClient({
                                     <div className="text-right">
                                         <h1 className="text-2xl font-bold text-slate-800 tracking-tight">DOCUMENT</h1>
                                         <div className="mt-2 space-y-1 text-sm">
-                                            <p className="text-slate-500">Date: <span className="text-slate-700">{initialContract.sentAt ? new Date(initialContract.sentAt).toLocaleDateString() : new Date(initialContract.createdAt).toLocaleDateString()}</span></p>
+                                            <p className="text-slate-500">Date: <span className="text-slate-700">{initialContract.sentAt ? fmtDate(initialContract.sentAt) : fmtDate(initialContract.createdAt)}</span></p>
                                         </div>
                                         <div className="mt-3">
                                             {isExecuted ? (
@@ -700,7 +709,7 @@ export default function PortalContractClient({
                                         <div>
                                             <h3 className="text-sm font-semibold text-green-800">{awaitingCountersign ? "You've Signed — Awaiting Company Countersignature" : "Document Executed — Electronically Signed"}</h3>
                                             <p className="text-sm text-green-700 mt-0.5">Primary Signer: <strong>{initialContract.approvedBy}</strong></p>
-                                            <p className="text-xs text-green-600 mt-0.5">{new Date(initialContract.approvedAt).toLocaleString()}</p>
+                                            <p className="text-xs text-green-600 mt-0.5">{fmtDateTime(initialContract.approvedAt)}</p>
                                         </div>
                                     </div>
                                     {initialContract.signatureUrl && (

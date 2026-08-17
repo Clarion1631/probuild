@@ -53,7 +53,7 @@
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import Module from "node:module";
-import { derivedMarginPct } from "../src/lib/budget-math";
+import { derivedMarginPct, marginIsSettable, marginIsUnrepresentable } from "../src/lib/budget-math";
 
 type CreateCall<T> = { data: T };
 
@@ -62,54 +62,148 @@ const calls = {
     estimateItemCreates: [] as CreateCall<any>[],
     estimatePaymentScheduleCreates: [] as CreateCall<any>[],
     takeoffUpdates: [] as CreateCall<any>[],
+    /** How many times the route opened an interactive transaction. */
+    transactions: 0,
+    /** `SELECT ... FOR UPDATE` row locks taken, in order. */
+    rowLocks: [] as string[],
 };
 
-const state: { takeoff: any; companySettings: any } = { takeoff: null, companySettings: null };
+const state: {
+    takeoff: any;
+    /**
+     * What `takeoff.findUnique` returns for the route's RE-READ inside the transaction, when that
+     * must differ from the outer read (concurrent conversion / concurrent delete). `undefined`
+     * means "same as `takeoff`"; `null` means the row is gone.
+     */
+    takeoffInTx: any;
+    companySettings: any;
+    /** Estimates the fake DB already holds, keyed by id — for the already-converted path. */
+    estimates: Record<string, any>;
+    /** When set, `estimateItem.create` throws on the Nth (1-based) call, mid-conversion. */
+    failItemCreateOn: number | null;
+} = { takeoff: null, takeoffInTx: undefined, companySettings: null, estimates: {}, failItemCreateOn: null };
 
 function resetFixture() {
     calls.estimateCreates.length = 0;
     calls.estimateItemCreates.length = 0;
     calls.estimatePaymentScheduleCreates.length = 0;
     calls.takeoffUpdates.length = 0;
+    calls.rowLocks.length = 0;
+    calls.transactions = 0;
+    ops.length = 0;
     state.takeoff = null;
+    state.takeoffInTx = undefined;
     state.companySettings = null;
+    state.estimates = {};
+    state.failItemCreateOn = null;
 }
 
 let estimateSeq = 0;
 let itemSeq = 0;
 let scheduleSeq = 0;
 
+/**
+ * Every operation, in the order it happened, tagged with which client issued it.
+ *
+ * `via: "root"` means the operation went through the top-level `prisma` object; `via: "tx"` means
+ * it went through the client the `$transaction` callback was handed. Those are DISTINCT objects in
+ * this fake (as they are in real Prisma) precisely so that a write which calls `prisma.x.create()`
+ * from inside the callback is caught: it is lexically "inside the transaction" but does NOT run in
+ * it, and would not be rolled back.
+ */
+const ops: { op: string; via: "root" | "tx" }[] = [];
+
+/** Ops issued through the root client — everything here escapes the transaction. */
+function opsOutsideTx() {
+    return ops.filter((o) => o.via === "root");
+}
+
+/**
+ * One set of model methods, bound to a client identity. The root client and the transaction client
+ * are two separate instances so the `via` tag is meaningful.
+ */
+function makeClient(via: "root" | "tx") {
+    const record = (op: string) => ops.push({ op, via });
+    return {
+        takeoff: {
+            findUnique: async () => {
+                record("takeoff.findUnique");
+                return via === "tx" && state.takeoffInTx !== undefined ? state.takeoffInTx : state.takeoff;
+            },
+            update: async (args: CreateCall<any>) => {
+                record("takeoff.update");
+                calls.takeoffUpdates.push(args);
+                return { ...state.takeoff, ...args.data };
+            },
+        },
+        companySettings: {
+            findUnique: async () => {
+                record("companySettings.findUnique");
+                return state.companySettings;
+            },
+        },
+        estimate: {
+            create: async (args: CreateCall<any>) => {
+                record("estimate.create");
+                calls.estimateCreates.push(args);
+                estimateSeq += 1;
+                return { id: `est-${estimateSeq}`, ...args.data };
+            },
+            findUnique: async (args: { where: { id: string } }) => {
+                record("estimate.findUnique");
+                return state.estimates[args.where.id] ?? null;
+            },
+        },
+        estimateItem: {
+            // The route bulk-inserts; the fake fans the rows back out into the same per-row shape
+            // the assertions below have always used.
+            createMany: async (args: { data: any[] }) => {
+                record("estimateItem.createMany");
+                for (const row of args.data) {
+                    calls.estimateItemCreates.push({ data: row });
+                    itemSeq += 1;
+                    if (state.failItemCreateOn != null && calls.estimateItemCreates.length === state.failItemCreateOn) {
+                        throw new Error("simulated mid-conversion failure");
+                    }
+                }
+                return { count: args.data.length };
+            },
+        },
+        estimatePaymentSchedule: {
+            createMany: async (args: { data: any[] }) => {
+                record("estimatePaymentSchedule.createMany");
+                for (const row of args.data) {
+                    calls.estimatePaymentScheduleCreates.push({ data: row });
+                    scheduleSeq += 1;
+                }
+                return { count: args.data.length };
+            },
+        },
+        // Tagged-template call: `tx.$queryRaw`SELECT id FROM "Takeoff" WHERE id = ${id} FOR UPDATE``
+        // arrives as (templateStrings, ...values). Record the joined SQL so a test can assert the
+        // row lock is actually taken, and taken FIRST.
+        // The route reads this result as its existence check, so the fake must answer honestly:
+        // a row when the takeoff exists, nothing when it doesn't. Always returning `[]` (or always
+        // returning a row) would make the missing-row branch untestable.
+        $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+            record("$queryRaw");
+            calls.rowLocks.push(strings.join("?").trim() + ` [${values.join(",")}]`);
+            const row = via === "tx" && state.takeoffInTx !== undefined ? state.takeoffInTx : state.takeoff;
+            return row ? [{ id: values[0] }] : [];
+        },
+    };
+}
+
+const txClient = makeClient("tx");
+
 const fakePrisma = {
-    takeoff: {
-        findUnique: async () => state.takeoff,
-        update: async (args: CreateCall<any>) => {
-            calls.takeoffUpdates.push(args);
-            return { ...state.takeoff, ...args.data };
-        },
-    },
-    companySettings: {
-        findUnique: async () => state.companySettings,
-    },
-    estimate: {
-        create: async (args: CreateCall<any>) => {
-            calls.estimateCreates.push(args);
-            estimateSeq += 1;
-            return { id: `est-${estimateSeq}`, ...args.data };
-        },
-    },
-    estimateItem: {
-        create: async (args: CreateCall<any>) => {
-            calls.estimateItemCreates.push(args);
-            itemSeq += 1;
-            return { id: `item-${itemSeq}`, ...args.data };
-        },
-    },
-    estimatePaymentSchedule: {
-        create: async (args: CreateCall<any>) => {
-            calls.estimatePaymentScheduleCreates.push(args);
-            scheduleSeq += 1;
-            return { id: `sched-${scheduleSeq}`, ...args.data };
-        },
+    ...makeClient("root"),
+    // The fake can't roll anything back, so tests assert on what the route ATTEMPTED: a failure
+    // inside the callback must propagate (no partial commit is possible in the real DB because the
+    // statements share one transaction) and must leave the later steps unexecuted.
+    $transaction: async (fn: (tx: any) => Promise<any>) => {
+        calls.transactions += 1;
+        return await fn(txClient);
     },
 };
 
@@ -275,6 +369,131 @@ test("canonical conversion: tax row stripped from line items, rate/name/total pe
     assert.equal(calls.takeoffUpdates.length, 1);
     assert.equal(calls.takeoffUpdates[0].data.estimateId, "est-1");
     assert.equal(calls.takeoffUpdates[0].data.status, "Completed");
+});
+
+// --- marginPercentFor: negative-costing rows -------------------------------------------------
+
+test("credit row: cost and price both negative derive the SAME margin the positive pair would", async () => {
+    // No 99-TAX row, so splitTakeoffTax never runs and finalTotal falls back to the raw
+    // totalEstimate — the only thing under test here is marginPercentFor's own branch, not the
+    // tax split.
+    const items = [{ costCode: "02-FRAME", name: "Credit Frame", total: -35000, baseCost: -20000, unitCost: -35000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-credit",
+        name: "Credit Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -35000,
+            paymentMilestones: [{ name: "Refund", percentage: "100", amount: "-35000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-credit"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    const row = calls.estimateItemCreates[0].data;
+    assert.equal(row.baseCost, -20000); // sign preserved on the stored cost/price themselves
+    assert.equal(row.unitCost, -35000);
+    // Same margin as the canonical positive Frame row (baseCost 20000, unitCost 35000) above —
+    // flipping both signs before deriving must not change the implied margin.
+    const expectedMargin = derivedMarginPct(20000, 35000);
+    assert.equal(row.markupPercent, expectedMargin);
+    assert.notEqual(row.markupPercent, 25); // proves this derived, rather than hit the default
+});
+
+test("mixed-sign cost/price (no stated markup) is genuinely underivable and stores 0%, not the fabricated default", async () => {
+    const items = [{ costCode: "02-FRAME", name: "Mixed Sign Item", total: -1000, baseCost: 500, unitCost: -1000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-mixed",
+        name: "Mixed Sign Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "-1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-mixed"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 0);
+});
+
+// The stored sentinel/clamped margin on a sign-broken pair is only safe because the guard layer
+// refuses to trust it: marginIsUnrepresentable flags every such shape (so the UI warns and repair
+// sweeps exclude it), and marginIsSettable disables margin EDITING wherever sell <= 0. These
+// assertions pin that contract — if the guards ever loosen, the conversion's sentinel writes above
+// become silent lies and must change with them. (Codex review 2026-08-14, round 2.)
+test("guard parity: every sign-broken pair the conversion can store is flagged unrepresentable", () => {
+    // Mixed sign, negative cost against positive sell — the rate<0 gate.
+    assert.equal(marginIsUnrepresentable(-500, 1000), true);
+    // Mixed sign, positive cost against negative sell — the price<=0 gate.
+    assert.equal(marginIsUnrepresentable(500, -1000), true);
+    // Same-sign credit sold BELOW cost (raw margin -75%): clamps to 0 exactly like the equivalent
+    // positive loss row, and like it is flagged rather than trusted.
+    assert.equal(marginIsUnrepresentable(-35000, -20000), true);
+    // Margin editing is disabled outright wherever the sell price is not positive, so the flagged
+    // value cannot be used to regenerate cost/sell from the negative-sell orientation at all.
+    assert.equal(marginIsSettable(-1000), false);
+    assert.equal(marginIsSettable(0), false);
+    // Control: an ordinary representable pair is NOT flagged — the guard is a gate, not a blanket.
+    assert.equal(marginIsUnrepresentable(20000, 35000), false);
+});
+
+test("mixed-sign cost/price WITH a stated markupPercent still converts the stated markup, rather than jumping straight to 0", async () => {
+    // markupPercent 25 (true markup) here converts to a 20% margin — proves the markup-conversion
+    // branch is still consulted before the mixed-sign fallback, not bypassed by it.
+    const items = [
+        { costCode: "02-FRAME", name: "Mixed Sign With Markup", total: -1000, baseCost: 500, unitCost: -1000, quantity: 1, markupPercent: 25 },
+    ];
+    state.takeoff = {
+        id: "takeoff-mixed-markup",
+        name: "Mixed Sign Job With Markup",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: -1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "-1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-mixed-markup"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 20);
+});
+
+test("no costing data at all (no baseCost/unitCost pair, no stated markup) still defaults to 25% — unaffected by the negative-costing fix", async () => {
+    const items = [{ costCode: "02-FRAME", name: "No Costing Data", total: 1000, quantity: 1 }];
+    state.takeoff = {
+        id: "takeoff-legacy",
+        name: "Legacy Job",
+        projectId: "project-1",
+        leadId: null,
+        aiEstimateData: JSON.stringify({
+            items,
+            totalEstimate: 1000,
+            paymentMilestones: [{ name: "Full", percentage: "100", amount: "1000" }],
+        }),
+    };
+
+    const res = await POST(postRequest("takeoff-legacy"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.markupPercent, 25);
 });
 
 // --- bail-out case: no usable rate ------------------------------------------------------------
@@ -722,4 +941,245 @@ test("the legacy totalEstimate fallback sums stringy totals numerically, not by 
     const estimateData = calls.estimateCreates[calls.estimateCreates.length - 1].data;
     assert.equal(estimateData.totalAmount, 1500);
     assert.equal(typeof estimateData.totalAmount, "number");
+});
+
+// --- atomicity ---------------------------------------------------------------------------------
+//
+// Before the fix, the four write groups (Estimate, its items, its schedules, the Takeoff link) ran
+// as four independent statements. A failure partway through returned a 500 while leaving a
+// complete, findable Estimate carrying real money with no payment schedules and no takeoff link.
+
+test("every write happens inside ONE transaction, opened by locking the Takeoff row first", async () => {
+    state.takeoff = canonicalTakeoff();
+    state.companySettings = canonicalCompanySettings();
+
+    const res = await POST(postRequest("takeoff-1"));
+    assert.equal(res.status, 200, JSON.stringify(await res.json()));
+
+    assert.equal(calls.transactions, 1, "expected exactly one interactive transaction");
+    // NOTHING may go through the root prisma client — not the reads either. A read taken outside
+    // the transaction is the stale-snapshot bug: the row it saw can change before the write lands.
+    assert.deepEqual(opsOutsideTx(), [], "every operation must go through the transaction client");
+
+    // The row lock must be the very FIRST operation. Ordering is the whole guarantee: if the
+    // takeoff is read before it is locked, two requests can both read `estimateId = null`, then
+    // serialize on the lock and each create an Estimate. Asserting "a lock happened" would not
+    // catch that, so assert its POSITION.
+    assert.equal(ops[0].op, "$queryRaw", `expected the row lock first, got: ${ops.map((o) => o.op).join(" -> ")}`);
+    assert.equal(ops[1].op, "takeoff.findUnique", "the takeoff must be read only after the lock is held");
+    assert.equal(calls.rowLocks.length, 1);
+    assert.match(calls.rowLocks[0], /SELECT id FROM "Takeoff"[\s\S]*FOR UPDATE/);
+    assert.match(calls.rowLocks[0], /\[takeoff-1\]/);
+
+    // And the writes still all landed.
+    assert.equal(calls.estimateCreates.length, 1);
+    assert.equal(calls.estimateItemCreates.length, 3);
+    assert.equal(calls.estimatePaymentScheduleCreates.length, 3);
+    assert.equal(calls.takeoffUpdates.length, 1);
+});
+
+test("a failure mid-way through the line items aborts the whole conversion: no schedules, no takeoff link", async () => {
+    state.takeoff = canonicalTakeoff();
+    state.companySettings = canonicalCompanySettings();
+    // Blow up on the 2nd of 3 line items — after the Estimate row was created, which is exactly
+    // the window that used to leave an orphaned money document behind.
+    state.failItemCreateOn = 2;
+
+    const res = await POST(postRequest("takeoff-1"));
+    const body = await res.json();
+    assert.equal(res.status, 500);
+    assert.equal(body.error, "simulated mid-conversion failure");
+
+    // Everything after the failure point must be unreached — in the real DB the transaction rolls
+    // back, so the Estimate row attempted above never becomes visible either.
+    assert.equal(calls.estimateItemCreates.length, 2);
+    assert.equal(calls.estimatePaymentScheduleCreates.length, 0, "schedules must not be written after a failed item");
+    assert.equal(calls.takeoffUpdates.length, 0, "takeoff must not be linked/Completed by a failed conversion");
+    assert.deepEqual(opsOutsideTx(), []);
+});
+
+test("the estimate is built from the takeoff as it exists UNDER THE LOCK, not from an earlier read", async () => {
+    // `state.takeoff` is what an un-locked read would have seen; `state.takeoffInTx` is the row as
+    // it actually is once the lock is held — a concurrent request reassigned the takeoff to another
+    // project and re-ran its AI estimate. Reading any conversion input before the lock would create
+    // an estimate for project-1 with the old $108,400 of items and then link the project-2 takeoff
+    // to it.
+    state.takeoff = canonicalTakeoff();
+    state.takeoffInTx = {
+        name: "Reassigned Job",
+        projectId: "project-2",
+        leadId: null,
+        estimateId: null,
+        aiEstimateData: JSON.stringify({
+            items: [{ costCode: "01-DEMO", name: "Fresh Demo", total: 7000, unitCost: 7000, quantity: 1 }],
+            totalEstimate: 7000,
+            paymentMilestones: [{ name: "Payment in full", percentage: "100", amount: "7000" }],
+        }),
+    };
+    state.companySettings = canonicalCompanySettings();
+
+    const res = await POST(postRequest("takeoff-1"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    const estimateData = calls.estimateCreates[0].data;
+    assert.equal(estimateData.projectId, "project-2", "ownership must come from the locked read");
+    assert.equal(estimateData.title, "Reassigned Job — AI Estimate");
+    assert.equal(estimateData.totalAmount, 7000);
+    assert.equal(calls.estimateItemCreates.length, 1);
+    assert.equal(calls.estimateItemCreates[0].data.name, "Fresh Demo");
+    // The redirect follows the same locked read, so the client is not sent to the old project.
+    assert.equal(body.redirectUrl, `/projects/project-2/estimates/${body.estimateId}`);
+});
+
+// --- idempotency -------------------------------------------------------------------------------
+//
+// Before the fix the route never checked `takeoff.estimateId`, so a second POST minted a SECOND
+// Estimate and relinked the takeoff to it, orphaning the first with its real money and milestones.
+// `Takeoff.estimateId` being @unique does not prevent that: the unique index forbids two takeoffs
+// pointing at one estimate, but happily allows one takeoff to be repointed at a second estimate.
+
+function alreadyConvertedTakeoff() {
+    const t = canonicalTakeoff();
+    return { ...t, id: "takeoff-converted", estimateId: "est-existing", status: "Completed" };
+}
+
+test("converting an already-converted takeoff returns the EXISTING estimate and writes nothing", async () => {
+    state.takeoff = alreadyConvertedTakeoff();
+    state.companySettings = canonicalCompanySettings();
+    state.estimates = {
+        "est-existing": {
+            id: "est-existing",
+            code: "EST-1234",
+            totalAmount: 108400,
+            projectId: "project-1",
+            leadId: null,
+            _count: { items: 3 },
+        },
+    };
+
+    const res = await POST(postRequest("takeoff-converted"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    assert.deepEqual(opsOutsideTx(), [], "the existing-estimate lookup must also run in the transaction");
+
+    // The pre-existing estimate is handed back, flagged so the caller can tell it wasn't new.
+    assert.equal(body.estimateId, "est-existing");
+    assert.equal(body.code, "EST-1234");
+    assert.equal(body.totalAmount, 108400);
+    assert.equal(typeof body.totalAmount, "number");
+    assert.equal(body.itemCount, 3);
+    assert.equal(body.alreadyConverted, true);
+    assert.equal(body.redirectUrl, "/projects/project-1/estimates/est-existing");
+
+    // NOTHING was written — no second estimate, no duplicate items or milestones, and the takeoff
+    // was not relinked.
+    assert.equal(calls.estimateCreates.length, 0);
+    assert.equal(calls.estimateItemCreates.length, 0);
+    assert.equal(calls.estimatePaymentScheduleCreates.length, 0);
+    assert.equal(calls.takeoffUpdates.length, 0);
+});
+
+test("a takeoff converted by a concurrent request that commits first does not get a second estimate", async () => {
+    // A concurrent conversion commits while this one waits on the row lock, so the state visible
+    // once the lock is finally held already carries an estimateId. Reading `estimateId` anywhere
+    // but under the lock is precisely the interleaving that creates the orphan.
+    state.takeoff = canonicalTakeoff();
+    state.takeoffInTx = { estimateId: "est-raced" };
+    state.companySettings = canonicalCompanySettings();
+    state.estimates = {
+        "est-raced": {
+            id: "est-raced",
+            code: "EST-9999",
+            totalAmount: 108400,
+            projectId: "project-1",
+            leadId: null,
+            _count: { items: 3 },
+        },
+    };
+
+    const res = await POST(postRequest("takeoff-1"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(body.estimateId, "est-raced");
+    assert.equal(body.alreadyConverted, true);
+    assert.equal(calls.estimateCreates.length, 0);
+    assert.equal(calls.takeoffUpdates.length, 0);
+    assert.deepEqual(opsOutsideTx(), []);
+});
+
+test("the already-converted redirect follows the ESTIMATE's owner, not the takeoff's current one", async () => {
+    // The takeoff was reassigned to project-2 after it produced this estimate. The estimate still
+    // lives under project-1, which is where the client has to be sent — routing by the takeoff
+    // would build a URL for a project that does not hold this estimate.
+    state.takeoff = { ...alreadyConvertedTakeoff(), projectId: "project-2" };
+    state.companySettings = canonicalCompanySettings();
+    state.estimates = {
+        "est-existing": {
+            id: "est-existing",
+            code: "EST-1234",
+            totalAmount: 108400,
+            projectId: "project-1",
+            leadId: null,
+            _count: { items: 3 },
+        },
+    };
+
+    const res = await POST(postRequest("takeoff-converted"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    assert.equal(body.redirectUrl, "/projects/project-1/estimates/est-existing");
+});
+
+test("a takeoff deleted before the lock is acquired returns 404, decided by the lock's own result", async () => {
+    state.takeoff = canonicalTakeoff();
+    state.takeoffInTx = null;
+    state.companySettings = canonicalCompanySettings();
+
+    const res = await POST(postRequest("takeoff-1"));
+    const body = await res.json();
+    assert.equal(res.status, 404);
+    assert.equal(body.error, "Takeoff not found");
+    assert.equal(calls.estimateCreates.length, 0);
+    // `FOR UPDATE` locks nothing when the row is absent, so the route must stop on the EMPTY LOCK
+    // rather than proceeding to an unlocked read. Proving that means proving it never read at all.
+    assert.deepEqual(
+        ops.map((o) => o.op),
+        ["$queryRaw"],
+    );
+});
+
+test("a takeoff whose estimateId points at a missing estimate self-heals: it converts again", async () => {
+    // Not reachable through the app (the FK nulls the link when an estimate is deleted), but if a
+    // dangling link ever exists, failing forever would strand the takeoff. Convert and relink.
+    state.takeoff = alreadyConvertedTakeoff();
+    state.companySettings = canonicalCompanySettings();
+    state.estimates = {}; // est-existing is gone
+
+    const res = await POST(postRequest("takeoff-converted"));
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+
+    assert.equal(body.alreadyConverted, undefined);
+    assert.equal(calls.estimateCreates.length, 1);
+    assert.equal(calls.estimateItemCreates.length, 3);
+    assert.equal(calls.takeoffUpdates.length, 1);
+    assert.equal(calls.takeoffUpdates[0].data.estimateId, body.estimateId);
+    assert.deepEqual(opsOutsideTx(), []);
+});
+
+test("companySettings is not queried when there is no tax split to name", async () => {
+    // The configured sales taxes exist only to NAME a derived rate. A conversion with no tax row
+    // must not spend a query — or inherit that query's failure mode — inside the lock.
+    state.takeoff = bailOutTakeoff();
+    state.companySettings = canonicalCompanySettings();
+
+    const res = await POST(postRequest("takeoff-2"));
+    assert.equal(res.status, 200, JSON.stringify(await res.json()));
+    assert.equal(
+        ops.filter((o) => o.op === "companySettings.findUnique").length,
+        0,
+        "the bail-out path derives no rate, so there is nothing to name",
+    );
 });

@@ -13,15 +13,18 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
+import { parsePaymentDateInput } from "./payment-date";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
 import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
 import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
+import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
@@ -38,6 +41,7 @@ import type { ChangeOrderUpdateInput } from "./change-order-core";
 import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
+import { resolveCompanyTimeZone } from "./company-timezone";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -124,6 +128,13 @@ import {
 import { findThreadItem } from "./selection-item-thread-dependencies";
 
 type NotificationToggleKey = "newLead" | "estimateViewed" | "estimateSigned" | "contractSigned" | "invoiceViewed" | "paymentReceived" | "messageReceived";
+
+// Server runs in UTC; "Viewed at" timestamps in notification emails must render
+// in the company's timezone, not the server's.
+async function formatViewedAt(): Promise<string> {
+    const timeZone = await resolveCompanyTimeZone();
+    return new Date().toLocaleString("en-US", { timeZone });
+}
 
 function isNotificationEnabled(settings: { notificationToggles?: string | null } | null, key: NotificationToggleKey): boolean {
     if (!settings?.notificationToggles) return true;
@@ -1630,7 +1641,11 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
     // Staff members can preview an estimate they are scoped to; portal clients
     // must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
-    const isStaff = !!(staffSession?.user as any)?.role;
+    // An explicit allowlist, not "any truthy role" — this branch bypasses the
+    // client gate below, so an unexpected role value must fall to the client path
+    // (which fails closed) rather than be handed staff access.
+    const isStaff = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]
+        .includes((staffSession?.user as { role?: string } | undefined)?.role ?? "");
     // The session carries a role but not projectAccess/assignedProjects, so the
     // horizontal check needs the full user row.
     const staffUser = isStaff ? await currentStaffUserOrNull() : null;
@@ -1641,12 +1656,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
 
-        // Restrict the query to the client's own estimates below
+        // Ownership alone is not enough. An estimate the contractor has never
+        // shared is internal pricing, and ids are reachable by walking the
+        // sequential `number` route — so AND the shared-ness predicate onto the
+        // ownership predicate. AND-composed rather than spread, because two `OR`
+        // keys in one object silently drop the first.
         const ownershipFilter = {
             id,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         };
 
@@ -2026,13 +2050,21 @@ export async function markEstimateViewed(estimateId: string) {
 
     // Atomic first-view claim — two simultaneous opens produce exactly one
     // notification and one activity event.
+    // Same shared-ness gate as getEstimateForPortal — an estimate the client
+    // cannot open must not be markable as viewed either, even by calling this
+    // server action directly. AND-composed so the two OR predicates cannot collide.
     const claim = await prisma.estimate.updateMany({
         where: {
             id: estimateId,
             viewedAt: null,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         },
         data: { viewedAt: new Date() },
@@ -2057,7 +2089,7 @@ export async function markEstimateViewed(estimateId: string) {
                     <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #0369a1;">Estimate Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened estimate <strong>${estimate.title || estimate.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -2232,7 +2264,7 @@ export async function markContractViewed(contractId: string, accessToken?: strin
                     <div style="background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 20px;">
                         <h3 style="margin: 0 0 8px; color: #854d0e;">Contract Viewed</h3>
                         <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened contract <strong>${contract.title}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
-                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${new Date().toLocaleString()}</p>
+                        <p style="margin: 0; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
                     </div>
                 </div>`
             );
@@ -3448,24 +3480,6 @@ export async function archiveEstimate(estimateId: string) {
     return { success: true, archived };
 }
 
-// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
-// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
-        where: { id: "singleton" },
-        select: { salesTaxes: true },
-    });
-    if (!settings?.salesTaxes) return 0;
-    try {
-        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
-        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
-        const def = taxes.find(t => t.isDefault) || taxes[0];
-        return typeof def.rate === "number" ? def.rate : 0;
-    } catch {
-        return 0;
-    }
-}
-
 export async function createInvoiceFromEstimate(estimateId: string) {
     // `invoices` says WHAT you may do, not WHICH job — the invoice this mints
     // inherits the estimate's numbers, so the source estimate must be in scope.
@@ -3624,35 +3638,8 @@ export async function getInvoice(id: string) {
     return invoice;
 }
 
-/** Parse a payment-date input into a Date.
- *  Accepts:
- *   - `YYYY-MM-DD` (strict — end-anchored, rejects overflow) → interpreted as LOCAL midnight
- *     so the stored value matches the calendar day the user typed.
- *   - A positive epoch-ms number → treated as an absolute instant.
- *   - An ISO-8601 datetime with a time component → `new Date()` (UTC semantics).
- *  Rejects: empty strings, 0/negative numbers, non-strict YYYY-M-D-ish shapes. */
-function parsePaymentDateInput(input: number | string): Date | null {
-    if (typeof input === "number") {
-        if (!Number.isFinite(input) || input <= 0) return null;
-        const d = new Date(input);
-        return isNaN(d.getTime()) ? null : d;
-    }
-    if (typeof input !== "string" || input.trim() === "") return null;
-    // Strict YYYY-MM-DD → local midnight (primary path from the date picker).
-    const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
-    if (ymd) {
-        const y = Number(ymd[1]);
-        const mo = Number(ymd[2]);
-        const d = Number(ymd[3]);
-        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-        const dt = new Date(y, mo - 1, d);
-        if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
-        return dt;
-    }
-    // Accept full ISO datetimes (e.g. "2026-04-20T14:30:00Z") for API callers that pass them.
-    const dt = new Date(input);
-    return isNaN(dt.getTime()) ? null : dt;
-}
+// parsePaymentDateInput lives in lib/payment-date.ts, next to isDateOnly — the
+// calendar-day sentinel's writer and reader have to agree, so they are unit-tested together.
 
 export async function recordPayment(
     paymentId: string,
@@ -3871,6 +3858,11 @@ export async function recordEstimatePayment(
         });
         if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
 
+        // One settle instant for BOTH sides of the mirrored pair, taken AFTER the parent
+        // locks so a contended settle records when it settled, not when it started
+        // queueing — see the fuller note in payment-record-core.ts.
+        const settledAt = new Date();
+
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
         if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
@@ -3902,7 +3894,7 @@ export async function recordEstimatePayment(
                 const mirrorClaim = await t.paymentSchedule.updateMany({
                     where: { id: copy.id, status: { not: "Paid" } },
                     data: {
-                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        status: "Paid", paymentDate, paidAt: settledAt, paymentMethod: method, referenceNumber, notes,
                         // Keep both sides agreeing on what was actually paid when the
                         // recorded amount overrides the milestone amount.
                         ...(input.amount != null && { amount: input.amount }),
@@ -3928,7 +3920,7 @@ export async function recordEstimatePayment(
             data: {
                 status: "Paid",
                 paymentDate,
-                paidAt: new Date(),
+                paidAt: settledAt,
                 paymentMethod: method,
                 referenceNumber,
                 notes,
@@ -5956,30 +5948,17 @@ export async function getResolvedMergePreview(
     return buildContractMergeData(projectId, leadId);
 }
 
-export async function getContracts(projectId?: string, leadId?: string) {
-    // Called with no arguments this returned EVERY contract with all scalar
-    // fields — legal body, approval IP/user-agent, signature paths and the
-    // portal accessToken that authorizes signing — to any anonymous caller.
-    // The scope filter is the list form of the same rule assertContractAccess
-    // applies to one row, so the list and the detail page cannot disagree.
-    const user = await assertStaffPermission("contracts");
-    return prisma.contract.findMany({
-        where: {
-            AND: [
-                contractScopeWhere(user),
-                {
-                    ...(projectId ? { projectId } : {}),
-                    ...(leadId ? { leadId } : {}),
-                },
-            ],
-        },
-        orderBy: { createdAt: "desc" },
-        include: {
-            project: { select: { name: true, client: { select: { name: true } } } },
-            lead: { select: { name: true, client: { select: { name: true } } } },
-        }
-    });
-}
+// `getContracts` was deleted here. It had no callers anywhere — the live staff
+// screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
+// directly with contractScopeWhere(viewer). Having no callers did NOT make it
+// inert: as this module actually builds (Next 16.2.11), the server-reference
+// manifest registers all 360 of its exports as individually invokable POST
+// endpoints, 37 of them unreferenced anywhere in src/ — so a caller-less export
+// here is live attack surface whose gate nothing exercises. Next documents that
+// unused actions MAY be eliminated, so that is a measurement of this build, not
+// a universal rule; see docs/CONTRACTS.md. #367 gated it; this removes it. The
+// scope rule it used, contractScopeWhere, is NOT orphaned: the two pages above
+// and getLead's contracts relation are its consumers.
 
 export async function getContract(id: string) {
     // Staff-only, scoped to the owning job. The docstring on getContractForPortal
@@ -6051,22 +6030,12 @@ export async function getContractForPortal(id: string, token?: string | null) {
     return contract;
 }
 
-/**
- * Staff-facing executed-contract file lookup. The lookup itself lives in
- * src/lib/contract-files-core.ts (session-free, shared with the client portal,
- * which proves access by accessToken or portal session instead).
- *
- * ONLY the contract `id` in the argument is trusted. The owning project/lead
- * and the title are re-read from the database, because the whole descriptor
- * used to be caller-supplied: naming another job's projectId returned that
- * job's executed PDF, and a crafted `title` steered the legacy prefix match.
- * The parameter keeps its old shape so existing callers are unchanged; the
- * extra fields are now ignored.
- */
-export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const { projectId, leadId, title } = await assertContractAccess(contract.id);
-    return executedContractPdfFor({ id: contract.id, title, projectId, leadId });
-}
+// `getExecutedContractPdf` was deleted here, for the same reason as
+// `getContracts` above: no callers, but on this build every export of this
+// module is registered as a POST endpoint anyway. Every real caller already uses
+// the session-free core `executedContractPdfFor` in contract-files-core.ts —
+// the client portal proves access by accessToken/portal session, and
+// countersignContractAsCompany calls it after its own gate.
 
 export async function createContractFromTemplate(
     templateId: string,
