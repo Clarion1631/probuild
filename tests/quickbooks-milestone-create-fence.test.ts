@@ -721,6 +721,12 @@ test("an aggregate QBO deadline aborts an in-flight milestone create", async () 
         });
     };
 
+    // AbortSignal.timeout()'s internal timer is UNREF'D in Node: when the
+    // mocked never-resolving fetch is the only pending work, the event loop
+    // drains before the 20ms abort fires and node:test kills the run with
+    // "Promise resolution is still pending" (flaked twice on CI). A ref'd
+    // timer keeps the loop alive until the deadline can actually fire.
+    const keepEventLoopAlive = setTimeout(() => {}, 10_000);
     try {
         const signal = startQBAutomationSideEffectDeadline(20);
         await assert.rejects(
@@ -733,6 +739,7 @@ test("an aggregate QBO deadline aborts an in-flight milestone create", async () 
         );
         assert.equal(fetchCalls, 1);
     } finally {
+        clearTimeout(keepEventLoopAlive);
         globalThis.fetch = originalFetch;
     }
 });
