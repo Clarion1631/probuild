@@ -1025,7 +1025,11 @@ test.describe.serial("change-order durable automation outbox", () => {
             { cutoverAt: LEGACY_APPROVED_AT, limit: 10 },
             { db: prisma, now: () => new Date("2099-08-17T12:01:00.000Z") },
         );
-        expect(seeded).toEqual({ seeded: 1, changeOrderIds: [ids.legacyRecovery] });
+        // Candidacy is date-unrestricted (Codex round 7: historic Approved
+        // rows are seeded with billing PARKED, never skipped), so other
+        // Approved fixtures in this suite recover in the same sweep — assert
+        // on this CO's recovery, not an exclusive count.
+        expect(seeded.changeOrderIds).toContain(ids.legacyRecovery);
         const jobs = await prisma.changeOrderAutomationJob.findMany({
             where: { changeOrderId: ids.legacyRecovery },
             orderBy: { kind: "asc" },
@@ -1037,9 +1041,13 @@ test.describe.serial("change-order durable automation outbox", () => {
             ["APPROVAL_TEAM_EMAIL", "SKIPPED"],
         ]);
         expect(jobs.filter(job => job.kind.endsWith("EMAIL")).every(job => job.completedAt !== null)).toBe(true);
-        expect(await seedLegacyApprovedChangeOrderAutomationJobs(
+        // Idempotency for THIS CO: a second sweep must not re-seed it. (Other
+        // spec files can create Approved COs concurrently against the shared
+        // database, so a global seeded:0 assertion would be racy.)
+        const second = await seedLegacyApprovedChangeOrderAutomationJobs(
             { cutoverAt: LEGACY_APPROVED_AT, limit: 10 },
             { db: prisma },
-        )).toEqual({ seeded: 0, changeOrderIds: [] });
+        );
+        expect(second.changeOrderIds).not.toContain(ids.legacyRecovery);
     });
 });

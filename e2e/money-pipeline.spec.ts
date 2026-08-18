@@ -1036,7 +1036,10 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       expectedRevision: 0,
       expectedTaxFingerprint: coTaxFingerprint({ taxExempt: true }),
     }));
-    expect(message).toContain("must be Sent");
+    // The demoting edit bumped revision past the stale page's 0, and the
+    // revision CAS now runs before status validation (Codex round 7), so the
+    // stale approval is rejected as a revision conflict.
+    expect(message).toContain("was modified after this page loaded");
   });
 
   test("CO10: guarded send rejects stored subtotal drift from rendered items", async () => {
