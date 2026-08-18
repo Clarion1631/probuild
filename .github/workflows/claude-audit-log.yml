@@ -1,0 +1,78 @@
+name: Audit Log
+# After any claude-fix PR merges, append a human-readable entry to AUDITLOG.md:
+# what shipped, the Codex verdict, the visual verification result, links.
+# Newest entries at the top. Written by the github-actions bot (does not
+# retrigger other workflows).
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  append-entry:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'claude-fix')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Build and prepend audit entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -e
+          DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          BODY=$(gh pr view "$PR" --json body -q .body)
+          # Plan section of the PR body (first ~12 lines after '## Plan')
+          PLAN=$(printf '%s\n' "$BODY" | awk '/^## Plan/{f=1;next}/^## /{f=0}f' | head -12)
+          [ -z "$PLAN" ] && PLAN="(see PR description)"
+          ISSUE=$(printf '%s\n' "$BODY" | grep -oiE 'fixes #[0-9]+' | head -1 || true)
+          COMMENTS=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate -q '.[].body' || true)
+          VERDICT=$(printf '%s\n' "$COMMENTS" | grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' | tail -1 || true)
+          [ -z "$VERDICT" ] && VERDICT="VERDICT: (not recorded)"
+          GAUNTLET=$(printf '%s\n' "$COMMENTS" | grep -m1 -E 'Gauntlet visual verification' || true)
+          [ -z "$GAUNTLET" ] && GAUNTLET="(no visual verification comment found)"
+
+          {
+            echo "## $DATE — $PR_TITLE ([PR #$PR]($PR_URL))"
+            echo ""
+            [ -n "$ISSUE" ] && echo "**Resolves:** $ISSUE" && echo ""
+            echo "**What shipped:**"
+            echo "$PLAN"
+            echo ""
+            echo "**Code review (Codex):** $VERDICT"
+            echo ""
+            echo "**Visual verification:** $GAUNTLET"
+            echo ""
+            echo "**Deployed:** merged to main → Vercel production build triggered."
+            echo ""
+            echo "---"
+            echo ""
+          } > /tmp/entry.md
+
+          # Prepend under the file header (keep first 4 header lines)
+          if [ -f AUDITLOG.md ]; then
+            head -4 AUDITLOG.md > /tmp/new.md
+            cat /tmp/entry.md >> /tmp/new.md
+            tail -n +5 AUDITLOG.md >> /tmp/new.md
+          else
+            { echo "# Auto-Loop Audit Log"; echo ""; echo "Newest first. One entry per shipped fix."; echo ""; } > /tmp/new.md
+            cat /tmp/entry.md >> /tmp/new.md
+          fi
+          mv /tmp/new.md AUDITLOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add AUDITLOG.md
+          git commit -m "audit: PR #$PR — $PR_TITLE"
+          git pull --rebase origin main || true
+          git push origin main

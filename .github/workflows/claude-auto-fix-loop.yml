@@ -1,14 +1,16 @@
 name: Claude Auto-Fix Loop
-# Runs hourly: picks the oldest open issue labeled `auto-fix`,
-# plans with Fable 5 (planner subagent), implements with Opus 5 (medium effort),
-# opens a PR. The PR gate workflow (claude-pr-gate.yml) takes it from there.
+# Fires INSTANTLY when an issue gets the `auto-fix` label, plus an hourly
+# sweeper cron as backup. Picks the oldest labeled issue, plans with Fable 5,
+# implements with Opus 5 (medium effort), opens a PR.
 #
 # Auth: Claude Max subscription OAuth token (run `claude setup-token` locally,
 # save as CLAUDE_CODE_OAUTH_TOKEN secret). No API key needed.
 
 on:
+  issues:
+    types: [labeled] # instant: labeling an issue `auto-fix` fires the loop now
   schedule:
-    - cron: "0 * * * *" # hourly, adjust as desired
+    - cron: "0 * * * *" # hourly sweeper in case anything was missed
   workflow_dispatch: {} # manual kick from phone via GitHub mobile app
 
 concurrency:
@@ -22,6 +24,7 @@ permissions:
 
 jobs:
   fix-next-issue:
+    if: github.event_name != 'issues' || github.event.label.name == 'auto-fix'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
