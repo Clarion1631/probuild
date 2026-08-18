@@ -5,9 +5,8 @@ name: Claude PR Gate (Codex review + Gauntlet visual verify + deploy)
 # Then: auto-merge -> Vercel production deploy -> post-deploy visual re-verify.
 #
 # Auth: subscriptions only, no API keys.
-# - Claude: CLAUDE_CODE_OAUTH_TOKEN secret (from `claude setup-token`, Max plan)
-# - Codex: CODEX_AUTH_JSON secret (contents of ~/.codex/auth.json after
-#   `codex login` with your ChatGPT Pro account)
+# - Claude: CLAUDE_CODE_OAUTH_TOKEN secret (needs id-token: write below)
+# - Codex: CODEX_AUTH_JSON secret (contents of ~/.codex/auth.json)
 
 on:
   pull_request:
@@ -17,6 +16,8 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  id-token: write
+  actions: read
 
 jobs:
   codex-review:
@@ -128,8 +129,8 @@ jobs:
             --allowedTools "Bash(npx:*),Bash(npm:*),Bash(node:*),Bash(gh:*),Read,Write,Edit,Grep,Glob,Task"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Auth for visual verification WITHOUT automating Google OAuth:
-          # the gauntlet-verify skill mints a Supabase session for the test user.
+          # Auth for visual verification WITHOUT automating Google OAuth —
+          # see .claude/skills/gauntlet-verify/SKILL.md (PIN/NextAuth path).
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
@@ -146,7 +147,6 @@ jobs:
         run: gh pr merge ${{ github.event.pull_request.number }} --squash --auto --repo ${{ github.repository }}
 
       # Optional: apply Supabase migrations on merge to main.
-      # Uncomment and set SUPABASE_ACCESS_TOKEN + SUPABASE_DB_PASSWORD + PROJECT_REF.
       # - name: Apply Supabase migrations
       #   run: |
       #     npx supabase link --project-ref $PROJECT_REF

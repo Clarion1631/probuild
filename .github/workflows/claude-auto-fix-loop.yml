@@ -3,8 +3,8 @@ name: Claude Auto-Fix Loop
 # sweeper cron as backup. Picks the oldest labeled issue, plans with Fable 5,
 # implements with Opus 5 (medium effort), opens a PR.
 #
-# Auth: Claude Max subscription OAuth token (run `claude setup-token` locally,
-# save as CLAUDE_CODE_OAUTH_TOKEN secret). No API key needed.
+# Auth: Claude Max subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN secret).
+# id-token: write is REQUIRED — the action exchanges the OAuth token via OIDC.
 
 on:
   issues:
@@ -21,6 +21,8 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  id-token: write
+  actions: read
 
 jobs:
   fix-next-issue:
