@@ -1,12 +1,18 @@
 "use client";
 
 import { useState } from "react";
-import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder } from "@/lib/actions";
+import { updateChangeOrder, deleteChangeOrder, countersignChangeOrderAsCompany, sendChangeOrderToClient, previewCostPlusChangeOrder, billCostPlusChangeOrder, manuallyApproveChangeOrder } from "@/lib/actions";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal } from "@/lib/co-tax";
+import { coTaxFingerprint, coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
+
+// handleSave's return type: the server action returns a JSON-serialized Prisma row,
+// but status/revision are the only fields the manual-approval CAS and Send-for-Approval
+// paths depend on.
+type SavedChangeOrder = { status: string; revision: number } & Record<string, unknown>;
 
 export default function ChangeOrderEditor({ context, initialData }: { context: any, initialData: any }) {
     const router = useRouter();
@@ -26,6 +32,14 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     const [isSending, setIsSending] = useState(false);
     const [isBilling, setIsBilling] = useState(false);
     const [billingPreview, setBillingPreview] = useState<any | null>(null);
+    const [showManualApproveConfirm, setShowManualApproveConfirm] = useState(false);
+    const [isManuallyApproving, setIsManuallyApproving] = useState(false);
+    // Tracks the CO's revision across saves so handleSave/handleManualApprove can send
+    // an expectedRevision CAS token that reflects what THIS tab last wrote, not just what
+    // the page loaded with — initialData.revision never updates after mount, since Next
+    // passing fresh server props to an already-mounted client component does not re-run
+    // useState's initializer.
+    const [revision, setRevision] = useState<number>(initialData.revision);
 
     // A signed CO is a contract: title, description, and items are the approved
     // scope and remain immutable after approval. The server enforces the same
@@ -41,15 +55,24 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
     );
     const isScopeLocked = isApproved || hasSignatureAudit;
     const canCountersign = status === "Sent" || status === "Approved";
+    const isManualApproval = isManualCoApproval({ ...initialData, status });
+    const manualApprovedByName = staffNameFromManualApprovedBy(initialData.approvedBy);
+    const canManuallyApprove = context.canManuallyApprove
+        && (status === "Draft" || status === "Sent")
+        && !initialData.clientSignatureUrl;
 
     // Same integer-cents math as the server's item sync and billChangeOrderCore,
     // so the Revised Amount shown here is exactly what billing will charge.
     // Tax follows the estimate's treatment (tax-exempt customers pay none) — kept
     // in sync with the portal signature page and billChangeOrderCore via lib/co-tax.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    // Status is controlled state: a scope-changing save can atomically return a
+    // formerly Sent CO to Draft. Draft must immediately switch from the frozen
+    // sent tuple to the loaded live Estimate terms for the next guarded action.
+    const taxInfo = effectiveCoTaxInfo({ ...initialData, status }, initialData.estimate);
+    const tax = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
-    const taxLabel = coTaxLabel(initialData.estimate);
+    const taxLabel = coTaxLabel(taxInfo);
     const unbilledTime = (initialData.timeEntries || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const unbilledExpenses = (initialData.expenses || []).filter((row: any) => row.isBillable && !row.invoiceId && !row.invoicedAt);
     const actualHours = unbilledTime.reduce((sum: number, row: any) => sum + Number(row.durationHours || 0), 0);
@@ -64,7 +87,21 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         try {
             // Company countersignature — writes only the company fields and never
             // touches the customer's approval (see countersignChangeOrderAsCompany).
-            await countersignChangeOrderAsCompany(initialData.id, signName.trim());
+            // The tracked revision rides along so a stale editor can never sign
+            // terms another staff member edited and resent (Codex round 7).
+            const updated = await countersignChangeOrderAsCompany(
+                initialData.id,
+                signName.trim(),
+                undefined,
+                revision,
+            );
+            if (!updated.success) {
+                toast.error(updated.error);
+                setShowSignModal(false);
+                router.refresh();
+                return;
+            }
+            setRevision(updated.revision);
             toast.success("Change order countersigned");
             setShowSignModal(false);
             router.refresh();
@@ -75,13 +112,57 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
         }
     }
 
+    async function handleManualApprove() {
+        setIsManuallyApproving(true);
+        try {
+            // Save first, exactly like Send for Approval below — otherwise a staff
+            // member could edit items/pricing, then approve, and bill whatever was
+            // last saved to the DB instead of what's on screen. Fail closed: a
+            // failed save must never reach the approval call. handleSave() already
+            // toasts its own failure.
+            // On the scope-locked path we pass the tracked revision (last set by our
+            // own save/approve, defaulting to the page-load value), so a countersign or
+            // any other edit this tab did not itself make fails closed with a refresh message.
+            const saved = isScopeLocked ? { revision } : await handleSave();
+            if (!saved) return;
+            // Staff-side approval — bills the same as the portal path but never
+            // emails the client (see manuallyApproveChangeOrder).
+            const approvalTaxInfo = effectiveCoTaxInfo({ ...initialData, ...saved }, initialData.estimate);
+            const result = await manuallyApproveChangeOrder(
+                initialData.id,
+                saved.revision,
+                coTaxFingerprint(approvalTaxInfo),
+            );
+            if (!result.success) {
+                if (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT") {
+                    // Next redacts thrown Server Action errors in production.
+                    // This fixed code is the only conflict detail crossing the
+                    // permission-gated action boundary.
+                    setShowManualApproveConfirm(false);
+                    window.location.reload();
+                }
+                return;
+            }
+            const updated = result.changeOrder;
+            setStatus(updated.status);
+            setRevision(updated.revision);
+            toast.success("Change order marked as approved (manual)");
+            setShowManualApproveConfirm(false);
+            router.refresh();
+        } catch (e: any) {
+            toast.error(e?.message || "Failed to mark as approved");
+        } finally {
+            setIsManuallyApproving(false);
+        }
+    }
+
     // Returns whether the save persisted — the send flow must not email the client
     // a signature request when the save failed (they'd sign the stale amounts).
-    async function handleSave(): Promise<boolean> {
-        if (isDeleting) return false; // Prevent saving if we are in the middle of deleting
+    async function handleSave(): Promise<SavedChangeOrder | null> {
+        if (isDeleting) return null; // Prevent saving if we are in the middle of deleting
         if (isScopeLocked) {
             toast.error("Signed change orders are locked. Create a new change order for additional work.");
-            return false;
+            return null;
         }
         setIsSaving(true);
         const mappedItems = items.map((item, index) => ({
@@ -102,7 +183,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
             // tax-inclusive total here is what inflated billed amounts before.
             // Status is never sent: sendChangeOrderToClientCore owns Draft -> Sent,
             // and Approved/Declined belong to the signature flows.
-            const updated = await updateChangeOrder(initialData.id, {
+            const result = await updateChangeOrder(initialData.id, {
                 title,
                 description,
                 items: mappedItems,
@@ -115,14 +196,26 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                     dueDate: row.dueDate || null,
                     order: index,
                 })),
+                expectedRevision: revision,
             });
+            if (!result.success) {
+                if (result.code === "REVISION_CONFLICT") {
+                    // A genuine conflict invalidates every controlled field. A
+                    // hard reload adopts the full server copy; router.refresh()
+                    // alone would preserve stale form and revision state.
+                    window.location.reload();
+                }
+                return null;
+            }
+            const updated = result.changeOrder;
             setStatus(updated.status);
+            setRevision(updated.revision);
             toast.success("Change Order saved");
             router.refresh();
-            return true;
+            return updated;
         } catch (e: any) {
             toast.error(e?.message || "Failed to save CO");
-            return false;
+            return null;
         } finally {
             setIsSaving(false);
         }
@@ -282,15 +375,27 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 // sign amounts that never persisted. The Sent status
                                 // is owned by sendChangeOrderToClientCore; the local
                                 // badge only updates after a confirmed send.
-                                const saved = isScopeLocked ? true : await handleSave();
+                                const saved = isScopeLocked
+                                    ? { ...initialData, status, revision }
+                                    : await handleSave();
                                 if (!saved) return;
-                                const result = await sendChangeOrderToClient(initialData.id);
+                                const sendTaxInfo = effectiveCoTaxInfo({ ...initialData, ...saved }, initialData.estimate);
+                                const result = await sendChangeOrderToClient(
+                                    initialData.id,
+                                    saved.revision,
+                                    coTaxFingerprint(sendTaxInfo),
+                                    crypto.randomUUID(),
+                                );
                                 if (result.success) {
                                     setStatus("Sent");
+                                    setRevision(result.revision);
                                     toast.success(`Change order sent to ${result.sentTo}`);
                                     router.refresh();
                                 } else {
                                     toast.error(result.error || "Failed to send");
+                                    if (result.code === "REVISION_CONFLICT" || result.code === "TAX_TERMS_CONFLICT") {
+                                        window.location.reload();
+                                    }
                                 }
                             } catch {
                                 toast.error("Failed to send change order");
@@ -461,8 +566,8 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <div className="border-t border-slate-200 px-8 py-7 bg-white">
                                     <div className="flex items-center justify-between mb-4">
                                         <div>
-                                            <h3 className="font-bold text-slate-800">Payment schedule</h3>
-                                            <p className="text-xs text-slate-500 mt-1">Optional. Use at least two positive payments; the final payment absorbs the cent-exact remainder.</p>
+                                            <h3 className="font-bold text-slate-800">Payment schedule (pre-tax)</h3>
+                                            <p className="text-xs text-slate-500 mt-1">Optional staff inputs are pre-tax. Use at least two positive payments; the final payment absorbs the cent-exact pre-tax remainder.</p>
                                         </div>
                                         {!isScopeLocked && <button type="button" onClick={addSchedule} className="hui-btn hui-btn-secondary text-sm">Add payment</button>}
                                     </div>
@@ -481,7 +586,7 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                     </div>
                                     {paymentSchedules.length > 0 && (
                                         <p className={`text-xs mt-3 ${paymentSchedules.length < 2 || finalScheduleCents <= 0 ? "text-red-600" : "text-emerald-700"}`}>
-                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the subtotal." : `Final payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Schedule sums to ${formatCurrency(subtotal)}.`}
+                                            {paymentSchedules.length < 2 ? "Add at least one more payment." : finalScheduleCents <= 0 ? "Earlier payments must total less than the pre-tax subtotal." : `Final pre-tax payment remainder: ${formatCurrency(finalScheduleCents / 100)}. Pre-tax schedule sums to ${formatCurrency(subtotal)}.`}
                                         </p>
                                     )}
                                 </div>
@@ -612,12 +717,25 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                 <span className={`px-2 py-0.5 rounded text-xs border ${
                                     initialData.approvedBy ? "bg-green-100 text-green-800 border-green-200" :
                                     "bg-slate-100 text-slate-600 border-slate-200"
-                                }`}>{initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
+                                }`}>{isManualApproval ? "Approved manually" : initialData.approvedBy ? "Signed" : "Pending Signature"}</span>
                             </div>
                             <div className="p-6 grid grid-cols-2 gap-8">
                                 <div className="border border-slate-200 rounded-lg p-6 bg-slate-50/50">
-                                    <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">Client Signature</h4>
-                                    {initialData.approvedBy ? (
+                                    <h4 className="font-semibold text-slate-700 mb-4 tracking-wide text-sm uppercase">
+                                        {isManualApproval ? "Staff Approval" : "Client Signature"}
+                                    </h4>
+                                    {isManualApproval ? (
+                                        <div className="space-y-4">
+                                            <div className="bg-amber-50 p-4 border border-amber-200 rounded min-h-[100px] flex flex-col items-center justify-center text-center">
+                                                <p className="text-sm font-semibold text-amber-900">Approved without a client signature</p>
+                                                <p className="text-xs text-amber-700 mt-1">Recorded by authorized staff.</p>
+                                            </div>
+                                            <div className="text-sm text-slate-600">
+                                                <p><strong>Approved By:</strong> {manualApprovedByName}</p>
+                                                <p><strong>Approved At:</strong> {new Date(initialData.approvedAt).toLocaleString()}</p>
+                                            </div>
+                                        </div>
+                                    ) : initialData.approvedBy ? (
                                         <div className="space-y-4">
                                             <div className="bg-white p-4 border border-slate-200 rounded flex items-center justify-center min-h-[100px]">
                                                 {initialData.clientSignatureUrl ? (
@@ -637,6 +755,41 @@ export default function ChangeOrderEditor({ context, initialData }: { context: a
                                             <p className="text-sm">Awaiting client signature</p>
                                             {status === "Sent" && (
                                                 <p className="text-xs mt-1 text-slate-400">We&apos;ve asked the client to sign this.</p>
+                                            )}
+                                            {canManuallyApprove && (
+                                                showManualApproveConfirm ? (
+                                                    <div className="mt-4 pt-4 border-t border-slate-200 text-left">
+                                                        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+                                                            Approves without client signature. Billing milestones are created but nothing is emailed to the client.
+                                                        </p>
+                                                        <div className="flex justify-center gap-2 mt-3">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setShowManualApproveConfirm(false)}
+                                                                disabled={isManuallyApproving}
+                                                                className="hui-btn hui-btn-secondary text-xs px-3 py-1.5 disabled:opacity-50"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={handleManualApprove}
+                                                                disabled={isManuallyApproving}
+                                                                className="hui-btn hui-btn-primary text-xs px-3 py-1.5 disabled:opacity-50"
+                                                            >
+                                                                {isManuallyApproving ? "Approving…" : "Confirm approval"}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setShowManualApproveConfirm(true)}
+                                                        className="text-amber-600 hover:text-amber-700 font-medium text-sm mt-3"
+                                                    >
+                                                        Mark as Approved (manual)
+                                                    </button>
+                                                )
                                             )}
                                         </div>
                                     )}

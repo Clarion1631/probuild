@@ -202,8 +202,40 @@ test("all staff financial actions authorize inside the exported action", () => {
     expectGuardBeforeDatabase(source, name, "await assertActiveStaff(");
   }
 
-  for (const name of ["deleteLead", "updateProjectStatus", "updateProjectName", "deleteProjects"]) {
+  for (const name of ["deleteLead", "updateProjectStatus", "updateProjectName"]) {
     expectGuardBeforeDatabase(source, name, "await assertActiveStaff(");
+  }
+  {
+    const action = exportSource(source, "deleteProjects");
+    const guard = action.indexOf("await assertActiveStaff(");
+    const role = action.indexOf('["ADMIN", "MANAGER"].includes(caller.role)');
+    const database = action.indexOf("prisma.");
+    expect(guard, "deleteProjects must resolve the active caller").toBeGreaterThanOrEqual(0);
+    expect(role, "deleteProjects must be ADMIN/MANAGER only").toBeGreaterThan(guard);
+    expect(role, "deleteProjects must authorize before database access").toBeLessThan(database);
+    expect(action, "project deletion must be shell-only once any invoice exists")
+      .toContain("invoices: { some: {} }");
+    expect(action, "project deletion must not orphan any estimate")
+      .toContain("estimates: { some: {} }");
+    expect(action, "project deletion must be shell-only once any contract exists")
+      .toContain("contracts: { some: {} }");
+    expect(action, "project deletion must preserve payroll and audit history")
+      .toContain("timeEntries: { some: {} }");
+    expect(action, "project deletion must preserve provider identity")
+      .toContain("qbProjectId: { not: null }");
+    const transaction = action.slice(
+      action.indexOf("prisma.$transaction"),
+      action.indexOf("    } catch (error: any)"),
+    );
+    expect(transaction, "audit-history checks must throw the typed error inside the locked delete transaction")
+      .toContain("throw new ProjectAuditHistoryDeleteBlockedError()");
+
+    const auditHistoryError = source.slice(
+      source.indexOf("class ProjectAuditHistoryDeleteBlockedError"),
+      source.indexOf("export async function deleteProjects"),
+    );
+    expect(auditHistoryError, "the typed audit-history error must retain the operator-facing archive guidance")
+      .toContain('super("Project financial or legal history must be archived, not hard-deleted")');
   }
   for (const name of ["saveCompanySettings", "updateCompanyProjectStatuses", "saveCompanySubcontractorTrades"]) {
     expectGuardBeforeDatabase(source, name, "await assertCompanySettingsPermission(");
@@ -221,6 +253,14 @@ test("all staff financial actions authorize inside the exported action", () => {
     expect(body, "assertActiveStaff must throw when there is no staff user")
       .toMatch(/if\s*\(!user\)\s*throw new Error\("Unauthorized"\)/);
   }
+});
+
+test("project deletion controls are rendered only for ADMIN/MANAGER", () => {
+  const page = readFileSync(join(process.cwd(), "src/app/projects/page.tsx"), "utf8");
+  const client = readFileSync(join(process.cwd(), "src/app/projects/ProjectsClient.tsx"), "utf8");
+  expect(page).toContain("currentStaffUserOrNull");
+  expect(page).toContain("canDeleteProjects");
+  expect(client).toContain("canDeleteProjects &&");
 });
 
 test("estimate readers filter by the same scope the detail page asserts", () => {

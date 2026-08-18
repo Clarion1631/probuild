@@ -1,4 +1,5 @@
 import { approveChangeOrderCore } from "./change-order-core";
+import { prisma } from "./prisma";
 import { persistOwnedSignature } from "./signature-storage";
 
 export type ChangeOrderSignatureCleanupEvent = {
@@ -12,6 +13,7 @@ export type ChangeOrderSignatureCleanupEvent = {
 export type ChangeOrderApprovalDependencies = {
     persistSignature: typeof persistOwnedSignature;
     approveCore: typeof approveChangeOrderCore;
+    isSignatureReferenced: (changeOrderId: string, signatureUrl: string) => Promise<boolean>;
     reportCleanupFailure: (event: ChangeOrderSignatureCleanupEvent) => void;
 };
 
@@ -19,6 +21,8 @@ type ChangeOrderApprovalInput = {
     signatureName: string;
     signatureDataUrl: string;
     approvedAt: Date;
+    expectedRevision: number;
+    expectedTaxFingerprint: string;
 };
 
 function safeIdentifier(value: unknown): string | undefined {
@@ -53,6 +57,13 @@ function cleanupEvent(changeOrderId: string, error: unknown): ChangeOrderSignatu
 const defaultDependencies: ChangeOrderApprovalDependencies = {
     persistSignature: persistOwnedSignature,
     approveCore: approveChangeOrderCore,
+    isSignatureReferenced: async (changeOrderId, signatureUrl) => {
+        const hit = await prisma.changeOrder.findFirst({
+            where: { id: changeOrderId, clientSignatureUrl: signatureUrl },
+            select: { id: true },
+        });
+        return !!hit;
+    },
     reportCleanupFailure: (event) => {
         console.error("[approveChangeOrder] signature cleanup failed", event);
     },
@@ -91,11 +102,28 @@ export async function approveChangeOrderWithSignature(
         }
     };
 
+    const discardIfDefinitelyUnreferenced = async () => {
+        if (!owned.url) return;
+        let referenced: unknown;
+        try {
+            referenced = await dependencies.isSignatureReferenced(id, owned.url);
+        } catch {
+            // A failed probe leaves the database outcome unknown. Keep the upload:
+            // an orphan can be swept later, but a committed signature is irreplaceable.
+            return;
+        }
+        // Fail closed even if a future override returns a non-boolean value.
+        if (referenced !== false) return;
+        await discard();
+    };
+
     try {
         const approval = await dependencies.approveCore(id, {
             signatureName: input.signatureName,
             clientSignatureUrl: owned.url,
             approvedAt: input.approvedAt,
+            expectedRevision: input.expectedRevision,
+            expectedTaxFingerprint: input.expectedTaxFingerprint,
         });
         if (!approval) {
             await discard();
@@ -103,7 +131,9 @@ export async function approveChangeOrderWithSignature(
         }
         return approval;
     } catch (error) {
-        await discard();
+        // A rejected Prisma call can still have committed before the connection
+        // failed. Probe the canonical row before compensating the uploaded object.
+        await discardIfDefinitelyUnreferenced();
         throw error;
     }
 }

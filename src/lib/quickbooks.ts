@@ -17,6 +17,71 @@ export const QB_API_BASE = process.env.QB_SANDBOX === "true"
 
 const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 
+// A claimed automation job is recoverable after five minutes. No single QBO
+// request may hold a worker beyond that lease horizon, or cron could reclaim
+// the job and repeat an external create/read while the first request is still
+// in flight. Callers may provide a shorter signal; this is the safe default.
+// A cold milestone push can query/create the customer and service item, create
+// the invoice, and read its link. Twelve is a deliberately conservative bound
+// over that current chain; 12 × 15s remains well below the five-minute lease.
+export const MAX_QB_REQUESTS_PER_AUTOMATION_SIDE_EFFECT = 12;
+export const QB_REQUEST_TIMEOUT_MS = 15_000;
+export const QB_AUTOMATION_SIDE_EFFECT_DEADLINE_MS =
+    MAX_QB_REQUESTS_PER_AUTOMATION_SIDE_EFFECT * QB_REQUEST_TIMEOUT_MS;
+
+/** Start one wall-clock budget shared by every QBO call in an automation push. */
+export function startQBAutomationSideEffectDeadline(
+    timeoutMs = QB_AUTOMATION_SIDE_EFFECT_DEADLINE_MS,
+): AbortSignal {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new Error("QuickBooks automation deadline must be positive");
+    }
+    return AbortSignal.timeout(Math.floor(timeoutMs));
+}
+
+export interface QBAutomationSideEffectFence {
+    signal: AbortSignal;
+    deadlineAt: number;
+    throwIfExpired: () => void;
+}
+
+/**
+ * Pair the abort signal with an absolute-time check. The latter closes the
+ * event-loop race where a long database await can finish after the deadline
+ * but before the timeout callback has had a chance to mark the signal aborted.
+ */
+export function createQBAutomationSideEffectFence(options: {
+    timeoutMs?: number;
+    now?: () => number;
+} = {}): QBAutomationSideEffectFence {
+    const timeoutMs = options.timeoutMs ?? QB_AUTOMATION_SIDE_EFFECT_DEADLINE_MS;
+    const now = options.now ?? Date.now;
+    const signal = startQBAutomationSideEffectDeadline(timeoutMs);
+    const deadlineAt = now() + Math.floor(timeoutMs);
+    return {
+        signal,
+        deadlineAt,
+        throwIfExpired: () => {
+            signal.throwIfAborted();
+            if (now() >= deadlineAt) {
+                throw new DOMException("QuickBooks automation aggregate deadline exceeded", "TimeoutError");
+            }
+        },
+    };
+}
+
+function qbNetworkFetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+    const perRequestSignal = AbortSignal.timeout(QB_REQUEST_TIMEOUT_MS);
+    const signal = init.signal
+        ? AbortSignal.any([init.signal, perRequestSignal])
+        : perRequestSignal;
+    signal.throwIfAborted();
+    return globalThis.fetch(input, {
+        ...init,
+        signal,
+    });
+}
+
 export interface QBTokens {
     accessToken: string;
     refreshToken: string;
@@ -29,7 +94,7 @@ export async function exchangeQBCode(code: string, redirectUri: string): Promise
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-    const res = await fetch(TOKEN_URL, {
+    const res = await qbNetworkFetch(TOKEN_URL, {
         method: "POST",
         headers: {
             Authorization: `Basic ${encoded}`,
@@ -57,13 +122,17 @@ export async function exchangeQBCode(code: string, redirectUri: string): Promise
 }
 
 /** Refresh an expired access token */
-export async function refreshQBToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+export async function refreshQBToken(
+    refreshToken: string,
+    options: { signal?: AbortSignal } = {},
+): Promise<{ accessToken: string; refreshToken: string }> {
     const clientId = process.env.QB_CLIENT_ID!;
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-    const res = await fetch(TOKEN_URL, {
+    const res = await qbNetworkFetch(TOKEN_URL, {
         method: "POST",
+        signal: options.signal,
         headers: {
             Authorization: `Basic ${encoded}`,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -92,7 +161,7 @@ export async function qbFetch(
     // backward compatible.
     const separator = path.includes("?") ? "&" : "?";
     const url = `${QB_API_BASE}/${tokens.realmId}${path}${separator}minorversion=73`;
-    return fetch(url, {
+    return qbNetworkFetch(url, {
         ...opts,
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
@@ -104,9 +173,14 @@ export async function qbFetch(
 }
 
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
-export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
+export async function qbQuery<T = any>(
+    tokens: QBTokens,
+    query: string,
+    options: { signal?: AbortSignal } = {},
+): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
-    const res = await fetch(url, {
+    const res = await qbNetworkFetch(url, {
+        signal: options.signal,
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
             Accept: "application/json",
@@ -163,17 +237,18 @@ export async function getQBPurchaseAttachables(
 /** Find a QBO customer by display name, creating it if missing. Returns the QBO customer Id. */
 export async function ensureQBCustomer(
     tokens: QBTokens,
-    client: { name: string; email?: string | null; qbCustomerId?: string | null }
+    client: { name: string; email?: string | null; qbCustomerId?: string | null },
+    options: { signal?: AbortSignal } = {},
 ): Promise<string> {
     // Trust a previously stored id if it still exists
     if (client.qbCustomerId) {
-        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`);
+        const existing = await qbQuery(tokens, `SELECT Id FROM Customer WHERE Id = '${escapeQBString(client.qbCustomerId)}'`, options);
         if (existing.length > 0) return client.qbCustomerId;
     }
 
     const name = client.name.trim();
     if (!name) throw new Error("Client name is empty — cannot sync customer to QuickBooks.");
-    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`);
+    const byName = await qbQuery(tokens, `SELECT Id FROM Customer WHERE DisplayName = '${escapeQBString(name)}'`, options);
     if (byName.length > 0) return byName[0].Id;
 
     // QBO normalizes whitespace when enforcing DisplayName uniqueness, so an
@@ -183,7 +258,8 @@ export async function ensureQBCustomer(
     const prefix = name.split(/\s+/)[0];
     const candidates = await qbQuery<{ Id: string; DisplayName?: string }>(
         tokens,
-        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`
+        `SELECT Id, DisplayName FROM Customer WHERE DisplayName LIKE '${escapeQBString(prefix)}%' MAXRESULTS 1000`,
+        options,
     );
     const matches = candidates.filter(c => normalize(c.DisplayName ?? "") === normalize(name));
     if (matches.length > 1) {
@@ -193,6 +269,7 @@ export async function ensureQBCustomer(
 
     const res = await qbFetch("/customer", tokens, {
         method: "POST",
+        signal: options.signal,
         body: JSON.stringify({
             DisplayName: name,
             ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
@@ -209,18 +286,22 @@ export async function ensureQBCustomer(
 const QB_SERVICE_ITEM_NAME = "Construction Services";
 
 /** Find or create the Service item used for all ProBuild invoice lines. */
-export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
-    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`);
+export async function ensureQBServiceItem(
+    tokens: QBTokens,
+    options: { signal?: AbortSignal } = {},
+): Promise<string> {
+    const items = await qbQuery(tokens, `SELECT Id FROM Item WHERE Name = '${escapeQBString(QB_SERVICE_ITEM_NAME)}'`, options);
     if (items.length > 0) return items[0].Id;
 
     // Need an income account to hang the item on — prefer an existing Income account.
-    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`);
+    const accounts = await qbQuery(tokens, `SELECT Id, Name FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`, options);
     let incomeAccountId: string;
     if (accounts.length > 0) {
         incomeAccountId = accounts[0].Id;
     } else {
         const created = await qbFetch("/account", tokens, {
             method: "POST",
+            signal: options.signal,
             body: JSON.stringify({ Name: "Construction Income", AccountType: "Income", AccountSubType: "ServiceFeeIncome" }),
         });
         if (!created.ok) throw new Error(`QB income account create failed: ${await created.text()}`);
@@ -229,6 +310,7 @@ export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
 
     const res = await qbFetch("/item", tokens, {
         method: "POST",
+        signal: options.signal,
         body: JSON.stringify({
             Name: QB_SERVICE_ITEM_NAME,
             Type: "Service",
@@ -243,29 +325,33 @@ export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
  * Create a QBO invoice for ONE payment milestone, with QuickBooks Payments
  * (card + ACH) enabled so the customer gets Intuit's hosted "Review & Pay" page.
  */
+export interface QBMilestoneInvoiceInput {
+    docNumber: string; // ≤ 21 chars
+    customerId: string;
+    itemId: string;
+    description: string;
+    amount: number; // grand total the client pays (tax-inclusive)
+    // When set, the QBO invoice carries the sales tax explicitly:
+    // a pre-tax taxable line + TxnTaxDetail, so QBO's sales-tax reporting
+    // sees the liability and the invoice total still equals `amount`.
+    tax?: { preTaxAmount: number; taxAmount: number } | null;
+    txnDate?: string;
+    dueDate?: Date | null;
+    billEmail?: string | null;
+    privateNote?: string;
+}
+
 export async function createQBMilestoneInvoice(
     tokens: QBTokens,
-    input: {
-        docNumber: string; // ≤ 21 chars
-        customerId: string;
-        itemId: string;
-        description: string;
-        amount: number; // grand total the client pays (tax-inclusive)
-        // When set, the QBO invoice carries the sales tax explicitly:
-        // a pre-tax taxable line + TxnTaxDetail, so QBO's sales-tax reporting
-        // sees the liability and the invoice total still equals `amount`.
-        tax?: { preTaxAmount: number; taxAmount: number } | null;
-        dueDate?: Date | null;
-        billEmail?: string | null;
-        privateNote?: string;
-    }
+    input: QBMilestoneInvoiceInput,
+    options: { signal?: AbortSignal; requestId?: string } = {},
 ): Promise<{ qbId: string; qbUrl: string; total: number }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
     const lineAmount = withTax ? input.tax!.preTaxAmount : input.amount;
 
     const payload: Record<string, unknown> = {
         DocNumber: input.docNumber.slice(0, 21),
-        TxnDate: new Date().toISOString().split("T")[0],
+        TxnDate: input.txnDate ?? new Date().toISOString().split("T")[0],
         CustomerRef: { value: input.customerId },
         // QuickBooks Payments is the ONLY payment rail (Stripe is disabled until
         // their 180-day hold clears) — the hosted page takes card, debit, AND bank.
@@ -292,7 +378,14 @@ export async function createQBMilestoneInvoice(
         ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
     };
 
-    const res = await qbFetch("/invoice", tokens, { method: "POST", body: JSON.stringify(payload) });
+    const path = options.requestId
+        ? `/invoice?requestid=${encodeURIComponent(options.requestId)}`
+        : "/invoice";
+    const res = await qbFetch(path, tokens, {
+        method: "POST",
+        body: JSON.stringify(payload),
+        signal: options.signal,
+    });
     if (!res.ok) throw new Error(`QB milestone invoice create failed: ${await res.text()}`);
     const data = await res.json();
     const qbId = data.Invoice?.Id;
@@ -301,9 +394,14 @@ export async function createQBMilestoneInvoice(
 }
 
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
-export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string): Promise<string | null> {
+export async function getQBInvoicePaymentLink(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    options: { signal?: AbortSignal } = {},
+): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
-    const res = await fetch(url, {
+    const res = await qbNetworkFetch(url, {
+        signal: options.signal,
         headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
     });
     if (!res.ok) return null;
@@ -318,8 +416,12 @@ export interface QBInvoiceStatus {
 }
 
 /** Read a QBO invoice's balance + linked payment transactions. */
-export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string): Promise<QBInvoiceStatus | null> {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+export async function getQBInvoiceStatus(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    options: { signal?: AbortSignal } = {},
+): Promise<QBInvoiceStatus | null> {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", signal: options.signal });
     if (!res.ok) return null;
     const data = await res.json();
     const inv = data.Invoice;
@@ -328,6 +430,44 @@ export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string):
         .filter((t: any) => t.TxnType === "Payment")
         .map((t: any) => String(t.TxnId));
     return { balance: Number(inv.Balance ?? 0), total: Number(inv.TotalAmt ?? 0), paymentTxnIds };
+}
+
+export interface QBInvoiceCreateRecovery {
+    qbId: string;
+    total: number;
+    docNumber: string;
+}
+
+/**
+ * Intuit's safe Create-retry pattern is query-by-stable-DocNumber before POST.
+ * A non-unique match is never guessed: company settings can permit duplicate
+ * document numbers, so ambiguity must stop for reconciliation.
+ */
+export async function findQBInvoiceByDocNumber(
+    tokens: QBTokens,
+    docNumber: string,
+    options: { signal?: AbortSignal } = {},
+): Promise<QBInvoiceCreateRecovery | null> {
+    const matches = await qbQuery<{ Id?: unknown; TotalAmt?: unknown; DocNumber?: unknown }>(
+        tokens,
+        `SELECT * FROM Invoice WHERE DocNumber = '${escapeQBString(docNumber)}' MAXRESULTS 2`,
+        options,
+    );
+    if (matches.length > 1) {
+        throw new Error(
+            `QuickBooks returned multiple invoices for recovery DocNumber ${docNumber}; reconcile them before retrying.`,
+        );
+    }
+    const match = matches[0];
+    if (!match) return null;
+    const qbId = typeof match.Id === "string" ? match.Id : String(match.Id ?? "");
+    const total = Number(match.TotalAmt);
+    if (!qbId || !Number.isFinite(total)) {
+        throw new Error(
+            `QuickBooks returned an incomplete invoice for recovery DocNumber ${docNumber}; reconcile it before retrying.`,
+        );
+    }
+    return { qbId, total, docNumber: String(match.DocNumber ?? docNumber) };
 }
 
 /**
@@ -548,7 +688,7 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Prom
     const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
     if (!get.ok) return false;
     const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
-    const res = await fetch(
+    const res = await qbNetworkFetch(
         `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
         {
             method: "POST",
@@ -563,7 +703,7 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Prom
 export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<boolean> {
     const inv = await readQBInvoice(tokens, qbInvoiceId);
     if (!inv) return false;
-    const res = await fetch(
+    const res = await qbNetworkFetch(
         `${QB_API_BASE}/${tokens.realmId}/invoice?operation=delete&minorversion=73`,
         {
             method: "POST",
@@ -702,7 +842,7 @@ export async function getQBPurchaseChangesSince(
         changedSince: since.toISOString(),
         minorversion: "73",
     });
-    const response = await fetch(
+    const response = await qbNetworkFetch(
         `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
         {
             headers: {
@@ -918,7 +1058,7 @@ export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendT
     const qs = new URLSearchParams({ minorversion: "73" });
     if (sendTo) qs.set("sendTo", sendTo);
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}/send?${qs}`;
-    const res = await fetch(url, {
+    const res = await qbNetworkFetch(url, {
         method: "POST",
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,

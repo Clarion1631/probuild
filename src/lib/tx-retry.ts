@@ -43,6 +43,13 @@ export function isRetryableTxError(e: any): boolean {
     return /deadlock detected|could not serialize|40P01|40001/i.test(String(e?.message ?? ""));
 }
 
+export class InvoiceEmailDeliveryInProgressError extends Error {
+    constructor(invoiceId: string) {
+        super(`Invoice ${invoiceId} has a provider-started email attempt. Finish or reconcile that stable delivery before changing money state.`);
+        this.name = "InvoiceEmailDeliveryInProgressError";
+    }
+}
+
 /**
  * Run `fn` (typically a `prisma.$transaction(...)` call), retrying with jittered
  * backoff when it fails with a retryable, cleanly-rolled-back transaction error.
@@ -74,13 +81,34 @@ export async function withTxRetry<T>(fn: () => Promise<T>, attempts = 3): Promis
  */
 export async function lockMoneyParents(
     tx: Prisma.TransactionClient,
-    ids: { estimateId?: string | null; invoiceId?: string | null },
+    ids: {
+        estimateId?: string | null;
+        invoiceId?: string | null;
+        /** Only the frozen email attempt itself may cross its provider fence. */
+        allowInvoiceEmailAttemptKey?: string | null;
+    },
 ): Promise<void> {
     if (ids.estimateId) {
         await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${ids.estimateId} FOR UPDATE`;
     }
     if (ids.invoiceId) {
         await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${ids.invoiceId} FOR UPDATE`;
+        // Separate statement is intentional. Under READ COMMITTED a joined
+        // SELECT can take its snapshot before waiting for the Invoice lock and
+        // miss an attempt row that commits while it waits. This fresh command
+        // sees and locks the post-wait checkpoint.
+        const [attempt] = await tx.$queryRaw<Array<{
+            attemptKey: string;
+            providerStartedAt: Date | null;
+        }>>`
+            SELECT "attemptKey", "providerStartedAt"
+            FROM "InvoiceEmailAttempt"
+            WHERE "invoiceId" = ${ids.invoiceId}
+            FOR UPDATE`;
+        if (attempt?.providerStartedAt
+            && attempt.attemptKey !== ids.allowInvoiceEmailAttemptKey) {
+            throw new InvoiceEmailDeliveryInProgressError(ids.invoiceId);
+        }
     }
 }
 

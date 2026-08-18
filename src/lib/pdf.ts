@@ -4,7 +4,8 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
-import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
+import { allocateCoScheduleGross, coTaxRate, coTaxLabel, billableCoItems, effectiveCoTaxInfo } from './co-tax';
+import { isManualCoApproval } from './co-approval';
 import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
 import { isEstimateSectionRow, rm } from './estimate-item-payload';
 
@@ -1193,13 +1194,14 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         where: { id: coId },
         include: {
             items: { orderBy: { order: 'asc' } },
-            paymentSchedules: { orderBy: { order: 'asc' } },
+            paymentSchedules: { orderBy: [{ order: 'asc' }, { id: 'asc' }] },
             project: { include: { client: true } },
             estimate: true,
         },
     });
 
     if (!co) throw new Error('Change Order not found');
+    const coTaxInfo = effectiveCoTaxInfo(co, co.estimate);
 
     const company = await prisma.companySettings.findUnique({ where: { id: 'singleton' } });
 
@@ -1389,8 +1391,9 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     // the same Subtotal / Tax / Revised Amount breakdown the customer signs on the
     // portal page so the PDF and signature page never disagree.
     const coSubtotal = Math.round((Number(co.totalAmount) || 0) * 100) / 100;
-    const coTax = Math.round(coSubtotal * coTaxRate(co.estimate) * 100) / 100;
+    const coTax = Math.round(coSubtotal * coTaxRate(coTaxInfo) * 100) / 100;
     const coTotal = Math.round((coSubtotal + coTax) * 100) / 100;
+    const customerSchedules = allocateCoScheduleGross(coSubtotal, co.paymentSchedules, coTaxInfo);
 
     const drawCoTotalRow = (label: string, value: string, size: number, font: PDFFont, color: ReturnType<typeof rgb>) => {
         page.drawText(label, { x: coLabelX, y, size, font, color });
@@ -1403,7 +1406,7 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     } else {
         drawCoTotalRow('Subtotal', formatCurrency(coSubtotal), 10, helvetica, colors.textMain);
         y -= 18;
-        drawCoTotalRow(coTaxLabel(co.estimate), formatCurrency(coTax), 10, helvetica, colors.textMain);
+        drawCoTotalRow(coTaxLabel(coTaxInfo), formatCurrency(coTax), 10, helvetica, colors.textMain);
         y -= 22;
         checkNewPage(60);
         drawCoTotalRow('Revised Amount', formatCurrency(coTotal), 14, helveticaBold, colors.primary);
@@ -1414,9 +1417,9 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         checkNewPage(60 + co.paymentSchedules.length * 18);
         page.drawText('PAYMENT SCHEDULE', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 18;
-        for (const schedule of co.paymentSchedules) {
+        for (const schedule of customerSchedules) {
             page.drawText(`${schedule.name}${schedule.dueDate ? ` · ${new Date(schedule.dueDate).toLocaleDateString('en-US')}` : ''}`, { x: margin, y, size: 9, font: helvetica, color: colors.textMain });
-            const value = formatCurrency(Number(schedule.amount));
+            const value = formatCurrency(schedule.grossCents / 100);
             page.drawText(value, { x: pageWidth - margin - helveticaBold.widthOfTextAtSize(value, 9), y, size: 9, font: helveticaBold, color: colors.textMain });
             y -= 18;
         }
@@ -1426,7 +1429,10 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     if (co.status === 'Approved' && co.approvedBy) {
         y -= 50;
         checkNewPage(100);
-        page.drawText('Client Approval', { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
+        // A manually-approved CO was never signed by the client — label it honestly
+        // rather than implying a client signature that doesn't exist.
+        const approvalLabel = isManualCoApproval(co) ? 'Approval (Recorded by Staff)' : 'Client Approval';
+        page.drawText(approvalLabel, { x: margin, y, size: 11, font: helveticaBold, color: colors.textMain });
         y -= 20;
         page.drawText(`Approved By: ${co.approvedBy}`, { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 15;

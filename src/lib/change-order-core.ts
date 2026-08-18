@@ -1,6 +1,32 @@
 import { prisma } from "./prisma";
 import { dateInputInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
-import { billableCoItems, coLineCents, coSectionRowError, coSectionRowNames } from "./co-tax";
+import { billableCoItems, canonicalCoTaxTerms, coLineCents, coSectionRowError, coSectionRowNames, coTaxFingerprint, fixedCoScheduleValidationError } from "./co-tax";
+import { MANUAL_CO_APPROVAL_SUFFIX } from "./co-approval";
+import type { ChangeOrderApprovalMode } from "./change-order-automation";
+import {
+    enqueueApprovalAutomationJobs,
+    prepareChangeOrderReviewJobsForMutation,
+    removeSafeReviewJobsForDraftDelete,
+} from "./change-order-automation-jobs";
+
+/**
+ * Internal CAS sentinel. Permission-gated Server Actions catch only this
+ * class and return a fixed, serializable conflict code; every other error
+ * stays on Next's normal thrown/redacted path.
+ */
+export class ChangeOrderRevisionConflictError extends Error {
+    constructor(changeOrderCode: string) {
+        super(`Change order ${changeOrderCode} was modified after this page loaded — refresh and try again.`);
+        this.name = "ChangeOrderRevisionConflictError";
+    }
+}
+
+export class ChangeOrderTaxTermsConflictError extends Error {
+    constructor(changeOrderCode: string) {
+        super(`Change order ${changeOrderCode} tax terms changed after this page loaded — reload and review the exact rate before continuing.`);
+        this.name = "ChangeOrderTaxTermsConflictError";
+    }
+}
 
 type ChangeOrderItemInput = {
     id?: string;
@@ -30,8 +56,41 @@ export type ChangeOrderUpdateInput = {
     paymentSchedules?: ChangeOrderScheduleInput[] | unknown;
     status?: unknown;
     items?: ChangeOrderItemInput[] | unknown;
+    // Mandatory CAS guard against every load/edit/save race. Replacement lists
+    // delete omitted children, so allowing any caller to skip this would let a
+    // stale connector/editor silently erase a concurrent scope update.
+    expectedRevision: number;
     [key: string]: unknown;
 };
+
+async function enqueueApprovalAutomation(
+    tx: Parameters<typeof enqueueApprovalAutomationJobs>[0],
+    input: {
+        changeOrderId: string;
+        eventRevision: number;
+        pricingType: string;
+        approvalMode: ChangeOrderApprovalMode;
+    },
+) {
+    const pricingType = input.pricingType === "COST_PLUS" ? "COST_PLUS" : "FIXED";
+    const frozenEvent = {
+        changeOrderId: input.changeOrderId,
+        eventRevision: input.eventRevision,
+        approvalMode: input.approvalMode,
+    };
+    await enqueueApprovalAutomationJobs(tx, {
+        changeOrderId: input.changeOrderId,
+        eventRevision: input.eventRevision,
+        pricingType,
+        approvalMode: input.approvalMode,
+        payloads: {
+            APPROVAL_BILL: { ...frozenEvent },
+            APPROVAL_CLIENT_EMAIL: { ...frozenEvent },
+            APPROVAL_SCHEDULE: { ...frozenEvent },
+            APPROVAL_TEAM_EMAIL: { ...frozenEvent },
+        },
+    });
+}
 
 function normalizedPricingType(value: unknown, fallback: string): "FIXED" | "COST_PLUS" {
     const pricingType = value ?? fallback;
@@ -70,7 +129,10 @@ function normalizeSchedules(
         priorCents += amountCents;
         const name = schedule.name?.trim() || `Payment ${index + 1}`;
         const dueDate = dateInputInTimeZone(schedule.dueDate, timeZone, `Due date for ${name}`);
-        return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: schedule.order ?? index };
+        // A replacement list is already ordered. Persist that array position as
+        // the canonical sequence so stale/duplicate caller-supplied order values
+        // cannot make different consumers attach residual cents to different rows.
+        return { id: schedule.id, name, amount: amountCents / 100, dueDate, order: index };
     });
 }
 
@@ -105,13 +167,28 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             companySignedBy: string | null;
             companySignedAt: Date | null;
             companySignatureUrl: string | null;
+            termsTaxExempt: boolean | null;
+            termsTaxRateName: string | null;
+            termsTaxRatePercent: unknown | null;
+            revision: number;
         }>>`
             SELECT "code", "status", "title", "description", "totalAmount", "pricingType", "markupPercent",
                    "approvedBy", "approvedAt", "clientSignatureUrl",
-                   "companySignedBy", "companySignedAt", "companySignatureUrl"
+                   "companySignedBy", "companySignedAt", "companySignatureUrl",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent", "revision"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) throw new Error("Change order not found");
+
+        // CAS guard against the load/edit/save race: a stale page loaded before a
+        // concurrent save must not clobber it and inherit a fresh revision that
+        // then passes the manual-approve CAS on the strength of a save that never
+        // saw the other edit. Same mechanism and message as
+        // manuallyApproveChangeOrderCore's expectedRevision check.
+        if (!Number.isInteger(data.expectedRevision) || data.expectedRevision < 0
+            || data.expectedRevision !== current.revision) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
 
         // Status transitions are lifecycle operations, never generic field
         // updates. In particular, Draft -> Sent must go through
@@ -351,38 +428,86 @@ export async function updateChangeOrderCore(id: string, data: ChangeOrderUpdateI
             scalarData.status = "Draft";
             scalarData.sentAt = null;
             scalarData.viewedAt = null;
+            scalarData.termsTaxExempt = null;
+            scalarData.termsTaxRateName = null;
+            scalarData.termsTaxRatePercent = null;
         }
 
-        return tx.changeOrder.update({ where: { id }, data: scalarData });
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
+        return tx.changeOrder.update({ where: { id }, data: { ...scalarData, revision: { increment: 1 } } });
     }, { timeout: 15_000 });
 }
 
 export async function approveChangeOrderCore(
     id: string,
-    approval: { signatureName: string; clientSignatureUrl: string | null; approvedAt: Date },
+    approval: {
+        signatureName: string;
+        clientSignatureUrl: string | null;
+        approvedAt: Date;
+        expectedRevision: number;
+        expectedTaxFingerprint: string;
+        expectedClientId?: string;
+    },
 ) {
     return prisma.$transaction(async (tx) => {
-        // The same parent-row lock is taken by editing, sending, billing, and
-        // co-audit repair. Status, item existence, subtotal validation, and the
-        // approval write therefore observe one serialized state and commit as a
-        // single invariant-preserving transition.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; status: string; pricingType: string; totalAmount: unknown }>>`
-            SELECT "id", "code", "status", "pricingType", "totalAmount"
+        // Lock order: Estimate -> Project -> ChangeOrder — the repo-wide money
+        // order (restoreEstimateItemAssociations and
+        // createInvoiceFromEstimateCore both hold Estimate before Project;
+        // holding Project or the CO while acquiring Estimate deadlocks
+        // against them — Codex round 7). The unlocked lookup is only a
+        // routing hint; ownership and routing are re-read after every lock
+        // is held.
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id },
+            select: { projectId: true, estimateId: true },
+        });
+        if (!coRef) return null;
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
+        const [project] = await tx.$queryRaw<Array<{ id: string; clientId: string | null }>>`
+            SELECT "id", "clientId" FROM "Project" WHERE "id" = ${coRef.projectId} FOR SHARE`;
+        if (!project) return null;
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
+            projectId: string; estimateId: string; revision: number; termsTaxExempt: boolean | null;
+            termsTaxRateName: string | null; termsTaxRatePercent: { toString(): string } | null;
+        }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "projectId", "estimateId", "revision",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
             FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
         const current = locked[0];
         if (!current) return null;
+        if (current.projectId !== project.id || current.estimateId !== coRef.estimateId) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
+        if (!approval.expectedClientId || project.clientId !== approval.expectedClientId) {
+            throw new Error(`Change order ${current.code} no longer belongs to the authenticated portal client.`);
+        }
 
+        // Revision FIRST, status second (Codex round 7): a concurrent edit
+        // that un-sent the CO (Sent -> Draft) bumped its revision, and the
+        // caller must see the fixed REVISION_CONFLICT code (reload-and-review
+        // behavior), not a generic status error.
+        if (current.revision !== approval.expectedRevision) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
         if (current.status !== "Sent") {
             throw new Error(`Change order ${current.code} must be Sent before it can be approved.`);
         }
-
         if (!approval.signatureName.trim() || !approval.clientSignatureUrl) {
             throw new Error("A client name and persisted signature is required to approve a change order.");
         }
 
-        if (current.pricingType === "COST_PLUS") {
-            const scheduleCount = await tx.changeOrderPaymentSchedule.count({ where: { changeOrderId: id } });
-            if (scheduleCount > 0) throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        const paymentSchedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: id },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { amount: true },
+        });
+        if (current.pricingType === "COST_PLUS" && paymentSchedules.length > 0) {
+            throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
         }
 
         const items = await tx.changeOrderItem.findMany({
@@ -404,7 +529,37 @@ export async function approveChangeOrderCore(
         if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
             throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
         }
+        if (current.pricingType !== "COST_PLUS") {
+            const scheduleError = fixedCoScheduleValidationError(storedSubtotalCents, paymentSchedules);
+            if (scheduleError) throw new Error(scheduleError);
+        }
 
+        // Every current Sent row already owns an immutable terms tuple. Legacy
+        // Sent/null rows predate that invariant, so preserve outstanding portal
+        // links by bootstrapping from the live Estimate only when it still
+        // matches the exact tuple the customer reviewed. This all runs under
+        // the locked CO transaction; a tax-only edit therefore cannot slip
+        // between the comparison and the approval write.
+        let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
+        if (current.termsTaxExempt === null) {
+            // estimateTax was read under FOR SHARE at the TOP of this
+            // transaction (lock order Estimate -> Project -> CO), so a
+            // tax-only edit either committed before that lock or waits for
+            // this transaction — same guarantee, correct lock order.
+            if (!estimateTax) throw new ChangeOrderTaxTermsConflictError(current.code);
+            if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
+                throw new ChangeOrderTaxTermsConflictError(current.code);
+            }
+            approvalTerms = canonicalCoTaxTerms(estimateTax);
+        } else if (coTaxFingerprint({
+            taxExempt: current.termsTaxExempt,
+            taxRateName: current.termsTaxRateName,
+            taxRatePercent: current.termsTaxRatePercent,
+        }) !== approval.expectedTaxFingerprint) {
+            throw new ChangeOrderTaxTermsConflictError(current.code);
+        }
+
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
         const co = await tx.changeOrder.update({
             where: { id },
             data: {
@@ -412,7 +567,163 @@ export async function approveChangeOrderCore(
                 approvedBy: approval.signatureName.trim(),
                 approvedAt: approval.approvedAt,
                 clientSignatureUrl: approval.clientSignatureUrl,
+                ...(approvalTerms ? {
+                    termsTaxExempt: approvalTerms.taxExempt,
+                    termsTaxRateName: approvalTerms.taxRateName,
+                    termsTaxRatePercent: approvalTerms.taxRatePercent,
+                } : {}),
+                revision: { increment: 1 },
             },
+        });
+        await enqueueApprovalAutomation(tx, {
+            changeOrderId: id,
+            eventRevision: co.revision,
+            pricingType: current.pricingType,
+            approvalMode: "CLIENT",
+        });
+        return { co, transitioned: true };
+    }, { timeout: 15_000 });
+}
+
+/**
+ * Staff-side manual approval — lets an internal user flip a change order to
+ * Approved without the client ever visiting the portal. Distinct from
+ * approveChangeOrderCore (the customer's signed approval, which requires
+ * status Sent and a persisted signature): this accepts Draft or Sent, never
+ * writes clientSignatureUrl, and stamps approvedBy with a "(manual approval —
+ * staff)" suffix so the audit trail can never be mistaken for a client
+ * signature. Rejects a CO that is already Approved or already carries a
+ * client signature — the portal approval flow owns that state once it exists.
+ * Carries the same item/section-row/subtotal invariants as
+ * approveChangeOrderCore so a manually-approved CO can never reach billing in
+ * a state billChangeOrderCore would otherwise reject.
+ */
+export async function manuallyApproveChangeOrderCore(
+    id: string,
+    approval: { staffName: string; approvedAt: Date; expectedRevision: number; expectedTaxFingerprint: string },
+) {
+    return prisma.$transaction(async (tx) => {
+        // Lock order: Estimate FIRST, then the CO parent-row lock (repo-wide
+        // money order — holding the CO while acquiring Estimate deadlocks
+        // against Estimate-first flows; Codex round 7). The unlocked lookup
+        // is only a routing hint, revalidated after the CO lock is held.
+        const coRef = await tx.changeOrder.findUnique({
+            where: { id },
+            select: { estimateId: true },
+        });
+        if (!coRef) return null;
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${coRef.estimateId} FOR SHARE`;
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; status: string; pricingType: string; totalAmount: unknown;
+            clientSignatureUrl: string | null; revision: number; estimateId: string;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null;
+            termsTaxRatePercent: { toString(): string } | null;
+        }>>`
+            SELECT "id", "code", "status", "pricingType", "totalAmount", "clientSignatureUrl", "revision", "estimateId",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent"
+            FROM "ChangeOrder" WHERE "id" = ${id} FOR UPDATE`;
+        const current = locked[0];
+        if (!current) return null;
+        if (current.estimateId !== coRef.estimateId) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
+
+        // CAS guard FIRST, status second (Codex round 7): the client does
+        // save (request 1) then approve (request 2), and a concurrent edit
+        // between them must not bill stale values. revision is a monotonic
+        // counter bumped by every transaction that changes billing inputs
+        // (items, schedules, pricing, status, signatures) — a mismatch means
+        // the row changed underneath the caller since it loaded the page, and
+        // the caller must see the fixed REVISION_CONFLICT code even when that
+        // change also moved the status.
+        if (current.revision !== approval.expectedRevision) {
+            throw new ChangeOrderRevisionConflictError(current.code);
+        }
+
+        if (current.status !== "Draft" && current.status !== "Sent") {
+            throw new Error(`Change order ${current.code} must be Draft or Sent to be manually approved.`);
+        }
+        if (current.clientSignatureUrl) {
+            throw new Error(`Change order ${current.code} already has a client signature — use the portal approval flow.`);
+        }
+
+        if (!approval.staffName.trim()) throw new Error("Staff name is required to manually approve a change order.");
+
+        const paymentSchedules = await tx.changeOrderPaymentSchedule.findMany({
+            where: { changeOrderId: id },
+            orderBy: [{ order: "asc" }, { id: "asc" }],
+            select: { amount: true },
+        });
+        if (current.pricingType === "COST_PLUS" && paymentSchedules.length > 0) {
+            throw new Error("Cost-plus change orders cannot have a fixed payment schedule.");
+        }
+
+        const items = await tx.changeOrderItem.findMany({
+            where: { changeOrderId: id },
+            select: { name: true, type: true, quantity: true, unitCost: true },
+        });
+        // Legacy rows written before section headers were rejected at the write path.
+        const sectionRows = coSectionRowNames(items);
+        if (sectionRows.length > 0) throw new Error(coSectionRowError(current.code, sectionRows));
+        if (current.pricingType !== "COST_PLUS" && items.length === 0) {
+            throw new Error(`Change order ${current.code} must contain at least one priced item before it can be approved.`);
+        }
+
+        const storedSubtotalCents = Math.round(Number(current.totalAmount) * 100);
+        const renderedSubtotalCents = itemSubtotalCents(items);
+        if (current.pricingType !== "COST_PLUS" && (storedSubtotalCents <= 0 || renderedSubtotalCents <= 0)) {
+            throw new Error(`Change order ${current.code} must have a positive subtotal before it can be approved.`);
+        }
+        if (current.pricingType !== "COST_PLUS" && storedSubtotalCents !== renderedSubtotalCents) {
+            throw new Error(`Change order ${current.code} pricing is out of sync with its items — save and resend it before approval.`);
+        }
+        if (current.pricingType !== "COST_PLUS") {
+            const scheduleError = fixedCoScheduleValidationError(storedSubtotalCents, paymentSchedules);
+            if (scheduleError) throw new Error(scheduleError);
+        }
+
+        let approvalTerms: ReturnType<typeof canonicalCoTaxTerms> | null = null;
+        if (current.status === "Draft" || current.termsTaxExempt === null) {
+            // estimateTax was read under FOR SHARE at the TOP of this
+            // transaction (Estimate before CO), so a tax-only edit either
+            // committed before that lock or waits for this transaction.
+            if (!estimateTax) throw new ChangeOrderTaxTermsConflictError(current.code);
+            if (coTaxFingerprint(estimateTax) !== approval.expectedTaxFingerprint) {
+                throw new ChangeOrderTaxTermsConflictError(current.code);
+            }
+            approvalTerms = canonicalCoTaxTerms(estimateTax);
+        } else if (coTaxFingerprint({
+            taxExempt: current.termsTaxExempt,
+            taxRateName: current.termsTaxRateName,
+            taxRatePercent: current.termsTaxRatePercent,
+        }) !== approval.expectedTaxFingerprint) {
+            throw new ChangeOrderTaxTermsConflictError(current.code);
+        }
+
+        await prepareChangeOrderReviewJobsForMutation(tx, id);
+        const co = await tx.changeOrder.update({
+            where: { id },
+            data: {
+                status: "Approved",
+                approvedBy: `${approval.staffName.trim()}${MANUAL_CO_APPROVAL_SUFFIX}`,
+                approvedAt: approval.approvedAt,
+                ...(approvalTerms ? {
+                    termsTaxExempt: approvalTerms.taxExempt,
+                    termsTaxRateName: approvalTerms.taxRateName,
+                    termsTaxRatePercent: approvalTerms.taxRatePercent,
+                } : {}),
+                revision: { increment: 1 },
+            },
+        });
+        await enqueueApprovalAutomation(tx, {
+            changeOrderId: id,
+            eventRevision: co.revision,
+            pricingType: current.pricingType,
+            approvalMode: "MANUAL",
         });
         return { co, transitioned: true };
     }, { timeout: 15_000 });
@@ -453,6 +764,7 @@ export async function deleteChangeOrderCore(id: string) {
         if (current.status !== "Draft" || hasSignatureAudit) {
             throw new Error("Only unsigned Draft change orders can be deleted. Sent and signed records must remain in the audit trail.");
         }
+        await removeSafeReviewJobsForDraftDelete(tx, id);
         await tx.changeOrder.delete({ where: { id } });
         return current;
     }, { timeout: 15_000 });

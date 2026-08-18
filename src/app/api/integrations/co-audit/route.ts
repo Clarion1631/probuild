@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal } from "@/lib/co-tax";
+import { coTaxRate, coTaxLabel, coItemsSubtotal, coSectionRowNames, coSectionRowError, classifyCoTotal, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { prepareChangeOrderReviewJobsForMutation } from "@/lib/change-order-automation-jobs";
 
 // One-off data-repair surface for the pre-2026-07-09 change-order editor bug:
 // the editor saved totalAmount tax-INCLUSIVE (item subtotal × (1 + rate)) while
@@ -56,6 +57,7 @@ export async function GET(req: Request) {
             id: true, code: true, title: true, status: true, pricingType: true,
             totalAmount: true, balanceDue: true, createdAt: true, updatedAt: true,
             approvedAt: true, sentAt: true,
+            termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
             paymentSchedules: { select: { amount: true } },
             project: { select: { id: true, name: true } },
             estimate: { select: { code: true, taxExempt: true, taxRatePercent: true, taxRateName: true } },
@@ -77,7 +79,8 @@ export async function GET(req: Request) {
     const rows = cos.map(co => {
         const stored = rc(Number(co.totalAmount));
         const subtotal = coItemsSubtotal(co.items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
-        const rate = coTaxRate(co.estimate);
+        const taxInfo = effectiveCoTaxInfo(co, co.estimate);
+        const rate = coTaxRate(taxInfo);
         const tax = rc(subtotal * rate);
         const expectedBilled = rc(subtotal + tax); // what billing charges once fixed
         const inflated = rc(stored - subtotal);
@@ -115,7 +118,7 @@ export async function GET(req: Request) {
             sectionRowNames: sectionNames,
             itemSubtotal: subtotal,
             storedLineTotalsSum: rc(co.items.reduce((s, i) => s + Number(i.total), 0)),
-            taxTreatment: coTaxLabel(co.estimate),
+            taxTreatment: coTaxLabel(taxInfo),
             taxRate: rate,
             expectedBilledAmount: expectedBilled,
             storedMinusSubtotal: inflated,
@@ -158,13 +161,33 @@ export async function POST(req: Request) {
 
     const result = await prisma.$transaction(async tx => {
         // Row lock so a concurrent approve/send/bill serializes against the fix.
-        const locked = await tx.$queryRaw<Array<{ id: string; code: string; title: string; status: string; pricingType: string; totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string }>>`
-            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId"
+        const locked = await tx.$queryRaw<Array<{
+            id: string; code: string; title: string; status: string; pricingType: string;
+            totalAmount: unknown; balanceDue: unknown; projectId: string; estimateId: string;
+            termsTaxExempt: boolean | null; termsTaxRateName: string | null;
+            termsTaxRatePercent: { toString(): string } | null;
+            clientSignatureUrl: string | null; approvedBy: string | null; approvedAt: Date | null;
+            companySignatureUrl: string | null; companySignedBy: string | null; companySignedAt: Date | null;
+        }>>`
+            SELECT "id", "code", "title", "status", "pricingType", "totalAmount", "balanceDue", "projectId", "estimateId",
+                   "termsTaxExempt", "termsTaxRateName", "termsTaxRatePercent",
+                   "clientSignatureUrl", "approvedBy", "approvedAt",
+                   "companySignatureUrl", "companySignedBy", "companySignedAt"
             FROM "ChangeOrder" WHERE "id" = ${changeOrderId} FOR UPDATE`;
         const co = locked[0];
         if (!co) return { ok: false as const, error: "Change order not found" };
         if (co.status !== "Draft" && co.status !== "Sent") {
             return { ok: false as const, error: `${co.code} is "${co.status}" — only Draft/Sent change orders may be auto-corrected. Approved rows need human review (billed milestone).` };
+        }
+        if ([
+            co.clientSignatureUrl,
+            co.approvedBy,
+            co.approvedAt,
+            co.companySignatureUrl,
+            co.companySignedBy,
+            co.companySignedAt,
+        ].some(value => value != null)) {
+            return { ok: false as const, error: `${co.code} has signature or approval audit data — automated repair is forbidden. Review the signed scope by hand.` };
         }
         const stored = rc(Number(co.totalAmount));
         if (Math.abs(stored - expectedTotalAmount) > 0.005) {
@@ -183,11 +206,13 @@ export async function POST(req: Request) {
         // nor subtotal+tax) may carry an intentional edit, so it needs an
         // explicit force from a human.
         const subtotal = coItemsSubtotal(items.map(i => ({ type: i.type, quantity: i.quantity, unitCost: Number(i.unitCost) })));
-        const estimateTax = await tx.estimate.findUnique({
-            where: { id: co.estimateId },
-            select: { taxExempt: true, taxRatePercent: true, taxRateName: true },
-        });
-        const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(estimateTax)));
+        const [estimateTax] = await tx.$queryRaw<Array<{
+            taxExempt: boolean; taxRatePercent: { toString(): string } | null; taxRateName: string | null;
+        }>>`
+            SELECT "taxExempt", "taxRatePercent", "taxRateName"
+            FROM "Estimate" WHERE "id" = ${co.estimateId} FOR SHARE`;
+        const taxInfo = effectiveCoTaxInfo(co, estimateTax);
+        const expectedBilled = rc(subtotal + rc(subtotal * coTaxRate(taxInfo)));
         const sectionNames = coSectionRowNames(items);
         const verdict = classify(stored, subtotal, expectedBilled, items.length, sectionNames.length, co.pricingType);
         // Not repairable here: writing back a subtotal that excludes the headers would leave
@@ -243,9 +268,22 @@ export async function POST(req: Request) {
                 return { ok: false as const, error: `${co.code} has a payment schedule row of $0.00 or less. Billing refuses those after signature, so fix the schedule in the editor before resetting the total here.` };
             }
         }
+        await prepareChangeOrderReviewJobsForMutation(tx, changeOrderId);
         await tx.changeOrder.update({
             where: { id: changeOrderId },
-            data: { totalAmount: subtotal, balanceDue: subtotal },
+            data: {
+                totalAmount: subtotal,
+                balanceDue: subtotal,
+                ...(co.status === "Sent" ? {
+                    status: "Draft",
+                    sentAt: null,
+                    viewedAt: null,
+                    termsTaxExempt: null,
+                    termsTaxRateName: null,
+                    termsTaxRatePercent: null,
+                } : {}),
+                revision: { increment: 1 },
+            },
         });
         return {
             ok: true as const, changed: true, code: co.code, title: co.title, projectId: co.projectId, verdict,

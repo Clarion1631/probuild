@@ -11,6 +11,7 @@ import {
 } from "../src/lib/billing-core";
 import { approveChangeOrderCore, updateChangeOrderCore } from "../src/lib/change-order-core";
 import { approveChangeOrderWithSignature } from "../src/lib/change-order-approval";
+import { coTaxFingerprint, effectiveCoTaxInfo } from "../src/lib/co-tax";
 import {
   calculateCrewTimeCosts,
   createExpenseCore,
@@ -24,6 +25,7 @@ import { reconcileMilestoneToQbo } from "../src/lib/quickbooks-payments";
 import { querySalesTaxData } from "../src/lib/sales-tax-report";
 import { signClientPortalToken } from "../src/lib/client-portal-auth";
 import { dateOnlyInTimeZone, endOfDateInTimeZone, resolveCompanyTimeZone } from "../src/lib/company-timezone";
+import { generateChangeOrderPdf } from "../src/lib/pdf";
 
 const prisma = new PrismaClient();
 const run = `cpco-${process.pid}-${Date.now()}`;
@@ -37,12 +39,14 @@ const IDS = {
   estimateA: `${run}-estimate-a`,
   estimateSplit: `${run}-estimate-split`,
   estimateB: `${run}-estimate-b`,
+  estimateSnapshot: `${run}-estimate-snapshot`,
   invoiceA: `${run}-invoice-a`,
   invoiceSplit: `${run}-invoice-split`,
   invoiceTax: `${run}-invoice-tax`,
   invoiceReconcile: `${run}-invoice-reconcile`,
   invoiceB: `${run}-invoice-b`,
   invoiceGuard: `${run}-invoice-guard`,
+  invoiceSnapshot: `${run}-invoice-snapshot`,
   receipt: `${run}-receipt`,
   costPlusZero: `${run}-co-zero`,
   dstCo: `${run}-co-dst`,
@@ -50,9 +54,16 @@ const IDS = {
   splitCo: `${run}-co-split`,
   lumpCo: `${run}-co-lump`,
   deniedCo: `${run}-co-denied`,
+  snapshotFixedCo: `${run}-co-snapshot-fixed`,
+  snapshotCostPlusCo: `${run}-co-snapshot-cost-plus`,
+  legacyCostPlusRace: `${run}-co-legacy-tax-race`,
+  metadataFingerprintCo: `${run}-co-metadata-fingerprint`,
   itemA: `${run}-item-a`,
   itemB: `${run}-item-b`,
 } as const;
+
+const approveAsClientA: typeof approveChangeOrderCore = (changeOrderId, approval) =>
+  approveChangeOrderCore(changeOrderId, { ...approval, expectedClientId: IDS.clientA });
 
 let costPlusId = "";
 let costPlusBillingId = "";
@@ -68,6 +79,41 @@ async function rejectionMessage(promise: Promise<unknown>): Promise<string> {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  await import("@napi-rs/canvas").catch(() => null);
+  const pdfParseMod: any = await import("pdf-parse");
+  const PDFParseCtor = pdfParseMod.PDFParse ?? pdfParseMod.default?.PDFParse;
+  const workerMod: any = await import("pdf-parse/worker").catch(() => null);
+  const workerData = workerMod?.getData?.();
+  if (workerData && typeof PDFParseCtor.setWorker === "function") PDFParseCtor.setWorker(workerData);
+  const parser = new PDFParseCtor({ data: buffer });
+  try {
+    return (await parser.getText())?.text ?? "";
+  } finally {
+    await parser.destroy?.();
+  }
+}
+
+async function waitForBlockedEstimateLockOrEarlySettlement(isSettled: () => boolean, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (isSettled()) throw new Error("Cost-plus billing settled before it acquired the locked Estimate tax row");
+    const [row] = await prisma.$queryRaw<Array<{ waiting: number }>>`
+      SELECT COUNT(*)::int AS waiting
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND pid <> pg_backend_pid()
+        AND state = 'active'
+        AND wait_event_type = 'Lock'
+        AND query LIKE '%FROM "Estimate"%'
+        AND query LIKE '%FOR UPDATE%'
+    `;
+    if (Number(row?.waiting ?? 0) > 0) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for cost-plus billing to lock the Estimate tax row");
 }
 
 const billingTestDependencies = {
@@ -140,6 +186,18 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
           totalAmount: 0,
           balanceDue: 0,
           taxExempt: true,
+        },
+        {
+          id: IDS.estimateSnapshot,
+          code: `${run}-EST-SNAPSHOT`,
+          title: "Tax snapshot estimate",
+          projectId: IDS.projectA,
+          status: "Approved",
+          totalAmount: 0,
+          balanceDue: 0,
+          taxRateName: "Live changed rate",
+          taxRatePercent: 10,
+          taxExempt: false,
         },
       ],
     });
@@ -220,6 +278,19 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
           totalAmount: 100,
           balanceDue: 100,
         },
+        {
+          id: IDS.invoiceSnapshot,
+          code: `${run}-INV-SNAPSHOT`,
+          projectId: IDS.projectA,
+          clientId: IDS.clientA,
+          estimateId: IDS.estimateSnapshot,
+          status: "Draft",
+          subtotal: 0,
+          taxRate: 8.8,
+          taxAmount: 0,
+          totalAmount: 0,
+          balanceDue: 0,
+        },
       ],
     });
     await prisma.estimateItem.createMany({
@@ -247,15 +318,16 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         where: { changeOrder: { projectId: { in: [IDS.projectA, IDS.projectB] } } },
       });
       await prisma.paymentSchedule.deleteMany({
-        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } },
+        where: { invoiceId: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard, IDS.invoiceSnapshot] } },
       });
       await prisma.timeEntry.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
-      await prisma.expense.deleteMany({ where: { estimateId: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
+      await prisma.expense.deleteMany({ where: { estimateId: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB, IDS.estimateSnapshot] } } });
+      await prisma.changeOrderAutomationJob.deleteMany({ where: { changeOrder: { projectId: { in: [IDS.projectA, IDS.projectB] } } } });
       await prisma.changeOrder.deleteMany({ where: { projectId: { in: [IDS.projectA, IDS.projectB] } } });
-      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard] } } });
+      await prisma.invoice.deleteMany({ where: { id: { in: [IDS.invoiceA, IDS.invoiceSplit, IDS.invoiceTax, IDS.invoiceReconcile, IDS.invoiceB, IDS.invoiceGuard, IDS.invoiceSnapshot] } } });
       await prisma.estimateItem.deleteMany({ where: { id: { in: [IDS.itemA, IDS.itemB] } } });
       await prisma.projectFile.deleteMany({ where: { id: IDS.receipt } });
-      await prisma.estimate.deleteMany({ where: { id: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB] } } });
+      await prisma.estimate.deleteMany({ where: { id: { in: [IDS.estimateA, IDS.estimateSplit, IDS.estimateB, IDS.estimateSnapshot] } } });
       await prisma.project.deleteMany({ where: { id: { in: [IDS.projectA, IDS.projectB] } } });
       await prisma.client.deleteMany({ where: { id: { in: [IDS.clientA, IDS.clientB] } } });
       await prisma.user.deleteMany({ where: { id: IDS.user } });
@@ -279,8 +351,15 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     if (!draft.ok) throw new Error(draft.error);
     costPlusId = draft.changeOrderId;
 
+    const sendGuard = await prisma.changeOrder.findUniqueOrThrow({
+      where: { id: costPlusId },
+      include: { estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } } },
+    });
+
     let sentHtml = "";
     const sent = await sendChangeOrderToClientCore(costPlusId, {
+      expectedRevision: sendGuard.revision,
+      expectedTaxFingerprint: coTaxFingerprint(effectiveCoTaxInfo(sendGuard, sendGuard.estimate)),
       sendNotification: async (_to, _subject, html) => {
         sentHtml = html;
         return { success: true, id: "playwright-mock-email" };
@@ -292,25 +371,22 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     expect(sentHtml).toContain("Billed from actual time and materials");
     expect(sentHtml).toContain("Cost + 10% + tax");
     await page.goto(`/portal/change-orders/${costPlusId}`);
-    await page.getByRole("button", { name: "Sign & Approve Change Order" }).click();
-    const canvas = page.locator("canvas");
-    const box = await canvas.boundingBox();
-    if (!box) throw new Error("Signature canvas was not visible");
-    await page.mouse.move(box.x + 80, box.y + 100);
-    await page.mouse.down();
-    await page.mouse.move(box.x + 170, box.y + 70, { steps: 6 });
-    await page.mouse.move(box.x + 250, box.y + 110, { steps: 6 });
-    await page.mouse.up();
-    await page.getByPlaceholder("e.g. John A. Doe").fill("Client A");
-    await expect(page.getByRole("button", { name: "Sign & Approve", exact: true })).toBeEnabled();
-    const capturedSignature = await canvas.evaluate((element) => (element as HTMLCanvasElement).toDataURL("image/png"));
+    await expect(page.getByRole("heading", { name: "Staff Preview — Read Only" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sign & Approve Change Order" })).toHaveCount(0);
+
+    // This suite runs with the staff storage state. Exercise the client approval
+    // pipeline directly with the exact owning client; portal-session ownership
+    // and cross-client rejection have their own auth-focused coverage.
+    const capturedSignature = "data:image/png;base64,AA==";
     const emptyApproval = await approveChangeOrderWithSignature(costPlusId, {
       signatureName: "Client A",
       signatureDataUrl: capturedSignature,
       approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+      expectedRevision: sent.success ? sent.revision : -1,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRatePercent: 10, taxRateName: "Test 10%" }),
     }, {
       persistSignature: async (value) => ({ url: value, discard: async () => undefined }),
-      approveCore: approveChangeOrderCore,
+      approveCore: approveAsClientA,
     });
     expect(emptyApproval?.co.status).toBe("Approved");
 
@@ -329,10 +405,12 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
         items: { create: { name: "Unknown until opened", quantity: 1, unitCost: 0, total: 0 } },
       },
     });
-    const zeroApproval = await approveChangeOrderCore(IDS.costPlusZero, {
+    const zeroApproval = await approveAsClientA(IDS.costPlusZero, {
       signatureName: "Client A",
       clientSignatureUrl: "data:image/png;base64,AA==",
       approvedAt: new Date("2026-07-15T12:01:00.000Z"),
+      expectedRevision: 0,
+      expectedTaxFingerprint: coTaxFingerprint({ taxExempt: false, taxRatePercent: 10, taxRateName: "Test 10%" }),
     });
     expect(zeroApproval?.co.status).toBe("Approved");
   });
@@ -656,6 +734,7 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
       },
     });
     await updateChangeOrderCore(IDS.splitCo, {
+      expectedRevision: 0,
       paymentSchedules: [
         { name: "Start", amount: 50, dueDate: "2026-07-20", order: 0 },
         { name: "Finish", amount: 50.01, dueDate: "2026-08-05", order: 1 },
@@ -757,6 +836,209 @@ test.describe.serial("PB-pipeline-004 cost-plus and split change orders", () => 
     expect(dollars(invoice.subtotal)).toBe(310);
     expect(dollars(invoice.taxAmount)).toBe(26);
     expect(dollars(invoice.balanceDue)).toBe(336);
+  });
+
+  test("CPCO8A: approved tax snapshots survive later estimate edits in renders and both billing modes", async ({ page }) => {
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.snapshotFixedCo,
+        code: `${run}-CO-SNAPSHOT-FIXED`,
+        title: "Approval tax snapshot fixed",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "FIXED",
+        totalAmount: 100,
+        balanceDue: 100,
+        approvedBy: "Snapshot Client",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        termsTaxExempt: false,
+        termsTaxRateName: "Approval snapshot",
+        termsTaxRatePercent: 8.8,
+        items: { create: { name: "Snapshot fixed work", quantity: 1, unitCost: 100, total: 100 } },
+      },
+    });
+
+    // The linked estimate says 10%, but an approved CO must keep rendering
+    // and billing the 8.8% terms frozen above.
+    await page.goto(`/portal/change-orders/${IDS.snapshotFixedCo}`);
+    await expect.soft(page.getByText("Approval snapshot (8.8%)", { exact: true })).toBeVisible();
+    await expect.soft(page.getByText("$108.80", { exact: true })).toBeVisible();
+
+    const pdfText = await extractPdfText(await generateChangeOrderPdf(IDS.snapshotFixedCo));
+    expect.soft(pdfText).toContain("Approval snapshot (8.8%)");
+    expect.soft(pdfText).toContain("$108.80");
+
+    const fixed = await billChangeOrderCore(IDS.snapshotFixedCo, billingTestDependencies);
+    expect(fixed.ok).toBe(true);
+    if (!fixed.ok) throw new Error(fixed.error);
+    expect.soft(fixed.taxLabel).toBe("Approval snapshot (8.8%)");
+    expect.soft(fixed.taxAmount).toBe(8.8);
+    expect.soft(fixed.amount).toBe(108.8);
+
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.snapshotCostPlusCo,
+        code: `${run}-CO-SNAPSHOT-COST-PLUS`,
+        title: "Approval tax snapshot cost plus",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "COST_PLUS",
+        markupPercent: 0,
+        totalAmount: 0,
+        balanceDue: 0,
+        approvedBy: "Snapshot Client",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        termsTaxExempt: false,
+        termsTaxRateName: "Approval snapshot",
+        termsTaxRatePercent: 8.8,
+      },
+    });
+    await prisma.timeEntry.create({
+      data: {
+        projectId: IDS.projectA,
+        userId: IDS.user,
+        changeOrderId: IDS.snapshotCostPlusCo,
+        startTime: new Date("2026-07-15T10:00:00.000Z"),
+        durationHours: 1,
+        laborCost: 100,
+        burdenCost: 0,
+        isBillable: true,
+      },
+    });
+
+    const preview = await previewCostPlusChangeOrderCore(IDS.snapshotCostPlusCo, { throughDate: "2026-07-15" });
+    expect.soft(preview.taxLabel).toBe("Approval snapshot (8.8%)");
+    expect.soft(preview.taxCents).toBe(880);
+    expect.soft(preview.totalCents).toBe(10_880);
+
+    const billed = await billCostPlusChangeOrderCore(IDS.snapshotCostPlusCo, {
+      throughDate: "2026-07-15",
+      actor: "Playwright tax snapshot",
+      expectedFingerprint: preview.fingerprint,
+    });
+    expect.soft(billed.taxCents).toBe(880);
+    expect.soft(billed.totalCents).toBe(10_880);
+  });
+
+  test("CPCO8B: legacy Approved/null cost-plus billing locks Estimate tax and snapshots the committed terms", async () => {
+    await prisma.estimate.update({
+      where: { id: IDS.estimateSnapshot },
+      data: { taxExempt: false, taxRatePercent: 10, taxRateName: "Before locked race" },
+    });
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.legacyCostPlusRace,
+        code: `${run}-CO-LEGACY-RACE`,
+        title: "Legacy cost-plus tax race",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "COST_PLUS",
+        markupPercent: 0,
+        totalAmount: 0,
+        balanceDue: 0,
+        approvedBy: "Legacy signer",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        termsTaxExempt: null,
+        termsTaxRateName: null,
+        termsTaxRatePercent: null,
+      },
+    });
+    await prisma.timeEntry.create({
+      data: {
+        projectId: IDS.projectA,
+        userId: IDS.user,
+        changeOrderId: IDS.legacyCostPlusRace,
+        startTime: new Date("2026-07-15T10:00:00.000Z"),
+        durationHours: 1,
+        laborCost: 100,
+        burdenCost: 0,
+        isBillable: true,
+      },
+    });
+
+    let lockReady!: () => void;
+    let release!: () => void;
+    const locked = new Promise<void>(resolve => { lockReady = resolve; });
+    const releaseGate = new Promise<void>(resolve => { release = resolve; });
+    const blocker = prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM "Estimate" WHERE id = ${IDS.estimateSnapshot} FOR UPDATE`;
+      lockReady();
+      await releaseGate;
+      await tx.estimate.update({
+        where: { id: IDS.estimateSnapshot },
+        data: { taxExempt: false, taxRatePercent: 12.5, taxRateName: "Cost-plus locked race winner" },
+      });
+    }, { timeout: 15_000 });
+
+    await locked;
+    let settled = false;
+    const billing = billCostPlusChangeOrderCore(IDS.legacyCostPlusRace, {
+      throughDate: "2026-07-15",
+      actor: "Playwright legacy tax race",
+    }).finally(() => { settled = true; });
+    try {
+      await waitForBlockedEstimateLockOrEarlySettlement(() => settled);
+    } finally {
+      release();
+    }
+    await blocker;
+    const billed = await billing;
+    expect(billed.taxCents).toBe(1_250);
+    expect(billed.totalCents).toBe(11_250);
+    const stored = await prisma.changeOrder.findUniqueOrThrow({ where: { id: IDS.legacyCostPlusRace } });
+    expect(stored).toMatchObject({ termsTaxExempt: false, termsTaxRateName: "Cost-plus locked race winner" });
+    expect(Number(stored.termsTaxRatePercent)).toBe(12.5);
+    await prisma.estimate.update({
+      where: { id: IDS.estimateSnapshot },
+      data: { taxExempt: false, taxRatePercent: 10, taxRateName: "Live changed rate" },
+    });
+  });
+
+  test("CPCO8C: cost-plus confirmation fingerprint binds customer-visible backup metadata", async () => {
+    await prisma.changeOrder.create({
+      data: {
+        id: IDS.metadataFingerprintCo,
+        code: `${run}-CO-METADATA`,
+        title: "Metadata fingerprint",
+        projectId: IDS.projectA,
+        estimateId: IDS.estimateSnapshot,
+        status: "Approved",
+        pricingType: "COST_PLUS",
+        markupPercent: 0,
+        totalAmount: 0,
+        balanceDue: 0,
+        approvedBy: "Metadata signer",
+        approvedAt: new Date("2026-07-15T12:00:00.000Z"),
+        termsTaxExempt: false,
+        termsTaxRateName: "Approval snapshot",
+        termsTaxRatePercent: 8.8,
+      },
+    });
+    const time = await prisma.timeEntry.create({
+      data: {
+        projectId: IDS.projectA,
+        userId: IDS.user,
+        changeOrderId: IDS.metadataFingerprintCo,
+        startTime: new Date("2026-07-15T10:00:00.000Z"),
+        durationHours: 1,
+        laborCost: 100,
+        burdenCost: 0,
+        notes: "Previewed customer note",
+        isBillable: true,
+      },
+    });
+    const preview = await previewCostPlusChangeOrderCore(IDS.metadataFingerprintCo, { throughDate: "2026-07-15" });
+    await prisma.timeEntry.update({ where: { id: time.id }, data: { notes: "Changed customer note" } });
+
+    await expect(billCostPlusChangeOrderCore(IDS.metadataFingerprintCo, {
+      throughDate: "2026-07-15",
+      actor: "Playwright metadata fingerprint",
+      expectedFingerprint: preview.fingerprint,
+    })).rejects.toThrow(/time or expenses changed since the preview/i);
+    expect(await prisma.changeOrderBilling.count({ where: { changeOrderId: IDS.metadataFingerprintCo } })).toBe(0);
   });
 
   test("CPCO9 amendments C/D: backup PDF allows staff and matching client token, rejects cross-client token", async ({ page }) => {

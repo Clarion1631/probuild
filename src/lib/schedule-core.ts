@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { withTxRetry } from "./tx-retry";
 import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
-import { coSignedAmount, coTaxRate } from "./co-tax";
+import { allocateCoScheduleGross, coSignedAmount, coTaxRate, effectiveCoTaxInfo } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
@@ -843,7 +843,7 @@ async function runShiftNotStartedTasks(
                     scheduleTaskId: { in: shiftedTaskIds },
                     dueDate: { not: null },
                 },
-                orderBy: { id: "asc" },
+                orderBy: [{ order: "asc" }, { id: "asc" }],
                 select: { id: true, name: true },
             });
             for (const milestone of estimateMilestones) {
@@ -1881,6 +1881,7 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
         where: { status: "Approved" },
         select: {
             id: true, code: true, title: true, totalAmount: true, projectId: true,
+            status: true, termsTaxExempt: true, termsTaxRateName: true, termsTaxRatePercent: true,
             estimate: { select: { taxExempt: true, taxRatePercent: true, taxRateName: true } },
             project: { select: { id: true, name: true } },
             paymentSchedules: {
@@ -1907,8 +1908,10 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
     for (const co of cos) {
         if (isBilled(co.projectId, co.code)) continue;
         const taskStartById = new Map(co.generatedScheduleTasks.map(t => [t.id, t.startDate]));
+        const taxInfo = effectiveCoTaxInfo(co, co.estimate);
         if (co.paymentSchedules.length > 0) {
-            for (const row of co.paymentSchedules) {
+            const customerSchedules = allocateCoScheduleGross(Number(co.totalAmount), co.paymentSchedules, taxInfo);
+            for (const row of customerSchedules) {
                 const effective = row.dueDate ?? (row.scheduleTaskId ? taskStartById.get(row.scheduleTaskId) : undefined) ?? null;
                 if (!effective || effective < from || effective >= to) continue;
                 rows.push({
@@ -1917,7 +1920,7 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
                     code: co.code,
                     title: co.title,
                     name: row.name,
-                    amount: Number(row.amount),
+                    amount: row.grossCents / 100,
                     effectiveDueDate: effective.toISOString(),
                     projectId: co.project?.id ?? null,
                     projectName: co.project?.name ?? null,
@@ -1925,7 +1928,7 @@ export async function getChangeOrderOverlayRows(from: Date, to: Date): Promise<O
                 });
             }
         } else {
-            const signedAmount = coSignedAmount(Number(co.totalAmount), co.estimate);
+            const signedAmount = coSignedAmount(Number(co.totalAmount), taxInfo);
             const synthDate = co.generatedScheduleTasks[0]?.startDate ?? null;
             if (!synthDate || synthDate < from || synthDate >= to) continue;
             rows.push({
@@ -2750,6 +2753,8 @@ async function runApplyChangeOrderToSchedule(
         const createdRows: GeneratedTaskRow[] = [];
         let skipped = 0;
         let milestonesLinked = 0;
+        const coTaxInfo = effectiveCoTaxInfo(co, co.estimate);
+        const customerSchedules = allocateCoScheduleGross(Number(co.totalAmount), co.paymentSchedules, coTaxInfo);
 
         // ── regenerate: delete eligible CO-provenance subtrees first ──
         if (mode === "regenerate") {
@@ -2939,10 +2944,10 @@ async function runApplyChangeOrderToSchedule(
                 if (task) milestoneTaskIdByRowId.set(row.id, task.id);
             }
             if (mode === "regenerate") {
-                const totalRowsAmount = co.paymentSchedules.reduce((sum, row) => sum + Number(row.amount), 0);
+                const totalRowsAmount = customerSchedules.reduce((sum, row) => sum + row.grossCents, 0);
                 let cumulative = 0;
-                for (const row of co.paymentSchedules) {
-                    cumulative += Number(row.amount);
+                for (const row of customerSchedules) {
+                    cumulative += row.grossCents;
                     if (milestoneTaskIdByRowId.has(row.id)) continue;
                     const derived = totalRowsAmount > 0
                         ? addDays(milestoneBase, Math.round((Math.min(cumulative, totalRowsAmount) / totalRowsAmount) * coWindowDays))
@@ -3024,11 +3029,11 @@ async function runApplyChangeOrderToSchedule(
 
             // Milestones: canonical date = dueDate if set, else cumulative
             // amount-share of the CO window by (order, id).
-            const totalRowsAmount = co.paymentSchedules.reduce((s, r) => s + Number(r.amount), 0);
+            const totalRowsAmount = customerSchedules.reduce((sum, row) => sum + row.grossCents, 0);
             if (co.paymentSchedules.length > 0) {
                 let cumAmount = 0;
-                for (const row of co.paymentSchedules) {
-                    cumAmount += Number(row.amount);
+                for (const row of customerSchedules) {
+                    cumAmount += row.grossCents;
                     const derived = totalRowsAmount > 0
                         ? addDays(coWindowStart, Math.round((Math.min(cumAmount, totalRowsAmount) / totalRowsAmount) * coWindowDays))
                         : addDays(coWindowStart, coWindowDays);
@@ -3049,7 +3054,7 @@ async function runApplyChangeOrderToSchedule(
                 // Zero-row fallback (R1 fix 4): one synthesized milestone at the
                 // CO block's end projecting signedAmount (totalAmount + tax via
                 // co-tax.ts — the same amount billing will invoice).
-                const signedAmount = coSignedAmount(Number(co.totalAmount), co.estimate);
+                const signedAmount = coSignedAmount(Number(co.totalAmount), coTaxInfo);
                 const blockEnd = addDays(coWindowStart, coWindowDays);
                 const mTask = await createTask({
                     name: `${co.code} payment`,
@@ -3063,6 +3068,11 @@ async function runApplyChangeOrderToSchedule(
                 milestoneTaskIds.push(mTask.id);
                 notes.push(`${co.code} has no payment schedule rows — synthesized one "${co.code} payment" milestone ($${signedAmount.toFixed(2)} projected) at the block end.`);
             }
+        }
+
+        if (provenanceCount > 0 && co.paymentSchedules.length === 0) {
+            const signedAmount = coSignedAmount(Number(co.totalAmount), coTaxInfo);
+            notes.push(`${co.code} has no payment schedule rows — existing synthesized "${co.code} payment" milestone remains $${signedAmount.toFixed(2)} projected.`);
         }
 
         // ── Linking (fresh + merge-converged): set scheduleTaskId on the CO

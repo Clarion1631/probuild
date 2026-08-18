@@ -13,7 +13,7 @@ import {
     selectedBillableRows,
 } from "../src/lib/estimate-item-payload";
 import { buildQBEstimateLines } from "../src/lib/quickbooks";
-import { billableCoItems, classifyCoTotal, coItemsSubtotal, coSectionRowNames } from "../src/lib/co-tax";
+import { billableCoItems, classifyCoTotal, coItemsSubtotal, coSectionRowNames, effectiveCoTaxInfo } from "../src/lib/co-tax";
 
 type Row = {
     id: string;
@@ -565,10 +565,25 @@ test("billableCoItems drops section rows without guessing at their meaning", () 
     assert.deepEqual(coSectionRowNames([{ type: "Material", name: "Tile" }]), []);
 });
 
+test("effectiveCoTaxInfo uses the sent terms tuple even when the estimate later changes", () => {
+    assert.deepEqual(
+        effectiveCoTaxInfo(
+            { status: "Approved", termsTaxExempt: false, termsTaxRateName: "Sent terms", termsTaxRatePercent: 8.8 },
+            { taxExempt: false, taxRateName: "Live changed rate", taxRatePercent: 10 },
+        ),
+        { taxExempt: false, taxRateName: "Sent terms", taxRatePercent: 8.8 },
+    );
+});
+
+test("effectiveCoTaxInfo deliberately falls back to the live estimate for legacy Approved null terms", () => {
+    const estimate = { taxExempt: false, taxRateName: "Legacy live rate", taxRatePercent: 8.9 };
+    assert.equal(effectiveCoTaxInfo({ status: "Approved", termsTaxExempt: null }, estimate), estimate);
+});
+
 test("every money path refuses a change order carrying section headers", () => {
     const root = path.join(__dirname, "..");
     const guarded = {
-        "src/lib/change-order-core.ts": 2,   // write + approve
+        "src/lib/change-order-core.ts": 3,   // write + approve + manual approve
         "src/lib/billing-core.ts": 2,        // send + bill
     };
     for (const [file, expected] of Object.entries(guarded)) {

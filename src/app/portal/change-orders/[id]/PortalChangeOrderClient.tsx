@@ -6,10 +6,19 @@ import SignaturePad from "@/components/SignaturePad";
 import Link from "next/link";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
-import { coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems } from "@/lib/co-tax";
+import { allocateCoScheduleGross, coTaxFingerprint, coTaxRate, coTaxLabel, coLineCents, coItemsSubtotal, billableCoItems, effectiveCoTaxInfo } from "@/lib/co-tax";
+import { isManualCoApproval, staffNameFromManualApprovedBy } from "@/lib/co-approval";
 import { buildPdf } from "@/lib/build-pdf";
 
-export default function PortalChangeOrderClient({ initialData, companySettings }: { initialData: any, companySettings?: any }) {
+export default function PortalChangeOrderClient({
+    initialData,
+    companySettings,
+    isStaffPreview,
+}: {
+    initialData: any;
+    companySettings?: any;
+    isStaffPreview: boolean;
+}) {
     const [isApproving, setIsApproving] = useState(false);
     const [signature, setSignature] = useState("");
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
@@ -31,7 +40,24 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
         setError("");
         try {
             const userAgent = window.navigator.userAgent;
-            await approveChangeOrder(initialData.id, signature.trim(), userAgent, signatureDataUrl);
+            const result = await approveChangeOrder(
+                initialData.id,
+                signature.trim(),
+                userAgent,
+                signatureDataUrl,
+                initialData.revision,
+                coTaxFingerprint(taxInfo),
+            );
+            // null means the approval core refused silently (expired portal
+            // authorization, internal identity, lost ownership). Never show
+            // success for it (Codex round 7).
+            if (!result || ("success" in result && !result.success)) {
+                if (!result) {
+                    toast.error("Your session or access to this change order changed. Reloading\u2026");
+                }
+                window.location.reload();
+                return;
+            }
             toast.success("Change Order Approved!");
             window.location.reload();
         } catch (e: any) {
@@ -45,6 +71,11 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     const isApproved = initialData.status === "Approved";
     const isSent = initialData.status === "Sent";
     const isDeclined = initialData.status === "Declined";
+    // Staff can approve on the client's behalf without a signature (manual
+    // approval) — the badge below must never claim the client signed something
+    // they never saw. See src/lib/co-approval.ts.
+    const isManualApproval = isManualCoApproval(initialData);
+    const manualApprovedByName = staffNameFromManualApprovedBy(initialData.approvedBy);
     // Draft covers "never sent yet" and "pulled back for edits after being sent" — the
     // client-facing copy already calls this state "Under Revision" in the skipped panel
     // below; the badge reuses that same label so a Draft/superseded CO never reads as
@@ -94,11 +125,13 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
     // customers pay none) — the amount shown here is what the customer signs
     // AND what billing charges, to the cent.
     const subtotal = coItemsSubtotal(items);
-    const tax = Math.round(subtotal * coTaxRate(initialData.estimate) * 100) / 100;
+    const taxInfo = effectiveCoTaxInfo(initialData, initialData.estimate);
+    const tax = Math.round(subtotal * coTaxRate(taxInfo) * 100) / 100;
     const total = Math.round((subtotal + tax) * 100) / 100;
-    const taxLabel = coTaxLabel(initialData.estimate);
+    const taxLabel = coTaxLabel(taxInfo);
     const isCostPlus = initialData.pricingType === "COST_PLUS";
-    const schedules = initialData.paymentSchedules || [];
+    const schedules = allocateCoScheduleGross(subtotal, initialData.paymentSchedules || [], taxInfo)
+        .map((row: any) => ({ ...row, amount: row.grossCents / 100 }));
 
     // Split on blank lines so each paragraph can be its own top-level data-pdf-row —
     // build-pdf.ts hard-slices any row taller than one page, which can cut through a
@@ -172,11 +205,17 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                         )}
                         {isDownloading ? "Generating..." : "Download PDF"}
                     </button>
-                    <Link data-pdf-skip="true" href={`/portal/projects/${initialData.projectId}`} className="text-sm text-blue-600 hover:underline">
-                        Back to Portal
+                    <Link
+                        data-pdf-skip="true"
+                        href={isStaffPreview
+                            ? `/projects/${initialData.projectId}/change-orders/${initialData.id}`
+                            : `/portal/projects/${initialData.projectId}`}
+                        className="text-sm text-blue-600 hover:underline"
+                    >
+                        {isStaffPreview ? "Back to Staff Change Order" : "Back to Portal"}
                     </Link>
                     {isApproved && (
-                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Approved & Signed</span>
+                        <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">{isManualApproval ? "✓ Approved" : "✓ Approved & Signed"}</span>
                     )}
                 </div>
             </header>
@@ -294,8 +333,14 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                     <svg className="h-4 w-4 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
                                 </div>
                                 <div>
-                                    <h3 className="text-sm font-semibold text-green-800">Electronically Signed and Approved</h3>
-                                    <p className="text-sm text-green-700 mt-0.5">Signed by: <strong>{initialData.approvedBy}</strong></p>
+                                    <h3 className="text-sm font-semibold text-green-800">
+                                        {isManualApproval ? "Approved by Staff (Manual Approval)" : "Electronically Signed and Approved"}
+                                    </h3>
+                                    <p className="text-sm text-green-700 mt-0.5">
+                                        {isManualApproval
+                                            ? <>Approved by <strong>{companyName} staff</strong>{manualApprovedByName ? ` — ${manualApprovedByName}` : ""}</>
+                                            : <>Signed by: <strong>{initialData.approvedBy}</strong></>}
+                                    </p>
                                     <p className="text-xs text-green-600 mt-0.5">{new Date(initialData.approvedAt).toLocaleString()}</p>
                                 </div>
                             </div>
@@ -397,7 +442,7 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                     </div>
 
                     {/* Signature / Approval Area */}
-                    {isSent && (
+                    {isSent && !isStaffPreview && (
                         <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
                             <div className="border-t-2 border-slate-200 pt-8">
                                 <div className="text-center max-w-lg mx-auto">
@@ -464,6 +509,22 @@ export default function PortalChangeOrderClient({ initialData, companySettings }
                                         </div>
                                     )}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+                    {isSent && isStaffPreview && (
+                        <div data-pdf-skip="true" className="px-5 sm:px-10 pb-10 print:hidden">
+                            <div className="border-t-2 border-slate-200 pt-8 text-center">
+                                <h3 className="text-lg font-bold text-slate-800 mb-2">Staff Preview — Read Only</h3>
+                                <p className="text-sm text-slate-500 max-w-xl mx-auto mb-5">
+                                    Client signature controls are disabled in staff preview. To record an approval on the client&apos;s behalf, use Manual Approve from the staff change-order editor so the audit trail identifies it as a staff action.
+                                </p>
+                                <Link
+                                    href={`/projects/${initialData.projectId}/change-orders/${initialData.id}`}
+                                    className="hui-btn hui-btn-secondary inline-flex"
+                                >
+                                    Open Staff Change Order for Manual Approve
+                                </Link>
                             </div>
                         </div>
                     )}

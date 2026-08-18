@@ -42,7 +42,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                 {/* Summary Metrics */}
                 <div className="grid grid-cols-4 gap-4 mb-6">
                     <div className="hui-card p-4 border-l-4 border-l-blue-500">
-                        <p className="text-xs font-semibold text-hui-textMuted uppercase">Total (All COs)</p>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase">Pre-tax total (All COs)</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
                             {formatCurrency(totalCOs)}
                         </p>
@@ -58,7 +58,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                         </p>
                     </div>
                     <div className="hui-card p-4 border-l-4 border-l-amber-500">
-                        <p className="text-xs font-semibold text-hui-textMuted uppercase">Balance</p>
+                        <p className="text-xs font-semibold text-hui-textMuted uppercase">Pre-tax CO balance</p>
                         <p className="text-2xl font-bold text-hui-textMain mt-1">
                             {formatCurrency(totalCOs)}
                         </p>
@@ -74,7 +74,7 @@ export default async function ChangeOrdersPage({ params }: { params: Promise<{ i
                                 <th className="px-4 py-3 font-semibold">Status</th>
                                 <th className="px-4 py-3 font-semibold">Base Estimate</th>
                                 <th className="px-4 py-3 font-semibold">Created</th>
-                                <th className="px-4 py-3 relative text-right">Total</th>
+                                <th className="px-4 py-3 relative text-right">Pre-tax total</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-hui-border text-sm">

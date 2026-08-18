@@ -7,12 +7,14 @@
 // `migrate diff`, and vanish without a word from any database built from the
 // committed migrations. Production currently has six such classes:
 //
-//   partialIndexes  – 8, four of them UNIQUE and carrying real invariants
-//   checkConstraints – 14, two of them XOR ownership invariants
-//   rlsTables       – 31 tables with RLS enabled (and no policies)
-//   functions       – 2 trigger functions
-//   triggers        – 2 non-constraint triggers
-//   policies        – 0 RLS policies
+//   partialIndexes  – the UNIQUE ones carry real invariants
+//   checkConstraints – includes XOR ownership invariants
+//   rlsTables       – tables with RLS enabled (and no policies)
+//   functions       – trigger functions
+//   triggers        – non-constraint triggers
+//   policies        – RLS policies (currently none)
+// (Counts live in prisma/prisma-blind-spots.json itself — regenerate rather
+// than hand-maintaining them here.)
 //
 // The baseline migration ends with a generated block built from this file, and
 // scripts/check-migrations-match.mjs asserts a migrated database matches it

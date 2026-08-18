@@ -390,6 +390,10 @@ setup("guard prod DB + seed test data + probe anthropic", async () => {
         const scopedPermissions = {
             estimates: true,
             leadAccess: true,
+            // Lets this non-ADMIN/MANAGER fixture open the CO editor so the
+            // manual-approval control's role visibility is exercised in a real
+            // browser. The server action remains independently role-gated.
+            changeOrders: true,
             // Off deliberately: an auto-grant would hand this user every project
             // and silently erase the partial scope the whole fixture exists for.
             autoGrantNewProjects: false,

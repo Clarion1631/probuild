@@ -9,6 +9,9 @@ export async function GET(req: Request) {
     }
 
     try {
+        // Explicit test/dev reset: automation audit rows intentionally use a
+        // RESTRICT FK, so remove them before cascading their CO parents.
+        await prisma.changeOrderAutomationJob.deleteMany({})
         // Clear existing
         await prisma.estimate.deleteMany({})
         await prisma.project.deleteMany({})
