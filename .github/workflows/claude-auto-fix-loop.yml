@@ -1,0 +1,61 @@
+name: Claude Auto-Fix Loop
+# Runs hourly: picks the oldest open issue labeled `auto-fix`,
+# plans with Fable 5 (planner subagent), implements with Opus 5 (medium effort),
+# opens a PR. The PR gate workflow (claude-pr-gate.yml) takes it from there.
+#
+# Auth: Claude Max subscription OAuth token (run `claude setup-token` locally,
+# save as CLAUDE_CODE_OAUTH_TOKEN secret). No API key needed.
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly, adjust as desired
+  workflow_dispatch: {} # manual kick from phone via GitHub mobile app
+
+concurrency:
+  group: claude-auto-fix
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  fix-next-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude picks and fixes the next issue
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are the EXECUTOR in an autonomous fix loop.
+
+            1. Run: gh issue list --label auto-fix --state open --json number,title,createdAt
+               Pick the OLDEST issue that does not already have an open PR from a
+               branch named claude/issue-<number>. If none, print "NO ELIGIBLE ISSUES" and stop.
+            2. Read the full issue with: gh issue view <number>
+            3. Delegate planning to the "planner" subagent (it runs on Claude Fable 5).
+               Give it the issue body and relevant code context. Get back a step-by-step plan
+               with acceptance criteria, including a VISUAL acceptance criterion
+               (what a browser check of the deployed app must show for this fix).
+            4. Implement the plan. Run the test suite and lint. Fix failures.
+            5. If the fix needs a Supabase schema change, add a migration under
+               supabase/migrations/ — never edit production directly.
+            6. Create branch claude/issue-<number>, commit with a message referencing
+               the issue, push, and open a PR:
+               gh pr create --title "Fix #<number>: <title>" \
+                 --body "Fixes #<number>\n\n## Plan\n<plan>\n\n## Visual acceptance criteria\n<criteria>" \
+                 --label claude-fix
+            7. Comment on the issue with a link to the PR.
+          claude_args: |
+            --model claude-opus-5
+            --effort medium
+            --allowedTools "Bash(gh:*),Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Read,Edit,Write,Grep,Glob,Task"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
