@@ -435,6 +435,11 @@ type MilestoneInvoiceEmailAttemptPayload = InvoiceEmailAttemptPayload & {
     resultMilestones: Array<{ id: string; name: string; wasReconciled: boolean }>;
 };
 
+// Strictness note (Codex round 8): the qbCreate* fields are REQUIRED even
+// though pre-fix serialized attempts would lack them. Safe because the
+// InvoiceEmailAttempt table ships in the SAME release as these fields — no
+// legacy rows can exist anywhere. A malformed payload fails parsing and the
+// caller fails closed ("verify that frozen attempt before sending").
 function parseMilestoneInvoiceEmailAttemptPayload(value: unknown): MilestoneInvoiceEmailAttemptPayload | null {
     const base = parseInvoiceEmailAttemptPayload(value);
     if (!base || !value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -2470,12 +2475,23 @@ export async function sendMilestoneInvoicesCore(
             const exact = sendableIds.length === expected.length
                 && sendableIds.every((id, index) => id === expected[index]);
             if (!exact) {
+                // Every EXPECTED milestone is reported as failed — the ones
+                // that failed verification already carry their own result
+                // entries, and the survivors get explicit aborted entries, so
+                // the caller's counts describe the whole expected set (Codex
+                // round 8).
+                const abortedResults = sendable.map(candidate => ({
+                    id: candidate.schedule.id,
+                    name: candidate.schedule.name,
+                    status: "failed" as const,
+                    error: "Aborted: the automation payment request must deliver every expected milestone in one email.",
+                }));
                 return {
                     success: false,
                     sent: 0,
-                    failed: sendable.length,
+                    failed: expected.length,
                     skipped: 0,
-                    results: results.map(result => ({ ...result })),
+                    results: [...results.map(result => ({ ...result })), ...abortedResults],
                     error: "Not every expected milestone survived QBO verification; the automation payment request was aborted rather than sent partially. Review the failed/drifted milestones and retry.",
                 };
             }

@@ -155,6 +155,12 @@ function milestoneStatesFromRows(rows: Array<{
     })).sort((a, b) => a.id.localeCompare(b.id));
 }
 
+// Strictness note (Codex round 8): the qbCreate* fields are REQUIRED here even
+// though older serialized payloads would lack them. That is safe because no
+// such payloads can exist — ChangeOrderAutomationJob and InvoiceEmailAttempt
+// ship in the SAME release as these fields, so every durable payload ever
+// written carries them. If a malformed payload appears anyway, the null
+// return fails closed into the caller's verify-before-retrying path.
 function milestoneStatesFromJson(value: unknown): MilestoneState[] | null {
     if (!Array.isArray(value) || value.length === 0 || value.some(state => (
         !state || typeof state !== "object" || Array.isArray(state)

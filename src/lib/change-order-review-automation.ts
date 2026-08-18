@@ -216,9 +216,25 @@ export function parseReviewEmailAutomationPayload(value: unknown): ReviewEmailAu
         expectedSubtotalCents: row.expectedSubtotalCents,
         companyName: row.companyName,
         expectedSettings,
-        expectedClientId: typeof row.expectedClientId === "string" && row.expectedClientId ? row.expectedClientId : null,
-        expectedProjectId: typeof row.expectedProjectId === "string" && row.expectedProjectId ? row.expectedProjectId : null,
+        expectedClientId: parseFrozenIdentityField(row, "expectedClientId"),
+        expectedProjectId: parseFrozenIdentityField(row, "expectedProjectId"),
     };
+}
+
+// Absent (or explicit null) => a legacy job from before identity binding
+// shipped, which skips the id check. A PRESENT value must be a non-empty
+// string: a malformed/empty value must reject the payload rather than
+// silently disabling the fence by collapsing to null (Codex round 8).
+function parseFrozenIdentityField(
+    row: Record<string, any>,
+    key: "expectedClientId" | "expectedProjectId",
+): string | null {
+    if (!(key in row) || row[key] === undefined || row[key] === null) return null;
+    const value = row[key];
+    if (typeof value !== "string" || !value.trim()) {
+        throw new Error("Review automation job payload is invalid");
+    }
+    return value;
 }
 
 type LockedDeliveryResult = ChangeOrderAutomationExecutionResult;
