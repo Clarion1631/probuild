@@ -819,7 +819,11 @@ test.describe.serial("Money pipeline: change-order lifecycle invariants", () => 
       { persistSignature: approvalSignatures.persistSignature, approveCore: approveAsInvariantPortalClient },
     ));
 
-    expect(message).toContain("must be Sent");
+    // The replay carries the pre-approval expectedRevision, and the revision
+    // CAS now runs BEFORE status validation (Codex round 7: a caller must get
+    // the fixed reload-and-review conflict, not a generic status error), so a
+    // replay is rejected as a stale revision.
+    expect(message).toContain("was modified after this page loaded");
     expect(approvalSignatures.objects).toEqual(new Set([committed.clientSignatureUrl!]));
     expect((await coInvariantPrisma.changeOrder.findUniqueOrThrow({
       where: { id: COI.replaySent },

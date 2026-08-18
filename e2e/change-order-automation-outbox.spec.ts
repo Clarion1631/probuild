@@ -384,6 +384,9 @@ function injectedMilestonePreflight(dispatch: ReturnType<typeof buildFrozenNotif
                 qbInvoiceId: true,
                 qbInvoiceLink: true,
                 qbSyncError: true,
+                qbCreateGeneration: true,
+                qbCreateRequestId: true,
+                qbCreateFingerprint: true,
             },
         });
         const milestones = milestoneRows.map((row): MilestoneAttemptState => ({
@@ -392,9 +395,15 @@ function injectedMilestonePreflight(dispatch: ReturnType<typeof buildFrozenNotif
             amount: Number(row.amount),
             status: row.status,
             qbInvoiceSentAt: row.qbInvoiceSentAt?.toISOString() ?? null,
-            qbInvoiceId: row.qbInvoiceId ?? "",
+            // null preserved and the qbCreate* fence fields included — the
+            // real deliverClientFrozenDispatch recomputes this fingerprint
+            // from live rows, so the fixture must build the same shape.
+            qbInvoiceId: row.qbInvoiceId,
             qbInvoiceLink: row.qbInvoiceLink,
             qbSyncError: row.qbSyncError,
+            qbCreateGeneration: row.qbCreateGeneration,
+            qbCreateRequestId: row.qbCreateRequestId,
+            qbCreateFingerprint: row.qbCreateFingerprint,
         }));
         const persistedDispatch = await automation.persistFrozenNotification(dispatch);
         const staged = await automation.sendFrozenNotification?.(persistedDispatch, automation.idempotencyKey);
