@@ -18,36 +18,42 @@ npm i -D playwright @playwright/test 2>/dev/null || npm i -g playwright
 ```
 
 Write a small script per criterion that navigates, performs the interaction,
-and saves a screenshot to ./gauntlet-shots/<criterion-N>.png. Use
-`executablePath` from the environment's Chromium if playwright's download is
-blocked.
+and saves a screenshot to ./gauntlet-shots/<criterion-N>.png.
 
-## Auth (Google-login apps — DO NOT automate Google OAuth)
+## Auth — how to log in (IMPORTANT: this app does NOT use Supabase Auth)
 
-Never drive the Google OAuth screen in CI — Google blocks automated logins and
-it will flake forever. The app's session is a SUPABASE session; Google is only
-the identity provider. Mint the session directly:
+ProBuild's users live in a Prisma `"User"` table in Postgres (columns include
+email, role, pinCode); `auth.users` is empty. Google is the SSO front door for
+office users — NEVER automate the Google OAuth screen in CI (Google blocks
+automated logins; it will flake forever).
 
-1. A seeded test user exists (email in `TEST_USER_EMAIL`). Using
-   `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` (CI secrets), call the admin
-   API to mint tokens for that user:
+Do this instead, in order of preference:
+
+1. READ THE AUTH CODE FIRST. Look at the app's auth implementation
+   (`app/api/auth`, NextAuth config, middleware, any PIN/crew login route)
+   and pick the non-Google login path that exists.
+2. PIN / credentials login: if the app has a PIN or credentials flow (the
+   `pinCode` column suggests a field-crew PIN login), fetch the test user's
+   record via the service-role connection and log in through the UI:
    ```js
    const { createClient } = require('@supabase/supabase-js');
-   const admin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-   const { data } = await admin.auth.admin.generateLink({ type: 'magiclink', email: process.env.TEST_USER_EMAIL });
-   // Open data.properties.action_link in the browser once — it lands authenticated —
-   // or verify the token_hash via supabase.auth.verifyOtp to get a session, then
-   // inject the access/refresh tokens into the app's storage before page load.
+   const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+   const { data: user } = await db.from('User').select('*')
+     .eq('email', process.env.TEST_USER_EMAIL).single();
+   // use user.pinCode (or equivalent) in the app's own login form
    ```
-2. Save the authenticated state once per run with Playwright
-   `context.storageState({ path: 'auth.json' })` and reuse it for every
-   criterion check (`browser.newContext({ storageState: 'auth.json' })`).
-3. If the Vercel deployment has protection enabled, send the
-   `x-vercel-protection-bypass: $VERCEL_AUTOMATION_BYPASS_SECRET` header
-   (set as extraHTTPHeaders in the Playwright context).
-4. If the fix under test is ABOUT the login flow itself, verify up to the
-   Google redirect (correct button, correct redirect URL params) and verify
-   the post-login state via the minted session — never through Google's UI.
+3. Session-token mint: if the app uses NextAuth JWT sessions and a
+   `NEXTAUTH_SECRET` env var is available, craft a valid session cookie for
+   the test user and set it on the Playwright context before page load.
+4. If no non-Google path is possible, verify every logged-OUT criterion,
+   then FAIL the auth-dependent criteria with reason "AUTH BLOCKED — needs
+   TEST_USER_PIN or NEXTAUTH_SECRET secret" — never fake a pass, never
+   attempt Google's UI.
+
+Save the authenticated state once per run (`context.storageState({ path:
+'auth.json' })`) and reuse it for every criterion. If the Vercel deployment
+has protection enabled, send `x-vercel-protection-bypass:
+$VERCEL_AUTOMATION_BYPASS_SECRET` as an extra HTTP header.
 
 ## The loop (max 3 rounds)
 
