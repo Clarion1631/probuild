@@ -182,9 +182,11 @@ async function main() {
     assert.match(routeSource, /serverInfo:\s*\{\s*name:\s*"probuild",\s*version:\s*"(?!1\.10\.0)[^"]+"/);
 
     // Customer-facing send tools deliberately stay on the established HMAC
-    // flow; schedule writers must not call that stateless helper.
-    assert.match(routeSource, /function mintPreviewToken/);
-    assert.match(routeSource, /function verifyPreviewToken/);
+    // flow; schedule writers must not call that stateless helper. The helper
+    // is now a const wrapping the actor-secret-scoped variant (the CO branch
+    // refactor), so match either declaration shape.
+    assert.match(routeSource, /(?:function mintPreviewToken|const mintPreviewToken\s*=)/);
+    assert.match(routeSource, /(?:function verifyPreviewToken|const verifyPreviewToken\s*=)/);
     const scheduleStart = routeSource.indexOf('"get_company_schedule"');
     const scheduleRegistry = routeSource.slice(scheduleStart);
     assert.doesNotMatch(scheduleRegistry, /mintPreviewToken|verifyPreviewToken/);
