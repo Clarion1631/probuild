@@ -42,6 +42,12 @@ const REQUEUE_CLEARED_KEYS = [
   "lastError", "lastErrorAt",
 ];
 
+// Files parked as non-receipts or duplicates are NOT outage victims — the bot
+// judged them correctly. Requeueing those would re-alert and re-duplicate, which
+// is the noise we just fixed. Only clear files whose park was caused by the API
+// being dead.
+const REQUEUE_SKIP_IF = ["nonReceipt", "duplicateOf", "amazonAppOwned", "emailed"];
+
 function previewParkedReceipts() {
   requeueParkedReceipts_(true);
 }
@@ -81,6 +87,17 @@ function requeueParkedReceipts_(dryRun) {
     if (!attempts && !runs && !busy && !park) {
       skipped++;
       Logger.log("  skip (clean state): " + name);
+      continue;
+    }
+
+    // Never requeue a file the bot judged correctly.
+    var judged = null;
+    for (var si = 0; si < REQUEUE_SKIP_IF.length; si++) {
+      if (state[REQUEUE_SKIP_IF[si]]) { judged = REQUEUE_SKIP_IF[si]; break; }
+    }
+    if (judged) {
+      skipped++;
+      Logger.log("  skip (" + judged + ", not an outage victim): " + name);
       continue;
     }
 

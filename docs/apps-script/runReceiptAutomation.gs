@@ -29,7 +29,7 @@
  * { runs, attempts, data, dedupOwned, dedupPk, dedupWeakOwned, dedupWeakPk, dedupWeak,
  *   dedupWeakReason, emailing, emailed, refund, refundAlerted, nonReceipt,
  *   nonReceiptAlerted, badFormat, badFormatAlerted, duplicateOf, weakDuplicateAlerted,
- *   parkReason, parkAlerted }.
+ *   parkReason, parkAlerted, amazonAppOwned }.
  *
  * PARKED (not wired into this flow):
  *   - WA "tax paid at source" recovery math -> taxPaidAtSource.parked.gs
@@ -103,27 +103,18 @@ const QBO_OK_MIMES = ["application/pdf", "image/jpeg", "image/png"];
 
 // The Gemini key comes from geminiApiKey_() in Config.gs, which reads Script Properties.
 // Models are tried IN ORDER — if one is overloaded (HTTP 503) or rate-limited (429),
-// the read falls through to the next, so one busy model never sinks the run.
-//
-// Model fallback chain, verified live 2026-08-19 against a real receipt.
-//
-// OUTAGE (2026-08-10 → 08-19): the previous chain was
-// ["gemini-2.5-pro", "gemini-2.5-flash"]. BOTH died at once — 2.5-pro was
-// retired ("no longer available to new users") while the whole project was
-// separately blocked with 403 PERMISSION_DENIED for unlinked billing. Every
-// receipt failed 3/3 for nine days and the only signal was mail piling up
-// in Justin's inbox. Billing is now on Paid Tier and the 403s are gone, but
-// gemini-2.5-pro is STILL 404 — a retired model never comes back.
-//
-// The chain therefore leads with a "-latest" alias, which Google repoints
-// as models retire, so a single retirement can no longer take the pipeline
-// down. Ordered fastest-verified first: gemini-flash-latest read this
-// receipt in 2.0s, 2.5-flash in 2.6s, pro-latest in 4.5s.
-//
-// WARNING: the /models LISTING endpoint lies. It happily returned
-// gemini-2.5-pro and gemini-2.5-flash all through the outage while
-// generateContent 404'd and 403'd them. Any health check MUST make a real
-// generateContent call — see checkVisionModels_() and the nightly watchdog.
+// the read falls through to the next, so one busy model never sinks the run. 2.5-pro
+// / 2.5-flash are GA and far more stable than the just-released 3.x models; pro leads
+// for accuracy on faded thermal receipts. (NOTE: "gemini-3.5-pro" is NOT a valid id on
+// this key — only "gemini-3.5-flash" exists, and it 503s under load.)
+// Chain verified live 2026-08-19 against a real receipt. The previous chain
+// ["gemini-2.5-pro","gemini-2.5-flash"] died ENTIRELY on 08-10: 2.5-pro was
+// RETIRED (404) while the project was simultaneously blocked (403), so nine
+// days of receipts failed with no survivor. Leading with a "-latest" alias
+// means Google repoints it as models retire, so one retirement can no longer
+// take the pipeline down. WARNING: the /models LISTING endpoint LIES - it
+// returned both dead models throughout the outage while generateContent 404d
+// and 403d them. Health checks must call generateContent for real.
 const GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-pro-latest"];
 const MAX_AI_ATTEMPTS = 3;  // failed AI reads per file, across runs
 const MAX_TOTAL_RUNS  = 6;  // total processing passes per file, across runs
@@ -461,6 +452,40 @@ function processSingleFile(file, ctx, archive, needsReview) {
     if (docType === "non_receipt") {
       state.nonReceipt = true;
       setState(file, state);
+
+      // DEDUP BEFORE PARKING (fixed 2026-08-19). This branch used to return here
+      // WITHOUT ever claiming a dedup key - the claim lives ~60 lines further down,
+      // past this early return. So a payroll screenshot was treated as brand new on
+      // every 10-minute pass: the same $973.25 CJ Havens PDF alerted at 2:59pm and
+      // again at 3:10pm and landed in _Needs Review twice, byte-identical.
+      // Left alone it emails forever and breeds copies.
+      //
+      // A non-receipt has no invoice number, so the strong key is unavailable; the
+      // weak key (vendor + date + amount) is the right identity. Claiming it makes
+      // the SECOND copy recognise the first as owner and stay silent.
+      var nrVendor = sanitize(aiData && aiData.vendor) || "Unknown";
+      var nrDateRaw = normalizeDateStr(aiData && aiData.date);
+      var nrDate = isValidDate(nrDateRaw) ? nrDateRaw : driveDateStr(file);
+      var nrAmount = cleanMoney(aiData && aiData.total_amount);
+      if (!state.dedupWeakOwned && isValidDate(nrDate)) {
+        var nrKey = dedupPropKey(makeWeakDedupKey(nrVendor, nrDate, nrAmount));
+        state.dedupWeakPk = nrKey; // persist BEFORE claiming so a crash cannot orphan it
+        setState(file, state);
+        var nrOwner = claimDedupKey(nrKey, file.getId(), nrAmount);
+        if (nrOwner) {
+          // An earlier copy already owns this identity. Park quietly - alerting
+          // again is the exact noise this fix exists to stop.
+          state.duplicateOf = nrOwner.fileId;
+          state.nonReceiptAlerted = true;
+          setState(file, state);
+          file.moveTo(needsReview);
+          Logger.log(" > [NON-RECEIPT DUPLICATE] already owned by " + nrOwner.fileId + " - parked silently, no second alert.");
+          return;
+        }
+        state.dedupWeakOwned = true;
+        setState(file, state);
+      }
+
       sendNonReceiptAlertIfNeeded(file, state, ctx, originalName);
       file.moveTo(needsReview);
       Logger.log(" > [NON-RECEIPT] parked in " + NEEDS_REVIEW_NAME + "; route to payroll (Gusto).");
@@ -599,7 +624,21 @@ function processSingleFile(file, ctx, archive, needsReview) {
     // it and skips — two runs can't both email the same document. "emailing" is marked
     // BEFORE the send; a crash mid-send leaves emailing=true/emailed=false so the next
     // pass re-sends WITH a duplicate warning.
-    if (!state.emailed || (state.refund && !state.refundAlerted)) {
+    // AMAZON: the native Intuit "Amazon Business Purchases" app (connected 2026-08-14)
+    // is the single writer for Amazon in QuickBooks. The bot must NOT also book these —
+    // two writers on one vendor is exactly how duplicates happen. The file still
+    // archives to the Drive receipt archive below (source of truth for
+    // expense-by-project) and keeps its dedup claim so stray copies cannot book either.
+    // Flip to false to hand booking back to the bot.
+    const AMAZON_APP_OWNS_BOOKING = true;
+    if (AMAZON_APP_OWNS_BOOKING && !state.emailed &&
+        /amazon|amzn/i.test(String((aiData && aiData.vendor) || ""))) {
+      if (!state.amazonAppOwned) {
+        state.amazonAppOwned = true;
+        setState(file, state);
+      }
+      Logger.log(" > [AMAZON] Booking owned by the Amazon Business QBO app — archiving only, no QBO send.");
+    } else if (!state.emailed || (state.refund && !state.refundAlerted)) {
       const sendLock = RECEIPT_RUN_LOCK_HELD_ ? null : LockService.getScriptLock();
       if (sendLock) sendLock.waitLock(30000);
       try {
@@ -1110,15 +1149,9 @@ function analyzeDriveFileWithGemini(file, ctx) {
             const part = cand && cand.content && cand.content.parts && cand.content.parts[0];
             const text = part && part.text;
             // The model answered; it just could not turn THIS document into usable data.
-            // An empty/blocked response means the model produced nothing. That is a
-            // MODEL failure, not proof this document is unreadable — so it falls
-            // through to the next model without charging the file. Only if EVERY
-            // model comes back empty does the busy ceiling eventually park it.
-            // (Kimi review #6: a garbage 200 is model-side, not document-side.)
-            if (!text) { Logger.log(" > [SERVICE] " + model + " returned no text (empty/safety-blocked). Trying next model."); break; }
+            if (!text) { Logger.log(" > [SERVICE] (" + model + ") returned no text (empty/safety-blocked). Trying next model."); break; }
             try { return JSON.parse(text); }
-            // Invalid JSON is the same class: the model failed to follow the contract.
-            catch (parseErr) { Logger.log(" > [SERVICE] " + model + " returned invalid JSON: " + parseErr + ". Trying next model."); break; }
+            catch (parseErr) { Logger.log(" > [SERVICE] (" + model + ") returned invalid JSON: " + parseErr + ". Trying next model."); break; }
           }
 
           if (code === 429 || code === 503) { // overloaded / rate-limited -> back off, then fall to next model
@@ -1130,48 +1163,30 @@ function analyzeDriveFileWithGemini(file, ctx) {
           }
 
           if (code === 404) { // model id not available for this key -> try the next one
-            // SERVICE failure, never the document's fault. A 404 means the model was
-            // RETIRED — the document was never even read.
-            //
-            // This line used to set sawDecisiveFailure = true, and that is precisely
-            // the bug that parked five perfectly legible receipts on 2026-08-10..19:
-            // gemini-2.5-pro was retired (404) while the project was simultaneously
-            // blocked (403), so every file burned all three attempts against an API
-            // that never looked at it. The Fred Meyer receipt it "gave up" on reads
-            // in 1.4 seconds.
-            //
-            // The rule (Kimi review 2026-08-19): a per-model SERVICE failure must not
-            // charge document-side attempts. Falling through to the next model is the
-            // whole point of a chain — a 404 on ONE model while another works is
-            // harmless. If EVERY model fails this way, no attempt is charged either;
-            // the busy ceiling catches it and parks with aiUnavailable, which is a
-            // "park and escalate" state rather than "park and forget".
-            Logger.log(" > [SERVICE] " + model + " returned 404 (model retired/unavailable). Trying next model.");
+            // Decisive, NOT "busy": if every model 404s the project is misconfigured, and
+            // quietly retrying that for hours per file would delay the one alert that tells
+            // someone to fix it. Still not the document's fault — the alert says so.
+            // SERVICE failure - the document was never read, so it must not cost
+            // this file an attempt. This line used to set sawDecisiveFailure = true,
+            // and that is exactly what parked five legible receipts during the
+            // 2026-08-10..19 outage. A 404 on ONE model while another works is
+            // harmless - that is what a chain is for.
+            Logger.log(" > [SKIP] " + model + " not available (HTTP 404). Trying next model.");
             break;
           }
 
-          // 401/403 (revoked key, blocked project, not authorised) is a SERVICE failure:
-          // the document was never read, so it must not cost this file an attempt.
-          //
-          // The old code returned null here — a decisive "this file failed" verdict —
-          // with a comment arguing that retrying would "hide the outage". That reasoning
-          // was wrong and it cost nine days: on 2026-08-10 the project was blocked with
-          // 403 PERMISSION_DENIED, and because 403 was fatal, every receipt burned its
-          // three attempts and parked permanently. The outage was hidden anyway, because
-          // the alert was an email to an inbox nobody watches.
-          //
-          // Surfacing an outage is the WATCHDOG's job (an hourly real generateContent
-          // canary that pages Telegram), not the retry counter's. The counter's only job
-          // is to distinguish "this document is unreadable" from "the service is down".
-          // Breaking here falls through to the next model; if all models fail this way
-          // the pass is charged as a busy pass, not an attempt.
+          // 401/403 (revoked key, blocked project) is a SERVICE failure: the
+          // document was never read, so it must not cost this file an attempt.
+          // The old code returned null here, arguing a retry would "hide the
+          // outage". Wrong twice: the outage was hidden anyway (the alert was
+          // email to an unwatched inbox), and surfacing an outage is the
+          // WATCHDOG's job, not the retry counter's.
           if (code === 401 || code === 403) {
-            Logger.log(" > [SERVICE] " + model + " HTTP " + code + " (auth/project blocked). Not the document's fault. Trying next model.");
+            Logger.log(" > [SERVICE] " + model + " HTTP " + code + " (auth/project blocked). Trying next model.");
             break;
           }
 
-          // 400 = oversized or undecodable payload. THAT is about this document, so it
-          // stays decisive.
+          // 400 = oversized/undecodable payload. THAT is about this document.
           sawDecisiveFailure = true;
           Logger.log("API Error (Fatal, " + model + "): " + response.getContentText());
           return null;
