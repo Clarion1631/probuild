@@ -311,6 +311,88 @@ test("zero-dollar rows never create phantom phases or items", () => {
     assert.equal(result.phases[0].costCodeId, "cc-demo");
 });
 
+// ── review findings: item/phase mismatch (CRITICAL) ─────────────────────────
+
+test("REVIEW BUG 1: a cost coded to phase A but linked to an item under phase B is not split across both", () => {
+    // Found in peer review. The explicit costCodeId won for the PHASE while the
+    // item link won for the ITEM, so the money landed on phase A's total and on
+    // an item sitting under phase B. That breaks the core invariant below and
+    // silently clears the "floor" warning on an item nobody actually measured.
+    const result = computeProjectVariance({
+        items: [
+            item({ id: "demoItem", total: 1000, costCodeId: "cc-demo", costCode: { code: "01-DEMO", name: "Demolition" } }),
+            item({ id: "frameItem", total: 1000, costCodeId: "cc-frame", costCode: { code: "02-FRAME", name: "Framing" } }),
+        ],
+        // Mismatch: says phase FRAME, but the item belongs to phase DEMO.
+        timeEntries: [time({ costCodeId: "cc-frame", estimateItemId: "demoItem", laborCost: 500 })],
+        expenses: [spend({ costCodeId: "cc-frame", itemId: "demoItem", amount: 300 })],
+    });
+
+    // INVARIANT: every phase's actual must equal the sum of its own items'
+    // actuals plus whatever is genuinely unassigned within that phase.
+    for (const phase of result.phases) {
+        const itemSum = phase.items.reduce((a, i) => a + i.actual, 0);
+        assert.ok(
+            itemSum <= phase.totalActual + 0.005,
+            `phase ${phase.code}: items sum to ${itemSum} but phase actual is ${phase.totalActual}`
+        );
+    }
+    // And the money must be counted exactly once overall.
+    assert.equal(result.totalActual, 800);
+});
+
+test("REVIEW BUG 1b: a mismatched link never silently clears the floor warning", () => {
+    const result = computeProjectVariance({
+        items: [
+            item({ id: "demoItem", total: 1000, costCodeId: "cc-demo", costCode: { code: "01-DEMO", name: "Demolition" } }),
+            item({ id: "frameItem", total: 1000, costCodeId: "cc-frame", costCode: { code: "02-FRAME", name: "Framing" } }),
+        ],
+        timeEntries: [time({ costCodeId: "cc-frame", estimateItemId: "demoItem", laborCost: 500 })],
+        expenses: [],
+    });
+    const frame = result.phases.find((p) => p.code === "02-FRAME")!;
+    // The $500 sits on FRAME but on no FRAME item, so frameItem is a floor.
+    assert.equal(frame.items.find((i) => i.itemId === "frameItem")!.phaseHasUnassignedActuals, true);
+});
+
+test("REVIEW BUG 4: negative expenses (refunds/credits) never push coverage outside 0..1", () => {
+    // Expense.amount can be negative — refunds, credits, voided purchases.
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [
+            spend({ amount: 900 }),                        // unattributed
+            spend({ costCodeId: "cc-demo", amount: -800 }), // a refund nets the total down
+        ],
+    });
+    assert.ok(result.coverage.attributedShare >= 0 && result.coverage.attributedShare <= 1,
+        `attributedShare out of range: ${result.coverage.attributedShare}`);
+});
+
+test("REVIEW BUG 4b: a fully refunded job reports a sane coverage share", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [spend({ amount: 500 }), spend({ costCodeId: "cc-demo", amount: -500 })],
+    });
+    // totalActual nets to 0 — must not divide by zero or emit Infinity.
+    assert.ok(Number.isFinite(result.coverage.attributedShare));
+    assert.ok(result.coverage.attributedShare >= 0 && result.coverage.attributedShare <= 1);
+});
+
+test("a refund reduces the phase actual rather than being dropped", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [
+            spend({ costCodeId: "cc-demo", amount: 900 }),
+            spend({ costCodeId: "cc-demo", amount: -200 }),
+        ],
+    });
+    assert.equal(result.phases[0].actualMaterial, 700, "a credit must net against the phase");
+    assert.equal(result.variance, 300);
+});
+
 test("an empty project produces zeros, not NaN", () => {
     const result = computeProjectVariance({ items: [], timeEntries: [], expenses: [] });
     for (const v of [result.totalBudget, result.totalActual, result.variance, result.uncodedBudget]) {

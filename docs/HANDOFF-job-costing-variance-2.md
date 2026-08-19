@@ -115,6 +115,56 @@ validator will start rejecting each other's phases.
 
 ---
 
+## Peer review (required by AGENTS.md for money-path changes)
+
+An independent reviewer read the new code, ran the tests, and typechecked. It found
+**three real bugs that the green test suite did not cover**, all now fixed with
+regression tests (suite grew 20 → 25 on the variance engine):
+
+1. **CRITICAL — item/phase mismatch double-counted.** When a posting carried an explicit
+   `costCodeId` for phase A *and* an `estimateItemId` whose item lived under phase B, the
+   money landed on **phase A's total** while crediting **an item under phase B**. That
+   broke the invariant "a phase's actuals ≥ the sum of its own items' actuals" and
+   silently cleared the ⚠ floor warning on an item nobody had measured.
+   Fixed by `reconcileAttribution()`: the explicit code still wins for the phase, but an
+   item is credited **only when it belongs to that phase**; a mismatched link is dropped
+   and the cost is treated as phase-only.
+2. **`attributedShare` was unbounded.** `Expense.amount` can be negative (refunds,
+   credits, voids), so the total could net toward zero while the unattributed portion
+   stayed large — producing shares like 1.4 or −3 and an impossible progress bar.
+   Now clamped to 0..1, with `ratio()` hardened against non-finite values.
+3. **`ratio()` could return a non-finite number.** Now returns `null` instead.
+
+### One review recommendation was tested and DELIBERATELY REJECTED
+
+The reviewer proposed applying `PHASE_ELIGIBLE_ESTIMATE_WHERE` to the **expense** query
+so both sides use the same predicate. It was implemented, then reverted after checking
+prod:
+
+```
+EXPENSES ON INELIGIBLE (Draft) ESTIMATES: 320 rows, $84,741.62
+   Hoppe Bathroom Remodel [Draft]: $12,757.73   <- 100% of that job's spend
+   Shop [Draft]:                   $71,983.89
+```
+
+Applying the filter would have hidden **all** of Hoppe's spend and made the job look
+perfectly on budget — the precise failure mode this rebuild exists to eliminate.
+
+**The asymmetry is intentional and is now documented in the code:** an estimate's status
+governs what we *promised* (budget), never what we *paid* (actual). A cost is real the
+moment it leaves the bank. Spend with no matching budget surfaces honestly as an
+"unbudgeted phase" or in the unattributed bucket rather than being dropped.
+
+### Known, accepted
+
+`Mesplay Kitchen`, `Hoppe`, and `Shop` each have **two eligible estimates**. Their items
+are unioned into one budget, which is correct today (the second estimate is a change
+order or revision carrying its own items). If a revision ever *duplicates* an original's
+items rather than replacing them, that budget would double-count. Worth a guard when
+estimate revisions get formalised.
+
+---
+
 ## New files
 
 | File | Purpose |

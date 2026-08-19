@@ -133,7 +133,14 @@ function emptyPhase(costCodeId: string, code: string, name: string): PhaseVarian
 /** actual/budget, or null when there is no budget — never Infinity or NaN in a UI. */
 function ratio(actual: number, budget: number): number | null {
     if (budget <= 0) return null;
-    return actual / budget;
+    const value = actual / budget;
+    return Number.isFinite(value) ? value : null;
+}
+
+/** Keep a share inside 0..1 so no consumer can render an impossible percentage. */
+function clamp01(value: number): number {
+    if (!Number.isFinite(value)) return 1;
+    return Math.min(1, Math.max(0, value));
 }
 
 /**
@@ -199,6 +206,33 @@ export function computeProjectVariance(input: {
         phase.items.push(itemRow);
     }
 
+    /**
+     * Decide which phase a cost belongs to, and whether its item link may be
+     * used — keeping the two CONSISTENT.
+     *
+     * Found in peer review: taking the explicit `costCodeId` for the phase while
+     * still crediting a linked item that sits under a DIFFERENT phase put the
+     * money on phase A's total and on an item under phase B. That breaks the
+     * invariant "a phase's actuals ≥ the sum of its own items' actuals", and it
+     * silently cleared the floor warning on an item nobody had measured.
+     *
+     * Resolution: the EXPLICIT cost code still wins for the phase (it is what the
+     * crew actually picked at clock-in). But an item is only credited when it
+     * genuinely belongs to that phase. A mismatched item link is dropped and the
+     * cost is treated as phase-only — visible, conservative, and it keeps the
+     * item row honestly marked as a floor.
+     */
+    const reconcileAttribution = (
+        explicitCostCodeId: string | null | undefined,
+        linkedItem: (ItemVariance & { costCodeId: string | null }) | undefined
+    ): { costCodeId: string | null; item: (ItemVariance & { costCodeId: string | null }) | undefined } => {
+        const costCodeId = explicitCostCodeId ?? linkedItem?.costCodeId ?? null;
+        if (!costCodeId) return { costCodeId: null, item: undefined };
+        // Only credit the item when it lives under the phase being charged.
+        const item = linkedItem && linkedItem.costCodeId === costCodeId ? linkedItem : undefined;
+        return { costCodeId, item };
+    };
+
     // ── actual side: labor ──────────────────────────────────────────────────
     let unattributedLabor = 0;
     let phaseOnlyActuals = 0;
@@ -206,10 +240,11 @@ export function computeProjectVariance(input: {
         const cost = (Number(entry.laborCost) || 0) + (Number(entry.burdenCost) || 0);
         if (cost === 0) continue;
 
-        // An entry may carry an item, a phase, or neither. An item implies its
-        // phase, so the item link is the richer one and wins.
-        const linkedItem = entry.estimateItemId ? itemsById.get(entry.estimateItemId) : undefined;
-        const costCodeId = entry.costCodeId ?? linkedItem?.costCodeId ?? null;
+        // An entry may carry an item, a phase, or neither.
+        const { costCodeId, item: linkedItem } = reconcileAttribution(
+            entry.costCodeId,
+            entry.estimateItemId ? itemsById.get(entry.estimateItemId) : undefined
+        );
 
         if (!costCodeId) { unattributedLabor += cost; continue; }
         // Actuals on a phase with NO budget are real and important: work
@@ -226,8 +261,10 @@ export function computeProjectVariance(input: {
         const amount = Number(expense.amount) || 0;
         if (amount === 0) continue;
 
-        const linkedItem = expense.itemId ? itemsById.get(expense.itemId) : undefined;
-        const costCodeId = expense.costCodeId ?? linkedItem?.costCodeId ?? null;
+        const { costCodeId, item: linkedItem } = reconcileAttribution(
+            expense.costCodeId,
+            expense.itemId ? itemsById.get(expense.itemId) : undefined
+        );
 
         if (!costCodeId) { unattributedMaterial += amount; continue; }
         const phase = ensurePhase(costCodeId);
@@ -281,7 +318,14 @@ export function computeProjectVariance(input: {
             unattributedLabor,
             unattributedMaterial,
             unattributedTotal,
-            attributedShare: totalActual > 0 ? (totalActual - unattributedTotal) / totalActual : 1,
+            // Clamped to 0..1. Peer-review finding: expenses can be NEGATIVE
+            // (refunds, credits, voided purchases), so totalActual can net down
+            // to near zero or below while unattributedTotal stays large. Unclamped
+            // this produced shares like 1.4 or -3, which the UI renders as an
+            // impossible progress bar and a nonsense "140% attributed".
+            attributedShare: clamp01(
+                totalActual > 0 ? (totalActual - unattributedTotal) / totalActual : 1
+            ),
             phaseOnlyActuals,
         },
     };

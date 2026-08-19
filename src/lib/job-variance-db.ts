@@ -73,6 +73,23 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 select: { costCodeId: true, estimateItemId: true, laborCost: true, burdenCost: true },
             }),
             prisma.expense.findMany({
+                // DELIBERATELY NOT filtered by estimate status.
+                //
+                // Peer review flagged the asymmetry with the budget side and
+                // proposed applying PHASE_ELIGIBLE_ESTIMATE_WHERE here too. That
+                // was tried and REVERTED after checking prod: 320 expenses worth
+                // $84,741 sit on Draft estimates — including 100% of Hoppe
+                // Bathroom's spend ($12,758) and the Shop bucket ($71,984).
+                // Filtering them out hides money that was genuinely spent and
+                // makes every affected job look under budget. That is exactly the
+                // failure this rebuild exists to end.
+                //
+                // The asymmetry is correct and intentional: an estimate's status
+                // governs what we PROMISED (budget), never what we PAID (actual).
+                // A cost is real the moment it leaves the bank. Where that lands
+                // with no matching budget, it surfaces honestly as an unbudgeted
+                // phase or in the unattributed bucket — visible, not silently
+                // dropped.
                 where: { estimate: { projectId: project.id } },
                 select: { costCodeId: true, itemId: true, amount: true },
             }),
