@@ -11,7 +11,7 @@
     "lint": "eslint",
     "test:qbo-expense-sync": "tsx --test tests/qbo-expense-sync.test.ts tests/qbo-expense-sync-route.test.ts tests/qbo-expense-sync-ui.test.tsx tests/qbo-purchase-changes.test.ts tests/qbo-expense-guard.test.ts tests/qbo-purchase-classification.test.ts",
     "test:qbo-receipt-push": "tsx --test tests/qbo-receipt-push.test.ts",
-    "test:bank-ledger": "tsx --test tests/bank-ledger.test.ts tests/bank-ledger-ingest-route.test.ts tests/bank-ledger-reconcile-route.test.ts tests/apply-bank-ledger.test.ts tests/migration-history-blind-spots.test.ts tests/parse-wtb-statement.test.ts tests/parse-wtb-daily-csv.test.ts",
+    "test:bank-ledger": "tsx --test tests/bank-ledger.test.ts tests/bank-ledger-ingest-route.test.ts tests/bank-ledger-reconcile-route.test.ts tests/apply-bank-ledger.test.ts tests/migration-history-blind-spots.test.ts tests/parse-wtb-statement.test.ts tests/parse-wtb-daily-csv.test.ts tests/post-qbo-register.test.ts tests/receipt-match.test.ts",
     "test:automation-key-resolver": "tsx --test tests/automation-key-resolver.test.ts",
     "test:automation-register": "tsx --test tests/automation-register-filters.test.ts tests/match-receipt-journey.test.ts tests/automation-events-grouping.test.ts tests/automation-format.test.ts",
     "test:ai-review-reasonableness": "tsx --test tests/ai-review-reasonableness.test.ts",

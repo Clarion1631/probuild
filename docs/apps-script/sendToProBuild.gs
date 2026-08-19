@@ -21,8 +21,28 @@
  */
 
 const PROBUILD_INGEST_URL = "https://probuild.goldentouchremodeling.com/api/integrations/receipt-ingest";
-// NOTE: move this to Config.gs / Script Properties; it is the RECEIPT_INGEST_SECRET.
-const PROBUILD_INGEST_KEY = "gtr_ri_CvyumWPdU4gymekR5PErGToDxpfOEUFkK2tg3Wydis";
+
+/**
+ * The RECEIPT_INGEST_SECRET, read from Script Properties — never hardcoded.
+ *
+ * Set it once (Apps Script → Project Settings → Script Properties, or run
+ * setProBuildIngestKey_ below with the value pasted in temporarily):
+ *   key:   PROBUILD_INGEST_KEY
+ *   value: the same string as RECEIPT_INGEST_SECRET in ProBuild's Vercel env
+ *
+ * Throws loudly if unset rather than posting an unauthenticated request that
+ * would 401 and look like a ProBuild outage.
+ */
+function getProBuildIngestKey_() {
+  const key = PropertiesService.getScriptProperties().getProperty("PROBUILD_INGEST_KEY");
+  if (!key) {
+    throw new Error(
+      "PROBUILD_INGEST_KEY is not set in Script Properties. " +
+      "Add it under Project Settings → Script Properties (value = ProBuild's RECEIPT_INGEST_SECRET)."
+    );
+  }
+  return key;
+}
 
 function sendExpensesToProBuild(file, ctx, aiData, isCheck, categoryGroups, totalAmount, dateStr, cleanInv, memo, state) {
   if (state.probuild) return; // already handled on a previous pass
@@ -63,7 +83,7 @@ function sendExpensesToProBuild(file, ctx, aiData, isCheck, categoryGroups, tota
   const res = UrlFetchApp.fetch(PROBUILD_INGEST_URL, {
     method: "post",
     contentType: "application/json",
-    headers: { "x-ingest-key": PROBUILD_INGEST_KEY },
+    headers: { "x-ingest-key": getProBuildIngestKey_() },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
