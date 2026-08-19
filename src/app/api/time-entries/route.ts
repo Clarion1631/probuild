@@ -6,7 +6,7 @@ import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-a
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
-import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
 export async function GET(req: Request) {
@@ -84,14 +84,29 @@ export async function POST(req: Request) {
                 id: estimateItemId,
                 estimate: {
                     projectId,
-                    status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
-                    archivedAt: null,
+                    // Shared constant, NOT an inline copy. Review finding: this list
+                    // was duplicated here while GET .../cost-codes/[id]/items used
+                    // PHASE_ELIGIBLE_ESTIMATE_WHERE. Identical today, but if
+                    // eligibility ever changed in one place the picker would offer
+                    // items this endpoint then rejects — turning a one-line config
+                    // change into a crew-facing clock-in dead end.
+                    ...PHASE_ELIGIBLE_ESTIMATE_WHERE,
                 },
             },
             select: { id: true, costCodeId: true },
         });
         if (!item) {
-            return NextResponse.json({ error: "Estimate item does not belong to an eligible estimate on this project" }, { status: 400 });
+            return NextResponse.json(
+                {
+                    error: "Estimate item does not belong to an eligible estimate on this project",
+                    // Coded so the client can recognise this as the same
+                    // stale-item case as ITEM_PHASE_MISMATCH and degrade to a
+                    // phase-only punch instead of retrying an identical payload
+                    // forever. Never make a crew member string-match an error.
+                    code: "ITEM_NOT_ON_PROJECT",
+                },
+                { status: 400 }
+            );
         }
         resolvedEstimateItemId = item.id;
         // The item alone decides the charge — a client-sent costCodeId must not
@@ -106,6 +121,21 @@ export async function POST(req: Request) {
         // That is precisely the item/phase mismatch that corrupted the variance
         // report (see reconcileAttribution in src/lib/job-variance.ts); reject
         // it at the door instead of letting it into the ledger.
+        // A codeless item is ALSO stale data when the client sent a phase: the
+        // office removed the cost code between the picker fetch and this punch.
+        // Persisting it would store an entry with an item but NO phase (the item
+        // cannot supply one), which reaches the variance report as labor that
+        // belongs to no phase. Same class, same coded response, so the client
+        // degrades to phase-only instead of silently recording a phase-less punch.
+        if (costCodeId && typeof costCodeId === "string" && !resolvedCostCodeId) {
+            return NextResponse.json(
+                {
+                    error: "That line item no longer has a phase. Reopen the phase list and pick again.",
+                    code: "ITEM_PHASE_MISMATCH",
+                },
+                { status: 400 }
+            );
+        }
         if (
             costCodeId &&
             typeof costCodeId === "string" &&

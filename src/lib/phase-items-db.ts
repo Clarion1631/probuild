@@ -3,7 +3,7 @@
 // project-phases.ts / project-phases-db.ts.
 
 import { prisma } from "@/lib/prisma";
-import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
+import { isEstimateSectionRow, type EstimateItemLike } from "@/lib/estimate-item-payload";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import type { PhaseItemOption, PhaseItemsDataSource } from "@/lib/phase-items";
 
@@ -33,7 +33,19 @@ export const prismaPhaseItemsDataSource: PhaseItemsDataSource = {
                 if (item.costCodeId !== costCodeId) continue;
                 // A section header mirrors its children's totals; offering one
                 // would double-count the phase if it were ever charged.
-                if (isEstimateSectionRow(item as never, estimate.items as never)) continue;
+                // Cast to the shape the helper actually needs, NOT `never`:
+                // `never` silently accepts a projection that has dropped
+                // id/type/parentId, which would degrade section detection to
+                // "nothing is a section" and start offering rollup headers to
+                // crews with no compiler warning. (Review finding.)
+                if (
+                    isEstimateSectionRow(
+                        item as EstimateItemLike,
+                        estimate.items as EstimateItemLike[]
+                    )
+                ) {
+                    continue;
+                }
                 // An unnamed row is unreadable on a phone — the crew cannot tell
                 // it apart from any other, so it is not a real choice.
                 const name = item.name?.trim();

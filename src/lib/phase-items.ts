@@ -1,18 +1,19 @@
 // Which estimate line ITEMS sit under a phase the crew just picked?
 //
-// This is the second half of the "one capture, both grains" design. Measured on
-// live prod (2026-08-19):
+// This is the second half of the "one capture, both grains" design. Measured
+// across EVERY phase on every In Progress project on live prod (2026-08-19),
+// which is the figure the mobile client's comments also quote:
 //
-//     1 item in a phase : 40 phases (51.9%)   <- zero extra taps
-//     2 items           : 27 phases (35.1%)
-//     3 items           :  6 phases ( 7.8%)
-//     4 items           :  3 phases ( 3.9%)
-//     5 items           :  1 phase  ( 1.3%)
+//     auto   (exactly 1 item — attached silently) : 57.5%
+//     none   (no coded items, e.g. the Safety phase): 12.6%
+//     choose (2-5 items — one extra tap)          : 29.9%
 //
-// So over half the time the item is IMPLIED by the phase and the crew is never
-// asked. Otherwise they choose from 2-5 rows, not a 52-item scroll. Capturing
-// the item yields the phase for free (resolveCostCode derives it), which is what
-// makes per-item variance affordable without hurting ADOPTION.
+// So 70.1% of clock-ins cost the crew NO extra taps, and the worst case
+// observed is 5 options — never a long scroll. (An earlier count of 51.9%
+// sampled only estimate-bearing phases; this is the complete measurement.)
+// Capturing the item yields the phase for free (resolveCostCode derives one
+// from the other), which is what makes per-item variance affordable without
+// hurting ADOPTION.
 //
 // Rules live here as pure functions; the Prisma reader is injected, matching
 // project-phases.ts / project-phases-db.ts. Deliberately built on
