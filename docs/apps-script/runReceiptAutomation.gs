@@ -103,11 +103,28 @@ const QBO_OK_MIMES = ["application/pdf", "image/jpeg", "image/png"];
 
 // The Gemini key comes from geminiApiKey_() in Config.gs, which reads Script Properties.
 // Models are tried IN ORDER — if one is overloaded (HTTP 503) or rate-limited (429),
-// the read falls through to the next, so one busy model never sinks the run. 2.5-pro
-// / 2.5-flash are GA and far more stable than the just-released 3.x models; pro leads
-// for accuracy on faded thermal receipts. (NOTE: "gemini-3.5-pro" is NOT a valid id on
-// this key — only "gemini-3.5-flash" exists, and it 503s under load.)
-const GEMINI_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
+// the read falls through to the next, so one busy model never sinks the run.
+//
+// Model fallback chain, verified live 2026-08-19 against a real receipt.
+//
+// OUTAGE (2026-08-10 → 08-19): the previous chain was
+// ["gemini-2.5-pro", "gemini-2.5-flash"]. BOTH died at once — 2.5-pro was
+// retired ("no longer available to new users") while the whole project was
+// separately blocked with 403 PERMISSION_DENIED for unlinked billing. Every
+// receipt failed 3/3 for nine days and the only signal was mail piling up
+// in Justin's inbox. Billing is now on Paid Tier and the 403s are gone, but
+// gemini-2.5-pro is STILL 404 — a retired model never comes back.
+//
+// The chain therefore leads with a "-latest" alias, which Google repoints
+// as models retire, so a single retirement can no longer take the pipeline
+// down. Ordered fastest-verified first: gemini-flash-latest read this
+// receipt in 2.0s, 2.5-flash in 2.6s, pro-latest in 4.5s.
+//
+// WARNING: the /models LISTING endpoint lies. It happily returned
+// gemini-2.5-pro and gemini-2.5-flash all through the outage while
+// generateContent 404'd and 403'd them. Any health check MUST make a real
+// generateContent call — see checkVisionModels_() and the nightly watchdog.
+const GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-pro-latest"];
 const MAX_AI_ATTEMPTS = 3;  // failed AI reads per file, across runs
 const MAX_TOTAL_RUNS  = 6;  // total processing passes per file, across runs
 // A pass that ended because GEMINI ITSELF was unavailable (503/429/404/403/network) says
