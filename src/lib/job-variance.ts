@@ -126,6 +126,17 @@ export interface VarianceCoverage {
      * surfaced and counted, not silently vanish.
      */
     malformedRows: number;
+    /**
+     * GROSS (absolute) unattributed dollars — the same basis `attributedShare`
+     * is computed on.
+     *
+     * Second-review finding: `unattributedTotal` is a NET figure, so a $1,000
+     * uncoded charge plus a $1,000 uncoded refund nets to $0 and the trust bar
+     * read "$0 spent with no phase" directly beside "0% attributed" — two true
+     * numbers that flatly contradict each other. The UI shows this one whenever
+     * netting hides activity, so the bar and the dollar figure always agree.
+     */
+    unattributedGross: number;
 }
 
 /** "Labor" vs everything else. A null cost type falls back to the legacy `type` string. */
@@ -336,13 +347,22 @@ export function computeProjectVariance(input: {
 
         // Flag every item under a phase carrying actuals that landed on no item:
         // those item rows are floors, and the UI must not imply otherwise.
-        // Math.abs: peer-review finding — summing Decimal-derived floats leaves
-        // sub-cent residue in EITHER direction, and a one-sided `> 0.005` test
-        // could suppress a flag that should fire.
+        //
+        // Sign matters, and it took two review rounds to get right:
+        //   POSITIVE remainder -> real unassigned spend sits on the phase, so
+        //     every item row understates its true cost. Flag it.
+        //   NEGATIVE remainder -> the items already account for MORE than the
+        //     phase net (item-linked refunds exceeding phase-level spend). The
+        //     items are fully attributed; flagging them would warn about
+        //     unmeasured money that does not exist.
+        // An earlier fix used Math.abs() to catch float residue in either
+        // direction and thereby over-fired on the negative case. The epsilon
+        // handles residue; only a positive remainder is a floor.
         const unassigned = phase.totalActual - phase.items.reduce((a, i) => a + i.actual, 0);
+        const hasUnassignedSpend = unassigned > 0.005;
         for (const item of phase.items) {
             item.variance = item.budget - item.actual;
-            item.phaseHasUnassignedActuals = Math.abs(unassigned) > 0.005;
+            item.phaseHasUnassignedActuals = hasUnassignedSpend;
         }
         phase.items.sort((a, b) => a.variance - b.variance);
     }
@@ -389,6 +409,7 @@ export function computeProjectVariance(input: {
             ),
             phaseOnlyActuals,
             malformedRows: malformedRows + malformedBudgetRows,
+            unattributedGross: absUnattributed,
         },
     };
 }

@@ -83,6 +83,14 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
         // real overruns (prod currently holds $67k of Draft/Sent CO scope).
         // ChangeOrderItem is a FLAT table (no parentId), so there are no section
         // rows to exclude here, unlike EstimateItem.
+        // KNOWN RISK, verified clear on prod 2026-08-19. `ChangeOrderItem` has
+        // NO provenance column (no sourceEstimateItemId), so nothing structurally
+        // prevents a CO generated FROM estimate lines from duplicating scope that
+        // the estimate already budgets — which would inflate the budget and hide
+        // a real overrun. Checked both approved COs on prod: "Deposit for Added
+        // Items" (Berg ADU, $4,629.63) and "Added items" (Shop, $1,000) are
+        // genuinely additional scope with no same-named estimate line. Re-check
+        // this if change orders ever start being generated from estimate rows.
         const changeOrderItems = await prisma.changeOrderItem.findMany({
             where: { changeOrder: { projectId: project.id, status: "Approved" } },
             select: {
@@ -101,6 +109,50 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
                 costTypeName: row.costType?.name ?? null,
                 type: row.type ?? null,
                 total: Number(row.total ?? 0),
+            });
+        }
+
+        // Item pool for ATTRIBUTION, which is broader than the budget pool.
+        //
+        // Second-review finding (latent). `items` above holds only BUDGET rows
+        // (eligible estimates + approved COs). But the expense query below
+        // deliberately counts spend on Draft/archived estimates too, and such an
+        // expense can carry an `itemId` pointing at its own estimate's coded
+        // item. Resolving links against the budget pool alone would discard that
+        // link and dump the money into "unattributed", overstating how little we
+        // know. Today this is harmless — prod has 0/562 expenses with an itemId —
+        // but it becomes live the moment material item-coding starts, which is
+        // the next planned piece of work.
+        //
+        // These extra rows carry a cost code for ATTRIBUTION but contribute NO
+        // budget: `budgetItemIds` marks the real budget rows, and anything not in
+        // that set is passed with `total: 0`. Spend against them therefore shows
+        // up as an unbudgeted phase — visible and honest — rather than vanishing.
+        const budgetItemIds = new Set(items.map((row) => row.id));
+        const attributionOnlyItems = await prisma.estimateItem.findMany({
+            where: {
+                estimate: { projectId: project.id },
+                id: { notIn: [...budgetItemIds] },
+                costCodeId: { not: null },
+            },
+            select: {
+                id: true, name: true, type: true,
+                costCodeId: true,
+                costCode: { select: { code: true, name: true } },
+                costType: { select: { name: true } },
+            },
+        });
+        for (const row of attributionOnlyItems) {
+            items.push({
+                id: row.id,
+                name: row.name?.trim() || "(unnamed line item)",
+                costCodeId: row.costCodeId,
+                costCode: row.costCode ? { code: row.costCode.code, name: row.costCode.name } : null,
+                costTypeName: row.costType?.name ?? null,
+                type: row.type ?? null,
+                // NO budget — this row exists only so a posting linked to it can
+                // still reach the right phase and line item.
+                total: 0,
             });
         }
 

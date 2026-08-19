@@ -461,6 +461,70 @@ test("clean data reports zero malformed rows", () => {
     assert.equal(result.coverage.malformedRows, 0);
 });
 
+// ── second review round (Kimi 3, post-deploy) ───────────────────────────────
+
+test("KIMI 1: a NEGATIVE remainder does NOT flag items as floors", () => {
+    // Regression on my own earlier fix. Math.abs() was added to catch float
+    // residue in either direction, but a negative remainder means the ITEMS
+    // account for more than the phase nets — they are fully attributed, and
+    // flagging them warns about unmeasured money that does not exist.
+    //
+    // To drive the remainder negative the item-linked total must exceed the
+    // phase total, so the phase carries a NON-item-linked refund: the phase nets
+    // $100 while its one item accounts for $500.
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [
+            spend({ costCodeId: "cc-demo", itemId: "i1", amount: 500 }), // on the item
+            spend({ costCodeId: "cc-demo", amount: -400 }),              // phase-level refund
+        ],
+    });
+    const phase = result.phases[0];
+    const itemSum = phase.items.reduce((a, i) => a + i.actual, 0);
+    assert.equal(phase.totalActual, 100);
+    assert.equal(itemSum, 500);
+    assert.ok(phase.totalActual - itemSum < 0, "precondition: the remainder is negative");
+    assert.equal(phase.items[0].phaseHasUnassignedActuals, false,
+        "items fully account for the phase — must NOT be marked as a floor");
+});
+
+test("a POSITIVE remainder still flags items as floors", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [
+            spend({ costCodeId: "cc-demo", itemId: "i1", amount: 100 }),
+            spend({ costCodeId: "cc-demo", amount: 400 }), // phase-only, no item
+        ],
+    });
+    assert.equal(result.phases[0].items[0].phaseHasUnassignedActuals, true);
+});
+
+test("KIMI 2: gross unattributed is reported so the trust bar cannot contradict itself", () => {
+    // A $1,000 uncoded charge plus a $1,000 uncoded refund NET to $0, which read
+    // "$0 spent with no phase" right beside "0% attributed" — both true, and
+    // flatly contradictory.
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 5000 })],
+        timeEntries: [],
+        expenses: [spend({ amount: 1000 }), spend({ amount: -1000 })],
+    });
+    assert.equal(result.coverage.unattributedTotal, 0, "net is genuinely zero");
+    assert.equal(result.coverage.unattributedGross, 2000, "but $2,000 of activity was unplaced");
+    assert.equal(result.coverage.attributedShare, 0, "and coverage correctly reads 0%");
+});
+
+test("gross and net unattributed agree when there are no refunds", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 5000 })],
+        timeEntries: [],
+        expenses: [spend({ amount: 300 }), spend({ costCodeId: "cc-demo", amount: 700 })],
+    });
+    assert.equal(result.coverage.unattributedTotal, 300);
+    assert.equal(result.coverage.unattributedGross, 300);
+});
+
 test("an empty project produces zeros, not NaN", () => {
     const result = computeProjectVariance({ items: [], timeEntries: [], expenses: [] });
     for (const v of [result.totalBudget, result.totalActual, result.variance, result.uncodedBudget]) {

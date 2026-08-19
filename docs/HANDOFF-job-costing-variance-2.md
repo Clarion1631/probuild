@@ -184,6 +184,55 @@ governs what we *promised* (budget), never what we *paid* (actual). A cost is re
 moment it leaves the bank. Spend with no matching budget surfaces honestly as an
 "unbudgeted phase" or in the unattributed bucket rather than being dropped.
 
+## Second peer review — Kimi 3 (K3), POST-DEPLOY
+
+Run after the code was already live, via the newly-installed Kimi CLI
+(`kimi -m kimi-code/k3 -p ...`). It independently ran the suite (45/45) and
+typecheck (clean), then found **three more issues the first review missed** —
+two of them regressions introduced BY the first round of fixes:
+
+1. **The `Math.abs()` floor-flag fix over-fired.** Round one changed
+   `unassigned > 0.005` to `Math.abs(unassigned) > 0.005` to catch float residue
+   in both directions. But a NEGATIVE remainder means the items account for MORE
+   than the phase nets (item-linked refunds exceeding phase-level spend) — they
+   are fully attributed, and flagging them warns about unmeasured money that does
+   not exist. Reverted to a positive-only test, with the sign logic explained.
+2. **The trust bar could contradict itself.** `unattributedTotal` is NET while
+   `attributedShare` is ABSOLUTE, so a $1,000 uncoded charge plus a $1,000
+   uncoded refund rendered "$0 spent with no phase" directly beside "0%
+   attributed" — both true, flatly contradictory. Added
+   `coverage.unattributedGross`; the UI shows it whenever netting hides activity.
+3. **Item links on ineligible estimates were discarded** (latent). The expense
+   query deliberately counts spend on Draft estimates, but the item pool was
+   built only from BUDGET rows, so an expense carrying an `itemId` into a Draft
+   estimate's coded item lost its link and inflated "unattributed". Harmless
+   today (prod: 0/562 expenses carry an itemId; 1 time entry affected) but it
+   goes live the moment material item-coding starts — which is the next task.
+   Fixed with an attribution-only item pool carrying `total: 0` (no budget).
+
+### The one finding Kimi said to check before trusting these numbers — CHECKED, CLEAR
+
+`ChangeOrderItem` has **no provenance column** (no `sourceEstimateItemId`), so
+nothing structurally stops a CO generated *from* estimate lines from duplicating
+scope the estimate already budgets — which would inflate the budget and hide a
+real overrun. Verified against prod: both approved COs are genuinely additional
+scope with no same-named estimate line —
+
+```
+Berg ADU  "Deposit for Added Items"  $4,629.63   no matching estimate line
+Shop      "Added items"              $1,000.00   no matching estimate line
+```
+
+So **Berg's −$5,474 stands**. The risk is documented in `job-variance-db.ts`;
+re-check it if change orders ever start being generated from estimate rows.
+
+Kimi's verdict on the deliberate expense-filter asymmetry: **defensible**, same
+conclusion reached independently. It also flagged that `Shop` is an overhead
+bucket rather than a job, and its −$59,480 / 0%-attributed row is "the largest,
+least actionable number on the page" — worth excluding from this report.
+
+---
+
 ### Known, accepted
 
 `Mesplay Kitchen`, `Hoppe`, and `Shop` each have **two eligible estimates**. Their items

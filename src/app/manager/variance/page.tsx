@@ -60,6 +60,14 @@ function TrustBar({ variance }: { variance: ProjectVariance }) {
                         {formatCurrency(variance.coverage.unattributedTotal)}
                     </span>
                     spent with no phase — invisible below
+                    {/* Netting can hide activity: a charge and an equal refund cancel to
+                        $0 while coverage still (correctly) reads 0%. Show the gross so
+                        the bar and the dollar figure can never contradict each other. */}
+                    {Math.abs(variance.coverage.unattributedGross - variance.coverage.unattributedTotal) > 0.005 && (
+                        <span className="block text-hui-textMuted">
+                            ({formatCurrency(variance.coverage.unattributedGross)} gross, before refunds)
+                        </span>
+                    )}
                 </div>
                 <div>
                     <span className="block font-medium text-hui-textMain">
