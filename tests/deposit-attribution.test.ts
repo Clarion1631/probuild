@@ -456,3 +456,54 @@ test("KIMI-3: a stale image cannot produce 'verified' on ANY path", async t => {
         assert.equal(a.needsImage, true);
     });
 });
+
+test("KIMI-4: an image in hand does not ask for another image pull", () => {
+    // Multi-customer QBO ambiguity WITH an image already present. Pulling
+    // the same image again cannot help — this needs a human.
+    const a = attributeDeposit(dep(), {
+        qboPayments: [
+            { date: "2026-07-31", amountCents: 3000000, customerName: "Mueller Remodel", checkNumber: null },
+            { date: "2026-07-31", amountCents: 3000000, customerName: "Berg ADU", checkNumber: null },
+        ],
+        checkImage: {
+            payerName: "Sandi Christensen", memo: null, checkNumber: "9",
+            amountCents: 3000000, documentDate: "2026-07-31",
+        },
+    });
+    assert.equal(a.needsImage, false, "the image is already in hand");
+    assert.equal(a.confidence, "conflict");
+    assert.equal(a.payerName, "Sandi Christensen", "do not discard the strongest name");
+    assert.equal(depositsNeedingHuman([a]).length, 1, "but a human must still see it");
+});
+
+test("KIMI-5: placeholder customer names are not payers", () => {
+    for (const junk of ["-", "N/A", "Unknown", "VARIOUS", "  none  ", "TBD"]) {
+        const a = attributeDeposit(dep(), {
+            qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: junk, checkNumber: null }],
+        });
+        assert.equal(a.payerName, null, `"${junk}" must not become a payer`);
+    }
+});
+
+test("KIMI-6: money must be integer cents", async t => {
+    const bad = [3000000.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2];
+    await t.test("a non-integer milestone amount is not a candidate", () => {
+        for (const amt of bad) {
+            const a = attributeDeposit(dep(), {
+                milestones: [{
+                    id: "m", projectName: "X", customerName: "Y",
+                    milestoneName: "Z", amountCents: amt as number, status: "Pending",
+                }],
+            });
+            assert.equal(a.candidateMilestones.length, 0, `${amt} must be rejected`);
+        }
+    });
+    await t.test("a non-integer payment amount never names a payer", () => {
+        for (const amt of bad) {
+            const a = attributeDeposit(dep(), {
+                qboPayments: [{ date: "2026-07-31", amountCents: amt as number, customerName: "Sandi Christensen", checkNumber: null }],
+            });
+            assert.equal(a.payerName, null, `${amt} must be rejected`);
+        }
+    });
+});

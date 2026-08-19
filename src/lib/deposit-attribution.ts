@@ -269,15 +269,21 @@ export function attributeDeposit(
 
     // Milestones this amount could settle. S2: an already-settled milestone
     // must never be proposed again — that is a double credit.
+    // Kimi NIT: money is INTEGER CENTS by repo invariant. A float or an
+    // unsafe integer arriving from a caller would break === comparisons
+    // silently, so a malformed candidate is excluded rather than trusted.
+    const isMoney = (c: unknown): c is number =>
+        typeof c === "number" && Number.isSafeInteger(c);
     const isOpen = (status: string) => !/^(paid|void|cancel)/i.test(status.trim());
     const candidates = milestones
-        .filter(m => m.amountCents === deposit.amountCents && isOpen(m.status))
+        .filter(m => isMoney(m.amountCents) && m.amountCents === deposit.amountCents && isOpen(m.status))
         .sort((a, b) => a.id.localeCompare(b.id));
 
     // ── Source 2: QBO payment (exact amount, tight date window) ──────────
     // S1: sort the hits so nothing downstream depends on argument order.
     const qboHits = payments
         .filter(p =>
+            isMoney(p.amountCents) &&
             p.amountCents === deposit.amountCents &&
             Number.isFinite(daysBetween(p.date, deposit.postedDate)) &&
             Math.abs(daysBetween(p.date, deposit.postedDate)) <= window)
@@ -286,10 +292,17 @@ export function attributeDeposit(
             (a.customerName ?? "").localeCompare(b.customerName ?? "") ||
             (a.checkNumber ?? "").localeCompare(b.checkNumber ?? ""));
 
-    // S5: a blank or placeholder customer name is not a payer.
+    // S5 + Kimi NIT: a blank or placeholder customer name is not a payer.
+    // Real accounting data carries several of these and any one of them
+    // becoming a "payer" would attach a bogus name to real money.
+    const PLACEHOLDER_NAMES = new Set([
+        "-", "--", "N/A", "NA", "NONE", "UNKNOWN", "VARIOUS", "MISC",
+        "MISCELLANEOUS", "CUSTOMER", "TBD", "?", ".",
+    ]);
     const cleanName = (n: string | null | undefined) => {
         const t = (n ?? "").trim();
-        return t && t !== "-" ? t : null;
+        if (!t) return null;
+        return PLACEHOLDER_NAMES.has(t.toUpperCase()) ? null : t;
     };
     const qboNames = [...new Set(qboHits.map(h => cleanName(h.customerName)).filter(Boolean) as string[])].sort();
     const qboName = qboNames.length === 1 ? qboNames[0] : null;
@@ -370,6 +383,26 @@ export function attributeDeposit(
                     `QuickBooks had ${qboNames.length} customers at this amount, but the check ` +
                     `image says ${imageName}` +
                     (m.length === 1 ? ` — settles "${m[0].milestoneName}" on ${m[0].projectName}.` : `. Which milestone it settles is still unclear.`),
+                needsImage: false,
+            };
+        }
+        // Kimi SHOULD-FIX: the image is already in hand. Even when it agrees
+        // with none of the QBO names, pulling it AGAIN cannot help — this
+        // needs a human, not another image pull. And the image's payer is
+        // still the strongest name we have, so do not discard it.
+        if (imageName) {
+            return {
+                ...base,
+                payerName: imageName,
+                source: "check_image",
+                confidence: "conflict",
+                checkNumber: image?.checkNumber ?? qboCheck,
+                candidateMilestones: candidates,
+                proposedMilestoneId: null,
+                reason:
+                    `The check image says ${imageName}, but QuickBooks has ${qboNames.length} ` +
+                    `different customers at this amount (${qboNames.join(", ")}). ` +
+                    `A human must reconcile them.`,
                 needsImage: false,
             };
         }
