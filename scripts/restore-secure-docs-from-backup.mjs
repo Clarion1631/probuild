@@ -78,6 +78,7 @@
 //   SUPABASE_SERVICE_KEY  Supabase service role key — phase upload/both
 import { PrismaClient } from "@prisma/client";
 import { createClient } from "@supabase/supabase-js";
+import dotenv from "dotenv";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -139,12 +140,26 @@ if (!fs.existsSync(SOURCE) || !fs.statSync(SOURCE).isDirectory()) {
   process.exit(1);
 }
 
+/**
+ * Read a key from the environment, then from the dotenv files in the order the Next.js
+ * toolchain resolves them: `.env.local` OVERRIDES `.env`. Checking `.env` first would let a
+ * committed default silently win over the local override and point this script's restore writes
+ * at the WRONG DATABASE or the WRONG STORAGE BUCKET.
+ *
+ * Parsing is delegated to `dotenv` rather than hand-rolled: a regex over the line mishandles
+ * quoted values containing `#`, `export` prefixes, inline comments, CRLF and multiline values,
+ * and every one of those is a silent wrong-target read. `in` rather than a truthiness check at
+ * BOTH levels so a source that assigns an EMPTY value — an exported `DATABASE_URL=""` included —
+ * still wins over every lower-precedence source and the missing-value check below fails loudly.
+ * Resolving one key from the shell and another from a file is how this script ends up uploading
+ * objects into one project and writing the resulting refs into another.
+ */
 function envFromFiles(key) {
-  if (process.env[key]) return process.env[key];
-  for (const f of [".env", ".env.local"]) {
+  if (key in process.env) return process.env[key];
+  for (const f of [".env.local", ".env"]) {
     if (!fs.existsSync(f)) continue;
-    const m = fs.readFileSync(f, "utf8").match(new RegExp(`^${key}\\s*=\\s*"?([^"\\n]+)"?`, "m"));
-    if (m) return m[1];
+    const parsed = dotenv.parse(fs.readFileSync(f));
+    if (key in parsed) return parsed[key];
   }
   return undefined;
 }

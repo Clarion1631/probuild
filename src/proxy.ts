@@ -34,11 +34,19 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
 // api/selections/link-schedule is the same shape (staff-only, self-
 // authorizing, must return a clean 403) for the schedule-linking AI
 // suggestion route (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
+// api/pdf/estimates only redirects to the self-gating portal estimate page;
+// api/pdf/invoices and api/pdf/change-orders (incl. the billing sub-route)
+// self-authorize in the handler via src/lib/pdf-route-auth (staff session or
+// matching portal client), so portal clients can fetch their documents
+// without a staff session.
+// api/office-tasks/ingest is a machine-to-machine endpoint (GTR Automations
+// bot) that self-authenticates with a Bearer secret (OFFICE_TASKS_INGEST_SECRET)
+// and must return a clean 401, not a redirect to /login. Exact-match only —
+// future descendants under /api/office-tasks/ must NOT inherit the bypass.
 // privacy / terms / account-deletion are static legal pages with no data access.
 // The app stores require them to be reachable by a logged-out reviewer, and Google
 // Play specifically requires a public account-deletion URL.
-const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
-const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/billing\/[^/]+\/?$/;
+const PUBLIC_PROXY_BYPASS_PATTERN = /^\/(?:api\/health$|api\/(?:auth|cron|twilio|webhook|payments|portal|integrations|mcp(?:\/|$)|version|pdf\/(?:estimates|invoices|change-orders)|sub-portal|mobile|selections\/(?:item-comments|ai-sort|link-schedule))(?:\/|$)|api\/office-tasks\/ingest\/?$|login(?:\/|$)|portal(?:\/|$)|sub-portal(?:\/|$)|share(?:\/|$)|privacy(?:\/|$)|terms(?:\/|$)|account-deletion(?:\/|$)|support(?:\/|$)|_next\/(?:static|image)(?:\/|$)|favicon\.ico$|.*\.(?:png|jpg|svg|webmanifest)$)/;
 
 // The legal pages are static server components that define no Server Actions.
 // Next's action IDs are global, so a bypassed path is a place an anonymous caller
@@ -46,8 +54,18 @@ const CHANGE_ORDER_BILLING_PDF_PATTERN = /^\/api\/pdf\/change-orders\/[^/]+\/bil
 // accept that tradeoff because they genuinely have anonymous actions, these don't.
 const LEGAL_PAGE_PATTERN = /^\/(?:privacy|terms|account-deletion|support)(?:\/|$)/;
 
+// Test-only action dispatchers that get the proxy bypass below. Explicit, not a
+// prefix match: the proxy checks only the environment gates, never the route's
+// `x-e2e-secret`, so a prefix would silently extend that bypass to any future
+// /api/test-only/* file before anyone reviewed its own gates. Each route here
+// implements the identical four gates internally.
+const TEST_ONLY_DISPATCHER_PATHS = new Set([
+    "/api/test-only/contract-actions",
+    "/api/test-only/portal-estimate-actions",
+]);
+
 export function isPublicProxyBypass(pathname: string) {
-    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname) || CHANGE_ORDER_BILLING_PDF_PATTERN.test(pathname);
+    return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
 }
 
 function hasNextAuthSessionCookie(req: any) {
@@ -80,6 +98,44 @@ export default async function proxy(req: any, event: any) {
         if (!token?.email || (token as any).accountDisabled === true || !await isStaffAccountEnabled(token.email)) {
             return new NextResponse("Forbidden", { status: 403 });
         }
+    }
+
+    // Test-only action dispatchers (src/app/api/test-only/*/route.ts — currently
+    // contract-actions and portal-estimate-actions). They exist so an
+    // UNAUTHENTICATED (or otherwise-scoped) request reaches the action itself
+    // and is refused by the action's OWN gate — a proxy redirect to /login would
+    // prove nothing about that gate, which is exactly what
+    // e2e/contract-auth-runtime.spec.ts and the portal-estimate-actions runtime
+    // tests in e2e/portal-estimate-access.spec.ts have to pin.
+    //
+    // The conditions here MUST stay identical to testOnlyRoutesEnabled() in each
+    // of those routes, and `!isServerAction` is load-bearing on top of them.
+    // Codex flagged the earlier version (contract-actions only): it checked only
+    // PLAYWRIGHT_TEST_SECRET while the route also checked VERCEL_ENV, so the two
+    // supposedly-matching gates did not match, and it waved through a request
+    // carrying a `next-action` header that the checks above had deliberately
+    // just scrutinised. An anonymous caller has no session cookie, so the
+    // stale-cookie check above does not cover them. Bypassing the proxy is
+    // never allowed to also mean bypassing the Server Action boundary.
+    //
+    // An explicit allowlist, NOT a `/api/test-only/` prefix match. The proxy does
+    // not verify `x-e2e-secret` — only the route handlers do — so a prefix match
+    // would pre-authorize any future test-only route the moment someone adds the
+    // file, before it has been reviewed for gates of its own. Adding a route here
+    // is the deliberate step that grants it the bypass.
+    if (
+        !isServerAction
+        && process.env.E2E_TEST_ROUTES === "1"
+        && !!process.env.PLAYWRIGHT_TEST_SECRET
+        // Affirmative, not merely "not production" — see the same clause in the
+        // routes. Every other condition is satisfied by an ABSENT variable, so a
+        // self-hosted production server (no VERCEL_ENV) passed them all.
+        && (process.env.NODE_ENV !== "production" || process.env.CI === "true")
+        && process.env.VERCEL_ENV !== "production"
+        && typeof pathname === "string"
+        && TEST_ONLY_DISPATCHER_PATHS.has(pathname)
+    ) {
+        return NextResponse.next();
     }
 
     // Legal pages are readable by anyone but are not an action endpoint.
@@ -155,6 +211,6 @@ export const config = {
          * - favicon.ico, public folder images, etc
          * - manifest.webmanifest (PWA manifest — must be fetchable for install)
          */
-        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates|api/pdf/invoices|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|privacy|terms|account-deletion|support|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
+        "/((?!api/health$|api/auth|api/cron|api/twilio|api/webhook|api/payments|api/portal|api/integrations|api/mcp/|api/version|api/pdf/estimates(?:/|$)|api/pdf/invoices(?:/|$)|api/pdf/change-orders(?:/|$)|api/sub-portal|api/mobile|api/selections/item-comments|api/selections/ai-sort|api/selections/link-schedule|login|portal|sub-portal|share|privacy|terms|account-deletion|support|_next/static|_next/image|favicon.ico|.*\\.png|.*\\.jpg|.*\\.svg|.*\\.webmanifest).*)",
     ],
 };

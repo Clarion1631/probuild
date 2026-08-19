@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import { formatCurrency } from "@/lib/utils";
+import { computeEstimateItemTotals } from "@/lib/estimate-item-payload";
 
 interface JobCostingClientProps {
     project: { id: string; name: string };
@@ -87,9 +88,13 @@ export default function JobCostingClient({
             return map.get(key)!;
         };
         estimates.forEach(est => {
-            est.items.forEach((item: any) => {
+            const items: any[] = est.items ?? [];
+            // Section headers mirror their children's roll-up, so budgeting them too double-counts.
+            const totals = computeEstimateItemTotals(items);
+            items.forEach((item: any, index: number) => {
+                if (totals[index].isSection) return;
                 const group = getGroup(item.costCodeId, item.costCode?.name, item.costCode?.code);
-                const total = num(item.quantity) * num(item.unitCost);
+                const total = totals[index].total;
                 const itemCategory = (item.costType?.name || item.type || "").toLowerCase();
                 if (itemCategory.includes("labor")) group.budgetLabor += total;
                 else group.budgetMaterial += total;

@@ -1,37 +1,12 @@
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { formatCurrency } from "@/lib/utils";
+import { isBackdatedPayment, formatMoneyDate } from "@/lib/payment-date";
 
 function isToggleOn(settings: { notificationToggles?: string | null } | null, key: string): boolean {
     if (!settings?.notificationToggles) return true;
     try { return JSON.parse(settings.notificationToggles)[key] !== false; } catch { return true; }
 }
-
-type ScheduleLike = {
-    id: string;
-    name: string;
-    amount: number | string | { toString(): string };
-    referenceNumber?: string | null;
-};
-
-type InvoiceLike = {
-    id: string;
-    code: string;
-    client: { name?: string | null; email?: string | null } | null;
-};
-
-type EstimateLike = {
-    id: string;
-    code: string;
-    project?: { client?: { name?: string | null; email?: string | null } | null } | null;
-    // Lead email lives on its related Client, not on Lead itself. The older `lead.email` shape
-    // was a phantom type that let a real bug reach production (auto receipts silently
-    // failed for lead-only estimates).
-    lead?: {
-        name?: string | null;
-        client?: { name?: string | null; email?: string | null } | null;
-    } | null;
-};
 
 const METHOD_LABELS: Record<string, string> = {
     card: "Card",
@@ -88,9 +63,10 @@ function receiptBodyHtml(opts: {
  * team alert (Settings → Notifications · Payment Received toggle), client
  * receipt (deduped via receiptSentAt), and the project activity-feed entry.
  * Called by every settle path — QuickBooks sync, manual invoice recording,
- * estimate-side recording via its mirrored invoice copy. The Stripe webhook
- * predates this and uses sendInvoicePaymentReceivedEmails below; a milestone
- * can only be claimed once, so the two can never both fire for one payment.
+ * estimate-side recording via its mirrored invoice copy, and the Stripe
+ * webhook's invoice branch (which enqueues via the payment outbox and
+ * delivers through here; estimate Stripe events route to
+ * notifyEstimateMilestonePaid instead).
  *
  * Fetches fresh state by id (call AFTER the settle transaction commits, so
  * balanceDue is already recalculated). Never throws.
@@ -128,7 +104,8 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         const amount = formatCurrency(s.amount);
         const remaining = formatCurrency(s.invoice.balanceDue);
         const newBalanceNum = Number(s.invoice.balanceDue.toString());
-        const when = (s.paymentDate || s.paidAt || new Date()).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+        const whenOpts: Intl.DateTimeFormatOptions = { year: "numeric", month: "long", day: "numeric" };
+        const when = formatMoneyDate(s.paymentDate || s.paidAt || new Date(), whenOpts, "en-US");
         const link = s.invoice.project
             ? `https://probuild.goldentouchremodeling.com/projects/${s.invoice.project.id}/invoices/${s.invoice.id}`
             : "https://probuild.goldentouchremodeling.com/invoices";
@@ -191,7 +168,11 @@ export async function notifyMilestonePaid(paymentScheduleId: string, opts?: { de
         // 3. Client receipt (once per milestone — receiptSentAt is the guard).
         //    Stamp receiptSentAt ONLY when the send actually succeeded, so a failed
         //    send stays retryable by the outbox drainer instead of being marked sent.
-        if (s.invoice.client?.email && !s.receiptSentAt) {
+        //    Back-dated payments (recorded days after the money actually arrived) skip
+        //    the auto-receipt — a stale "Payment Confirmed" email blindsides the client.
+        //    receiptSentAt stays null so staff can still send one via the Send Receipt
+        //    button when they want to.
+        if (s.invoice.client?.email && !s.receiptSentAt && !isBackdatedPayment(s.paymentDate)) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/invoices/${s.invoice.id}`;
             const receiptSend = await sendNotification(
                 s.invoice.client.email,
@@ -239,7 +220,7 @@ export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { d
         const s = await prisma.estimatePaymentSchedule.findUnique({
             where: { id: scheduleId },
             select: {
-                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true, receiptSentAt: true,
+                id: true, name: true, amount: true, status: true, paymentMethod: true, referenceNumber: true, receiptSentAt: true, paymentDate: true,
                 estimate: {
                     select: {
                         id: true, code: true, title: true, projectId: true, leadId: true, balanceDue: true,
@@ -305,10 +286,12 @@ export async function notifyEstimateMilestonePaid(scheduleId: string, opts?: { d
             if (adminSend && !adminSend.success) ok = false;
         }
 
-        // 3. Client receipt (once per milestone — receiptSentAt guard, stamped only on success)
+        // 3. Client receipt (once per milestone — receiptSentAt guard, stamped only on success).
+        //    Back-dated payments skip the auto-receipt (see notifyMilestonePaid); receiptSentAt
+        //    stays null so a manual Send Receipt is still possible.
         const clientEmail = est.project?.client?.email || est.lead?.client?.email || null;
         const clientName = est.project?.client?.name || est.lead?.client?.name || est.lead?.name || "";
-        if (clientEmail && !s.receiptSentAt) {
+        if (clientEmail && !s.receiptSentAt && !isBackdatedPayment(s.paymentDate)) {
             const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://probuild.goldentouchremodeling.com"}/portal/estimates/${est.id}`;
             const receiptSend = await sendNotification(
                 clientEmail,
@@ -424,120 +407,6 @@ export async function notifyQBSyncIssues(issues: QBSyncIssue[]): Promise<void> {
         );
     } catch (e) {
         console.error("[notifyQBSyncIssues] failed:", e);
-    }
-}
-
-/**
- * Send admin alert + customer receipt for a newly-paid invoice milestone.
- * Used by the Stripe webhook (auto) — callers must handle idempotency themselves.
- */
-export async function sendInvoicePaymentReceivedEmails(opts: {
-    invoice: InvoiceLike;
-    schedule: ScheduleLike;
-    method: string;
-    newBalance: number;
-    referenceNumber?: string | null;
-}) {
-    const { invoice, schedule, method, newBalance, referenceNumber } = opts;
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Golden Touch Remodeling";
-    const methodLabel = formatMethod(method, referenceNumber);
-
-    if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
-        await sendNotification(
-            settings.notificationEmail,
-            `Payment Received: ${schedule.name} - ${invoice.code}`,
-            `<div style="font-family: sans-serif; padding: 20px;">
-                <h2>Payment Received! 🎉</h2>
-                <p>A payment of <strong>${formatCurrency(schedule.amount)}</strong> has been successfully processed via ${methodLabel} for Invoice #${invoice.code}.</p>
-                <p>Milestone: ${schedule.name}</p>
-                <p>Remaining Invoice Balance: ${formatCurrency(newBalance)}</p>
-            </div>`
-        );
-    }
-
-    if (invoice.client?.email) {
-        const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || ''}/portal/invoices/${invoice.id}`;
-        await sendNotification(
-            invoice.client.email,
-            `Payment Receipt — Invoice #${invoice.code}`,
-            receiptBodyHtml({
-                invoiceLike: { code: invoice.code, kind: "invoice" },
-                clientName: invoice.client.name || "",
-                schedule,
-                method,
-                referenceNumber,
-                newBalance,
-                portalUrl,
-                companyName,
-                phone: settings?.phone,
-                email: settings?.email,
-            }),
-            undefined,
-            { replyTo: settings?.email ?? undefined }
-        );
-        await prisma.paymentSchedule.update({
-            where: { id: schedule.id },
-            data: { receiptSentAt: new Date() },
-        });
-    }
-}
-
-/**
- * Send admin alert + customer receipt for a newly-paid estimate deposit milestone.
- * Used by the Stripe webhook (auto).
- */
-export async function sendEstimatePaymentReceivedEmails(opts: {
-    estimate: EstimateLike;
-    schedule: ScheduleLike;
-    method: string;
-    newBalance: number;
-    referenceNumber?: string | null;
-}) {
-    const { estimate, schedule, method, newBalance, referenceNumber } = opts;
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const companyName = settings?.companyName || "Golden Touch Remodeling";
-    const methodLabel = formatMethod(method, referenceNumber);
-
-    if (settings?.notificationEmail && isToggleOn(settings, "paymentReceived")) {
-        await sendNotification(
-            settings.notificationEmail,
-            `Estimate Payment Received: ${schedule.name} - ${estimate.code}`,
-            `<div style="font-family: sans-serif; padding: 20px;">
-                <h2>Estimate Payment Received! 🎉</h2>
-                <p>A payment of <strong>${formatCurrency(schedule.amount)}</strong> has been successfully processed via ${methodLabel} for Estimate #${estimate.code}.</p>
-                <p>Milestone: ${schedule.name}</p>
-                <p>Remaining Estimate Balance: ${formatCurrency(newBalance)}</p>
-            </div>`
-        );
-    }
-
-    const clientEmail = estimate.project?.client?.email || estimate.lead?.client?.email || null;
-    const clientName = estimate.project?.client?.name || estimate.lead?.client?.name || estimate.lead?.name || "";
-    if (clientEmail) {
-        const portalUrl = `${process.env.NEXT_PUBLIC_APP_URL || ''}/portal/estimates/${estimate.id}`;
-        await sendNotification(
-            clientEmail,
-            `Payment Receipt — Estimate #${estimate.code}`,
-            receiptBodyHtml({
-                invoiceLike: { code: estimate.code, kind: "estimate" },
-                clientName,
-                schedule,
-                method,
-                referenceNumber,
-                newBalance,
-                portalUrl,
-                companyName,
-                phone: settings?.phone,
-                email: settings?.email,
-            }),
-            undefined,
-            { replyTo: settings?.email ?? undefined }
-        );
-        await prisma.estimatePaymentSchedule.update({
-            where: { id: schedule.id },
-            data: { receiptSentAt: new Date() },
-        });
     }
 }
 

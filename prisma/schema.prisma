@@ -9,39 +9,40 @@ datasource db {
 }
 
 model User {
-  id               String           @id @default(cuid())
-  email            String           @unique
-  name             String?
-  role             String           @default("FIELD_CREW") // ADMIN, MANAGER, FIELD_CREW, FINANCE
-  status           String           @default("PENDING") // PENDING, ACTIVATED, DISABLED
-  hourlyRate       Decimal            @default(0)
-  burdenRate       Decimal            @default(0)
-  pinCode          String? // Used for mobile app quick login
-  invitedAt        DateTime?        @default(now())
-  timeEntries      TimeEntry[]
-  assignedProjects Project[]        @relation("CrewAssignments")
-  taskAssignments  TaskAssignment[]
-  taskComments     TaskComment[]
-  uploadedFiles    ProjectFile[]
-  permissions      UserPermission?
-  projectAccess    ProjectAccess[]
-  leadTasks        LeadTask[]
-  managedLeads     Lead[]           @relation("LeadManager")
-  managedProjects  Project[]        @relation("ProjectManager")
-  dailyLogs        DailyLog[]
-  documentComments DocumentComment[]
-  teamMessages     TeamMessage[]
-  fieldUpdatesSeenAt DateTime?
-  clippedImports   ClippedImport[]
-  officeTasks        OfficeTask[]      @relation("OfficeTaskAssignee")
-  createdOfficeTasks OfficeTask[]      @relation("OfficeTaskCreator")
-  dispatchPublications DispatchPublication[] @relation("DispatchPublisher")
-  createdTaskMaterials TaskMaterial[] @relation("TaskMaterialCreator")
-  taskMaterialStatusChanges TaskMaterial[] @relation("TaskMaterialStatusChanger")
-  createdPunchItems TaskPunchItem[] @relation("TaskPunchItemCreator")
-  clippedProducts    ProductLibraryItem[]
-  addedFavorites     ProjectProductFavorite[]
-  decidedProposals   SelectionProposal[]
+  id                        String                   @id @default(cuid())
+  email                     String                   @unique
+  name                      String?
+  role                      String                   @default("FIELD_CREW") // ADMIN, MANAGER, FIELD_CREW, FINANCE
+  status                    String                   @default("PENDING") // PENDING, ACTIVATED, DISABLED
+  hourlyRate                Decimal                  @default(0)
+  burdenRate                Decimal                  @default(0)
+  pinCode                   String? // Used for mobile app quick login
+  invitedAt                 DateTime?                @default(now())
+  timeEntries               TimeEntry[]
+  assignedProjects          Project[]                @relation("CrewAssignments")
+  taskAssignments           TaskAssignment[]
+  taskComments              TaskComment[]
+  uploadedFiles             ProjectFile[]
+  permissions               UserPermission?
+  projectAccess             ProjectAccess[]
+  leadTasks                 LeadTask[]
+  managedLeads              Lead[]                   @relation("LeadManager")
+  managedProjects           Project[]                @relation("ProjectManager")
+  dailyLogs                 DailyLog[]
+  documentComments          DocumentComment[]
+  teamMessages              TeamMessage[]
+  fieldUpdatesSeenAt        DateTime?
+  clippedImports            ClippedImport[]
+  officeTasks               OfficeTask[]             @relation("OfficeTaskAssignee")
+  createdOfficeTasks        OfficeTask[]             @relation("OfficeTaskCreator")
+  dispatchPublications      DispatchPublication[]    @relation("DispatchPublisher")
+  createdTaskMaterials      TaskMaterial[]           @relation("TaskMaterialCreator")
+  taskMaterialStatusChanges TaskMaterial[]           @relation("TaskMaterialStatusChanger")
+  createdPunchItems         TaskPunchItem[]          @relation("TaskPunchItemCreator")
+  clippedProducts           ProductLibraryItem[]
+  addedFavorites            ProjectProductFavorite[]
+  decidedProposals          SelectionProposal[]
+  mcpKeys                   McpKey[]
 }
 
 model Client {
@@ -77,6 +78,13 @@ model Client {
   taxExemptCertExpiresAt DateTime?
   taxExemptCertNote      String?
 
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt     DateTime? @ignore @db.Timestamp(6)
+  deletedById   String?   @ignore
+  deleteBatchId String?   @ignore
+
   projects       Project[]
   leads          Lead[]
   invoices       Invoice[]
@@ -85,6 +93,7 @@ model Client {
 
   @@index([primaryPhoneE164])
   @@index([additionalPhoneE164])
+  @@index([deletedAt])
 }
 
 model Lead {
@@ -117,6 +126,13 @@ model Lead {
   driveFolderId  String?
   driveFolderUrl String?
 
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt     DateTime? @ignore @db.Timestamp(6)
+  deletedById   String?   @ignore
+  deleteBatchId String?   @ignore
+
   // Relations
   estimates      Estimate[]
   roomDesigns    RoomDesign[]
@@ -135,6 +151,7 @@ model Lead {
   @@index([createdAt])
   @@index([clientId])
   @@index([stage])
+  @@index([deletedAt])
 }
 
 model LeadNote {
@@ -162,23 +179,23 @@ model LeadTask {
 }
 
 model OfficeTask {
-  id          String    @id @default(cuid())
-  title       String
-  notes       String?
-  status      String    @default("To Do") // LEGACY — kept in sync with column.name on create/move for prod rollback safety until v2 deploys; reads should use columnId
-  columnId    String?
-  column      OfficeBoardColumn? @relation(fields: [columnId], references: [id], onDelete: SetNull)
-  position    Int       @default(0) // sort order within its column
-  archivedAt  DateTime?
-  dueDate     DateTime?
-  assigneeId  String?
-  assignee    User?     @relation("OfficeTaskAssignee", fields: [assigneeId], references: [id])
-  aiPrompt    String?   // suggested prompt the user can copy into Claude
+  id            String             @id @default(cuid())
+  title         String
+  notes         String?
+  status        String             @default("To Do") // LEGACY — kept in sync with column.name on create/move for prod rollback safety until v2 deploys; reads should use columnId
+  columnId      String?
+  column        OfficeBoardColumn? @relation(fields: [columnId], references: [id], onDelete: SetNull)
+  position      Int                @default(0) // sort order within its column
+  archivedAt    DateTime?
+  dueDate       DateTime?
+  assigneeId    String?
+  assignee      User?              @relation("OfficeTaskAssignee", fields: [assigneeId], references: [id])
+  aiPrompt      String? // suggested prompt the user can copy into Claude
   automationGap String? // what capability gap forced this to be handed off to a human
-  createdById String?
-  createdBy   User?     @relation("OfficeTaskCreator", fields: [createdById], references: [id])
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  createdById   String?
+  createdBy     User?              @relation("OfficeTaskCreator", fields: [createdById], references: [id])
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @default(now()) @updatedAt
 
   @@index([status, position])
   @@index([assigneeId])
@@ -212,86 +229,105 @@ model LeadMeeting {
 }
 
 model Project {
-  id                  String                       @id @default(cuid())
-  number              Int                          @default(autoincrement())
-  name                String
-  clientId            String
-  client              Client                       @relation(fields: [clientId], references: [id])
-  leadId              String?                      @unique
-  lead                Lead?                        @relation(fields: [leadId], references: [id], onDelete: Restrict)
-  viewedAt            DateTime                     @default(now())
-  createdAt           DateTime                     @default(now())
-  updatedAt           DateTime                     @default(now()) @updatedAt
-  location            String?
+  id                      String                       @id @default(cuid())
+  number                  Int                          @default(autoincrement())
+  name                    String
+  clientId                String
+  client                  Client                       @relation(fields: [clientId], references: [id])
+  leadId                  String?                      @unique
+  lead                    Lead?                        @relation(fields: [leadId], references: [id], onDelete: Restrict)
+  viewedAt                DateTime                     @default(now())
+  createdAt               DateTime                     @default(now())
+  updatedAt               DateTime                     @default(now()) @updatedAt
+  location                String?
   // Geofencing for mobile time-clock (added for gtr-probuild-mobile integration)
-  locationLat            Float?
-  locationLng            Float?
-  geofenceRadiusMeters   Int?     @default(100)
-  status              String                       @default("In Progress") // Waiting to Start, In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
+  locationLat             Float?
+  locationLng             Float?
+  geofenceRadiusMeters    Int?                         @default(100)
+  status                  String                       @default("In Progress") // Waiting to Start, In Progress, Substantial Completion, Closed Complete, Closed Lost (see lib/project-status.ts)
   // Company-level schedule markers (company dashboard): startDate = planned
   // project start shown on the start calendar; endDate reserved for Phase 2.
-  startDate           DateTime?
-  endDate             DateTime?
-  type                String? // Kitchen Remodeling, Patio, Water Damage
-  code                String?
-  tags                String?
-  color               String?                      @default("#3b82f6") // Added color field
-  paymentRemindersEnabled Boolean                  @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
-  portalStageOverride String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
-  managerId           String?
-  manager             User?                        @relation("ProjectManager", fields: [managerId], references: [id])
-  estimates           Estimate[]
-  invoices            Invoice[]
-  budgets             Budget[]
-  timeEntries         TimeEntry[]
-  roomDesigns         RoomDesign[]
-  contracts           Contract[]
-  crew                User[]                       @relation("CrewAssignments")
-  scheduleTasks       ScheduleTask[]
-  files               ProjectFile[]
-  folders             FileFolder[]
-  userAccess          ProjectAccess[]
-  subcontractorAccess SubcontractorProjectAccess[]
-  takeoffs            Takeoff[]
-  portalVisibility    PortalVisibility?
-  messageThreads      MessageThread[]
-  clientMessages      ClientMessage[]
-  changeOrders        ChangeOrder[]
-  purchaseOrders      PurchaseOrder[]
-  selectionBoards     SelectionBoard[]
-  dailyLogs           DailyLog[]
-  moodBoards          MoodBoard[]
-  retainers           Retainer[]
-  bidPackages         BidPackage[]
-  teamMessages        TeamMessage[]
-  activityLogs        ActivityLog[]
-  productFavorites    ProjectProductFavorite[]
-  selectionProposals  SelectionProposal[]
-  decisions           Decision[]
+  startDate               DateTime?
+  endDate                 DateTime?
+  type                    String? // Kitchen Remodeling, Patio, Water Damage
+  code                    String?
+  tags                    String?
+  color                   String?                      @default("#3b82f6") // Added color field
+  // Logistics/shop/admin job — not a client remodel. Clock-in on these projects
+  // doesn't require an estimate item / cost code (see /api/time-entries POST),
+  // and clock-out requires notes describing the work performed (see the
+  // /api/time-entries/[id] PATCH handler) since there's no cost-code context.
+  isLogistics             Boolean                      @default(false)
+  paymentRemindersEnabled Boolean                      @default(false) // Settings → Client Dashboard: send automated payment-due reminder emails to the client. Opt-in — off by default, enabled per project.
+  portalStageOverride     String? // Staff-pinned current stage on the portal project route (a CLIENT_STAGES label); null = derive position from schedule tasks
+  chatWebhookUrl          String? // Google Chat incoming webhook for the project's team space — treated as a credential: manager-only, never serialized to field crew
+  googleChatSpaceId       String?                      @unique
+  clientNextSteps         String?
+  clientNextStepsAt       DateTime?
+  qbProjectId             String?
+  qbSyncedAt              DateTime?                    @db.Timestamp(6)
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt               DateTime?                    @ignore @db.Timestamp(6)
+  deletedById             String?                      @ignore
+  deleteBatchId           String?                      @ignore
+  managerId               String?
+  manager                 User?                        @relation("ProjectManager", fields: [managerId], references: [id])
+  estimates               Estimate[]
+  invoices                Invoice[]
+  budgets                 Budget[]
+  timeEntries             TimeEntry[]
+  roomDesigns             RoomDesign[]
+  contracts               Contract[]
+  crew                    User[]                       @relation("CrewAssignments")
+  scheduleTasks           ScheduleTask[]
+  files                   ProjectFile[]
+  folders                 FileFolder[]
+  userAccess              ProjectAccess[]
+  subcontractorAccess     SubcontractorProjectAccess[]
+  takeoffs                Takeoff[]
+  portalVisibility        PortalVisibility?
+  messageThreads          MessageThread[]
+  clientMessages          ClientMessage[]
+  changeOrders            ChangeOrder[]
+  purchaseOrders          PurchaseOrder[]
+  selectionBoards         SelectionBoard[]
+  dailyLogs               DailyLog[]
+  moodBoards              MoodBoard[]
+  retainers               Retainer[]
+  bidPackages             BidPackage[]
+  teamMessages            TeamMessage[]
+  activityLogs            ActivityLog[]
+  productFavorites        ProjectProductFavorite[]
+  selectionProposals      SelectionProposal[]
+  decisions               Decision[]
+  permits                 Permit[]
 
   @@index([viewedAt])
   @@index([clientId])
   @@index([status])
   @@index([createdAt])
   @@index([startDate])
+  @@index([deletedAt])
 }
 
 model RoomDesign {
-  id           String      @id @default(cuid())
+  id           String       @id @default(cuid())
   name         String
   roomType     String // kitchen | bathroom | laundry | bedroom | other
   projectId    String?
-  project      Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project      Project?     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   leadId       String?
-  lead         Lead?       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  lead         Lead?        @relation(fields: [leadId], references: [id], onDelete: Cascade)
   layoutJson   Json // walls, dimensions, camera, surfaces
-  shareToken   String?     @unique
-  shareEnabled Boolean     @default(false)
+  shareToken   String?      @unique
+  shareEnabled Boolean      @default(false)
   thumbnail    String?
   // USDZ export of the LiDAR scan - powers "View in AR" (Apple Quick Look).
   scanUsdzUrl  String?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
   assets       RoomAsset[]
   renders      RoomRender[]
 
@@ -373,20 +409,28 @@ model Estimate {
   invoices         Invoice[] // invoices generated from this estimate (auto-created on signing)
 
   // Processing fee & expiration
-  processingFeeMarkup Decimal?
-  hideProcessingFee   Boolean   @default(true)
-  expirationDate      DateTime?
-  archivedAt          DateTime?
-  taxExempt           Boolean   @default(false)
-  taxRateName         String?
-  taxRatePercent      Decimal?
+  processingFeeMarkup    Decimal?
+  hideProcessingFee      Boolean   @default(true)
+  expirationDate         DateTime?
+  archivedAt             DateTime?
+  taxExempt              Boolean   @default(false)
+  taxRateName            String?
+  taxRatePercent         Decimal?  @db.Decimal
+  qbEstimateId           String?
+  qbSyncedAt             DateTime? @db.Timestamp(6)
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt              DateTime? @ignore @db.Timestamp(6)
+  deletedById            String?   @ignore
+  deleteBatchId          String?   @ignore
   // Progress billing core: legacy estimates carry tax-inclusive milestone
   // amounts (the historical behavior); new estimates set this false once the
   // UI switches to tax-exclusive milestone entry. Read by progress-billing.ts.
-  taxInclusiveMilestones Boolean @default(true)
+  taxInclusiveMilestones Boolean   @default(true)
 
   // AI budget fill: target overall margin for the estimate (gross margin %, not markup)
-  targetMarginPercent Float     @default(25)
+  targetMarginPercent Float @default(25)
 
   // Phase 7: Contracts & Approvals
   approvedBy        String?
@@ -417,15 +461,23 @@ model Estimate {
   notesBody       String? // sanitized rich-text HTML
   notesPlacement  String  @default("after") // "before" | "after" line items
 
-  changeOrders       ChangeOrder[]
-  files              EstimateFile[]
+  changeOrders           ChangeOrder[]
+  files                  EstimateFile[]
   // Tasks generated from this estimate by generateScheduleFromEstimate.
   generatedScheduleTasks ScheduleTask[]
+
+  /// Optimistic-concurrency guard for the whole line-item collection (adds, deletes, updates,
+  /// reorders, wholesale rewrites). saveEstimate compare-and-sets on this under the Estimate row's
+  /// FOR UPDATE lock (see lockMoneyParents); a save carrying a stale revision is rejected instead
+  /// of silently reverting another actor's write. Bumped by every writer that mutates this
+  /// estimate's items — see docs/specs/estimate-item-optimistic-concurrency.md REVISION 2.
+  itemsRevision Int @default(0)
 
   @@index([createdAt])
   @@index([projectId])
   @@index([leadId])
   @@index([status])
+  @@index([deletedAt])
 }
 
 model EstimateFile {
@@ -456,80 +508,97 @@ model EstimatePaymentSchedule {
   referenceNumber       String? // check # / confirmation #
   notes                 String? // free-form memo
   receiptSentAt         DateTime? // last time admin sent the receipt email
-  paidAt                DateTime?
-  paymentDate           DateTime?
+  paidAt                DateTime? @db.Timestamptz(6)
+  paymentDate           DateTime? @db.Timestamptz(6)
+
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt     DateTime? @ignore @db.Timestamp(6)
+  deleteBatchId String?   @ignore
 
   // Optional link to the schedule task this milestone follows (company
   // dashboard start-date moves shift the dueDate with the task).
-  scheduleTaskId        String?
-  scheduleTask          ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+  scheduleTaskId String?
+  scheduleTask   ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
 
   @@index([estimateId])
   @@index([scheduleTaskId])
+  @@index([deletedAt])
 }
 
 model EstimateItem {
-  id            String         @id @default(cuid())
-  estimateId    String
-  estimate      Estimate       @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  name          String
-  description   String?
-  type          String         @default("Material") // Legacy fallback
-  quantity      Float          @default(1)
-  baseCost      Decimal? // Raw cost before markup (internal only)
-  markupPercent Float          @default(25) // Markup percentage (internal only)
-  unitCost      Decimal          @default(0) // Sell price = baseCost * (1 + markupPercent/100)
-  total         Decimal          @default(0)
-  order         Int            @default(0)
-  parentId      String?
-  parent        EstimateItem?  @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
-  subItems      EstimateItem[] @relation("SubItems")
-  expenses      Expense[]
-  costCodeId    String?
-  costCode      CostCode?      @relation(fields: [costCodeId], references: [id])
-  costTypeId    String?
-  costType      CostType?      @relation(fields: [costTypeId], references: [id])
-  approvalStatus String?        // pending, approved, rejected
-  approvalNote   String?
-  purchaseOrderId  String?
-  purchaseOrder    PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
-  budgetQuantity   Float?
-  budgetUnit       String?
-  budgetRate       Decimal?
-  timeEntries    TimeEntry[]
-  scheduleTask   ScheduleTask?
-  createdAt      DateTime       @default(now())
+  id                 String                      @id @default(cuid())
+  estimateId         String
+  estimate           Estimate                    @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  name               String
+  description        String?
+  type               String                      @default("Material") // Legacy fallback
+  quantity           Float                       @default(1)
+  baseCost           Decimal? // Raw cost before margin (internal only)
+  markupPercent      Float                       @default(25) // Gross margin % on sell price (internal only; field name is legacy/misleading — see src/lib/budget-math.ts)
+  unitCost           Decimal                     @default(0) // Sell price = baseCost / (1 - markupPercent/100)
+  total              Decimal                     @default(0)
+  order              Int                         @default(0)
+  parentId           String?
+  parent             EstimateItem?               @relation("SubItems", fields: [parentId], references: [id], onDelete: Cascade)
+  subItems           EstimateItem[]              @relation("SubItems")
+  expenses           Expense[]
+  costCodeId         String?
+  costCode           CostCode?                   @relation(fields: [costCodeId], references: [id])
+  costTypeId         String?
+  costType           CostType?                   @relation(fields: [costTypeId], references: [id])
+  approvalStatus     String? // pending, approved, rejected
+  approvalNote       String?
+  /// @deprecated legacy single-PO link. Superseded by purchaseOrderLinks; kept
+  /// dual-written (syncLegacyPoLink) so a rollback to the pre-many-to-many build
+  /// still reads correctly. Drop in a follow-up once this has been stable on prod.
+  purchaseOrderId    String?
+  purchaseOrder      PurchaseOrder?              @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  purchaseOrderLinks EstimateItemPurchaseOrder[]
+  budgetQuantity     Float?
+  budgetUnit         String?
+  budgetRate         Decimal?
+  timeEntries        TimeEntry[]
+  scheduleTask       ScheduleTask?
+  createdAt          DateTime                    @default(now())
+  // Soft-delete columns adopted from prod (0 non-null rows). Soft delete is NOT implemented:
+  // nothing filters on these. @ignore keeps them out of the generated client so no caller can
+  // set them and wrongly assume the row disappears. Un-ignore when soft delete actually ships.
+  deletedAt          DateTime?                   @ignore @db.Timestamp(6)
+  deleteBatchId      String?                     @ignore
 
   @@index([estimateId])
   @@index([purchaseOrderId])
+  @@index([deletedAt])
 }
 
 model Expense {
-  id          String        @id @default(cuid())
-  estimateId  String
-  estimate    Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  itemId      String?
-  item        EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
-  costCodeId  String?
-  costCode    CostCode?     @relation(fields: [costCodeId], references: [id])
-  costTypeId  String?
-  costType    CostType?     @relation(fields: [costTypeId], references: [id])
-  amount      Decimal
-  vendor      String?
-  date        DateTime?
-  description String?
-  receiptUrl  String?
+  id            String        @id @default(cuid())
+  estimateId    String
+  estimate      Estimate      @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  itemId        String?
+  item          EstimateItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  costCodeId    String?
+  costCode      CostCode?     @relation(fields: [costCodeId], references: [id])
+  costTypeId    String?
+  costType      CostType?     @relation(fields: [costTypeId], references: [id])
+  amount        Decimal
+  vendor        String?
+  date          DateTime?
+  description   String?
+  receiptUrl    String?
   // Stable identity for finalized money-out imported from QuickBooks Online.
   // Nullable so existing/manual and receipt-intake expenses remain unchanged.
-  qbPurchaseId String?   @unique(map: "Expense_qbPurchaseId_key")
-  qbSyncToken  String?
-  qbSyncedAt   DateTime?
+  qbPurchaseId  String?       @unique(map: "Expense_qbPurchaseId_key")
+  qbSyncToken   String?
+  qbSyncedAt    DateTime?     @db.Timestamptz(6)
   changeOrderId String?
-  changeOrder   ChangeOrder? @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
-  isBillable    Boolean      @default(false)
+  changeOrder   ChangeOrder?  @relation(fields: [changeOrderId], references: [id], onDelete: SetNull)
+  isBillable    Boolean       @default(false)
   invoiceId     String?
   invoicedAt    DateTime?
-  status      String        @default("Pending") // Pending, Reviewed
+  status        String        @default("Pending") // Pending, Reviewed
 
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
@@ -552,18 +621,20 @@ model Invoice {
   estimateId  String?
   estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
   status      String    @default("Draft") // Draft, Issued, Paid, Overdue
-  totalAmount Decimal     @default(0)
-  subtotal    Decimal     @default(0)  // pre-tax
-  taxRate     Decimal     @default(0)  // percent, e.g. 8.8
-  taxAmount   Decimal     @default(0)  // dollars
-  balanceDue  Decimal     @default(0)
+  totalAmount Decimal   @default(0)
+  subtotal    Decimal   @default(0) // pre-tax
+  taxRate     Decimal   @default(0) // percent, e.g. 8.8
+  taxAmount   Decimal   @default(0) // dollars
+  balanceDue  Decimal   @default(0)
   notes       String?
   issueDate   DateTime?
   sentAt      DateTime?
   viewedAt    DateTime?
   createdAt   DateTime  @default(now())
+  qbInvoiceId String?
+  qbSyncedAt  DateTime? @db.Timestamp(6)
 
-  payments PaymentSchedule[]
+  payments         PaymentSchedule[]
   progressBillings ProgressBilling[]
 
   @@index([projectId])
@@ -581,30 +652,34 @@ model PaymentSchedule {
   taxAmount             Decimal?
   status                String    @default("Pending") // Pending, Paid, Canceled
   dueDate               DateTime?
-  paymentDate           DateTime?
+  // Mirrored to EstimatePaymentSchedule.paymentDate, which is Timestamptz(6) — the two
+  // sides must match or every settle copy crosses timestamp semantics. Carries DUAL
+  // SEMANTICS (calendar day vs instant); see lib/payment-date.ts before touching it.
+  paymentDate           DateTime? @db.Timestamptz(6)
   stripeSessionId       String?
   stripePaymentIntentId String?
   paymentMethod         String? // Stripe: "card"/"ach"; manual: "check"/"cash"; "quickbooks" via QB Payments
   referenceNumber       String? // check # / confirmation #
   notes                 String? // free-form memo
   receiptSentAt         DateTime? // last time admin sent the receipt email
-  lastReminderAt        DateTime? // last time the automated payment-reminder cron emailed the client for this milestone
-  paidAt                DateTime?
+  lastReminderAt        DateTime? @db.Timestamptz(6) // last time the automated payment-reminder cron emailed the client for this milestone
+  // Mirrored to EstimatePaymentSchedule.paidAt (Timestamptz(6)) — keep the types equal.
+  paidAt                DateTime? @db.Timestamptz(6)
   createdAt             DateTime  @default(now())
 
   // QuickBooks Payments rail: each milestone maps to one QBO invoice with its own pay link.
-  qbInvoiceId   String?
-  qbInvoiceLink String? // Intuit-hosted "Review & Pay" page (card/ACH)
-  qbPaymentId   String? // QBO Payment txn that settled this milestone (set by the sync poller)
-  qbSyncedAt    DateTime?
+  qbInvoiceId     String?
+  qbInvoiceLink   String? // Intuit-hosted "Review & Pay" page (card/ACH)
+  qbPaymentId     String? // QBO Payment txn that settled this milestone (set by the sync poller)
+  qbSyncedAt      DateTime?
   qbInvoiceSentAt DateTime? // last time the QBO invoice email was sent to the client
-  qbSyncError   String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
+  qbSyncError     String? // "voided" | "notFound" — set by the sync poller when the linked QBO invoice is gone/voided; cleared on a successful re-push
 
   // EstimatePaymentSchedule row this milestone was cloned from at invoicing time.
   // Payment mirrors settle/unwind by this link (name+amount matching is the legacy fallback).
   sourceScheduleId    String?
   sourceChangeOrderId String?
-  sourceCoScheduleId  String? @unique
+  sourceCoScheduleId  String?                     @unique
   sourceCoSchedule    ChangeOrderPaymentSchedule? @relation("CoScheduleBilling", fields: [sourceCoScheduleId], references: [id], onDelete: SetNull)
   coBilling           ChangeOrderBilling?
 
@@ -621,6 +696,52 @@ model PaymentSchedule {
   @@index([scheduleTaskId])
 }
 
+// Deposit auto-apply pipeline (Phase B1): one row per Drive file the GTR
+// receipt bot classifies as a `customer_payment` (an incoming check/deposit
+// photo). Backs the crash-safe idempotency + state machine owned by
+// POST /api/payments/deposit-ingest — see that route for the full state
+// machine (processing/qbo_unknown/qbo_created/applied/unmatched/failed/reconcile).
+//
+// NOTE: a partial unique index reserves paymentScheduleId while a deposit is
+// in flight, so two different files can never both claim the same pending
+// milestone. Prisma cannot express a partial index — it is created ONLY by
+// scripts/apply-deposit-ingest-schema.mjs:
+//   CREATE UNIQUE INDEX ... ON "DepositIngest" ("paymentScheduleId")
+//     WHERE "status" IN ('processing','qbo_unknown','qbo_created','applied','reconcile','failed')
+//     AND "paymentScheduleId" IS NOT NULL
+// ('failed' is in the predicate for boundary-marked rows that keep their
+//  reservation; unmarked failed rows carry NULL and are excluded. 'unmatched'
+//  is deliberately NOT — that transition releases the milestone.)
+model DepositIngest {
+  id     String @id @default(cuid())
+  fileId String @unique // Drive file id — stable idempotency key across the bot's archive move
+
+  status    String // processing | qbo_unknown | qbo_created | applied | unmatched | failed | reconcile
+  extracted String // JSON snapshot of the inbound payload — carried into the OfficeTask + audit trail
+
+  // Reserved milestone (see the partial unique index note above). NULLed on
+  // pre-QBO-boundary retry exhaustion so the reservation frees the milestone.
+  paymentScheduleId String?
+  qbPaymentId       String? // set once the QuickBooks Payment is created
+  qbRequestPayload  String? // exact JSON body sent to QBO POST /payment — replayed byte-identical on qbo_unknown recovery
+  // Money-boundary marker for the NON-QBO settle path (the analog of qbRequestPayload
+  // for the QBO path): stamped immediately before recordPaymentCore runs. While any
+  // boundary marker is set, retry reclaims preserve the reservation + extracted payload
+  // so recovery goes through the exact reserved-row path, never a re-match.
+  settleStartedAt   DateTime?
+  officeTaskId      String? // set once, on the first unmatched/reconcile — re-POSTs never create a second task
+
+  attempts            Int       @default(0)
+  lastError           String?
+  processingStartedAt DateTime? // claim lease — stale after 5 min, like the notification outbox
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@index([status])
+  @@index([paymentScheduleId])
+}
+
 // Progress billing: the billable artifact the user builds by picking
 // milestones and/or a custom amount, writing one client-facing description,
 // and staging exactly ONE QuickBooks invoice. An approved change order is
@@ -632,46 +753,46 @@ model PaymentSchedule {
 // see src/lib/progress-billing.ts for the auto-split mechanic that keeps every
 // ProgressBillingLine mapped 1:1 to a whole milestone.
 model ProgressBilling {
-  id          String   @id @default(cuid())
-  invoiceId   String
-  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
-  code        String   // "INV-00171-P1" — sequential per invoice
-  description String   // client-facing: what this payment covers
-  status      String   @default("Draft") // Draft | Staged | Sent | Paid | Void
-  subtotal    Decimal  @default(0)  // pre-tax
-  taxExempt   Boolean  @default(false)
-  taxRate     Decimal  @default(0)  // percent snapshot at build time
-  taxAmount   Decimal  @default(0)
-  total       Decimal  @default(0)  // subtotal + taxAmount
+  id              String                @id @default(cuid())
+  invoiceId       String
+  invoice         Invoice               @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  code            String // "INV-00171-P1" — sequential per invoice
+  description     String // client-facing: what this payment covers
+  status          String                @default("Draft") // Draft | Staged | Sent | Paid | Void
+  subtotal        Decimal               @default(0) // pre-tax
+  taxExempt       Boolean               @default(false)
+  taxRate         Decimal               @default(0) // percent snapshot at build time
+  taxAmount       Decimal               @default(0)
+  total           Decimal               @default(0) // subtotal + taxAmount
   qbInvoiceId     String?
   qbInvoiceLink   String?
   qbInvoiceSentAt DateTime?
   qbPaymentId     String?
   qbSyncedAt      DateTime?
   qbSyncError     String?
-  sentAt      DateTime?
-  paidAt      DateTime?
-  createdAt   DateTime @default(now())
-  lines       ProgressBillingLine[]
+  sentAt          DateTime?
+  paidAt          DateTime?
+  createdAt       DateTime              @default(now())
+  lines           ProgressBillingLine[]
 
   @@index([invoiceId])
   @@index([status])
 }
 
 model ProgressBillingLine {
-  id            String @id @default(cuid())
-  billingId     String
-  billing       ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
-  scheduleId    String?  // PaymentSchedule this line bills (null = custom line)
-  description   String
-  amount        Decimal  // pre-tax — feeds the QuickBooks taxable line
+  id          String          @id @default(cuid())
+  billingId   String
+  billing     ProgressBilling @relation(fields: [billingId], references: [id], onDelete: Cascade)
+  scheduleId  String? // PaymentSchedule this line bills (null = custom line)
+  description String
+  amount      Decimal // pre-tax — feeds the QuickBooks taxable line
   // What was actually carved out of the milestone, in the milestone's own units
   // (gross on tax-inclusive/legacy jobs, pre-tax on new ones). Recorded rather
   // than recomputed from `amount`: reconstructing it re-applies tax to a rounded
   // number and can land a cent low, which let a second billing claim the
   // difference on an already fully-billed milestone.
-  splitAmount   Decimal  @default(0)
-  order         Int      @default(0)
+  splitAmount Decimal         @default(0)
+  order       Int             @default(0)
 
   @@index([billingId])
   @@index([scheduleId])
@@ -683,8 +804,8 @@ model Budget {
   project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   estimateId          String   @unique
   estimate            Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  totalLaborBudget    Decimal    @default(0)
-  totalMaterialBudget Decimal    @default(0)
+  totalLaborBudget    Decimal  @default(0)
+  totalMaterialBudget Decimal  @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 }
@@ -775,6 +896,20 @@ model TimeEntry {
   // Invoice linkage — set when pulled into a cost-plus invoice
   invoicedAt DateTime?
 
+  // Clock-in task suggestion audit (daily-log-driven accuracy feature)
+  suggestedScheduleTaskId String?
+  suggestedCostCodeId     String?
+  suggestedTaskName       String? // denormalized — survives task edits/deletes
+  suggestionSource        String? // "daily_log" | "today_schedule" | "user_history"
+  suggestionOverridden    Boolean @default(false)
+
+  mealSkipped        Boolean   @default(false)
+  mealDeductionHours Float?
+  needsReview        Boolean   @default(false)
+  reviewReason       String?
+  qbTimeActivityId   String?
+  qbSyncedAt         DateTime? @db.Timestamp(6)
+
   @@index([projectId])
   @@index([userId])
   @@index([costCodeId])
@@ -806,9 +941,9 @@ model Contract {
   signatureUrl      String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
 
   // Contractor signing fields
-  contractorSignedBy       String?
-  contractorSignedAt       DateTime?
-  contractorSignatureUrl   String? // Supabase Storage URL of the contractor's drawn signature (legacy rows may hold an inline data-URL)
+  contractorSignedBy     String?
+  contractorSignedAt     DateTime? @db.Timestamptz(6)
+  contractorSignatureUrl String? // Supabase Storage URL of the contractor's drawn signature (legacy rows may hold an inline data-URL)
 
   // Company countersignature (executed AFTER the customer signs — see countersignContractAsCompany)
   requiresCountersign Boolean   @default(false) // when true, contract isn't Finalized until the company countersigns
@@ -860,51 +995,51 @@ model ContractSigningRecord {
 }
 
 model CompanySettings {
-  id                  String  @id @default("singleton")
-  companyName         String  @default("My Construction Co.")
-  address             String?
-  phone               String?
-  email               String?
-  website             String?
-  logoUrl             String?
-  licenseNumber       String?
-  notificationEmail   String? // Where to send View/Sign alerts
-  timeZone           String  @default("America/Los_Angeles")
+  id                      String  @id @default("singleton")
+  companyName             String  @default("My Construction Co.")
+  address                 String?
+  phone                   String?
+  email                   String?
+  website                 String?
+  logoUrl                 String?
+  licenseNumber           String?
+  notificationEmail       String? // Where to send View/Sign alerts
+  timeZone                String  @default("America/Los_Angeles")
   // Google Drive (work account) - lead media folders. Set via Settings > Integrations.
   googleDriveRefreshToken String?
   googleDriveEmail        String?
-  projectStatuses     String? // JSON string array of custom statues [{label, value, color, dot}, ...]
-  subcontractorTrades String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
-  stripeEnabled       Boolean @default(false)
-  enableCard          Boolean @default(true)
-  enableBankTransfer  Boolean @default(false)
-  enableAffirm        Boolean @default(false)
-  enableKlarna        Boolean @default(false)
+  projectStatuses         String? // JSON string array of custom statues [{label, value, color, dot}, ...]
+  subcontractorTrades     String? // JSON string array of trades ["Architect", "Asphalt", "Bricklaying"]
+  stripeEnabled           Boolean @default(false)
+  enableCard              Boolean @default(true)
+  enableBankTransfer      Boolean @default(false)
+  enableAffirm            Boolean @default(false)
+  enableKlarna            Boolean @default(false)
 
   // Processing Fees
   passProcessingFee  Boolean @default(false)
-  cardProcessingRate Decimal   @default(2.9)
-  cardProcessingFlat Decimal   @default(0.30)
+  cardProcessingRate Decimal @default(2.9)
+  cardProcessingFlat Decimal @default(0.30)
 
   // Company overhead per month (rent, insurance, owner salary, vehicles, software…)
   // Used by /reports/profitability to answer "are we profitable including overhead".
   monthlyOverhead Decimal @default(0)
 
   // Calendar settings
-  workDays      String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
-  workdayStart  String? // e.g. "07:00"
-  workdayEnd    String? // e.g. "17:00"
+  workDays     String? // JSON array: ["Mon","Tue","Wed","Thu","Fri"]
+  workdayStart String? // e.g. "07:00"
+  workdayEnd   String? // e.g. "17:00"
 
   // Sales taxes
   salesTaxes String? // JSON array: [{name, rate, isDefault}]
 
   // Letterhead
-  letterheadMode         String?  @default("built_in") // 'built_in' | 'custom_image'
+  letterheadMode         String? @default("built_in") // 'built_in' | 'custom_image'
   letterheadImageUrl     String?
-  letterheadLogoPosition String?  @default("left") // 'left' | 'center' | 'right'
-  letterheadFields       String?  @default("[\"name\",\"address\",\"phone\",\"email\",\"license\"]")
-  letterheadAccentColor  String?  @default("#4F46E5")
-  letterheadDivider      Boolean  @default(true)
+  letterheadLogoPosition String? @default("left") // 'left' | 'center' | 'right'
+  letterheadFields       String? @default("[\"name\",\"address\",\"phone\",\"email\",\"license\"]")
+  letterheadAccentColor  String? @default("#4F46E5")
+  letterheadDivider      Boolean @default(true)
 
   // Notification event toggles
   notificationToggles String? // JSON: {newLead, estimateViewed, estimateSigned, contractSigned, invoiceViewed, paymentReceived, messageReceived}
@@ -926,45 +1061,46 @@ model DocumentTemplate {
 }
 
 model ScheduleTask {
-  id             String         @id @default(cuid())
-  projectId      String?
-  project        Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  leadId         String?
-  lead           Lead?          @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  name           String
-  startDate      DateTime
-  endDate        DateTime
-  color          String         @default("#4c9a2a")
-  progress       Int            @default(0)
-  estimatedHours Float?
-  assignee       String?
-  parentId       String?
-  parent         ScheduleTask?  @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
-  children       ScheduleTask[] @relation("SubTasks")
-  order          Int            @default(0)
-  status         String         @default("Not Started")
-  type           String         @default("task") // "task" | "milestone" | "appointment"
-  doneWhen       String?        // Completion criteria shown to the field crew
-  blockedReason  String?        // Required explanation while status is "Blocked"
+  id                         String         @id @default(cuid())
+  projectId                  String?
+  project                    Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId                     String?
+  lead                       Lead?          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  name                       String
+  startDate                  DateTime
+  endDate                    DateTime
+  color                      String         @default("#4c9a2a")
+  progress                   Int            @default(0)
+  estimatedHours             Float?
+  assignee                   String?
+  parentId                   String?
+  parent                     ScheduleTask?  @relation("SubTasks", fields: [parentId], references: [id], onDelete: Cascade)
+  children                   ScheduleTask[] @relation("SubTasks")
+  order                      Int            @default(0)
+  status                     String         @default("Not Started")
+  type                       String         @default("task") // "task" | "milestone" | "appointment"
+  doneWhen                   String? // Completion criteria shown to the field crew
+  blockedReason              String? // Required explanation while status is "Blocked"
   // Client-facing stage on the portal tracker rail. Null = derive from the task
   // name/cost code (see lib/portal-tracker.ts). Set explicitly to override when
   // keyword matching guesses wrong — must be one of CLIENT_STAGES[].label.
-  clientStage    String?
-  scheduledTime  String?        // "HH:MM" in America/Los_Angeles; appointment tasks only
-  confirmationStatus String?    // "planned" | "requested" | "confirmed"; appointment tasks only
-  estimateItemId String?        @unique
-  estimateItem   EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
+  clientStage                String?
+  progressSource             String? // provenance of the last progress update (e.g. "daily_log", "manual")
+  scheduledTime              String? // "HH:MM" in America/Los_Angeles; appointment tasks only
+  confirmationStatus         String? // "planned" | "requested" | "confirmed"; appointment tasks only
+  estimateItemId             String?        @unique
+  estimateItem               EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
   // Generation provenance: set on every task kind created by
   // generateScheduleFromEstimate (phase parents, children, flat tasks,
   // milestones) so regenerate can identify them without touching manual tasks.
-  generatedFromEstimateId String?
-  generatedFromEstimate   Estimate? @relation(fields: [generatedFromEstimateId], references: [id], onDelete: SetNull)
+  generatedFromEstimateId    String?
+  generatedFromEstimate      Estimate?      @relation(fields: [generatedFromEstimateId], references: [id], onDelete: SetNull)
   // CO-task provenance: set on tasks created by applyChangeOrderToSchedule
   // (CO parent, children, milestones).
   generatedFromChangeOrderId String?
-  generatedFromChangeOrder   ChangeOrder? @relation(fields: [generatedFromChangeOrderId], references: [id], onDelete: SetNull)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  generatedFromChangeOrder   ChangeOrder?   @relation(fields: [generatedFromChangeOrderId], references: [id], onDelete: SetNull)
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
 
   // Dependencies
   dependencies TaskDependency[] @relation("Dependent")
@@ -981,8 +1117,8 @@ model ScheduleTask {
   subAssignments SubTaskAssignment[]
 
   // Payment milestones anchored to this task (company dashboard start moves).
-  estimatePaymentSchedules EstimatePaymentSchedule[]
-  paymentSchedules         PaymentSchedule[]
+  estimatePaymentSchedules    EstimatePaymentSchedule[]
+  paymentSchedules            PaymentSchedule[]
   changeOrderPaymentSchedules ChangeOrderPaymentSchedule[]
 
   @@index([projectId])
@@ -1030,14 +1166,14 @@ model TaskDependency {
 }
 
 model TaskComment {
-  id                String       @id @default(cuid())
+  id                String             @id @default(cuid())
   taskId            String
-  task              ScheduleTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task              ScheduleTask       @relation(fields: [taskId], references: [id], onDelete: Cascade)
   userId            String?
-  user              User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
-  subcontractorName String?      // display name for sub-portal comments
+  user              User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  subcontractorName String? // display name for sub-portal comments
   text              String
-  createdAt         DateTime     @default(now())
+  createdAt         DateTime           @default(now())
   photos            TaskCommentPhoto[]
 }
 
@@ -1162,22 +1298,22 @@ model FileFolder {
 }
 
 model ProjectFile {
-  id           String      @id @default(cuid())
-  name         String
-  url          String
-  size         Int         @default(0)
-  mimeType     String      @default("application/octet-stream")
-  visibility   String?     // null = inherit from folder. Explicit: "team" | "shared" | "financial"
-  projectId    String?
-  project      Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  leadId       String?
-  lead         Lead?       @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  folderId     String?
-  folder       FileFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
-  uploadedById String?
-  uploadedBy   User?       @relation(fields: [uploadedById], references: [id])
-  uploadedByClient Boolean @default(false)
-  createdAt    DateTime    @default(now())
+  id               String      @id @default(cuid())
+  name             String
+  url              String
+  size             Int         @default(0)
+  mimeType         String      @default("application/octet-stream")
+  visibility       String? // null = inherit from folder. Explicit: "team" | "shared" | "financial"
+  projectId        String?
+  project          Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId           String?
+  lead             Lead?       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  folderId         String?
+  folder           FileFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  uploadedById     String?
+  uploadedBy       User?       @relation(fields: [uploadedById], references: [id])
+  uploadedByClient Boolean     @default(false)
+  createdAt        DateTime    @default(now())
 
   @@index([projectId])
   @@index([leadId])
@@ -1289,8 +1425,8 @@ model EstimateTemplateItem {
   type          String           @default("Material")
   quantity      Float            @default(1)
   baseCost      Decimal?
-  markupPercent Float            @default(25)
-  unitCost      Decimal            @default(0)
+  markupPercent Float            @default(25) // Same semantic as EstimateItem.markupPercent: gross margin % on sell price, NOT markup on cost. saveEstimateAsTemplate/createEstimateFromTemplate copy it verbatim both ways; the MCP templateToPhases path drops it and rebuilds rows with baseCost null + the default 25.
+  unitCost      Decimal          @default(0) // Sell price. Where baseCost is present it is baseCost / (1 - markupPercent/100); seeded templates often carry a null baseCost, so that is not an invariant.
   order         Int              @default(0)
   parentId      String?
   costCodeId    String?
@@ -1312,6 +1448,7 @@ model PortalVisibility {
   showChangeOrders Boolean @default(true)
   showSelections   Boolean @default(true)
   showMoodBoards   Boolean @default(true)
+  showPermits      Boolean @default(true)
 
   isPortalEnabled      Boolean   @default(true)
   lastSharedAt         DateTime?
@@ -1344,13 +1481,16 @@ model Message {
 }
 
 model ClientMessage {
-  id           String    @id @default(cuid())
+  // This table was renamed LeadMessage -> ClientMessage in code (commit 363b70c) but the
+  // Postgres constraints kept their original names. The map:s below record that, so the
+  // schema stays an accurate description of prod instead of proposing a rename.
+  id           String    @id(map: "LeadMessage_pkey") @default(cuid())
   // Client-level FK for unified conversation view (all messages for one client)
   clientId     String?
   client       Client?   @relation(fields: [clientId], references: [id], onDelete: SetNull)
   // Entity context: which lead/project the message was sent from/threaded to
   leadId       String?
-  lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  lead         Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade, map: "LeadMessage_leadId_fkey")
   projectId    String?
   project      Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   direction    String // "INBOUND" (from client) or "OUTBOUND" (from team)
@@ -1366,7 +1506,7 @@ model ClientMessage {
   scheduledFor DateTime?
   ccEmails     String? // JSON array of emails
   createdAt    DateTime  @default(now())
-  readAt       DateTime? // Set when the recipient (team or client) reads the message
+  readAt       DateTime? @db.Timestamptz(6) // Set when the recipient (team or client) reads the message
 
   // Twilio MessageSid for inbound idempotency + outbound observability.
   // Partial-unique index in DB: WHERE "twilioMessageSid" IS NOT NULL.
@@ -1392,28 +1532,30 @@ model SubcontractorProjectAccess {
 }
 
 model ChangeOrder {
-  id          String   @id @default(cuid())
-  number      Int      @default(autoincrement())
-  projectId   String
-  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  estimateId  String
-  estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
-  code        String
-  title       String
-  description String?
-  status      String   @default("Draft") // Draft, Sent, Approved, Declined
-  totalAmount Decimal    @default(0)
-  balanceDue  Decimal    @default(0)
-  pricingType String     @default("FIXED")
+  id            String   @id @default(cuid())
+  number        Int      @default(autoincrement())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  estimateId    String
+  estimate      Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  code          String
+  title         String
+  description   String?
+  status        String   @default("Draft") // Draft, Sent, Approved, Declined
+  totalAmount   Decimal  @default(0)
+  balanceDue    Decimal  @default(0)
+  pricingType   String   @default("FIXED")
+  // COST_PLUS only: a TRUE markup on actuals — billing = (labor + expenses) * (1 + markupPercent/100), see lib/billing-core.ts.
+  // Deliberately a different semantic from ChangeOrderItem.markupPercent / EstimateItem.markupPercent, which hold gross margin on sell.
   markupPercent Float?
 
   termsAndConditions String?
   memos              String?
 
   // Customer approval (set by approveChangeOrder — portal/magic-link signer)
-  clientSignatureUrl  String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
-  approvedBy          String?
-  approvedAt          DateTime?
+  clientSignatureUrl String? // Supabase Storage URL of the drawn signature (legacy rows may hold an inline data-URL)
+  approvedBy         String?
+  approvedAt         DateTime?
 
   // Company countersignature (set by countersignChangeOrderAsCompany — ADMIN/MANAGER).
   // Separate fields so countersigning never overwrites the customer's approval/audit trail.
@@ -1421,14 +1563,14 @@ model ChangeOrder {
   companySignedBy     String?
   companySignedAt     DateTime?
 
-  sentAt              DateTime?
-  viewedAt            DateTime?
+  sentAt   DateTime?
+  viewedAt DateTime?
 
   items            ChangeOrderItem[]
   paymentSchedules ChangeOrderPaymentSchedule[]
-  timeEntries       TimeEntry[]
-  expenses          Expense[]
-  billings          ChangeOrderBilling[]
+  timeEntries      TimeEntry[]
+  expenses         Expense[]
+  billings         ChangeOrderBilling[]
 
   // Schedule tasks generated from this CO (provenance / idempotency).
   generatedScheduleTasks ScheduleTask[]
@@ -1447,10 +1589,15 @@ model ChangeOrderItem {
   description   String?
   type          String      @default("Material")
   quantity      Float       @default(1)
+  // baseCost + markupPercent below:
+  // Legacy/copied estimate costing metadata. When a CO is generated from estimate lines these carry the
+  // estimate's gross-margin-on-sell values, but the CO editor and billing paths neither maintain nor read
+  // them (MCP-created rows leave baseCost null and take the default 25). Don't derive CO margin from here.
+  // Not the same field as ChangeOrder.markupPercent, which IS live: a true cost-plus markup on actuals.
   baseCost      Decimal?
   markupPercent Float       @default(25)
-  unitCost      Decimal       @default(0)
-  total         Decimal       @default(0)
+  unitCost      Decimal     @default(0) // Authoritative per-line sell price; `total` below is its quantity-derived mirror (line cents = quantity * unitCost).
+  total         Decimal     @default(0)
   order         Int         @default(0)
   costCodeId    String?
   costCode      CostCode?   @relation(fields: [costCodeId], references: [id])
@@ -1460,14 +1607,14 @@ model ChangeOrderItem {
 }
 
 model ChangeOrderPaymentSchedule {
-  id            String      @id @default(cuid())
-  changeOrderId String
-  changeOrder   ChangeOrder @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
-  name          String
-  amount        Decimal
-  dueDate       DateTime?
-  order         Int         @default(0)
-  createdAt     DateTime    @default(now())
+  id              String           @id @default(cuid())
+  changeOrderId   String
+  changeOrder     ChangeOrder      @relation(fields: [changeOrderId], references: [id], onDelete: Cascade)
+  name            String
+  amount          Decimal
+  dueDate         DateTime?
+  order           Int              @default(0)
+  createdAt       DateTime         @default(now())
   billedMilestone PaymentSchedule? @relation("CoScheduleBilling")
 
   // Optional milestone anchor created by applyChangeOrderToSchedule.
@@ -1553,9 +1700,12 @@ model PurchaseOrder {
   projectId   String
   project     Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   vendorId    String
-  vendor      Vendor  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  // Restrict, not Cascade: deleting a vendor must never silently destroy its
+  // purchase orders (and their items, files, messages) behind the app's back.
+  // deleteVendor blocks with a count; this is the backstop for every other caller.
+  vendor      Vendor  @relation(fields: [vendorId], references: [id], onDelete: Restrict)
   status      String  @default("Draft") // Draft, Sent, Received, Cancelled
-  totalAmount Decimal   @default(0)
+  totalAmount Decimal @default(0)
   notes       String?
   memos       String?
   terms       String?
@@ -1566,11 +1716,13 @@ model PurchaseOrder {
   approvedBy String?
   approvedAt DateTime?
 
-  items    PurchaseOrderItem[]
-  files    PurchaseOrderFile[]
-  expenses Expense[]
-  messages PurchaseOrderMessage[]
-  estimateItems EstimateItem[]
+  items             PurchaseOrderItem[]
+  files             PurchaseOrderFile[]
+  expenses          Expense[]
+  messages          PurchaseOrderMessage[]
+  /// @deprecated back-relation for the legacy single-PO link. See EstimateItem.purchaseOrderId.
+  estimateItems     EstimateItem[]
+  estimateItemLinks EstimateItemPurchaseOrder[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1579,21 +1731,35 @@ model PurchaseOrder {
   @@index([vendorId])
 }
 
+/// Join table letting one estimate line item carry several purchase orders.
+/// Replaces the one-PO-per-item cap of EstimateItem.purchaseOrderId.
+model EstimateItemPurchaseOrder {
+  id              String        @id @default(cuid())
+  estimateItemId  String
+  estimateItem    EstimateItem  @relation(fields: [estimateItemId], references: [id], onDelete: Cascade)
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+
+  @@unique([estimateItemId, purchaseOrderId])
+  @@index([purchaseOrderId])
+}
+
 model PurchaseOrderMessage {
   id              String        @id @default(cuid())
   purchaseOrderId String
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  
-  gmailMessageId  String?       @unique
-  body            String        @db.Text
-  senderEmail     String
-  senderName      String?
-  senderType      String        @default("VENDOR") // TEAM, VENDOR, AI
-  
-  isAttachment    Boolean       @default(false)
-  attachmentUrl   String?
-  
-  createdAt       DateTime      @default(now())
+
+  gmailMessageId String? @unique
+  body           String  @db.Text
+  senderEmail    String
+  senderName     String?
+  senderType     String  @default("VENDOR") // TEAM, VENDOR, AI
+
+  isAttachment  Boolean @default(false)
+  attachmentUrl String?
+
+  createdAt DateTime @default(now())
 }
 
 model PurchaseOrderFile {
@@ -1613,10 +1779,10 @@ model PurchaseOrderItem {
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
 
   description String
-  quantity    Float  @default(1)
-  unitCost    Decimal  @default(0)
-  total       Decimal  @default(0)
-  order       Int    @default(0)
+  quantity    Float   @default(1)
+  unitCost    Decimal @default(0)
+  total       Decimal @default(0)
+  order       Int     @default(0)
 
   costCodeId String?
   costCode   CostCode? @relation(fields: [costCodeId], references: [id])
@@ -1666,24 +1832,23 @@ model SelectionOption {
   createdAt   DateTime          @default(now())
 }
 
-
 // Company-wide reusable product catalog, populated via the team "clipper" (paste a
 // vendor URL, parsed server-side) or manual entry. Approved client SelectionProposals
 // also mint a row here (source: "client_proposal"). See docs/specs/product-library-portal-selections.md.
 model ProductLibraryItem {
-  id          String   @id @default(cuid())
+  id          String                   @id @default(cuid())
   name        String
   description String?
   imageUrl    String?
-  price       Decimal? @db.Decimal(12, 2) // list price captured at clip time
+  price       Decimal?                 @db.Decimal(12, 2) // list price captured at clip time
   vendor      String?
-  vendorUrl   String?  // source/product URL
-  category    String?  // free text v1 (e.g. "Plumbing Fixtures")
-  source      String   @default("clip") // "clip" | "manual" | "client_proposal"
+  vendorUrl   String? // source/product URL
+  category    String? // free text v1 (e.g. "Plumbing Fixtures")
+  source      String                   @default("clip") // "clip" | "manual" | "client_proposal"
   clippedById String?
-  clippedBy   User?    @relation(fields: [clippedById], references: [id])
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  clippedBy   User?                    @relation(fields: [clippedById], references: [id])
+  createdAt   DateTime                 @default(now())
+  updatedAt   DateTime                 @updatedAt
   favorites   ProjectProductFavorite[]
 
   @@index([category])
@@ -1694,16 +1859,16 @@ model ProductLibraryItem {
 // list. Rows created by an approved client SelectionProposal carry addedByClient: true
 // and a null addedById (no team member picked it).
 model ProjectProductFavorite {
-  id            String   @id @default(cuid())
+  id            String             @id @default(cuid())
   projectId     String
-  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project       Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
   productId     String
   product       ProductLibraryItem @relation(fields: [productId], references: [id], onDelete: Cascade)
-  addedById     String?  // team member User, null when added via approved client proposal
-  addedBy       User?    @relation(fields: [addedById], references: [id])
-  addedByClient Boolean  @default(false)
+  addedById     String? // team member User, null when added via approved client proposal
+  addedBy       User?              @relation(fields: [addedById], references: [id])
+  addedByClient Boolean            @default(false)
   note          String?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime           @default(now())
 
   @@unique([projectId, productId])
   @@index([projectId])
@@ -1713,33 +1878,33 @@ model ProjectProductFavorite {
 // approves (mints a ProductLibraryItem + optional favorite/board option) or declines.
 // Price is never shown to the client until the proposal is Approved.
 model SelectionProposal {
-  id           String   @id @default(cuid())
-  projectId    String
-  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name         String
-  description  String?
-  imageUrl     String?
-  price        Decimal? @db.Decimal(12, 2) // clipped list price; team-context only — NEVER returned by any portal read path, in any status (docs/specs/client-selections-playground.md)
-  vendorUrl    String?
-  clientNote   String?
-  status       String   @default("Idea") // "Idea" | "Chosen" | "Archived" (new, docs/specs/client-selections-playground.md); legacy "Pending" | "Approved" | "Declined" rows remain readable, never rewritten in place except by the migration script's remap
-  pmNote       String?  // decline reason / approval comment, client-visible
-  productId    String?  // ProductLibraryItem created on approval
-  boardId      String?  // optional: SelectionBoard the PM approved it into
-  categoryId   String?  // optional: SelectionCategory it became an option in
-  decidedById  String?
-  decidedBy    User?    @relation(fields: [decidedById], references: [id])
-  decidedAt    DateTime?
-  createdAt    DateTime @default(now())
-  decisionId   String?  // Decision this candidate sits in; null = "Unsorted" in the playground
-  decision     Decision? @relation("DecisionCandidates", fields: [decisionId], references: [id], onDelete: SetNull)
-  chosenForDecision Decision? @relation("DecisionChosenItem") // back-relation only; the FK lives on Decision.chosenItemId
+  id                  String                 @id @default(cuid())
+  projectId           String
+  project             Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name                String
+  description         String?
+  imageUrl            String?
+  price               Decimal?               @db.Decimal(12, 2) // clipped list price; team-context only — NEVER returned by any portal read path, in any status (docs/specs/client-selections-playground.md)
+  vendorUrl           String?
+  clientNote          String?
+  status              String                 @default("Idea") // "Idea" | "Chosen" | "Archived" (new, docs/specs/client-selections-playground.md); legacy "Pending" | "Approved" | "Declined" rows remain readable, never rewritten in place except by the migration script's remap
+  pmNote              String? // decline reason / approval comment, client-visible
+  productId           String? // ProductLibraryItem created on approval
+  boardId             String? // optional: SelectionBoard the PM approved it into
+  categoryId          String? // optional: SelectionCategory it became an option in
+  decidedById         String?
+  decidedBy           User?                  @relation(fields: [decidedById], references: [id])
+  decidedAt           DateTime?
+  createdAt           DateTime               @default(now())
+  decisionId          String? // Decision this candidate sits in; null = "Unsorted" in the playground
+  decision            Decision?              @relation("DecisionCandidates", fields: [decisionId], references: [id], onDelete: SetNull)
+  chosenForDecision   Decision?              @relation("DecisionChosenItem") // back-relation only; the FK lives on Decision.chosenItemId
   // Soft delete only, same rule as Decision.deletedAt — the client can delete
   // an archived item outright from their own playground, but "lose no customer
   // data" still holds: the row survives and the team can restore it for 30
   // days (getRecentlyDeletedItems / restoreItem). Filtered out of every read.
-  deletedAt    DateTime?
-  comments     SelectionItemComment[]
+  deletedAt           DateTime?
+  comments            SelectionItemComment[]
   // AI Auto-Sort (docs/superpowers/plans/2026-07-30-selection-ai-sort.md).
   // NOT an FK on purpose — suggestions are advisory, may go stale (decision
   // deleted/renamed), and stale values are filtered at read time rather than
@@ -1763,14 +1928,14 @@ model SelectionItemComment {
   id             String            @id @default(cuid())
   proposalId     String
   proposal       SelectionProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
-  authorType     String            // "TEAM" | "CLIENT"
-  authorUserId   String?           // User.id when authorType TEAM
-  authorClientId String?           // Client.id when authorType CLIENT
+  authorType     String // "TEAM" | "CLIENT"
+  authorUserId   String? // User.id when authorType TEAM
+  authorClientId String? // Client.id when authorType CLIENT
   authorName     String
-  body           String            // server-enforced max 4000 chars, trimmed, non-empty (or an attachment)
-  attachments    String?           // JSON [{id, name, url}] — same shape as ClientMessage
-  readByTeamAt   DateTime?         // null on CLIENT posts until any staff opens the thread
-  readByClientAt DateTime?         // null on TEAM posts until the client opens the thread
+  body           String // server-enforced max 4000 chars, trimmed, non-empty (or an attachment)
+  attachments    String? // JSON [{id, name, url}] — same shape as ClientMessage
+  readByTeamAt   DateTime? // null on CLIENT posts until any staff opens the thread
+  readByClientAt DateTime? // null on TEAM posts until the client opens the thread
   createdAt      DateTime          @default(now())
 
   @@index([proposalId, createdAt])
@@ -1787,55 +1952,55 @@ model SelectionItemComment {
 // promotes it to the company's approved record. Additive alongside the legacy
 // SelectionBoard/SelectionCategory/SelectionOption flow, which is untouched.
 model Decision {
-  id              String              @id @default(cuid())
-  projectId       String
-  project         Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name            String              // "Sink Faucet"
-  area            String?             // "Master Bath" — grouping in the UI
-  status          String              @default("Open") // Open | Decided | Flagged | Ordered | Received
-  chosenItemId    String?             @unique
-  chosenItem      SelectionProposal?  @relation("DecisionChosenItem", fields: [chosenItemId], references: [id], onDelete: SetNull)
-  candidates      SelectionProposal[] @relation("DecisionCandidates")
-  sortOrder       Int                 @default(0)
-  templateKey     String?             // provenance when seeded from a template (Phase 3) or imported from a legacy board category ("board-import:<categoryId>") — per-item key "decision-template:<templateId>:<itemId>" when applied from a DecisionTemplate
+  id                String              @id @default(cuid())
+  projectId         String
+  project           Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name              String // "Sink Faucet"
+  area              String? // "Master Bath" — grouping in the UI
+  status            String              @default("Open") // Open | Decided | Flagged | Ordered | Received
+  chosenItemId      String?             @unique
+  chosenItem        SelectionProposal?  @relation("DecisionChosenItem", fields: [chosenItemId], references: [id], onDelete: SetNull)
+  candidates        SelectionProposal[] @relation("DecisionCandidates")
+  sortOrder         Int                 @default(0)
+  templateKey       String? // provenance when seeded from a template (Phase 3) or imported from a legacy board category ("board-import:<categoryId>") — per-item key "decision-template:<templateId>:<itemId>" when applied from a DecisionTemplate
   // Phase 3 — Decision Templates + Schedule-Driven Due Dates
   // (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
   // scheduleTaskId is advisory, NOT an FK — same rationale as
   // suggestedDecisionId on SelectionProposal: schedule tasks get deleted/
   // regenerated, and read paths validate against live tasks, treating a
   // dangling id as "not linked" rather than an error.
-  scheduleTaskId  String?             // linked ScheduleTask.id — advisory, no FK
-  leadTimeDays    Int?                // days before the linked task's startDate the decision is due
+  scheduleTaskId    String? // linked ScheduleTask.id — advisory, no FK
+  leadTimeDays      Int? // days before the linked task's startDate the decision is due
   // MANUAL OVERRIDE ONLY — written exclusively by setDecisionDueDateOverride.
   // Linking, unlinking, template apply, and schedule changes never touch this
   // column. effectiveDueDate is computed on read (dueDate ?? derived from the
   // linked task minus leadTimeDays) — see decision-due-date.ts.
-  dueDate         DateTime?
+  dueDate           DateTime?
   // Phase 4 — Selection Order Tracking + Delivery Risk
   // (docs/superpowers/plans/2026-07-31-selection-order-tracking.md). All
   // nullable, no FK, no backfill — `status` keeps driving the lifecycle.
   // Canonical writer: setDecisionOrderInfo (decision-order-actions-core.ts) —
   // no other path writes these three columns.
   orderedAt         DateTime? // when the order was placed
-  orderedBy         String?   // "TEAM" | "CLIENT" — who purchased
+  orderedBy         String? // "TEAM" | "CLIENT" — who purchased
   expectedArrivalAt DateTime? // ETA used for schedule-risk comparison
-  createdByClient Boolean             @default(false)
-  decidedAt       DateTime?
-  pmNote          String?             // client-visible note from the flag path
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
+  createdByClient   Boolean             @default(false)
+  decidedAt         DateTime?
+  pmNote            String? // client-visible note from the flag path
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @default(now()) @updatedAt
   // Soft delete only — deleteDecision never hard-deletes (Justin: "it's
   // their playground", clients can delete any decision on their project, but
   // "lose no customer data" still holds). Filtered out of every read below;
   // the team can restore within 30 days (getRecentlyDeletedDecisions /
   // restoreDecision).
-  deletedAt       DateTime?
+  deletedAt         DateTime?
 
-  @@index([projectId, status])
   // Authoritative idempotency guard for importBoardPicksAsDecisions — a
   // nullable templateKey is fine, Postgres treats each NULL as distinct so
   // ordinary (non-imported) decisions never collide with each other.
   @@unique([projectId, templateKey])
+  @@index([projectId, status])
 }
 
 // Decision Templates — Phase 3 (docs/superpowers/plans/2026-07-31-selection-templates-due-dates.md).
@@ -1847,11 +2012,11 @@ model Decision {
 // SelectionItemComment.
 model DecisionTemplate {
   id          String                 @id @default(cuid())
-  name        String                 // "Kitchen Remodel"
+  name        String                 @unique // "Kitchen Remodel"
   description String?
-  archivedAt  DateTime?              // archive, not delete — applied projects keep working
+  archivedAt  DateTime? // archive, not delete — applied projects keep working
   createdAt   DateTime               @default(now())
-  updatedAt   DateTime               @updatedAt
+  updatedAt   DateTime               @default(now()) @updatedAt
   items       DecisionTemplateItem[]
 }
 
@@ -1859,13 +2024,23 @@ model DecisionTemplateItem {
   id                  String           @id @default(cuid())
   templateId          String
   template            DecisionTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
-  name                String           // "Cabinets"
+  name                String // "Cabinets"
   area                String?
-  defaultLeadTimeDays Int?             // suggested lead time when this decision links to a phase
-  scheduleHint        String?          // free text ("cabinet install", "05-PLUMBING") to help AI matching
+  defaultLeadTimeDays Int? // suggested lead time when this decision links to a phase
+  scheduleHint        String? // free text ("cabinet install", "05-PLUMBING") to help AI matching
   order               Int              @default(0)
 
+  // Superseded duplicates of scheduleHint/order, still present in prod holding identical data.
+  // @ignore keeps them out of the generated client so nothing can write them by accident,
+  // while still declaring them here so a migrate diff does not propose dropping them.
+  costCodeId String?  @ignore
+  stageHint  String?  @ignore
+  sortOrder  Int      @default(0) @ignore
+  createdAt  DateTime @default(now()) @ignore
+  updatedAt  DateTime @default(now()) @ignore
+
   @@index([templateId, order])
+  @@index([templateId])
 }
 
 model MoodBoard {
@@ -1881,19 +2056,19 @@ model MoodBoard {
 }
 
 model MoodBoardItem {
-  id          String    @id @default(cuid())
-  moodBoardId String
-  moodBoard   MoodBoard @relation(fields: [moodBoardId], references: [id], onDelete: Cascade)
-  type        String // "IMAGE", "TEXT", "SWATCH"
-  content     String // Image URL, text body, or hex code
-  x           Float     @default(0)
-  y           Float     @default(0)
-  width       Float     @default(200)
-  height      Float     @default(200)
-  zIndex      Int       @default(1)
-  addedByClient Boolean @default(false)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id            String    @id @default(cuid())
+  moodBoardId   String
+  moodBoard     MoodBoard @relation(fields: [moodBoardId], references: [id], onDelete: Cascade)
+  type          String // "IMAGE", "TEXT", "SWATCH"
+  content       String // Image URL, text body, or hex code
+  x             Float     @default(0)
+  y             Float     @default(0)
+  width         Float     @default(200)
+  height        Float     @default(200)
+  zIndex        Int       @default(1)
+  addedByClient Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 }
 
 model DailyLog {
@@ -1908,8 +2083,13 @@ model DailyLog {
   workPerformed      String          @db.Text
   materialsDelivered String?         @db.Text
   issues             String?         @db.Text
+  nextSteps          String?         @db.Text // what's planned next — drives clock-in task suggestions
+  aiSuggestedTaskId  String? // ScheduleTask picked by the task matcher from this log's text + photos
+  aiSuggestionReason String?         @db.Text
   sharedToPortal     Boolean         @default(false)
   sharedContentHash  String?
+  source             String          @default("manual") // "manual" | Chat-ingest provenance
+  chatMessageName    String?         @unique
   photos             DailyLogPhoto[]
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
@@ -1918,43 +2098,61 @@ model DailyLog {
 }
 
 model DailyLogPhoto {
-  id         String   @id @default(cuid())
-  dailyLogId String
-  dailyLog   DailyLog @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
-  url        String
-  caption    String?
-  sharedToPortal Boolean @default(false)
-  createdAt  DateTime @default(now())
+  id             String   @id @default(cuid())
+  dailyLogId     String
+  dailyLog       DailyLog @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
+  url            String
+  caption        String?
+  sharedToPortal Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@unique([dailyLogId, url])
+}
+
+model Permit {
+  id               String    @id @default(cuid())
+  projectId        String
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  permitNumber     String
+  type             String? // e.g. Building, Electrical, Plumbing, Mechanical
+  status           String    @default("applied") // applied | issued | inspections | closed | expired
+  issuingAuthority String?
+  issueDate        DateTime?
+  expirationDate   DateTime?
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @default(now()) @updatedAt
+
+  @@index([projectId])
 }
 
 model Retainer {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   code        String
   projectId   String
-  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   clientId    String
-  client      Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  status      String   @default("Draft") // Draft, Sent, Partially Paid, Paid
-  totalAmount Decimal    @default(0)
-  balanceDue  Decimal    @default(0)
-  amountPaid  Decimal    @default(0)
+  client      Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  status      String    @default("Draft") // Draft, Sent, Partially Paid, Paid
+  totalAmount Decimal   @default(0)
+  balanceDue  Decimal   @default(0)
+  amountPaid  Decimal   @default(0)
   notes       String?
   issueDate   DateTime?
   dueDate     DateTime?
   sentAt      DateTime?
   viewedAt    DateTime?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
 
   @@index([projectId])
   @@index([clientId])
 }
 
-
 model CatalogItem {
   id          String    @id @default(cuid())
   name        String
   description String?
-  unitCost    Decimal     @default(0)
+  unitCost    Decimal   @default(0)
   unit        String    @default("each")
   costCodeId  String?
   costCode    CostCode? @relation(fields: [costCodeId], references: [id])
@@ -1965,16 +2163,16 @@ model CatalogItem {
 }
 
 model BidPackage {
-  id          String       @id @default(cuid())
+  id          String          @id @default(cuid())
   projectId   String
-  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
   title       String
   description String?
   dueDate     DateTime?
-  status      String       @default("Draft") // Draft, Open, Awarded, Closed
+  status      String          @default("Draft") // Draft, Open, Awarded, Closed
   totalBudget Decimal?
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
   scopes      BidScope[]
   invitations BidInvitation[]
 
@@ -1993,30 +2191,30 @@ model BidScope {
 }
 
 model BidInvitation {
-  id               String     @id @default(cuid())
-  packageId        String
-  package          BidPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
-  subcontractorId  String?
-  email            String
-  status           String     @default("Invited") // Invited, Viewed, Submitted, Declined, Awarded
-  bidAmount        Decimal?
-  notes            String?
-  sentAt           DateTime?
-  respondedAt      DateTime?
-  createdAt        DateTime   @default(now())
-  updatedAt        DateTime   @updatedAt
+  id              String     @id @default(cuid())
+  packageId       String
+  package         BidPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  subcontractorId String?
+  email           String
+  status          String     @default("Invited") // Invited, Viewed, Submitted, Declined, Awarded
+  bidAmount       Decimal?
+  notes           String?
+  sentAt          DateTime?
+  respondedAt     DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
 }
 
 model DocumentComment {
-  id             String   @id @default(cuid())
-  documentType   String   // estimate, invoice, change-order, purchase-order, contract
-  documentId     String
-  visibility     String   @default("team") // team, client
-  authorId       String?
-  author         User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
-  authorName     String?  // fallback for client/sub comments
-  text           String
-  createdAt      DateTime @default(now())
+  id           String   @id @default(cuid())
+  documentType String // estimate, invoice, change-order, purchase-order, contract
+  documentId   String
+  visibility   String   @default("team") // team, client
+  authorId     String?
+  author       User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorName   String? // fallback for client/sub comments
+  text         String
+  createdAt    DateTime @default(now())
 
   @@index([documentType, documentId])
 }
@@ -2026,12 +2224,12 @@ model DocumentComment {
 model ChatConversation {
   id         String    @id @default(cuid())
   userId     String
-  title      String?   // Auto-generated from first message
+  title      String? // Auto-generated from first message
   archivedAt DateTime? // Auto-archived after 7 days of inactivity
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
 
-  messages   ChatMessage[]
+  messages ChatMessage[]
 
   @@index([userId])
   @@index([userId, archivedAt])
@@ -2040,11 +2238,11 @@ model ChatConversation {
 model ChatMessage {
   id             String   @id @default(cuid())
   conversationId String
-  role           String   // "user" or "assistant"
+  role           String // "user" or "assistant"
   content        String
   createdAt      DateTime @default(now())
 
-  conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([conversationId])
 }
@@ -2063,19 +2261,19 @@ model TeamMessage {
 }
 
 model ActivityLog {
-  id         String   @id @default(cuid())
-  projectId  String?
-  project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  leadId     String?  // lead-stage events (estimate sent/viewed before conversion); no FK — log survives lead deletion
-  actorType  String   // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
-  actorName  String
+  id          String   @id @default(cuid())
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  leadId      String? // lead-stage events (estimate sent/viewed before conversion); no FK — log survives lead deletion
+  actorType   String // "CLIENT", "TEAM", "SUBCONTRACTOR", "SYSTEM"
+  actorName   String
   actorUserId String? // User.id of the acting team member, when known (e.g. MCP connector actor); no FK — log survives user deletion
-  action     String   // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
-  entityType String?  // "estimate", "invoice", "contract", "change_order", "message"
-  entityId   String?
-  entityName String?  // e.g. "Estimate #E-001"
-  metadata   String?  // JSON for extra data
-  createdAt  DateTime @default(now())
+  action      String // "viewed_estimate", "signed_contract", "paid_invoice", "sent_message", "viewed_portal"
+  entityType  String? // "estimate", "invoice", "contract", "change_order", "message"
+  entityId    String?
+  entityName  String? // e.g. "Estimate #E-001"
+  metadata    String? // JSON for extra data
+  createdAt   DateTime @default(now())
 
   @@index([projectId, createdAt])
   @@index([entityType, entityId])
@@ -2084,8 +2282,8 @@ model ActivityLog {
 }
 
 model DispatchPublication {
-  id              String   @id @default(cuid())
-  clientRequestId String   @unique
+  id              String @id @default(cuid())
+  clientRequestId String @unique
   requestHash     String
 
   publishedById   String?
@@ -2093,8 +2291,8 @@ model DispatchPublication {
   publishedByName String
   publishedAt     DateTime @default(now())
 
-  changes         DispatchPublicationChange[]
-  deliveries      ChatDelivery[]
+  changes    DispatchPublicationChange[]
+  deliveries ChatDelivery[]
 
   @@index([publishedById])
   @@index([publishedAt])
@@ -2105,19 +2303,20 @@ model DispatchPublicationChange {
   publicationId String
   publication   DispatchPublication @relation(fields: [publicationId], references: [id], onDelete: Cascade)
 
-  position      Int
-  projectId     String
-  targetType    String // PROJECT | TASK
-  targetId      String
-  kind          String // PROJECT_START | TASK_DATES | TASK_CREW
-  before        Json
-  after         Json
-  summary       String
+  position   Int
+  projectId  String
+  targetType String // PROJECT | TASK
+  targetId   String
+  kind       String // PROJECT_START | TASK_DATES | TASK_CREW
+  before     Json
+  after      Json
+  summary    String
 
   @@unique([publicationId, position], map: "DispatchChange_pub_position_key")
   @@unique([publicationId, kind, targetType, targetId], map: "DispatchChange_pub_target_kind_key")
   @@index([projectId])
   @@index([targetType, targetId])
+  @@index([publicationId])
 }
 
 model ChatDelivery {
@@ -2129,24 +2328,25 @@ model ChatDelivery {
   kind        String @default("dispatch_publication")
   payload     Json
 
-  status              String   @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
-  attempts            Int      @default(0)
+  status              String    @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
+  attempts            Int       @default(0)
   lastError           String?
   claimToken          String?
   processingStartedAt DateTime?
   providerMessageId   String?
-  createdAt           DateTime @default(now())
+  createdAt           DateTime  @default(now())
   processedAt         DateTime?
 
   @@unique([publicationId, destination, kind], map: "ChatDelivery_pub_dest_kind_key")
   @@index([status, createdAt])
   @@index([status, processingStartedAt])
+  @@index([publicationId])
 }
 
 model Integration {
   id        String   @id
   settings  String
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
 
 // Command Center pause switches. SAFETY INVARIANT: these can only PAUSE a
@@ -2156,7 +2356,7 @@ model Integration {
 model AutomationSetting {
   key       String   @id
   value     String
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
 
 // One row per automation happening: a receipt pushed to QuickBooks by the
@@ -2165,219 +2365,28 @@ model AutomationSetting {
 // audit history. Append-only; writes are fire-and-forget so a logging
 // failure can never fail the automation it describes.
 model AutomationEvent {
-  id          String   @id @default(cuid())
-  kind        String   // "receipt-push" | "qbo-sync" | "receipt-stage"
-  stage       String?  // receipt-stage beacons: "intake" | "read" | "dedupe" | "email-book" (push events imply stage "push")
-  status      String   // push: "created" | "already-exists" | "fallback" | "error" · sync: "ok" | "error" · stage: "ok" | "parked" | "quarantined" | "emailed"
-  reason      String?  // fallback/decline/park reason or error name
-  source      String?  // sync: "cron" | "manual" | "backfill" · push/stage: "apps-script"
-  vendor      String?
-  projectName String?
-  docNumber   String?
-  fileName    String?
-  amountCents Int?
-  taxCents    Int?
-  // Typed provenance (Unified Money Register plan §1, "Promote evidence out
-  // of JSON"). Dual-written alongside `detail.fileId` / `detail.qbPurchaseId`
-  // by logAutomationEvent — join on these, never on the 21-char `docNumber`
-  // prefix, which two different Drive fileIds can share.
+  id           String   @id @default(cuid())
+  kind         String // "receipt-push" | "qbo-sync" | "receipt-stage"
+  stage        String? // receipt-stage beacons: "intake" | "read" | "dedupe" | "email-book" (push events imply stage "push")
+  status       String // push: "created" | "already-exists" | "fallback" | "error" · sync: "ok" | "error" · stage: "ok" | "parked" | "quarantined" | "emailed"
+  reason       String? // fallback/decline/park reason or error name
+  source       String? // sync: "cron" | "manual" | "backfill" · push/stage: "apps-script"
+  vendor       String?
+  projectName  String?
+  docNumber    String?
+  fileName     String?
+  amountCents  Int?
+  taxCents     Int?
+  detail       String? // JSON extras (sync counts, decline context)
+  createdAt    DateTime @default(now())
   qbPurchaseId String?
   driveFileId  String?
-  detail      String?  // JSON extras (sync counts, decline context)
-  createdAt   DateTime @default(now())
 
   @@index([kind, createdAt])
   @@index([createdAt])
   @@index([docNumber, createdAt])
   @@index([qbPurchaseId])
   @@index([driveFileId])
-}
-
-// Persisted at QBO expense-sync time (Unified Money Register plan §5 step 3,
-// docs/UNIFIED-REGISTER-PLAN.md). A QuickBooks Purchase's customer/account/
-// equity shape decides whether it's job-costable, overhead, or an owner
-// draw — and a bank-register GL row (qbo-bank-register.ts) carries none of
-// that shape, so it CANNOT be recomputed from the register alone. Captured
-// once at sync time and joined back in by qbPurchaseId. `classification` is
-// CHECK-constrained to the four values below (see
-// scripts/apply-qbo-purchase-classification.mjs) rather than left an
-// unvalidated string.
-model QboPurchaseClassification {
-  qbPurchaseId   String   @id
-  classification String // "job-cost" | "overhead" | "owner-draw" | "unknown"
-  reason         String? // why, e.g. "no customer on purchase", "no-active-project"
-  qbSyncToken    String? // lets a later sync tell whether the Purchase changed since classification
-  classifiedAt   DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  @@index([classification])
-}
-
-// ── Review alerts (Unified Money Register plan §4/§5 step 8) ────────────────
-// Google Chat notifications for register rows that land in "needs-review".
-// Three-model durable state machine, mirroring the PaymentNotification outbox
-// (src/lib/payment-outbox.ts) for the delivery half and adding a lifecycle
-// layer on top (src/lib/review-alert-lifecycle.ts) because — unlike a
-// milestone-paid event, which fires once — a review issue's reason set can
-// change, clear, and re-open many times, and delivery must track exactly one
-// "current" outstanding problem per target without re-alerting on every sync.
-//
-// Reason codes are STABLE ENUM-LIKE STRINGS (NO_RECEIPT, NO_JOB_COST, ...),
-// never free text — see src/lib/review-alert-reasons.ts for the closed set,
-// canonical-JSON encoding, and untruncated-SHA-256 hashing (plan punch 9: a
-// comma-joined string collides, and hashing display text churns a new
-// generation on every evaluation). `reasonCodes` / `reasonHash` are that
-// canonical encoding; `displayDetails` is a SEPARATE, NEVER-hashed JSON blob
-// for amounts/dates/vendor — display data changes constantly (a backdated
-// CDC catch-up can revise an amount) and must never itself trigger a new
-// alert generation.
-
-// Current state, one row per (targetType, targetKey) — e.g. targetType
-// "qbo-purchase", targetKey the QBO Purchase Id. `version` guards every write
-// with optimistic concurrency (see the lifecycle module): the ordered
-// decision tree runs in one short transaction keyed on `{id, version}`, and a
-// conflict retries the whole evaluation rather than blindly overwriting.
-model ReviewIssue {
-  id                String    @id @default(cuid())
-  targetType        String
-  targetKey         String
-  version           Int       @default(1)
-  reasonCodes       String // canonical JSON array of ReasonCode, sorted + deduped
-  reasonHash        String // untruncated SHA-256 hex of reasonCodes
-  displayDetails    String? // JSON: amounts/dates/vendor/project — NOT hashed, NOT what drives a new generation
-  acknowledgedCodes String    @default("[]") // canonical JSON array — acknowledgement is per-code (plan punch 9), not whole-set
-  acknowledgedAt    DateTime?
-  firstObservedAt   DateTime // reset whenever the issue re-opens after clearing — "when did the CURRENT failure start"
-  clearedAt         DateTime?
-  // When this issue's target first went missing from a trustworthy snapshot.
-  // Not lifecycle state — bookkeeping for the age-out policy; deliberately
-  // does NOT bump version.
-  absentSince       DateTime?
-  // Highest ReviewAlertEpisode.generation opened for this issue. Not called
-  // out by name in the plan's schema bullet list, but the lifecycle ("open
-  // generation+1") needs an authoritative counter to bump race-safely inside
-  // the same version-guarded transaction — deriving it via
-  // MAX(generation) FROM ReviewAlertEpisode on every evaluation would be an
-  // extra query and an extra race window for no benefit.
-  currentGeneration Int       @default(1)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  episodes ReviewAlertEpisode[]
-
-  @@unique([targetType, targetKey])
-  @@index([clearedAt])
-}
-
-// IMMUTABLE per-generation snapshot — one row per (issueId, generation), never
-// updated in place except for its OWN delivery-retry bookkeeping (status,
-// claimToken, attempts, ...). `reasonCodes` / `reasonHash` / `displayDetails`
-// here are a snapshot AS OF the generation open, independent of whatever the
-// parent ReviewIssue's current values later become — so a delayed send still
-// reports the numbers that were true when the alert was generated.
-//
-// Delivery state mirrors src/lib/payment-outbox.ts's PaymentNotification
-// model exactly (plan punch 3): status PENDING|CLAIMED|SENT|FAILED, plus
-// SUPERSEDED (a newer generation opened before this one sent — plan punch 1
-// step 6) and CANCELLED (the issue cleared before this one sent — step 1) and
-// SUPPRESSED (acknowledged-superset suppression, or a rollout-baseline
-// snapshot that must never actually send — plan §4 "Rollout").
-model ReviewAlertEpisode {
-  id      String @id @default(cuid())
-  issueId String
-  issue   ReviewIssue @relation(fields: [issueId], references: [id])
-  generation Int
-
-  reasonCodes    String
-  reasonHash     String
-  displayDetails String?
-
-  status String @default("PENDING") // PENDING | CLAIMED | SENT | FAILED | SUPERSEDED | CANCELLED | SUPPRESSED | BATCHED
-  // Fencing token: set on each claim, required by the completion update — a
-  // worker whose lease expired (row re-claimed by another drainer) writes a
-  // stale token, so its late completion no-ops instead of overwriting the new
-  // owner's result (same convention as PaymentNotification.claimToken).
-  claimToken    String?
-  claimedAt     DateTime?
-  attempts      Int       @default(0)
-  lastError     String?
-  // Retry-as-PENDING backoff gate, distinct from claimedAt's stale-claim
-  // reclaim window — see src/lib/review-alert-outbox.ts.
-  nextAttemptAt DateTime?
-  sentAt        DateTime?
-  chatMessageName String? // Google Chat message resource name, for the deterministic-requestId re-fetch path (step 10)
-
-  // Rate-ceiling overflow (plan §4 "Rate ceiling"): when more than 10 episodes
-  // are ready in one drain run, the overflow moves PENDING → BATCHED with a
-  // batchId, and the batch itself is drained through the SAME claim/fence/
-  // retry path as a single ReviewAlertBatch row. FK is ON DELETE RESTRICT
-  // (Codex finding 3 — SET NULL let a deleted batch orphan its still-BATCHED
-  // members with nothing left to drain them); apply-review-alerts-schema.mjs
-  // is the source of truth for the FK's actual delete rule, this attribute
-  // relation doesn't encode it.
-  batchId String?
-  batch   ReviewAlertBatch? @relation(fields: [batchId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@unique([issueId, generation])
-  // Real indexes (finding 11) are two separate PARTIAL indexes — one on
-  // (nextAttemptAt, createdAt) WHERE status='PENDING', one on
-  // (claimedAt, createdAt) WHERE status='CLAIMED' — managed by
-  // apply-review-alerts-schema.mjs. A single composite (status,
-  // nextAttemptAt, claimedAt) index can't serve both branches of the
-  // drainer's due-retry / stale-claim OR query; Prisma's schema DSL has no
-  // partial-index syntax, so this line is documentation only, not what's
-  // actually applied.
-  @@index([status, nextAttemptAt, claimedAt])
-  @@index([batchId])
-}
-
-// Rate-ceiling overflow summary card. Same COMPLETE retry model as
-// ReviewAlertEpisode (plan §4 "Schema") — drained through the identical
-// claim/fence/retry code path, just building a multi-episode summary payload
-// instead of a single-issue card.
-model ReviewAlertBatch {
-  id     String @id @default(cuid())
-  status String @default("PENDING") // PENDING | CLAIMED | SENT | FAILED
-
-  claimToken      String?
-  claimedAt       DateTime?
-  attempts        Int       @default(0)
-  lastError       String?
-  nextAttemptAt   DateTime?
-  sentAt          DateTime?
-  chatMessageName String?
-
-  createdAt DateTime @default(now())
-
-  episodes ReviewAlertEpisode[]
-
-  // Same partial-index split as ReviewAlertEpisode above (finding 11) —
-  // documentation only, see that model's comment.
-  @@index([status, nextAttemptAt, claimedAt])
-}
-
-// Durable lease row for the rollout baseline (plan §4 "Rollout"). NOT a long
-// transaction and NOT a session advisory lock — neither survives pgbouncer's
-// transaction-pooling mode (every statement can land on a different backend
-// connection). A single row, claimed the same conditional-updateMany way the
-// outbox claims work, records whether the one-time baseline sweep (existing
-// failures written as SUPPRESSED episodes so enabling alerts doesn't dump the
-// entire backlog into Chat) has completed.
-model RolloutGate {
-  key    String @id
-  status String @default("pending") // pending | in-progress | complete
-
-  claimToken  String?
-  claimedAt   DateTime?
-  startedAt   DateTime?
-  completedAt DateTime?
-  attempts    Int       @default(0)
-  lastError   String?
-  updatedAt   DateTime  @updatedAt
-
-  @@index([status])
 }
 
 model StripeEvent {
@@ -2423,7 +2432,7 @@ model CatalogProduct {
   heightIn    Float
   mount       String   @default("floor")
   elevationIn Float?
-  price       Decimal?
+  price       Decimal? @db.Decimal(12, 2)
   finishes    Json?
   sourceUrl   String?
   notes       String?
@@ -2458,4 +2467,370 @@ model PaymentNotification {
 
   @@index([status])
   @@index([scheduleId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  entity     String
+  entityId   String
+  action     String
+  actorId    String?
+  actorEmail String?
+  snapshot   Json?
+  createdAt  DateTime @default(now()) @db.Timestamp(6)
+
+  @@index([entity, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model McpKey {
+  id         String    @id @default(cuid())
+  label      String
+  keyHash    String    @unique
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  @@index([userId])
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  type        String
+  severity    String    @default("info")
+  title       String
+  body        String?
+  projectId   String?
+  timeEntryId String?
+  expenseId   String?
+  actorId     String?
+  dedupeKey   String?   @unique
+  channels    String?
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([projectId])
+  @@index([readAt])
+  @@index([createdAt])
+}
+
+// Read/written by src/app/api/help-chat/* via raw SQL.
+model HelpRequest {
+  id                String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId            String
+  type              String    @default("help")
+  question          String
+  response          String?
+  currentPage       String?
+  status            String?   @default("open")
+  slackMessageTs    String?
+  completedAt       DateTime? @db.Timestamptz(6)
+  verifiedAt        DateTime? @db.Timestamptz(6)
+  changeDescription String?
+  changeLocation    String?
+  externalIssueRef  String?
+  conversationId    String?
+  createdAt         DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@index([conversationId])
+  @@index([externalIssueRef])
+}
+
+model RolloutGate {
+  key         String    @id
+  status      String    @default("pending")
+  claimToken  String?
+  claimedAt   DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+  updatedAt   DateTime
+
+  @@index([status])
+}
+
+model QboPurchaseClassification {
+  qbPurchaseId   String   @id
+  classification String
+  reason         String?
+  qbSyncToken    String?
+  classifiedAt   DateTime @default(now())
+  updatedAt      DateTime
+
+  @@index([classification])
+}
+
+model ReviewIssue {
+  id                String               @id @default(cuid())
+  targetType        String
+  targetKey         String
+  version           Int                  @default(1)
+  reasonCodes       String
+  reasonHash        String
+  displayDetails    String?
+  acknowledgedCodes String               @default("[]")
+  acknowledgedAt    DateTime?
+  firstObservedAt   DateTime
+  clearedAt         DateTime?
+  currentGeneration Int                  @default(1)
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime
+  absentSince       DateTime?
+  episodes          ReviewAlertEpisode[]
+
+  @@unique([targetType, targetKey])
+  @@index([clearedAt])
+}
+
+model ReviewAlertBatch {
+  id              String               @id @default(cuid())
+  status          String               @default("PENDING")
+  claimToken      String?
+  claimedAt       DateTime?
+  attempts        Int                  @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime?
+  sentAt          DateTime?
+  chatMessageName String?
+  createdAt       DateTime             @default(now())
+  episodes        ReviewAlertEpisode[]
+}
+
+model ReviewAlertEpisode {
+  id              String            @id @default(cuid())
+  issueId         String
+  issue           ReviewIssue       @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  generation      Int
+  reasonCodes     String
+  reasonHash      String
+  displayDetails  String?
+  status          String            @default("PENDING")
+  claimToken      String?
+  claimedAt       DateTime?
+  attempts        Int               @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime?
+  sentAt          DateTime?
+  chatMessageName String?
+  batchId         String?
+  batch           ReviewAlertBatch? @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  createdAt       DateTime          @default(now())
+
+  @@unique([issueId, generation])
+  @@index([batchId])
+}
+
+// ── Bank ledger (Receipt Automation Phase 1) ────────────────────────────────
+// docs/RECEIPT-AUTOMATION-PHASES.md, "Persistence decision" (2026-08-14) +
+// Codex peer-review round-1 amendments (2026-08-14): BankLine is the
+// canonical transaction ledger, and the bank STATEMENT is true north — a
+// canonical BankLine is only ever minted from a STATEMENT observation, never
+// from QBO. BankLineObservation holds one row per source sighting (a
+// statement line, a QBO register row, ...), uniquely identified by its own
+// source locator, so two sources reporting the "same" transaction both stay
+// on record instead of one silently overwriting the other via a hash
+// collision. Cross-source dedup is an explicit reconcile step
+// (reconcileObservations in src/lib/bank-ledger.ts, exposed via
+// POST /api/integrations/bank-ledger/reconcile) that links an observation to
+// a canonical BankLine by EXACT account+postedDate+amountCents+
+// normalizedPayee match (plus checkNumber agreement whenever either side
+// carries one) — never a side effect of ingest, and never on
+// amount+date/rails alone (see the Chevron/Cash App wrong-match lesson in
+// that doc — amount+date alone is zero confidence). Immutable source
+// identity, mutable workflow state: BankLine/BankLineObservation/
+// StatementImport rows are never overwritten; BankLine.state and the
+// validation columns change as automation progresses. The /automation
+// dashboard becomes a report over these tables instead of a live in-memory
+// merge.
+//
+// Codex peer-review round-2 amendments (2026-08-14): reconciliation links
+// are written by a transactional persistence function (see the reconcile
+// route) that uses a SAVEPOINT per proposed link inside one transaction, so
+// a unique-index conflict on one link (a concurrent run already claimed
+// that BankLine, or that Observation) rolls back only that link and is
+// reported back to the caller — it never fails the whole batch.
+//
+// Pseudo-enum columns stay Prisma `String` (repo convention) — allowed
+// values are documented on each field and enforced by a Postgres CHECK
+// constraint of the same name in scripts/apply-bank-ledger.mjs, since Prisma
+// writes (and raw SQL) bypass anything short of a DB constraint.
+
+model StatementImport {
+  id           String   @id @default(cuid())
+  account      String // e.g. "WTB-0723"
+  periodStart  DateTime @db.Date
+  periodEnd    DateTime @db.Date
+  openingCents Int
+  closingCents Int
+  // sha256(JSON.stringify([1, account, periodStart, periodEnd, openingCents,
+  // closingCents, lines])) — computeStatementContentHash() in
+  // src/lib/bank-ledger.ts. An identical re-post of the same statement
+  // reproduces this hash exactly, which is what makes re-ingesting a
+  // statement content-addressed and safe to retry: same hash for the same
+  // account+period is a no-op, a different hash is a conflict (HTTP 409),
+  // never a silent overwrite.
+  contentHash  String   @unique
+  status       String   @default("FINALIZED") // PENDING, FINALIZED, FAILED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  observations BankLineObservation[]
+
+  @@unique([account, periodStart, periodEnd])
+}
+
+model BankLine {
+  id              String   @id @default(cuid())
+  account         String // e.g. "WTB-0723"
+  postedDate      DateTime @db.Date
+  amountCents     Int // signed: negative = debit/subtraction, positive = credit/addition — UNCONDITIONALLY IMMUTABLE once the row exists (bank_line_amount_immutable_trigger, scripts/apply-bank-ledger.mjs; Codex round-4 fix). Amounts come from bank statements; a correction is a new observation/line, never an edit.
+  rawDescriptor   String
+  normalizedPayee String // "" is a valid but exceptional value — paired with state EXCEPTION, never silently accepted as a real identity
+  checkNumber     String?
+  state           String   @default("POSTED") // POSTED, EVIDENCE_FOUND, TRANSACTION_CREATED, ATTACHMENT_CONFIRMED, MATCHED, JOB_CODED, TAX_VALIDATED, EXCEPTION
+  exceptionReason String?
+
+  // Validation columns
+  qbTxnId           String?
+  qbBankMatched     Boolean  @default(false)
+  probuildExpenseId String?
+  projectName       String?
+  projectValidated  Boolean  @default(false)
+  receiptUrl        String?
+  taxValidated      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  observations      BankLineObservation[]
+  items             BankLineItem[]
+  refundsAsOriginal RefundEvent[]         @relation("RefundEventOriginal")
+  refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
+
+  @@index([account, postedDate])
+  @@index([qbTxnId])
+}
+
+// NOTE: two invariants live ONLY in raw SQL, applied by
+// scripts/apply-bank-ledger.mjs — Prisma cannot express either in schema.prisma:
+//   1. A partial UNIQUE index caps each canonical BankLine at ONE linked
+//      observation PER SOURCE, so a canonical line can never accumulate two
+//      QBO observations (or two STATEMENT observations) across separate
+//      reconciliation/ingest runs:
+//        CREATE UNIQUE INDEX ... ON "BankLineObservation" ("source", "bankLineId")
+//          WHERE "bankLineId" IS NOT NULL
+//   2. A source-dependent CHECK constraint enforces each source's own shape —
+//      STATEMENT rows always carry both statementImportId and bankLineId
+//      (minted together at ingest); QBO_REGISTER rows must never carry a
+//      statementImportId (there is no per-import document for that source):
+//        CHECK (
+//          (source = 'STATEMENT' AND "statementImportId" IS NOT NULL AND "bankLineId" IS NOT NULL)
+//          OR (source = 'QBO_REGISTER' AND "statementImportId" IS NULL)
+//        )
+model BankLineObservation {
+  id     String @id @default(cuid())
+  source String // STATEMENT, QBO_REGISTER
+  account String
+
+  // StatementImport.id for STATEMENT; the constant "QBO_REGISTER" for
+  // QBO_REGISTER (there is no per-import document there — the register is
+  // one ongoing stream identified by sourceLineId alone).
+  sourceDocumentId String
+  // The durable per-source line identity that replaced request-local
+  // occurrenceIndex hashing: a 0-based sequence position within the
+  // statement import (STATEMENT) or the QBO transaction id (QBO_REGISTER).
+  sourceLineId     String
+
+  postedDate    DateTime @db.Date
+  amountCents   Int
+  rawDescriptor String
+  checkNumber   String?
+
+  // Reconciliation target (see the reconcile route). NULL until an explicit
+  // reconcileObservations() link is persisted; STATEMENT rows get theirs at
+  // ingest time (the canonical line minted alongside them). At most one
+  // observation per (source, bankLineId) — see the partial unique index note
+  // above.
+  //
+  // onDelete: Restrict, not SetNull (Codex round-3 should-fix) — the
+  // source-shape CHECK above requires STATEMENT rows to carry BOTH
+  // bankLineId and statementImportId, so nulling either one on a parent
+  // delete would violate that CHECK. Restrict makes the deletion policy
+  // explicit (delete/reassign the observation first) instead of failing
+  // confusingly, or, for QBO_REGISTER rows, silently dropping a link.
+  bankLineId String?
+  bankLine   BankLine? @relation(fields: [bankLineId], references: [id], onDelete: Restrict)
+
+  statementImportId String?
+  statementImport   StatementImport? @relation(fields: [statementImportId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@unique([source, account, sourceDocumentId, sourceLineId], map: "BankLineObservation_source_account_sourceDocumentId_sourceLineI")
+  @@index([bankLineId])
+  @@index([account, postedDate])
+}
+
+model BankLineItem {
+  id             String   @id @default(cuid())
+  bankLineId     String
+  bankLine       BankLine @relation(fields: [bankLineId], references: [id], onDelete: Cascade)
+  description    String
+  qty            Decimal?
+  unitPriceCents Int?
+  lineTotalCents Int?
+  source         String // RECEIPT_AI, LOWES_CSV, AMAZON_APP, MANUAL
+  jobHint        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([bankLineId])
+}
+
+// NOTE: originalBankLineId must point to a DEBIT BankLine (amountCents < 0)
+// and refundBankLineId to a CREDIT BankLine (amountCents > 0) — a refund
+// pairs the original outgoing charge with the credit that reverses it, and
+// swapping them silently produces a RefundEvent that means the opposite of
+// what it says. Prisma can't express a cross-table CHECK, so this is
+// enforced two ways: a BEFORE INSERT/UPDATE trigger
+// (refund_event_signs_trigger, applied by scripts/apply-bank-ledger.mjs) as
+// the DB-level backstop, and validateRefundEventSigns() in
+// src/lib/bank-ledger.ts, which any future write path MUST call first so a
+// bad pairing surfaces as a normal validation error rather than a raised
+// Postgres exception.
+//
+// That trigger only guards RefundEvent write time — a separate parent-side
+// trigger (bank_line_amount_immutable_trigger, Codex round-4 fix) rejects
+// ANY UPDATE that changes BankLine.amountCents, unconditionally, not just
+// once a RefundEvent references the line. Round-3's version gated the check
+// behind an EXISTS lookup against RefundEvent, which an unlocked MVCC read
+// let race a concurrent RefundEvent insert + amountCents update into both
+// committing — and once every referencing RefundEvent was deleted, the
+// amount became editable again. BankLine.amountCents comes from a bank
+// statement and must never change after the row exists; a correction is a
+// new observation/line, never an edit. Making it unconditional removes that
+// race entirely and means the sign pairing validated by
+// validateRefundEventSigns() can never be silently broken afterward by
+// editing the BankLine instead.
+model RefundEvent {
+  id                 String    @id @default(cuid())
+  originalBankLineId String?
+  originalBankLine   BankLine? @relation("RefundEventOriginal", fields: [originalBankLineId], references: [id], onDelete: SetNull)
+  refundBankLineId   String?
+  refundBankLine     BankLine? @relation("RefundEventRefund", fields: [refundBankLineId], references: [id], onDelete: SetNull)
+  vendorRefundRef    String?
+  amountCents        Int       // positive magnitude, never signed — CHECK (amountCents > 0)
+  taxCents           Int       @default(0) // CHECK (taxCents >= 0 AND taxCents <= amountCents)
+  status             String    @default("EXPECTED") // EXPECTED, CREDIT_SEEN, PAIRED, POSTED
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([originalBankLineId])
+  @@index([refundBankLineId])
 }

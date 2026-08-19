@@ -11,6 +11,7 @@ export type CreateDailyLogCoreInput = {
     workPerformed: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
     photoUrls?: Array<{ url: string; caption?: string }>;
 };
 
@@ -29,6 +30,7 @@ export async function createDailyLogCore(
         workPerformed,
         materialsDelivered,
         issues,
+        nextSteps,
         photoUrls,
     } = input;
     return tx.dailyLog.create({
@@ -40,6 +42,7 @@ export async function createDailyLogCore(
             workPerformed,
             materialsDelivered: materialsDelivered || null,
             issues: issues || null,
+            nextSteps: nextSteps || null,
             createdById: actorUserId,
             photos: photoUrls && photoUrls.length > 0 ? {
                 create: photoUrls.map(photo => ({

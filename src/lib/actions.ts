@@ -13,14 +13,26 @@ import { safeEstimateSelect, toNum, deriveInvoiceTaxFields } from "./prisma-help
 import { formatCurrency } from "./utils";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { resolveSessionClientId } from "./portal-auth";
+import { portalVisibleEstimateWhere } from "./estimate-portal-visibility";
 import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
-import { canUseDevAuthFallback, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, PortalAuthError } from "./permissions";
+import { parsePaymentDateInput } from "./payment-date";
+// normalizeEstimateItemForSave is no longer imported here — the item projection moved into
+// estimate-item-upsert.ts, which is now its only caller on the save path.
+import { selectedBillableRows } from "./estimate-item-payload";
+import { LEGACY_MARKUP_MARGIN_PCT, roundMoney, sellFromMargin } from "./budget-math";
+import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNull, getCurrentUserWithPermissions, getUserWithPermissionsByEmail, hasPermission, canAccessProject, canAccessEstimate, canCreateContractFor, canAccessContract, contractScopeWhere, estimateScopeWhere, estimateTotalsAreComplete, canWriteDocumentTemplateType, PortalAuthError } from "./permissions";
 import { logActivity } from "./activity-log";
+import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
+import { runDailyLogTaskMatch } from "./daily-log-task-match";
+import { postDailyLogSummary } from "./chat-webhook";
+import { runAfterRequest } from "./after-request";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "./payment-outbox";
+import { recordPaymentCore } from "./payment-record-core";
 import { deleteChangeOrderCore, updateChangeOrderCore } from "./change-order-core";
 import { approveChangeOrderWithSignature } from "./change-order-approval";
 import { applyChangeOrderToSchedule, autoGenerateScheduleForApprovedEstimate, canonicalContractEstimateQuery, deriveEstimateItemHours, setProjectStartDate, shiftNotStartedTasks, parseStartDateInput, generateScheduleFromEstimate, setProjectCrew, setTaskCrew, lockTaskAssignmentParent, touchTaskAssignmentRevision } from "./schedule-core";
@@ -99,7 +111,9 @@ import {
     type CreateScheduleTaskInput,
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
-import { ensureStandardFolders } from "./project-folders";
+import { convertLeadToProjectCore } from "./lead-conversion-core";
+import { buildContractMergeData, normalizeContractBody, resolveMergeFields, createContractFromTemplateCore, createContractBlankCore } from "./contract-creation-core";
+import { executedContractPdfFor } from "./contract-files-core";
 import { createDailyLogCore } from "./daily-log-core";
 import { normalizeSelectionItemNote } from "./selection-item-notes";
 // Import the -core module, not the "server-only" wrapper: actions.ts is in the
@@ -242,12 +256,12 @@ export async function generatePdfUploadToken(estimateId: string): Promise<string
 }
 
 export async function getLeads() {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const leads = await prisma.lead.findMany({
         orderBy: { createdAt: "desc" },
         include: {
             client: true,
-            estimates: safeEstimateInclude,
+            estimates: scopedEstimateRelation(safeEstimateInclude, user),
             manager: true,
             project: { select: { id: true } },
             tasks: {
@@ -271,24 +285,35 @@ export async function getLeads() {
 }
 
 export const getLead = cache(async function getLead(id: string) {
+    const user = await currentStaffUserOrNull();
     const lead = await prisma.lead.findUnique({
         where: { id },
         include: {
             client: true,
-            estimates: safeEstimateInclude,
-            contracts: true,
+            estimates: scopedEstimateRelation(safeEstimateInclude, user),
+            // Scoped for the same reason the estimates relation above is, and
+            // it mattered more here: currentStaffUserOrNull() returns null
+            // rather than throwing, so `contracts: true` handed an ANONYMOUS
+            // caller who knew a lead id every contract field — legal body,
+            // signatures, audit metadata and the accessToken that is by itself
+            // sufficient to view and sign. That defeated the per-action gates
+            // through a differently named action. contractScopeWhere matches
+            // nothing for a null user or one without the `contracts`
+            // permission. (Codex round-1 blocker.)
+            contracts: { where: contractScopeWhere(user) },
             manager: true,
             tasks: {
                 orderBy: { createdAt: "desc" }
             },
             roomDesigns: true,
             // Pull the linked project + its estimates so the lead estimates page
-            // can surface project estimates alongside lead-direct ones.
+            // can surface project estimates alongside lead-direct ones. These are
+            // project-owned, so they are scoped by project access, not leadAccess.
             project: {
                 select: {
                     id: true,
                     name: true,
-                    estimates: safeEstimateInclude,
+                    estimates: scopedEstimateRelation(safeEstimateInclude, user),
                 }
             }
         },
@@ -445,25 +470,43 @@ export async function updateLeadMetadata(id: string, updates: { isUnread?: boole
 
 export async function deleteLead(id: string) {
     await assertActiveStaff();
-    // Prevent deletion of leads that have a linked project — checking the FK directly is
-    // authoritative. Previously this only checked stage === "Won", but any stage can be
-    // linked to a project, and with unlink removed there is no recovery path from a
-    // Postgres FK constraint violation.
-    const linked = await prisma.project.findUnique({ where: { leadId: id }, select: { id: true } });
-    if (linked) {
-        throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+    // One transaction for the whole flow. The guard below is a read, so it cannot stop a
+    // Project from being created against this lead a moment later; once
+    // Project_leadId_fkey is ON DELETE RESTRICT (migration 20260814120000) that race makes
+    // `lead.delete` raise P2003. Run as separate statements the contract deletes would
+    // already have committed by then, leaving the lead alive with its contracts gone.
+    // Inside the transaction the FK failure rolls the deletes back with it.
+    try {
+        await prisma.$transaction(async (tx) => {
+            // Prevent deletion of leads that have a linked project — checking the FK directly is
+            // authoritative. Previously this only checked stage === "Won", but any stage can be
+            // linked to a project, and with unlink removed there is no recovery path from a
+            // Postgres FK constraint violation.
+            const linked = await tx.project.findUnique({ where: { leadId: id }, select: { id: true } });
+            if (linked) {
+                throw new Error("Cannot delete a lead that has a linked project. Archive it instead.");
+            }
+            const lead = await tx.lead.findUnique({ where: { id }, select: { stage: true } });
+            if (lead?.stage === "Won") {
+                throw new Error("Cannot delete a converted lead. Archive it instead.");
+            }
+            // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
+            // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
+            // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
+            await tx.contract.deleteMany({ where: { leadId: id, projectId: null } });
+            await tx.lead.delete({
+                where: { id }
+            });
+        });
+    } catch (error: any) {
+        // P2003 = FK constraint failure, i.e. a Project was linked to this lead between the
+        // guard above and the delete. Nothing was written — report it the same way the guard
+        // does instead of surfacing a raw Prisma error.
+        if (error?.code === "P2003") {
+            throw new Error("Cannot delete a lead that has a linked project. Delete the project first.");
+        }
+        throw error;
     }
-    const lead = await prisma.lead.findUnique({ where: { id }, select: { stage: true } });
-    if (lead?.stage === "Won") {
-        throw new Error("Cannot delete a converted lead. Archive it instead.");
-    }
-    // Contract.lead FK is onDelete:SetNull — explicitly delete lead-only contracts to
-    // avoid orphaning rows with both leadId=null and projectId=null after the lead is gone.
-    // (Leads with a linked project are already blocked above, so all contracts here have projectId=null.)
-    await prisma.contract.deleteMany({ where: { leadId: id, projectId: null } });
-    await prisma.lead.delete({
-        where: { id }
-    });
     revalidatePath(`/leads`);
 }
 
@@ -622,12 +665,20 @@ export async function updateLeadInfo(id: string, data: any) {
 }
 
 export async function getClients() {
+    // Server Actions are remotely invokable, so the getSessionOrDev() check in
+    // /settings/contacts guards the page render, not this getter. Without a gate
+    // here anyone who can reach the app could read every client's internalNotes
+    // and QuickBooks fields plus the full leads relation. The contacts page and
+    // its settings nav entry are gated on "logged in" only — no permission key —
+    // so the matching rule is active staff, not a per-role scope.
+    await assertActiveStaff();
     const clients = await prisma.client.findMany({
         orderBy: { name: "asc" },
         include: {
-            projects: {
-                include: { estimates: safeEstimateInclude }
-            },
+            // The contacts page only renders a project count and the combobox
+            // only needs id/name — no caller reads the project rows themselves,
+            // so keep this to ids instead of every column (and every estimate).
+            projects: { select: { id: true } },
             leads: true
         }
     });
@@ -890,7 +941,8 @@ export async function updateLead(leadId: string, data: { name?: string; source?:
 
     revalidatePath(`/leads/${leadId}`);
     revalidatePath(`/leads`);
-    return lead;
+    // targetRevenue/expectedProfit are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(lead));
 }
 
 // =============================================
@@ -1095,12 +1147,12 @@ export async function deleteLeadMeeting(meetingId: string) {
 }
 
 export async function getProjects() {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const projects = await prisma.project.findMany({
         orderBy: { viewedAt: "desc" },
         include: {
             client: true,
-            estimates: { select: { totalAmount: true, status: true } },
+            estimates: scopedEstimateRelation({ select: { totalAmount: true, status: true } }, user),
         },
     });
     return JSON.parse(JSON.stringify(projects.map((p: any) => ({
@@ -1109,10 +1161,10 @@ export async function getProjects() {
     }))));
 }
 export const getProject = cache(async function getProject(id: string) {
-    await assertActiveStaff();
+    const user = await assertActiveStaff();
     const include = {
         client: true,
-        estimates: {
+        estimates: scopedEstimateRelation({
             select: {
                 id: true,
                 number: true,
@@ -1133,8 +1185,8 @@ export const getProject = cache(async function getProject(id: string) {
                 contractId: true,
                 viewedAt: true,
             }
-        },
-    } as const;
+        }, user),
+    };
 
     // Support both CUID and friendly numeric ID in URL params
     const numericId = /^\d+$/.test(id) ? parseInt(id, 10) : null;
@@ -1148,99 +1200,21 @@ export const getProject = cache(async function getProject(id: string) {
     return project ? JSON.parse(JSON.stringify(project)) : null;
 });
 
+// Staff entry point for lead → project conversion. The conversion itself moves
+// every estimate, contract, schedule task and file off the lead and onto a brand
+// new project, so as a remotely invokable Server Action it must not run for an
+// unauthenticated caller. Mirrors the /leads/[id] layout gate (`leadAccess`),
+// which is the only UI that offers "Convert to project".
+//
+// Callers that authorize the conversion themselves — the portal's
+// approveEstimate (client ownership via resolveSessionClientId) and
+// /api/manager/jobs (mobile token or session + assertLeadAccess) — call
+// convertLeadToProjectCore directly instead; a portal client is not staff and
+// would always fail this gate.
 export async function convertLeadToProject(leadId: string) {
-    const lead = await prisma.lead.findUnique({ 
-        where: { id: leadId },
-        include: { client: true }
-    });
-    if (!lead) throw new Error("Lead not found");
-
-    // Idempotency: if this lead was already converted, return existing project
-    const existingProject = await prisma.project.findUnique({ where: { leadId } });
-    if (existingProject) return { id: existingProject.id };
-
-    // Normalize the job-site address (outside the transaction — external call).
-    // Also catches legacy leads saved before geocode-on-save existed; a precise
-    // match seeds the project's time-clock geofence coordinates.
-    const geo = await geocodeJobSiteAddress(lead.location);
-
-    // Wrap entire conversion in a transaction for atomicity
-    const project = await prisma.$transaction(async (tx) => {
-        const project = await tx.project.create({
-            data: {
-                name: lead.name,
-                clientId: lead.clientId,
-                location: geo?.formattedAddress ?? lead.location,
-                ...(geo?.lat != null && geo?.lng != null ? { locationLat: geo.lat, locationLng: geo.lng } : {}),
-                status: "Waiting to Start",
-                startDate: lead.expectedStartDate ?? null,
-                type: lead.projectType || "Unknown",
-                managerId: lead.managerId || null,
-                tags: lead.tags || null,
-                leadId,
-            },
-        });
-
-        // Relink child records to the new project.
-        // Estimate has no onDelete:Cascade on its lead FK — keep leadId so it
-        // remains visible from both the lead view and the project view.
-        await tx.estimate.updateMany({ where: { leadId }, data: { projectId: project.id } });
-        // RoomDesign has an owner-XOR CHECK constraint (projectId XOR leadId), so we must
-        // clear leadId when setting projectId in the same transaction.
-        await tx.roomDesign.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        // Contract.lead FK is onDelete:SetNull — keep leadId so contracts remain visible from
-        // both the lead view and the project view (same pattern as Estimate).
-        await tx.contract.updateMany({ where: { leadId }, data: { projectId: project.id } });
-        // The remaining models still have onDelete:Cascade on their lead FK — clear leadId.
-        await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-        await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
-
-        await tx.lead.update({ where: { id: leadId }, data: { stage: "Won" } });
-
-        return project;
-    });
-
-    // Auto-grant access to eligible team members
-    const { autoGrantProjectAccessToEligibleUsers } = await import("@/lib/auto-grant-project-access");
-    await autoGrantProjectAccessToEligibleUsers(project.id);
-
-    // The ProBuild Files tab gets its own canonical scaffold. This is
-    // deliberately independent of Drive provisioning and never rolls back a
-    // successfully-created project.
-    try {
-        await ensureStandardFolders(project.id);
-    } catch (folderErr) {
-        console.error("[Project folders] Failed to create the standard scaffold:", folderErr);
-    }
-
-    // Provision Google Drive Folders in the background/async after project creation
-    try {
-        const { createProjectDriveFolder } = await import("./google-drive");
-        const driveResult = await createProjectDriveFolder(project.name, lead.client?.email);
-        
-        if (driveResult.success) {
-            // Create a FileFolder record in ProBuild representing this Google Drive folder
-            await prisma.fileFolder.create({
-                data: {
-                    name: `📁 Google Drive - Client Shared Folder`,
-                    projectId: project.id,
-                    visibility: "shared", // Shared with client
-                }
-            });
-            console.log(`[Google Drive] Successfully provisioned Google Drive for project: ${project.id}`);
-        }
-    } catch (driveErr) {
-        console.error("[Google Drive] Failed to provision Google Drive folder during conversion:", driveErr);
-    }
-
-    revalidatePath("/leads");
-    revalidatePath("/projects");
-    revalidatePath(`/leads/${leadId}`);
-
-    return { id: project.id };
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "leadAccess")) throw new Error("Forbidden");
+    return convertLeadToProjectCore(leadId);
 }
 
 // Create a project directly (e.g. a repeat customer with another job).
@@ -1261,6 +1235,11 @@ export async function createProject(data: {
     projectType?: string;
     status?: string;
 }) {
+    // Same conversion path as convertLeadToProject, and it creates a Client and
+    // a Lead on the way — it cannot be left open to an unauthenticated caller.
+    // Gated on staff (not `leadAccess`) because the lead here is an internal
+    // implementation detail of "new project", offered on /projects.
+    await assertActiveStaff();
     if (!data.name?.trim()) throw new Error("Project name is required.");
 
     // Resolve the customer: prefer an existing client by id; otherwise find-or-create by name.
@@ -1306,7 +1285,9 @@ export async function createProject(data: {
         },
     });
 
-    const { id: projectId } = await convertLeadToProject(lead.id);
+    // Core, not the gated wrapper: this action already authorized the caller
+    // above, and it owns the lead it just created.
+    const { id: projectId } = await convertLeadToProjectCore(lead.id);
 
     // Apply project-specific fields the conversion doesn't carry (it defaults status to "Waiting to Start").
     // A provided status always applies — including "In Progress" for callers
@@ -1321,7 +1302,7 @@ export async function createProject(data: {
 }
 
 export async function createDraftEstimate(projectId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     // WA is destination-based: default the rate from the job-site address,
     // falling back to the company default (null fields) when unresolvable.
     const taxDefault = await defaultTaxForNewEstimate({ projectId });
@@ -1347,7 +1328,7 @@ export async function createDraftEstimate(projectId: string) {
 }
 
 export async function createDraftLeadEstimate(leadId: string) {
-    await assertEstimatePermission();
+    await assertEstimateLeadAccess(leadId);
     const taxDefault = await defaultTaxForNewEstimate({ leadId });
     const estimate = await prisma.estimate.create({
         data: {
@@ -1539,8 +1520,27 @@ export async function listRoomsForLead(leadId: string) {
     return JSON.parse(JSON.stringify(rooms));
 }
 
+// Linked-invoice shape shared by BOTH getEstimate query branches (the fallback
+// must stay in sync or the editor silently loses this data on a healthy DB).
+// Includes the invoice-side payment rows so the editor can diff mirrored rows
+// (via sourceScheduleId) against the estimate's schedule — the portal renders
+// the invoice's rows once one exists. Oldest-first + take 1 matches
+// getEstimateForPortal's pick, so the editor warns about the invoice the
+// client actually sees.
+const ESTIMATE_LINKED_INVOICE_QUERY = {
+    select: {
+        id: true, code: true, status: true, projectId: true,
+        payments: {
+            select: { id: true, name: true, amount: true, sourceScheduleId: true },
+            orderBy: { createdAt: "asc" as const },
+        },
+    },
+    orderBy: { createdAt: "asc" as const },
+    take: 1,
+};
+
 export const getEstimate = cache(async function getEstimate(id: string) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(id);
     try {
         // Full query — works when all schema columns exist in DB
         return await prisma.estimate.findUnique({
@@ -1553,12 +1553,18 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                         costCode: true,
                         costType: true,
                         purchaseOrder: { include: { vendor: true } },
+                        purchaseOrderLinks: {
+                            orderBy: { createdAt: "asc" },
+                            include: { purchaseOrder: { include: { vendor: true } } },
+                        },
+                        scheduleTask: { select: { id: true, name: true } },
+                        _count: { select: { timeEntries: true, expenses: true } },
                     },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
                 files: { orderBy: { createdAt: "desc" } },
-                invoices: { select: { id: true, code: true, status: true } },
+                invoices: ESTIMATE_LINKED_INVOICE_QUERY,
             },
         });
     } catch {
@@ -1571,6 +1577,14 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                 code: true, status: true, privacy: true, createdAt: true,
                 totalAmount: true, balanceDue: true, taxExempt: true,
                 taxRateName: true, taxRatePercent: true,
+                // If the apply-estimate-items-revision.mjs migration hasn't run yet, selecting
+                // this column throws P2022 and this whole fallback query fails loudly (caught by
+                // getEstimate's own outer try only if a caller wraps it further) rather than
+                // silently omitting the column and letting the editor fabricate itemsRevision 0
+                // — which would defeat the save-conflict guard for every editor session opened
+                // against a not-yet-migrated DB. That's deliberate: CLAUDE.md's schema-before-
+                // deploy checklist is what's supposed to prevent this state from being reachable.
+                itemsRevision: true,
                 approvedBy: true, approvedAt: true,
                 approvalUserAgent: true, signatureUrl: true, contractId: true, viewedAt: true,
                 items: {
@@ -1585,20 +1599,29 @@ export const getEstimate = cache(async function getEstimate(id: string) {
                         purchaseOrderId: true,
                         budgetQuantity: true, budgetUnit: true, budgetRate: true,
                         purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
+                        purchaseOrderLinks: {
+                            orderBy: { createdAt: "asc" },
+                            select: {
+                                purchaseOrderId: true,
+                                purchaseOrder: { select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } } },
+                            },
+                        },
+                        scheduleTask: { select: { id: true, name: true } },
+                        _count: { select: { timeEntries: true, expenses: true } },
                     },
                 },
                 paymentSchedules: { orderBy: { order: "asc" } },
                 expenses: true,
-                invoices: { select: { id: true, code: true, status: true } },
+                invoices: ESTIMATE_LINKED_INVOICE_QUERY,
             },
         });
     }
 });
 
 export async function updateEstimateStatus(id: string, status: string, leadId?: string, projectId?: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Scoped on the estimate's own owner, not the caller-supplied leadId/projectId
+    // — those two are revalidatePath hints only and are attacker-controlled.
+    const { user } = await assertEstimateAccess(id);
 
     const VALID_STATUSES = ["Draft", "Sent", "Viewed", "Approved", "Invoiced", "Partially Paid", "Paid", "Declined", "Expired", "Archived"];
     if (!VALID_STATUSES.includes(status)) throw new Error("Invalid status");
@@ -1633,10 +1656,17 @@ export async function updateEstimateStatus(id: string, status: string, leadId?: 
 }
 
 export const getEstimateForPortal = cache(async function getEstimateForPortal(id: string) {
-    // Staff members (any user with a role on their session) can preview any estimate.
-    // Portal clients must pass the IDOR ownership check below.
+    // Staff members can preview an estimate they are scoped to; portal clients
+    // must pass the IDOR ownership check below.
     const staffSession = await getServerSession(authOptions);
-    const isStaff = !!(staffSession?.user as any)?.role;
+    // An explicit allowlist, not "any truthy role" — this branch bypasses the
+    // client gate below, so an unexpected role value must fall to the client path
+    // (which fails closed) rather than be handed staff access.
+    const isStaff = ["ADMIN", "MANAGER", "FIELD_CREW", "FINANCE"]
+        .includes((staffSession?.user as { role?: string } | undefined)?.role ?? "");
+    // The session carries a role but not projectAccess/assignedProjects, so the
+    // horizontal check needs the full user row.
+    const staffUser = isStaff ? await currentStaffUserOrNull() : null;
 
     if (!isStaff) {
         // IDOR #2 fix: require a resolvable portal session and gate the fetch by
@@ -1644,12 +1674,21 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         const sessionClientId = await resolveSessionClientId();
         if (!sessionClientId) return null;
 
-        // Restrict the query to the client's own estimates below
+        // Ownership alone is not enough. An estimate the contractor has never
+        // shared is internal pricing, and ids are reachable by walking the
+        // sequential `number` route — so AND the shared-ness predicate onto the
+        // ownership predicate. AND-composed rather than spread, because two `OR`
+        // keys in one object silently drop the first.
         const ownershipFilter = {
             id,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         };
 
@@ -1740,11 +1779,14 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         }));
     }
 
-    // Staff path: no ownership restriction — just fetch by id
+    // Staff path: fetch by id, narrowed to the estimates this staff user is
+    // scoped to. AND-composed rather than spread so a match-nothing predicate
+    // cannot overwrite the id it is meant to narrow.
+    const staffFilter = { AND: [{ id }, estimateScopeWhere(staffUser)] };
     let estimate: any;
     try {
         estimate = await prisma.estimate.findFirst({
-            where: { id },
+            where: staffFilter,
             include: {
                 project: { include: { client: true } },
                 lead: { include: { client: true } },
@@ -1772,7 +1814,7 @@ export const getEstimateForPortal = cache(async function getEstimateForPortal(id
         console.error("[getEstimateForPortal] Primary query failed:", err);
         try {
             estimate = await prisma.estimate.findFirst({
-                where: { id },
+                where: staffFilter,
                 select: {
                     id: true, number: true, title: true, projectId: true, leadId: true,
                     code: true, status: true, privacy: true, createdAt: true,
@@ -1874,8 +1916,10 @@ export async function ensureEstimatePayInFullSchedule(estimateId: string): Promi
 }
 
 export const getAllEstimates = cache(async function getAllEstimates() {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
+    // Same rule the estimate detail page applies — see estimateScopeWhere.
     return await prisma.estimate.findMany({
+        where: estimateScopeWhere(user),
         orderBy: { createdAt: "desc" },
         select: {
             id: true,
@@ -2024,13 +2068,21 @@ export async function markEstimateViewed(estimateId: string) {
 
     // Atomic first-view claim — two simultaneous opens produce exactly one
     // notification and one activity event.
+    // Same shared-ness gate as getEstimateForPortal — an estimate the client
+    // cannot open must not be markable as viewed either, even by calling this
+    // server action directly. AND-composed so the two OR predicates cannot collide.
     const claim = await prisma.estimate.updateMany({
         where: {
             id: estimateId,
             viewedAt: null,
-            OR: [
-                { project: { is: { clientId: sessionClientId } } },
-                { lead: { is: { clientId: sessionClientId } } },
+            AND: [
+                {
+                    OR: [
+                        { project: { is: { clientId: sessionClientId } } },
+                        { lead: { is: { clientId: sessionClientId } } },
+                    ],
+                },
+                portalVisibleEstimateWhere(),
             ],
         },
         data: { viewedAt: new Date() },
@@ -2096,7 +2148,7 @@ export type EstimateActivityEvent = {
  * so payment history is always complete without any extra logging.
  */
 export async function getEstimateActivity(estimateId: string): Promise<EstimateActivityEvent[]> {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const [estimate, logs, invoice] = await Promise.all([
         prisma.estimate.findUnique({
             where: { id: estimateId },
@@ -2284,7 +2336,12 @@ async function ensureProjectAndDepositInvoiceForEstimate(estimateId: string): Pr
     // 1) Ensure a project exists (idempotent — conversion returns the existing one).
     let projectId = estimate.projectId;
     if (!projectId && estimate.leadId) {
-        const converted = await convertLeadToProject(estimate.leadId);
+        // Core, not the gated wrapper: the caller here is approveEstimate, which
+        // has already proven the signed-in PORTAL CLIENT owns this estimate
+        // (resolveSessionClientId + project.clientId/lead.clientId). A portal
+        // client is not staff, so the staff gate would reject a legitimate
+        // client approval.
+        const converted = await convertLeadToProjectCore(estimate.leadId);
         projectId = converted.id;
     }
     if (!projectId) return null;
@@ -2819,6 +2876,10 @@ export async function getInvoiceForPortal(id: string) {
     }
 }
 
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?: string[]) {
     const sessionClientId = await assertInvoicePortalAccess();
     if (!sessionClientId) return;
@@ -2826,7 +2887,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
     // Client-supplied (from the portal's ?milestone= param) — validated against
     // the invoice's own payments below before it influences anything.
     const claimedFocusIds = Array.isArray(focusedMilestoneIds)
-        ? focusedMilestoneIds.filter((id): id is string => typeof id === "string" && id.length <= 50).slice(0, 40)
+        ? focusedMilestoneIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 50).slice(0, 40)
         : [];
 
     const claim = await prisma.invoice.updateMany({
@@ -2848,7 +2909,7 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
             viewedAt: true, code: true, projectId: true,
             project: { select: { name: true, client: { select: { name: true } } } },
             client: { select: { name: true } },
-            payments: { select: { id: true, name: true, amount: true, status: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+            payments: { select: { id: true, name: true, amount: true, status: true, qbInvoiceId: true, qbSyncError: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
         },
     });
     if (invoice) {
@@ -2880,22 +2941,58 @@ export async function markInvoiceViewed(invoiceId: string, focusedMilestoneIds?:
                 }
 
                 const focusedLine = focusedPayments.length > 0
-                    ? `<p style="margin: 0 0 4px; color: #333;">They were viewing the payment request for <strong>${focusedPayments.map(p => p.name).join(" · ")}</strong> (${formatCurrency(focusedTotal)}).</p>`
+                    ? `<p style="margin: 0 0 4px; color: #333;">They were viewing the payment request for <strong>${focusedPayments.map(p => escapeHtml(p.name)).join(" · ")}</strong> (${formatCurrency(focusedTotal)}).</p>`
                     : "";
+
+                // Each milestone maps to its own QBO invoice (schema.prisma:595), so there is no
+                // single "the" QuickBooks invoice for this ProBuild invoice. When the portal scoped
+                // the view to specific milestones, link only those — note this keys off the CLAIM,
+                // not off focusedPayments, so a stale/invalid ?milestone= param doesn't silently
+                // widen into "link everything". Milestones not staged to QuickBooks have no link.
+                //
+                // qbSyncError ("voided" | "notFound") is set by the sync poller when the linked QBO
+                // invoice is gone, and it deliberately KEEPS qbInvoiceId so the Break-QB-Link flow
+                // can still act on it. Linking a flagged row would point at a dead or stale QBO
+                // page, so those fall back to the ProBuild button instead.
+                const scopedView = claimedFocusIds.length > 0;
+                const qbLinked = (scopedView ? focusedPayments : invoice.payments)
+                    .filter(p => !p.qbSyncError)
+                    .map(p => ({ name: p.name, amount: Number(p.amount), qbId: (p.qbInvoiceId || "").trim() }))
+                    .filter(p => p.qbId.length > 0);
+                const qbUrlFor = (qbId: string) => `https://app.qbo.intuit.com/app/invoice?txnId=${encodeURIComponent(qbId)}`;
+                const btn = (href: string, label: string) =>
+                    `<a href="${href}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">${label}</a>`;
+
+                let ctaBlock: string;
+                if (qbLinked.length === 1) {
+                    ctaBlock = `<div style="text-align: center; margin: 16px 0;">
+                                ${btn(qbUrlFor(qbLinked[0].qbId), "View in QuickBooks")}
+                            </div>`;
+                } else if (qbLinked.length > 1) {
+                    const heading = scopedView
+                        ? "QuickBooks invoices for the milestones they viewed:"
+                        : `This invoice has ${qbLinked.length} QuickBooks invoices, one per milestone:`;
+                    ctaBlock = `<p style="margin: 16px 0 8px; color: #333; font-size: 13px;">${heading}</p>
+                            <div style="margin: 0 0 16px;">
+                                ${qbLinked.map(p => `<p style="margin: 0 0 6px;"><a href="${qbUrlFor(p.qbId)}" style="color: #059669; font-weight: 600; text-decoration: none;">${escapeHtml(p.name)} — ${formatCurrency(p.amount)}</a></p>`).join("")}
+                            </div>`;
+                } else {
+                    // Nothing staged to QuickBooks yet — the ProBuild invoice is the only real target.
+                    ctaBlock = `<div style="text-align: center; margin: 16px 0;">
+                                ${btn(editorUrl, "View Invoice")}
+                            </div>`;
+                }
                 await sendNotification(
                     settings.notificationEmail,
                     `👁️ Invoice Viewed — ${invoice.code}`,
                     `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
                         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px;">
                             <h3 style="margin: 0 0 8px; color: #065f46;">Invoice Viewed</h3>
-                            <p style="margin: 0 0 4px; color: #333;"><strong>${clientName}</strong> opened invoice <strong>${invoice.code}</strong>${projectName ? ` for ${projectName}` : ""}.</p>
+                            <p style="margin: 0 0 4px; color: #333;"><strong>${escapeHtml(clientName)}</strong> opened invoice <strong>${escapeHtml(invoice.code)}</strong>${projectName ? ` for ${escapeHtml(projectName)}` : ""}.</p>
                             ${focusedLine}
                             <p style="margin: 0 0 16px; color: #666; font-size: 13px;">Viewed at: ${await formatViewedAt()}</p>
-                            <div style="text-align: center; margin: 16px 0;">
-                                <a href="${editorUrl}" style="display: inline-block; background: #059669; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 14px;">
-                                    View Invoice
-                                </a>
-                            </div>
+                            ${ctaBlock}
+                            ${qbLinked.length > 0 ? `<p style="margin: 0 0 12px; text-align: center;"><a href="${editorUrl}" style="color: #666; font-size: 12px;">Open in ProBuild</a></p>` : ""}
                             ${attachments ? `<p style="margin: 0; color: #666; font-size: 12px; text-align: center;">A PDF copy of the invoice as the client saw it is attached.</p>` : ""}
                         </div>
                     </div>`,
@@ -2953,7 +3050,19 @@ export async function emailInvoiceCopyToMe(
 }
 
 export async function saveEstimate(estimateId: string, contextId: string, contextType: "project" | "lead", data: any, items: any[]) {
-    await assertEstimatePermission();
+    // Scope on the estimate's OWN project/lead, not on the caller-supplied
+    // contextId — every argument here is attacker-controlled, so trusting the
+    // context id would let a caller name a job it can access while writing to
+    // an estimate belonging to one it cannot.
+    const scope = await assertEstimateAccess(estimateId);
+    // ...and then require the context to MATCH that owner. contextId is not just
+    // a revalidatePath hint: the Budget row below is created with
+    // `projectId: contextId`, so an unchecked mismatch files an in-scope
+    // estimate's budget under an out-of-scope project.
+    const expectedContextId = contextType === "project" ? scope.projectId : scope.leadId;
+    if (!expectedContextId || contextId !== expectedContextId) {
+        throw new Error("Estimate does not belong to the supplied context");
+    }
     // Update estimate inside a transaction to guarantee atomicity and avoid partial write inconsistencies.
     // targetMarginPercent must live in safeData so a failure on the main payload does
     // not silently revert the AI budget target to the default.
@@ -2968,6 +3077,27 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         //      or is blocked until we commit (so it recomputes against our new totalAmount).
         //      Either way, no committed payment's balanceDue effect is silently overwritten.
         await lockMoneyParents(tx, { estimateId });
+
+        // Estimate-level optimistic-concurrency compare-and-set — see
+        // docs/specs/estimate-item-optimistic-concurrency.md REVISION 2. The Estimate row is
+        // already locked FOR UPDATE by lockMoneyParents above, so this CAS is airtight (not
+        // merely probable): no other transaction can read or write itemsRevision on this row
+        // until we commit or roll back. No escape hatch — a payload without a numeric
+        // itemsRevision is rejected as stale. The sole caller is the editor, which always sends
+        // one.
+        // Non-negative safe integer only. A plain `typeof === "number"` let NaN, Infinity and
+        // fractional values through to Prisma, where they surface as a generic query/validation
+        // error instead of the structured conflict the client knows how to handle.
+        if (!Number.isSafeInteger(data.itemsRevision) || data.itemsRevision < 0) {
+            throw new EstimateStaleSaveError();
+        }
+        const revisionCas = await tx.estimate.updateMany({
+            where: { id: estimateId, itemsRevision: data.itemsRevision },
+            data: { itemsRevision: { increment: 1 } },
+        });
+        if (revisionCas.count === 0) {
+            throw new EstimateStaleSaveError();
+        }
 
         // Preserve payment credits: subtract already-paid milestones from totalAmount.
         // Read AFTER the lock above so paidSum reflects committed-and-locked state, not a stale
@@ -3031,6 +3161,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
         const existingItems = await tx.estimateItem.findMany({ where: { estimateId } });
         const existingItemsMap = new Map(existingItems.map(item => [item.id, item]));
 
+        // Payload check, ahead of every item write (and ahead of the destructive delete pass
+        // below). Item ids are already scoped by existingItemsMap, but parentId used to be passed
+        // straight through, and EstimateItem's self-referencing FK does not require parent and
+        // child to share an estimateId — so a save could hang this estimate's rows off another
+        // estimate's tree, and the section roll-up would then compute this estimate's subtotal
+        // (and therefore its tax and payment milestones) over that other tree. Throwing here
+        // aborts the whole transaction, so the estimate-level update above never survives either.
+        assertEstimateItemParentsInScope(items, existingItemsMap.keys());
+
         const incomingItemIds = new Set(items.map(item => item.id).filter(Boolean));
         const deletedItems = existingItems.filter(item => !incomingItemIds.has(item.id));
 
@@ -3065,61 +3204,15 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             });
         }
 
-        const toItemData = (item: any, fallbackOrder: number) => ({
-            id: item.id,
+        // The itemsRevision CAS above already guards this whole write — no per-row conflict
+        // handling needed here. The field list lives in lib/estimate-item-payload, shared with
+        // the editor's change-detection snapshot so the two can't drift (a snapshot missing a
+        // field saveEstimate writes makes edits to it invisible, and the save silently no-ops).
+        await upsertEstimateItems(tx, {
             estimateId,
-            name: item.name,
-            description: item.description || "",
-            type: item.type,
-            quantity: parseFloat(item.quantity) || 0,
-            baseCost: item.baseCost != null ? (parseFloat(item.baseCost) || 0) : null,
-            markupPercent: parseFloat(item.markupPercent) || 25,
-            unitCost: parseFloat(item.unitCost) || 0,
-            total: parseFloat(item.total) || 0,
-            order: item.order ?? fallbackOrder,
-            parentId: item.parentId || null,
-            costCodeId: item.costCodeId || null,
-            costTypeId: item.costTypeId || null,
-            purchaseOrderId: item.purchaseOrderId || null,
-            budgetQuantity: item.budgetQuantity != null ? (parseFloat(item.budgetQuantity) || null) : null,
-            budgetUnit: item.budgetUnit || null,
-            budgetRate: item.budgetRate != null ? (parseFloat(item.budgetRate) || null) : null,
+            items,
+            existingItemsMap,
         });
-
-        const parentItems = items.filter((i: any) => !i.parentId);
-        const childItems  = items.filter((i: any) =>  i.parentId);
-
-        // Upsert Parents
-        for (let idx = 0; idx < parentItems.length; idx++) {
-            const item = parentItems[idx];
-            const itemData = toItemData(item, idx);
-            if (item.id && existingItemsMap.has(item.id)) {
-                await tx.estimateItem.update({
-                    where: { id: item.id },
-                    data: itemData,
-                });
-            } else {
-                await tx.estimateItem.create({
-                    data: itemData,
-                });
-            }
-        }
-
-        // Upsert Children
-        for (let idx = 0; idx < childItems.length; idx++) {
-            const item = childItems[idx];
-            const itemData = toItemData(item, idx);
-            if (item.id && existingItemsMap.has(item.id)) {
-                await tx.estimateItem.update({
-                    where: { id: item.id },
-                    data: itemData,
-                });
-            } else {
-                await tx.estimateItem.create({
-                    data: itemData,
-                });
-            }
-        }
 
         // 2. Differential Payment Schedule Upsert
         const existingSchedules = await tx.estimatePaymentSchedule.findMany({ where: { estimateId } });
@@ -3217,7 +3310,7 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
             }
         }
 
-        return { success: true };
+        return { success: true as const, itemsRevision: data.itemsRevision + 1 };
     }, {
         // A full estimate save fans out to ~12 + itemCount + scheduleCount sequential statements;
         // the default 5s interactive-transaction limit is too tight for large estimates that
@@ -3230,15 +3323,28 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     // behavior). If the deployed DB is missing an optional column, Prisma throws P2022 and the
     // transaction rolls back cleanly; re-run the whole transaction writing only the safe columns.
     // Any other error (e.g. the linked-expense guard, deadlocks) propagates unchanged.
+    //
+    // EstimateStaleSaveError is checked around BOTH attempts (not just the first) — a conflict
+    // can just as easily surface on the safeOnly retry, and prod redacts thrown server-action
+    // messages, so an uncaught throw from that retry would reach the client as a generic failure
+    // instead of the named conflict. Nothing was written either way (the transaction rolled
+    // back), so we return immediately, before the revalidatePath/auto-assign-phases calls below.
     let result;
     try {
-        result = await withTxRetry(() => runSave(false));
-    } catch (e: any) {
-        if (e?.code === "P2022") {
-            result = await withTxRetry(() => runSave(true));
-        } else {
-            throw e;
+        try {
+            result = await withTxRetry(() => runSave(false));
+        } catch (e: any) {
+            if (e?.code === "P2022") {
+                result = await withTxRetry(() => runSave(true));
+            } else {
+                throw e;
+            }
         }
+    } catch (e: any) {
+        if (e instanceof EstimateStaleSaveError) {
+            return { success: false as const, conflict: { staleSave: true } };
+        }
+        throw e;
     }
 
     if (contextType === "project") {
@@ -3269,9 +3375,37 @@ export async function saveEstimate(estimateId: string, contextId: string, contex
     return result;
 }
 
+/**
+ * Read-only: the current `costCodeId` of every line item on an estimate.
+ *
+ * Exists for one job — letting an open editor learn what `autoAssignPhasesForEstimate` wrote.
+ * That helper runs post-response via `after()` on every save and fills `costCodeId` on uncoded
+ * rows directly, deliberately WITHOUT bumping `Estimate.itemsRevision` (bumping there would wedge
+ * the editor into a permanent conflict, see the comment in auto-assign-phases.ts). Nothing else
+ * tells the editor, so its rows keep `costCodeId: null` and its next save writes that null back,
+ * silently reverting the assignment. The editor polls this after a save that carried uncoded rows
+ * and merges the answer into local state, fill-only.
+ *
+ * Deliberately returns nothing but ids and codes — in particular NOT `itemsRevision`. The merge
+ * is a local catch-up to writes that never bumped the revision, so the editor's revision is still
+ * correct and this must not disturb it (or the merge would look like a conflict to its next save).
+ */
+export async function getEstimateItemCostCodes(estimateId: string): Promise<{ id: string; costCodeId: string | null }[]> {
+    "use server";
+    // Scoped, like every other estimate action addressed by an estimate id (#333). This action
+    // was written on a branch cut before that landed, so it originally carried the old bare
+    // `assertEstimatePermission()` — which merges without a git conflict and would have quietly
+    // reopened the hole #333 closed.
+    await assertEstimateAccess(estimateId);
+    return prisma.estimateItem.findMany({
+        where: { estimateId },
+        select: { id: true, costCodeId: true },
+    });
+}
+
 export async function logEstimatePayment(estimateId: string, data: { amount: number; paymentMethod: string; date: string; referenceNumber?: string }) {
     "use server";
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     // One transaction, estimate locked FIRST (canonical Estimate → Invoice order; this flow
     // touches only the estimate). Without the lock two concurrent logs each read the same
     // balanceDue and each write balanceDue − amount, losing one decrement. The lock serializes
@@ -3326,7 +3460,7 @@ export async function logEstimatePayment(estimateId: string, data: { amount: num
 
 export async function archiveEstimate(estimateId: string) {
     "use server";
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: safeEstimateSelect,
@@ -3364,26 +3498,11 @@ export async function archiveEstimate(estimateId: string) {
     return { success: true, archived };
 }
 
-// Returns the default sales tax rate (percent, e.g. 8.8) from CompanySettings.
-// Returns 0 if no default is configured. Safe to call often — the singleton row is tiny.
-async function getDefaultSalesTaxRate(): Promise<number> {
-    const settings = await prisma.companySettings.findUnique({
-        where: { id: "singleton" },
-        select: { salesTaxes: true },
-    });
-    if (!settings?.salesTaxes) return 0;
-    try {
-        const taxes = JSON.parse(settings.salesTaxes) as Array<{ name?: string; rate?: number; isDefault?: boolean }>;
-        if (!Array.isArray(taxes) || taxes.length === 0) return 0;
-        const def = taxes.find(t => t.isDefault) || taxes[0];
-        return typeof def.rate === "number" ? def.rate : 0;
-    } catch {
-        return 0;
-    }
-}
-
 export async function createInvoiceFromEstimate(estimateId: string) {
-    await assertInvoicePermission();
+    // `invoices` says WHAT you may do, not WHICH job — the invoice this mints
+    // inherits the estimate's numbers, so the source estimate must be in scope.
+    const user = await assertInvoicePermission();
+    assertEstimateScope(user, await estimateOwnerOrThrow(estimateId));
     return createInvoiceFromEstimateInternal(estimateId);
 }
 
@@ -3537,35 +3656,8 @@ export async function getInvoice(id: string) {
     return invoice;
 }
 
-/** Parse a payment-date input into a Date.
- *  Accepts:
- *   - `YYYY-MM-DD` (strict — end-anchored, rejects overflow) → interpreted as LOCAL midnight
- *     so the stored value matches the calendar day the user typed.
- *   - A positive epoch-ms number → treated as an absolute instant.
- *   - An ISO-8601 datetime with a time component → `new Date()` (UTC semantics).
- *  Rejects: empty strings, 0/negative numbers, non-strict YYYY-M-D-ish shapes. */
-function parsePaymentDateInput(input: number | string): Date | null {
-    if (typeof input === "number") {
-        if (!Number.isFinite(input) || input <= 0) return null;
-        const d = new Date(input);
-        return isNaN(d.getTime()) ? null : d;
-    }
-    if (typeof input !== "string" || input.trim() === "") return null;
-    // Strict YYYY-MM-DD → local midnight (primary path from the date picker).
-    const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
-    if (ymd) {
-        const y = Number(ymd[1]);
-        const mo = Number(ymd[2]);
-        const d = Number(ymd[3]);
-        if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
-        const dt = new Date(y, mo - 1, d);
-        if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
-        return dt;
-    }
-    // Accept full ISO datetimes (e.g. "2026-04-20T14:30:00Z") for API callers that pass them.
-    const dt = new Date(input);
-    return isNaN(dt.getTime()) ? null : dt;
-}
+// parsePaymentDateInput lives in lib/payment-date.ts, next to isDateOnly — the
+// calendar-day sentinel's writer and reader have to agree, so they are unit-tested together.
 
 export async function recordPayment(
     paymentId: string,
@@ -3594,110 +3686,13 @@ export async function recordPayment(
         return { success: false, error: "Invalid payment date" as const };
     }
 
-    const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-        // Canonical lock order: Estimate → Invoice → schedules. Two concurrent payments on
-        // DIFFERENT milestones of the SAME invoice each claim their own schedule row (no mutual
-        // block), so without a parent lock they both read a stale sibling set and overwrite each
-        // other's Invoice.balanceDue — one payment's balance effect is silently lost, and no
-        // deadlock fires to trigger a retry. Locking the parent(s) first serializes the recompute:
-        // the second call blocks until the first commits, then recomputes against fresh state.
-        // Read the estimate link (non-locking) so we can lock Estimate BEFORE Invoice, matching
-        // recordEstimatePayment's mirror order so the two flows never invert and deadlock.
-        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
-        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
-
-        const payment = await t.paymentSchedule.findUnique({ where: { id: paymentId } });
-        if (!payment) return { success: false as const, error: "Milestone not found" as const };
-        if (payment.status === "Paid") return { success: false as const, error: "Milestone already paid" as const };
-        if (payment.invoiceId !== invoiceId) return { success: false as const, error: "Milestone/invoice mismatch" as const };
-
-        const claim = await t.paymentSchedule.updateMany({
-            where: { id: paymentId, status: { not: "Paid" } },
-            data: {
-                status: "Paid",
-                paymentDate,
-                paidAt: new Date(),
-                paymentMethod: method,
-                referenceNumber,
-                notes,
-            },
-        });
-        if (claim.count === 0) return { success: false as const, error: "Milestone already paid" as const };
-
-        // Recalculate from scratch (matches Stripe webhook) to avoid drift.
-        const invoice = await t.invoice.findUnique({ where: { id: invoiceId } });
-        if (!invoice) return { success: false as const, error: "Invoice not found" as const };
-
-        const allSchedules = await t.paymentSchedule.findMany({ where: { invoiceId } });
-        const totalPaid = allSchedules
-            .filter((s) => s.status === "Paid")
-            .reduce((sum, s) => sum + toNum(s.amount), 0);
-        const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-        const newStatus =
-            newBalance <= 0 ? "Paid"
-            : totalPaid > 0 ? "Partially Paid"
-            : invoice.status;
-
-        await t.invoice.update({
-            where: { id: invoiceId },
-            data: { balanceDue: newBalance, status: newStatus },
-        });
-
-        // Mirror to the estimate-side milestone copy so the estimate editor and
-        // its balance don't drift from the invoice that actually got paid.
-        // Link-first (this milestone's sourceScheduleId points at its estimate
-        // original); name+amount fallback only when exactly one row matches.
-        if (invoice.estimateId) {
-            let estCopy: { id: string } | null = null;
-            if (payment.sourceScheduleId) {
-                estCopy = await t.estimatePaymentSchedule.findFirst({
-                    where: { id: payment.sourceScheduleId, estimateId: invoice.estimateId, status: { not: "Paid" } },
-                });
-            } else {
-                const candidates = await t.estimatePaymentSchedule.findMany({
-                    where: { estimateId: invoice.estimateId, status: { not: "Paid" }, name: payment.name },
-                    take: 2,
-                });
-                const matching = candidates.filter(c => toNum(c.amount) === toNum(payment.amount));
-                estCopy = matching.length === 1 ? matching[0] : null;
-            }
-            if (estCopy) {
-                const mirrorClaim = await t.estimatePaymentSchedule.updateMany({
-                    where: { id: estCopy.id, status: { not: "Paid" } },
-                    data: { status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber },
-                });
-                if (mirrorClaim.count > 0) {
-                    const estimate = await t.estimate.findUnique({ where: { id: invoice.estimateId } });
-                    if (estimate) {
-                        const estSiblings = await t.estimatePaymentSchedule.findMany({ where: { estimateId: invoice.estimateId } });
-                        const estPaid = estSiblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                        const estBalance = Math.max(0, toNum(estimate.totalAmount) - estPaid);
-                        const estFirstPayment = !["Paid", "Partially Paid"].includes(estimate.status);
-                        await t.estimate.update({
-                            where: { id: invoice.estimateId },
-                            data: {
-                                balanceDue: estBalance,
-                                status: estBalance <= 0 ? "Paid" : estPaid > 0 ? "Partially Paid" : estimate.status,
-                                // Captured so unrecording can restore the pre-payment status
-                                ...(estFirstPayment && { statusBeforePayment: estimate.status }),
-                            },
-                        });
-                    }
-                }
-            }
-        }
-
-        // Durable notification: enqueue INSIDE the tx so it commits atomically with the
-        // settle — a crash before delivery can't drop the team alert / receipt / activity log.
-        await enqueueMilestonePaid(t, { scheduleId: paymentId, scheduleType: "invoice" });
-        return { success: true as const, projectId: invoice.projectId };
-    }));
-
-    if (!tx.success) return tx;
-
-    // Inline fast-path delivery of the just-enqueued notification (single canonical writer,
-    // via the outbox). Best-effort — the cron backstop redelivers anything left pending.
-    await drainPaymentNotifications({ scheduleId: paymentId }).catch(() => {});
+    // Core transaction (claim → recalc → estimate mirror → enqueue notification)
+    // lives in payment-record-core.ts, shared with the deposit-ingest endpoint
+    // (src/app/api/payments/deposit-ingest/route.ts, Phase B1) so both settle a
+    // milestone through the exact same claim-then-recalculate-then-mirror path.
+    const result = await recordPaymentCore(paymentId, invoiceId, { paymentDate, method, referenceNumber, notes });
+    if (!result.success) return result;
+    const tx = result;
 
     revalidatePath(`/projects/${tx.projectId}/invoices`);
     revalidatePath(`/projects/${tx.projectId}/invoices/${invoiceId}`);
@@ -3843,9 +3838,13 @@ export async function recordEstimatePayment(
         amount?: number;
     },
 ) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Two ids, and the milestone is the one that actually gets settled. Scope
+    // the estimate, then resolve the milestone THROUGH it — pairing enforced by
+    // the query rather than by a follow-up comparison, so there is no second
+    // authorization to keep in sync and no way to settle another job's
+    // milestone by pairing it with an estimateId this caller can reach.
+    const { user } = await assertEstimateAccess(estimateId);
+    await assertPaymentBelongsToEstimate(paymentId, estimateId);
 
     const VALID_METHODS = ["check", "cash", "zelle", "venmo", "credit_card", "ach", "wire", "quickbooks", "other"];
     const method = input.method;
@@ -3876,6 +3875,11 @@ export async function recordEstimatePayment(
             select: { id: true },
         });
         if (lockInv) await lockMoneyParents(t, { invoiceId: lockInv.id });
+
+        // One settle instant for BOTH sides of the mirrored pair, taken AFTER the parent
+        // locks so a contended settle records when it settled, not when it started
+        // queueing — see the fuller note in payment-record-core.ts.
+        const settledAt = new Date();
 
         const payment = await t.estimatePaymentSchedule.findUnique({ where: { id: paymentId } });
         if (!payment) return { success: false as const, error: "Milestone not found" as const };
@@ -3908,7 +3912,7 @@ export async function recordEstimatePayment(
                 const mirrorClaim = await t.paymentSchedule.updateMany({
                     where: { id: copy.id, status: { not: "Paid" } },
                     data: {
-                        status: "Paid", paymentDate, paidAt: new Date(), paymentMethod: method, referenceNumber, notes,
+                        status: "Paid", paymentDate, paidAt: settledAt, paymentMethod: method, referenceNumber, notes,
                         // Keep both sides agreeing on what was actually paid when the
                         // recorded amount overrides the milestone amount.
                         ...(input.amount != null && { amount: input.amount }),
@@ -3934,7 +3938,7 @@ export async function recordEstimatePayment(
             data: {
                 status: "Paid",
                 paymentDate,
-                paidAt: new Date(),
+                paidAt: settledAt,
                 paymentMethod: method,
                 referenceNumber,
                 notes,
@@ -4025,9 +4029,8 @@ export async function sendPaymentReceipt(paymentScheduleId: string) {
 }
 
 export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Emails a client, so scope has to be settled before the send, not after.
+    await assertEstimatePaymentAccess(paymentScheduleId);
 
     const { sendEstimatePaymentReceiptOnly } = await import("./payment-notifications");
     const result = await sendEstimatePaymentReceiptOnly(paymentScheduleId);
@@ -4048,9 +4051,9 @@ export async function sendEstimatePaymentReceipt(paymentScheduleId: string) {
 }
 
 export async function unrecordEstimatePayment(paymentId: string, estimateId: string) {
-    const user = await getCurrentUserWithPermissions();
-    if (!user) throw new Error("Unauthorized");
-    if (!hasPermission(user, "estimates")) throw new Error("Forbidden");
+    // Same two-id pairing as recordEstimatePayment — see the note there.
+    const { user } = await assertEstimateAccess(estimateId);
+    await assertPaymentBelongsToEstimate(paymentId, estimateId);
 
     const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
         // Canonical lock order: Estimate → Invoice → schedules. This flow releases both the
@@ -4160,18 +4163,27 @@ export async function unrecordEstimatePayment(paymentId: string, estimateId: str
     return { success: true };
 }
 
-async function assertActiveStaff(): Promise<any> {
-    const user = await getCurrentUserWithPermissions();
-    if (user) return user;
-
-    if (await canUseDevAuthFallback()) {
-        const devSession = await getSessionOrDev();
-        if ((devSession?.user as { role?: string } | undefined)?.role) return devSession.user;
-    }
-    throw new Error("Unauthorized");
+/**
+ * Resolve the acting staff user, or null if there genuinely isn't one.
+ *
+ * Deliberately has NO try/catch: a Prisma or session failure must propagate.
+ * Swallowing it would turn an outage into "no user", which the estimate scope
+ * filter reads as "show no estimates" — a page of zeroes that looks like real
+ * data. Only a real absence of a signed-in staff user returns null.
+ */
+async function currentStaffUserOrNull(): Promise<any | null> {
+    // Body moved to permissions.ts so server components that scope a query
+    // themselves can share it without actions.ts publishing another endpoint.
+    return currentStaffViewerOrNull();
 }
 
-async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts") {
+async function assertActiveStaff(): Promise<any> {
+    const user = await currentStaffUserOrNull();
+    if (!user) throw new Error("Unauthorized");
+    return user;
+}
+
+async function assertStaffPermission(permission: "estimates" | "invoices" | "changeOrders" | "financialReports" | "companySettings" | "contracts" | "manageVendors") {
     const user = await assertActiveStaff();
     if (!hasPermission(user, permission)) throw new Error("Forbidden");
     return user;
@@ -4187,6 +4199,204 @@ async function assertInvoicePermission() {
 
 async function assertChangeOrderPermission() {
     return assertStaffPermission("changeOrders");
+}
+
+/**
+ * Horizontal-access check for an estimate that has already been resolved to its
+ * owner. `assertEstimatePermission()` answers "may this user touch estimates at
+ * all", NOT "may this user touch THIS estimate" — and every action in this file
+ * is a remotely invokable Server Action, so without this any staff member
+ * holding `estimates` could read or rewrite another job's numbers by id alone.
+ *
+ * Same shape as assertSendScope: project-owned estimates go through
+ * canAccessProject (ADMIN/MANAGER pass unconditionally inside it); lead-owned
+ * ones fall back to `leadAccess`, the gate the /leads/[id] layout applies.
+ * FINANCE is deliberately NOT exempt the way assertFinancialProjectScope exempts
+ * it for reports — an estimate is a per-job document, not a company roll-up.
+ */
+function assertEstimateScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
+    // Fail CLOSED on an ownerless estimate. Both ownership columns are optional
+    // in the schema, so "no project and no lead" would otherwise fall straight
+    // through this function and be authorized by default. Reported distinctly
+    // from "Forbidden" because it is a data problem, not a permissions one.
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This estimate is not attached to a project or lead, so access cannot be checked");
+    }
+    // The decision itself lives in access-rules.ts, shared verbatim with the
+    // list filter (estimateScopeWhere) so the two can never disagree.
+    if (!canAccessEstimate(user, scope)) throw new Error("Forbidden");
+}
+
+/**
+ * The nested-relation form of estimateScopeWhere. Prisma relation filters take
+ * the same where shape, so a lead/project getter that embeds estimates can
+ * reuse the predicate rather than growing its own copy of the rules.
+ */
+function scopedEstimateRelation<T extends object>(relation: T, user: any | null | undefined): T & { where: any } {
+    return { ...relation, where: estimateScopeWhere(user) };
+}
+
+/**
+ * Session-bound form of estimateTotalsAreComplete, for pages that sum estimates
+ * embedded in an UNSCOPED parent list (the project list is company-wide, so its
+ * revenue card would otherwise label a scoped sum as company-wide truth).
+ *
+ * Pass the OWNERS the aggregate could have drawn from — `{ projectId }` for a
+ * project's estimates, `{ leadId }` for a lead's. Not a bare id list: null in
+ * one cannot distinguish lead-owned from attached-to-nothing, and those two
+ * answer differently.
+ */
+export async function estimateTotalsComplete(owners: { projectId?: string | null; leadId?: string | null }[]): Promise<boolean> {
+    const user = await assertActiveStaff();
+    return estimateTotalsAreComplete(user, owners);
+}
+
+/** Permission + scope for actions that reach estimates through a project id. */
+async function assertEstimateProjectAccess(projectId: string) {
+    const user = await assertEstimatePermission();
+    assertEstimateScope(user, { projectId });
+    return user;
+}
+
+/** Permission + scope for actions that reach estimates through a lead id. */
+async function assertEstimateLeadAccess(leadId: string) {
+    const user = await assertEstimatePermission();
+    assertEstimateScope(user, { leadId });
+    return user;
+}
+
+/**
+ * Permission + scope for actions that create a contract on a project or lead.
+ * `createContractFromTemplate` / `createContractBlank` are exported Server
+ * Actions with no other caller-supplied proof of identity, so without this
+ * gate any anonymous caller could generate a contract — with merged client
+ * and financial data — on any job by id alone.
+ */
+async function assertContractContextAccess(context: { type: "project" | "lead"; id: string }) {
+    const user = await assertActiveStaff();
+    const scope = context.type === "project" ? { projectId: context.id } : { leadId: context.id };
+    if (!canCreateContractFor(user, scope)) throw new Error("Forbidden");
+    return user;
+}
+
+/**
+ * Resolve a contract's owning project/lead. Deliberately reads the owner from
+ * the DATABASE by id: every contract action is addressed by contract id, and
+ * the descriptor a caller hands us is exactly the thing an attacker controls.
+ */
+async function contractOwnerOrThrow(contractId: string) {
+    const contract = await prisma.contract.findUnique({
+        where: { id: contractId },
+        select: { projectId: true, leadId: true, title: true },
+    });
+    if (!contract) throw new Error("Contract not found");
+    return contract;
+}
+
+/**
+ * Horizontal-access check for a contract already resolved to its owner.
+ * Same shape as assertEstimateScope, and fails CLOSED on an ownerless contract
+ * for the same reason: both ownership columns are optional in the schema, so
+ * "no project and no lead" would otherwise be authorized by default.
+ */
+function assertContractScope(user: any, scope: { projectId?: string | null; leadId?: string | null }) {
+    if (!scope.projectId && !scope.leadId) {
+        throw new Error("This contract is not attached to a project or lead, so access cannot be checked");
+    }
+    if (!canAccessContract(user, scope)) throw new Error("Forbidden");
+}
+
+/**
+ * Permission + scope for a single EXISTING contract, addressed by contract id.
+ *
+ * The contract-family actions in this file are exported Server Actions, i.e.
+ * individually invokable POST endpoints — "only imported by a staff page" is
+ * not an enforced boundary. Reading a contract exposes its legal body, the
+ * approval IP/user-agent trail, the signature storage paths and the portal
+ * `accessToken`, which by itself authorizes a client to view AND SIGN; writing
+ * one can clear a contractor signature. Both therefore need the same gate.
+ *
+ * Permission is asserted BEFORE the lookup so the "Contract not found" vs
+ * "Forbidden" difference cannot be used as an existence oracle by a caller who
+ * holds no contract permission at all.
+ */
+async function assertContractAccess(contractId: string) {
+    const user = await assertStaffPermission("contracts");
+    const contract = await contractOwnerOrThrow(contractId);
+    assertContractScope(user, contract);
+    return { user, projectId: contract.projectId, leadId: contract.leadId, title: contract.title };
+}
+
+/** Resolve an estimate's owning project/lead, for callers that hold a user already. */
+async function estimateOwnerOrThrow(estimateId: string) {
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true, leadId: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    return estimate;
+}
+
+/**
+ * Permission + scope for a single estimate. Mirrors assertScheduleTaskAccess:
+ * resolve the row's owning project/lead, then apply the horizontal check.
+ * Permission is asserted BEFORE the lookup so the "Estimate not found" vs
+ * "Forbidden" difference cannot be used as an existence oracle by a caller who
+ * holds no estimate permission at all.
+ */
+async function assertEstimateAccess(estimateId: string) {
+    const user = await assertEstimatePermission();
+    const estimate = await estimateOwnerOrThrow(estimateId);
+    assertEstimateScope(user, estimate);
+    return { user, projectId: estimate.projectId, leadId: estimate.leadId };
+}
+
+/**
+ * Pairing check for the two-id payment actions. The caller has already been
+ * scoped against `estimateId`; this proves the milestone it is about to settle
+ * or release actually hangs off that estimate. Enforced by the WHERE clause, so
+ * there is no second authorization decision that can drift out of sync.
+ */
+async function assertPaymentBelongsToEstimate(paymentId: string, estimateId: string) {
+    const payment = await prisma.estimatePaymentSchedule.findFirst({
+        where: { id: paymentId, estimateId },
+        select: { id: true },
+    });
+    if (!payment) throw new Error("Payment not found");
+}
+
+/**
+ * Permission + scope for actions addressed by EstimatePaymentSchedule id alone.
+ * The milestone carries no ownership of its own, so it has to be walked back to
+ * its estimate before any side effect (a receipt email) happens.
+ */
+async function assertEstimatePaymentAccess(paymentScheduleId: string) {
+    const user = await assertEstimatePermission();
+    const schedule = await prisma.estimatePaymentSchedule.findUnique({
+        where: { id: paymentScheduleId },
+        select: { estimateId: true, estimate: { select: { projectId: true, leadId: true } } },
+    });
+    if (!schedule?.estimate) throw new Error("Payment not found");
+    assertEstimateScope(user, schedule.estimate);
+    return { user, estimateId: schedule.estimateId };
+}
+
+/**
+ * Permission + scope for actions addressed by EstimateItem id rather than by
+ * estimate id. Every id must resolve: a missing row is something the caller
+ * cannot be scoped against, so it is rejected rather than silently skipped.
+ */
+async function assertEstimateItemAccess(itemIds: string[]) {
+    const user = await assertEstimatePermission();
+    const unique = Array.from(new Set(itemIds));
+    if (unique.length === 0) return user;
+    const items = await prisma.estimateItem.findMany({
+        where: { id: { in: unique } },
+        select: { estimate: { select: { projectId: true, leadId: true } } },
+    });
+    if (items.length !== unique.length) throw new Error("Estimate item not found");
+    for (const item of items) assertEstimateScope(user, item.estimate);
+    return user;
 }
 
 async function assertScheduleProjectAccess(projectId: string) {
@@ -4254,12 +4464,80 @@ async function assertCompanySettingsPermission() {
     return assertStaffPermission("companySettings");
 }
 
+async function assertVendorPermission() {
+    return assertStaffPermission("manageVendors");
+}
+
+// Document templates hold the terms & conditions, contract language and
+// disclaimers that get SNAPSHOTTED onto estimates and contracts when they are
+// sent — an unauthenticated write changes the legal text on future
+// client-facing documents. Company-wide, so there is no per-project scope to
+// apply; the split below follows the screens that actually use them.
+//
+// Reads: every consumer is an estimates or contracts surface (the estimate
+// editor's T&C picker, SendEstimateModal, the lead/project contracts tabs) plus
+// the company settings library itself.
+async function assertDocumentTemplateReadAccess() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "estimates") && !hasPermission(user, "contracts") && !hasPermission(user, "companySettings")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+// Writes: `companySettings` is the permission that owns the library at
+// /company/templates, and it alone may touch EVERY type. `estimates` is
+// accepted too, but only for the types an estimator actually authors — the
+// estimate editor's "save as template" and the /estimates Terms & Conditions
+// tab. Without the type scope below, an estimates-only user (which is the
+// FINANCE default) could rewrite contract, lien-release, warranty, addendum and
+// disclaimer language through /company/templates' full type selector, which is
+// a far bigger grant than the estimator surfaces justify.
+async function assertDocumentTemplateWritePermission() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "companySettings") && !hasPermission(user, "estimates")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
+// Second half of the write gate: which TYPE this caller may write. Split from
+// the permission check so the permission still runs before any database access
+// — update/delete have to load the row to learn its type, and an edit that
+// changes `type` must clear the scope on BOTH the old and the new value or a
+// caller could launder a contract template out of its protected type.
+function assertDocumentTemplateTypeScope(user: any, type: string | null | undefined) {
+    if (!canWriteDocumentTemplateType(user, type)) throw new Error("Forbidden");
+}
+
+// Creating a vendor is also part of the PO flow — SelectVendorModal and
+// POQuickCreateModal let an estimator add one inline, and those screens gate on
+// financialReports (see quickCreatePOAndLink). So either permission is enough to
+// create; editing and deleting still require manageVendors.
+async function assertVendorCreatePermission() {
+    const user = await assertActiveStaff();
+    if (!hasPermission(user, "manageVendors") && !hasPermission(user, "financialReports")) {
+        throw new Error("Forbidden");
+    }
+    return user;
+}
+
 async function assertEstimateStaffOrPortalAccess(estimateId: string) {
     const user = await getCurrentUserWithPermissions();
     if (user) {
         if (!hasPermission(user, "estimates") && !hasPermission(user, "invoices")) {
             throw new Error("Forbidden");
         }
+        // The portal branch below is already ownership-scoped; the staff branch
+        // was not. Same horizontal check as assertEstimateAccess so a staff
+        // caller cannot mint a PDF upload token (or a pay-in-full schedule) for
+        // a job they have no access to.
+        const estimate = await prisma.estimate.findUnique({
+            where: { id: estimateId },
+            select: { projectId: true, leadId: true },
+        });
+        if (!estimate) throw new Error("Estimate not found");
+        assertEstimateScope(user, estimate);
         return;
     }
     if (await canUseDevAuthFallback()) {
@@ -4822,7 +5100,7 @@ export async function saveCompanySettings(data: any) {
 }
 
 export async function deleteEstimate(estimateId: string): Promise<{ success: boolean; error?: string }> {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         select: { projectId: true, leadId: true, status: true },
@@ -4880,7 +5158,10 @@ export async function deleteEstimate(estimateId: string): Promise<{ success: boo
 // =============================================
 
 export async function duplicateEstimate(estimateId: string, targetProjectId?: string, newTitle?: string) {
-    await assertEstimatePermission();
+    // Both ends are scoped: you must be able to read the source estimate AND to
+    // write into the destination job, or a duplicate becomes a copy-out channel.
+    await assertEstimateAccess(estimateId);
+    if (targetProjectId) await assertEstimateProjectAccess(targetProjectId);
     const original = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: {
@@ -5022,7 +5303,9 @@ export async function duplicateEstimates(
 // =============================================
 
 export async function saveEstimateAsTemplate(estimateId: string, templateName: string) {
-    await assertEstimatePermission();
+    // The template is company-wide, but it is BUILT from this estimate's line
+    // items — so reading the source still needs the source's scope.
+    await assertEstimateAccess(estimateId);
     const estimate = await prisma.estimate.findUnique({
         where: { id: estimateId },
         include: { items: { orderBy: { order: "asc" } } },
@@ -5069,14 +5352,17 @@ export async function saveEstimateAsTemplate(estimateId: string, templateName: s
 
 export async function getEstimateTemplates() {
     await assertEstimatePermission();
-    return await prisma.estimateTemplate.findMany({
+    const templates = await prisma.estimateTemplate.findMany({
         orderBy: { createdAt: "desc" },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
     });
+    // Item baseCost/unitCost are Prisma Decimals, which can't cross the server->client
+    // boundary; consumers already coerce with Number(...).
+    return JSON.parse(JSON.stringify(templates));
 }
 
 export async function createEstimateFromTemplate(projectId: string, templateId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const template = await prisma.estimateTemplate.findUnique({
         where: { id: templateId },
         include: { items: { orderBy: [{ order: "asc" }, { id: "asc" }] } },
@@ -5190,6 +5476,7 @@ export async function deleteAssembly(templateId: string) {
 // =============================================
 
 export async function getDocumentTemplates(type?: string) {
+    await assertDocumentTemplateReadAccess();
     return await prisma.documentTemplate.findMany({
         where: type ? { type } : undefined,
         orderBy: { updatedAt: "desc" },
@@ -5197,10 +5484,13 @@ export async function getDocumentTemplates(type?: string) {
 }
 
 export async function getDocumentTemplate(id: string) {
+    await assertDocumentTemplateReadAccess();
     return await prisma.documentTemplate.findUnique({ where: { id } });
 }
 
 export async function createDocumentTemplate(data: { name: string; type: string; body: string; isDefault?: boolean }) {
+    const user = await assertDocumentTemplateWritePermission();
+    assertDocumentTemplateTypeScope(user, data.type);
     // If setting as default, unset all other defaults of same type
     if (data.isDefault) {
         await prisma.documentTemplate.updateMany({
@@ -5215,23 +5505,46 @@ export async function createDocumentTemplate(data: { name: string; type: string;
 }
 
 export async function updateDocumentTemplate(id: string, data: { name?: string; type?: string; body?: string; isDefault?: boolean }) {
-    if (data.isDefault) {
-        const existing = await prisma.documentTemplate.findUnique({ where: { id } });
-        if (existing) {
-            await prisma.documentTemplate.updateMany({
+    const user = await assertDocumentTemplateWritePermission();
+    const existing = await prisma.documentTemplate.findUnique({ where: { id } });
+    if (!existing) throw new Error("Template not found");
+    // Scope the type this row ALREADY has, and — when the edit retypes it — the
+    // one it is moving to, so neither end of a retype escapes the estimator set.
+    assertDocumentTemplateTypeScope(user, existing.type);
+    if (data.type !== undefined) assertDocumentTemplateTypeScope(user, data.type);
+    // The type was authorized from a separately-loaded row, so the write must
+    // re-assert it or a concurrent retype (by someone who IS allowed to retype)
+    // could hand an estimates-only caller a now-protected row. Pinning the
+    // observed type in the mutation's own filter closes that window; count 0
+    // means the row changed type underneath us, which is a refusal, not a 404.
+    const template = await prisma.$transaction(async (tx) => {
+        const claimed = await tx.documentTemplate.updateMany({
+            where: { id, type: existing.type },
+            data,
+        });
+        if (claimed.count === 0) throw new Error("Forbidden");
+        if (data.isDefault) {
+            await tx.documentTemplate.updateMany({
                 where: { type: data.type || existing.type, isDefault: true, NOT: { id } },
                 data: { isDefault: false }
             });
         }
-    }
-    const template = await prisma.documentTemplate.update({ where: { id }, data });
+        return tx.documentTemplate.findUnique({ where: { id } });
+    });
     revalidatePath("/company/templates");
     revalidatePath("/estimates");
     return template;
 }
 
 export async function deleteDocumentTemplate(id: string) {
-    await prisma.documentTemplate.delete({ where: { id } });
+    const user = await assertDocumentTemplateWritePermission();
+    const existing = await prisma.documentTemplate.findUnique({ where: { id }, select: { type: true } });
+    if (!existing) throw new Error("Template not found");
+    assertDocumentTemplateTypeScope(user, existing.type);
+    // Same TOCTOU pin as the update path: delete only the row whose type was
+    // actually authorized, never "whatever this id is now".
+    const removed = await prisma.documentTemplate.deleteMany({ where: { id, type: existing.type } });
+    if (removed.count === 0) throw new Error("Forbidden");
     revalidatePath("/company/templates");
     revalidatePath("/estimates");
     return { success: true };
@@ -5299,24 +5612,15 @@ export async function sendEstimateToClient(
         const paidSum = schedules.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
         const balanceDue = rc(estimateTotal - paidSum);
 
-        const otherUnpaidSum = unpaidSchedules.slice(0, -1).reduce((sum, s) => sum + toNum(s.amount), 0);
-        const lastMilestone = unpaidSchedules[unpaidSchedules.length - 1];
-        const correctLastAmount = rc(balanceDue - otherUnpaidSum);
-
-        if (correctLastAmount >= 0 && Math.abs(correctLastAmount - toNum(lastMilestone.amount)) > 0.001) {
-            await prisma.$transaction([
-                prisma.estimatePaymentSchedule.update({
-                    where: { id: lastMilestone.id },
-                    data: { amount: correctLastAmount }
-                })
-            ]);
-            const refreshed = await prisma.estimatePaymentSchedule.findMany({ where: { estimateId }, orderBy: { order: "asc" } });
-            schedules.splice(0, schedules.length, ...refreshed);
-        }
-
-        const unpaidSum = schedules.reduce((sum, s) => sum + toNum(s.amount), 0) - paidSum;
-        const unpaidRounded = rc(unpaidSum);
-        if (Math.abs(unpaidRounded - balanceDue) > 0.01) {
+        // No silent repair: this used to UPDATE the last unpaid milestone to
+        // balanceDue − others before emailing, which is one of the writers that
+        // kept reverting hand-corrected amounts (Mesplay EST-4226-3, Aug 2026).
+        // A mismatched schedule now blocks the send with the explicit error
+        // below — the editor's distribute-remainder button is the fix.
+        const unpaidRounded = rc(unpaidSchedules.reduce((sum, s) => sum + toNum(s.amount), 0));
+        // Integer-cent compare: |99.99 − 100| in floats is 0.010000000000005116,
+        // which would reject an exactly-one-cent difference the tolerance means to allow.
+        if (Math.abs(Math.round(unpaidRounded * 100) - Math.round(balanceDue * 100)) > 1) {
             const fmt = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
             const diff = Math.abs(unpaidRounded - balanceDue);
             return { success: false, error: `Milestone total (${fmt(unpaidRounded)}) doesn't match the estimate balance due (${fmt(balanceDue)}). Difference: ${fmt(diff)}. Please adjust your milestones before sending.` };
@@ -5632,109 +5936,12 @@ export async function sendEstimateToClient(
 // Contracts
 // ────────────────────────────────────────────────
 
-function resolveMergeFields(template: string, data: Record<string, string>): string {
-    // Handle TipTap <span data-merge-field="key">...</span> nodes first
-    let result = template.replace(/<span[^>]*data-merge-field="(\w+)"[^>]*>[\s\S]*?<\/span>/g,
-        (match, key) => key in data ? data[key] : match);
-    // Then handle raw {{key}} placeholders
-    result = result.replace(/\{\{(\w+)\}\}/g, (match, key) => key in data ? data[key] : match);
-    return result;
-}
-
 function bodyHasContractorBlock(body: string): boolean {
     return /\{\{CONTRACTOR_SIGNATURE_BLOCK\}\}|data-merge-field=["']CONTRACTOR_SIGNATURE_BLOCK["']/i.test(body || "");
 }
 
-// Save-time guard for the author↔portal signing-field handshake.
-// The portal and PDF rendering locate signing blocks by grepping for the raw {{KEY}} form.
-// If an un-normalized TipTap <span data-merge-field="KEY">…</span> ever reaches the saved
-// body (editor bug, pasted content, template drift), the portal would find nothing and the
-// signature fields would silently vanish for the customer. Normalizing any remaining
-// merge-field spans back to {{KEY}} on save closes that failure class. (Data merge fields are
-// already resolved to values before this runs; only unresolved/signing keys remain as spans.)
-function normalizeContractBody(body: string): string {
-    return (body || "").replace(/<span[^>]*data-merge-field=["'](\w+)["'][^>]*>[\s\S]*?<\/span>/g, "{{$1}}");
-}
-
 function escapeEmailHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-async function buildMergeData(projectId?: string | null, leadId?: string | null): Promise<Record<string, string>> {
-    const settings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-    const data: Record<string, string> = {
-        company_name: settings?.companyName || "Our Company",
-        company_address: settings?.address || "",
-        company_phone: settings?.phone || "",
-        company_email: settings?.email || "",
-        company_license: settings?.licenseNumber || "",
-        company_website: settings?.website || "",
-        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
-        year: new Date().getFullYear().toString(),
-    };
-
-    const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-
-    const populateFromEntity = (
-        entity: { name: string; location?: string | null; number?: number; type?: string | null; projectType?: string | null },
-        client: { name: string; email?: string | null; primaryPhone?: string | null; additionalEmail?: string | null; additionalPhone?: string | null; addressLine1?: string | null; city?: string | null; state?: string | null; zipCode?: string | null },
-        estimates: { code: string; totalAmount: any; balanceDue: any; paymentSchedules?: { name: string; percentage?: number | null; amount: any; order: number }[] }[]
-    ) => {
-        data.project_name = entity.name;
-        data.location = entity.location || "";
-        if (!data.location) {
-            const stateZip = [client.state, client.zipCode].filter(Boolean).join(" ");
-            data.location = [client.addressLine1, client.city, stateZip].filter(Boolean).join(", ");
-        }
-        if (entity.number) data.project_number = `P-${entity.number}`;
-        const entityType = entity.type || entity.projectType || null;
-        if (entityType) data.project_type = entityType;
-
-        data.client_name = client.name;
-        data.client_email = client.email || "";
-        data.client_phone = client.primaryPhone || "";
-        const clientStateZip = [client.state, client.zipCode].filter(Boolean).join(" ");
-        data.client_address = [client.addressLine1, client.city, clientStateZip].filter(Boolean).join(", ");
-        data.client_additional_email = client.additionalEmail || "";
-        data.client_additional_phone = client.additionalPhone || "";
-
-        const est = estimates[0];
-        if (est) {
-            data.estimate_total = `$${Number(est.totalAmount).toLocaleString("en-US")}`;
-            data.estimate_number = est.code;
-            data.estimate_balance_due = `$${Number(est.balanceDue).toLocaleString("en-US")}`;
-            if (est.paymentSchedules && est.paymentSchedules.length > 0) {
-                const rows = est.paymentSchedules
-                    .sort((a, b) => a.order - b.order)
-                    .map((ps) => `<tr><td style="padding:4px 12px 4px 0;border-bottom:1px solid #e5e7eb;">${escHtml(ps.name)}</td><td style="padding:4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">${ps.percentage ? `${ps.percentage}%` : ""}</td><td style="padding:4px 0 4px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">$${Number(ps.amount).toLocaleString("en-US")}</td></tr>`)
-                    .join("");
-                data.payment_schedule = `<table style="width:100%;border-collapse:collapse;font-size:14px;"><thead><tr style="border-bottom:2px solid #333;"><th style="text-align:left;padding:4px 12px 4px 0;">Milestone</th><th style="text-align:right;padding:4px 12px;">%</th><th style="text-align:right;padding:4px 0 4px 12px;">Amount</th></tr></thead><tbody>${rows}</tbody></table>`;
-            }
-        }
-        if (!est) {
-            data.estimate_total = "$0.00";
-            data.estimate_number = "";
-            data.estimate_balance_due = "$0.00";
-        }
-    };
-
-    const estimateInclude = { orderBy: { createdAt: "desc" as const }, take: 1, include: { paymentSchedules: { orderBy: { order: "asc" as const } } } };
-
-    if (projectId) {
-        const project = await prisma.project.findUnique({
-            where: { id: projectId },
-            include: { client: true, estimates: estimateInclude },
-        });
-        if (project) populateFromEntity(project, project.client, project.estimates);
-    } else if (leadId) {
-        const lead = await prisma.lead.findUnique({
-            where: { id: leadId },
-            include: { client: true, estimates: estimateInclude },
-        });
-        if (lead) populateFromEntity(lead, lead.client, lead.estimates);
-    }
-
-    return data;
 }
 
 async function resolveContractBody(
@@ -5743,7 +5950,7 @@ async function resolveContractBody(
     leadId?: string | null
 ): Promise<string> {
     if (!/\{\{\w+\}\}/.test(body) && !/data-merge-field=/.test(body)) return body;
-    const data = await buildMergeData(projectId, leadId);
+    const data = await buildContractMergeData(projectId, leadId);
     return resolveMergeFields(body, data);
 }
 
@@ -5756,24 +5963,27 @@ export async function getResolvedMergePreview(
         ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
         : null;
     if (!caller || !["ADMIN", "MANAGER"].includes(caller.role)) throw new Error("Forbidden");
-    return buildMergeData(projectId, leadId);
+    return buildContractMergeData(projectId, leadId);
 }
 
-export async function getContracts(projectId?: string, leadId?: string) {
-    return prisma.contract.findMany({
-        where: {
-            ...(projectId ? { projectId } : {}),
-            ...(leadId ? { leadId } : {}),
-        },
-        orderBy: { createdAt: "desc" },
-        include: {
-            project: { select: { name: true, client: { select: { name: true } } } },
-            lead: { select: { name: true, client: { select: { name: true } } } },
-        }
-    });
-}
+// `getContracts` was deleted here. It had no callers anywhere — the live staff
+// screens (projects/[id]/contracts, leads/[id]/contracts) query prisma.contract
+// directly with contractScopeWhere(viewer). Having no callers did NOT make it
+// inert: as this module actually builds (Next 16.2.11), the server-reference
+// manifest registers all 360 of its exports as individually invokable POST
+// endpoints, 37 of them unreferenced anywhere in src/ — so a caller-less export
+// here is live attack surface whose gate nothing exercises. Next documents that
+// unused actions MAY be eliminated, so that is a measurement of this build, not
+// a universal rule; see docs/CONTRACTS.md. #367 gated it; this removes it. The
+// scope rule it used, contractScopeWhere, is NOT orphaned: the two pages above
+// and getLead's contracts relation are its consumers.
 
 export async function getContract(id: string) {
+    // Staff-only, scoped to the owning job. The docstring on getContractForPortal
+    // below always CLAIMED this one was "admin-only"; nothing enforced it, so an
+    // anonymous caller could read any contract — including its accessToken — plus
+    // the full related client record, by id alone.
+    await assertContractAccess(id);
     return prisma.contract.findUnique({
         where: { id },
         include: {
@@ -5838,51 +6048,12 @@ export async function getContractForPortal(id: string, token?: string | null) {
     return contract;
 }
 
-/**
- * Returns the executed PDF ProjectFile for a specific contract.
- *
- * Files written by the finalize route set `ProjectFile.name` to the exact string
- * `Executed_Contract_{contractId}.pdf` (no timestamp prefix — the timestamp only
- * appears in the storage path, not the DB `name` column). We use exact equality
- * for airtight lookup.
- *
- * Legacy fallback: files written before the contractId naming convention used
- * `Executed_Contract_{safeTitle}.pdf`. If exact-match returns nothing we retry
- * with the title-based prefix as a best-effort courtesy for old data. Same-title
- * collisions on legacy data are accepted as a known limitation — new data is
- * unambiguous.
- */
-export async function getExecutedContractPdf(contract: { id: string; title: string; projectId: string | null; leadId: string | null }) {
-    const where: any = contract.projectId
-        ? { projectId: contract.projectId }
-        : contract.leadId
-            ? { leadId: contract.leadId }
-            : null;
-    if (!where) return null;
-
-    // Preferred: exact-match on the contract-id-embedded filename.
-    const exactName = `Executed_Contract_${contract.id}.pdf`;
-    const byContractId = await prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: exactName,
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
-    if (byContractId) return byContractId;
-
-    // Legacy fallback — title-prefixed files from before the contractId naming change.
-    const legacyPrefix = `Executed_Contract_${contract.title.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
-    return prisma.projectFile.findFirst({
-        where: {
-            ...where,
-            name: { startsWith: legacyPrefix },
-            mimeType: "application/pdf",
-        },
-        orderBy: { createdAt: "desc" },
-    });
-}
+// `getExecutedContractPdf` was deleted here, for the same reason as
+// `getContracts` above: no callers, but on this build every export of this
+// module is registered as a POST endpoint anyway. Every real caller already uses
+// the session-free core `executedContractPdfFor` in contract-files-core.ts —
+// the client portal proves access by accessToken/portal session, and
+// countersignContractAsCompany calls it after its own gate.
 
 export async function createContractFromTemplate(
     templateId: string,
@@ -5890,36 +6061,8 @@ export async function createContractFromTemplate(
     titleOverride?: string,
     recurringDays?: number
 ) {
-    const template = await prisma.documentTemplate.findUnique({ where: { id: templateId } });
-    if (!template) throw new Error("Template not found");
-
-    const mergeData = await buildMergeData(
-        context.type === "project" ? context.id : null,
-        context.type === "lead" ? context.id : null
-    );
-
-    const resolvedBody = normalizeContractBody(resolveMergeFields(template.body, mergeData));
-    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
-
-    const contract = await prisma.contract.create({
-        data: {
-            title: titleOverride || template.name,
-            body: resolvedBody,
-            // Recurring docs (e.g. lien releases) cycle status back to "Sent" each period and never
-            // reach a stable "Signed" state, so they can't support countersign — force it off.
-            requiresCountersign: (recurringDays && recurringDays > 0) ? false : (coSettings?.requireContractCountersign ?? false),
-            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
-            ...(recurringDays && recurringDays > 0 ? {
-                recurringDays,
-                nextDueDate: new Date(Date.now() + recurringDays * 86400000),
-            } : {}),
-        }
-    });
-
-    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
-    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
-
-    return contract;
+    await assertContractContextAccess(context);
+    return createContractFromTemplateCore(templateId, context, titleOverride, recurringDays);
 }
 
 export async function createContractBlank(
@@ -5927,27 +6070,8 @@ export async function createContractBlank(
     title: string,
     body: string
 ) {
-    const mergeData = await buildMergeData(
-        context.type === "project" ? context.id : null,
-        context.type === "lead" ? context.id : null
-    );
-
-    const resolvedBody = normalizeContractBody(resolveMergeFields(body, mergeData));
-    const coSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" }, select: { requireContractCountersign: true } });
-
-    const contract = await prisma.contract.create({
-        data: {
-            title,
-            body: resolvedBody,
-            requiresCountersign: coSettings?.requireContractCountersign ?? false,
-            ...(context.type === "project" ? { projectId: context.id } : { leadId: context.id }),
-        }
-    });
-
-    if (context.type === "project") revalidatePath(`/projects/${context.id}`);
-    if (context.type === "lead") revalidatePath(`/leads/${context.id}`);
-
-    return contract;
+    await assertContractContextAccess(context);
+    return createContractBlankCore(context, title, body);
 }
 
 export async function createContractFromPdf(
@@ -5991,6 +6115,11 @@ export async function createContractFromPdf(
 }
 
 export async function updateContract(id: string, data: { title?: string; body?: string; status?: string; requiresCountersign?: boolean }) {
+    // Unauthenticated before this gate: an anonymous caller could rewrite any
+    // contract's title/body/status/requiresCountersign by id — and because a
+    // text edit clears the contractor signature (see below), a plain edit was
+    // enough to strip a signature off a live legal document.
+    await assertContractAccess(id);
     const existing = await prisma.contract.findUnique({
         where: { id },
         select: { status: true, title: true, body: true, contractorSignedBy: true, contractorSignedAt: true },
@@ -6062,6 +6191,9 @@ export async function updateContract(id: string, data: { title?: string; body?: 
 }
 
 export async function deleteContract(id: string) {
+    // Unauthenticated before this gate: an anonymous caller could permanently
+    // delete any contract — signed ones included — by id alone.
+    await assertContractAccess(id);
     const contract = await prisma.contract.findUnique({ where: { id } });
     await prisma.contract.delete({ where: { id } });
     if (contract?.projectId) revalidatePath(`/projects/${contract.projectId}`);
@@ -6239,11 +6371,13 @@ export async function sendContractToClient(
 // Prefill for the "Send contract" dialog: the primary recipient + the default CC set
 // (additional client email + assigned manager) that the user can edit before sending.
 export async function getContractSendDefaults(contractId: string): Promise<{ toEmail: string | null; autoCc: string[] }> {
-    const session = await getServerSession(authOptions);
-    const caller = session?.user?.email
-        ? await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true } })
-        : null;
-    if (!caller || !["ADMIN", "MANAGER", "FINANCE"].includes(caller.role)) throw new Error("Forbidden");
+    // Was authenticated but neither permission-checked nor scoped: a hard-coded
+    // role list let any FINANCE user pass an arbitrary contract id and read the
+    // client's primary/additional email plus the assigned manager's. FINANCE's
+    // role default is `estimates`, not `contracts`, and this prefills a dialog
+    // whose send path (assertContractSendPermission) already demands `contracts`
+    // — so the old list granted a preview of data it could never act on.
+    await assertContractAccess(contractId);
 
     const contract = await prisma.contract.findUnique({
         where: { id: contractId },
@@ -6761,6 +6895,10 @@ export async function approveContract(contractId: string, signatureName: string,
 }
 
 export async function getContractSigningHistory(contractId: string) {
+    // Unauthenticated before this gate: signer names, IP addresses, user agents,
+    // notes and — because this action resolves `secure:` refs into loadable URLs
+    // — the signature IMAGES themselves, for any contract id.
+    await assertContractAccess(contractId);
     const records = await prisma.contractSigningRecord.findMany({
         where: { contractId },
         orderBy: { signedAt: "desc" },
@@ -6807,7 +6945,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     // file isn't archived yet (a concurrent call is mid-archive), tell the admin to retry rather
     // than returning a false success with no file.
     if (contract.status === "Finalized") {
-        const existing = await getExecutedContractPdf(contract);
+        const existing = await executedContractPdfFor(contract);
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
@@ -6891,7 +7029,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
     });
     if (!after) throw new Error("Contract not found");
     if (after.status === "Finalized") {
-        return { success: true, file: await getExecutedContractPdf(after), alreadyFinalized: true };
+        return { success: true, file: await executedContractPdfFor(after), alreadyFinalized: true };
     }
     if (after.status !== "Signed" || !after.companySignedAt || !after.signedPdfPath) {
         throw new Error("Contract is not in a countersignable state.");
@@ -6907,7 +7045,7 @@ export async function countersignContractAsCompany(contractId: string, signerNam
         // the winner is still archiving (or rolled back), so tell the admin to retry rather than
         // returning a false success with no file.
         const fresh = await prisma.contract.findUnique({ where: { id: contractId } });
-        const existing = fresh?.status === "Finalized" ? await getExecutedContractPdf(fresh) : null;
+        const existing = fresh?.status === "Finalized" ? await executedContractPdfFor(fresh) : null;
         if (existing) return { success: true, file: existing, alreadyFinalized: true };
         throw new Error("This contract is being finalized by another request. Please refresh in a moment.");
     }
@@ -7284,7 +7422,7 @@ export async function getDashboardTasks(projectId: string) {
 }
 
 export async function getEstimateItemsForProject(projectId: string) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const items = await prisma.estimateItem.findMany({
         where: { estimate: { projectId }, type: { not: "Section" } },
         orderBy: { order: "asc" },
@@ -7474,7 +7612,10 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
 }
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
-    await assertEstimatePermission();
+    // Two ids, two scopes: the estimate being read and the project whose
+    // schedule is written. They are independent arguments, so check both.
+    await assertEstimateAccess(estimateId);
+    await assertEstimateProjectAccess(projectId);
     // Rewired through the schedule-core generator (PB-pipeline-002): one
     // shared precondition/idempotency path for estimate — schedule.
     // Merge mode skips already task-linked items. Response shape preserved
@@ -8347,9 +8488,34 @@ export async function updateProjectColor(projectId: string, color: string) {
 }
 
 export async function updateProjectTags(projectId: string, tags: string) {
+    await assertProjectMemberStaff(projectId);
     await prisma.project.update({
         where: { id: projectId },
         data: { tags }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectType(projectId: string, type: string) {
+    await assertProjectMemberStaff(projectId);
+    const trimmed = type.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { type: trimmed || null }
+    });
+    revalidatePath(`/projects`);
+    revalidatePath(`/projects/${projectId}`);
+    return { success: true };
+}
+
+export async function updateProjectCode(projectId: string, code: string) {
+    await assertProjectMemberStaff(projectId);
+    const trimmed = code.trim();
+    await prisma.project.update({
+        where: { id: projectId },
+        data: { code: trimmed || null }
     });
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
@@ -8493,6 +8659,7 @@ export async function getPortalVisibility(projectId: string) {
             showChangeOrders: true,
             showSelections: true,
             showMoodBoards: true,
+            showPermits: true,
             isPortalEnabled: true,
             lastSharedAt: null,
             lastShareEmailId: null,
@@ -8512,8 +8679,10 @@ export async function savePortalVisibility(projectId: string, data: {
     showMessages: boolean;
     showSelections?: boolean;
     showMoodBoards?: boolean;
+    showPermits?: boolean;
     isPortalEnabled: boolean;
 }) {
+    await assertProjectMemberStaff(projectId);
     const record = await prisma.portalVisibility.upsert({
         where: { projectId },
         update: {
@@ -8526,6 +8695,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
         create: {
@@ -8539,6 +8709,7 @@ export async function savePortalVisibility(projectId: string, data: {
             showMessages: data.showMessages,
             showSelections: data.showSelections ?? true,
             showMoodBoards: data.showMoodBoards ?? true,
+            showPermits: data.showPermits ?? true,
             isPortalEnabled: data.isPortalEnabled,
         },
     });
@@ -8725,10 +8896,14 @@ export async function saveSubcontractorExplicitProjects(subId: string, projectId
 // =============================================
 
 export async function createChangeOrder(projectId: string, estimateId: string, itemIds?: string[]) {
-    await assertChangeOrderPermission();
+    const user = await assertChangeOrderPermission();
+    // Scope the destination project, then require the source estimate to be
+    // that same project's. Unpaired, this copies an arbitrary estimate's priced
+    // items into an arbitrary project.
+    assertEstimateScope(user, { projectId });
 
     const estimate = await prisma.estimate.findUnique({
-        where: { id: estimateId },
+        where: { id: estimateId, projectId },
         include: { items: true }
     });
     if (!estimate) throw new Error("Estimate not found");
@@ -8747,7 +8922,10 @@ export async function createChangeOrder(projectId: string, estimateId: string, i
     await prisma.changeOrder.update({ where: { id: changeOrder.id }, data: { code: coCode } });
 
     if (itemIds && itemIds.length > 0) {
-        const selectedItems = estimate.items.filter(i => itemIds.includes(i.id));
+        // Section headers carry their children's rolled-up total, and ChangeOrderItem is flat,
+        // so copying a header alongside its children would bill the section twice. Selecting a
+        // header means "bill this whole phase" — it resolves to the leaves underneath it.
+        const selectedItems = selectedBillableRows(estimate.items, itemIds);
         for (const item of selectedItems) {
             await prisma.changeOrderItem.create({
                 data: {
@@ -8914,7 +9092,8 @@ export async function updateChangeOrder(id: string, data: ChangeOrderUpdateInput
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 export async function previewCostPlusChangeOrder(changeOrderId: string, throughDate: string) {
@@ -9024,7 +9203,8 @@ export async function approveChangeOrder(id: string, signatureName: string, user
 
     revalidatePath(`/projects/${co.projectId}/change-orders/${id}`);
     revalidatePath(`/projects/${co.projectId}/change-orders`);
-    return co;
+    // totalAmount/balanceDue are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(co));
 }
 
 // Company-side countersignature. Distinct from approveChangeOrder (the customer's
@@ -9322,48 +9502,141 @@ export async function subPortalDeleteCOI() {
 // ==========================================
 export async function getVendors() {
     "use server";
-    return prisma.vendor.findMany({ 
+    // Vendor rows carry EIN, account numbers, contacts and file URLs — this was
+    // reachable unauthenticated. The PO-flow modals need it too, so gate on
+    // active staff and let the two write permissions stay narrower.
+    await assertVendorCreatePermission();
+    return prisma.vendor.findMany({
         orderBy: { name: "asc" },
         include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
     });
 }
 
+// Vendor columns a caller is allowed to write. Anything not listed here — most
+// importantly the `purchaseOrders` relation — is dropped. Spreading the raw
+// payload into Prisma let a caller pass nested relation writes such as
+// { purchaseOrders: { deleteMany: {} } }, which deletes POs directly and so
+// never trips the vendor FK's ON DELETE RESTRICT or deletePurchaseOrder's checks.
+const VENDOR_WRITABLE_FIELDS = [
+    "name", "website", "description", "firstName", "lastName", "email", "phone",
+    "fax", "address1", "address2", "city", "state", "zipCode", "country",
+    "paymentTerms", "chargesTax", "accountNumber", "ein", "notes", "status",
+] as const;
+
+function pickVendorFields(data: any) {
+    const out: Record<string, any> = {};
+    for (const key of VENDOR_WRITABLE_FIELDS) {
+        if (data?.[key] !== undefined) out[key] = data[key];
+    }
+    return out;
+}
+
+// Same reasoning for vendor files — map the scalars explicitly rather than
+// handing Prisma a caller-shaped object.
+function pickVendorFiles(files: any[]) {
+    return files.map((f: any) => ({
+        name: f.name,
+        url: f.url,
+        size: f.size,
+        type: f.type,
+    }));
+}
+
+// Free-text trade labels ("Supplier, Lumber") normalised into VendorTag names.
+// Tags are how the vendors list filters, so a trade typed during inline vendor
+// creation belongs here rather than buried in a text column.
+const MAX_TAG_NAME_LENGTH = 40;
+const MAX_NEW_TAGS = 10;
+
+function parseTagNames(tagNames: any): string[] {
+    if (!tagNames) return [];
+    const raw = Array.isArray(tagNames) ? tagNames : [tagNames];
+    const seen = new Set<string>();
+    for (const entry of raw) {
+        if (typeof entry !== "string") continue;
+        for (const part of entry.split(",")) {
+            const name = part.trim().slice(0, MAX_TAG_NAME_LENGTH);
+            if (name) seen.add(name);
+            if (seen.size >= MAX_NEW_TAGS) return [...seen];
+        }
+    }
+    return [...seen];
+}
+
 export async function createVendor(data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorCreatePermission();
+    const { tagIds, tagNames, files } = data ?? {};
+    const newTagNames = parseTagNames(tagNames);
 
-    const v = await prisma.vendor.create({ 
+    // name is the one required Vendor column — the allowlist above can't prove
+    // to the type system that it survived, so check it rather than cast it away.
+    const fields = pickVendorFields(data);
+    const name = typeof fields.name === "string" ? fields.name.trim() : "";
+    if (!name) {
+        // status lets the API route answer 400 without matching on the message.
+        const err: any = new Error("Vendor name is required");
+        err.status = 400;
+        throw err;
+    }
+
+    const tagWrite = {
+        ...(tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : {}),
+        // connectOrCreate so an existing trade tag is reused rather than
+        // colliding on VendorTag.name's unique constraint.
+        ...(newTagNames.length
+            ? { connectOrCreate: newTagNames.map(tagName => ({ where: { name: tagName }, create: { name: tagName } })) }
+            : {}),
+    };
+
+    const createArgs = {
         data: {
-            ...vendorData,
-            tags: tagIds?.length ? { connect: tagIds.map((id: string) => ({ id })) } : undefined,
-            files: files?.length ? { create: files } : undefined
-        }
-    });
+            ...fields,
+            name,
+            ...(Object.keys(tagWrite).length ? { tags: tagWrite } : {}),
+            ...(files?.length ? { files: { create: pickVendorFiles(files) } } : {}),
+        },
+        include: { tags: true, files: true, _count: { select: { purchaseOrders: true } } }
+    };
+
+    let v;
+    try {
+        v = await prisma.vendor.create(createArgs);
+    } catch (error: any) {
+        // connectOrCreate is a check-then-create, so two vendors naming the same
+        // new tag at once can race and one loses on VendorTag.name. The retry
+        // finds the tag the winner just created and connects to it instead.
+        const rawTarget = error?.meta?.target;
+        const targets: string[] = Array.isArray(rawTarget)
+            ? rawTarget.map(String)
+            : rawTarget ? [String(rawTarget)] : [];
+        const isTagNameRace = error?.code === "P2002"
+            && targets.includes("name")
+            && newTagNames.length > 0;
+        if (!isTagNameRace) throw error;
+        v = await prisma.vendor.create(createArgs);
+    }
+
     revalidatePath("/company/vendors");
     return v;
 }
 
 export async function updateVendor(id: string, data: any) {
     "use server";
-    const { tagIds, files, ...vendorData } = data;
+    await assertVendorPermission();
+    const { tagIds, files } = data ?? {};
 
-    const v = await prisma.vendor.update({ 
-        where: { id }, 
+    const v = await prisma.vendor.update({
+        where: { id },
         data: {
-            ...vendorData,
+            ...pickVendorFields(data),
             tags: tagIds ? { set: tagIds.map((id: string) => ({ id })) } : undefined,
         }
     });
 
     if (files && files.length > 0) {
         await prisma.vendorFile.createMany({
-            data: files.map((f: any) => ({
-                name: f.name,
-                url: f.url,
-                size: f.size,
-                type: f.type,
-                vendorId: id
-            }))
+            data: pickVendorFiles(files).map(f => ({ ...f, vendorId: id }))
         });
     }
 
@@ -9373,12 +9646,41 @@ export async function updateVendor(id: string, data: any) {
 
 export async function deleteVendor(id: string) {
     "use server";
-    await prisma.vendor.delete({ where: { id } });
+    await assertVendorPermission();
+
+    // Purchase orders are financial records — a vendor that still has any must
+    // not be deletable. The FK is ON DELETE RESTRICT, so the database is the
+    // real guard; the count here only turns that into a message naming how many
+    // POs are in the way. The two are not atomic, hence the P2003 catch below.
+    //
+    // This returns a result rather than throwing, because a production Next
+    // build redacts thrown Server Function messages — a throw would reach the
+    // user as a generic error with the count stripped out. Authorization still
+    // throws: being denied is not an expected outcome worth rendering.
+    const poCount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+    if (poCount > 0) {
+        return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: poCount };
+    }
+
+    try {
+        await prisma.vendor.delete({ where: { id } });
+    } catch (error: any) {
+        // P2003 = FK constraint failure, i.e. a PO was attached between the
+        // count above and this delete.
+        if (error?.code === "P2003") {
+            const recount = await prisma.purchaseOrder.count({ where: { vendorId: id } });
+            return { ok: false as const, reason: "HAS_PURCHASE_ORDERS" as const, count: recount };
+        }
+        throw error;
+    }
+
     revalidatePath("/company/vendors");
+    return { ok: true as const };
 }
 
 export async function deleteVendorFile(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorFile.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
@@ -9390,6 +9692,7 @@ export async function getVendorTags() {
 
 export async function createVendorTag(name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.create({ data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9397,6 +9700,7 @@ export async function createVendorTag(name: string) {
 
 export async function updateVendorTag(id: string, name: string) {
     "use server";
+    await assertVendorPermission();
     const tag = await prisma.vendorTag.update({ where: { id }, data: { name } });
     revalidatePath("/company/vendors");
     return tag;
@@ -9404,6 +9708,7 @@ export async function updateVendorTag(id: string, name: string) {
 
 export async function deleteVendorTag(id: string) {
     "use server";
+    await assertVendorPermission();
     await prisma.vendorTag.delete({ where: { id } });
     revalidatePath("/company/vendors");
 }
@@ -9460,7 +9765,8 @@ export async function createPurchaseOrder(projectId: string, data: any) {
         }
     });
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function createPurchaseOrderFromEstimate(projectId: string, estimateId: string, itemIds: string[], vendorId: string) {
@@ -9481,46 +9787,95 @@ export async function createPurchaseOrderFromEstimate(projectId: string, estimat
     const selectedItems = estimate.items.filter((item: any) => itemIds.includes(item.id));
     if (selectedItems.length === 0) throw new Error("No valid items found");
 
+    // itemIds must exactly match a validated in-estimate selection — never trust the raw
+    // argument for the PO-link step below, or a caller could link cross-estimate/cross-project
+    // items by passing arbitrary ids alongside valid ones.
+    const dedupedItemIds = Array.from(new Set(itemIds));
+    if (dedupedItemIds.length !== selectedItems.length) {
+        throw new Error("Selected items do not match a valid set of items on this estimate");
+    }
+
     const totalAmount = selectedItems.reduce((acc: number, item: any) => acc + ((parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0)), 0);
 
-    // Get project PO count for the code
-    const count = await prisma.purchaseOrder.count({ where: { projectId } });
-    const nextNum = (count + 1).toString().padStart(3, '0');
-
-    // Create the PO
-    const newPo = await prisma.purchaseOrder.create({
-        data: {
-            projectId,
-            vendorId,
-            code: `PO-${nextNum}`,
-            status: "Draft",
-            totalAmount,
-            notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
-            memos: "",
-            terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
-            items: {
-                create: selectedItems.map((item: any, idx: number) => {
-                    // Preserve an explicit zero quantity (optional/alternate estimate
-                    // lines are shown at $0) — only a missing/unparseable quantity
-                    // falls back to 1. `|| 1` would reprice a $0 option into the PO.
-                    const parsedQty = parseFloat(item.quantity);
-                    const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
-                    return {
-                        description: item.name + (item.description ? ` - ${item.description}` : ""),
-                        quantity: qty,
-                        unitCost: parseFloat(item.unitCost) || 0,
-                        total: qty * (parseFloat(item.unitCost) || 0),
-                        order: idx,
-                        costCodeId: item.costCodeId,
-                        costTypeId: item.costTypeId
-                    };
-                })
-            }
+    // Create the PO, its PurchaseOrderItems, the PO<->item join rows, and the legacy mirror
+    // resync all inside ONE retried transaction (mirrors quickCreatePOAndLink's fix) — the PO
+    // used to commit in its own transaction before the link step ran separately, so a failure in
+    // the link step left an orphaned, unlinked PO behind, and a retry after the fact created a
+    // second one instead of resuming the first. The attempt loop keeps the same PO-code
+    // collision retry quickCreatePOAndLink uses: a P2002 on the code aborts that attempt's
+    // transaction cleanly (nothing committed), so the next attempt starts clean.
+    let newPo: any;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            newPo = await withTxRetry(() => prisma.$transaction(async (tx) => {
+                // Selected items are pre-validated against the in-estimate selection above —
+                // never the raw itemIds argument.
+                await lockEstimateItemLinks(tx, estimateId, selectedItems.map((item: any) => item.id));
+                const count = await tx.purchaseOrder.count({ where: { projectId } });
+                const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
+                const created = await tx.purchaseOrder.create({
+                    data: {
+                        projectId,
+                        vendorId,
+                        code,
+                        status: "Draft",
+                        totalAmount,
+                        notes: `Auto-generated from Estimate: ${estimate.title}\n\nReview line items and update costs/quantities as needed.`,
+                        memos: "",
+                        terms: "Standard Subcontractor/Vendor terms apply unless overridden.",
+                        items: {
+                            create: selectedItems.map((item: any, idx: number) => {
+                                // Preserve an explicit zero quantity (optional/alternate estimate
+                                // lines are shown at $0) — only a missing/unparseable quantity
+                                // falls back to 1. `|| 1` would reprice a $0 option into the PO.
+                                const parsedQty = parseFloat(item.quantity);
+                                const qty = Number.isFinite(parsedQty) ? parsedQty : 1;
+                                return {
+                                    description: item.name + (item.description ? ` - ${item.description}` : ""),
+                                    quantity: qty,
+                                    unitCost: parseFloat(item.unitCost) || 0,
+                                    total: qty * (parseFloat(item.unitCost) || 0),
+                                    order: idx,
+                                    costCodeId: item.costCodeId,
+                                    costTypeId: item.costTypeId
+                                };
+                            })
+                        }
+                    }
+                });
+                for (const item of selectedItems) {
+                    await migrateLegacyPoLink(tx, item.id);
+                }
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: selectedItems.map((item: any) => ({ estimateItemId: item.id, purchaseOrderId: created.id })),
+                    skipDuplicates: true,
+                });
+                for (const item of selectedItems) {
+                    await syncLegacyPoLink(tx, item.id);
+                }
+                return created;
+            }));
+            break;
+        } catch (e: any) {
+            // Unique constraint violation on code — retry with the next number. Any other
+            // error (including a deadlock withTxRetry already exhausted its own retries on)
+            // propagates immediately. Check e.meta?.target too, not just e.code, so a P2002 on
+            // some unrelated constraint inside this same transaction doesn't get mistaken for a
+            // code collision and silently retried instead of surfaced.
+            // NOTE: PurchaseOrder.code has no unique constraint in the schema yet (see
+            // prisma/schema.prisma ~1553), so this P2002 branch may never actually fire, and
+            // concurrent creates from different estimates can still produce duplicate codes —
+            // that gap needs its own migration + duplicate-cleanup plan, out of scope here.
+            const target = e?.meta?.target;
+            const isCodeCollision = e?.code === "P2002"
+                && (Array.isArray(target) ? target.includes("code") : typeof target === "string" && target.includes("code"));
+            if (!isCodeCollision || attempt === 4) throw e;
         }
-    });
+    }
 
     revalidatePath(`/projects/${projectId}/purchase-orders`);
-    return newPo;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(newPo));
 }
 
 export async function updatePurchaseOrder(id: string, data: any) {
@@ -9565,8 +9920,9 @@ export async function updatePurchaseOrder(id: string, data: any) {
 
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    
-    return po;
+
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function deletePurchaseOrder(id: string) {
@@ -9574,7 +9930,56 @@ export async function deletePurchaseOrder(id: string) {
     const po = await prisma.purchaseOrder.findUnique({ where: { id } });
     if (!po) return;
     assertFinancialProjectScope(user, po.projectId);
-    await prisma.purchaseOrder.delete({ where: { id } });
+
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // Lock this PurchaseOrder row FIRST, before discovering which items are currently
+        // linked to it. Without this, the "affected" snapshot below is a bare read that races
+        // a concurrent link/quick-create/legacy-migrate: that operation could commit a brand
+        // new join row (or migrate the legacy scalar mirror onto this PO) in the gap between
+        // our snapshot and the delete, so our resync loop — built from the stale, possibly-empty
+        // snapshot — would never touch that item's legacy mirror, leaving it dangling once the
+        // PO it names has been deleted out from under it.
+        //
+        // Every PO-link writer (linkPOToEstimateItem, unlinkPOFromEstimateItem, and
+        // restoreEstimateItemAssociations) locks its target PurchaseOrder id(s) through
+        // lockEstimateItemLinks BEFORE the Estimate/EstimateItem locks — see that function's
+        // doc comment for why PurchaseOrder leads the order. Locking it here, first, keeps this
+        // path consistent with that same order (PurchaseOrder → Estimate → EstimateItem below).
+        await tx.$queryRaw`SELECT id FROM "PurchaseOrder" WHERE id = ${id} FOR UPDATE`;
+
+        // Collect affected items BEFORE the delete cascades their join rows away, so their
+        // legacy scalar mirrors can be resynced even when other links survive (the FK alone
+        // would only null out the mirror for items whose one-and-only link was this PO).
+        const affected = await tx.estimateItemPurchaseOrder.findMany({
+            where: { purchaseOrderId: id },
+            select: { estimateItemId: true },
+        });
+        if (affected.length > 0) {
+            const items = await tx.estimateItem.findMany({
+                where: { id: { in: affected.map((a) => a.estimateItemId) } },
+                select: { id: true, estimateId: true },
+            });
+            // Group by estimate and lock each group in sorted order so this commutes with
+            // every other path's Estimate → sorted-EstimateItem lock order instead of
+            // deadlocking against it. This PO is already locked above — passing it again here
+            // is a harmless re-lock (same transaction already holds it) that keeps every
+            // lockEstimateItemLinks call site symmetric.
+            const byEstimate = new Map<string, string[]>();
+            for (const it of items) {
+                const arr = byEstimate.get(it.estimateId) ?? [];
+                arr.push(it.id);
+                byEstimate.set(it.estimateId, arr);
+            }
+            for (const [estId, itemIds] of Array.from(byEstimate.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+                await lockEstimateItemLinks(tx, estId, itemIds, [id]);
+            }
+        }
+        await tx.purchaseOrder.delete({ where: { id } });
+        for (const link of affected) {
+            await syncLegacyPoLink(tx, link.estimateItemId);
+        }
+    }));
+
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
 }
 
@@ -9609,7 +10014,8 @@ export async function approvePurchaseOrder(id: string, signatureName: string) {
     
     revalidatePath(`/projects/${po.projectId}/purchase-orders/${id}`);
     revalidatePath(`/projects/${po.projectId}/purchase-orders`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
 export async function uploadPurchaseOrderFile(purchaseOrderId: string, formData: FormData) {
@@ -9719,7 +10125,7 @@ export async function uploadPurchaseOrderFileFromBuffer(
 }
 
 export async function uploadEstimateFile(estimateId: string, formData: FormData) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     const file = formData.get("file") as File;
     if (!file) throw new Error("No file uploaded");
 
@@ -9766,9 +10172,12 @@ export async function uploadEstimateFile(estimateId: string, formData: FormData)
 }
 
 export async function deleteEstimateFile(fileId: string) {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
     const file = await prisma.estimateFile.findUnique({ where: { id: fileId }, include: { estimate: { select: { id: true, code: true, title: true, status: true, totalAmount: true, projectId: true, leadId: true } } } });
     if (!file) return;
+    // Addressed by file id, so the owning estimate has to be resolved before the
+    // horizontal check can run.
+    assertEstimateScope(user, file.estimate);
 
     await prisma.estimateFile.delete({ where: { id: fileId } });
     if (file.estimate.projectId) {
@@ -9777,7 +10186,7 @@ export async function deleteEstimateFile(fileId: string) {
 }
 
 export async function getEstimateFiles(estimateId: string) {
-    await assertEstimatePermission();
+    await assertEstimateAccess(estimateId);
     return prisma.estimateFile.findMany({
         where: { estimateId },
         orderBy: { createdAt: "desc" },
@@ -10322,7 +10731,8 @@ export async function createProductLibraryItem(data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateProductLibraryItem(id: string, data: {
@@ -10348,7 +10758,8 @@ export async function updateProductLibraryItem(id: string, data: {
         },
     });
     revalidatePath("/company/product-library");
-    return item;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteProductLibraryItem(id: string) {
@@ -11929,7 +12340,8 @@ export async function addTeamCandidate(decisionId: string | null, data: {
         entityName: candidate.name,
     });
 
-    return candidate;
+    // price is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(candidate));
 }
 
 export async function importBoardPicksAsDecisions(projectId: string) {
@@ -12108,6 +12520,7 @@ export async function createDailyLog(projectId: string, data: {
     workPerformed: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
     photoUrls?: { url: string; caption?: string }[];
 }) {
     // Hardened (dispatch-arc foundation): derive the author from an authorized staff session.
@@ -12116,6 +12529,14 @@ export async function createDailyLog(projectId: string, data: {
         projectId,
         actorUserId: author.id,
         ...data,
+    });
+
+    // Best-effort enrichment after the response: pin the AI task match on the
+    // log, then post the summary (with tomorrow's task) to the project's Chat
+    // space. Neither may block or fail the log write.
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(log.id);
+        await postDailyLogSummary(log.id);
     });
 
     revalidatePath(`/projects/${projectId}/dailylogs`);
@@ -12129,6 +12550,7 @@ export async function updateDailyLog(id: string, data: {
     workPerformed?: string;
     materialsDelivered?: string;
     issues?: string;
+    nextSteps?: string;
 }) {
     // Hardened (dispatch-arc foundation): authorize against the persisted log project before updating.
     const target = await prisma.dailyLog.findUnique({ where: { id }, select: { projectId: true } });
@@ -12146,10 +12568,22 @@ export async function updateDailyLog(id: string, data: {
     }
     if (data.materialsDelivered !== undefined) updateData.materialsDelivered = data.materialsDelivered || null;
     if (data.issues !== undefined) updateData.issues = data.issues || null;
+    if (data.nextSteps !== undefined) updateData.nextSteps = data.nextSteps || null;
 
     const log = await prisma.dailyLog.update({
         where: { id },
         data: updateData,
+    });
+
+    // Re-run the task match on any edit; re-post to Chat only when the
+    // narrative fields changed (a weather/date touch-up shouldn't re-ping the
+    // whole crew space).
+    const narrativeChanged = data.workPerformed !== undefined
+        || data.nextSteps !== undefined
+        || data.issues !== undefined;
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(log.id);
+        if (narrativeChanged) await postDailyLogSummary(log.id);
     });
 
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
@@ -12180,6 +12614,13 @@ export async function addDailyLogPhotos(dailyLogId: string, photos: { url: strin
             caption: p.caption || null,
         })),
     });
+    // Bump the log row: its updatedAt versions the content for the matcher's
+    // atomic stale-store guard, and photo rows alone don't touch it.
+    await prisma.dailyLog.update({ where: { id: dailyLogId }, data: { updatedAt: new Date() } });
+
+    // Photos are matcher evidence — refresh the pick. No Chat re-post for
+    // photo-only mutations.
+    runAfterRequest(() => runDailyLogTaskMatch(dailyLogId));
 
     revalidatePath(`/projects/${log.projectId}/dailylogs`);
     return { success: true };
@@ -12196,13 +12637,17 @@ export async function deleteDailyLogPhoto(photoId: string) {
 
     await prisma.$transaction(async tx => {
         await tx.dailyLogPhoto.delete({ where: { id: photoId } });
-        if (photo.sharedToPortal) {
-            await tx.dailyLog.update({
-                where: { id: photo.dailyLog.id },
-                data: { sharedContentHash: null },
-            });
-        }
+        // Bump the log row regardless: updatedAt versions the content for the
+        // matcher's atomic stale-store guard.
+        await tx.dailyLog.update({
+            where: { id: photo.dailyLog.id },
+            data: photo.sharedToPortal ? { sharedContentHash: null, updatedAt: new Date() } : { updatedAt: new Date() },
+        });
     });
+
+    // Photos are matcher evidence — refresh the pick after removal too.
+    runAfterRequest(() => runDailyLogTaskMatch(photo.dailyLog.id));
+
     revalidatePath(`/projects/${photo.dailyLog.projectId}/dailylogs`);
     return { success: true };
 }
@@ -12571,7 +13016,8 @@ export async function createCatalogItem(data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function updateCatalogItem(id: string, data: {
@@ -12589,7 +13035,8 @@ export async function updateCatalogItem(id: string, data: {
         include: { costCode: { select: { code: true, name: true } } },
     });
     revalidatePath("/company/my-items");
-    return item;
+    // unitCost is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(item));
 }
 
 export async function deleteCatalogItem(id: string) {
@@ -12758,7 +13205,8 @@ export async function createBidPackage(projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function updateBidPackage(id: string, projectId: string, data: {
@@ -12783,7 +13231,8 @@ export async function updateBidPackage(id: string, projectId: string, data: {
     });
     revalidatePath(`/projects/${projectId}/bid-packages`);
     revalidatePath(`/projects/${projectId}/bid-packages/${id}/edit`);
-    return pkg;
+    // totalBudget is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pkg));
 }
 
 export async function deleteBidPackage(id: string, projectId: string) {
@@ -12812,7 +13261,8 @@ export async function addBidScope(packageId: string, projectId: string, data: {
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return scope;
+    // budgetAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(scope));
 }
 
 export async function deleteBidScope(scopeId: string, packageId: string, projectId: string) {
@@ -12866,7 +13316,8 @@ export async function recordBidResponse(invitationId: string, packageId: string,
         },
     });
     revalidatePath(`/projects/${projectId}/bid-packages/${packageId}/edit`);
-    return inv;
+    // bidAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(inv));
 }
 
 export async function awardBid(packageId: string, invitationId: string, projectId: string) {
@@ -12919,7 +13370,8 @@ export async function createRetainer(projectId: string, data: {
     });
 
     revalidatePath(`/projects/${projectId}/retainers`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function updateRetainer(id: string, data: {
@@ -12947,7 +13399,8 @@ export async function updateRetainer(id: string, data: {
     const retainer = await prisma.retainer.update({ where: { id }, data: updateData });
     revalidatePath(`/projects/${existing.projectId}/retainers`);
     revalidatePath(`/projects/${existing.projectId}/retainers/${id}`);
-    return retainer;
+    // totalAmount/balanceDue/amountPaid are Prisma Decimals — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(retainer));
 }
 
 export async function deleteRetainer(id: string) {
@@ -13120,7 +13573,7 @@ export async function deleteDocumentComment(commentId: string) {
 // ========== PER-ITEM APPROVAL ==========
 
 export async function updateItemApproval(itemId: string, status: "approved" | "rejected" | null, note?: string) {
-    await assertEstimatePermission();
+    await assertEstimateItemAccess([itemId]);
     try {
         return await prisma.estimateItem.update({
             where: { id: itemId },
@@ -13133,7 +13586,9 @@ export async function updateItemApproval(itemId: string, status: "approved" | "r
 }
 
 export async function bulkUpdateItemApproval(itemIds: string[], status: "approved" | "rejected" | null) {
-    await assertEstimatePermission();
+    // All-or-nothing: one out-of-scope id fails the whole batch rather than
+    // being quietly dropped from the updateMany.
+    await assertEstimateItemAccess(itemIds);
     try {
         await prisma.estimateItem.updateMany({
             where: { id: { in: itemIds } },
@@ -13144,6 +13599,80 @@ export async function bulkUpdateItemApproval(itemIds: string[], status: "approve
         return { success: false, count: 0, error: "Update failed — database column may not be migrated yet" };
     }
     return { success: true, count: itemIds.length }
+}
+
+// Keeps the deprecated EstimateItem.purchaseOrderId mirror pointing at the oldest surviving
+// link (or null) so a rollback to the pre-many-to-many build stays correct. Secondary `id`
+// ordering makes the pick deterministic when two rows share the identical `createdAt` (e.g. a
+// migrated legacy row and a brand-new link inserted in the same transaction both get the same
+// CURRENT_TIMESTAMP from Postgres) — without it, ordering by `createdAt` alone could pick the
+// NEW link as the mirror instead of the original.
+async function syncLegacyPoLink(tx: Prisma.TransactionClient, estimateItemId: string) {
+    const oldest = await tx.estimateItemPurchaseOrder.findFirst({
+        where: { estimateItemId },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        select: { purchaseOrderId: true },
+    });
+    await tx.estimateItem.update({
+        where: { id: estimateItemId },
+        data: { purchaseOrderId: oldest?.purchaseOrderId ?? null },
+    });
+}
+
+// If the item still carries a non-null legacy scalar link with no matching join row (predates
+// the join table, or the backfill hasn't run yet), create that join row first so it isn't
+// silently dropped when a new link is added. Safe to call unconditionally — no-ops otherwise.
+//
+// Uses createMany + skipDuplicates rather than a bare create with a P2002 catch: a unique
+// violation from a bare create aborts the whole surrounding Postgres transaction, so every
+// later statement in the same tx — including syncLegacyPoLink — would fail too, even though
+// "the row already exists" is exactly the no-op case this function exists to handle.
+//
+// Backdates the migrated row to the item's own `createdAt` (not "now") so it is genuinely the
+// oldest link and syncLegacyPoLink's findFirst deterministically picks it as the mirror.
+async function migrateLegacyPoLink(tx: Prisma.TransactionClient, estimateItemId: string) {
+    const item = await tx.estimateItem.findUnique({
+        where: { id: estimateItemId },
+        select: { purchaseOrderId: true, createdAt: true },
+    });
+    if (!item?.purchaseOrderId) return;
+    await tx.estimateItemPurchaseOrder.createMany({
+        data: [{ estimateItemId, purchaseOrderId: item.purchaseOrderId, createdAt: item.createdAt }],
+        skipDuplicates: true,
+    });
+}
+
+// Locks the affected PurchaseOrder row(s), then the parent Estimate, then the affected
+// EstimateItem row(s) FOR UPDATE — all in a stable (sorted) id order within each type — before
+// any read or write of purchaseOrderLinks / the legacy scalar mirror. Every path that mutates
+// PO<->item links takes these same locks in this same order so concurrent link/unlink/backfill
+// operations serialize instead of racing — without it, two concurrent unlinks on the same item
+// can each read the other's uncommitted delete and pick the wrong "oldest surviving link" in
+// syncLegacyPoLink, resurrecting a link the user just removed.
+//
+// PurchaseOrder leads (rather than following Estimate) because deletePurchaseOrder must lock its
+// own PO row before it can even discover which estimate(s)/item(s) are currently linked to it
+// (that discovery is itself a snapshot read racing against concurrent links) — putting
+// PurchaseOrder after Estimate would force deletePurchaseOrder to lock Estimate rows it hasn't
+// identified yet, which isn't possible without re-introducing that race. Every caller that knows
+// its target PurchaseOrder id(s) upfront (link/unlink/restore/delete) passes them here so this
+// stays the one global order; callers creating a brand-new PO (quickCreatePOAndLink,
+// createPurchaseOrderFromEstimate) have no existing row to lock and pass none.
+async function lockEstimateItemLinks(
+    tx: Prisma.TransactionClient,
+    estimateId: string,
+    estimateItemIds: string[],
+    purchaseOrderIds: string[] = [],
+) {
+    const sortedPoIds = Array.from(new Set(purchaseOrderIds)).sort();
+    for (const id of sortedPoIds) {
+        await tx.$queryRaw`SELECT id FROM "PurchaseOrder" WHERE id = ${id} FOR UPDATE`;
+    }
+    await lockMoneyParents(tx, { estimateId });
+    const sortedIds = Array.from(new Set(estimateItemIds)).sort();
+    for (const id of sortedIds) {
+        await tx.$queryRaw`SELECT id FROM "EstimateItem" WHERE id = ${id} FOR UPDATE`;
+    }
 }
 
 export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrderId: string) {
@@ -13161,15 +13690,22 @@ export async function linkPOToEstimateItem(estimateItemId: string, purchaseOrder
     if (!po) throw new Error("Purchase order not found");
     if (po.projectId !== item.estimate.projectId) throw new Error("PO must belong to the same project");
 
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId },
-    });
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId], [purchaseOrderId]);
+        await migrateLegacyPoLink(tx, estimateItemId);
+        await tx.estimateItemPurchaseOrder.createMany({
+            data: [{ estimateItemId, purchaseOrderId }],
+            skipDuplicates: true,
+        });
+        await syncLegacyPoLink(tx, estimateItemId);
+    }));
+
     revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
 }
 
-export async function unlinkPOFromEstimateItem(estimateItemId: string) {
+export async function unlinkPOFromEstimateItem(estimateItemId: string, purchaseOrderId: string) {
     const user = await assertFinancialPermission();
 
     const item = await prisma.estimateItem.findUnique({
@@ -13179,10 +13715,15 @@ export async function unlinkPOFromEstimateItem(estimateItemId: string) {
     if (!item) throw new Error("Estimate item not found");
     if (!item.estimate.projectId) throw new Error("Purchase orders require a project");
     assertFinancialProjectScope(user, item.estimate.projectId);
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId: null },
-    });
+
+    await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId], [purchaseOrderId]);
+        await tx.estimateItemPurchaseOrder.deleteMany({
+            where: { estimateItemId, purchaseOrderId },
+        });
+        await syncLegacyPoLink(tx, estimateItemId);
+    }));
+
     if (item?.estimate.projectId) {
         revalidatePath(`/projects/${item.estimate.projectId}/estimates`);
     }
@@ -13201,58 +13742,285 @@ export async function quickCreatePOAndLink(estimateItemId: string, data: { vendo
     const projectId = item.estimate.projectId;
     assertFinancialProjectScope(user, projectId);
 
-    // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count
+    // Retry loop to handle TOCTOU race: two concurrent creates could pick the same count.
+    // Each attempt is its own retried transaction that creates the PO AND its join row AND
+    // resyncs the legacy mirror atomically. A P2002 on the code aborts that attempt's
+    // transaction cleanly (nothing committed) so the next attempt retries clean — the PO was
+    // previously created in a separate transaction from its link, which meant a retry after
+    // the fact left an orphaned, unlinked PO behind and created a second one.
     let po: any;
     for (let attempt = 0; attempt < 5; attempt++) {
-        const count = await prisma.purchaseOrder.count({ where: { projectId } });
-        const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
         try {
-            po = await prisma.purchaseOrder.create({
-                data: {
-                    projectId,
-                    vendorId: data.vendorId,
-                    code,
-                    totalAmount: data.amount,
-                    notes: data.notes || null,
-                    status: "Draft",
-                },
-                include: { vendor: true },
-            });
+            po = await withTxRetry(() => prisma.$transaction(async (tx) => {
+                await lockEstimateItemLinks(tx, item.estimateId, [estimateItemId]);
+                const count = await tx.purchaseOrder.count({ where: { projectId } });
+                const code = `PO-${(count + 1 + attempt).toString().padStart(3, "0")}`;
+                const created = await tx.purchaseOrder.create({
+                    data: {
+                        projectId,
+                        vendorId: data.vendorId,
+                        code,
+                        totalAmount: data.amount,
+                        notes: data.notes || null,
+                        status: "Draft",
+                    },
+                    include: { vendor: true },
+                });
+                await migrateLegacyPoLink(tx, estimateItemId);
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: [{ estimateItemId, purchaseOrderId: created.id }],
+                    skipDuplicates: true,
+                });
+                await syncLegacyPoLink(tx, estimateItemId);
+                return created;
+            }));
             break;
         } catch (e: any) {
-            // Unique constraint violation on code — retry with next number
-            if (attempt === 4) throw e;
+            // Unique constraint violation on code — retry with the next number. Any other
+            // error (including a deadlock withTxRetry already exhausted its own retries on)
+            // propagates immediately.
+            if (e?.code !== "P2002" || attempt === 4) throw e;
         }
     }
 
-    await prisma.estimateItem.update({
-        where: { id: estimateItemId },
-        data: { purchaseOrderId: po.id },
-    });
-
     revalidatePath(`/projects/${projectId}/purchase-orders`);
     revalidatePath(`/projects/${projectId}/estimates`);
-    return po;
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(po));
+}
+
+// Result of restoreEstimateItemAssociations — reports exactly what was (and wasn't) restored
+// so the caller can distinguish "nothing left to do" from "nothing happened yet". Two skip
+// reasons are classified separately because they call for opposite caller behavior:
+//   - missing.itemIds is RETRYABLE: the EstimateItem itself doesn't exist yet (e.g. its
+//     row-recreation save hasn't landed, or hasn't happened at all). It may come back on a
+//     later save, so the caller should keep these entries pending and retry.
+//   - missing.purchaseOrderIds / missing.scheduleTaskIds are PERMANENT: the target itself is
+//     gone, out of this estimate's project scope, or (for a ScheduleTask) already owned by a
+//     different EstimateItem. Retrying can never fix these — the caller should drop them.
+export type RestoreEstimateItemAssociationsResult = {
+    restoredLinks: { estimateItemId: string; purchaseOrderId: string }[];
+    restoredScheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+    missing: {
+        itemIds: string[];
+        purchaseOrderIds: string[];
+        scheduleTaskIds: string[];
+    };
+};
+
+// Backs the durable delete-undo (Part B). Re-creates join rows and re-points schedule tasks
+// severed when an estimate item was deleted (both cascade/SetNull at the DB level), and
+// resyncs the legacy scalar mirror. Idempotent — skips ids that no longer exist rather than
+// throwing, so a partial restore (e.g. a PO deleted in the meantime) still succeeds. Reports
+// exactly what it restored vs. skipped (see RestoreEstimateItemAssociationsResult) instead of
+// a bare success — the caller cannot tell "restored everything" from "restored nothing" any
+// other way, and treating both as plain success risks clearing a still-needed retry payload.
+export async function restoreEstimateItemAssociations({
+    estimateId,
+    links,
+    scheduleTasks,
+}: {
+    estimateId: string;
+    links: { estimateItemId: string; purchaseOrderId: string; createdAt?: string | Date }[];
+    scheduleTasks: { scheduleTaskId: string; estimateItemId: string }[];
+}): Promise<RestoreEstimateItemAssociationsResult> {
+    // This restores TWO independent kinds of association from an undo snapshot: PO<->item
+    // links (financial data) and estimateItemId<->ScheduleTask repoints (schedule data). They
+    // are authorized separately by payload — per permissions.ts, FINANCE has no "schedules"
+    // permission, so a FINANCE user must not be able to repoint ScheduleTask rows just because
+    // they're restoring PO links in the same undo call, and a schedule-only user must not need
+    // financial access just to restore a task link. A payload the caller isn't permitted to
+    // touch throws (rather than being silently skipped) — consistent with every other auth
+    // assertion in this file, and it keeps an undo from ever reporting "done" while quietly
+    // leaving part of the restore undone.
+    const user = await assertActiveStaff();
+
+    const estimate = await prisma.estimate.findUnique({
+        where: { id: estimateId },
+        select: { projectId: true },
+    });
+    if (!estimate) throw new Error("Estimate not found");
+    if (!estimate.projectId) throw new Error("Purchase orders require a project");
+    const projectId = estimate.projectId;
+
+    if (links.length > 0) {
+        if (!hasPermission(user, "financialReports")) throw new Error("Forbidden: restoring purchase-order links requires financial access");
+        assertFinancialProjectScope(user, projectId);
+    }
+    if (scheduleTasks.length > 0) {
+        if (!hasPermission(user, "schedules") || !canAccessProject(user, projectId)) {
+            throw new Error("Forbidden: restoring schedule-task links requires schedule access");
+        }
+    }
+
+    const result = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        // PO-item ids are only those referenced by the `links` payload — the financial
+        // permission asserted above authorizes the legacy PO mirror ONLY for these items. An
+        // item that appears solely in `scheduleTasks` is authorized under the schedules
+        // permission and must never reach migrateLegacyPoLink/syncLegacyPoLink below, or a
+        // schedules-only caller could pass a valid EstimateItem id (paired with even a
+        // nonexistent ScheduleTask id) and clobber that item's financial PO link.
+        const poItemIds = new Set(links.map(l => l.estimateItemId));
+        const candidateItemIds = Array.from(new Set([
+            ...links.map(l => l.estimateItemId),
+            ...scheduleTasks.map(s => s.estimateItemId),
+        ]));
+        // Purchase-order ids are known upfront from the undo snapshot, so lock them now too —
+        // PurchaseOrder → Estimate → EstimateItem is the global order every PO-link path obeys
+        // (see lockEstimateItemLinks's doc comment). Lock the full candidate set (PO items AND
+        // schedule-only items) since both are read/written below and must serialize against
+        // concurrent link/delete operations — only the migrate/sync calls further down are
+        // restricted to PO items.
+        await lockEstimateItemLinks(tx, estimateId, candidateItemIds, links.map(l => l.purchaseOrderId));
+
+        const existingItems = candidateItemIds.length
+            ? await tx.estimateItem.findMany({
+                where: { id: { in: candidateItemIds }, estimateId },
+                select: { id: true },
+            })
+            : [];
+        const existingItemIds = new Set(existingItems.map(i => i.id));
+
+        // RETRYABLE: the EstimateItem itself isn't back yet. Collected from both payloads —
+        // an item id can appear in `links`, `scheduleTasks`, or both.
+        const missingItemIds = new Set<string>();
+        for (const l of links) if (!existingItemIds.has(l.estimateItemId)) missingItemIds.add(l.estimateItemId);
+        for (const st of scheduleTasks) if (!existingItemIds.has(st.estimateItemId)) missingItemIds.add(st.estimateItemId);
+
+        // Materialize any pre-existing legacy scalar link into the join table BEFORE creating
+        // the restored links below, so the final syncLegacyPoLink pass sees the full set of
+        // links (legacy + restored) instead of racing its own migration. PO items only.
+        for (const itemId of existingItemIds) {
+            if (poItemIds.has(itemId)) {
+                await migrateLegacyPoLink(tx, itemId);
+            }
+        }
+
+        const validLinks = links.filter(l => existingItemIds.has(l.estimateItemId));
+        const restoredLinks: { estimateItemId: string; purchaseOrderId: string }[] = [];
+        // PERMANENT: the PO itself is gone or out of this project — retrying can't fix it.
+        const missingPurchaseOrderIds = new Set<string>();
+        if (validLinks.length > 0) {
+            // A PO must belong to the SAME project as this estimate — otherwise a caller
+            // authorized for this estimate could pass an id belonging to another project's PO
+            // (or ScheduleTask, below) and have it linked here.
+            const existingPos = await tx.purchaseOrder.findMany({
+                where: { id: { in: validLinks.map(l => l.purchaseOrderId) }, projectId },
+                select: { id: true },
+            });
+            const existingPoIds = new Set(existingPos.map(p => p.id));
+            const linksToCreate = validLinks
+                .filter(l => existingPoIds.has(l.purchaseOrderId))
+                .map(l => ({
+                    estimateItemId: l.estimateItemId,
+                    purchaseOrderId: l.purchaseOrderId,
+                    // Preserve the original link's timestamp when the caller has it (e.g. an
+                    // undo snapshot), so syncLegacyPoLink's oldest-link ordering stays correct
+                    // instead of treating a restored link as brand new.
+                    ...(l.createdAt ? { createdAt: new Date(l.createdAt) } : {}),
+                }));
+            if (linksToCreate.length > 0) {
+                await tx.estimateItemPurchaseOrder.createMany({
+                    data: linksToCreate,
+                    skipDuplicates: true,
+                });
+            }
+            for (const l of validLinks) {
+                if (existingPoIds.has(l.purchaseOrderId)) {
+                    restoredLinks.push({ estimateItemId: l.estimateItemId, purchaseOrderId: l.purchaseOrderId });
+                } else {
+                    missingPurchaseOrderIds.add(l.purchaseOrderId);
+                }
+            }
+        }
+
+        if (scheduleTasks.length > 0) {
+            // Schedule-task repointing writes ScheduleTask rows, so it must take the Project
+            // row lock FIRST — the same order lockTaskAssignmentParent establishes for every
+            // other ScheduleTask writer in schedule-core.ts (Project → ScheduleTask; see its
+            // doc comment there). Taking it here — after the PurchaseOrder/Estimate/EstimateItem
+            // locks above, before any ScheduleTask lock below — makes this function's full lock
+            // chain (PurchaseOrder → Estimate → EstimateItem → Project → ScheduleTask) a strict
+            // extension of both established orders, so it can't invert against either family of
+            // writer. (schedule-core.ts itself never acquires a PurchaseOrder, Estimate, or
+            // EstimateItem lock, so there's no reciprocal ordering constraint on that side to
+            // reconcile — no follow-up change to schedule-core.ts is needed for this.)
+            await tx.$queryRaw`SELECT id FROM "Project" WHERE id = ${projectId} FOR UPDATE`;
+        }
+
+        // Sort so two concurrent restores lock ScheduleTask rows in the same global order.
+        const sortedScheduleTasks = [...scheduleTasks].sort((a, b) => a.scheduleTaskId.localeCompare(b.scheduleTaskId));
+        const restoredScheduleTasks: { scheduleTaskId: string; estimateItemId: string }[] = [];
+        // PERMANENT: the ScheduleTask is gone, out of project scope, or owned by a different
+        // item — retrying can't fix any of these (item-missing is tracked separately above).
+        const missingScheduleTaskIds = new Set<string>();
+        for (const st of sortedScheduleTasks) {
+            if (!existingItemIds.has(st.estimateItemId)) continue;
+            const rows = await tx.$queryRaw<{ id: string; projectId: string | null; estimateItemId: string | null }[]>`
+                SELECT id, "projectId", "estimateItemId" FROM "ScheduleTask" WHERE id = ${st.scheduleTaskId} FOR UPDATE
+            `;
+            const task = rows[0];
+            if (!task) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            // Same-project + no-theft guard: a ScheduleTask must belong to this estimate's
+            // project, and must be either unlinked or already pointing at the target item —
+            // never repoint a task that belongs to a different estimate item (schedule-task
+            // theft across items or projects).
+            if (task.projectId !== projectId) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            if (task.estimateItemId && task.estimateItemId !== st.estimateItemId) { missingScheduleTaskIds.add(st.scheduleTaskId); continue; }
+            await tx.scheduleTask.update({
+                where: { id: st.scheduleTaskId },
+                data: { estimateItemId: st.estimateItemId },
+            });
+            restoredScheduleTasks.push({ scheduleTaskId: st.scheduleTaskId, estimateItemId: st.estimateItemId });
+        }
+
+        // Resync the legacy mirror only for PO items — never for schedule-only candidates (see
+        // poItemIds above); a schedules-only caller has no financial permission and must not be
+        // able to reach this write.
+        for (const itemId of existingItemIds) {
+            if (poItemIds.has(itemId)) {
+                await syncLegacyPoLink(tx, itemId);
+            }
+        }
+
+        return {
+            restoredLinks,
+            restoredScheduleTasks,
+            missing: {
+                itemIds: Array.from(missingItemIds),
+                purchaseOrderIds: Array.from(missingPurchaseOrderIds),
+                scheduleTaskIds: Array.from(missingScheduleTaskIds),
+            },
+        };
+    }));
+
+    revalidatePath(`/projects/${projectId}/estimates`);
+    return result;
 }
 
 export async function getProjectPurchaseOrdersForLinking(projectId: string) {
     await assertFinancialProjectAccess(projectId);
 
-    return prisma.purchaseOrder.findMany({
+    const pos = await prisma.purchaseOrder.findMany({
         where: { projectId },
         select: { id: true, code: true, totalAmount: true, status: true, vendor: { select: { id: true, name: true } } },
         orderBy: { createdAt: "desc" },
     });
+    // totalAmount is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return JSON.parse(JSON.stringify(pos));
 }
 
 export async function createEstimateFromRoomDesign(roomId: string) {
-    await assertEstimatePermission();
+    const user = await assertEstimatePermission();
 
     const room = await prisma.roomDesign.findUnique({
         where: { id: roomId },
         include: { assets: true },
     });
     if (!room) throw new Error("Room Design not found");
+    // The new estimate lands on the room's project/lead, so that owner is what
+    // has to be scoped — the room id alone says nothing about access.
+    assertEstimateScope(user, room);
 
     const isProject = !!room.projectId;
     const ownerId = isProject ? room.projectId : room.leadId;
@@ -13339,7 +14107,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             ? productById.get(asset.assetId.slice(5))
             : undefined;
         const def = getItemDef(asset.assetId);
-        const markupPercent = 25;
+        const marginPercent = LEGACY_MARKUP_MARGIN_PCT;
         const name = product?.name ?? def?.name ?? `${asset.assetType.charAt(0).toUpperCase()}${asset.assetType.slice(1)}`;
 
         const metadata = (asset.metadata ?? {}) as Record<string, any>;
@@ -13375,7 +14143,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             ?? `GTR-${(def?.category ?? "item").slice(0, 3).toUpperCase()}-${(def?.id ?? asset.assetId).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 10)}-${wIn}`;
         detailsArray.unshift(`SKU: ${sku}`);
 
-        const unitCost = Math.round(baseCost * (1 + markupPercent / 100));
+        const unitCost = roundMoney(sellFromMargin(baseCost, marginPercent));
         const total = unitCost * 1;
         totalEstimate += total;
 
@@ -13387,7 +14155,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
             type: "Material",
             quantity: 1,
             baseCost,
-            markupPercent,
+            markupPercent: marginPercent,
             unitCost,
             total,
             costCodeId,
@@ -13449,7 +14217,7 @@ export async function createEstimateFromRoomDesign(roomId: string) {
 }
 
 export async function addVoiceEstimateItem(projectId: string, name: string, quantity: number, unitCost: number) {
-    await assertEstimatePermission();
+    await assertEstimateProjectAccess(projectId);
     const estimate = await prisma.estimate.findFirst({
         where: { projectId },
         orderBy: { createdAt: "desc" }
@@ -13459,37 +14227,51 @@ export async function addVoiceEstimateItem(projectId: string, name: string, quan
         throw new Error("No active estimate found for this project. Please create an estimate first.");
     }
 
-    const lastItem = await prisma.estimateItem.findFirst({
-        where: { estimateId: estimate.id },
-        orderBy: { order: "desc" },
-        select: { order: true }
-    });
-    const nextOrder = lastItem ? lastItem.order + 1 : 0;
+    // One transaction, estimate locked FIRST (canonical Estimate → Invoice order), because the
+    // row insert and the itemsRevision bump must be atomic. Split across two autocommit
+    // statements — as this was — a concurrent saveEstimate can interleave between them: it takes
+    // the lock, passes its CAS against the not-yet-bumped revision, sees this brand-new row as
+    // absent from its own payload, deletes it as "removed by the user", and commits. Bumping
+    // inside the lock means that save either ran entirely before this insert (and is now stale,
+    // so its next attempt is rejected) or blocks until the bump is committed and fails its CAS.
+    // See docs/specs/estimate-item-optimistic-concurrency.md REVISION 2.
+    const item = await withTxRetry(() => prisma.$transaction(async (tx) => {
+        await lockMoneyParents(tx, { estimateId: estimate.id });
 
-    const item = await prisma.estimateItem.create({
-        data: {
-            estimateId: estimate.id,
-            name,
-            type: "Material",
-            quantity,
-            baseCost: unitCost,
-            markupPercent: 0,
-            unitCost,
-            total: quantity * unitCost,
-            order: nextOrder
-        }
-    });
+        const lastItem = await tx.estimateItem.findFirst({
+            where: { estimateId: estimate.id },
+            orderBy: { order: "desc" },
+            select: { order: true }
+        });
+        const nextOrder = lastItem ? lastItem.order + 1 : 0;
 
-    const allItems = await prisma.estimateItem.findMany({
-        where: { estimateId: estimate.id },
-        select: { total: true }
-    });
-    const totalAmount = allItems.reduce((sum, it) => sum + Number(it.total), 0);
+        const created = await tx.estimateItem.create({
+            data: {
+                estimateId: estimate.id,
+                name,
+                type: "Material",
+                quantity,
+                baseCost: unitCost,
+                markupPercent: 0,
+                unitCost,
+                total: quantity * unitCost,
+                order: nextOrder
+            }
+        });
 
-    await prisma.estimate.update({
-        where: { id: estimate.id },
-        data: { totalAmount }
-    });
+        const allItems = await tx.estimateItem.findMany({
+            where: { estimateId: estimate.id },
+            select: { total: true }
+        });
+        const totalAmount = allItems.reduce((sum, it) => sum + Number(it.total), 0);
+
+        await tx.estimate.update({
+            where: { id: estimate.id },
+            data: { totalAmount, itemsRevision: { increment: 1 } }
+        });
+
+        return created;
+    }));
 
     revalidatePath(`/projects/${projectId}/estimates/${estimate.id}`);
     revalidatePath(`/projects/${projectId}/estimates`);
@@ -13830,4 +14612,125 @@ export async function restoreOfficeTask(id: string) {
 
     revalidatePath("/tasks");
     return task;
+}
+
+// ============ Permits CRUD ============
+
+const PERMIT_STATUSES = ["applied", "issued", "inspections", "closed", "expired"] as const;
+
+// Shared staff-membership gate: caller must be a signed-in, non-disabled
+// staff user with access to this specific project (canAccessProject covers
+// ADMIN/MANAGER auto-pass plus per-user projectAccess/assignedProjects
+// scoping). Used anywhere a mutation is scoped to one project and the
+// weaker assertActiveStaff (any signed-in staff, any project) would be
+// too permissive.
+async function assertProjectMemberStaff(projectId: string) {
+    // assertActiveStaff already handles the ID-less dev-auth fallback and
+    // disabled-user rejection; its user carries projectAccess/assignedProjects.
+    const user = await assertActiveStaff();
+    if (!canAccessProject(user, projectId)) throw new Error("Forbidden");
+    return user;
+}
+
+async function assertPermitAccess(projectId: string) {
+    return assertProjectMemberStaff(projectId);
+}
+
+function parsePermitDate(value: string | undefined): Date | null | undefined {
+    if (value === undefined) return undefined;
+    if (!value) return null;
+    const parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export async function getPermits(projectId: string) {
+    await assertPermitAccess(projectId);
+    return prisma.permit.findMany({
+        where: { projectId },
+        orderBy: { createdAt: "desc" },
+    });
+}
+
+export async function createPermit(projectId: string, data: {
+    permitNumber: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    await assertPermitAccess(projectId);
+
+    const permitNumber = data.permitNumber?.trim();
+    if (!permitNumber) throw new Error("Permit number is required");
+
+    const status = data.status && (PERMIT_STATUSES as readonly string[]).includes(data.status)
+        ? data.status
+        : "applied";
+
+    const permit = await prisma.permit.create({
+        data: {
+            projectId,
+            permitNumber,
+            type: data.type || null,
+            status,
+            issuingAuthority: data.issuingAuthority || null,
+            issueDate: parsePermitDate(data.issueDate) ?? null,
+            expirationDate: parsePermitDate(data.expirationDate) ?? null,
+            notes: data.notes || null,
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}/permits`);
+    return permit;
+}
+
+export async function updatePermit(permitId: string, data: {
+    permitNumber?: string;
+    type?: string;
+    status?: string;
+    issuingAuthority?: string;
+    issueDate?: string;
+    expirationDate?: string;
+    notes?: string;
+}) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    const updateData: any = {};
+    if (data.permitNumber !== undefined) {
+        const permitNumber = data.permitNumber.trim();
+        if (!permitNumber) throw new Error("Permit number is required");
+        updateData.permitNumber = permitNumber;
+    }
+    if (data.type !== undefined) updateData.type = data.type.trim() || null;
+    if (data.status !== undefined) {
+        updateData.status = (PERMIT_STATUSES as readonly string[]).includes(data.status)
+            ? data.status
+            : "applied";
+    }
+    if (data.issuingAuthority !== undefined) updateData.issuingAuthority = data.issuingAuthority.trim() || null;
+    if (data.issueDate !== undefined) updateData.issueDate = parsePermitDate(data.issueDate);
+    if (data.expirationDate !== undefined) updateData.expirationDate = parsePermitDate(data.expirationDate);
+    if (data.notes !== undefined) updateData.notes = data.notes.trim() || null;
+
+    const permit = await prisma.permit.update({
+        where: { id: permitId },
+        data: updateData,
+    });
+
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return permit;
+}
+
+export async function deletePermit(permitId: string) {
+    const target = await prisma.permit.findUnique({ where: { id: permitId }, select: { projectId: true } });
+    if (!target) throw new Error("Permit not found");
+    await assertPermitAccess(target.projectId);
+
+    await prisma.permit.delete({ where: { id: permitId } });
+    revalidatePath(`/projects/${target.projectId}/permits`);
+    return { success: true };
 }

@@ -7,6 +7,70 @@ on:
     branches: [main]
 
 jobs:
+  # Proves that prisma/migrations/ still reproduces PRODUCTION's schema. Before
+  # the 2026-08-14 baseline, prisma/migrations/ and prod's _prisma_migrations had
+  # no common ancestor at all: the folder held one never-applied 3-line file, and
+  # nothing in CI or the deploy path ever ran `migrate deploy`, so a database
+  # built from the committed migrations bore no relation to prod.
+  #
+  # Runs against a throwaway Postgres service container — NEVER the live DB.
+  migrations:
+    name: Migrations reproduce production
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: probuild
+          POSTGRES_PASSWORD: probuild
+          POSTGRES_DB: probuild_migrations
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+      DIRECT_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      # `npm ci`, not `npm install`: this job's whole purpose is byte-level
+      # reproducibility, so the toolchain that renders DDL has to come from the
+      # lockfile rather than being free to resolve a different engine build.
+      - run: npm ci
+
+      # Executes the baseline for real. Nothing had ever run this SQL before it
+      # was committed, so this step alone is the difference between a baseline
+      # that is known-good and one that merely looks right.
+      - name: Apply committed migrations to the throwaway database
+        run: npx prisma migrate deploy
+
+      # The schema gap the baseline recorded is now closed by
+      # 20260814120000_missing_fk_indexes, so `migrate deploy` above already
+      # produces the final shape and there is no separate gap file to apply.
+      # prisma/EXPECTED_SCHEMA_GAP.sql was deleted with that migration; an
+      # absent gap file means the only remaining diff is PRISMA_PHANTOM_DIFF.sql.
+      - name: Assert the result matches production's shape
+        run: node scripts/check-migrations-match.mjs
+
+      # The gap-file steps that sat here are gone with the file: this branch's
+      # migration closes the recorded gap, so `migrate deploy` now reproduces
+      # production's shape directly and the assertion above is the whole check.
+      #
+      # The focused integration regression deliberately drifts the disposable
+      # database's function and trigger after proving the checker recognizes
+      # the production snapshot. It therefore runs last in this job.
+      - name: Prove the blind-spot checker rejects function and trigger drift
+        run: npx tsx --test tests/migration-history-blind-spots.test.ts
+        env:
+          MIGRATION_HISTORY_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
   build:
     name: Build + Bundle Size
     runs-on: ubuntu-latest
@@ -32,6 +96,12 @@ jobs:
       - name: Format check
         run: npx prettier --check . --ignore-unknown
         continue-on-error: true
+
+      # Hermetic pure-logic suites — no DB, no network, so they belong in this job rather
+      # than the Postgres one. CI ran neither of these before: tests/ was never wired up at
+      # all, so the estimate money-math coverage added with PR #315 was gating nothing.
+      - name: Unit tests
+        run: npm run test:unit
 
       - name: Build
         run: npm run build 2>&1 | tee /tmp/build-output.txt
@@ -115,6 +185,28 @@ jobs:
       # their deterministic mocks. Without it the specs hit the real Anthropic
       # API on every PR and the forced-failure test marker is inert prose.
       SELECTION_AI_MOCK: "1"
+      # Routes getFreshQBTokens/buildQBPaymentRequest/sendQBPaymentCreateRequest
+      # (src/lib/quickbooks.ts, quickbooks-payments.ts) to the deterministic,
+      # no-network mock in src/lib/quickbooks-mock.ts. Real Intuit calls are
+      # forbidden in CI; without this e2e/deposit-ingest.spec.ts's QBO-linked
+      # cases would either hit the live API or fail with QBNotConnectedError
+      # (no Integration row exists in the throwaway DB).
+      E2E_QBO_MOCK: "1"
+      # Shared secret for POST /api/payments/deposit-ingest's Bearer auth
+      # (src/app/api/payments/deposit-ingest/route.ts). No external system
+      # depends on this value — it only gates e2e/deposit-ingest.spec.ts
+      # against the throwaway DB — so unlike the provider secrets above it's a
+      # literal here rather than a repo secret (there's nothing to rotate).
+      DEPOSIT_INGEST_SECRET: "e2e-ci-deposit-ingest-secret"
+      # Forces the Stage A daily-log task matcher (daily-log-task-match.ts) onto
+      # its deterministic keyword fallback instead of calling Gemini, so
+      # time-suggestion.spec.ts's Stage A end-to-end test is reproducible in CI.
+      DAILY_LOG_MATCH_AI_MOCK: "1"
+      # Disables the post-save cost-code auto-assigner (lib/auto-assign-phases.ts). ANTHROPIC_API_KEY
+      # IS supplied below, so without this the real classifier fires on every estimate save in the
+      # suite and races estimate-cost-code-catchup.spec.ts, which simulates the assignment with a
+      # direct DB write — flaky results plus real API spend on every PR.
+      AUTO_ASSIGN_PHASES_AI_MOCK: "1"
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
@@ -130,6 +222,15 @@ jobs:
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
       SENTRY_ORG: golden-touch-remodeling
       PLAYWRIGHT_TEST_SECRET: ${{ secrets.PLAYWRIGHT_TEST_SECRET }}
+      # Explicit opt-in for src/app/api/test-only/contract-actions (and the
+      # src/proxy.ts bypass it needs): the dispatcher e2e/contract-auth-runtime.spec.ts
+      # calls to exercise the contract guards behaviorally. Deliberately set ONLY
+      # in this job — a secret leaking into an environment must not silently turn
+      # the route on, so "test routes are enabled" is its own positive decision,
+      # not a side effect of PLAYWRIGHT_TEST_SECRET being present. Without it the
+      # dispatcher 404s and the spec fails loudly instead of silently passing
+      # against a route that never ran.
+      E2E_TEST_ROUTES: "1"
       CI: true
 
     steps:
@@ -147,6 +248,16 @@ jobs:
 
       - name: Create schema in throwaway Postgres
         run: npx prisma db push --skip-generate
+
+      # DepositIngest's reservation index (stops two deposit files from
+      # claiming the same pending milestone — see the model's doc comment in
+      # prisma/schema.prisma) is a partial unique index, which Prisma cannot
+      # express and `db push` therefore never creates. e2e/deposit-ingest.spec.ts's
+      # reservation-blocking cases need it for real, so apply it here exactly
+      # like a prod deploy would (scripts/apply-deposit-ingest-schema.mjs is
+      # additive/idempotent — safe to run against the fresh throwaway DB).
+      - name: Apply DepositIngest reservation index
+        run: node scripts/apply-deposit-ingest-schema.mjs
 
       - name: Build application
         run: npm run build

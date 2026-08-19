@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { approveEstimate, markEstimateViewed, generatePdfUploadToken } from "@/lib/actions";
 import SignaturePad from "@/components/SignaturePad";
 import PortalPayButton from "@/components/PortalPayButton";
@@ -12,6 +12,7 @@ import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
 import { buildPdf } from "@/lib/build-pdf";
 import { getTaxCertStatus } from "@/lib/tax-cert";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -593,7 +594,7 @@ export default function PortalEstimateClient({ initialEstimate, companySettings 
                                                     )}
                                                 </div>
                                                 {isPaid && p.paymentDate && (
-                                                    <p className="text-xs text-slate-400 mt-0.5">Paid {new Date(p.paymentDate).toLocaleDateString()}</p>
+                                                    <p className="text-xs text-slate-400 mt-0.5">Paid {formatMoneyDate(p.paymentDate, {})}</p>
                                                 )}
                                                 {!isPaid && p.dueDate && (
                                                     <p className="text-xs text-slate-400 mt-0.5">Due {new Date(p.dueDate).toLocaleDateString()}</p>

@@ -3,6 +3,10 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { toCompanyDayKey } from "@/lib/company-day";
+import { resolveCompanyTimeZone } from "@/lib/company-timezone";
+import { addCalendarDaysInTimeZone } from "@/lib/tz-date";
+import { bucketWorkweeks, type OvertimeTimeEntry } from "@/lib/overtime";
 
 // One-shot dashboard payload for the mobile manager tab. Replaces ~4 prior client-side
 // Supabase queries + 2 realtime subscriptions; mobile polls this every 30s while focused.
@@ -52,7 +56,13 @@ export async function GET(req: Request) {
     }
 
     const weekStart = weekStartParam ? new Date(weekStartParam) : startOfThisWeek();
-    const weekEnd = new Date(weekStart.getTime() + 7 * 86_400_000);
+    // 7 CALENDAR days later, not weekStart + 168h — a fixed hour offset lands an
+    // hour off local midnight across a DST transition week (e.g. a week
+    // containing the November fall-back is 169 real hours, not 168).
+    const companyTimeZone = await resolveCompanyTimeZone();
+    const weekEnd = Number.isNaN(weekStart.getTime())
+        ? new Date(NaN)
+        : addCalendarDaysInTimeZone(weekStart, 7, companyTimeZone);
 
     if (
         Number.isNaN(dayStart.getTime()) ||
@@ -177,8 +187,46 @@ export async function GET(req: Request) {
         }
     }
 
+    // -------- Weekly overtime (WA weekly rule: hours over 40 in a Mon-Sun
+    // company-local workweek are 1.5x). Bucketed per-employee straight from
+    // weeklyEntries, which are already scoped to [weekStart, weekEnd) as
+    // requested by the caller (mobile's default is a Sun-Sat display week,
+    // not the Mon-Sun legal workweek). Because of that mismatch, a workweek
+    // that straddles the edge of the requested window is judged only on the
+    // hours actually inside the window — if hours worked just outside it
+    // would have pushed the week over 40, this figure can understate OT for
+    // that boundary week. That's an acceptable approximation for an
+    // at-a-glance dashboard; a payroll-accurate number should come from
+    // /api/mobile/pay-period-summary, which queries the exact full workweeks
+    // overlapping the requested range regardless of the display window. --------
+    const entriesByUser = new Map<string, OvertimeTimeEntry[]>();
+    for (const e of weeklyEntries) {
+        if (typeof e.durationHours !== "number" || e.durationHours <= 0) continue;
+        const list = entriesByUser.get(e.userId);
+        const entry: OvertimeTimeEntry = { startTime: e.startTime, durationHours: e.durationHours };
+        if (list) list.push(entry);
+        else entriesByUser.set(e.userId, [entry]);
+    }
+    const overtimeHoursByUser = new Map<string, number>();
+    let weeklyRegularHours = 0;
+    let weeklyOvertimeHours = 0;
+    for (const [userId, userEntries] of entriesByUser) {
+        const weeks = bucketWorkweeks(userEntries, companyTimeZone);
+        const otHours = weeks.reduce((sum, w) => sum + w.overtimeHours, 0);
+        const regHours = weeks.reduce((sum, w) => sum + w.regularHours, 0);
+        overtimeHoursByUser.set(userId, otHours);
+        weeklyOvertimeHours += otHours;
+        weeklyRegularHours += regHours;
+    }
+
     const employeeStats = Array.from(employeeAgg.entries())
-        .map(([userId, v]) => ({ userId, name: v.name, hours: v.hours, cost: v.cost }))
+        .map(([userId, v]) => ({
+            userId,
+            name: v.name,
+            hours: v.hours,
+            cost: v.cost,
+            overtimeHours: overtimeHoursByUser.get(userId) ?? 0,
+        }))
         .sort((a, b) => b.hours - a.hours);
 
     // -------- Per-project rollup --------
@@ -275,16 +323,108 @@ export async function GET(req: Request) {
         (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
 
+    // -------- Field compliance flags (open projects with a clock-in on the selected day) --------
+    const dayKey = toCompanyDayKey(dayStart);
+
+    const dayProjectGroups = await prisma.timeEntry.groupBy({
+        by: ["projectId"],
+        where: { startTime: { gte: dayStart, lt: dayEnd } },
+    });
+    const dayProjectIds = new Set(dayProjectGroups.map((g) => g.projectId));
+    const eligibleProjects = projects.filter((p) => dayProjectIds.has(p.id));
+    const eligibleProjectIds = eligibleProjects.map((p) => p.id);
+
+    let compliance: Array<{
+        projectId: string;
+        projectName: string;
+        noDailyLog: boolean;
+        noPhotos: boolean;
+        itemsMissingPhaseCode: number;
+    }> = [];
+
+    if (eligibleProjectIds.length > 0) {
+        const [dailyLogs, eligibleEstimates] = await Promise.all([
+            prisma.dailyLog.findMany({
+                where: { projectId: { in: eligibleProjectIds } },
+                select: { id: true, projectId: true, date: true },
+            }),
+            prisma.estimate.findMany({
+                where: {
+                    projectId: { in: eligibleProjectIds },
+                    status: { in: ["Approved", "Invoiced", "Partially Paid", "Paid"] },
+                    archivedAt: null,
+                },
+                select: { id: true, projectId: true },
+            }),
+        ]);
+
+        // Daily logs whose calendar day, in company-local time, matches the requested day.
+        const logsForDay = dailyLogs.filter((log) => toCompanyDayKey(log.date) === dayKey);
+        const logIdsForDay = logsForDay.map((l) => l.id);
+
+        const photoCounts = logIdsForDay.length
+            ? await prisma.dailyLogPhoto.groupBy({
+                  by: ["dailyLogId"],
+                  where: { dailyLogId: { in: logIdsForDay } },
+                  _count: { id: true },
+              })
+            : [];
+        const photoCountByLogId = new Map(photoCounts.map((p) => [p.dailyLogId, p._count.id]));
+
+        const logsForDayByProject = new Map<string, typeof logsForDay>();
+        for (const log of logsForDay) {
+            const arr = logsForDayByProject.get(log.projectId) ?? [];
+            arr.push(log);
+            logsForDayByProject.set(log.projectId, arr);
+        }
+
+        const estimateIds = eligibleEstimates.map((e) => e.id);
+        const missingPhaseGroups = estimateIds.length
+            ? await prisma.estimateItem.groupBy({
+                  by: ["estimateId"],
+                  where: { estimateId: { in: estimateIds }, parentId: null, costCodeId: null },
+                  _count: { id: true },
+              })
+            : [];
+        const estimateToProject = new Map(eligibleEstimates.map((e) => [e.id, e.projectId]));
+        const missingPhaseByProject = new Map<string, number>();
+        for (const g of missingPhaseGroups) {
+            const projectId = estimateToProject.get(g.estimateId);
+            if (!projectId) continue;
+            missingPhaseByProject.set(projectId, (missingPhaseByProject.get(projectId) ?? 0) + g._count.id);
+        }
+
+        compliance = eligibleProjects
+            .map((p) => {
+                const logsToday = logsForDayByProject.get(p.id) ?? [];
+                const noDailyLog = logsToday.length === 0;
+                const photosToday = logsToday.reduce((sum, l) => sum + (photoCountByLogId.get(l.id) ?? 0), 0);
+                const noPhotos = !noDailyLog && photosToday === 0;
+                const itemsMissingPhaseCode = missingPhaseByProject.get(p.id) ?? 0;
+                return {
+                    projectId: p.id,
+                    projectName: p.name,
+                    noDailyLog,
+                    noPhotos,
+                    itemsMissingPhaseCode,
+                };
+            })
+            .filter((c) => c.noDailyLog || c.noPhotos || c.itemsMissingPhaseCode > 0);
+    }
+
     return NextResponse.json({
         totalActiveWorkers: activeWorkers.length,
         weeklyTotalHours,
         weeklyLaborCost,
         weeklyBurdenedCost,
+        weeklyRegularHours,
+        weeklyOvertimeHours,
         activeJobs,
         offsiteWorkers,
         employeeStats,
         activity,
         employees: employees.map((u) => ({ id: u.id, name: u.name ?? u.email })),
+        compliance,
     });
 }
 

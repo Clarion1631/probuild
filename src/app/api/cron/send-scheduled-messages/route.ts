@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { sendNotification } from "@/lib/email";
 import { sendSMS, type SmsResult } from "@/lib/sms";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
 
 // Prevent this hitting max duration, limit to batched amounts if needed
 // Vercel Cron hits this endpoint via GET
@@ -50,8 +51,46 @@ export async function GET(request: Request) {
                     continue;
                 }
 
-                const parsedAttachments: { type: string, id: string, name: string, url?: string }[] = attachments ? JSON.parse(attachments) : [];
+                const rawAttachments: { type: string, id: string, name: string, url?: string }[] = attachments ? JSON.parse(attachments) : [];
                 const parsedCcEmails: string[] = ccEmails ? JSON.parse(ccEmails) : [];
+
+                // Re-validate stored estimate attachments at SEND time, before any
+                // PDF or link is built from them. The ids were checked when the
+                // message was scheduled, but the world can move in between: the
+                // estimate may have been reassigned to another job, or marked
+                // Private. Generating first and validating after would already have
+                // put another client's pricing in the email.
+                const scheduledEstimateIds = rawAttachments
+                    .filter(a => a.type === "estimate" && a.id)
+                    .map(a => a.id);
+                let permittedEstimateIds = new Set<string>();
+                if (scheduledEstimateIds.length > 0) {
+                    const ownerScope = msg.leadId
+                        ? { leadId: msg.leadId }
+                        : msg.projectId
+                            ? { projectId: msg.projectId }
+                            : null;
+                    if (ownerScope) {
+                        const permitted = await prisma.estimate.findMany({
+                            where: {
+                                AND: [
+                                    { id: { in: scheduledEstimateIds } },
+                                    ownerScope,
+                                    portalVisibleEstimateWhere(),
+                                ],
+                            },
+                            select: { id: true },
+                        });
+                        permittedEstimateIds = new Set(permitted.map(e => e.id));
+                    }
+                }
+                const dropped = scheduledEstimateIds.filter(id => !permittedEstimateIds.has(id));
+                if (dropped.length > 0) {
+                    console.warn(`[Cron] message ${msg.id}: dropped estimate attachments no longer shareable:`, dropped);
+                }
+                const parsedAttachments = rawAttachments.filter(
+                    a => a.type !== "estimate" || permittedEstimateIds.has(a.id)
+                );
 
                 const emailAttachments: { filename: string; content: Buffer }[] = [];
                 for (const att of parsedAttachments) {

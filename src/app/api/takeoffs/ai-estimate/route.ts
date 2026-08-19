@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import Anthropic from "@anthropic-ai/sdk";
+import { isTaxCostCode, numOr, numOrNull, rmc, TAX_COST_CODE } from "@/lib/takeoff-costing";
+import { getDefaultSalesTax } from "@/lib/sales-tax";
+import { buildSalesTaxPromptSections, resolveSalesTax, salesTaxAmount, salesTaxLineName } from "@/lib/takeoff-tax-prompt";
 
 export async function POST(req: NextRequest) {
     if (!process.env.ANTHROPIC_API_KEY) {
@@ -61,6 +64,21 @@ export async function POST(req: NextRequest) {
 
     const phasesList = costCodes.map(cc => `${cc.code} — ${cc.name}`).join("\n");
     const typesList = costTypes.map(ct => ct.name).join(", ");
+
+    // The prompt used to hardcode "Clark County WA sales tax rate is 8.4%", which disagreed with the
+    // rate the rest of the app applies (CompanySettings default, 8.8% in production) — so every
+    // AI-generated takeoff quoted the client a tax amount nothing else in the system would produce.
+    // #372's splitTakeoffTax() DERIVES the stored rate back out of the 99-TAX line rather than
+    // trusting a constant, so the stored rate was already right; the quoted dollars were not.
+    // The tax line is now computed here from the configured rate instead of by the model — see
+    // lib/takeoff-tax-prompt.ts for why the model is kept out of it entirely.
+    const salesTax = resolveSalesTax(await getDefaultSalesTax());
+    if (!salesTax.ok) {
+        // A rate the converter would refuse to recognize can only produce a mispriced estimate.
+        // Fail visibly rather than quietly quoting the client something no other screen agrees with.
+        return NextResponse.json({ error: salesTax.error }, { status: 400 });
+    }
+    const { salesTaxContextLine, salesTaxSection, estimateStructureSection } = buildSalesTaxPromptSections(salesTax);
 
     // Build file descriptions
     const fileDescriptions = takeoff.files.map(f =>
@@ -124,7 +142,7 @@ export async function POST(req: NextRequest) {
 
 IMPORTANT LOCATION CONTEXT:
 - Clark County, WA is in the Portland-Vancouver metropolitan area
-- Washington State has NO income tax, but higher property taxes and WA sales tax (8.4% in Clark County)
+${salesTaxContextLine}
 - Labor rates in Clark County tend to be 5-10% higher than national averages due to cost of living and no income tax
 - Material costs reflect Pacific Northwest pricing (lumber is local/competitive, but specialty items may cost more due to shipping)
 - Permits are handled by Clark County Community Development — building permits typically run $800-4,000 for remodels
@@ -215,19 +233,9 @@ PRICING STRATEGY — HOW A REAL CONTRACTOR BIDS:
    * Plan review fees
    * These are legitimately separate because they're paid directly to the county
 
-IMPORTANT — WA SALES TAX:
-- In Washington State, residential remodeling/construction is classified as a RETAIL SALE
-- Clark County WA sales tax rate is 8.4%
-- The 8.4% tax applies to the ENTIRE CONTRACT PRICE
-- Add ONE SEPARATE line item at the end: "WA Sales Tax (8.4%)" in phase "99-TAX", type "Other"
-- Calculate: tax = 8.4% × (sum of ALL other line item totals)
-- All other line items are pre-tax
-- The totalEstimate MUST INCLUDE the tax line item
+${salesTaxSection}
 
-ESTIMATE STRUCTURE:
-  Construction line items (phases 00-15, with O&P already baked into each price)
-  + WA Sales Tax (8.4% of the above total)
-  = TOTAL ESTIMATE (this is totalEstimate)
+${estimateStructureSection}
 
 PAYMENT MILESTONES — Use WA residential remodeling industry standard:
 - "Deposit / Contract Signing": 10% (due at signing)
@@ -235,7 +243,7 @@ PAYMENT MILESTONES — Use WA residential remodeling industry standard:
 - "Mid-Project / Drywall & Mechanical": 25% (due when drywall hung, HVAC complete)
 - "Finish Work / Cabinets & Counters": 25% (due when cabinets, counters, tile, paint complete)
 - "Final Completion & Walkthrough": 15% (due after final inspection, punchlist, and client walkthrough)
-Note: Each milestone amount = percentage × totalEstimate (tax-inclusive total). Percentages must sum to 100%.
+Note: Each milestone amount = percentage × totalEstimate (the full total above, including any tax line). Percentages must sum to 100%.
 
 Also generate a "planAnalysis" object describing what you detected from the plans.
 
@@ -321,24 +329,74 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
         const typeMap: Record<string, string> = {};
         for (const ct of costTypes) typeMap[ct.name] = ct.id;
 
-        const estimateItems = aiItems.map((item: any, idx: number) => ({
-            id: `ai_${Date.now()}_${idx}`,
-            name: item.name || "Unnamed Item",
-            description: item.description || "",
-            type: item.costType || "Material",
-            quantity: item.quantity || 1,
-            unit: item.unit || "each",
-            unitCost: item.unitCost || 0,
-            total: item.total || (item.quantity || 1) * (item.unitCost || 0),
-            parentId: null,
-            costCodeId: codeMap[item.costCode] || null,
-            costTypeId: typeMap[item.costType] || null,
-            costCode: item.costCode || "",
-            order: idx,
-            isAllowance: item.isAllowance || false,
-        }));
+        // The prompt asks for baseCost/markupPercent per item — that is the internal costing the
+        // BudgetStrip and margin reporting read, and it used to be dropped here entirely. Carry it
+        // through, but normalize first: the model returns JSON, and a stringy or garbage number
+        // silently poisons the totals below (0 + "250" is the string "0250").
+        //
+        // These rows stay in the AI's own vocabulary — `markupPercent` here is TRUE MARKUP
+        // (sell = cost x (1 + m/100)), which is what the prompt asks for and what the takeoff
+        // preview screen renders. The estimate side stores gross margin under the same field name;
+        // convert-to-estimate does that translation when it writes EstimateItem rows.
+        // The prompt tells the model not to emit a tax line, but a model instruction is not a
+        // guarantee — drop any it returned anyway, so the appended row below is the ONLY tax row and
+        // the pre-tax subtotal it is computed from is really pre-tax.
+        const untaxedAiItems = aiItems.filter((item: any) => !isTaxCostCode(String(item?.costCode || "").trim()));
 
-        const totalEstimate = estimateItems.reduce((sum: number, i: any) => sum + (i.total || 0), 0);
+        const estimateItems = untaxedAiItems.map((item: any, idx: number) => {
+            const costCode = String(item.costCode || "").trim();
+            // Sales tax is a pass-through: no markup, whatever the model returned.
+            const isTaxItem = isTaxCostCode(costCode);
+            const quantity = numOr(item.quantity, 1);
+            const unitCost = numOr(item.unitCost, 0);
+            return {
+                id: `ai_${Date.now()}_${idx}`,
+                name: item.name || "Unnamed Item",
+                description: item.description || "",
+                type: item.costType || "Material",
+                quantity,
+                unit: item.unit || "each",
+                baseCost: numOrNull(item.baseCost),
+                markupPercent: isTaxItem ? 0 : numOrNull(item.markupPercent),
+                unitCost,
+                total: numOr(item.total, quantity * unitCost),
+                parentId: null,
+                costCodeId: codeMap[costCode] || null,
+                costTypeId: typeMap[item.costType] || null,
+                costCode,
+                order: idx,
+                isAllowance: item.isAllowance || false,
+            };
+        });
+
+        // Sales tax, computed here rather than by the model. It is appended even at a rate of 0: a
+        // zero tax row is how convert-to-estimate learns the job is explicitly UNTAXED
+        // (splitTakeoffTax => taxRatePercent 0). With no row at all it would store a null rate,
+        // which the portal reads as "gross this up by the default rate" and resolves to a hardcoded
+        // 8.8% when no tax is configured — quoting untaxed and displaying +8.8%.
+        const preTaxSubtotal = rmc(estimateItems.reduce((sum: number, i: any) => sum + i.total, 0));
+        const taxAmount = salesTaxAmount(salesTax.rate, preTaxSubtotal);
+        estimateItems.push({
+            id: `ai_${Date.now()}_tax`,
+            name: salesTaxLineName(salesTax),
+            description: "",
+            type: "Other",
+            quantity: 1,
+            unit: "each",
+            // Tax is a pass-through: it is its own cost and carries no markup.
+            baseCost: taxAmount,
+            markupPercent: 0,
+            unitCost: taxAmount,
+            total: taxAmount,
+            parentId: null,
+            costCodeId: codeMap[TAX_COST_CODE] || null,
+            costTypeId: typeMap["Other"] || null,
+            costCode: TAX_COST_CODE,
+            order: estimateItems.length,
+            isAllowance: false,
+        });
+
+        const totalEstimate = rmc(preTaxSubtotal + taxAmount);
 
         const paymentMilestones = aiMilestones.map((m: any, idx: number) => ({
             id: `pm_${Date.now()}_${idx}`,
@@ -352,7 +410,14 @@ Sort items by phase code, then by cost type within each phase. Be thorough and p
         await prisma.takeoff.update({
             where: { id: takeoffId },
             data: {
-                aiEstimateData: JSON.stringify({ items: estimateItems, paymentMilestones, summary: aiSummary, totalEstimate, planAnalysis }),
+                // `salesTax` snapshots the rate and jurisdiction this estimate was actually priced
+                // at. convert-to-estimate can otherwise only RE-DERIVE the rate from the tax row's
+                // dollars, and cent rounding makes that reconstruction inexact (an 8.8% tax on
+                // $1,234.56 is $108.64, which derives back as 8.79989…%) — close enough for the
+                // money, but it misses the exact-match test that lets the estimate carry the real
+                // jurisdiction name instead of a generic "Sales Tax". Legacy takeoffs have no
+                // snapshot, so the converter keeps the derivation as its fallback.
+                aiEstimateData: JSON.stringify({ items: estimateItems, paymentMilestones, summary: aiSummary, totalEstimate, planAnalysis, salesTax: { rate: salesTax.rate, name: salesTax.name } }),
                 status: "In Progress",
             },
         });

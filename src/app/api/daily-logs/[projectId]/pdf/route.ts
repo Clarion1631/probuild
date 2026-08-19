@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isStaffRequest } from "@/lib/pdf-route-auth";
 import { prisma } from "@/lib/prisma";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 
@@ -19,6 +20,11 @@ export async function GET(
     { params }: { params: Promise<{ projectId: string }> }
 ) {
     const { projectId } = await params;
+
+    // Internal field report — staff only.
+    if (!await isStaffRequest()) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
 
     const project = await prisma.project.findUnique({
         where: { id: projectId },
@@ -215,6 +221,17 @@ export async function GET(
             y -= 6;
         }
 
+        // Next Steps
+        if (log.nextSteps) {
+            checkNewPage(60);
+            page.drawText("NEXT STEPS", {
+                x: margin + 4, y, size: 8, font: helveticaBold, color: colors.blue,
+            });
+            y -= 14;
+            y = drawWrappedText(log.nextSteps, margin + 4, y, contentWidth - 8, 9, helvetica, colors.textMain);
+            y -= 6;
+        }
+
         // Photos count
         if (log.photos.length > 0) {
             checkNewPage(40);
@@ -242,6 +259,7 @@ export async function GET(
     return new NextResponse(buffer, {
         headers: {
             "Content-Type": "application/pdf",
+            "Cache-Control": "private, no-store",
             "Content-Disposition": `attachment; filename="daily-logs-${project.name.replace(/\s+/g, "-")}.pdf"`,
         },
     });

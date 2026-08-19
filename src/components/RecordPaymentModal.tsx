@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { formatLocalDateString } from "@/lib/sales-tax-report";
+import { isBackdatedPayment } from "@/lib/payment-date";
 
 const PAYMENT_METHODS = [
     { key: "check", label: "Check", icon: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" },
@@ -116,6 +117,11 @@ export default function RecordPaymentModal({
                             onChange={(e) => setPaymentDate(e.target.value)}
                             required
                         />
+                        {isBackdatedPayment(paymentDate) && (
+                            <p className="mt-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+                                Back-dated payment — the client won&apos;t be emailed a receipt automatically. Use the Send Receipt button if you want one.
+                            </p>
+                        )}
                     </div>
 
                     {/* Payment Method Grid */}

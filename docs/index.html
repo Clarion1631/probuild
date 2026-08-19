@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProBuild Auto-Loop Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb; --page: #f9f9f7;
+    --ink-1: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --good-text: #006300;
+    --accent: #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --page: #0d0d0d;
+      --ink-1: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+      --grid: #2c2c2a; --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --good-text: #0ca30c;
+      --accent: #3987e5;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page); color: var(--ink-1);
+    padding: 20px; max-width: 980px; margin: 0 auto;
+  }
+  header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  h1 { font-size: 20px; font-weight: 650; }
+  h1 small { font-weight: 400; color: var(--ink-2); font-size: 13px; margin-left: 8px; }
+  .meta { font-size: 12px; color: var(--ink-muted); display: flex; gap: 10px; align-items: center; }
+  button.refresh {
+    font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--ink-1); cursor: pointer;
+  }
+  button.refresh:hover { border-color: var(--accent); }
+  section { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 12px; display:flex; justify-content:space-between; align-items:baseline; }
+  h2 .sec-note { font-size: 11px; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--ink-muted); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile .num { font-size: 28px; font-weight: 650; line-height: 1.1; }
+  .tile .lbl { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--grid); flex-wrap: wrap; }
+  .row:first-of-type { border-top: none; }
+  .row a { color: var(--accent); text-decoration: none; font-weight: 550; font-size: 14px; }
+  .row a:hover { text-decoration: underline; }
+  .row .sub { font-size: 12px; color: var(--ink-muted); width: 100%; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--ink-2); background: transparent;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--baseline); flex: none; }
+  .chip.ok    { color: var(--good-text); }  .chip.ok .dot    { background: var(--good); }
+  .chip.run   { color: var(--ink-1); }      .chip.run .dot   { background: var(--warning); }
+  .chip.fail  { color: var(--critical); }   .chip.fail .dot  { background: var(--critical); }
+  .chip.skip  { color: var(--ink-muted); }
+  .arrow { color: var(--ink-muted); font-size: 12px; }
+  .runstrip { display: flex; gap: 4px; flex-wrap: wrap; }
+  .runcell {
+    width: 26px; height: 26px; border-radius: 4px; border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; text-decoration: none; color: #fff; font-weight: 700;
+  }
+  .runcell.s  { background: var(--good); }
+  .runcell.f  { background: var(--critical); }
+  .runcell.p  { background: var(--warning); color: #0b0b0b; }
+  .runcell.n  { background: transparent; color: var(--ink-muted); }
+  .legend { font-size: 11.5px; color: var(--ink-muted); margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; font-style: normal; }
+  .empty { color: var(--ink-muted); font-size: 13px; padding: 6px 0; }
+  .err { color: var(--critical); font-size: 12.5px; }
+  .audit { font-size: 13.5px; line-height: 1.55; color: var(--ink-1); }
+  .audit h3 { font-size: 14px; margin: 14px 0 6px; padding-top: 12px; border-top: 1px solid var(--grid); }
+  .audit h3:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+  .audit p { margin: 4px 0; }
+  .audit b { font-weight: 600; }
+  .audit a { color: var(--accent); text-decoration: none; }
+  footer { font-size: 11.5px; color: var(--ink-muted); text-align: center; padding: 8px 0 20px; }
+  footer a { color: var(--ink-muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔁 ProBuild Auto-Loop <small>Clarion1631/probuild</small></h1>
+  <div class="meta"><span id="updated">loading…</span><button class="refresh" onclick="loadAll(true)">↻ Refresh</button></div>
+</header>
+
+<section>
+  <h2>Audit log — what shipped, in plain English <span class="sec-note" id="audit-note"></span></h2>
+  <div class="audit" id="audit"><div class="empty">Loading…</div></div>
+</section>
+
+<section>
+  <h2>At a glance <span class="sec-note" id="tiles-note"></span></h2>
+  <div class="tiles" id="tiles"><div class="empty">Loading…</div></div>
+</section>
+
+<section>
+  <h2>Pipeline — PRs in flight <span class="sec-note" id="pipeline-note"></span></h2>
+  <div id="pipeline"><div class="empty">Loading…</div></div>
+</section>
+
+<section>
+  <h2>Queue — issues labeled auto-fix <span class="sec-note" id="queue-note"></span></h2>
+  <div id="queue"><div class="empty">Loading…</div></div>
+</section>
+
+<section>
+  <h2>Run history (newest first, click to open logs) <span class="sec-note" id="runs-note"></span></h2>
+  <div class="runstrip" id="runs"><div class="empty">Loading…</div></div>
+  <div class="legend">
+    <span><i style="background:var(--good)"></i>✓ success</span>
+    <span><i style="background:var(--critical)"></i>✕ failed</span>
+    <span><i style="background:var(--warning)"></i>● running</span>
+    <span><i style="border:1px solid var(--border)"></i>– other</span>
+  </div>
+</section>
+
+<footer>Live from the public GitHub API · auto-refreshes every 3 min · sections update independently ·
+  <a href="https://github.com/Clarion1631/probuild/actions" target="_blank">Actions</a> ·
+  <a href="https://github.com/Clarion1631/probuild/pulls" target="_blank">PRs</a> ·
+  <a href="https://github.com/Clarion1631/probuild/blob/main/AUDITLOG.md" target="_blank">Full audit log</a></footer>
+
+<script>
+const API = 'https://api.github.com/repos/Clarion1631/probuild';
+const RAW = 'https://raw.githubusercontent.com/Clarion1631/probuild/main';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago = iso => {
+  const m = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (m < 60) return m + 'm ago';
+  const h = Math.round(m / 60); if (h < 48) return h + 'h ago';
+  return Math.round(h / 24) + 'd ago';
+};
+async function gh(path) {
+  const r = await fetch(API + path, { headers: { 'Accept': 'application/vnd.github+json' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+function note(id, msg, isErr) {
+  const el = document.getElementById(id + '-note');
+  if (el) el.innerHTML = isErr ? `<span class="err">⚠ ${esc(msg)} — showing last data, retrying</span>` : esc(msg || '');
+}
+function chip(label, state) {
+  const cls = { ok: 'ok', run: 'run', fail: 'fail', skip: 'skip' }[state] || 'skip';
+  const icon = { ok: '✓', run: '●', fail: '✕', skip: '·' }[state] || '·';
+  return `<span class="chip ${cls}"><span class="dot"></span>${icon} ${esc(label)}</span>`;
+}
+function stageFromChecks(checks, name) {
+  const c = (checks || []).find(x => (x.name || '').toLowerCase().includes(name));
+  if (!c) return 'skip';
+  if (c.status !== 'completed') return 'run';
+  return c.conclusion === 'success' ? 'ok' : (c.conclusion === 'failure' ? 'fail' : 'skip');
+}
+// Minimal markdown → HTML for the audit log (headings, bold, links, paragraphs)
+function mdToHtml(md) {
+  const lines = md.split('\n').slice(0); let html = '', count = 0;
+  for (let ln of lines) {
+    if (/^# /.test(ln) || /^---\s*$/.test(ln)) continue;
+    if (/^## /.test(ln)) { count++; if (count > 5) break; html += `<h3>${inline(ln.slice(3))}</h3>`; continue; }
+    if (ln.trim() === '') continue;
+    html += `<p>${inline(ln)}</p>`;
+  }
+  return html || '<div class="empty">No entries yet.</div>';
+  function inline(s) {
+    return esc(s)
+      .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank">$1</a>')
+      .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+      .replace(/_([^_]+)_/g, '<i>$1</i>');
+  }
+}
+
+// Each loader is independent: one failing does not blank the others,
+// and a failure keeps the previous render on screen.
+async function loadAudit() {
+  try {
+    const r = await fetch(RAW + '/AUDITLOG.md', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    document.getElementById('audit').innerHTML = mdToHtml(await r.text());
+    note('audit', 'last 5 entries · full log linked below');
+  } catch (e) { note('audit', e.message, true); }
+}
+async function loadRunsAndTiles() {
+  try {
+    const runs = (await gh('/actions/runs?per_page=30')).workflow_runs
+      .filter(r => /auto-fix|pr gate|audit/i.test(r.name));
+    document.getElementById('runs').innerHTML = runs.length ? runs.map(r => {
+      const st = r.status !== 'completed' ? 'p' : (r.conclusion === 'success' ? 's' : (r.conclusion === 'failure' ? 'f' : 'n'));
+      const ic = { s: '✓', f: '✕', p: '●', n: '–' }[st];
+      return `<a class="runcell ${st}" href="${esc(r.html_url)}" target="_blank"
+        title="${esc(r.name)} · ${esc(r.status)} ${esc(r.conclusion || '')} · ${esc(ago(r.created_at))}">${ic}</a>`;
+    }).join('') : '<div class="empty">No runs yet — fire one via Actions → Claude Auto-Fix Loop → Run workflow.</div>';
+    note('runs', runs.length ? `latest: ${ago(runs[0].created_at)}` : '');
+    window._lastRun = runs[0];
+  } catch (e) { note('runs', e.message, true); }
+}
+async function loadPipelineQueueShipped() {
+  try {
+    const [openPRs, issues, closedPRs] = await Promise.all([
+      gh('/pulls?state=open&per_page=20'),
+      gh('/issues?labels=auto-fix&state=open&per_page=20'),
+      gh('/pulls?state=closed&per_page=15'),
+    ]);
+    const prs = openPRs.filter(p => (p.labels || []).some(l => l.name === 'claude-fix'));
+    const queue = issues.filter(i => !i.pull_request);
+    const shipped = closedPRs.filter(p => p.merged_at && (p.labels || []).some(l => l.name === 'claude-fix'));
+
+    for (const p of prs.slice(0, 4)) {
+      try { p._checks = (await gh(`/commits/${p.head.sha}/check-runs?per_page=30`)).check_runs; }
+      catch (e) { p._checks = []; }
+    }
+
+    document.getElementById('tiles').innerHTML = `
+      <div class="tile"><div class="num">${queue.length}</div><div class="lbl">issues queued (auto-fix)</div></div>
+      <div class="tile"><div class="num">${prs.length}</div><div class="lbl">PRs in flight</div></div>
+      <div class="tile"><div class="num" style="color:var(--good-text)">${shipped.length}</div><div class="lbl">shipped (recent merges)</div></div>
+      <div class="tile"><div class="num">${window._lastRun ? esc(ago(window._lastRun.created_at)) : '—'}</div><div class="lbl">last loop run</div></div>`;
+
+    document.getElementById('pipeline').innerHTML = prs.length ? prs.map(p => {
+      const review = stageFromChecks(p._checks, 'codex');
+      const verify = stageFromChecks(p._checks, 'gauntlet');
+      return `<div class="row">
+        <a href="${esc(p.html_url)}" target="_blank">#${p.number} ${esc(p.title)}</a>
+        <span class="arrow">·</span>
+        ${chip('Built', 'ok')}<span class="arrow">→</span>
+        ${chip('Codex review', review)}<span class="arrow">→</span>
+        ${chip('Visual verify', verify)}<span class="arrow">→</span>
+        ${chip('Merge & deploy', p.auto_merge ? 'run' : 'skip')}
+        <div class="sub">opened ${esc(ago(p.created_at))} · branch ${esc(p.head.ref)}</div>
+      </div>`;
+    }).join('') : '<div class="empty">Nothing in flight right now.</div>';
+
+    document.getElementById('queue').innerHTML = queue.length ? queue.map(i =>
+      `<div class="row"><a href="${esc(i.html_url)}" target="_blank">#${i.number} ${esc(i.title)}</a>
+       <div class="sub">opened ${esc(ago(i.created_at))}</div></div>`).join('')
+      : '<div class="empty">Queue is empty — label an issue <b>auto-fix</b> to feed the loop.</div>';
+    note('tiles'); note('pipeline'); note('queue');
+  } catch (e) { note('tiles', e.message, true); note('pipeline', e.message, true); note('queue', e.message, true); }
+}
+async function loadAll(manual) {
+  document.getElementById('updated').textContent = 'refreshing…';
+  await Promise.allSettled([loadAudit(), loadRunsAndTiles()]);
+  await loadPipelineQueueShipped();
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+loadAll();
+setInterval(loadAll, 180000);
+</script>
+</body>
+</html>

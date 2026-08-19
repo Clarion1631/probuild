@@ -8,6 +8,13 @@ import { sendNotification } from "@/lib/email";
 import { toNum } from "@/lib/prisma-helpers";
 import { formatCurrency } from "@/lib/utils";
 import { settleStripeEstimatePayment } from "@/lib/stripe-estimate-settlement";
+import { mirrorInvoiceSettleToEstimate } from "@/lib/payment-mirror";
+import {
+    resolveChargeGroup,
+    unwindRefundedCharge,
+    chargeGroupIsEmpty,
+    type UnwindResult,
+} from "@/lib/refund-group";
 
 // Helper function to process a single event by eventId asynchronously
 async function processEvent(eventId: string) {
@@ -65,20 +72,27 @@ async function processEvent(eventId: string) {
                     const scheduleId = metadata.paymentScheduleId;
                     const invoiceId = metadata.invoiceId;
                     const tx = await withTxRetry(() => prisma.$transaction(async (t) => {
-                        // Lock the parent invoice FIRST (canonical Estimate → Invoice → schedules
-                        // order; this branch touches only the invoice). Two concurrent webhooks
-                        // settling different milestones of the same invoice would otherwise each
-                        // read a stale sibling set and overwrite each other's balanceDue — the lock
-                        // serializes the recompute so the second waits and reads fresh state.
-                        await lockMoneyParents(t, { invoiceId });
+                        // Lock the parents in canonical Estimate → Invoice → schedules order.
+                        // Two concurrent webhooks settling different milestones of the same
+                        // invoice would otherwise each read a stale sibling set and overwrite
+                        // each other's balanceDue — the lock serializes the recompute so the
+                        // second waits and reads fresh state. The estimate is locked too because
+                        // this branch mirrors onto the estimate-side milestone copy below; the
+                        // link is read non-locking first so the order can never invert.
+                        const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+                        await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+                        // One settle instant, taken AFTER the locks — see payment-record-core.ts.
+                        const settledAt = new Date();
                         const claim = await t.paymentSchedule.updateMany({
                             where: { id: scheduleId, status: { not: "Paid" } },
                             data: {
                                 status: "Paid",
                                 stripePaymentIntentId: session.payment_intent as string | null,
                                 paymentMethod,
-                                paymentDate: new Date(),
-                                paidAt: new Date(),
+                                // Stripe-sourced: a real INSTANT, not a calendar day (see
+                                // lib/payment-date.ts). Same instant in both columns.
+                                paymentDate: settledAt,
+                                paidAt: settledAt,
                             },
                         });
                         const alreadyPaid = claim.count === 0;
@@ -95,11 +109,28 @@ async function processEvent(eventId: string) {
                             where: { id: invoiceId },
                             data: { balanceDue: newBalance, status: newStatus },
                         });
+                        const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
+                        // Mirror onto the estimate-side copy so the estimate editor and the
+                        // client portal don't keep showing this milestone as unpaid.
+                        if (!alreadyPaid && paidSchedule) {
+                            await mirrorInvoiceSettleToEstimate(t, {
+                                estimateId: invLink?.estimateId,
+                                payment: paidSchedule,
+                                data: {
+                                    paymentDate: paidSchedule.paymentDate ?? new Date(),
+                                    paidAt: paidSchedule.paidAt ?? new Date(),
+                                    paymentMethod,
+                                    // Same metadata the portal fallback writes, so the mirror
+                                    // looks identical whichever rail wins the settle claim.
+                                    stripeSessionId: session.id,
+                                    stripePaymentIntentId: (session.payment_intent as string | null) ?? null,
+                                },
+                            });
+                        }
                         // Durable notification enqueued in-tx (delivered by the drainer below).
                         if (!alreadyPaid) {
                             await enqueueMilestonePaid(t, { scheduleId, scheduleType: "invoice" });
                         }
-                        const paidSchedule = siblings.find(s => s.id === scheduleId) ?? null;
                         return { alreadyPaid, invoice, paidSchedule, newBalance };
                     }));
                     if (!tx.alreadyPaid) {
@@ -184,124 +215,65 @@ async function processEvent(eventId: string) {
                 const isFullyRefunded = chargeAmount > 0
                     && Math.abs(chargeAmount - refundedAmount) < 0.005;
 
-                // Try invoice payment schedule first
-                const invoiceSchedule = await prisma.paymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { invoice: true },
-                });
+                // One charge can be recorded on several milestone rows across both
+                // tables — invoice conversion copies the PaymentIntent onto every
+                // clone of an already-paid estimate milestone. Resolve the whole
+                // group so a full refund releases all of it, instead of picking one
+                // row and leaving the rest showing money the client got back.
+                // See src/lib/refund-group.ts.
+                const group = await resolveChargeGroup(prisma, paymentIntentId);
+                if (chargeGroupIsEmpty(group)) break;
 
-                if (invoiceSchedule) {
-                    if (isFullyRefunded) {
-                        // Full refund: reset the schedule and recompute the invoice in one transaction
-                        // so we don't race with a concurrent payment settlement on a sibling schedule.
-                        await withTxRetry(() => prisma.$transaction(async (t) => {
-                            // Canonical Estimate → Invoice → schedules order; this branch touches
-                            // only the invoice. Lock it first so a concurrent settle on a sibling
-                            // milestone can't have its balanceDue effect lost to this recompute.
-                            await lockMoneyParents(t, { invoiceId: invoiceSchedule.invoiceId });
-                            // Re-read the parent AFTER the lock — the outer query's snapshot of
-                            // totalAmount/status may be stale if a concurrent flow changed it.
-                            const invoice = await t.invoice.findUnique({ where: { id: invoiceSchedule.invoiceId } });
-                            if (invoice) {
-                                await t.paymentSchedule.update({
-                                    where: { id: invoiceSchedule.id },
-                                    data: { status: "Pending", paidAt: null, paymentDate: null },
-                                });
-                                const siblings = await t.paymentSchedule.findMany({
-                                    where: { invoiceId: invoiceSchedule.invoiceId },
-                                });
-                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                                const newBalance = Math.max(0, toNum(invoice.totalAmount) - totalPaid);
-                                const newStatus = newBalance <= 0
-                                    ? "Paid"
-                                    : totalPaid > 0 ? "Partially Paid"
-                                    : "Issued";
-                                await t.invoice.update({
-                                    where: { id: invoice.id },
-                                    data: { balanceDue: newBalance, status: newStatus },
-                                });
-                            }
-                        }));
-                    }
-
-                    const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (refundSettings?.notificationEmail) {
-                        // `charge.amount_refunded` is the CUMULATIVE refund total, so this message reflects
-                        // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
-                        const summary = isFullyRefunded
-                            ? `The schedule has been reset to Pending and the invoice balance restored.`
-                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile the invoice balance manually in the Stripe dashboard.`;
-                        await sendNotification(
-                            refundSettings.notificationEmail,
-                            `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Invoice ${invoiceSchedule.invoice.code}`,
-                            `<div style="font-family: sans-serif; padding: 20px;">
-                                <h2>Refund Processed</h2>
-                                <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)} on Invoice #${invoiceSchedule.invoice.code} (milestone: ${invoiceSchedule.name}).</p>
-                                <p>${summary}</p>
-                            </div>`
-                        );
-                    }
-                    break;
+                let unwound: UnwindResult | null = null;
+                if (isFullyRefunded) {
+                    unwound = await unwindRefundedCharge(prisma, paymentIntentId);
                 }
 
-                // Try estimate payment schedule
-                const estSchedule = await prisma.estimatePaymentSchedule.findFirst({
-                    where: { stripePaymentIntentId: paymentIntentId },
-                    include: { estimate: true },
-                });
-
-                if (estSchedule) {
-                    if (isFullyRefunded) {
-                        await withTxRetry(() => prisma.$transaction(async (t) => {
-                            // Canonical Estimate → Invoice → schedules order; this branch touches
-                            // only the estimate. Lock it first so a concurrent settle on a sibling
-                            // milestone can't have its balanceDue effect lost to this recompute.
-                            await lockMoneyParents(t, { estimateId: estSchedule.estimateId });
-                            // Re-read the parent AFTER the lock — the outer query's snapshot of
-                            // totalAmount/status may be stale if a concurrent flow changed it.
-                            const estimate = await t.estimate.findUnique({ where: { id: estSchedule.estimateId } });
-                            if (estimate) {
-                                await t.estimatePaymentSchedule.update({
-                                    where: { id: estSchedule.id },
-                                    data: { status: "Pending", paidAt: null, paymentDate: null },
-                                });
-                                const siblings = await t.estimatePaymentSchedule.findMany({
-                                    where: { estimateId: estSchedule.estimateId },
-                                });
-                                const totalPaid = siblings.filter(s => s.status === "Paid").reduce((sum, s) => sum + toNum(s.amount), 0);
-                                const newBalance = Math.max(0, toNum(estimate.totalAmount) - totalPaid);
-                                const newStatus =
-                                    totalPaid === 0 ? estimate.statusBeforePayment ?? "Approved"
-                                    : newBalance <= 0 ? "Paid"
-                                    : "Partially Paid";
-
-                                await t.estimate.update({
-                                    where: { id: estimate.id },
-                                    data: {
-                                        balanceDue: newBalance,
-                                        status: newStatus,
-                                        ...(totalPaid === 0 && { statusBeforePayment: null }),
-                                    },
-                                });
-                            }
-                        }));
-                    }
-
-                    const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
-                    if (refundSettings?.notificationEmail) {
-                        const summary = isFullyRefunded
-                            ? `The schedule has been reset to Pending and the estimate balance restored.`
-                            : `This is a <strong>partial refund</strong>. The schedule remains marked Paid; please reconcile manually.`;
-                        await sendNotification(
-                            refundSettings.notificationEmail,
-                            `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: Estimate ${estSchedule.estimate.code}`,
-                            `<div style="font-family: sans-serif; padding: 20px;">
-                                <h2>Refund Processed</h2>
-                                <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)} on Estimate #${estSchedule.estimate.code} (milestone: ${estSchedule.name}).</p>
-                                <p>${summary}</p>
-                            </div>`
-                        );
-                    }
+                const refundSettings = await prisma.companySettings.findUnique({ where: { id: "singleton" } });
+                if (refundSettings?.notificationEmail) {
+                    const label = (rows: { name: string; parentCode: string | null }[]) =>
+                        rows.map((r) => `${r.parentCode ?? "(no code)"} — ${r.name}`);
+                    const found = [...label(group.invoiceSchedules), ...label(group.estimateSchedules)];
+                    const reset = unwound
+                        ? [...label(unwound.invoiceSchedules), ...label(unwound.estimateSchedules)]
+                        : [];
+                    // Paid mirror partners with no PaymentIntent that sit in a one-to-many
+                    // group: they might be this charge or a separate manual payment, so the
+                    // unwind refuses to guess and hands them to a human instead.
+                    const ambiguous = label(unwound?.unattributable ?? group.unattributable);
+                    // `charge.amount_refunded` is the CUMULATIVE refund total, so this message reflects
+                    // total-refunded-so-far, not this delivery's delta. We frame it that way explicitly.
+                    const summary = !isFullyRefunded
+                        ? `This is a <strong>partial refund</strong>. The milestones below remain marked Paid; please reconcile the balances manually in the Stripe dashboard.`
+                        // Nothing was still Paid once the unwind held its locks. Usually a
+                        // redelivery of this refund, but a staff "undo payment" landing first
+                        // looks the same, so this must not credit an earlier delivery.
+                        : unwound?.nothingLeftPaid
+                        ? `Nothing recording this charge was still marked Paid when reconciliation ran, so there was nothing to reset.`
+                        : reset.length === found.length
+                        ? `All ${reset.length} milestone(s) recording this charge were reset to Pending and their balances restored.`
+                        : reset.length > 0
+                        ? `${reset.length} of ${found.length} milestone(s) were reset. The rest no longer matched this charge when the refund was processed — please reconcile them manually in the Stripe dashboard.`
+                        : `These milestones were <strong>not</strong> reset automatically — they no longer matched this charge when the refund was processed. Please reconcile the balances manually in the Stripe dashboard.`;
+                    const primaryCode = group.invoiceSchedules[0]?.parentCode
+                        ?? group.estimateSchedules[0]?.parentCode
+                        ?? group.unattributable[0]?.parentCode
+                        ?? paymentIntentId;
+                    await sendNotification(
+                        refundSettings.notificationEmail,
+                        `${isFullyRefunded ? "Refund Issued" : "Partial Refund Issued"}: ${primaryCode}`,
+                        `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2>Refund Processed</h2>
+                            <p>Total refunded to date: <strong>${formatCurrency(refundedAmount)}</strong> of ${formatCurrency(chargeAmount)}.</p>
+                            ${found.length > 0 ? `<p>Milestones recording this charge:</p>
+                            <ul>${found.map((l) => `<li>${l}</li>`).join("")}</ul>` : ""}
+                            <p>${summary}</p>
+                            ${ambiguous.length > 0 ? `<p><strong>Needs a human:</strong> these milestones mirror one of the above but carry no
+                            payment reference, so we cannot tell whether they recorded this charge or a separate
+                            payment. They were left as-is — please check them in the Stripe dashboard:</p>
+                            <ul>${ambiguous.map((l) => `<li>${l}</li>`).join("")}</ul>` : ""}
+                        </div>`
+                    );
                 }
                 break;
             }

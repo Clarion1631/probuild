@@ -80,13 +80,39 @@ test("N1: order-permutation — a prefix-only stage beacon, a qbPurchaseId-only 
         assert.equal(j.steps.length, 3, "all three events must be folded into the one journey's timeline");
         assert.equal(j.qbPurchaseId, "PID-1");
         assert.equal(j.driveFileId, `${doc}extra-chars-to-be-full-id`);
-        assert.equal(j.keyConfirmed, true);
+        // Codex round 1 finding 5: `stageBeacon` is id-less and only joined
+        // this cluster via the doc-prefix bridge heuristic (it shares no
+        // fileId/qbPurchaseId with anything) — even though qboOnlyPush and
+        // bridge together prove real id-confirmed evidence for THIS journey,
+        // the bridge itself is still a guess (see "N1: an id-less event
+        // bridged..." below for the case where that guess is wrong), so the
+        // merged journey must not report confirmed.
+        assert.equal(j.keyConfirmed, false);
         // The reconciled journey must read as booked (the push succeeded),
         // never "stuck" — this is the actual defect N1 fixes: before the
         // fix, the prefix-only stage beacon's OWN journey (missing the push
         // step) would have read in-flight/stuck instead.
         assert.equal(j.finalState, "booked-api");
     }
+});
+
+test("A4/N1: an id-less event bridged into an id-confirmed cluster via the doc-prefix heuristic downgrades the WHOLE journey to unconfirmed — the bridge is a guess, not proof, even though the cluster also has real driveFileId evidence", () => {
+    const doc = "COLLIDING-PREFIX-00000";
+    // Receipt A: a real, id-confirmed cluster (has its own driveFileId).
+    const receiptA = fakeEvent({
+        id: "a", driveFileId: "FILE-A-full-id", docNumber: doc, createdAt: new Date("2026-07-01T00:00:00Z"),
+    });
+    // Receipt B's id-less intake event, sharing A's doc prefix — gets
+    // bridged into A's cluster because A is the SOLE id-confirmed cluster
+    // sharing that prefix, but that's a guess: B could be a genuinely
+    // different receipt that just collides on the same 21-char prefix,
+    // and nothing here can tell the two cases apart.
+    const receiptBIntake = fakeEvent({
+        id: "b", docNumber: doc, createdAt: new Date("2026-07-01T00:01:00Z"),
+    });
+    const journeys = [...groupEventsIntoJourneys([receiptA, receiptBIntake]).values()];
+    assert.equal(journeys.length, 1, "still one merged journey — the bridge itself is unchanged by this fix");
+    assert.equal(journeys[0].keyConfirmed, false, "but the merge must never be presented as confirmed");
 });
 
 test("N1: mixed-evidence — an event with only a qbPurchaseId reconciles with an event that only has a fileId, when a THIRD event links the two", () => {

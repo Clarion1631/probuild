@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
+import { billableCoItems } from "@/lib/co-tax";
 
 // ─── Types ──────────────────────────────────────────────────────
 interface BudgetData {
@@ -278,7 +279,11 @@ export default function BudgetClient({ project, data }: { project: { id: string;
 
         // Change orders add to revised
         for (const co of changeOrders) {
-            for (const item of co.items) {
+            // Section headers mirror their children's rolled-up total, so counting both
+            // inflates revisedEst. Nothing can create such a row anymore and the money paths
+            // reject any that predate the guard; dropping it here just keeps the budget
+            // honest while a human sorts that change order out.
+            for (const item of billableCoItems(co.items)) {
                 const gk = getGroupKey(item);
                 const row = getOrCreate(gk);
                 row.revisedEst += num(item.total);

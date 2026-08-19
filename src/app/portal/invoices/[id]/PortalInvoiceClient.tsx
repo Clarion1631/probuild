@@ -1,11 +1,14 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import { toast } from "sonner";
 import { markInvoiceViewed } from "@/lib/actions";
 import PortalPayButton from "@/components/PortalPayButton";
 import { formatCurrency } from "@/lib/utils";
 import DocumentLetterhead from "@/components/DocumentLetterhead";
 import { buildLetterheadConfig } from "@/lib/letterhead";
+import { buildPdf } from "@/lib/build-pdf";
+import { formatMoneyDate } from "@/lib/payment-date";
 
 class PaymentSectionErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
     constructor(props: { children: React.ReactNode }) {
@@ -39,6 +42,7 @@ function parseFocusIds(param: string | null | undefined): string[] {
 
 export default function PortalInvoiceClient({ initialInvoice, companySettings, paymentSuccess, focusMilestoneParam }: { initialInvoice: any, companySettings?: any, paymentSuccess?: boolean, focusMilestoneParam?: string | null }) {
     const [isPayingId, setIsPayingId] = useState<string | null>(null);
+    const [isDownloading, setIsDownloading] = useState(false);
 
     useEffect(() => {
         // Pass the focused milestone ids so the internal "Invoice Viewed"
@@ -85,6 +89,31 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
     const companyEmail = companySettings?.email || "";
     const companyAddress = companySettings?.address || "";
     const companyLicense = companySettings?.licenseNumber || "";
+    const invoiceBannerText = `${companyName} • Invoice ${initialInvoice.code} (continued)`;
+
+    async function handleDownload() {
+        const element = document.getElementById("invoice-document-wrapper");
+        if (!element) return;
+        setIsDownloading(true);
+        const prevShadow = element.style.boxShadow;
+        const prevBorder = element.style.border;
+        try {
+            element.style.boxShadow = "none";
+            element.style.border = "none";
+            const pdf = await buildPdf(element, { bannerText: invoiceBannerText });
+            pdf.save(`Invoice_${initialInvoice.code || initialInvoice.id}.pdf`);
+        } catch (err) {
+            console.error("Download failed:", err);
+            toast.error("Couldn't generate the PDF. Please try again.");
+        } finally {
+            // Restore even on failure — a thrown buildPdf() must not leave the
+            // card visually altered (no shadow/border) for the rest of the visit.
+            element.style.boxShadow = prevShadow;
+            element.style.border = prevBorder;
+            setIsDownloading(false);
+        }
+    }
+
     const isPaid = initialInvoice.status === "Paid";
     const totalPaid = Number(initialInvoice.totalAmount || 0) - Number(initialInvoice.balanceDue || 0);
 
@@ -108,6 +137,14 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
         .filter((p: any) => p.status === "Pending" && p.qbInvoiceSentAt)
         .reduce((sum: number, p: any) => sum + Number(p.amount), 0);
 
+    // Split on blank lines so each paragraph can be its own top-level
+    // data-pdf-row — build-pdf.ts hard-slices any row taller than one page,
+    // which can cut through a text line if the whole notes block is one atomic
+    // row. Sibling rows give the paginator safe break points between paragraphs.
+    const noteParagraphs = initialInvoice.notes
+        ? String(initialInvoice.notes).split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean)
+        : [];
+
     return (
         <div className="min-h-screen bg-slate-100 font-sans">
             {/* Payment success banner */}
@@ -130,6 +167,19 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     )}
                     <span className="text-sm text-slate-500">Invoice Portal</span>
                 </div>
+                <button
+                    data-pdf-skip="true"
+                    onClick={handleDownload}
+                    disabled={isDownloading}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition disabled:opacity-50"
+                >
+                    {isDownloading ? (
+                        <svg className="animate-spin w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                    ) : (
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    )}
+                    {isDownloading ? "Generating..." : "Download PDF"}
+                </button>
                 {isPaid && (
                     <span className="px-3 py-1 bg-green-50 text-green-700 rounded-full text-xs font-semibold border border-green-200">✓ Paid in Full</span>
                 )}
@@ -137,7 +187,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
             {/* Document Container */}
             <div className="max-w-4xl mx-auto py-8 px-4 print:py-0 print:px-0">
-                <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
+                <div id="invoice-document-wrapper" className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden print:shadow-none print:border-none print:rounded-none">
 
                     {/* Document Header */}
                     <DocumentLetterhead
@@ -174,7 +224,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     />
 
                     {/* Bill To */}
-                    <div className="px-5 sm:px-10 pt-6 pb-0">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 pt-6 pb-0">
                         <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 sm:gap-8">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Bill To</p>
@@ -188,22 +238,32 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         </div>
                     </div>
 
-                    {/* Focused payment request — the amount the client is being asked to pay right now */}
+                    {/* Focused payment request — the amount the client is being asked to pay
+                        right now. Left as one atomic data-pdf-row: it's a short, bounded card
+                        (label + payment names + amount), not free-form long text like Notes, so
+                        it will never approach the one-page hard-slice threshold — splitting it
+                        would only fragment a single visual card for no pagination benefit. */}
                     {hasFocus && (
-                        <div className="px-5 sm:px-10 py-8 bg-emerald-50 border-b border-emerald-200">
+                        <div data-pdf-row="true" className="px-5 sm:px-10 py-8 bg-emerald-50 border-b border-emerald-200">
                             <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wider mb-1">Payment Requested</p>
                             <p className="text-sm text-emerald-900 mb-3">{focusedPayments.map((p: any) => p.name).join(" · ")}</p>
-                            <div className="flex items-center justify-between flex-wrap gap-4">
+                            {/* min-h reserves space for the pay button so its removal from the
+                                PDF capture (data-pdf-skip is a hard DOM omission in build-pdf.ts,
+                                not a CSS hide) can't shrink this row below the pre-capture
+                                measurement used for pagination — see build-pdf.ts Step 1 vs Step 3. */}
+                            <div className="flex items-center justify-between flex-wrap gap-4 min-h-14">
                                 <p className="text-3xl font-bold text-emerald-700">{formatCurrency(focusTotal)}</p>
                                 {focusedPayments.length === 1 && (
-                                    <PortalPayButton
-                                        invoiceId={initialInvoice.id}
-                                        paymentScheduleId={focusedPayments[0].id}
-                                        amount={Number(focusedPayments[0].amount)}
-                                        label="Pay Now"
-                                        settings={companySettings}
-                                        qbPayLink={focusedPayments[0].status === "Pending" && !focusedPayments[0].qbSyncError ? (focusedPayments[0].qbInvoiceLink || null) : null}
-                                    />
+                                    <div data-pdf-skip="true">
+                                        <PortalPayButton
+                                            invoiceId={initialInvoice.id}
+                                            paymentScheduleId={focusedPayments[0].id}
+                                            amount={Number(focusedPayments[0].amount)}
+                                            label="Pay Now"
+                                            settings={companySettings}
+                                            qbPayLink={focusedPayments[0].status === "Pending" && !focusedPayments[0].qbSyncError ? (focusedPayments[0].qbInvoiceLink || null) : null}
+                                        />
+                                    </div>
                                 )}
                             </div>
                         </div>
@@ -213,7 +273,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                         payment request shows just the requested amount above; the full
                         balance stays out of the client's view until it's asked for. */}
                     {!hasFocus && (
-                    <div className="px-5 sm:px-10 py-8 bg-slate-50 border-b border-slate-200">
+                    <div data-pdf-row="true" className="px-5 sm:px-10 py-8 bg-slate-50 border-b border-slate-200">
                         <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-center">
                             <div>
                                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Total Amount</p>
@@ -236,11 +296,24 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     </div>
                     )}
 
-                    {/* Notes */}
-                    {initialInvoice.notes && (
-                        <div className="px-5 sm:px-10 py-6 border-b border-slate-200">
-                            <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Notes</p>
-                            <p className="text-sm text-slate-600 whitespace-pre-wrap">{initialInvoice.notes}</p>
+                    {/* Notes — heading and each paragraph are sibling data-pdf-row blocks
+                        (not nested inside a parent that itself carries data-pdf-row, which
+                        build-pdf.ts would ignore) so long notes get safe per-paragraph page
+                        breaks instead of one atomic block that can hard-slice through text. */}
+                    {noteParagraphs.length > 0 && (
+                        <div className="border-b border-slate-200">
+                            <div data-pdf-row="true" className="px-5 sm:px-10 pt-6 pb-2">
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Notes</p>
+                            </div>
+                            {noteParagraphs.map((para: string, i: number) => (
+                                <div
+                                    key={i}
+                                    data-pdf-row="true"
+                                    className={`px-5 sm:px-10 text-sm text-slate-600 whitespace-pre-wrap ${i === noteParagraphs.length - 1 ? "pb-6" : "pb-3"}`}
+                                >
+                                    {para}
+                                </div>
+                            ))}
                         </div>
                     )}
 
@@ -259,8 +332,12 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
 
                                     return (
                                         <div
+                                            data-pdf-row="true"
                                             key={payment.id}
-                                            className={`flex flex-wrap items-center justify-between gap-y-3 px-4 sm:px-5 py-4 rounded-lg border ${
+                                            // min-h-14 reserves room for the pay button (skipped from the
+                                            // PDF capture below) so the row can't shrink between the
+                                            // pre-capture row measurement and the filtered capture image.
+                                            className={`flex flex-wrap items-center justify-between gap-y-3 px-4 sm:px-5 py-4 rounded-lg border min-h-14 ${
                                                 isPaidItem
                                                     ? 'bg-green-50 border-green-200'
                                                     : isFocused
@@ -288,7 +365,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                         ? `Due: ${new Date(payment.dueDate).toLocaleDateString()}`
                                                         : 'Due upon receipt'}
                                                     {isPaidItem && payment.paymentDate && (
-                                                        <span className="ml-2">• Paid {new Date(payment.paymentDate).toLocaleDateString()}</span>
+                                                        <span className="ml-2">• Paid {formatMoneyDate(payment.paymentDate, {})}</span>
                                                     )}
                                                 </p>
                                                 {payment.coBilling && (
@@ -311,14 +388,16 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                                                     goes out; Processing/Canceled rows must never re-offer
                                                     checkout. Unrequested rows are schedule context, not an ask. */}
                                                 {!isPaidItem && (payment.status === "Pending" && payment.qbInvoiceSentAt ? (
-                                                    <PortalPayButton
-                                                        invoiceId={initialInvoice.id}
-                                                        paymentScheduleId={payment.id}
-                                                        amount={payment.amount}
-                                                        label="Pay Now"
-                                                        settings={companySettings}
-                                                        qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
-                                                    />
+                                                    <div data-pdf-skip="true">
+                                                        <PortalPayButton
+                                                            invoiceId={initialInvoice.id}
+                                                            paymentScheduleId={payment.id}
+                                                            amount={payment.amount}
+                                                            label="Pay Now"
+                                                            settings={companySettings}
+                                                            qbPayLink={payment.status === "Pending" && !payment.qbSyncError ? (payment.qbInvoiceLink || null) : null}
+                                                        />
+                                                    </div>
                                                 ) : (
                                                     payment.status === "Pending" && (
                                                         <span className="text-xs text-slate-400 whitespace-nowrap">Not yet due</span>
@@ -339,7 +418,7 @@ export default function PortalInvoiceClient({ initialInvoice, companySettings, p
                     )}
 
                     {/* Footer */}
-                    <div className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
+                    <div data-pdf-row="true" className="bg-slate-50 border-t border-slate-200 px-5 sm:px-10 py-4 text-center">
                         <p className="text-xs text-slate-400">
                             This invoice was prepared by {companyName}. {companyPhone && `Contact: ${companyPhone}.`} {companyEmail && `Email: ${companyEmail}.`} {companyLicense && `License # ${companyLicense}.`}
                         </p>

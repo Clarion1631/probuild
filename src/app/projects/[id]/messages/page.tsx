@@ -3,6 +3,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import ClientMessaging from "@/components/ClientMessaging";
+import { portalVisibleEstimateWhere } from "@/lib/estimate-portal-visibility";
 
 export default async function ProjectMessagesPage({ params }: { params: Promise<{ id: string }> }) {
     const session = await getServerSession(authOptions);
@@ -16,7 +17,13 @@ export default async function ProjectMessagesPage({ params }: { params: Promise<
             id: true,
             name: true,
             client: { select: { id: true, name: true, email: true, primaryPhone: true } },
-            estimates: { select: { id: true, code: true, title: true, status: true } },
+            // The picker may only offer estimates the client can actually open —
+            // sending one emails a portal link, and an unshared estimate would
+            // 404 for them (and, before the portal gate existed, leaked pricing).
+            estimates: {
+                where: portalVisibleEstimateWhere(),
+                select: { id: true, code: true, title: true, status: true },
+            },
         },
     });
 

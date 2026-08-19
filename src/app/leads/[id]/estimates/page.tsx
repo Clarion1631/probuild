@@ -1,4 +1,4 @@
-import { getLead, createDraftLeadEstimate, getProjects } from "@/lib/actions";
+import { getLead, createDraftLeadEstimate, getProjects, estimateTotalsComplete } from "@/lib/actions";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import StatusBadge from "@/components/StatusBadge";
@@ -32,6 +32,19 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
     const totalApproved = approvedEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
     const totalAll = allEstimates.reduce((sum: number, e: any) => sum + Number(e.totalAmount || 0), 0);
 
+    // This page only requires `leadAccess`, but a converted lead's estimates are
+    // owned by its linked PROJECT and are scoped by project access. So a reader
+    // without access to that project gets a lead view whose totals silently omit
+    // them — the labels below say so rather than claiming completeness.
+    // Two owners feed these totals: the lead itself, and the linked project if
+    // there is one. Named as owners, not ids, so the lead branch is checked as
+    // `leadAccess` and cannot be confused with an unattached estimate.
+    const totalsAreComplete = await estimateTotalsComplete(
+        linkedProject
+            ? [{ leadId: lead.id }, { projectId: linkedProject.id }]
+            : [{ leadId: lead.id }],
+    );
+
     // Active projects for "Copy to project" bulk action — exclude Archived
     let allActiveProjects: { id: string; name: string }[] = [];
     try {
@@ -60,7 +73,7 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                                 </Link>
                             </div>
                             <h1 className="text-2xl font-bold text-hui-textMain">Estimates</h1>
-                            <p className="text-sm text-hui-textMuted mt-1">{allEstimates.length} estimate{allEstimates.length !== 1 ? "s" : ""} for {lead.name}</p>
+                            <p className="text-sm text-hui-textMuted mt-1">{allEstimates.length} estimate{allEstimates.length !== 1 ? "s" : ""} for {lead.name}{totalsAreComplete || !linkedProject ? "" : ` · you don't have access to ${linkedProject.name}, so its estimates aren't included`}</p>
                         </div>
                         <form action={handleNewEstimate}>
                             <button type="submit" className="px-5 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-lg transition shadow-sm flex items-center gap-2">
@@ -76,19 +89,19 @@ export default async function LeadEstimatesPage({ params }: { params: Promise<{ 
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-green-400 to-emerald-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Approved</p>
                             <p className="text-2xl font-bold text-slate-900">{formatCurrency(totalApproved)}</p>
-                            <p className="text-[10px] text-slate-400 mt-1">{approvedEstimates.length} approved</p>
+                            <p className="text-[10px] text-slate-400 mt-1">{approvedEstimates.length} approved{totalsAreComplete ? "" : " that you can see"}</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-400 to-indigo-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Total Value</p>
                             <p className="text-2xl font-bold text-blue-600">{formatCurrency(totalAll)}</p>
-                            <p className="text-[10px] text-slate-400 mt-1">Across all estimates</p>
+                            <p className="text-[10px] text-slate-400 mt-1">{totalsAreComplete ? "Across all estimates" : "Across the estimates you can see"}</p>
                         </div>
                         <div className="bg-white p-5 rounded-xl border border-slate-200/80 shadow-sm relative overflow-hidden">
                             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-purple-400 to-violet-500" />
                             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Estimates</p>
                             <p className="text-2xl font-bold text-purple-600">{allEstimates.length}</p>
-                            <p className="text-[10px] text-slate-400 mt-1">Total created</p>
+                            <p className="text-[10px] text-slate-400 mt-1">{totalsAreComplete ? "Total created" : "Visible to you"}</p>
                         </div>
                     </div>
 

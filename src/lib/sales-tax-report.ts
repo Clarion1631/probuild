@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { parseLocalDateString, formatLocalDateString } from "./report-utils";
+import { formatMoneyMonth, formatMoneyMonthKey, formatMoneyDateISO } from "./payment-date";
 export { parseLocalDateString, formatLocalDateString } from "./report-utils";
 
 export type SalesTaxBasis = "cash" | "accrual";
@@ -333,8 +334,8 @@ export async function querySalesTaxData(filters: SalesTaxFilters): Promise<{ row
 export function groupRowsByMonth(rows: SalesTaxRow[]) {
     const byMonth = new Map<string, { month: string; key: string; count: number; gross: number; subtotal: number; tax: number }>();
     for (const r of rows) {
-        const key = `${r.date.getFullYear()}-${String(r.date.getMonth() + 1).padStart(2, "0")}`;
-        const label = r.date.toLocaleString("en-US", { month: "long", year: "numeric" });
+        const key = formatMoneyMonthKey(r.date);
+        const label = formatMoneyMonth(r.date);
         const curr = byMonth.get(key) || { month: label, key, count: 0, gross: 0, subtotal: 0, tax: 0 };
         curr.count += 1;
         curr.gross += r.gross;
@@ -367,7 +368,7 @@ export function rowsToCsv(rows: SalesTaxRow[], basis: SalesTaxBasis): string {
 
     const lines = [headers.join(",")];
     for (const r of rows) {
-        const dateStr = formatLocalDateString(r.date);
+        const dateStr = formatMoneyDateISO(r.date);
         if (basis === "cash") {
             lines.push([
                 dateStr,

@@ -8,6 +8,7 @@ import { formatRelativeTime } from "./format";
 import { StateChip, FINAL_STATE_STYLE } from "./shared/state-chip";
 import { StepTimeline } from "./shared/step-timeline";
 import { isStaleBookedApi } from "./shared/stale-detection";
+import { ReceiptThumb } from "./shared/receipt-thumb";
 import { type FilterKey, FILTERS, ReceiptFilterBar } from "./shared/receipt-filters";
 import { SuggestionCard } from "./shared/suggestion-card";
 import { ValidationPanel } from "./shared/validation-panel";
@@ -92,11 +93,16 @@ function EmptyState() {
  * Exception-first verdict: one owner-readable sentence per row. An audit
  * event proves what happened at booking time — this line summarizes that,
  * not a live QuickBooks re-check (that's what "Verify in QuickBooks" is for).
+ *
+ * Finding 7: `truncated` suppresses the "stuck"/stale conclusion — that
+ * diagnosis assumes it has seen this journey's COMPLETE step history, which
+ * a truncated event read can't promise (an older step that would explain
+ * the gap may simply be missing from this render, not missing in reality).
  */
-function journeyVerdict(journey: SerializedJourney, suggestion: FixSuggestion | null, nowMs: number): { text: string; attention: boolean } {
+function journeyVerdict(journey: SerializedJourney, suggestion: FixSuggestion | null, nowMs: number, truncated: boolean): { text: string; attention: boolean } {
     if (journey.finalState === "booked-api") {
         if (journey.synced) return { text: "Booked and in job costs", attention: false };
-        if (isStaleBookedApi(journey, nowMs)) {
+        if (!truncated && isStaleBookedApi(journey, nowMs)) {
             return { text: "Booked but not yet in ProBuild — worth a look", attention: true };
         }
         return { text: "Booked — waiting for the next sync (runs every 4 hours)", attention: false };
@@ -141,7 +147,19 @@ function QbPurchaseLink({ qbPurchaseId }: { qbPurchaseId: string }) {
     );
 }
 
-function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; suggestion: FixSuggestion | null; now: number }) {
+function JourneyRow({
+    journey,
+    suggestion,
+    now,
+    truncated,
+}: {
+    journey: SerializedJourney;
+    suggestion: FixSuggestion | null;
+    now: number;
+    /** See `JourneyList`'s doc comment — suppresses the "stuck" verdict and
+     * the suggestion card, both of which assume complete step history. */
+    truncated: boolean;
+}) {
     const [isOpen, setIsOpen] = useState(false);
 
     const primaryLabel = journey.fileName || journey.vendor || journey.docNumber;
@@ -152,7 +170,7 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
     ].filter(Boolean);
 
     const showPendingSync = journey.finalState === "booked-api" && journey.syncedExpenseId === null;
-    const verdict = journeyVerdict(journey, suggestion, now);
+    const verdict = journeyVerdict(journey, suggestion, now, truncated);
     // The dedupe stage records "duplicate-of:<driveFileId>" (confirmed) or
     // "possible-duplicate-of:<driveFileId>" (totals disagreed — tentative).
     // Surface a link to the other file so a reviewer can eyeball both without
@@ -160,6 +178,11 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
     const dupMatch = journey.finalReason?.match(/^(possible-)?duplicate-of:([\w-]+)$/) ?? null;
     const duplicateOfFileId = dupMatch?.[2] ?? null;
     const duplicateTentative = Boolean(dupMatch?.[1]);
+    // Best available receipt link — the ProBuild-stored copy once synced,
+    // else the Drive original. Same fallback order row-drilldown.tsx uses
+    // for its own `openReceiptHref`.
+    const receiptHref =
+        journey.synced?.receiptUrl ?? (journey.driveFileId ? `https://drive.google.com/file/d/${journey.driveFileId}/view` : null);
 
     return (
         <div className="border-b border-hui-border last:border-b-0">
@@ -202,11 +225,13 @@ function JourneyRow({ journey, suggestion, now }: { journey: SerializedJourney; 
 
             {isOpen && (
                 <div className="px-4 pb-4 space-y-4">
+                    {receiptHref && <ReceiptThumb url={receiptHref} fileName={journey.fileName ?? journey.docNumber} />}
+
                     <ValidationPanel journey={journey} now={now} />
 
                     <StepTimeline steps={journey.steps} showPendingSync={showPendingSync} unconfirmed={!journey.keyConfirmed} now={now} />
 
-                    {suggestion && <SuggestionCard suggestion={suggestion} />}
+                    {suggestion && !truncated && <SuggestionCard suggestion={suggestion} />}
 
                     {duplicateOfFileId && (
                         <a
@@ -244,6 +269,7 @@ export default function JourneyList({
     journeys,
     suggestions,
     now,
+    truncated,
 }: {
     journeys: SerializedJourney[];
     suggestions: Record<string, FixSuggestion | null>;
@@ -251,6 +277,13 @@ export default function JourneyList({
      * both the SSR and hydration render passes — see `isStaleBookedApi`'s
      * doc comment for why this can't be `Date.now()` called in here. */
     now: number;
+    /** True when `receiptJourneys`'s underlying event query hit its cap
+     * (automation-events.ts) — this list may be missing older audit
+     * evidence. Shows a warning banner and suppresses conclusions that
+     * assume complete history: the "stuck"/stale verdict and suggestion
+     * cards, both of which could misdiagnose a journey whose real earlier
+     * steps simply didn't make it into this render. */
+    truncated: boolean;
 }) {
     const [filter, setFilter] = useState<FilterKey>("all");
     const [month, setMonth] = useState<string>("all");
@@ -273,6 +306,13 @@ export default function JourneyList({
 
     return (
         <div className="space-y-3">
+            {truncated && (
+                <p className="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    Journey history is incomplete for this range (event volume exceeded what this view can load) —
+                    &quot;stuck&quot; warnings and fix suggestions are hidden below since they&apos;d be judging partial
+                    data.
+                </p>
+            )}
             <ReceiptFilterBar journeys={scoped} filter={filter} onFilterChange={setFilter} now={now} />
             <div className="flex flex-wrap items-center gap-2">
                 <select
@@ -329,6 +369,7 @@ export default function JourneyList({
                             journey={j}
                             suggestion={suggestions[journeyKey(j)] ?? null}
                             now={now}
+                            truncated={truncated}
                         />
                     ))}
                 </div>

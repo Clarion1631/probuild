@@ -18,5 +18,6 @@ export default async function ProjectTasksPage({ params }: Props) {
         getTeamMembers(),
     ]);
 
-    return <TasksClient projectId={id} initialTasks={tasks} teamMembers={teamMembers} />;
+    // Task total is a Prisma Decimal — serialize before crossing the server->client boundary.
+    return <TasksClient projectId={id} initialTasks={JSON.parse(JSON.stringify(tasks))} teamMembers={teamMembers} />;
 }

@@ -162,10 +162,14 @@ export async function POST(req: Request) {
             );
         }
 
-        const { convertLeadToProject } = await import("@/lib/actions");
+        // The session-free core, not the actions.ts server action: this route
+        // authenticates a mobile token OR a web session and then runs
+        // assertLeadAccess above, and the action's gate assumes a NextAuth staff
+        // session — which a mobile-token caller does not have.
+        const { convertLeadToProjectCore } = await import("@/lib/lead-conversion-core");
         let projectId: string;
         try {
-            const result = await convertLeadToProject(leadId);
+            const result = await convertLeadToProjectCore(leadId);
             projectId = result.id;
         } catch (e: any) {
             // Two concurrent requests can both pass the precheck above; the loser

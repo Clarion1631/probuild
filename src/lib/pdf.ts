@@ -4,8 +4,9 @@ import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
 import { isOwnSignatureStorageUrl } from './signature-storage';
 import { isSecureRef, downloadDocBytes } from './secure-storage';
-import { coTaxRate, coTaxLabel } from './co-tax';
-import { drawRichHtml, type RichTextCtx } from './pdf-richtext';
+import { coTaxRate, coTaxLabel, billableCoItems } from './co-tax';
+import { drawRichHtml, drawWrappedText, measureWrappedLines, type RichTextCtx } from './pdf-richtext';
+import { isEstimateSectionRow, rm } from './estimate-item-payload';
 
 /** pdf-lib only supports PNG/JPG; SignaturePad always emits PNG, so a failed PNG embed
  *  falls through to a JPG attempt (no content-type header is available once bytes come
@@ -144,14 +145,17 @@ function hexToRgb(hex: string) {
 }
 
 function formatCurrency(amount: number): string {
-    return `$${Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const n = Number(amount);
+    const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    // Sign before the dollar sign: -$4,629.63, not $-4,629.63.
+    return n < 0 ? `-$${abs}` : `$${abs}`;
 }
 
 /** Word-wrap plain (non-HTML) text to maxWidth, collapsing any run of blank lines to a single one
  *  (whitespace-only lines count as blank for this rule), trimming leading/trailing blank lines,
- *  and hard-breaking any single word wider than maxWidth by character. Used for user-authored
- *  fields (notes, terms, description) that were previously drawn with a single unwrapped
- *  drawText call and ran off the page. */
+ *  and hard-breaking any single word wider than maxWidth by character. Used for table cells and
+ *  the letterhead, which need the wrapped lines themselves (for manual per-line column alignment)
+ *  rather than pdf-richtext's flow-and-paginate drawWrappedText/measureWrappedLines. */
 function wrapPlainText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
     const normalized = (text ?? '').replace(/\r\n/g, '\n');
     const lines: string[] = [];
@@ -204,31 +208,6 @@ function wrapPlainText(text: string, font: PDFFont, size: number, maxWidth: numb
     while (start < end && collapsed[start] === '') start++;
     while (end > start && collapsed[end - 1] === '') end--;
     return collapsed.slice(start, end);
-}
-
-/** Draw word-wrapped plain text starting at { page, y }, breaking to a new page (via
- *  doc.addPage) when a line would run past the bottom margin. Returns the updated
- *  { page, y } cursor so the caller's closure can continue from where drawing left off. */
-function drawWrappedText(
-    ctx: { doc: PDFDocument; page: PDFPage; y: number },
-    text: string,
-    opts: { x: number; maxWidth: number; size: number; font: PDFFont; color: ReturnType<typeof rgb>; pageWidth: number; pageHeight: number; margin: number },
-): { page: PDFPage; y: number } {
-    const { x, maxWidth, size, font, color, pageWidth, pageHeight, margin } = opts;
-    const leading = size + 4;
-    const { doc } = ctx;
-    let { page, y } = ctx;
-    for (const line of wrapPlainText(text, font, size, maxWidth)) {
-        // Empty lines are just paragraph spacing — never let one trigger a page break
-        // (an empty line landing at the page bottom should simply be dropped).
-        if (line && y < margin + leading) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-        }
-        if (line) page.drawText(line, { x, y, size, font, color });
-        y -= leading;
-    }
-    return { page, y };
 }
 
 async function drawLetterhead(
@@ -495,7 +474,11 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     // --- Table Rows ---
     const rowLeading = 12;
     for (const item of estimate.items) {
-        const isSection = !item.parentId && estimate.items.some(i => i.parentId === item.id);
+        // Shared with serializeEstimateItemsForSave: a row is a section if it is typed as one
+        // or has children. Keying off children alone rendered an emptied section (and any
+        // nested section) as a billable line with qty/unit-cost columns, even though its
+        // stored total is a rolled-up figure that does not equal qty * unitCost.
+        const isSection = isEstimateSectionRow(item, estimate.items);
         const isSubItem = !!item.parentId;
         const nameX = isSubItem ? cols.name + 16 : cols.name;
         const nameFont = isSection || !isSubItem ? helveticaBold : helvetica;
@@ -572,11 +555,18 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
     });
     y -= 20;
 
-    const subtotal = estimate.items.reduce((acc, item) => {
-        if (item.parentId) return acc + toNum(item.total);
-        if (!estimate.items.some(i => i.parentId === item.id)) return acc + toNum(item.total);
-        return acc;
-    }, 0);
+    // Leaf rows only, using the same predicate as the rows above. Keying off `parentId`
+    // added a nested section's rolled-up total on top of the child totals it already
+    // contains, inflating the subtotal (and therefore tax and the grand total).
+    // `rm` on the accumulated sum matches computeEstimateSubtotal: without it the raw float
+    // sum can land a hair under the canonical figure and drag tax, the processing fee and
+    // the grand total a cent below what the editor showed.
+    const subtotal = rm(
+        estimate.items.reduce(
+            (acc, item) => (isEstimateSectionRow(item, estimate.items) ? acc : acc + toNum(item.total)),
+            0,
+        ),
+    );
 
     const taxRatePercent = toNum(estimate.taxRatePercent);
     const taxExempt = !!estimate.taxExempt;
@@ -790,6 +780,20 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         }
     }
 
+    // Flow wrapped multi-line plain text (notes/terms can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const poFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: poFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
+    }
+
     // --- Letterhead ---
     const lhConfig = buildLetterheadConfig(company);
     y = await drawLetterhead(doc, page, lhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
@@ -970,8 +974,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         checkNewPage(80);
         page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        const notesRes = drawWrappedText({ doc, page, y }, po.notes, { x: margin, maxWidth: contentWidth, size: 9, font: helvetica, color: colors.textMuted, pageWidth, pageHeight, margin });
-        page = notesRes.page; y = notesRes.y;
+        flowText(po.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
 
     if (po.terms) {
@@ -979,8 +982,7 @@ export async function generatePurchaseOrderPdf(poId: string): Promise<Buffer> {
         checkNewPage(80);
         page.drawText('Terms & Conditions:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        const termsRes = drawWrappedText({ doc, page, y }, po.terms, { x: margin, maxWidth: contentWidth, size: 9, font: helvetica, color: colors.textMuted, pageWidth, pageHeight, margin });
-        page = termsRes.page; y = termsRes.y;
+        flowText(po.terms, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
 
     const pdfBytes = await doc.save();
@@ -1031,6 +1033,20 @@ export async function generateInvoicePdf(
             page = doc.addPage([pageWidth, pageHeight]);
             y = pageHeight - margin;
         }
+    }
+
+    // Flow wrapped multi-line plain text (notes can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const invFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: invFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
     }
 
     // --- Letterhead ---
@@ -1159,8 +1175,7 @@ export async function generateInvoicePdf(
         checkNewPage(80);
         page.drawText('Notes:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        const notesRes = drawWrappedText({ doc, page, y }, invoice.notes, { x: margin, maxWidth: contentWidth, size: 9, font: helvetica, color: colors.textMuted, pageWidth, pageHeight, margin });
-        page = notesRes.page; y = notesRes.y;
+        flowText(invoice.notes, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
     }
 
     // No pre-footer page-break guard here: every content path above already page-breaks
@@ -1207,25 +1222,44 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         }
     }
 
+    // Flow wrapped multi-line text (descriptions can be long) and sync the local
+    // page/y cursor — drawWrappedText paginates on its own when it runs out of room.
+    const coFonts = { regular: helvetica, bold: helveticaBold, italic: helvetica, boldItalic: helveticaBold };
+    function flowText(text: string, opts: { x: number; maxWidth: number; size: number; color: ReturnType<typeof rgb>; lineHeight: number }) {
+        const ctx: RichTextCtx = {
+            doc, page, y, fonts: coFonts,
+            layout: { pageWidth, pageHeight, margin, contentWidth },
+            color: colors.textMain, mutedColor: colors.textMuted,
+        };
+        const res = drawWrappedText(text, ctx, opts);
+        page = res.page;
+        y = res.y;
+    }
+
     // --- Letterhead ---
     const coLhConfig = buildLetterheadConfig(company);
     y = await drawLetterhead(doc, page, coLhConfig, { pageWidth, pageHeight, margin }, { regular: helvetica, bold: helveticaBold });
 
-    page.drawText('CHANGE ORDER', { x: margin, y, size: 22, font: helveticaBold, color: colors.textMain });
+    // Header mirrors the invoice PDF: 26pt title, BILL TO block (name + email),
+    // right-aligned meta column, then a divider clear of both columns.
+    y -= 24;
+    page.drawText('CHANGE ORDER', { x: margin, y, size: 26, font: helveticaBold, color: colors.textMain });
 
-    y -= 22;
     if (co.title) {
-        page.drawText(co.title, { x: margin, y, size: 12, font: helvetica, color: colors.textMain });
-        y -= 10;
+        y -= 22;
+        page.drawText(co.title, { x: margin, y, size: 11, font: helvetica, color: colors.textMuted });
     }
+    y -= 30;
 
-    y -= 20;
     const coClientName = co.project?.client?.name || '';
-    page.drawText('CLIENT', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
+    const coClientEmail = co.project?.client?.email || '';
+    const coBillToY = y; // meta column anchors to the BILL TO baseline
+    page.drawText('BILL TO', { x: margin, y, size: 9, font: helveticaBold, color: colors.textMuted });
     if (coClientName) { y -= 16; page.drawText(coClientName, { x: margin, y, size: 11, font: helvetica, color: colors.textMain }); }
+    if (coClientEmail) { y -= 14; page.drawText(coClientEmail, { x: margin, y, size: 9, font: helvetica, color: colors.textMuted }); }
 
     const coRightX = pageWidth - margin;
-    let coRy = y + (coClientName ? 16 : 0);
+    let coRy = coBillToY;
 
     const drawCORL = (label: string, value: string, yPos: number) => {
         page.drawText(label, { x: coRightX - 160, y: yPos, size: 9, font: helvetica, color: colors.textMuted });
@@ -1241,69 +1275,77 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
     coRy -= 16;
     drawCORL('Project', co.project?.name || '', coRy);
 
-    y -= 20;
+    // The meta column is 4 rows tall; the client block can be shorter. Drop the
+    // divider below whichever column ends lower so it never crosses a meta row.
+    y = Math.min(y, coRy) - 20;
     page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 20;
 
     if (co.description) {
         page.drawText('Description:', { x: margin, y, size: 10, font: helveticaBold, color: colors.textMain });
         y -= 14;
-        const descRes = drawWrappedText({ doc, page, y }, co.description, { x: margin, maxWidth: contentWidth, size: 9, font: helvetica, color: colors.textMuted, pageWidth, pageHeight, margin });
-        page = descRes.page; y = descRes.y;
-        y -= 6;
+        flowText(co.description, { x: margin, maxWidth: contentWidth, size: 9, color: colors.textMuted, lineHeight: 13 });
+        y -= 10;
     }
 
+    // Full name and description render wrapped (no truncation — the client must
+    // see the entire scope text). Items are pre-measured so short items never
+    // split across a page break; very long ones flow and paginate on their own.
+    // An empty name still consumes one 13pt row (the money columns' baseline).
+    // The name shares its first row with the QTY/UNIT COST/TOTAL figures so it
+    // stays inside its column; description lines sit below that row and can run
+    // wider without colliding with the money columns.
+    const coNameWidth = contentWidth * 0.5;
+    const coDescWidth = contentWidth * 0.78;
+    const coItemEstHeight = (item: { name?: string | null; description?: string | null }) => {
+        const nameLines = measureWrappedLines(item.name || '', helvetica, 10, coNameWidth);
+        const descLines = item.description ? measureWrappedLines(item.description, helvetica, 8.5, coDescWidth) : 0;
+        return Math.max(1, nameLines) * 13 + (descLines ? 4 + descLines * 11.5 : 0) + 16;
+    };
+    // Fully empty placeholder rows (no name, no description, $0) would render
+    // as orphan "$0.00" lines — drop them. Anything with text or money stays.
+    // Section headers are excluded before the empty-row filter: a header mirrors the total
+    // of the lines beneath it, so printing it would make the visible lines out-sum the
+    // subtotal the customer signs. (The send guard refuses such a CO outright; this keeps an
+    // unsent draft's preview honest.)
+    const coVisibleItems = billableCoItems(co.items).filter(it =>
+        (it.name || '').trim() || (it.description || '').trim() || Number(it.total) || Number(it.unitCost));
+    // Reserve through the first item so neither the cost-plus terms block nor
+    // the table header is left orphaned when the first row's preflight breaks.
+    const coFirstItemH = coVisibleItems.length ? coItemEstHeight(coVisibleItems[0]) : 30;
+
     if (co.pricingType === 'COST_PLUS') {
-        checkNewPage(70);
+        // Terms block (40pt) + table header (22pt) + first item stay together.
+        checkNewPage(Math.min(margin + 62 + coFirstItemH, 500));
         page.drawText(`COST + ${co.markupPercent ?? 10}% + TAX`, { x: margin, y, size: 12, font: helveticaBold, color: colors.primary });
         y -= 16;
         page.drawText('Billed from actual time and materials. Scope-line amounts below are non-binding estimates.', { x: margin, y, size: 9, font: helvetica, color: colors.textMuted });
         y -= 24;
     }
 
-    // Items table
-    // 100 (not 60): the header below consumes ~22 before the first row's own guard
-    // runs, so a smaller reserve here can orphan the header at the bottom of a page.
-    checkNewPage(100);
+    // Items table — a long description above may have flowed near the page
+    // bottom; keep the column header (22pt) with the complete first item.
+    checkNewPage(Math.min(margin + 22 + coFirstItemH, 500));
     const coCols = { name: margin, qty: margin + contentWidth * 0.55, unitCost: margin + contentWidth * 0.75, total: pageWidth - margin };
-    const coPricingType = co.pricingType;
 
-    function drawCOTableHeader() {
-        page.drawText(coPricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const coQtyLabel = 'QTY'; const coQtyW = helveticaBold.widthOfTextAtSize(coQtyLabel, 8);
-        page.drawText(coQtyLabel, { x: coCols.qty - coQtyW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const coUcLabel = 'UNIT COST'; const coUcW = helveticaBold.widthOfTextAtSize(coUcLabel, 8);
-        page.drawText(coUcLabel, { x: coCols.unitCost - coUcW, y, size: 8, font: helveticaBold, color: colors.textMuted });
-        const coTLabel = 'TOTAL'; const coTW = helveticaBold.widthOfTextAtSize(coTLabel, 8);
-        page.drawText(coTLabel, { x: coCols.total - coTW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    page.drawText(co.pricingType === 'COST_PLUS' ? 'SCOPE ESTIMATE (NOT A FIXED PRICE)' : 'ITEM DESCRIPTION', { x: coCols.name, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coQtyLabel = 'QTY'; const coQtyW = helveticaBold.widthOfTextAtSize(coQtyLabel, 8);
+    page.drawText(coQtyLabel, { x: coCols.qty - coQtyW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coUcLabel = 'UNIT COST'; const coUcW = helveticaBold.widthOfTextAtSize(coUcLabel, 8);
+    page.drawText(coUcLabel, { x: coCols.unitCost - coUcW, y, size: 8, font: helveticaBold, color: colors.textMuted });
+    const coTLabel = 'TOTAL'; const coTW = helveticaBold.widthOfTextAtSize(coTLabel, 8);
+    page.drawText(coTLabel, { x: coCols.total - coTW, y, size: 8, font: helveticaBold, color: colors.textMuted });
 
-        y -= 8;
-        page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
-        y -= 14;
-    }
+    y -= 8;
+    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
+    y -= 14;
 
-    drawCOTableHeader();
-
-    const rowLeading = 12;
-    for (const item of co.items) {
-        // Wrap the item name to the column width instead of truncating it.
-        const displayName = item.name || '';
-        const maxNameWidth = contentWidth * 0.5;
-        const wrappedName = wrapPlainText(displayName, helvetica, 10, maxNameWidth);
-        const lineCount = Math.max(wrappedName.length, 1);
-        const rowHeight = lineCount * rowLeading + 8;
-
-        // Page-break BEFORE the row if the whole (possibly multi-line) row doesn't fit,
-        // re-drawing the table header on the new page.
-        if (y - rowHeight < margin) {
-            page = doc.addPage([pageWidth, pageHeight]);
-            y = pageHeight - margin;
-            drawCOTableHeader();
-        }
-
-        wrappedName.forEach((line, idx) => {
-            page.drawText(line, { x: coCols.name, y: y - idx * rowLeading, size: 10, font: helvetica, color: colors.textMain });
-        });
+    for (let itemIdx = 0; itemIdx < coVisibleItems.length; itemIdx++) {
+        const item = coVisibleItems[itemIdx];
+        const itemName = item.name || '';
+        const itemDesc = item.description || '';
+        const nameLines = measureWrappedLines(itemName, helvetica, 10, coNameWidth);
+        checkNewPage(Math.min(margin + coItemEstHeight(item), 500));
 
         const qtyStr = String(item.quantity || 0);
         const qtyStrW = helvetica.widthOfTextAtSize(qtyStr, 10);
@@ -1317,12 +1359,28 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         const itemTotalW = helveticaBold.widthOfTextAtSize(itemTotalStr, 10);
         page.drawText(itemTotalStr, { x: coCols.total - itemTotalW, y, size: 10, font: helveticaBold, color: colors.textMain });
 
-        y -= rowHeight;
+        if (nameLines > 0) flowText(itemName, { x: coCols.name, maxWidth: coNameWidth, size: 10, color: colors.textMain, lineHeight: 13 });
+        else y -= 13;
+        if (itemDesc) {
+            y -= 4;
+            flowText(itemDesc, { x: coCols.name, maxWidth: coDescWidth, size: 8.5, color: colors.textMuted, lineHeight: 11.5 });
+        }
+        // Hairline between items keeps long scope lists scannable; the totals
+        // rule already follows the last item, so skip it there.
+        if (itemIdx < coVisibleItems.length - 1) {
+            const ruleY = y + 5;
+            page.drawLine({ start: { x: margin, y: ruleY }, end: { x: pageWidth - margin, y: ruleY }, thickness: 0.5, color: colors.border });
+            y = ruleY - 16;
+        } else {
+            y -= 7;
+        }
     }
 
-    // Total
+    // Total — reserve the whole Subtotal/Tax/Revised Amount block (rule + 3 rows)
+    // so it never straddles the bottom margin or splits across pages. Cost-plus
+    // shows a single terms row, so the smaller reserve avoids early page breaks.
     y -= 10;
-    checkNewPage(80);
+    checkNewPage(co.pricingType === 'COST_PLUS' ? 80 : 125);
     page.drawLine({ start: { x: margin + contentWidth * 0.5, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: colors.border });
     y -= 25;
 
@@ -1385,10 +1443,6 @@ export async function generateChangeOrderPdf(coId: string): Promise<Buffer> {
         page.drawText(`Date: ${co.companySignedAt ? new Date(co.companySignedAt).toLocaleString() : '—'}`, { x: margin, y, size: 10, font: helvetica, color: colors.textMain });
     }
 
-    // No pre-footer page-break guard here: every content path above already page-breaks
-    // (or is bounded, e.g. the checkNewPage(60)/(100) guards on the totals and signature
-    // rows) well clear of the footer's y=30, so this can't collide — and a guard here
-    // would emit a footer-only blank page.
     const coFooterText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
     page.drawText(coFooterText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
 

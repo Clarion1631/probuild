@@ -1,4 +1,11 @@
-import { getContractForPortal, getPublicCompanySettings, getPortalVisibility, getExecutedContractPdf } from "@/lib/actions";
+import { getContractForPortal, getPublicCompanySettings, getPortalVisibility } from "@/lib/actions";
+// The session-free core, NOT a staff-gated server action: this page has no
+// staff session. (The staff wrapper `getExecutedContractPdf` that used to sit
+// beside this core in actions.ts has since been deleted as caller-less dead
+// surface.) Access was already proven above by getContractForPortal,
+// which matches the emailed accessToken or a portal session resolving to the
+// owning Client, and the descriptor below comes from the row it returned.
+import { executedContractPdfFor } from "@/lib/contract-files-core";
 import { notFound } from "next/navigation";
 import PortalContractClient from "./PortalContractClient";
 import Link from "next/link";
@@ -47,7 +54,7 @@ export default async function PortalContractPage({
 
     // Fetch the executed PDF file (if this contract has been signed & archived) so the client
     // can download it from the portal page instead of hunting through email.
-    const archivedFile = await getExecutedContractPdf({
+    const archivedFile = await executedContractPdfFor({
         id: contract.id,
         title: contract.title,
         projectId: contract.projectId,

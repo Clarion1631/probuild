@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import type { SerializedJourney } from "../journey-list";
 import { formatRelativeTime } from "../format";
-import { AiFieldChip, aiReadLine, useAiReview } from "./ai-review";
+import { AiFieldChip, ReasonablenessChip, aiReadLine, useAiReview } from "./ai-review";
 
 // ── Validation station ──────────────────────────────────────────────────────
 
@@ -416,6 +416,11 @@ export function ValidationPanel({ journey, now }: { journey: SerializedJourney; 
                                         ? "⚠ Model read matches the booked values, but the receipt match itself is unconfirmed — verify manually"
                                         : `${aiResult.models.length === 1 ? "Model agrees" : "Both models agree"} with what was booked ✓`}
                         </p>
+                        {aiResult.reasonableness && (
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                                <ReasonablenessChip reasonableness={aiResult.reasonableness} />
+                            </div>
+                        )}
                         {aiResult.models.map((m) => (
                             <div key={m.model} className="border border-hui-border rounded-lg p-2.5">
                                 <p className="text-xs font-semibold text-hui-textMain mb-1">{m.model}</p>

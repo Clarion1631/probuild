@@ -1,13 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import DOMPurify from "dompurify";
+import DOMPurify from "isomorphic-dompurify";
 import { sendEstimateToClient, getDocumentTemplates, generatePdfUploadToken } from "@/lib/actions";
 import { toast } from "sonner";
 
 type Template = { id: string; name: string; type: string; body: string; isDefault: boolean };
 
-export default function SendEstimateModal({ estimateId, clientEmail, onClose }: { estimateId: string; clientEmail?: string; onClose: () => void }) {
+export default function SendEstimateModal({ estimateId, clientEmail, onClose, onBeforeSend }: { estimateId: string; clientEmail?: string; onClose: () => void; onBeforeSend?: () => Promise<unknown> }) {
     const [templates, setTemplates] = useState<Template[]>([]);
     const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
     const [isSending, setIsSending] = useState(false);
@@ -127,6 +127,21 @@ export default function SendEstimateModal({ estimateId, clientEmail, onClose }: 
         }
         setIsSending(true);
         try {
+            // The editor passes a silent-save hook: sendEstimateToClient reads the
+            // estimate from the database, so any edit made after the modal opened
+            // (or while the pre-open save was still in flight) must be persisted
+            // right before the send. A failed save aborts the send.
+            if (onBeforeSend) {
+                try {
+                    await onBeforeSend();
+                } catch (e: any) {
+                    if (!e?.isSaveConflict) {
+                        const detail = e?.message ? ` (${e.message})` : "";
+                        toast.error(`We couldn't confirm the save — the estimate was not sent.${detail}`);
+                    }
+                    return;
+                }
+            }
             const ccList = ccEmails.split(",").map(e => e.trim()).filter(Boolean);
             const result = await sendEstimateToClient(
                 estimateId,

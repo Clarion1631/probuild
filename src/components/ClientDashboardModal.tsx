@@ -12,6 +12,7 @@ type VisibilityState = {
     showInvoices: boolean;
     showContracts: boolean;
     showMessages: boolean;
+    showPermits?: boolean;
     isPortalEnabled: boolean;
     lastSharedAt?: Date | null;
     lastShareEmailId?: string | null;
@@ -22,6 +23,7 @@ const TOGGLE_CONFIG: { key: keyof VisibilityState; label: string; description: s
     { key: "showEstimates", label: "Estimates & Proposals", description: "Client can view shared estimates and approve them" },
     { key: "showInvoices", label: "Invoices & Payments", description: "Client can view invoices and make payments" },
     { key: "showContracts", label: "Contracts", description: "Client can view and sign contracts" },
+    { key: "showPermits", label: "Permits", description: "Permit numbers and status for the job" },
     { key: "showSchedule", label: "Schedule", description: "Client can view the project schedule timeline" },
     { key: "showFiles", label: "Files & Documents", description: "Client can browse project files and documents" },
     { key: "showDailyLogs", label: "Daily Logs", description: "Client can view daily project logs and notes" },

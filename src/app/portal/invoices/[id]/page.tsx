@@ -7,6 +7,7 @@ import { stripe } from "@/lib/stripe";
 import { toNum } from "@/lib/prisma-helpers";
 import { withTxRetry, lockMoneyParents } from "@/lib/tx-retry";
 import { enqueueMilestonePaid, drainPaymentNotifications } from "@/lib/payment-outbox";
+import { mirrorInvoiceSettleToEstimate } from "@/lib/payment-mirror";
 
 // Fallback settlement for when the client lands back on the portal invoice page with a
 // Stripe session_id before the webhook has processed it. Mirrors the webhook's invoice
@@ -46,7 +47,13 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
         }
 
         const result = await withTxRetry(() => prisma.$transaction(async (t) => {
-            await lockMoneyParents(t, { invoiceId });
+            // Canonical Estimate → Invoice lock order. The estimate is locked too because
+            // the estimate-side milestone copy is mirrored below; the link is read
+            // non-locking first so the order can never invert against another flow.
+            const invLink = await t.invoice.findUnique({ where: { id: invoiceId }, select: { estimateId: true } });
+            await lockMoneyParents(t, { estimateId: invLink?.estimateId, invoiceId });
+            // One settle instant, taken AFTER the locks — see payment-record-core.ts.
+            const settledAt = new Date();
             const claim = await t.paymentSchedule.updateMany({
                 where: { id: scheduleId, invoiceId, status: { not: "Paid" } },
                 data: {
@@ -54,8 +61,10 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                     stripeSessionId: sessionId,
                     stripePaymentIntentId: session.payment_intent as string | null,
                     paymentMethod,
-                    paymentDate: new Date(),
-                    paidAt: new Date(),
+                    // Stripe-sourced: a real INSTANT, not a calendar day (see lib/payment-date.ts).
+                    // Both columns take the same instant so they can never disagree.
+                    paymentDate: settledAt,
+                    paidAt: settledAt,
                 },
             });
             const won = claim.count > 0;
@@ -71,6 +80,25 @@ async function verifyStripeSession(sessionId: string, invoiceId: string): Promis
                 where: { id: invoice.id },
                 data: { balanceDue: newBalance, status: newStatus },
             });
+            // Mirror onto the estimate-side copy so the estimate and the portal don't keep
+            // showing this milestone as unpaid. Only the winner of the claim mirrors; the
+            // loser's mirror write would be a no-op against an already-Paid row anyway.
+            if (won) {
+                const paidSchedule = allSchedules.find(s => s.id === scheduleId) ?? null;
+                if (paidSchedule) {
+                    await mirrorInvoiceSettleToEstimate(t, {
+                        estimateId: invLink?.estimateId,
+                        payment: paidSchedule,
+                        data: {
+                            paymentDate: paidSchedule.paymentDate ?? new Date(),
+                            paidAt: paidSchedule.paidAt ?? new Date(),
+                            paymentMethod,
+                            stripeSessionId: sessionId,
+                            stripePaymentIntentId: session.payment_intent as string | null,
+                        },
+                    });
+                }
+            }
             // Durable notification enqueued in-tx; delivered by the drainer below (single
             // canonical writer, exactly-once with the webhook via the outbox + settle claim).
             if (won) {
