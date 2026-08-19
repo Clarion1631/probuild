@@ -83,6 +83,9 @@ supabase/.temp/
 # Template backup files produced by scripts/seed-residential-templates.mjs
 scripts/.template-backup-*.json
 
+# Resumable-backfill checkpoint produced by scripts/backfill-review-evidence.mjs
+scripts/.backfill-review-evidence.checkpoint.json
+
 # Graphify / AI tool temporary & AST files
 .graphify_*
 /graphify-out/

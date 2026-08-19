@@ -312,29 +312,323 @@ function journeyFinalState(steps: JourneyStep[]): { state: ReceiptJourney["final
 }
 
 /** Stable key for a journey, for anywhere a Map/Record needs exactly one
- * entry per journey (React list keys, fix-suggestion lookups, …). Full
- * driveFileId when confirmed; otherwise a composite of the bare docNumber
- * prefix + firstSeen so two journeys sharing that prefix (a real collision)
- * never collide onto the same key. Never key on the bare docNumber alone. */
-export function journeyKey(j: { driveFileId: string | null; docNumber: string; firstSeen: Date }): string {
-    return j.driveFileId ?? `${j.docNumber}:${j.firstSeen.toISOString()}`;
+ * entry per journey (React list keys, fix-suggestion lookups, …). Trust
+ * order: full driveFileId, then full qbPurchaseId, then a composite of the
+ * bare docNumber prefix + firstSeen — mirrors the grouping tiers in
+ * `groupEventsIntoJourneys` below. Two QBO-only journeys can share a
+ * docNumber prefix (and, at second resolution, even a `firstSeen` instant),
+ * so the qbPurchaseId tier must come BEFORE the prefix+firstSeen fallback or
+ * their keys can collide. Never key on the bare docNumber alone. */
+export function journeyKey(j: { driveFileId: string | null; qbPurchaseId: string | null; docNumber: string; firstSeen: Date }): string {
+    return j.driveFileId ?? (j.qbPurchaseId ? `qb:${j.qbPurchaseId}` : `${j.docNumber}:${j.firstSeen.toISOString()}`);
+}
+
+/** Minimal shape `groupEventsIntoJourneys` needs from an AutomationEvent row —
+ * a subset of the Prisma model so the grouping logic stays testable against
+ * plain objects instead of a live database. */
+export interface JourneyEventInput {
+    id: string;
+    kind: string;
+    stage: string | null;
+    status: string;
+    reason: string | null;
+    source: string | null;
+    vendor: string | null;
+    projectName: string | null;
+    docNumber: string | null;
+    fileName: string | null;
+    amountCents: number | null;
+    taxCents: number | null;
+    qbPurchaseId: string | null;
+    driveFileId: string | null;
+    detail: string | null;
+    createdAt: Date;
 }
 
 /**
- * Group stage beacons + push events into one timeline per receipt, newest
- * receipt first, and mark the ones the 4-hour sync already landed in
- * ProBuild (matched via the [gtr-file:...] marker the sync copies into the
- * expense description).
+ * Group stage beacons + push events into one timeline per receipt.
  *
+ * N1 fix: earlier code had each event independently pick ONE key (fileId,
+ * else qbPurchaseId, else docNumber prefix) as it was folded in. That let
+ * one receipt split across two journeys — e.g. a QBO-only event (carries
+ * qbPurchaseId but no fileId yet) landing under `qb:<id>` while an earlier
+ * prefix-only stage beacon for the SAME receipt stayed under `prefix:<doc>`.
+ * One of the two journeys could then read "booked/synced" while the other
+ * read "stuck" and got a fix suggestion — actively wrong, not just
+ * incomplete.
+ *
+ * Fixed with a union-find pass BEFORE any journey object is built: every
+ * event that shares a fileId with another event is unioned into the same
+ * group, same for qbPurchaseId, and any event carrying BOTH ids is the
+ * bridge that reconciles a fileId-only cluster with a qbPurchaseId-only
+ * cluster describing the same receipt. An id-less event (e.g. an "intake"
+ * stage beacon logged before the bot had booked anything) is then bridged
+ * into whichever id-confirmed cluster is the SOLE one sharing its docNumber
+ * — that's the actual N1 scenario above, and is safe because docNumber is
+ * derived from the same fileId at logging time for every event in one
+ * receipt's real timeline. When a docNumber has more than one distinct
+ * id-confirmed cluster (a genuine collision), id-less events sharing it are
+ * never guessed onto either — they fall back to their own per-docNumber-
+ * prefix bucket instead (still `keyConfirmed: false`; a prefix collision
+ * between two genuinely different receipts that both lack any id anywhere
+ * is a real, disclosed limitation this fix does not attempt to resolve —
+ * there is no data to disambiguate them with). This whole pass is
+ * order-independent by construction — the same input set produces the same
+ * groups regardless of what order the events happen to arrive in.
+ *
+ * Events are sorted by (createdAt, id) before grouping — id is a
+ * deterministic tie-breaker for events sharing the same millisecond
+ * timestamp, so journey.steps/firstSeen/lastSeen assembly never depends on
+ * incidental DB/array order.
+ */
+export function groupEventsIntoJourneys(events: JourneyEventInput[]): Map<string, ReceiptJourney> {
+    const sorted = [...events].sort((a, b) => {
+        const t = a.createdAt.getTime() - b.createdAt.getTime();
+        if (t !== 0) return t;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+
+    const parent = sorted.map((_, i) => i);
+    function find(i: number): number {
+        while (parent[i] !== i) {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    }
+    function union(a: number, b: number) {
+        const ra = find(a);
+        const rb = find(b);
+        if (ra !== rb) parent[ra] = rb;
+    }
+
+    const byFileId = new Map<string, number>();
+    const byQbPurchaseId = new Map<string, number>();
+    sorted.forEach((e, i) => {
+        const fileId = resolveEventFileId(e);
+        const qbPurchaseId = resolveEventQbPurchaseId(e);
+        if (fileId) {
+            const existing = byFileId.get(fileId);
+            if (existing !== undefined) union(i, existing);
+            else byFileId.set(fileId, i);
+        }
+        if (qbPurchaseId) {
+            const existing = byQbPurchaseId.get(qbPurchaseId);
+            if (existing !== undefined) union(i, existing);
+            else byQbPurchaseId.set(qbPurchaseId, i);
+        }
+        // The bridge: an event carrying BOTH ids ties the fileId cluster and
+        // the qbPurchaseId cluster together — this is the actual N1 fix.
+        if (fileId && qbPurchaseId) {
+            union(byFileId.get(fileId)!, byQbPurchaseId.get(qbPurchaseId)!);
+        }
+    });
+
+    // Events with neither id (e.g. an "intake" stage beacon logged before
+    // the bot had booked anything, whose logging path never dual-wrote a
+    // typed column): bridge them into the SINGLE id-confirmed cluster that
+    // shares their docNumber, when there is exactly one. docNumber is
+    // derived from the same fileId at logging time for every event in one
+    // receipt's real timeline, so an id-less event and a later id-confirmed
+    // event sharing a docNumber are overwhelmingly the SAME receipt — this
+    // is what actually reconciles a prefix-only stage beacon with the push
+    // event for that same receipt (the N1 scenario). Never guess when a
+    // docNumber has MORE THAN ONE distinct id-confirmed cluster (a genuine
+    // collision) — id-less events for that docNumber are left out of both
+    // rather than arbitrarily attached to one of the colliding receipts.
+    const idRootsByDoc = new Map<string, Set<number>>();
+    sorted.forEach((e, i) => {
+        if (!resolveEventFileId(e) && !resolveEventQbPurchaseId(e)) return;
+        const doc = e.docNumber as string;
+        const roots = idRootsByDoc.get(doc) ?? new Set<number>();
+        roots.add(find(i));
+        idRootsByDoc.set(doc, roots);
+    });
+    sorted.forEach((e, i) => {
+        if (resolveEventFileId(e) || resolveEventQbPurchaseId(e)) return;
+        const roots = idRootsByDoc.get(e.docNumber as string);
+        if (roots && roots.size === 1) union(i, [...roots][0]);
+    });
+
+    // Any id-less events NOT bridged above (no id-confirmed cluster shares
+    // their docNumber, or more than one genuinely does) bucket by bare
+    // docNumber prefix among themselves only — never merged into an
+    // id-confirmed group just because it shares that group's docNumber,
+    // which is exactly the collision this whole scheme exists to avoid.
+    const byPrefix = new Map<string, number>();
+    sorted.forEach((e, i) => {
+        if (resolveEventFileId(e) || resolveEventQbPurchaseId(e)) return;
+        const doc = e.docNumber as string;
+        const roots = idRootsByDoc.get(doc);
+        if (roots && roots.size === 1) return; // already bridged above
+        const existing = byPrefix.get(doc);
+        if (existing !== undefined) union(i, existing);
+        else byPrefix.set(doc, i);
+    });
+
+    const groups = new Map<number, number[]>();
+    sorted.forEach((_, i) => {
+        const root = find(i);
+        const arr = groups.get(root);
+        if (arr) arr.push(i);
+        else groups.set(root, [i]);
+    });
+
+    const journeys = new Map<string, ReceiptJourney>();
+    for (const indices of groups.values()) {
+        const groupEvents = indices.map((i) => sorted[i]); // already ascending (createdAt, id)
+        let driveFileId: string | null = null;
+        let qbPurchaseId: string | null = null;
+        for (const e of groupEvents) {
+            driveFileId = driveFileId ?? resolveEventFileId(e);
+            const qb = resolveEventQbPurchaseId(e);
+            if (qb) qbPurchaseId = qb;
+        }
+        const doc = groupEvents[0].docNumber as string;
+        const key = driveFileId ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : `prefix:${doc}`);
+
+        const j: ReceiptJourney = {
+            docNumber: doc,
+            fileName: null, vendor: null, projectName: null,
+            amountCents: null, taxCents: null,
+            firstSeen: groupEvents[0].createdAt,
+            lastSeen: groupEvents[groupEvents.length - 1].createdAt,
+            steps: [], finalState: "in-flight", finalReason: null,
+            syncedExpenseId: null, syncedProjectName: null,
+            driveFileId, qbPurchaseId, synced: null, backfilled: false,
+            keyConfirmed: Boolean(driveFileId) || Boolean(qbPurchaseId),
+        };
+        for (const e of groupEvents) {
+            if (e.source === "backfill") j.backfilled = true;
+            j.fileName = e.fileName ?? j.fileName;
+            j.vendor = e.vendor ?? j.vendor;
+            j.projectName = e.projectName ?? j.projectName;
+            j.amountCents = e.amountCents ?? j.amountCents;
+            j.taxCents = e.taxCents ?? j.taxCents;
+            j.steps.push({
+                at: e.createdAt,
+                stage: e.stage ?? (e.kind === "receipt-push" ? "push" : "unknown"),
+                status: e.status,
+                reason: e.reason,
+                detail: e.detail,
+            });
+        }
+        const final = journeyFinalState(j.steps);
+        j.finalState = final.state;
+        j.finalReason = final.reason;
+        journeys.set(key, j);
+    }
+    return journeys;
+}
+
+/** Fields the sync-landing join (`attachSyncedExpenses`) needs off the
+ * Expense row, whichever caller fetched it. */
+interface SyncedExpenseInput {
+    id: string;
+    description: string | null;
+    amount: unknown; // Prisma Decimal — converted with Number(), display data only
+    vendor: string | null;
+    receiptUrl: string | null;
+    qbSyncedAt: Date | null;
+    createdAt: Date;
+    qbPurchaseId: string | null;
+    estimate: { project: { id: string; name: string } | null } | null;
+}
+
+/**
+ * Mark the journeys the 4-hour sync already landed in ProBuild job costs,
+ * matched via the [gtr-file:<fileId>] marker the sync copies into the
+ * Expense description. Mutates `journeys` in place.
+ */
+function attachSyncedExpenses(journeys: Map<string, ReceiptJourney>, expenses: SyncedExpenseInput[]): void {
+    for (const exp of expenses) {
+        const m = exp.description?.match(/\[gtr-file:([^\]]+)\]/);
+        if (!m) continue;
+        const fullId = m[1];
+        // Confirmed match, in trust order: a journey already keyed on this
+        // exact fileId, then one keyed on this exact qbPurchaseId (same
+        // grouping tiers as `groupEventsIntoJourneys`). Only when NEITHER
+        // exists do we fall back to the bare prefix bucket — which may
+        // belong to a DIFFERENT colliding fileId — so that fallback match is
+        // marked unconfirmed rather than sure.
+        let j = journeys.get(fullId);
+        if (!j && exp.qbPurchaseId) {
+            j = journeys.get(`qb:${exp.qbPurchaseId}`);
+        }
+        if (!j) {
+            j = journeys.get(`prefix:${fullId.slice(0, 21)}`);
+            if (j) j.keyConfirmed = false;
+        }
+        if (j) {
+            const syncedAt = exp.qbSyncedAt ?? exp.createdAt;
+            j.syncedExpenseId = exp.id;
+            j.syncedProjectName = exp.estimate?.project?.name ?? null;
+            j.driveFileId = j.driveFileId ?? fullId;
+            j.synced = {
+                expenseId: exp.id,
+                projectId: exp.estimate?.project?.id ?? null,
+                projectName: exp.estimate?.project?.name ?? null,
+                // Prisma Decimal → cents; guard the conversion, this is display data.
+                amountCents: exp.amount != null ? Math.round(Number(exp.amount) * 100) : null,
+                vendor: exp.vendor ?? null,
+                receiptUrl: exp.receiptUrl ?? null,
+                syncedAt,
+            };
+            // The expense records when the sync actually landed it — never
+            // fabricate the step time from unrelated event timestamps.
+            j.steps.push({ at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null });
+        }
+    }
+}
+
+const SYNCED_EXPENSE_SELECT = {
+    id: true,
+    description: true,
+    amount: true,
+    vendor: true,
+    receiptUrl: true,
+    qbSyncedAt: true,
+    createdAt: true,
+    qbPurchaseId: true,
+    // Expense hangs off the ESTIMATE, not the project directly.
+    estimate: { select: { project: { select: { id: true, name: true } } } },
+} as const;
+
+/** B2: an unordered `take` cap can silently drop EITHER side of the window
+ * (Postgres gives no ordering guarantee without ORDER BY) — always order the
+ * sync-Expense query deterministically, and log (never swallow) when the cap
+ * was actually hit so a truncated read leaves a trace instead of quietly
+ * reading as "no receipt record". */
+async function fetchSyncedExpensesSince(since: Date): Promise<SyncedExpenseInput[]> {
+    const cap = 2000;
+    const expenses = await prisma.expense.findMany({
+        where: {
+            qbPurchaseId: { not: null },
+            description: { contains: "[gtr-file:" },
+            createdAt: { gte: since },
+        },
+        select: SYNCED_EXPENSE_SELECT,
+        orderBy: { createdAt: "desc" },
+        take: cap,
+    });
+    if (expenses.length === cap) {
+        console.error(`receiptJourneysAll: sync-Expense query hit its ${cap}-row cap — some sync-landing evidence may be missing from this render`);
+    }
+    return expenses;
+}
+
+/**
  * Returns the COMPLETE list for the trailing `days` window — uncapped.
  * Callers that need a display-size-limited list (the pipeline view) must cap
  * it themselves (see `receiptJourneys` below); anything that keys/looks up a
- * SPECIFIC journey (e.g. the register row drill-down) must use this
- * uncapped list, or a genuinely-matching older journey can silently miss the
- * cap and read as "no audit record".
+ * SPECIFIC journey (e.g. the register row drill-down) should prefer
+ * `receiptJourneysForKeys` instead, which fetches exactly the events for the
+ * identifiers it's asked about rather than depending on this function's
+ * event-count cap.
  */
 export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]> {
     const since = new Date(Date.now() - days * 86_400_000);
+    const cap = 5000;
     const events = await prisma.automationEvent.findMany({
         where: {
             kind: { in: ["receipt-stage", "receipt-push"] },
@@ -342,135 +636,23 @@ export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]
             docNumber: { not: null },
         },
         // DESC + cap keeps the NEWEST events when over the cap (asc would
-        // silently drop current activity and freeze the dashboard in the past),
-        // then restore chronological order for grouping.
+        // silently drop current activity and freeze the dashboard in the past).
         orderBy: { createdAt: "desc" },
-        take: 5000,
+        take: cap,
     });
-
-    events.reverse(); // back to ascending for timeline assembly
-
-    // Grouping key, in trust order: FULL driveFileId, then FULL qbPurchaseId,
-    // then the bare 21-char docNumber prefix as a last resort. Two different
-    // Drive fileIds can share a prefix (qbo-receipt-push.ts:477-481), so
-    // keying by prefix alone would silently merge two different receipts'
-    // timelines into one journey — but keying SOLELY by fileId also misses
-    // real matches: events that never recorded a fileId can still carry the
-    // same typed qbPurchaseId (near-zero collision risk, same trust tier
-    // `automation-key-resolver.ts` gives it), and without that tier those
-    // events would stay split into separate, incomplete journeys. An event
-    // with neither id groups under a `prefix:`-tagged bucket (distinct from
-    // any real fileId/qbPurchaseId string) and the resulting journey is
-    // marked `keyConfirmed: false`.
-    const byDoc = new Map<string, ReceiptJourney>();
-    for (const e of events) {
-        const doc = e.docNumber as string;
-        const fileId = resolveEventFileId(e);
-        const qbPurchaseId = resolveEventQbPurchaseId(e);
-        const key = fileId ?? (qbPurchaseId ? `qb:${qbPurchaseId}` : `prefix:${doc}`);
-        let j = byDoc.get(key);
-        if (!j) {
-            j = {
-                docNumber: doc,
-                fileName: null, vendor: null, projectName: null,
-                amountCents: null, taxCents: null,
-                firstSeen: e.createdAt, lastSeen: e.createdAt,
-                steps: [], finalState: "in-flight", finalReason: null,
-                syncedExpenseId: null, syncedProjectName: null,
-                driveFileId: fileId, qbPurchaseId: null, synced: null, backfilled: false,
-                keyConfirmed: Boolean(fileId) || Boolean(qbPurchaseId),
-            };
-            byDoc.set(key, j);
-        }
-        j.lastSeen = e.createdAt;
-        if (e.source === "backfill") j.backfilled = true;
-        j.fileName = e.fileName ?? j.fileName;
-        j.vendor = e.vendor ?? j.vendor;
-        j.projectName = e.projectName ?? j.projectName;
-        j.amountCents = e.amountCents ?? j.amountCents;
-        j.taxCents = e.taxCents ?? j.taxCents;
-        j.driveFileId = j.driveFileId ?? fileId;
-        if (qbPurchaseId) j.qbPurchaseId = qbPurchaseId;
-        j.steps.push({
-            at: e.createdAt,
-            stage: e.stage ?? (e.kind === "receipt-push" ? "push" : "unknown"),
-            status: e.status,
-            reason: e.reason,
-            detail: e.detail,
-        });
+    if (events.length === cap) {
+        console.error(`receiptJourneysAll: event query hit its ${cap}-row cap — some older audit evidence may be missing from this render`);
     }
 
-    for (const j of byDoc.values()) {
-        const final = journeyFinalState(j.steps);
-        j.finalState = final.state;
-        j.finalReason = final.reason;
+    const journeys = groupEventsIntoJourneys(events);
+
+    const booked = [...journeys.values()].some((j) => j.finalState === "booked-api");
+    if (booked) {
+        const expenses = await fetchSyncedExpensesSince(since);
+        attachSyncedExpenses(journeys, expenses);
     }
 
-    // Sync landing: expenses carry the QBO PrivateNote (with the full
-    // [gtr-file:<fileId>] marker) in their description.
-    const booked = [...byDoc.values()].filter(j => j.finalState === "booked-api");
-    if (booked.length > 0) {
-        const expenses = await prisma.expense.findMany({
-            where: {
-                qbPurchaseId: { not: null },
-                description: { contains: "[gtr-file:" },
-                createdAt: { gte: since },
-            },
-            select: {
-                id: true,
-                description: true,
-                amount: true,
-                vendor: true,
-                receiptUrl: true,
-                qbSyncedAt: true,
-                createdAt: true,
-                qbPurchaseId: true,
-                // Expense hangs off the ESTIMATE, not the project directly.
-                estimate: { select: { project: { select: { id: true, name: true } } } },
-            },
-            take: 2000,
-        });
-        for (const exp of expenses) {
-            const m = exp.description?.match(/\[gtr-file:([^\]]+)\]/);
-            if (!m) continue;
-            const fullId = m[1];
-            // Confirmed match, in trust order: a journey already keyed on
-            // this exact fileId, then one keyed on this exact qbPurchaseId
-            // (same journeys.ts grouping tiers above). Only when NEITHER
-            // exists do we fall back to the bare prefix bucket — which may
-            // belong to a DIFFERENT colliding fileId — so that fallback
-            // match is marked unconfirmed rather than sure.
-            let j = byDoc.get(fullId);
-            if (!j && exp.qbPurchaseId) {
-                j = byDoc.get(`qb:${exp.qbPurchaseId}`);
-            }
-            if (!j) {
-                j = byDoc.get(`prefix:${fullId.slice(0, 21)}`);
-                if (j) j.keyConfirmed = false;
-            }
-            if (j) {
-                const syncedAt = exp.qbSyncedAt ?? exp.createdAt;
-                j.syncedExpenseId = exp.id;
-                j.syncedProjectName = exp.estimate?.project?.name ?? null;
-                j.driveFileId = j.driveFileId ?? fullId;
-                j.synced = {
-                    expenseId: exp.id,
-                    projectId: exp.estimate?.project?.id ?? null,
-                    projectName: exp.estimate?.project?.name ?? null,
-                    // Prisma Decimal → cents; guard the conversion, this is display data.
-                    amountCents: exp.amount != null ? Math.round(Number(exp.amount) * 100) : null,
-                    vendor: exp.vendor ?? null,
-                    receiptUrl: exp.receiptUrl ?? null,
-                    syncedAt,
-                };
-                // The expense records when the sync actually landed it — never
-                // fabricate the step time from unrelated event timestamps.
-                j.steps.push({ at: syncedAt, stage: "synced", status: "ok", reason: null, detail: null });
-            }
-        }
-    }
-
-    return [...byDoc.values()].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime());
+    return [...journeys.values()].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime());
 }
 
 /**
@@ -479,9 +661,89 @@ export async function receiptJourneysAll(days: number): Promise<ReceiptJourney[]
  * use this for a lookup/match against one specific journey (e.g. the
  * register row drill-down) — an older, genuinely-matching journey can sit
  * just past the cap and read as "no audit record" even though it exists;
- * use `receiptJourneysAll` for that instead.
+ * use `receiptJourneysAll` or `receiptJourneysForKeys` for that instead.
  */
 export async function receiptJourneys(days: number, maxReceipts: number): Promise<ReceiptJourney[]> {
     const all = await receiptJourneysAll(days);
     return all.slice(0, Math.min(Math.max(maxReceipts, 1), 200));
+}
+
+/**
+ * N2/B2: targeted journey lookup for the register row drill-down. Instead of
+ * matching every register row against a bulk, count-capped journey list
+ * (an R × J scan on the page that carries the money register, and one whose
+ * cap could silently drop a genuinely-matching older journey), this fetches
+ * ONLY the events that could belong to the receipts named by `keys` — bounded
+ * by the register's own row count, not by an arbitrary cap — and returns them
+ * pre-indexed by both lookup tiers `matchReceiptJourney` needs.
+ *
+ * `byQbPurchaseId` covers the confirmed match path (`journey.qbPurchaseId ===
+ * row.qbTxnId`); `byDocNumber` covers the always-unconfirmed prefix-fallback
+ * path. When more than one journey shares a docNumber (a real prefix
+ * collision), the journey with the most recent `lastSeen` wins the map slot —
+ * the same tie-break `matchReceiptJourney`'s old `.find()` against a
+ * newest-first list produced.
+ */
+export async function receiptJourneysForKeys(
+    keys: { qbPurchaseId: string | null; docNumber: string | null }[],
+    days: number,
+): Promise<{ byQbPurchaseId: Map<string, ReceiptJourney>; byDocNumber: Map<string, ReceiptJourney> }> {
+    const docNumbers = [...new Set(keys.map((k) => k.docNumber).filter((v): v is string => Boolean(v)))];
+    const qbPurchaseIds = [...new Set(keys.map((k) => k.qbPurchaseId).filter((v): v is string => Boolean(v)))];
+
+    const byQbPurchaseId = new Map<string, ReceiptJourney>();
+    const byDocNumber = new Map<string, ReceiptJourney>();
+    if (docNumbers.length === 0 && qbPurchaseIds.length === 0) {
+        return { byQbPurchaseId, byDocNumber };
+    }
+
+    const since = new Date(Date.now() - days * 86_400_000);
+    const events = await prisma.automationEvent.findMany({
+        where: {
+            kind: { in: ["receipt-stage", "receipt-push"] },
+            createdAt: { gte: since },
+            docNumber: { not: null },
+            OR: [
+                ...(docNumbers.length ? [{ docNumber: { in: docNumbers } }] : []),
+                ...(qbPurchaseIds.length ? [{ qbPurchaseId: { in: qbPurchaseIds } }] : []),
+            ],
+        },
+        // Bounded by the explicit id lists above, not by a display cap — no
+        // `take` needed, so there is nothing here for B2 to silently drop.
+    });
+
+    const journeys = groupEventsIntoJourneys(events);
+
+    const booked = [...journeys.values()].some((j) => j.finalState === "booked-api");
+    if (booked && qbPurchaseIds.length > 0) {
+        const expenses = await prisma.expense.findMany({
+            where: { qbPurchaseId: { in: qbPurchaseIds }, description: { contains: "[gtr-file:" } },
+            select: SYNCED_EXPENSE_SELECT,
+            orderBy: { createdAt: "desc" },
+        });
+        attachSyncedExpenses(journeys, expenses);
+    }
+
+    return indexJourneysByKeys([...journeys.values()]);
+}
+
+/**
+ * Pure indexing step of `receiptJourneysForKeys`, split out so it's testable
+ * without a database: builds the two lookup tiers `matchReceiptJourney`
+ * needs from an already-grouped journey list. Newest `lastSeen` first, so
+ * when more than one journey shares a docNumber (a real prefix collision)
+ * the map keeps the most recently active one — the same tie-break a
+ * `.find()` against a newest-first list gave before this fix.
+ */
+export function indexJourneysByKeys(
+    journeys: ReceiptJourney[],
+): { byQbPurchaseId: Map<string, ReceiptJourney>; byDocNumber: Map<string, ReceiptJourney> } {
+    const byQbPurchaseId = new Map<string, ReceiptJourney>();
+    const byDocNumber = new Map<string, ReceiptJourney>();
+    const sorted = [...journeys].sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime());
+    for (const j of sorted) {
+        if (j.qbPurchaseId && !byQbPurchaseId.has(j.qbPurchaseId)) byQbPurchaseId.set(j.qbPurchaseId, j);
+        if (!byDocNumber.has(j.docNumber)) byDocNumber.set(j.docNumber, j);
+    }
+    return { byQbPurchaseId, byDocNumber };
 }
