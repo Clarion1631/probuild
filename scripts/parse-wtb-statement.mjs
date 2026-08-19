@@ -592,6 +592,20 @@ async function main() {
     const account = args.account || `WTB-${meta.accountNumber.slice(-4)}`;
     const gates = evaluateGates(meta, lines);
 
+    // Source-of-truth boundary (docs/BANK-REGISTER-PLAN.md "Daily vs
+    // monthly", Codex daily-parser review B1): dates >= DAILY_CANONICAL_FROM
+    // are owned by the daily-CSV path (scripts/parse-wtb-daily-csv.mjs).
+    // A monthly statement whose period touches that territory would
+    // double-mint canonical BankLines for every overlapping transaction —
+    // refuse it outright. Monthly imports are backfill-only.
+    const { DAILY_CANONICAL_FROM } = await import("./parse-wtb-daily-csv.mjs");
+    if (meta.periodEnd >= DAILY_CANONICAL_FROM) {
+        console.error(`GATE FAILED: statement period ${meta.periodStart}..${meta.periodEnd} crosses DAILY_CANONICAL_FROM (${DAILY_CANONICAL_FROM}).`);
+        console.error("Dates on/after that boundary are owned by the daily-CSV path; ingesting this statement would double-mint BankLines. See docs/BANK-REGISTER-PLAN.md \"Daily vs monthly\".");
+        process.exitCode = 1;
+        return;
+    }
+
     if (args.dryRun) {
         console.log(`Account:      ${account} (${meta.accountNumber})`);
         console.log(`Period:       ${meta.periodStart} .. ${meta.periodEnd}`);

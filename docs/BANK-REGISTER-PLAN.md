@@ -62,6 +62,19 @@ Purchase); save signed PDF to Drive receipt repo; upsert ProBuild expense receip
 Upload/drop a WTB CSV export; diff against the register (amount+date+check#); report bank rows with no QBO
 entry. Closes the "pending/absent from QBO" blind spot honestly.
 
+## Daily vs monthly — source-of-truth boundary (decided 2026-08-18, Codex daily-parser review B1)
+The DAILY CSV path (`scripts/parse-wtb-daily-csv.mjs`, fed by the Hermes 6pm cron) is **canonical for all
+dates >= 2026-08-12** (`DAILY_CANONICAL_FROM`, exported by that script). The monthly PDF parser
+(`scripts/parse-wtb-statement.mjs`) is for **backfilling periods strictly before** that date only. Reason:
+both post source=STATEMENT for WTB-0723 and the ingest uniqueness key is (account, periodStart, periodEnd),
+so a monthly (08-01..08-31) import would COEXIST with the daily one-day statements and double-mint a
+canonical BankLine for every overlapping transaction. The daily parser refuses days before the boundary;
+never run the monthly parser on a statement whose period crosses it. If the boundary must ever move,
+change `DAILY_CANONICAL_FROM` and write the migration story here first.
+Known limit (review S4): daily-file continuity is within-file only; an outage longer than the 7-day export
+window leaves silent gaps — backfill via a WTB "Custom Range" CSV export covering the gap, run through the
+same daily parser.
+
 ## Standing constraints
 - Claude never enters bank credentials (WTB creds shared in chat should be rotated). Check-image
   acquisition = Marge's monthly download or Justin-driven browser session.
