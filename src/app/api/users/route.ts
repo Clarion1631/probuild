@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -151,6 +152,11 @@ export async function PATCH(req: Request) {
             data,
             include: { permissions: true, projectAccess: { select: { projectId: true } } },
         });
+
+        // A user who just became ACTIVATED FIELD_CREW (or is CJ) joins every
+        // "In Progress" project. Fail-soft inside the helper; never blocks the save.
+        const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
+        after(() => autoAssignProjectsOnUserChange(id, { role, status }));
 
         return NextResponse.json({ ...user, hasPin: !!_pin });
     } catch (error: any) {

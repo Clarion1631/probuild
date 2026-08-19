@@ -1,5 +1,6 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
+import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
@@ -84,6 +85,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             burdenRate: true,
         },
     });
+
+    // Newly ACTIVATED FIELD_CREW (or CJ) joins every "In Progress" project.
+    // Fail-soft inside the helper; never blocks the save.
+    const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
+    after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
 
     return NextResponse.json({
         ...updated,

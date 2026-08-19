@@ -69,6 +69,12 @@ export const authOptions: NextAuthOptions = {
                         where: { id: existingUser.id },
                         data: { status: "ACTIVATED" },
                     });
+                    // Just-activated FIELD_CREW (or CJ) joins every "In Progress"
+                    // project. Awaited rather than after() — this callback is not a
+                    // route handler, so after() is not available here — but the
+                    // helper is fail-soft and never throws, so sign-in cannot break.
+                    const { autoAssignProjectsForUser } = await import("@/lib/crew-auto-assign-sync");
+                    await autoAssignProjectsForUser(existingUser.id);
                 }
             }
             return true;

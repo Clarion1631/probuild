@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -26,6 +27,11 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             ...(body.location && { location: body.location }),
         },
     });
+
+    // Auto-assign ACTIVATED FIELD_CREW (+ CJ) whenever a job moves to
+    // "In Progress". Fail-soft inside the helper; never blocks the save.
+    const { autoAssignCrewOnStatusChange } = await import("@/lib/crew-auto-assign-sync");
+    after(() => autoAssignCrewOnStatusChange(id, project.status));
 
     return NextResponse.json(project);
 }

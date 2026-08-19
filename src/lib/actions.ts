@@ -8181,6 +8181,11 @@ export async function updateProjectStatus(projectId: string, status: string) {
         where: { id: projectId },
         data: { status }
     });
+    // "All field crew and CJ auto added" to jobs being worked. Post-response
+    // via after() and fail-soft inside the helper, so it can never block the
+    // status save (same pattern as autoAssignPhasesForEstimate above).
+    const { autoAssignCrewOnStatusChange } = await import("@/lib/crew-auto-assign-sync");
+    after(() => autoAssignCrewOnStatusChange(projectId, status));
     revalidatePath(`/projects`);
     revalidatePath(`/projects/${projectId}`);
     return { success: true };

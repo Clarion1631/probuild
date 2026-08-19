@@ -1,5 +1,6 @@
 export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
+import { after } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { canonicalProjectStatus } from "@/lib/project-status";
@@ -151,5 +152,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const updated = await prisma.project.update({ where: { id }, data, select: SELECT });
+    // Auto-assign ACTIVATED FIELD_CREW (+ CJ) when a job moves to "In Progress".
+    // Fail-soft inside the helper; never blocks the save.
+    const { autoAssignCrewOnStatusChange } = await import("@/lib/crew-auto-assign-sync");
+    after(() => autoAssignCrewOnStatusChange(id, updated.status));
     return NextResponse.json(updated);
 }

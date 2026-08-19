@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { after } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
@@ -72,6 +73,10 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
             if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
             if (Object.keys(data).length > 0) {
                 await prisma.user.update({ where: { id }, data });
+                // Newly ACTIVATED FIELD_CREW (or CJ) joins every "In Progress"
+                // project. Fail-soft inside the helper; never blocks the save.
+                const { autoAssignProjectsOnUserChange } = await import("@/lib/crew-auto-assign-sync");
+                after(() => autoAssignProjectsOnUserChange(id, { role: data.role, status: data.status }));
             }
         }
 
