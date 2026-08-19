@@ -6,6 +6,8 @@ import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-a
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
+import { isCostCodeAllowedForProject } from "@/lib/project-phases";
+import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -96,10 +98,22 @@ export async function POST(req: Request) {
         // fill in for a codeless item, or crew can charge any code they like.
         resolvedCostCodeId = item.costCodeId ?? null;
     } else if (costCodeId && typeof costCodeId === "string") {
-        // True legacy path (no estimate item): keep the client's code, but only
-        // if it actually exists.
-        const code = await prisma.costCode.findUnique({ where: { id: costCodeId }, select: { id: true } });
-        resolvedCostCodeId = code?.id ?? null;
+        // Phase-only clock-in (the primary path since the mobile picker went
+        // phases-only) — and the old legacy path. "The cost code exists" is NOT
+        // a permission: this used to accept ANY CostCode row, so a crew member
+        // could post labor against a code that has nothing to do with the job.
+        // The code must be one of THIS project's phases — the exact list
+        // /api/projects/[id]/cost-codes serves, computed by the same shared
+        // helper so the picker and this check can never disagree. That includes
+        // the Safety Meeting phase, but only on an In Progress project.
+        const allowed = await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId);
+        if (!allowed) {
+            return NextResponse.json(
+                { error: "That phase is not available on this project", code: "PHASE_NOT_ON_PROJECT" },
+                { status: 400 }
+            );
+        }
+        resolvedCostCodeId = costCodeId;
     }
 
     // A phase (cost code or estimate item) is required to clock in on a normal

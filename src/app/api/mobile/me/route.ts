@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { authenticateMobileOnly } from "@/lib/mobile-auth";
 import { getEffectivePermissions } from "@/lib/permissions";
 import { toNum } from "@/lib/prisma-helpers";
+import { mobileVisibleProjectWhere } from "@/lib/project-status";
 
 export const dynamic = "force-dynamic";
 
@@ -31,7 +32,10 @@ export async function GET(req: Request) {
             permissions: true,
             projectAccess: { select: { projectId: true } },
             assignedProjects: {
-                where: { status: { not: "Closed" } },
+                // Crew see only jobs actually being worked (plus logistics) —
+                // see mobileVisibleProjectWhere() for the rule and why the old
+                // `status: { not: "Closed" }` filtered nothing.
+                where: mobileVisibleProjectWhere(),
                 select: projectSelect,
                 orderBy: { viewedAt: "desc" },
             },
@@ -46,7 +50,7 @@ export async function GET(req: Request) {
 
     if (fullUser.role === "ADMIN" || fullUser.role === "MANAGER") {
         assignedProjects = await prisma.project.findMany({
-            where: { status: { not: "Closed" } },
+            where: mobileVisibleProjectWhere(),
             select: projectSelect,
             orderBy: { viewedAt: "desc" },
         });
@@ -58,7 +62,7 @@ export async function GET(req: Request) {
 
         if (accessOnlyIds.length > 0) {
             const accessProjects = await prisma.project.findMany({
-                where: { id: { in: accessOnlyIds }, status: { not: "Closed" } },
+                where: { id: { in: accessOnlyIds }, ...mobileVisibleProjectWhere() },
                 select: projectSelect,
                 orderBy: { viewedAt: "desc" },
             });

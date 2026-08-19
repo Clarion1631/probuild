@@ -23,6 +23,11 @@ export const PROJECT_STATUSES: ProjectStatusDef[] = [
 
 export const PROJECT_STATUS_VALUES = PROJECT_STATUSES.map(s => s.value);
 
+// The one status that means "crew are on this job right now". Named so the
+// rules that key off it (mobile project list, safety-meeting phase) reference
+// a constant instead of retyping the string. See src/lib/project-phases.ts.
+export const PROJECT_STATUS_IN_PROGRESS = "In Progress";
+
 // Jobs still being worked — the default view on /projects and the scope for
 // "active project" queries (variance, SMS routing, AI summaries).
 export const OPEN_PROJECT_STATUSES = ["Waiting to Start", "In Progress", "Substantial Completion"];
@@ -48,4 +53,30 @@ export function canonicalProjectStatus(status: string): string | null {
 export function projectStatusRank(status: string | null | undefined): number {
     const i = PROJECT_STATUS_VALUES.indexOf(status || "");
     return i === -1 ? PROJECT_STATUS_VALUES.length : i;
+}
+
+// Which jobs the mobile crew app may see at all (src/app/api/mobile/me/route.ts
+// assignedProjects — the crew's project dropdown).
+//
+// Owner rule (2026-08): the crew picker shows ONLY jobs that are actually being
+// worked, i.e. status === "In Progress". The previous filter was
+// `status: { not: "Closed" }`, which was both wrong-valued (no canonical status
+// is literally "Closed" — they are "Closed Complete"/"Closed Lost", so it
+// excluded nothing) and far too broad.
+//
+// Logistics jobs (shop, travel, admin time) are the deliberate exception: they
+// carry no estimate and are frequently parked at a non-In-Progress status, but
+// crew must still be able to book shop/travel time. They keep the old,
+// permissive predicate rather than being silently dropped.
+// Built as a function, not a frozen `as const` object: Prisma's generated
+// `ProjectWhereInput` takes a MUTABLE `OR` array, and a readonly tuple is not
+// assignable to it. Returning a fresh object per call also keeps two call sites
+// from sharing (and accidentally mutating) one literal.
+export function mobileVisibleProjectWhere() {
+    return {
+        OR: [
+            { status: PROJECT_STATUS_IN_PROGRESS },
+            { isLogistics: true, status: { not: "Closed" } },
+        ],
+    };
 }
