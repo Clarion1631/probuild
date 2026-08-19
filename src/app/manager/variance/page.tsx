@@ -1,171 +1,217 @@
-import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
-import { OPEN_PROJECT_STATUSES } from "@/lib/project-status";
-import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
+import { loadProjectVariance } from "@/lib/job-variance-db";
+import type { PhaseVariance, ProjectVariance } from "@/lib/job-variance";
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
+
+/**
+ * Job-cost variance — estimated vs actual, per phase and per estimate item.
+ *
+ * Rebuilt 2026-08-19. The previous version summed ONLY time-entry labor and did
+ * not query expenses at all, so materials and subcontractors — most of the cost
+ * of a remodel — read as $0 and every job showed a large favourable variance.
+ * The rules now live in src/lib/job-variance.ts and are unit-tested.
+ *
+ * TRUST rule: every number here ships with the share of actual dollars that
+ * could not be attributed to a phase. A tidy variance computed on 41% of the
+ * money is not a result, and this page must never let it look like one.
+ */
+
+function VarianceAmount({ value, className = "" }: { value: number; className?: string }) {
+    // Negative variance = over budget. Colour and sign must agree, always.
+    const over = value < 0;
+    return (
+        <span className={`font-bold ${over ? "text-red-600" : "text-green-600"} ${className}`}>
+            {over ? "−" : "+"}
+            {formatCurrency(Math.abs(value))}
+        </span>
+    );
+}
+
+function TrustBar({ variance }: { variance: ProjectVariance }) {
+    const pct = Math.round(variance.coverage.attributedShare * 100);
+    const tone =
+        pct >= 90 ? { bar: "bg-green-500", text: "text-green-700", label: "Trustworthy" }
+        : pct >= 60 ? { bar: "bg-amber-500", text: "text-amber-700", label: "Partial — read with care" }
+        : { bar: "bg-red-500", text: "text-red-700", label: "Too little data to trust" };
+
+    return (
+        <div className="rounded-lg border border-hui-border bg-slate-50 p-4">
+            <div className="flex items-baseline justify-between mb-2">
+                <span className="text-sm font-semibold text-hui-textMain">
+                    Data coverage: <span className={tone.text}>{pct}% attributed</span>
+                </span>
+                <span className={`text-xs font-medium ${tone.text}`}>{tone.label}</span>
+            </div>
+            <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden mb-3">
+                <div className={`h-2 ${tone.bar}`} style={{ width: `${Math.max(2, pct)}%` }} />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-hui-textMuted">
+                <div>
+                    <span className="block font-medium text-hui-textMain">
+                        {formatCurrency(variance.coverage.unattributedTotal)}
+                    </span>
+                    spent with no phase — invisible below
+                </div>
+                <div>
+                    <span className="block font-medium text-hui-textMain">
+                        {formatCurrency(variance.coverage.phaseOnlyActuals)}
+                    </span>
+                    on a phase but no line item
+                </div>
+                <div>
+                    <span className="block font-medium text-hui-textMain">
+                        {formatCurrency(variance.uncodedBudget)}
+                    </span>
+                    budget on uncoded items
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function PhaseRow({ phase }: { phase: PhaseVariance }) {
+    const pct = phase.percentUsed;
+    const over = phase.variance < 0;
+    // A phase with actuals and no budget is 100% overrun by definition.
+    const barWidth = pct === null ? (phase.totalActual > 0 ? 100 : 0) : Math.min(100, pct * 100);
+
+    return (
+        <div className="p-4 rounded-lg bg-white border border-hui-border">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+                <div className="min-w-0">
+                    <span className="font-mono text-xs text-slate-500 mr-2">{phase.code}</span>
+                    <span className="font-medium text-hui-textMain">{phase.name}</span>
+                    {phase.totalBudget === 0 && phase.totalActual > 0 && (
+                        <span className="ml-2 text-xs font-medium text-red-600">not in the estimate</span>
+                    )}
+                </div>
+                <VarianceAmount value={phase.variance} />
+            </div>
+
+            <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-hui-textMuted mb-2">
+                <span>Budget <span className="text-hui-textMain font-medium">{formatCurrency(phase.totalBudget)}</span></span>
+                <span>Actual <span className="text-hui-textMain font-medium">{formatCurrency(phase.totalActual)}</span></span>
+                <span>Labor {formatCurrency(phase.actualLabor)} / {formatCurrency(phase.laborBudget)}</span>
+                <span>Materials {formatCurrency(phase.actualMaterial)} / {formatCurrency(phase.materialBudget)}</span>
+                {pct !== null && <span>{(pct * 100).toFixed(0)}% used</span>}
+            </div>
+
+            <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden mb-3">
+                <div className={`h-2 ${over ? "bg-red-500" : "bg-green-500"}`} style={{ width: `${barWidth}%` }} />
+            </div>
+
+            {phase.items.length > 0 && (
+                <div className="space-y-1 pl-3 border-l-2 border-slate-100">
+                    {phase.items.map((item) => (
+                        <div key={item.itemId} className="flex flex-wrap items-baseline justify-between gap-2 text-xs">
+                            <span className="text-hui-textMuted min-w-0 truncate max-w-[55%]" title={item.name}>
+                                {item.name}
+                                {item.phaseHasUnassignedActuals && (
+                                    // AGENCY rule: we never spread phase-level spend across items to
+                                    // make this look complete. Say the number is a floor instead.
+                                    <span
+                                        className="ml-1 text-amber-600"
+                                        title="This phase has costs that aren't linked to any line item, so this actual is a floor, not a measurement."
+                                    >
+                                        ⚠ at least
+                                    </span>
+                                )}
+                            </span>
+                            <span className="text-hui-textMuted">
+                                {formatCurrency(item.actual)} / {formatCurrency(item.budget)}{" "}
+                                <VarianceAmount value={item.variance} className="ml-1" />
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
 
 export default async function VarianceReportPage() {
     const session = await getServerSession(authOptions);
-    if (!session || !session.user) return redirect("/login");
+    if (!session?.user?.email) return redirect("/login");
 
-    if (!session.user.email) return redirect("/login");
     const user = await prisma.user.findUnique({ where: { email: session.user.email } });
-    if (!user || (user.role !== 'MANAGER' && user.role !== 'ADMIN')) {
+    if (!user || (user.role !== "MANAGER" && user.role !== "ADMIN")) {
         return <div className="p-8 text-red-500">Access Denied. Managers Only.</div>;
     }
 
-    // Get all projects with their time entries grouped by cost code
-    const projects = await prisma.project.findMany({
-        where: { status: { in: OPEN_PROJECT_STATUSES } },
-        include: {
-            estimates: {
-                include: {
-                    items: {
-                        include: { costCode: true, costType: true }
-                    }
-                }
-            },
-            timeEntries: {
-                include: { costCode: true, user: true }
-            }
-        },
-        orderBy: { createdAt: 'desc' }
-    });
+    const reports = await loadProjectVariance();
 
     return (
         <div className="max-w-7xl mx-auto py-8 px-6 space-y-8">
-            <div className="flex justify-between items-center">
-                <h1 className="text-2xl font-bold text-hui-textMain">Project Variance Report</h1>
+            <div className="flex flex-wrap justify-between items-center gap-3">
+                <div>
+                    <h1 className="text-2xl font-bold text-hui-textMain">Job Cost Variance</h1>
+                    <p className="text-sm text-hui-textMuted mt-1">
+                        Estimated vs actual — labor, burden, materials and subs — by phase and line item.
+                    </p>
+                </div>
                 <Link href="/manager/time-entries" className="hui-btn hui-btn-primary">
                     View Time Entries Audit
                 </Link>
             </div>
 
-            <div className="space-y-8">
-                {projects.map((project: any) => {
-                    // Build cost code budget from estimate items
-                    const costCodeBudgets: Record<string, { code: string; name: string; laborBudget: number; materialBudget: number; actualLabor: number }> = {};
-                    
-                    for (const estimate of project.estimates) {
-                        for (const item of estimate.items) {
-                            // Section headers roll up their children's totals — counting them
-                            // here would double the budget for every sectioned estimate.
-                            if (isEstimateSectionRow(item, estimate.items)) continue;
-                            const ccId = item.costCodeId || '__uncategorized';
-                            if (!costCodeBudgets[ccId]) {
-                                costCodeBudgets[ccId] = {
-                                    code: item.costCode?.code || 'N/A',
-                                    name: item.costCode?.name || 'Uncategorized',
-                                    laborBudget: 0,
-                                    materialBudget: 0,
-                                    actualLabor: 0,
-                                };
-                            }
-                            const itemCategory = item.costType?.name || item.type || "";
-                            if (itemCategory === 'Labor') {
-                                costCodeBudgets[ccId].laborBudget += Number(item.total) || 0;
-                            } else {
-                                costCodeBudgets[ccId].materialBudget += Number(item.total) || 0;
-                            }
-                        }
-                    }
-
-                    // Add actuals from time entries
-                    for (const te of project.timeEntries) {
-                        const ccId = te.costCodeId || '__uncategorized';
-                        if (!costCodeBudgets[ccId]) {
-                            costCodeBudgets[ccId] = {
-                                code: te.costCode?.code || 'N/A',
-                                name: te.costCode?.name || 'Uncategorized',
-                                laborBudget: 0,
-                                materialBudget: 0,
-                                actualLabor: 0,
-                            };
-                        }
-                        costCodeBudgets[ccId].actualLabor += (Number(te.laborCost) || 0) + (Number(te.burdenCost) || 0);
-                    }
-
-                    const phases = Object.values(costCodeBudgets);
-                    const totalLaborBudget = phases.reduce((acc, p) => acc + p.laborBudget, 0);
-                    const totalActualLabor = phases.reduce((acc, p) => acc + p.actualLabor, 0);
-                    const projectVariance = totalLaborBudget - totalActualLabor;
-                    const isOverBudget = projectVariance < 0;
-
-                    if (phases.length === 0) return null;
-
-                    return (
-                        <div key={project.id} className="hui-card overflow-hidden">
-                            <div className="p-6 border-b border-hui-border bg-slate-50 flex justify-between items-start">
-                                <div>
-                                    <h2 className="text-xl font-bold text-hui-textMain">{project.name}</h2>
-                                    <p className="text-sm text-hui-textMuted mt-1">
-                                        {project.estimates.length} estimate(s) • {project.timeEntries.length} time entries
-                                    </p>
-                                </div>
-                                <div className="text-right">
-                                    <div className="text-sm text-hui-textMuted mb-1">Total Labor Variance</div>
-                                    <div className={`text-xl font-bold ${isOverBudget ? 'text-red-600' : 'text-green-600'}`}>
-                                        {isOverBudget ? '-' : '+'}{formatCurrency(Math.abs(projectVariance))}
-                                    </div>
-                                </div>
+            {reports.map((report) => {
+                const v = report.variance;
+                const over = v.variance < 0;
+                return (
+                    <div key={report.projectId} className="hui-card overflow-hidden">
+                        <div className="p-6 border-b border-hui-border bg-slate-50 flex flex-wrap justify-between items-start gap-4">
+                            <div>
+                                <h2 className="text-xl font-bold text-hui-textMain">{report.projectName}</h2>
+                                <p className="text-sm text-hui-textMuted mt-1">
+                                    Budget {formatCurrency(v.totalBudget)} · Actual {formatCurrency(v.totalActual)}
+                                    {v.percentUsed !== null && ` · ${(v.percentUsed * 100).toFixed(0)}% used`}
+                                </p>
                             </div>
-
-                            <div className="p-6">
-                                <div className="flex justify-between text-sm mb-2">
-                                    <span className="font-medium text-hui-textMain">Budgeted Labor: {formatCurrency(totalLaborBudget)}</span>
-                                    <span className="font-medium text-hui-textMain">Actual Labor + Burden: {formatCurrency(totalActualLabor)}</span>
+                            <div className="text-right">
+                                <div className="text-sm text-hui-textMuted mb-1">
+                                    {over ? "Over budget by" : "Remaining"}
                                 </div>
-                                <div className="w-full bg-slate-100 rounded-full h-3 mb-8 overflow-hidden flex">
-                                    <div
-                                        className={`h-3 ${isOverBudget ? 'bg-red-500' : 'bg-green-500'}`}
-                                        style={{ width: `${Math.min(100, (totalActualLabor / (totalLaborBudget || 1)) * 100)}%` }}
-                                    ></div>
-                                </div>
-
-                                <h3 className="text-sm font-semibold uppercase tracking-wider text-hui-textMuted mb-4">Phase Breakdown (by Cost Code)</h3>
-                                <div className="space-y-4">
-                                    {phases.map((phase, idx) => {
-                                        const variance = phase.laborBudget - phase.actualLabor;
-                                        return (
-                                            <div key={idx} className="flex items-center justify-between p-4 rounded-lg bg-slate-50 border border-hui-border">
-                                                <div className="w-1/3">
-                                                    <span className="font-mono text-xs text-slate-500 mr-2">{phase.code}</span>
-                                                    <span className="font-medium text-hui-textMain">{phase.name}</span>
-                                                </div>
-                                                <div className="w-1/4 text-sm">
-                                                    <div className="text-hui-textMuted">Budget</div>
-                                                    <div className="font-medium text-hui-textMain">{formatCurrency(phase.laborBudget)}</div>
-                                                </div>
-                                                <div className="w-1/4 text-sm">
-                                                    <div className="text-hui-textMuted">Actual (w/ Burden)</div>
-                                                    <div className="font-medium text-hui-textMain">{formatCurrency(phase.actualLabor)}</div>
-                                                </div>
-                                                <div className={`w-1/4 text-sm text-right font-bold ${variance < 0 ? 'text-red-600' : 'text-green-600'}`}>
-                                                    {variance < 0 ? '-' : '+'}{formatCurrency(Math.abs(variance))}
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                    {phases.length === 0 && (
-                                        <div className="text-sm text-hui-textMuted italic">No cost codes assigned yet.</div>
-                                    )}
+                                <div className="text-xl">
+                                    <VarianceAmount value={v.variance} />
                                 </div>
                             </div>
                         </div>
-                    );
-                })}
 
-                {projects.length === 0 && (
-                    <div className="text-center py-12 text-hui-textMuted hui-card border-dashed">
-                        No active projects found.
+                        <div className="p-6 space-y-5">
+                            <TrustBar variance={v} />
+
+                            {v.phases.length === 0 ? (
+                                <div className="text-sm text-hui-textMuted italic">
+                                    No phases with a budget or actuals yet.
+                                </div>
+                            ) : (
+                                <>
+                                    <h3 className="text-sm font-semibold uppercase tracking-wider text-hui-textMuted">
+                                        Phases — worst variance first
+                                    </h3>
+                                    <div className="space-y-3">
+                                        {v.phases.map((phase) => (
+                                            <PhaseRow key={phase.costCodeId} phase={phase} />
+                                        ))}
+                                    </div>
+                                </>
+                            )}
+                        </div>
                     </div>
-                )}
-            </div>
+                );
+            })}
+
+            {reports.length === 0 && (
+                <div className="text-center py-12 text-hui-textMuted hui-card border-dashed">
+                    No In Progress projects found.
+                </div>
+            )}
         </div>
     );
 }

@@ -1,5 +1,15 @@
 // Pure reduction for the mobile phase picker
 // (src/app/api/mobile/projects/[id]/phases/route.ts). Kept free of Prisma/Next
+//
+// ⚠️ DRIFT TRAP (audited 2026-08-19). That route is currently DEAD CODE — no
+// client calls it. The crew app's phase picker calls
+// GET /api/projects/[id]/cost-codes, which uses src/lib/project-phases.ts and a
+// DIFFERENT rule set: project-phases.ts unions every ELIGIBLE estimate
+// (Approved/Invoiced/Partially Paid/Paid) and appends the Safety phase, while
+// this module picks ONE canonical Approved estimate and never adds Safety.
+// The two answers genuinely disagree. Before wiring any client to the /phases
+// route, reconcile it with project-phases.ts or the picker and the clock-in
+// validator will start rejecting each other's phases.
 // imports so the canonical-estimate selection and representative-item
 // selection can be unit-tested directly (mirrors src/lib/overtime.ts's
 // convention) — the route does the DB fetches and just passes in the
