@@ -1110,9 +1110,15 @@ function analyzeDriveFileWithGemini(file, ctx) {
             const part = cand && cand.content && cand.content.parts && cand.content.parts[0];
             const text = part && part.text;
             // The model answered; it just could not turn THIS document into usable data.
-            if (!text) { sawDecisiveFailure = true; Logger.log(" > Gemini (" + model + ") returned no text (empty/safety-blocked). Trying next model."); break; }
+            // An empty/blocked response means the model produced nothing. That is a
+            // MODEL failure, not proof this document is unreadable — so it falls
+            // through to the next model without charging the file. Only if EVERY
+            // model comes back empty does the busy ceiling eventually park it.
+            // (Kimi review #6: a garbage 200 is model-side, not document-side.)
+            if (!text) { Logger.log(" > [SERVICE] " + model + " returned no text (empty/safety-blocked). Trying next model."); break; }
             try { return JSON.parse(text); }
-            catch (parseErr) { sawDecisiveFailure = true; Logger.log(" > Gemini (" + model + ") returned invalid JSON: " + parseErr + ". Trying next model."); break; }
+            // Invalid JSON is the same class: the model failed to follow the contract.
+            catch (parseErr) { Logger.log(" > [SERVICE] " + model + " returned invalid JSON: " + parseErr + ". Trying next model."); break; }
           }
 
           if (code === 429 || code === 503) { // overloaded / rate-limited -> back off, then fall to next model
@@ -1124,20 +1130,49 @@ function analyzeDriveFileWithGemini(file, ctx) {
           }
 
           if (code === 404) { // model id not available for this key -> try the next one
-            // Decisive, NOT "busy": if every model 404s the project is misconfigured, and
-            // quietly retrying that for hours per file would delay the one alert that tells
-            // someone to fix it. Still not the document's fault — the alert says so.
-            sawDecisiveFailure = true;
-            Logger.log(" > [SKIP] " + model + " not available (HTTP 404). Trying next model.");
+            // SERVICE failure, never the document's fault. A 404 means the model was
+            // RETIRED — the document was never even read.
+            //
+            // This line used to set sawDecisiveFailure = true, and that is precisely
+            // the bug that parked five perfectly legible receipts on 2026-08-10..19:
+            // gemini-2.5-pro was retired (404) while the project was simultaneously
+            // blocked (403), so every file burned all three attempts against an API
+            // that never looked at it. The Fred Meyer receipt it "gave up" on reads
+            // in 1.4 seconds.
+            //
+            // The rule (Kimi review 2026-08-19): a per-model SERVICE failure must not
+            // charge document-side attempts. Falling through to the next model is the
+            // whole point of a chain — a 404 on ONE model while another works is
+            // harmless. If EVERY model fails this way, no attempt is charged either;
+            // the busy ceiling catches it and parks with aiUnavailable, which is a
+            // "park and escalate" state rather than "park and forget".
+            Logger.log(" > [SERVICE] " + model + " returned 404 (model retired/unavailable). Trying next model.");
             break;
           }
 
-          // 401/403 (revoked key, exhausted quota, not authorised) and 400 (oversized or
-          // undecodable payload) both stop this file now. Auth is deliberately NOT treated
-          // as a transient "busy" state: a dead key affects EVERY file, so retrying each one
-          // for hours would hide the outage instead of surfacing it, and the receipts would
-          // not book during that time anyway. Transient 429/503/network above is the only
-          // availability-class failure. Do not "fix" this into a retry.
+          // 401/403 (revoked key, blocked project, not authorised) is a SERVICE failure:
+          // the document was never read, so it must not cost this file an attempt.
+          //
+          // The old code returned null here — a decisive "this file failed" verdict —
+          // with a comment arguing that retrying would "hide the outage". That reasoning
+          // was wrong and it cost nine days: on 2026-08-10 the project was blocked with
+          // 403 PERMISSION_DENIED, and because 403 was fatal, every receipt burned its
+          // three attempts and parked permanently. The outage was hidden anyway, because
+          // the alert was an email to an inbox nobody watches.
+          //
+          // Surfacing an outage is the WATCHDOG's job (an hourly real generateContent
+          // canary that pages Telegram), not the retry counter's. The counter's only job
+          // is to distinguish "this document is unreadable" from "the service is down".
+          // Breaking here falls through to the next model; if all models fail this way
+          // the pass is charged as a busy pass, not an attempt.
+          if (code === 401 || code === 403) {
+            Logger.log(" > [SERVICE] " + model + " HTTP " + code + " (auth/project blocked). Not the document's fault. Trying next model.");
+            break;
+          }
+
+          // 400 = oversized or undecodable payload. THAT is about this document, so it
+          // stays decisive.
+          sawDecisiveFailure = true;
           Logger.log("API Error (Fatal, " + model + "): " + response.getContentText());
           return null;
 
