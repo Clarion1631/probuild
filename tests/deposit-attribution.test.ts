@@ -383,3 +383,76 @@ test("empty inputs are safe", () => {
     assert.deepEqual(attributeDeposits([]), []);
     assert.deepEqual(depositsNeedingImages([]), []);
 });
+
+// ── Kimi review, 2026-08-19 ──────────────────────────────────────────────
+// A second independent reviewer (different model family) found two defects
+// that Codex missed, both INTRODUCED BY THE FIXES for its own findings.
+
+test("KIMI-1: a given name ending in S must not escape the guard", async t => {
+    // The B3 fix folded a trailing S, turning JAMES into JAME, CHARLES into
+    // CHARLE and CHRIS into CHRI — none of which are in COMMON_GIVEN_NAMES.
+    // Every such given name was then treated as a SURNAME, reopening the
+    // exact wrong-job hole B3 existed to close.
+    await t.test("James Christensen != James Mueller", () => {
+        assert.ok(!namesAgree("James Christensen", "James Mueller"));
+    });
+    await t.test("Charles Smith != Charles Jones", () => {
+        assert.ok(!namesAgree("Charles Smith", "Charles Jones"));
+    });
+    await t.test("Chris Adams != Chris Baker", () => {
+        assert.ok(!namesAgree("Chris Adams", "Chris Baker"));
+    });
+    await t.test("the original Sandi case still rejects", () => {
+        assert.ok(!namesAgree("Sandi Christensen", "Sandi Mueller"));
+    });
+    await t.test("a real surname ending in S still agrees", () => {
+        assert.ok(namesAgree("Robert Adams", "Adams Remodel"));
+    });
+});
+
+test("KIMI-2: the given-name LIST can never be complete", () => {
+    // "Emily" was not in the list, so "Emily Smith" agreed with "Emily
+    // Jones". A structural rule is needed, not a longer list: two full
+    // person names sharing exactly one token only agree when the token is
+    // in the same POSITION — a shared FIRST name is two people, a shared
+    // LAST name is a family.
+    assert.ok(!namesAgree("Emily Smith", "Emily Jones"), "unlisted given name");
+    assert.ok(!namesAgree("Fiona Baker", "Fiona Doyle"), "another unlisted one");
+    assert.ok(namesAgree("Emily Smith", "Smith Remodel"), "surname still works");
+});
+
+test("KIMI-3: a stale image cannot produce 'verified' on ANY path", async t => {
+    // The S3 branch (image settles a multi-customer QBO ambiguity) skipped
+    // the B4 amount/date validation entirely, so a mis-keyed image could
+    // return the system's highest confidence AND propose a milestone.
+    const ms: MilestoneCandidate = {
+        id: "m", projectName: "Christensen Remodel", customerName: "Sandi Christensen",
+        milestoneName: "Drywall Complete", amountCents: 3000000, status: "Pending",
+    };
+    await t.test("via the multi-customer QBO branch", () => {
+        const a = attributeDeposit(dep(), {
+            qboPayments: [
+                { date: "2026-07-31", amountCents: 3000000, customerName: "Mueller Remodel", checkNumber: null },
+                { date: "2026-07-31", amountCents: 3000000, customerName: "Christensen Remodel", checkNumber: null },
+            ],
+            checkImage: {
+                payerName: "Sandi Christensen", memo: null, checkNumber: "9",
+                amountCents: 12345, documentDate: "2026-07-31",   // WRONG amount
+            },
+            milestones: [ms],
+        });
+        assert.notEqual(a.confidence, "verified", "a stale image must never be 'verified'");
+        assert.equal(a.proposedMilestoneId, null);
+        assert.equal(a.needsImage, true);
+    });
+    await t.test("with no milestone candidates at all", () => {
+        const a = attributeDeposit(dep(), {
+            checkImage: {
+                payerName: "Sandi Christensen", memo: null, checkNumber: "9",
+                amountCents: 3000000, documentDate: "2019-01-01",  // stale DATE
+            },
+        });
+        assert.notEqual(a.confidence, "verified");
+        assert.equal(a.needsImage, true);
+    });
+});

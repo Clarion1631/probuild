@@ -155,13 +155,24 @@ function foldToken(raw: string): string {
 /**
  * Identity tokens from a party name: diacritics normalized, 3+ chars, no
  * digits, no scope/entity boilerplate.
+ *
+ * S-FOLDING TRAP (Kimi review, 2026-08-19): folding a trailing S turns
+ * JAMES into JAME, CHARLES into CHARLE and CHRIS into CHRI — none of which
+ * are in COMMON_GIVEN_NAMES, so every given name ending in S escaped the
+ * guard and was treated as a surname. "James Christensen" then agreed with
+ * "James Mueller", reopening exactly the B3 wrong-job hole. So the raw
+ * token is tested against the given-name set BEFORE folding, and a token
+ * recognised as a given name is never folded.
  */
 export function nameTokens(value: string | null): string[] {
     if (!value) return [];
     const ascii = value.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     const out: string[] = [];
     for (const raw of ascii.toUpperCase().split(/[^A-Z0-9']+/)) {
-        const t = foldToken(raw);
+        const bare = raw.replace(/'/g, "");
+        // Recognise the given name on the UNFOLDED token, then keep it
+        // unfolded so isGivenName() still sees it downstream.
+        const t = COMMON_GIVEN_NAMES.has(bare) ? bare : foldToken(raw);
         if (t.length < 3) continue;
         if (/\d/.test(t)) continue;
         if (NAME_STOP_TOKENS.has(t)) continue;
@@ -170,24 +181,38 @@ export function nameTokens(value: string | null): string[] {
     return out;
 }
 
+/**
+ * Is this token a personal given name rather than an identifying surname?
+ * Checks the folded form too, so a list entry can never be missed by the
+ * S-folding above.
+ */
+function isGivenName(token: string): boolean {
+    return COMMON_GIVEN_NAMES.has(token) || COMMON_GIVEN_NAMES.has(foldToken(token));
+}
+
 /** True when a name looks like a person (or people), not a business. */
 function looksLikePerson(tokens: string[]): boolean {
-    return tokens.some(t => COMMON_GIVEN_NAMES.has(t));
+    return tokens.some(isGivenName);
 }
 
 /**
  * Do two party names refer to the same customer?
  *
  * "Sandi Christensen" vs "Christensen Remodel" → true (shared surname).
- * "Sandi Christensen" vs "Sandi Mueller"       → FALSE (shared given name
- *                                                 only — different families).
+ * "Sandi Christensen" vs "Sandi Mueller"       → FALSE (different families).
+ * "Emily Smith"       vs "Emily Jones"         → FALSE (see below).
  *
- * Rules, tightened after Codex review B3:
- *  - a shared GIVEN name never counts on its own;
+ * Rules, tightened after two peer reviews:
  *  - scope words (REMODEL, KITCHEN, HOME…) never count, folded for plurals
  *    so "Remodeling" cannot sneak past "REMODEL";
- *  - when BOTH sides look like person names, require two shared tokens,
- *    because one surname can be coincidence across two households.
+ *  - a shared token from COMMON_GIVEN_NAMES never counts on its own;
+ *  - STRUCTURAL GUARD (Kimi review, 2026-08-19): the given-name list can
+ *    never be complete — "Emily" was missing, so "Emily Smith" agreed with
+ *    "Emily Jones". So when both sides look like two-part person names and
+ *    they share exactly ONE token, that token must be in the same POSITION
+ *    in both. A shared FIRST token across two full names is two people with
+ *    the same first name; a shared LAST token is a family. This holds for
+ *    names nobody thought to list.
  */
 export function namesAgree(a: string | null, b: string | null): boolean {
     const ta = nameTokens(a);
@@ -198,13 +223,20 @@ export function namesAgree(a: string | null, b: string | null): boolean {
     if (!shared.length) return false;
 
     // A shared given name alone is not identity.
-    const identifying = shared.filter(t => !COMMON_GIVEN_NAMES.has(t));
+    const identifying = shared.filter(t => !isGivenName(t));
     if (!identifying.length) return false;
 
-    // Two person-shaped names sharing exactly one surname could be two
-    // different households; demand corroboration.
     if (looksLikePerson(ta) && looksLikePerson(tb) && shared.length < 2) {
         return false;
+    }
+
+    // Structural guard: two full person-style names (2+ tokens each) that
+    // share exactly one token only agree when it sits in the same position.
+    if (ta.length >= 2 && tb.length >= 2 && shared.length === 1) {
+        const token = shared[0];
+        const firstInA = ta[0] === token;
+        const firstInB = tb[0] === token;
+        if (firstInA && firstInB) return false; // same first name, different people
     }
     return true;
 }
@@ -264,7 +296,43 @@ export function attributeDeposit(
     const qboCheck = qboHits.map(h => cleanName(h.checkNumber)).find(Boolean) ?? null;
 
     // ── Source 1: the check image, strongest ─────────────────────────────
-    const imageName = cleanName(image?.payerName);
+    const rawImageName = cleanName(image?.payerName);
+
+    // B4/Kimi: an image is only evidence for THIS deposit if its amount and
+    // date agree. Computed ONCE here so every downstream branch honours it —
+    // the S3 branch previously skipped this check and could return
+    // "verified" off a stale image.
+    const imageAmountDisagrees =
+        rawImageName !== null && image?.amountCents != null && image.amountCents !== deposit.amountCents;
+    const imageDateDelta =
+        rawImageName !== null && image?.documentDate
+            ? Math.abs(daysBetween(image.documentDate, deposit.postedDate))
+            : null;
+    const imageDateDisagrees =
+        imageDateDelta !== null && (!Number.isFinite(imageDateDelta) || imageDateDelta > window);
+    const imageIsForThisDeposit = rawImageName !== null && !imageAmountDisagrees && !imageDateDisagrees;
+
+    // A mismatched image must never act as evidence anywhere.
+    const imageName = imageIsForThisDeposit ? rawImageName : null;
+
+    if (rawImageName && !imageIsForThisDeposit) {
+        return {
+            ...base,
+            payerName: rawImageName,
+            source: "check_image",
+            confidence: "conflict",
+            checkNumber: image?.checkNumber ?? qboCheck,
+            candidateMilestones: candidates,
+            proposedMilestoneId: null,
+            reason:
+                `The check image does not match this deposit — ` +
+                (imageAmountDisagrees
+                    ? `image says ${((image!.amountCents ?? 0) / 100).toFixed(2)}, bank says ${(deposit.amountCents / 100).toFixed(2)}. `
+                    : `image is dated ${image!.documentDate}, ${imageDateDelta} days from the deposit. `) +
+                `It may be filed against the wrong transaction.`,
+            needsImage: true,
+        };
+    }
 
     // ── Conflict beats everything: two sources naming DIFFERENT people ───
     if (imageName && qboName && !namesAgree(imageName, qboName)) {
@@ -331,38 +399,6 @@ export function attributeDeposit(
 
     if (payerName && agreeing.length === 1) {
         const m = agreeing[0];
-        // B4 (Codex review): "verified" must mean the image is evidence FOR
-        // THIS deposit. A mis-keyed or stale image row carries someone
-        // else's amount/date, and promoting that to the system's highest
-        // confidence is exactly how bad evidence gets trusted.
-        const imageAmountDisagrees =
-            imageName !== null && image?.amountCents != null && image.amountCents !== deposit.amountCents;
-        const imageDateDelta =
-            imageName !== null && image?.documentDate
-                ? Math.abs(daysBetween(image.documentDate, deposit.postedDate))
-                : null;
-        const imageDateDisagrees =
-            imageDateDelta !== null && (!Number.isFinite(imageDateDelta) || imageDateDelta > window);
-
-        if (imageName && (imageAmountDisagrees || imageDateDisagrees)) {
-            return {
-                ...base,
-                payerName: imageName,
-                source: "check_image",
-                confidence: "conflict",
-                checkNumber: image?.checkNumber ?? qboCheck,
-                candidateMilestones: candidates,
-                proposedMilestoneId: null,
-                reason:
-                    `The check image does not match this deposit — ` +
-                    (imageAmountDisagrees
-                        ? `image says ${((image!.amountCents ?? 0) / 100).toFixed(2)}, bank says ${(deposit.amountCents / 100).toFixed(2)}. `
-                        : `image is dated ${image!.documentDate}, ${imageDateDelta} days from the deposit. `) +
-                    `It may be filed against the wrong transaction.`,
-                needsImage: true,
-            };
-        }
-
         return {
             ...base,
             payerName,
