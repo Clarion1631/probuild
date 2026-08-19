@@ -50,11 +50,14 @@
 // backfill (pull a Custom Range export covering the gap and run this
 // parser on it).
 //
-// LINE-ORDER ASSUMPTION (Codex review N4): the route's statement content
-// hash includes line ORDER, so replay-as-no-op relies on WTB emitting a
-// day's rows in a stable order across daily exports (held across all
-// observed files so far). If the bank ever re-sorts, a completed day will
-// present as a 409 "restatement" — annoying but loud, never silent.
+// LINE ORDER (Codex review N4, then round-2 B-2 — RESOLVED): the route's
+// statement content hash includes line ORDER, and WTB's export demonstrably
+// does NOT preserve row order between pulls (the per-day summary block alone
+// appears in three different orders inside one sample file). Because the
+// 7-day window re-posts each completed day several times, that would turn a
+// cosmetic bank-side re-order into a 409 that halts every later day. Lines
+// are therefore sorted into a total order (sortLines) before the payload is
+// built, so the hash is addressed by CONTENT, not by transport order.
 //
 // Usage:
 //   node scripts/parse-wtb-daily-csv.mjs <daily.csv> [--dry-run]
@@ -74,9 +77,61 @@ const DEFAULT_ACCOUNT = "WTB-0723";
 // periods strictly BEFORE this date; this parser refuses days before it, so
 // the two sources can never both mint canonical BankLines for one date.
 export const DAILY_CANONICAL_FROM = "2026-08-12";
+// HASH-FORMAT EPOCH (Codex daily review round 2). The round-2 fixes changed
+// how a day is REPRESENTED — lines are now sorted into a total order (B-2)
+// and descriptors have their internal whitespace collapsed (S-1) — so the
+// statement content hash for a given day differs from what the pre-round-2
+// parser produced. The days below were already posted to prod under the old
+// representation (verified: same 14/7/10/20 line counts, same balances, only
+// the encoding differs — no data is wrong). Re-posting them would hash
+// differently, return 409 "restatement", and under the fail-fast rule stall
+// every later day, forever.
+//
+// Rather than delete-and-re-post immutable prod money rows to fix what is a
+// purely cosmetic difference, this floor simply declines to re-post days that
+// predate the format change. They stay exactly as they are, and the parser
+// resumes at the first day posted under the new format.
+//
+// This is deliberately SEPARATE from DAILY_CANONICAL_FROM: that constant marks
+// where the monthly PDF path hands off to the daily path, and moving it would
+// wrongly tell the monthly parser it owns 08-12..08-17 (which the daily ledger
+// already holds) — inviting the exact double-minting B1 exists to prevent.
+export const REPOST_FLOOR = "2026-08-18";
 // The daily export shows this account; refuse anything else so a future
 // second-account export can't silently pollute WTB-0723's ledger.
 const EXPECTED_ACCOUNT_NUMBER = "1001780723";
+
+// BAI codes seen on this export's non-transaction summary rows (blank Status).
+// B-1: this list is a WHITELIST — a blank-Status row on any other code is
+// refused, not skipped, because it may be a real money-bearing row.
+//   010 opening ledger   015 closing ledger   030 current ledger
+//   040 opening avail    045 closing avail    060 current avail
+//   072 1-day float      074 2+-day float     100 total credits
+//   400 total debits
+const SUMMARY_BAI_CODES = new Set(["010", "015", "030", "040", "045", "060", "072", "074", "100", "400"]);
+const BAI_TOTAL_CREDITS = "100";
+const BAI_TOTAL_DEBITS = "400";
+const BAI_CHECK_PAID = "475";
+const POST_TIMEOUT_MS = 30_000;
+
+/** Collapse internal whitespace runs to one space and trim. Hash stability. */
+function collapseWs(value) { return value.trim().replace(/\s+/g, " "); }
+
+/**
+ * Total order over a day's lines so the statement content hash is addressed by
+ * CONTENT, not by transport order (Codex daily review round 2, B-2). WTB's
+ * export demonstrably re-orders rows between pulls — the per-day summary block
+ * alone appears in three different orders inside one sample file — and because
+ * the 7-day window re-posts each completed day up to ~5 times, an unsorted
+ * payload turns a cosmetic re-order into a 409 that stalls every later day.
+ */
+function sortLines(lines) {
+    return [...lines].sort((a, b) =>
+        a.postedDate.localeCompare(b.postedDate)
+        || a.amountCents - b.amountCents
+        || a.rawDescriptor.localeCompare(b.rawDescriptor)
+        || String(a.checkNumber ?? "").localeCompare(String(b.checkNumber ?? "")));
+}
 
 function parseArgs(argv) {
     const args = { csvPath: null, dryRun: false, post: null, account: DEFAULT_ACCOUNT };
@@ -88,7 +143,16 @@ function parseArgs(argv) {
             if (value === undefined || value.startsWith("--")) throw new Error("--post requires a base URL argument");
             args.post = value;
         }
-        else if (arg === "--account") args.account = argv[++i];
+        else if (arg === "--account") {
+            const value = argv[++i];
+            // S-3: guard the missing-value case like --post does, and pin the
+            // label to the account this export actually contains — otherwise
+            // `--account WTB-9999` files 0723's transactions into a different
+            // ledger account with no complaint from either side.
+            if (value === undefined || value.startsWith("--")) throw new Error("--account requires a value");
+            if (value !== DEFAULT_ACCOUNT) throw new Error(`--account ${value} does not match the account this export contains (${DEFAULT_ACCOUNT} / ${EXPECTED_ACCOUNT_NUMBER})`);
+            args.account = value;
+        }
         else if (!arg.startsWith("--") && !args.csvPath) args.csvPath = arg;
     }
     return args;
@@ -171,12 +235,19 @@ export function buildDayStatements(csvText, account) {
     for (let r = 1; r < rows.length; r++) {
         const rec = rows[r];
         if (rec.every(f => f.trim() === "")) continue;
+        // S-2: a short/ragged row reads its missing trailing fields as "",
+        // silently changing rawDescriptor (→ different hash → false 409).
+        // Refuse the file instead of guessing at the bank's intent.
+        if (rec.length !== header.length) {
+            problems.push(`row ${r + 1}: has ${rec.length} column(s), expected ${header.length} — ragged/truncated CSV`);
+            continue;
+        }
         const isoDate = toIsoDate(rec[iDate]);
         if (!isoDate) { problems.push(`row ${r + 1}: bad Post Date "${rec[iDate]}"`); continue; }
         const acctNum = (rec[iAcct] ?? "").trim();
         if (acctNum !== EXPECTED_ACCOUNT_NUMBER) { problems.push(`row ${r + 1}: unexpected account "${acctNum}"`); continue; }
 
-        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], pending: 0 });
+        if (!days.has(isoDate)) days.set(isoDate, { openingCents: null, closingCents: null, lines: [], pending: 0, totalCreditsCents: null, totalDebitsCents: null });
         const day = days.get(isoDate);
 
         const desc = (rec[iDesc] ?? "").trim();
@@ -196,15 +267,46 @@ export function buildDayStatements(csvText, account) {
             if (day.closingCents !== null && day.closingCents !== cents) { problems.push(`row ${r + 1}: conflicting CLOSING LEDGER for ${isoDate} (${day.closingCents} vs ${cents})`); continue; }
             day.closingCents = cents; continue;
         }
-        if (status === "") continue; // other summary rows: floats, totals, closing available
+        // B-1 (Codex daily review round 2): the two independent sub-totals the
+        // bank already gives us. Captured here, enforced as a gate below.
+        if (bai === BAI_TOTAL_CREDITS && status === "") {
+            if (day.totalCreditsCents !== null && day.totalCreditsCents !== cents) { problems.push(`row ${r + 1}: conflicting TOTAL CREDITS for ${isoDate} (${day.totalCreditsCents} vs ${cents})`); continue; }
+            day.totalCreditsCents = cents; continue;
+        }
+        if (bai === BAI_TOTAL_DEBITS && status === "") {
+            if (day.totalDebitsCents !== null && day.totalDebitsCents !== cents) { problems.push(`row ${r + 1}: conflicting TOTAL DEBITS for ${isoDate} (${day.totalDebitsCents} vs ${cents})`); continue; }
+            day.totalDebitsCents = cents; continue;
+        }
+        // B-1: a blank Status used to mean "some summary row, skip it". That
+        // silently dropped any money-bearing row the bank emitted without a
+        // status, and an offsetting PAIR of such rows (a reversal, a
+        // deposit-return) nets to zero and sails straight through the
+        // opening+sum==closing gate. Only KNOWN summary BAI codes may be
+        // skipped; anything else blank is unvouchable and refuses the file.
+        if (status === "") {
+            if (!SUMMARY_BAI_CODES.has(bai)) {
+                problems.push(`row ${r + 1}: blank Status on unrecognized BAI code "${bai}" (desc "${desc}", amount ${cents}) — refusing rather than silently dropping a possible money-bearing row`);
+            }
+            continue;
+        }
         if (status === "Pending") { day.pending++; continue; }
         if (status !== "Cleared") { problems.push(`row ${r + 1}: unknown Status "${status}"`); continue; }
 
         const detail = (rec[iDetail] ?? "").trim();
-        const rawDescriptor = detail !== "" ? `${desc} ${detail}`.trim() : desc;
-        // Check number: Customer Reference on CHECK PAID rows (e.g. "1027").
+        // S-1: collapse internal whitespace. computeStatementContentHash does
+        // NOT normalize descriptors (unlike computeQboLineContentHash), so a
+        // purely cosmetic spacing change from the bank on a re-delivered day
+        // would otherwise be a false 409 — which halts the whole pipeline.
+        const rawDescriptor = collapseWs(detail !== "" ? `${desc} ${detail}` : desc);
+        // Check number: Customer Reference on a check-paid row. S-4: key off
+        // BAI 475 rather than exact descriptor text (a variant such as
+        // "CHECK PAID - RETURN" would otherwise silently yield null), and
+        // strip leading zeros so "01027" and "1027" are one identity — the
+        // monthly parser captures them unpadded.
         const custRef = (rec[iCustRef] ?? "").trim();
-        const checkNumber = desc === "CHECK PAID" && /^\d+$/.test(custRef) ? custRef : null;
+        const checkNumber = (bai === BAI_CHECK_PAID || desc.startsWith("CHECK PAID")) && /^\d+$/.test(custRef)
+            ? String(Number(custRef))
+            : null;
 
         day.lines.push({ postedDate: isoDate, amountCents: cents, rawDescriptor, checkNumber });
     }
@@ -230,6 +332,20 @@ export function buildDayStatements(csvText, account) {
         if (day.openingCents + sum !== day.closingCents) {
             throw new Error(`day ${isoDate} FAILS control total: opening ${day.openingCents} + cleared sum ${sum} = ${day.openingCents + sum}, but closing is ${day.closingCents}`);
         }
+        // B-1: SECOND, INDEPENDENT control total. opening+sum==closing alone
+        // cannot detect an offsetting pair of dropped rows (a reversal nets to
+        // zero). The bank publishes its own per-day TOTAL CREDITS (BAI 100) and
+        // TOTAL DEBITS (BAI 400); tying the cleared rows to BOTH closes that
+        // hole, because a dropped row moves exactly one side of the pair.
+        const creditSum = day.lines.reduce((a, l) => (l.amountCents > 0 ? a + l.amountCents : a), 0);
+        const debitSum = day.lines.reduce((a, l) => (l.amountCents < 0 ? a + l.amountCents : a), 0);
+        if (day.totalCreditsCents !== null && creditSum !== day.totalCreditsCents) {
+            throw new Error(`day ${isoDate} FAILS credit sub-total: cleared credits ${creditSum} but bank reports TOTAL CREDITS ${day.totalCreditsCents} — a money-bearing row is missing or misparsed`);
+        }
+        // The bank reports TOTAL DEBITS as a negative figure on this export.
+        if (day.totalDebitsCents !== null && debitSum !== day.totalDebitsCents) {
+            throw new Error(`day ${isoDate} FAILS debit sub-total: cleared debits ${debitSum} but bank reports TOTAL DEBITS ${day.totalDebitsCents} — a money-bearing row is missing or misparsed`);
+        }
         // S1: a zero-transaction complete day is legitimate (quiet business
         // day) but the ingest route rejects empty lines — skip it loudly.
         // Balance continuity is unaffected (opening == closing).
@@ -246,7 +362,7 @@ export function buildDayStatements(csvText, account) {
             periodEnd: isoDate,
             openingCents: day.openingCents,
             closingCents: day.closingCents,
-            lines: day.lines,
+            lines: sortLines(day.lines), // B-2: content-addressed, not transport-order-addressed
             pending: day.pending,
         });
     }
@@ -263,10 +379,12 @@ export function buildDayStatements(csvText, account) {
 
 async function postStatement(baseUrl, secret, statement) {
     const { pending, ...payload } = statement;
+    // NIT (round 2): a hung fetch would stall the nightly cron indefinitely.
     const res = await fetch(new URL(INGEST_PATH, baseUrl), {
         method: "POST",
         headers: { "content-type": "application/json", "x-ingest-key": secret },
         body: JSON.stringify({ source: "STATEMENT", ...payload }),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
     let body = null;
     try { body = await res.json(); } catch { /* non-JSON error body */ }
@@ -310,7 +428,24 @@ async function main() {
     }
 
     let hadError = false;
-    for (const statement of complete) {
+    for (let i = 0; i < complete.length; i++) {
+        const statement = complete[i];
+        // REPOST_FLOOR: skip days that were posted under the pre-round-2 hash
+        // format. Deliberately applied HERE and not during parsing, so those
+        // days still take part in every control-total and continuity gate
+        // above — they just aren't re-transmitted.
+        if (statement.periodStart < REPOST_FLOOR) {
+            console.log(`  POST ${statement.periodStart}: skipped — predates REPOST_FLOOR (${REPOST_FLOOR}); already stored under the pre-round-2 hash format`);
+            continue;
+        }
+        // S-6: name the days that did NOT post. A bare exit code under an
+        // unattended cron reads as "nothing happened"; every later run then
+        // re-hits the same conflict and stalls again, indefinitely. Say so.
+        const stalled = () => {
+            const rest = complete.slice(i + 1).map(s => s.periodStart).filter(d => d >= REPOST_FLOOR);
+            console.error(`  NOT POSTED (${rest.length + 1} day(s)): ${[statement.periodStart, ...rest].join(", ")}`);
+            console.error(`  This will repeat every run until a human resolves ${statement.periodStart}. Escalate if you see it twice.`);
+        };
         const { status, body } = await postStatement(args.post, secret, statement);
         if (status === 200 && body?.ok) {
             const tag = body.replay ? "replay (no-op)" : `inserted ${body.inserted}`;
@@ -321,12 +456,12 @@ async function main() {
             // S2: stop here — later days chain off this day's balances, and
             // posting them against a disputed base would bake the
             // discontinuity into the DB. Resolve this day first.
-            console.error(`  Remaining day(s) NOT posted (they depend on ${statement.periodStart}'s balances).`);
+            stalled();
             break;
         } else {
             hadError = true;
             console.error(`  POST ${statement.periodStart}: HTTP ${status} ${JSON.stringify(body)}`);
-            console.error(`  Remaining day(s) NOT posted — resolve this failure first.`);
+            stalled();
             break;
         }
     }
