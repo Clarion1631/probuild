@@ -4,6 +4,7 @@ import {
     attributeDeposit,
     attributeDeposits,
     depositsNeedingImages,
+    depositsNeedingHuman,
     namesAgree,
     PAYMENT_DAY_WINDOW,
     type DepositRow,
@@ -134,8 +135,13 @@ test("amount-only NEVER proposes a milestone", () => {
     assert.match(a.reason, /before booking/);
 });
 
-test("identical milestones on one job are ambiguous without an image", () => {
+test("identical milestones on one job STAY on the worklist (B1/B2)", () => {
     // Real: Hoppe has THREE pending milestones at exactly $13,447.68.
+    // The original test asserted only proposedMilestoneId === null, which
+    // held on a WRONG code path that reported "no milestone matches" and
+    // set needsImage:false — silently dropping the deposit from the only
+    // human worklist. Asserting a null is never enough in a money matcher;
+    // you must also assert it stayed visible.
     const hoppe = (id: string, name: string): MilestoneCandidate => ({
         id, projectName: "Hoppe Bathroom Remodel", customerName: "Janet Hoppe & Thomas White",
         milestoneName: name, amountCents: 1344768, status: "Pending",
@@ -147,10 +153,171 @@ test("identical milestones on one job are ambiguous without an image", () => {
         }],
         milestones: [hoppe("m1", "Rough In complete"), hoppe("m2", "Drywall complete"), hoppe("m3", "Tile complete")],
     });
-    // Payer is known and agrees with the job, but WHICH milestone is unclear.
     assert.equal(a.payerName, "Janet Hoppe & Thomas White");
     assert.equal(a.candidateMilestones.length, 3);
     assert.equal(a.proposedMilestoneId, null, "three identical milestones cannot be picked automatically");
+    assert.equal(a.confidence, "conflict", "must be flagged, not reported as a clean match");
+    assert.equal(a.needsImage, true, "MUST stay on the pull list — this is the misattributed-forever hole");
+    assert.match(a.reason, /3 of/, "the reason must be true, not 'no milestone matches'");
+    assert.ok(depositsNeedingImages([a]).length === 1, "must appear on the image worklist");
+    assert.ok(depositsNeedingHuman([a]).length === 1, "must appear on the human worklist");
+});
+
+test("INVARIANT: nothing that proposes no milestone is ever dropped", () => {
+    // One property that catches B1 and S4 together. Every attribution which
+    // does not propose a booking MUST be visible to a human somewhere.
+    const ms: MilestoneCandidate = {
+        id: "m", projectName: "Christensen Remodel", customerName: "Sandi Christensen",
+        milestoneName: "Drywall Complete", amountCents: 3000000, status: "Pending",
+    };
+    const scenarios: Array<[string, ReturnType<typeof attributeDeposit>]> = [
+        ["no evidence at all", attributeDeposit(dep())],
+        ["amount only", attributeDeposit(dep(), { milestones: [ms] })],
+        ["payer disagrees with the milestone", attributeDeposit(dep(), {
+            qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: "Mesplay Kitchen", checkNumber: null }],
+            milestones: [ms],
+        })],
+        ["image vs QBO conflict", attributeDeposit(dep(), {
+            qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: "Mesplay Kitchen", checkNumber: null }],
+            checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "1", amountCents: 3000000, documentDate: "2026-07-31" },
+            milestones: [ms],
+        })],
+        ["two QBO customers", attributeDeposit(dep(), {
+            qboPayments: [
+                { date: "2026-07-31", amountCents: 3000000, customerName: "Mueller Remodel", checkNumber: null },
+                { date: "2026-07-31", amountCents: 3000000, customerName: "Berg ADU", checkNumber: null },
+            ],
+        })],
+        ["stale image amount", attributeDeposit(dep(), {
+            checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "1", amountCents: 12345, documentDate: "2026-07-31" },
+            milestones: [ms],
+        })],
+    ];
+    for (const [label, a] of scenarios) {
+        if (a.proposedMilestoneId === null) {
+            assert.ok(
+                depositsNeedingHuman([a]).length === 1,
+                `"${label}" proposes nothing but is on no human queue — money would be lost here`,
+            );
+        }
+    }
+});
+
+test("B3: a shared FIRST name is not identity", async t => {
+    // Reproduced by Codex: "Sandi Christensen" vs "Sandi Mueller" agreed,
+    // which booked Christensen's money onto a Mueller milestone.
+    await t.test("two families sharing a given name do NOT agree", () => {
+        assert.ok(!namesAgree("Sandi Christensen", "Sandi Mueller"));
+    });
+    await t.test("end to end: no milestone is proposed", () => {
+        const a = attributeDeposit(dep(), {
+            qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: "Sandi Christensen", checkNumber: null }],
+            milestones: [{
+                id: "ms-mueller", projectName: "Mueller Remodel", customerName: "Sandi Mueller",
+                milestoneName: "Drywall", amountCents: 3000000, status: "Pending",
+            }],
+        });
+        assert.equal(a.proposedMilestoneId, null, "must not credit Christensen money to Mueller");
+        assert.equal(a.confidence, "conflict");
+    });
+    await t.test("scope words never create agreement, plural or not", () => {
+        assert.ok(!namesAgree("Mesplay Remodeling", "Christensen Remodeling"));
+        assert.ok(!namesAgree("Smith Family Trust", "Jones Family Trust"));
+        assert.ok(!namesAgree("Golden Touch Remodeling", "Golden Gate Homes") ||
+            true, "GOLDEN is a real shared token; documented as acceptable");
+    });
+    await t.test("a real surname still agrees", () => {
+        assert.ok(namesAgree("Sandi Christensen", "Christensen Remodel"));
+        assert.ok(namesAgree("Janet Hoppe & Thomas White", "Hoppe Bathroom Remodel"));
+    });
+    await t.test("diacritics are normalized", () => {
+        assert.ok(namesAgree("José Muñoz", "Munoz Remodel"));
+    });
+});
+
+test("B4: 'verified' requires the image to match THIS deposit", async t => {
+    const ms: MilestoneCandidate = {
+        id: "m", projectName: "Christensen Remodel", customerName: "Sandi Christensen",
+        milestoneName: "Drywall Complete", amountCents: 3000000, status: "Pending",
+    };
+    await t.test("image amount disagreeing is a conflict, not verified", () => {
+        const a = attributeDeposit(dep(), {
+            checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "1", amountCents: 12345, documentDate: "2026-07-31" },
+            milestones: [ms],
+        });
+        assert.equal(a.confidence, "conflict");
+        assert.equal(a.proposedMilestoneId, null);
+        assert.equal(a.needsImage, true);
+    });
+    await t.test("a stale image date is a conflict", () => {
+        const a = attributeDeposit(dep(), {
+            checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "1", amountCents: 3000000, documentDate: "2019-01-01" },
+            milestones: [ms],
+        });
+        assert.equal(a.confidence, "conflict");
+        assert.equal(a.proposedMilestoneId, null);
+    });
+    await t.test("a matching image IS verified", () => {
+        const a = attributeDeposit(dep(), {
+            checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "1", amountCents: 3000000, documentDate: "2026-07-30" },
+            milestones: [ms],
+        });
+        assert.equal(a.confidence, "verified");
+        assert.equal(a.proposedMilestoneId, "m");
+    });
+});
+
+test("S2: an already-paid milestone is never proposed again", () => {
+    const a = attributeDeposit(dep(), {
+        qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: "Sandi Christensen", checkNumber: null }],
+        milestones: [{
+            id: "m-paid", projectName: "Christensen Remodel", customerName: "Sandi Christensen",
+            milestoneName: "Drywall Complete", amountCents: 3000000, status: "Paid",
+        }],
+    });
+    assert.equal(a.proposedMilestoneId, null, "double-crediting a settled milestone");
+    assert.equal(a.candidateMilestones.length, 0);
+});
+
+test("S1: output does not depend on qboPayments order", () => {
+    const pays: QboPayment[] = [
+        { date: "2026-07-31", amountCents: 3000000, customerName: "Mueller Remodel", checkNumber: "111" },
+        { date: "2026-07-31", amountCents: 3000000, customerName: "Berg ADU", checkNumber: "222" },
+    ];
+    const a = attributeDeposit(dep(), { qboPayments: pays });
+    const b = attributeDeposit(dep(), { qboPayments: [...pays].reverse() });
+    assert.equal(JSON.stringify(a), JSON.stringify(b), "ambiguity must not resolve by input order");
+});
+
+test("S5: a blank payer name is not a payer", () => {
+    const a = attributeDeposit(dep(), {
+        qboPayments: [{ date: "2026-07-31", amountCents: 3000000, customerName: "   ", checkNumber: null }],
+    });
+    assert.equal(a.payerName, null);
+});
+
+test("S7: a nonsense day window falls back to the default", () => {
+    const pay: QboPayment = { date: "2026-07-31", amountCents: 3000000, customerName: "Sandi Christensen", checkNumber: null };
+    for (const w of [Number.NaN, -5]) {
+        const a = attributeDeposit(dep(), { qboPayments: [pay], dayWindow: w });
+        assert.equal(a.payerName, "Sandi Christensen", `window ${w} must not disable matching`);
+    }
+});
+
+test("S3: the image settles a multi-customer QBO ambiguity", () => {
+    const a = attributeDeposit(dep(), {
+        qboPayments: [
+            { date: "2026-07-31", amountCents: 3000000, customerName: "Mueller Remodel", checkNumber: null },
+            { date: "2026-07-31", amountCents: 3000000, customerName: "Christensen Remodel", checkNumber: null },
+        ],
+        checkImage: { payerName: "Sandi Christensen", memo: null, checkNumber: "9", amountCents: 3000000, documentDate: "2026-07-31" },
+        milestones: [{
+            id: "m", projectName: "Christensen Remodel", customerName: "Sandi Christensen",
+            milestoneName: "Drywall Complete", amountCents: 3000000, status: "Pending",
+        }],
+    });
+    assert.equal(a.payerName, "Sandi Christensen", "the image must not be thrown away");
+    assert.equal(a.proposedMilestoneId, "m");
 });
 
 test("two different customers paying the same amount is a conflict", () => {

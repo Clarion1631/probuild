@@ -111,19 +111,102 @@ function daysBetween(a: string, b: string): number {
 }
 
 /**
- * Loose person/company name agreement. "Sandi Christensen" vs
- * "Christensen Remodel" agree; "Mesplay Kitchen" vs "Christensen Remodel"
- * do not. Requires a shared token of 4+ chars so "and"/"the" cannot match.
+ * Given names that collide constantly across unrelated customers. A shared
+ * FIRST name is not identity — "Sandi Christensen" and "Sandi Mueller" are
+ * two different families, and treating them as one credits the wrong job.
+ * (Codex review B3, 2026-08-19: this exact pair was reproduced booking
+ * Christensen's money onto a Mueller milestone.)
+ */
+const COMMON_GIVEN_NAMES = new Set([
+    "SANDI", "SANDY", "JANET", "THOMAS", "CALEB", "ROBYNE", "DIXIE", "SALLY",
+    "TIMOTHY", "ANNIE", "APRIL", "ALLISON", "JUSTIN", "RICHARD", "MICHAEL",
+    "DAVID", "JOHN", "JAMES", "ROBERT", "MARY", "PATRICIA", "JENNIFER",
+    "LINDA", "ELIZABETH", "BARBARA", "SUSAN", "JESSICA", "SARAH", "KAREN",
+    "WILLIAM", "JOSEPH", "CHARLES", "CHRIS", "MARK", "PAUL", "STEVEN",
+    "ANDREW", "KEVIN", "BRIAN", "GEORGE", "EDWARD", "RONALD", "ANTHONY",
+]);
+
+/**
+ * Words that describe a JOB or a company, not a party. Consulted AFTER
+ * plural folding, so list the singular form only ("REMODELS" arrives as
+ * "REMODEL"). Same discipline as vendor-alias.ts:92.
+ */
+const NAME_STOP_TOKENS = new Set([
+    // project/scope nouns
+    "REMODEL", "REMODELING", "KITCHEN", "BATHROOM", "BATH", "ADDITION",
+    "PROJECT", "CONSTRUCTION", "BUILD", "BUILDING", "HOME", "HOUSE",
+    "PROPERTY", "RESIDENCE", "GARAGE", "SHOP", "SHED", "SIDING", "ROOF",
+    "ELECTRICAL", "PLUMBING", "DECK", "PATIO", "BASEMENT", "UNIT", "SUITE",
+    // family / entity boilerplate
+    "FAMILY", "TRUST", "ESTATE", "ENTERPRISE", "HOLDING", "PARTNER",
+    "LLC", "INC", "CORP", "CORPORATION", "COMPANY", "LTD", "GROUP",
+    // connectives
+    "AND", "THE", "OF", "FOR",
+]);
+
+/** Fold a trailing plural/possessive S, mirroring vendorTokens(). */
+function foldToken(raw: string): string {
+    let t = raw.replace(/'/g, "");
+    if (t === "S") return "";
+    if (t.length >= 4 && t.endsWith("S")) t = t.slice(0, -1);
+    return t;
+}
+
+/**
+ * Identity tokens from a party name: diacritics normalized, 3+ chars, no
+ * digits, no scope/entity boilerplate.
+ */
+export function nameTokens(value: string | null): string[] {
+    if (!value) return [];
+    const ascii = value.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const out: string[] = [];
+    for (const raw of ascii.toUpperCase().split(/[^A-Z0-9']+/)) {
+        const t = foldToken(raw);
+        if (t.length < 3) continue;
+        if (/\d/.test(t)) continue;
+        if (NAME_STOP_TOKENS.has(t)) continue;
+        out.push(t);
+    }
+    return out;
+}
+
+/** True when a name looks like a person (or people), not a business. */
+function looksLikePerson(tokens: string[]): boolean {
+    return tokens.some(t => COMMON_GIVEN_NAMES.has(t));
+}
+
+/**
+ * Do two party names refer to the same customer?
+ *
+ * "Sandi Christensen" vs "Christensen Remodel" → true (shared surname).
+ * "Sandi Christensen" vs "Sandi Mueller"       → FALSE (shared given name
+ *                                                 only — different families).
+ *
+ * Rules, tightened after Codex review B3:
+ *  - a shared GIVEN name never counts on its own;
+ *  - scope words (REMODEL, KITCHEN, HOME…) never count, folded for plurals
+ *    so "Remodeling" cannot sneak past "REMODEL";
+ *  - when BOTH sides look like person names, require two shared tokens,
+ *    because one surname can be coincidence across two households.
  */
 export function namesAgree(a: string | null, b: string | null): boolean {
-    if (!a || !b) return false;
-    const norm = (s: string) =>
-        s.toUpperCase().replace(/[^A-Z\s]/g, " ").split(/\s+/).filter(t => t.length >= 4);
-    const ta = norm(a);
-    const tb = norm(b);
+    const ta = nameTokens(a);
+    const tb = nameTokens(b);
     if (!ta.length || !tb.length) return false;
-    const stop = new Set(["REMODEL", "KITCHEN", "BATHROOM", "PROJECT", "CONSTRUCTION"]);
-    return ta.some(t => tb.includes(t) && !stop.has(t));
+
+    const shared = ta.filter(t => tb.includes(t));
+    if (!shared.length) return false;
+
+    // A shared given name alone is not identity.
+    const identifying = shared.filter(t => !COMMON_GIVEN_NAMES.has(t));
+    if (!identifying.length) return false;
+
+    // Two person-shaped names sharing exactly one surname could be two
+    // different households; demand corroboration.
+    if (looksLikePerson(ta) && looksLikePerson(tb) && shared.length < 2) {
+        return false;
+    }
+    return true;
 }
 
 export function attributeDeposit(
@@ -135,7 +218,13 @@ export function attributeDeposit(
         dayWindow?: number;
     } = {},
 ): DepositAttribution {
-    const window = options.dayWindow ?? PAYMENT_DAY_WINDOW;
+    // S7: a NaN or negative window silently disables every QBO match, which
+    // would quietly downgrade every deposit to amount_only.
+    const rawWindow = options.dayWindow;
+    const window =
+        typeof rawWindow === "number" && Number.isFinite(rawWindow) && rawWindow >= 0
+            ? rawWindow
+            : PAYMENT_DAY_WINDOW;
     const payments = options.qboPayments ?? [];
     const image = options.checkImage ?? null;
     const milestones = options.milestones ?? [];
@@ -146,23 +235,36 @@ export function attributeDeposit(
         amountCents: deposit.amountCents,
     };
 
-    // Milestones this amount could settle, cheapest signal, computed once.
+    // Milestones this amount could settle. S2: an already-settled milestone
+    // must never be proposed again — that is a double credit.
+    const isOpen = (status: string) => !/^(paid|void|cancel)/i.test(status.trim());
     const candidates = milestones
-        .filter(m => m.amountCents === deposit.amountCents)
+        .filter(m => m.amountCents === deposit.amountCents && isOpen(m.status))
         .sort((a, b) => a.id.localeCompare(b.id));
 
     // ── Source 2: QBO payment (exact amount, tight date window) ──────────
-    const qboHits = payments.filter(p =>
-        p.amountCents === deposit.amountCents &&
-        Number.isFinite(daysBetween(p.date, deposit.postedDate)) &&
-        Math.abs(daysBetween(p.date, deposit.postedDate)) <= window);
+    // S1: sort the hits so nothing downstream depends on argument order.
+    const qboHits = payments
+        .filter(p =>
+            p.amountCents === deposit.amountCents &&
+            Number.isFinite(daysBetween(p.date, deposit.postedDate)) &&
+            Math.abs(daysBetween(p.date, deposit.postedDate)) <= window)
+        .sort((a, b) =>
+            a.date.localeCompare(b.date) ||
+            (a.customerName ?? "").localeCompare(b.customerName ?? "") ||
+            (a.checkNumber ?? "").localeCompare(b.checkNumber ?? ""));
 
-    const qboNames = [...new Set(qboHits.map(h => h.customerName).filter(Boolean))] as string[];
+    // S5: a blank or placeholder customer name is not a payer.
+    const cleanName = (n: string | null | undefined) => {
+        const t = (n ?? "").trim();
+        return t && t !== "-" ? t : null;
+    };
+    const qboNames = [...new Set(qboHits.map(h => cleanName(h.customerName)).filter(Boolean) as string[])].sort();
     const qboName = qboNames.length === 1 ? qboNames[0] : null;
-    const qboCheck = qboHits.map(h => h.checkNumber).find(c => c && c !== "-") ?? null;
+    const qboCheck = qboHits.map(h => cleanName(h.checkNumber)).find(Boolean) ?? null;
 
     // ── Source 1: the check image, strongest ─────────────────────────────
-    const imageName = image?.payerName ?? null;
+    const imageName = cleanName(image?.payerName);
 
     // ── Conflict beats everything: two sources naming DIFFERENT people ───
     if (imageName && qboName && !namesAgree(imageName, qboName)) {
@@ -182,6 +284,27 @@ export function attributeDeposit(
     }
 
     if (qboNames.length > 1) {
+        // S3: consult the IMAGE before giving up. If the strongest evidence
+        // names exactly one of the competing customers, it settles the case
+        // rather than being thrown away.
+        const agreeingQbo = imageName ? qboNames.filter(n => namesAgree(imageName, n)) : [];
+        if (imageName && agreeingQbo.length === 1) {
+            const m = candidates.filter(c => namesAgree(imageName, c.customerName) || namesAgree(imageName, c.projectName));
+            return {
+                ...base,
+                payerName: imageName,
+                source: "check_image",
+                confidence: m.length === 1 ? "verified" : "conflict",
+                checkNumber: image?.checkNumber ?? qboCheck,
+                candidateMilestones: candidates,
+                proposedMilestoneId: m.length === 1 ? m[0].id : null,
+                reason:
+                    `QuickBooks had ${qboNames.length} customers at this amount, but the check ` +
+                    `image says ${imageName}` +
+                    (m.length === 1 ? ` — settles "${m[0].milestoneName}" on ${m[0].projectName}.` : `. Which milestone it settles is still unclear.`),
+                needsImage: false,
+            };
+        }
         return {
             ...base,
             payerName: null,
@@ -208,6 +331,38 @@ export function attributeDeposit(
 
     if (payerName && agreeing.length === 1) {
         const m = agreeing[0];
+        // B4 (Codex review): "verified" must mean the image is evidence FOR
+        // THIS deposit. A mis-keyed or stale image row carries someone
+        // else's amount/date, and promoting that to the system's highest
+        // confidence is exactly how bad evidence gets trusted.
+        const imageAmountDisagrees =
+            imageName !== null && image?.amountCents != null && image.amountCents !== deposit.amountCents;
+        const imageDateDelta =
+            imageName !== null && image?.documentDate
+                ? Math.abs(daysBetween(image.documentDate, deposit.postedDate))
+                : null;
+        const imageDateDisagrees =
+            imageDateDelta !== null && (!Number.isFinite(imageDateDelta) || imageDateDelta > window);
+
+        if (imageName && (imageAmountDisagrees || imageDateDisagrees)) {
+            return {
+                ...base,
+                payerName: imageName,
+                source: "check_image",
+                confidence: "conflict",
+                checkNumber: image?.checkNumber ?? qboCheck,
+                candidateMilestones: candidates,
+                proposedMilestoneId: null,
+                reason:
+                    `The check image does not match this deposit — ` +
+                    (imageAmountDisagrees
+                        ? `image says ${((image!.amountCents ?? 0) / 100).toFixed(2)}, bank says ${(deposit.amountCents / 100).toFixed(2)}. `
+                        : `image is dated ${image!.documentDate}, ${imageDateDelta} days from the deposit. `) +
+                    `It may be filed against the wrong transaction.`,
+                needsImage: true,
+            };
+        }
+
         return {
             ...base,
             payerName,
@@ -221,6 +376,30 @@ export function attributeDeposit(
                 `"${m.milestoneName}" on ${m.projectName}` +
                 (imageName ? " (confirmed by the check image)" : " (per QuickBooks)"),
             needsImage: false,
+        };
+    }
+
+    // B1 (Codex review): the payer is known and agrees with SEVERAL
+    // milestones — the real Hoppe case, three pending milestones at exactly
+    // $13,447.68. Previously this fell through to the "no milestone matches"
+    // branch, which reported a FALSE reason and set needsImage:false,
+    // removing the deposit from the only human worklist. That is the
+    // "misattributed forever" hole this module exists to close.
+    if (payerName && agreeing.length > 1) {
+        const names = agreeing.map(m => `"${m.milestoneName}" (${m.projectName})`).join(", ");
+        return {
+            ...base,
+            payerName,
+            source,
+            confidence: "conflict",
+            checkNumber: image?.checkNumber ?? qboCheck,
+            candidateMilestones: candidates,
+            proposedMilestoneId: null,
+            reason:
+                `${payerName} paid ${(deposit.amountCents / 100).toFixed(2)}, but ${agreeing.length} of ` +
+                `their milestones are for exactly this amount: ${names}. ` +
+                `A human must say which one this settles.`,
+            needsImage: !imageName,
         };
     }
 
@@ -312,4 +491,17 @@ export function attributeDeposits(
 /** The short list for the weekly bank-login batch. */
 export function depositsNeedingImages(attributions: DepositAttribution[]): DepositAttribution[] {
     return attributions.filter(a => a.needsImage);
+}
+
+/**
+ * Everything a HUMAN must look at (S4, Codex review). Strictly wider than
+ * depositsNeedingImages(): an image-vs-QuickBooks conflict needs no new
+ * image — the image is already in hand — but it absolutely needs a person,
+ * and without this queue it had nowhere to appear.
+ *
+ * INVARIANT this enforces: if a deposit proposes no milestone, it is on a
+ * queue. Nothing may be silently dropped.
+ */
+export function depositsNeedingHuman(attributions: DepositAttribution[]): DepositAttribution[] {
+    return attributions.filter(a => a.needsImage || a.confidence === "conflict" || a.proposedMilestoneId === null);
 }
