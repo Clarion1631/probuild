@@ -2708,6 +2708,7 @@ model BankLine {
 
   observations      BankLineObservation[]
   items             BankLineItem[]
+  imageMatches      BankImageMatch[]
   refundsAsOriginal RefundEvent[]         @relation("RefundEventOriginal")
   refundsAsRefund   RefundEvent[]         @relation("RefundEventRefund")
 
@@ -2833,4 +2834,65 @@ model RefundEvent {
 
   @@index([originalBankLineId])
   @@index([refundBankLineId])
+}
+
+/// Check and deposit images pulled from the bank (docs/BANK-REGISTER-PLAN.md
+/// Phase 3). The ledger carries lines the CSV cannot explain — a bare
+/// "CHECK PAID" with no payee, a generic "DEPOSIT - DDA/MMKT" — and the
+/// image is the only evidence that names them.
+///
+/// Applied via scripts/apply-bank-image.mjs (NOT prisma migrate; see
+/// CLAUDE.md "Schema migrations"). Identity is (source, sourceExternalId),
+/// so re-pulling the same document from the bank is a no-op.
+model BankImage {
+  id               String    @id @default(cuid())
+  source           String // WTB_ONLINE, GOOGLE_CHAT, MANUAL
+  /// The bank's own id for this document — the idempotency key with source.
+  sourceExternalId String
+  kind             String // CHECK_FRONT, CHECK_BACK, DEPOSIT_SLIP, DEPOSIT_PHOTO
+  account          String // e.g. "WTB-0723"
+  capturedAt       DateTime  @db.Timestamptz(6)
+  /// Date printed on the document, when readable.
+  documentDate     DateTime? @db.Date
+  driveFileId      String?
+  fileName         String
+  mime             String
+  byteSize         Int?
+  /// Digits only, leading zeros stripped — the same check identity the
+  /// daily CSV, monthly PDF and QBO register parsers all produce.
+  normalizedCheckNumber String?
+  /// Positive cents: an image is evidence of a document, never a signed
+  /// ledger movement.
+  amountCents           Int?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  matches BankImageMatch[]
+
+  @@unique([source, sourceExternalId])
+  @@index([kind, capturedAt])
+  @@index([kind, normalizedCheckNumber])
+  @@index([account, documentDate])
+}
+
+/// A HUMAN-confirmed link between an image and what it explains.
+/// Deliberately separate from BankImage: an automated candidate (same check
+/// number + date + amount) is only ever a suggestion, and a row here means
+/// somebody actually said yes. Matchers never write this table.
+model BankImageMatch {
+  id          String    @id @default(cuid())
+  bankImageId String    @unique
+  bankImage   BankImage @relation(fields: [bankImageId], references: [id], onDelete: Restrict)
+  /// Restrict, not Cascade — deleting a bank line must not silently erase a
+  /// human's confirmation.
+  bankLineId  String?
+  bankLine    BankLine? @relation(fields: [bankLineId], references: [id], onDelete: Restrict)
+  qbType      String?
+  qbTxnId     String?
+  confirmedBy String
+  confirmedAt DateTime  @default(now()) @db.Timestamptz(6)
+  note        String?
+
+  @@index([bankLineId])
 }
