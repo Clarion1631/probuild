@@ -26,8 +26,20 @@
 // constants). tests/crew-auto-assign.test.ts pins the TS implementation, and
 // this file is checked against it by tests/backfill-crew-assignments.test.ts.
 import { PrismaClient } from "@prisma/client";
+import { config } from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
-const prisma = new PrismaClient();
+// Load .env.local the same way every other script in this folder does. Without
+// this the script dies with "Environment variable not found: DATABASE_URL" —
+// `next dev`/`next build` inject .env.local for the app, but a bare `node
+// scripts/*.mjs` gets nothing, so a script that skips this only ever works when
+// the operator happens to have DATABASE_URL exported.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+config({ path: join(__dirname, "..", ".env.local") });
+config({ path: join(__dirname, "..", ".env") });
+
+const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
 
 const TARGET_STATUS = "In Progress";     // src/lib/project-status.ts
 const ELIGIBLE_ROLE = "FIELD_CREW";      // ROLE_LABELS, src/lib/permissions.ts
