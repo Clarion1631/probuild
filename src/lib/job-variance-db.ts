@@ -9,6 +9,7 @@ import { prisma } from "@/lib/prisma";
 import { isEstimateSectionRow } from "@/lib/estimate-item-payload";
 import { computeProjectVariance, type ProjectVariance, type VarianceEstimateItem } from "@/lib/job-variance";
 import { PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
+import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
 
 export interface ProjectVarianceReport {
     projectId: string;
@@ -19,7 +20,15 @@ export interface ProjectVarianceReport {
 
 export async function loadProjectVariance(projectIds?: string[]): Promise<ProjectVarianceReport[]> {
     const projects = await prisma.project.findMany({
-        where: { status: "In Progress", ...(projectIds ? { id: { in: projectIds } } : {}) },
+        where: {
+            status: "In Progress",
+            // The overhead bucket ("Shop") is not a job: no client, no bid, no
+            // meaningful budget. On prod it showed $71,991 of actuals against a
+            // $12,511 nominal budget at 0% attribution — the biggest and least
+            // actionable row on the report. An explicit projectIds request still
+            // wins, so it stays inspectable on purpose.
+            ...(projectIds ? { id: { in: projectIds } } : { id: { not: OVERHEAD_PROJECT_ID } }),
+        },
         select: { id: true, name: true, status: true },
         orderBy: { name: "asc" },
     });

@@ -2,11 +2,10 @@ import { prisma } from "@/lib/prisma";
 import { getParam, getAllParams, type SearchParamMap } from "@/lib/report-utils";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 
-// "Shop" is the sanctioned overhead bucket — same env var as the company
-// financials rollup page and the QBO expense sync, so all three can never
-// point at different projects.
-const OVERHEAD_PROJECT_ID =
-    process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || "cmpd6xca1009x1iizdf4suln3";
+// "Shop" is the sanctioned overhead bucket. The id now lives in ONE place
+// (src/lib/overhead-project.ts) so this page, the QBO expense sync, and the job
+// variance report can never point at different projects.
+import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
 
 // Same parent-status gating as computeProjectFinancials (src/lib/project-financials.ts,
 // includeUnissued: false) — Draft invoices/retainers are not receivables and must

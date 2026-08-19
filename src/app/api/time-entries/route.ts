@@ -97,6 +97,29 @@ export async function POST(req: Request) {
         // The item alone decides the charge — a client-sent costCodeId must not
         // fill in for a codeless item, or crew can charge any code they like.
         resolvedCostCodeId = item.costCodeId ?? null;
+
+        // Optional item step (2026-08): the client may send BOTH the phase the
+        // crew tapped and the item it resolved underneath it. They must agree.
+        // A disagreement means the client's phase list was stale — the item was
+        // re-coded on the estimate between the phase tap and the punch — and
+        // silently trusting the item would charge a phase the crew never chose.
+        // That is precisely the item/phase mismatch that corrupted the variance
+        // report (see reconcileAttribution in src/lib/job-variance.ts); reject
+        // it at the door instead of letting it into the ledger.
+        if (
+            costCodeId &&
+            typeof costCodeId === "string" &&
+            resolvedCostCodeId &&
+            costCodeId !== resolvedCostCodeId
+        ) {
+            return NextResponse.json(
+                {
+                    error: "That line item belongs to a different phase. Reopen the phase list and pick again.",
+                    code: "ITEM_PHASE_MISMATCH",
+                },
+                { status: 400 }
+            );
+        }
     } else if (costCodeId && typeof costCodeId === "string") {
         // Phase-only clock-in (the primary path since the mobile picker went
         // phases-only) — and the old legacy path. "The cost code exists" is NOT
