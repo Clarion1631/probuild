@@ -46,7 +46,7 @@ Running the real engine over live prod data:
 
 ```
 job                    budget      actual     variance   attributed
-Berg ADU              $29,250     $39,354    -$10,104        41%
+Berg ADU              $33,880     $39,354     -$5,474        41%
 Christensen Remodel  $225,000     $11,349   +$213,651        98%
 Hoppe Bathroom        $95,925     $12,758    +$83,167        56%
 Mesplay Kitchen      $239,875    $167,385    +$72,490        43%
@@ -54,7 +54,10 @@ Robbins Electrical     $4,596      $2,930     +$1,666       100%
 Shop                  $12,511     $71,991    -$59,480         0%
 ```
 
-**Berg ADU is genuinely over budget** — and note *why* it is legible: four phases
+(Berg's budget includes its approved $4,629.63 change order — see review finding 0.
+An earlier draft of this doc reported −$10,104 before that bug was found and fixed.)
+
+**Berg ADU is genuinely over budget** (−$5,474, 116% used) — and note *why* it is legible: four phases
 (`20-CLEAN`, `23-SITEWORK`, `17-CONCRETE`, `06-INSUL`) carry real spend and appear
 **nowhere in the estimate**. That is a bidding gap, exactly the kind of "why" the
 whole project exists to surface.
@@ -121,6 +124,14 @@ An independent reviewer read the new code, ran the tests, and typechecked. It fo
 **three real bugs that the green test suite did not cover**, all now fixed with
 regression tests (suite grew 20 → 25 on the variance engine):
 
+0. **HIGH — approved CHANGE ORDERS were counted as cost but never as budget.**
+   Budget came only from `EstimateItem`; approved change-order scope lives in the
+   separate `ChangeOrderItem` table and was never read, while the costs for that work
+   still landed on the job. **Berg ADU's overrun was overstated by $4,629.63** — it
+   reads **−$5,474 (116% used)**, not −$10,104 (134%). Fixed by including
+   `ChangeOrderItem` rows from **Approved** change orders only (Draft/Sent are
+   proposals — prod holds $67k of those, and counting them would hide real overruns).
+   `ChangeOrderItem` is flat, so there are no section rows to exclude.
 1. **CRITICAL — item/phase mismatch double-counted.** When a posting carried an explicit
    `costCodeId` for phase A *and* an `estimateItemId` whose item lived under phase B, the
    money landed on **phase A's total** while crediting **an item under phase B**. That
@@ -134,6 +145,24 @@ regression tests (suite grew 20 → 25 on the variance engine):
    stayed large — producing shares like 1.4 or −3 and an impossible progress bar.
    Now clamped to 0..1, with `ratio()` hardened against non-finite values.
 3. **`ratio()` could return a non-finite number.** Now returns `null` instead.
+4. **Coverage was measured on NET dollars.** `Expense.amount` is signed, so a job with
+   a $500 uncoded charge and a $500 coded refund netted to $0 and the guard reported
+   **"100% attributed — Trustworthy"** on data that was 0% attributed. Coverage is now
+   computed over **absolute** dollars moved.
+5. **A phase with a NEGATIVE budget** (a discount/credit line under one cost code)
+   silently lost both its "% used" line and its warning label. Now flagged explicitly
+   as "negative budget — check the estimate" via `hasNegativeBudget`.
+6. **The trust bar rounded UP.** 99.6% rendered as "100% attributed / Trustworthy"
+   while hundreds of dollars were unplaced. Now `Math.floor`, so coverage can never
+   flatter itself into the trustworthy band. The floor-flag float threshold is also
+   `Math.abs()` now — one-sided comparison could suppress a warning that should fire.
+7. **`Number(x) || 0` turned corrupt amounts into a confident $0 of spend.** Non-finite
+   values are now counted into `coverage.malformedRows` and rendered as a red warning.
+   (Prod currently has zero such rows — the guard is preventive.)
+
+`scripts/variance-report.ts` was also rewritten to call the SAME loader the page uses.
+It previously duplicated the queries and silently missed the change-order fix — exactly
+the drift this repo has been bitten by before.
 
 ### One review recommendation was tested and DELIBERATELY REJECTED
 

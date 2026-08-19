@@ -393,6 +393,74 @@ test("a refund reduces the phase actual rather than being dropped", () => {
     assert.equal(result.variance, 300);
 });
 
+// ── review findings 4-7: coverage honesty ───────────────────────────────────
+
+test("REVIEW BUG 4c: a net-zero job from refunds does NOT report 100% attributed", () => {
+    // The old guard fell through to 1 ("Trustworthy") on data that was 0% placed.
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [spend({ amount: 500 }), spend({ amount: -500 })], // both UNattributed
+    });
+    assert.equal(result.coverage.attributedShare, 0,
+        "no dollars were attributed, so coverage must be 0 — not 1");
+});
+
+test("REVIEW BUG 4d: signed refunds cannot inflate coverage above the real share", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [],
+        expenses: [spend({ amount: 500 }), spend({ costCodeId: "cc-demo", amount: -400 })],
+    });
+    // Absolute dollars moved: 500 unattributed + 400 attributed.
+    assert.ok(Math.abs(result.coverage.attributedShare - 400 / 900) < 1e-9,
+        `expected ~0.444, got ${result.coverage.attributedShare}`);
+});
+
+test("REVIEW BUG 5: a phase with a NEGATIVE budget is flagged, not silently blanked", () => {
+    const result = computeProjectVariance({
+        items: [
+            item({ id: "i1", total: 400 }),
+            item({ id: "credit", total: -500 }), // a discount/credit line
+        ],
+        timeEntries: [],
+        expenses: [spend({ costCodeId: "cc-demo", amount: 100 })],
+    });
+    const phase = result.phases[0];
+    assert.ok(phase.totalBudget < 0);
+    assert.equal(phase.percentUsed, null);
+    assert.equal(phase.hasNegativeBudget, true, "UI needs this to explain the missing % used");
+});
+
+test("a normal phase is never flagged as having a negative budget", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [], expenses: [spend({ costCodeId: "cc-demo", amount: 100 })],
+    });
+    assert.equal(result.phases[0].hasNegativeBudget, false);
+});
+
+test("REVIEW BUG 7: an unreadable amount is COUNTED and reported, never treated as $0 spend", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [time({ costCodeId: "cc-demo", laborCost: Number.NaN, burdenCost: 0 })],
+        expenses: [spend({ costCodeId: "cc-demo", amount: Number.NaN })],
+    });
+    assert.equal(result.coverage.malformedRows, 2, "both bad rows must be surfaced");
+    // And they must not poison the arithmetic.
+    assert.ok(Number.isFinite(result.totalActual));
+    assert.ok(Number.isFinite(result.variance));
+});
+
+test("clean data reports zero malformed rows", () => {
+    const result = computeProjectVariance({
+        items: [item({ id: "i1", total: 1000 })],
+        timeEntries: [time({ costCodeId: "cc-demo", laborCost: 100 })],
+        expenses: [spend({ costCodeId: "cc-demo", amount: 50 })],
+    });
+    assert.equal(result.coverage.malformedRows, 0);
+});
+
 test("an empty project produces zeros, not NaN", () => {
     const result = computeProjectVariance({ items: [], timeEntries: [], expenses: [] });
     for (const v of [result.totalBudget, result.totalActual, result.variance, result.uncodedBudget]) {

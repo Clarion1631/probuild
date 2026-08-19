@@ -34,7 +34,10 @@ function VarianceAmount({ value, className = "" }: { value: number; className?: 
 }
 
 function TrustBar({ variance }: { variance: ProjectVariance }) {
-    const pct = Math.round(variance.coverage.attributedShare * 100);
+    // Math.floor, not round: peer-review finding — rounding UP let 99.6% render
+    // as "100% attributed / Trustworthy" while hundreds of dollars were genuinely
+    // unplaced. Coverage must never flatter itself into the trustworthy band.
+    const pct = Math.floor(variance.coverage.attributedShare * 100);
     const tone =
         pct >= 90 ? { bar: "bg-green-500", text: "text-green-700", label: "Trustworthy" }
         : pct >= 60 ? { bar: "bg-amber-500", text: "text-amber-700", label: "Partial — read with care" }
@@ -71,6 +74,14 @@ function TrustBar({ variance }: { variance: ProjectVariance }) {
                     budget on uncoded items
                 </div>
             </div>
+            {variance.coverage.malformedRows > 0 && (
+                // Surfaced rather than silently zeroed — a corrupt amount is a
+                // data problem someone must fix, not $0 of spend.
+                <div className="mt-3 text-xs font-medium text-red-700">
+                    ⚠ {variance.coverage.malformedRows} row(s) had an unreadable amount and are
+                    excluded from every figure above. Check the source data.
+                </div>
+            )}
         </div>
     );
 }
@@ -89,6 +100,13 @@ function PhaseRow({ phase }: { phase: PhaseVariance }) {
                     <span className="font-medium text-hui-textMain">{phase.name}</span>
                     {phase.totalBudget === 0 && phase.totalActual > 0 && (
                         <span className="ml-2 text-xs font-medium text-red-600">not in the estimate</span>
+                    )}
+                    {phase.hasNegativeBudget && (
+                        // Without this the "% used" line and the "not in the
+                        // estimate" warning both vanish with no explanation.
+                        <span className="ml-2 text-xs font-medium text-amber-600">
+                            negative budget — check the estimate
+                        </span>
                     )}
                 </div>
                 <VarianceAmount value={phase.variance} />

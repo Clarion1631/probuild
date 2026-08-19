@@ -67,6 +67,43 @@ export async function loadProjectVariance(projectIds?: string[]): Promise<Projec
             }
         }
 
+        // ── Approved CHANGE ORDERS are budget too ───────────────────────────
+        // Peer-review finding (HIGH). Budget came only from EstimateItem, but
+        // approved change-order scope lives in the separate ChangeOrderItem
+        // table. Costs for that work still land on the job (labor via
+        // TimeEntry.projectId, materials via the parent estimate), so omitting
+        // the CO budget manufactures an overrun on every job with an approved CO.
+        //
+        // Verified on prod 2026-08-19: Berg ADU carries an approved CO worth
+        // $4,629.63 and Shop $1,000 — Berg's reported overrun was overstated by
+        // exactly that amount until this was added.
+        //
+        // ONLY "Approved" counts. Draft and Sent change orders are proposals,
+        // not committed work — counting them would inflate the budget and hide
+        // real overruns (prod currently holds $67k of Draft/Sent CO scope).
+        // ChangeOrderItem is a FLAT table (no parentId), so there are no section
+        // rows to exclude here, unlike EstimateItem.
+        const changeOrderItems = await prisma.changeOrderItem.findMany({
+            where: { changeOrder: { projectId: project.id, status: "Approved" } },
+            select: {
+                id: true, name: true, total: true, type: true,
+                costCodeId: true,
+                costCode: { select: { code: true, name: true } },
+                costType: { select: { name: true } },
+            },
+        });
+        for (const row of changeOrderItems) {
+            items.push({
+                id: row.id,
+                name: row.name?.trim() ? `${row.name.trim()} (CO)` : "(unnamed change order item)",
+                costCodeId: row.costCodeId,
+                costCode: row.costCode ? { code: row.costCode.code, name: row.costCode.name } : null,
+                costTypeName: row.costType?.name ?? null,
+                type: row.type ?? null,
+                total: Number(row.total ?? 0),
+            });
+        }
+
         const [timeRows, expenseRows] = await Promise.all([
             prisma.timeEntry.findMany({
                 where: { projectId: project.id },

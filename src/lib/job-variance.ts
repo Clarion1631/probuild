@@ -64,6 +64,13 @@ export interface PhaseVariance {
     variance: number;
     /** actual / budget, or null when there is no budget to divide by. */
     percentUsed: number | null;
+    /**
+     * True when this phase's budget nets NEGATIVE (a discount/credit line under
+     * the same cost code). `percentUsed` is null in that case, so without this
+     * flag the UI would quietly drop the "% used" line and the "not in the
+     * estimate" warning with no explanation. Peer-review finding.
+     */
+    hasNegativeBudget: boolean;
     items: ItemVariance[];
 }
 
@@ -112,6 +119,13 @@ export interface VarianceCoverage {
     attributedShare: number;
     /** Actuals coded to a phase but not to a specific item, so item rows are floors. */
     phaseOnlyActuals: number;
+    /**
+     * Rows whose amount was not a finite number (corrupt/NaN). Peer-review
+     * finding: `Number(x) || 0` turns garbage into a confident $0 of spend.
+     * Given this module exists to never flatter a job, a corrupt amount must be
+     * surfaced and counted, not silently vanish.
+     */
+    malformedRows: number;
 }
 
 /** "Labor" vs everything else. A null cost type falls back to the legacy `type` string. */
@@ -126,15 +140,29 @@ function emptyPhase(costCodeId: string, code: string, name: string): PhaseVarian
         costCodeId, code, name,
         laborBudget: 0, materialBudget: 0, totalBudget: 0,
         actualLabor: 0, actualMaterial: 0, totalActual: 0,
-        variance: 0, percentUsed: null, items: [],
+        variance: 0, percentUsed: null, hasNegativeBudget: false, items: [],
     };
 }
 
-/** actual/budget, or null when there is no budget — never Infinity or NaN in a UI. */
+/**
+ * actual/budget, or null when there is no usable budget — never Infinity or NaN.
+ *
+ * A NEGATIVE budget (a phase whose items net below zero via a discount or credit
+ * line) is deliberately treated the same as no budget for the ratio, but callers
+ * must distinguish the two: see `hasNegativeBudget` on PhaseVariance, which the
+ * UI uses to say "check the estimate" instead of silently hiding the % used.
+ */
 function ratio(actual: number, budget: number): number | null {
     if (budget <= 0) return null;
     const value = actual / budget;
     return Number.isFinite(value) ? value : null;
+}
+
+/** A money value that is guaranteed finite; non-finite input is reported, not silently zeroed. */
+function toAmount(value: unknown): { amount: number; malformed: boolean } {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return { amount: 0, malformed: true };
+    return { amount: n, malformed: false };
 }
 
 /** Keep a share inside 0..1 so no consumer can render an impossible percentage. */
@@ -165,6 +193,7 @@ export function computeProjectVariance(input: {
     const phases = new Map<string, PhaseVariance>();
     const itemsById = new Map<string, ItemVariance & { costCodeId: string | null }>();
     let uncodedBudget = 0;
+    let malformedBudgetRows = 0;
 
     /**
      * Get-or-create a phase for a cost code that carries ACTUALS but has no
@@ -183,7 +212,9 @@ export function computeProjectVariance(input: {
 
     // ── budget side ─────────────────────────────────────────────────────────
     for (const item of input.items) {
-        const budget = Number(item.total) || 0;
+        const parsedBudget = toAmount(item.total);
+        if (parsedBudget.malformed) malformedBudgetRows += 1;
+        const budget = parsedBudget.amount;
         const itemRow = {
             itemId: item.id, name: item.name, budget, actual: 0, variance: budget,
             phaseHasUnassignedActuals: false, costCodeId: item.costCodeId,
@@ -236,8 +267,18 @@ export function computeProjectVariance(input: {
     // ── actual side: labor ──────────────────────────────────────────────────
     let unattributedLabor = 0;
     let phaseOnlyActuals = 0;
+    let malformedRows = 0;
+    // Coverage is measured over ABSOLUTE dollars. Peer-review finding:
+    // Expense.amount is signed (refunds/credit memos are normal), so netting
+    // could drive the denominator to ~0 and report "100% attributed" on data
+    // that was 0% attributed. Magnitude of money moved is the honest base.
+    let absAttributed = 0;
+    let absUnattributed = 0;
     for (const entry of input.timeEntries) {
-        const cost = (Number(entry.laborCost) || 0) + (Number(entry.burdenCost) || 0);
+        const labor = toAmount(entry.laborCost);
+        const burden = toAmount(entry.burdenCost);
+        if (labor.malformed || burden.malformed) malformedRows += 1;
+        const cost = labor.amount + burden.amount;
         if (cost === 0) continue;
 
         // An entry may carry an item, a phase, or neither.
@@ -246,7 +287,12 @@ export function computeProjectVariance(input: {
             entry.estimateItemId ? itemsById.get(entry.estimateItemId) : undefined
         );
 
-        if (!costCodeId) { unattributedLabor += cost; continue; }
+        if (!costCodeId) {
+            unattributedLabor += cost;
+            absUnattributed += Math.abs(cost);
+            continue;
+        }
+        absAttributed += Math.abs(cost);
         // Actuals on a phase with NO budget are real and important: work
         // happened that nobody estimated.
         const phase = ensurePhase(costCodeId);
@@ -258,7 +304,9 @@ export function computeProjectVariance(input: {
     // ── actual side: materials / subs ───────────────────────────────────────
     let unattributedMaterial = 0;
     for (const expense of input.expenses) {
-        const amount = Number(expense.amount) || 0;
+        const parsed = toAmount(expense.amount);
+        if (parsed.malformed) malformedRows += 1;
+        const amount = parsed.amount;
         if (amount === 0) continue;
 
         const { costCodeId, item: linkedItem } = reconcileAttribution(
@@ -266,7 +314,12 @@ export function computeProjectVariance(input: {
             expense.itemId ? itemsById.get(expense.itemId) : undefined
         );
 
-        if (!costCodeId) { unattributedMaterial += amount; continue; }
+        if (!costCodeId) {
+            unattributedMaterial += amount;
+            absUnattributed += Math.abs(amount);
+            continue;
+        }
+        absAttributed += Math.abs(amount);
         const phase = ensurePhase(costCodeId);
         phase.actualMaterial += amount;
         if (linkedItem) linkedItem.actual += amount;
@@ -279,13 +332,17 @@ export function computeProjectVariance(input: {
         phase.totalActual = phase.actualLabor + phase.actualMaterial;
         phase.variance = phase.totalBudget - phase.totalActual;
         phase.percentUsed = ratio(phase.totalActual, phase.totalBudget);
+        phase.hasNegativeBudget = phase.totalBudget < 0;
 
         // Flag every item under a phase carrying actuals that landed on no item:
         // those item rows are floors, and the UI must not imply otherwise.
+        // Math.abs: peer-review finding — summing Decimal-derived floats leaves
+        // sub-cent residue in EITHER direction, and a one-sided `> 0.005` test
+        // could suppress a flag that should fire.
         const unassigned = phase.totalActual - phase.items.reduce((a, i) => a + i.actual, 0);
         for (const item of phase.items) {
             item.variance = item.budget - item.actual;
-            item.phaseHasUnassignedActuals = unassigned > 0.005;
+            item.phaseHasUnassignedActuals = Math.abs(unassigned) > 0.005;
         }
         phase.items.sort((a, b) => a.variance - b.variance);
     }
@@ -323,10 +380,15 @@ export function computeProjectVariance(input: {
             // to near zero or below while unattributedTotal stays large. Unclamped
             // this produced shares like 1.4 or -3, which the UI renders as an
             // impossible progress bar and a nonsense "140% attributed".
+            // Measured over ABSOLUTE dollars moved, so signed refunds cannot net
+            // the denominator toward zero and fake a "100% attributed" result.
             attributedShare: clamp01(
-                totalActual > 0 ? (totalActual - unattributedTotal) / totalActual : 1
+                absAttributed + absUnattributed > 0
+                    ? absAttributed / (absAttributed + absUnattributed)
+                    : 1
             ),
             phaseOnlyActuals,
+            malformedRows: malformedRows + malformedBudgetRows,
         },
     };
 }
