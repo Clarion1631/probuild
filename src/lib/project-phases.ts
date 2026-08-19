@@ -41,7 +41,7 @@ export const PHASE_ELIGIBLE_ESTIMATE_WHERE = {
  * estimate items. `CostCode.code` is unique, so this string is the key.
  * The row is created by scripts/apply-safety-cost-code.mjs.
  */
-export const SAFETY_COST_CODE = "22-SAFETY";
+export const SAFETY_COST_CODE = "32-SAFETY";
 export const SAFETY_COST_CODE_NAME = "Safety Meeting";
 
 /** The narrow cost-code shape both the picker response and validation need. */
@@ -71,7 +71,7 @@ export function shouldIncludeSafetyPhase(projectStatus: string | null | undefine
 /**
  * Compose the final phase list: the project's estimate-derived cost codes,
  * plus the Safety Meeting phase when the project qualifies. Deduplicated by
- * code (an estimate that already carries a 22-SAFETY line must not produce two
+ * code (an estimate that already carries a safety line must not produce two
  * rows) and sorted by code — plain string sort, correct for zero-padded codes
  * like "01-DEMO".
  */
@@ -100,7 +100,7 @@ export interface PhaseDataSource {
     getProject(projectId: string): Promise<{ id: string; status: string } | null>;
     /** Distinct cost codes referenced by items on the project's ELIGIBLE estimates. */
     getEstimateCostCodes(projectId: string): Promise<PhaseCostCode[]>;
-    /** The 22-SAFETY CostCode row, or null if it hasn't been seeded yet. */
+    /** The SAFETY_COST_CODE CostCode row, or null if it hasn't been seeded yet. */
     getSafetyCostCode(): Promise<PhaseCostCode | null>;
 }
 

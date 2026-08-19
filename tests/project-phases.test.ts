@@ -131,7 +131,7 @@ test("an unseeded safety cost code degrades to an empty/estimate-only list, not 
     assert.deepEqual(await resolveProjectPhaseCodes(dataSource, "p1"), []);
 });
 
-test("an estimate that already carries a 22-SAFETY line does not produce a duplicate row", () => {
+test("an estimate that already carries the safety line does not produce a duplicate row", () => {
     const phases = composeProjectPhases({
         estimateCostCodes: [SAFETY, DEMO],
         projectStatus: "In Progress",
