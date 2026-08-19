@@ -4,6 +4,9 @@ import {
     classifyReceiptRequirement,
     resolveReceiptOwner,
     summarizeReceiptWork,
+    classifyPersonToPersonPayment,
+    extractP2PPayee,
+    type RosterPerson,
 } from "@/lib/receipt-policy";
 
 // Fixture note: every descriptor below is a REAL string from the GTR prod
@@ -54,6 +57,26 @@ test("an insurance-shaped word inside a merchant name does not exempt a purchase
     // Guard against the exemption patterns being too greedy.
     const v = classifyReceiptRequirement(line("MISCELLANEOUS DEBIT LOWES #01632* 360-260-2120  WA C#6098 DBT CRD 1409"));
     assert.equal(v.requirement, "receipt_expected");
+});
+
+test("person-to-person rails are NEVER blanket-exempted by card", async t => {
+    // Justin's correction 2026-08-19: a Cash App payment can be an owner
+    // draw, a payroll advance to an employee, or a payment to a household
+    // worker. Exempting the rail because it left Justin's card would
+    // silently misfile payroll — a tax error, not a receipt inconvenience.
+    for (const [who, d] of [
+        ["Justin's card", "MISCELLANEOUS DEBIT CASH APP*MADISON WILKE Oakland CA C#4297 DBT CRD 1257"],
+        ["CJ's card", "MISCELLANEOUS DEBIT CASH APP*SOME HELPER Oakland CA C#8516 DBT CRD 1257"],
+        ["Richard's card", "MISCELLANEOUS DEBIT CASH APP*SOME HELPER Oakland CA C#6098 DBT CRD 1257"],
+    ] as const) {
+        await t.test(`Cash App on ${who} is not auto-exempt`, () => {
+            assert.notEqual(classifyReceiptRequirement(line(d)).ruleKey, "owner-transfer");
+        });
+    }
+    await t.test("PayPal to a vendor is still a purchase", () => {
+        const v = classifyReceiptRequirement(line("MISCELLANEOUS DEBIT PAYPAL *THERTASTORE 402-935-7733  NY C#6098 DBT CRD 0827"));
+        assert.equal(v.requirement, "receipt_expected");
+    });
 });
 
 test("software subscriptions expect a receipt but are labelled as overhead", async t => {
@@ -109,13 +132,17 @@ test("card rails resolve to the right person", async t => {
         assert.equal(v.owner, "Richard");
         assert.equal(v.cardTail, "6098");
     });
-    await t.test("an UNKNOWN card is never guessed onto a person", () => {
-        // C#4297 appears in prod on Plaid/Google Cloud/Anthropic/Cash App.
+    await t.test("Justin's own card is …4297", () => {
+        const v = resolveReceiptOwner("MISCELLANEOUS DEBIT ANTHROPIC ANTHROPIC.COM CA C#4297 DBT CRD 1852");
+        assert.equal(v.owner, "Justin");
+        assert.equal(v.cardTail, "4297");
+    });
+    await t.test("a card tail nobody claims is never guessed onto a person", () => {
         // Guessing an owner would send someone else's affidavit to the wrong
         // person — the exact trust failure this module prevents.
-        const v = resolveReceiptOwner("MISCELLANEOUS DEBIT ANTHROPIC ANTHROPIC.COM CA C#4297 DBT CRD 1852");
+        const v = resolveReceiptOwner("MISCELLANEOUS DEBIT SOMEWHERE C#9999 DBT CRD 1852");
         assert.equal(v.owner, "unassigned");
-        assert.equal(v.cardTail, "4297");
+        assert.equal(v.cardTail, "9999");
     });
     await t.test("no card means the office owns it, not the crew", () => {
         const v = resolveReceiptOwner("PREAUTHORIZED ACH DEBIT BILLPAY    RLI INSURANCE CO");
@@ -154,4 +181,91 @@ test("exempt lines are REPORTED, never silently dropped", () => {
 test("empty input is handled", () => {
     const s = summarizeReceiptWork([], () => false);
     assert.deepEqual(s, { needsReceipt: [], exempt: [], notSpend: [], satisfied: [] });
+});
+
+// ── Person-to-person payments ────────────────────────────────────────────
+// Justin, 2026-08-19: "if it's Richard's housekeeper, then it would be a
+// payroll advance… if it's me, it's just an owner's draw, if it's an
+// employee then payroll advance set up properly in Gusto."
+//
+// Roster below mirrors the real ProBuild user table (verified in prod).
+
+const ROSTER: RosterPerson[] = [
+    { name: "Justin Adkins", kind: "owner" },
+    { name: "Garrett Erickson", kind: "employee" },
+    { name: "CJ Havens", kind: "employee" },
+    { name: "Richard Lord", kind: "employee" },
+    { name: "Kevin Barth", kind: "employee" },
+    { name: "Chris Temple", kind: "employee" },
+    { name: "Pierce Gange", kind: "employee" },
+];
+
+test("person-to-person payments book by WHO was paid, not whose card", async t => {
+    await t.test("paying an employee is a payroll advance, not a draw", () => {
+        const v = classifyPersonToPersonPayment(
+            "MISCELLANEOUS DEBIT CASH APP*GARRETT ERICKSON Vancouver WA C#4297 DBT CRD 1257",
+            ROSTER,
+        );
+        assert.equal(v.disposition, "payroll_advance");
+        assert.equal(v.matchedPerson, "Garrett Erickson");
+        assert.match(v.reason, /Gusto/);
+    });
+
+    await t.test("paying the owner is a draw", () => {
+        const v = classifyPersonToPersonPayment(
+            "PREAUTHORIZED ACH DEBIT PAYMENT    VENMO JUSTIN ADKINS 1052320032752 WEB",
+            ROSTER,
+        );
+        assert.equal(v.disposition, "owner_draw");
+        assert.equal(v.matchedPerson, "Justin Adkins");
+    });
+
+    await t.test("an unknown payee is NEVER auto-decided", () => {
+        // The live Madison Wilke charge. Justin says it's a draw THIS time,
+        // but the same shape could be a housekeeper (payroll advance) — so
+        // the machine must ask rather than guess.
+        const v = classifyPersonToPersonPayment(
+            "MISCELLANEOUS DEBIT CASH APP*MADISON WILKE Oakland       CA C#4297 DBT CRD 1257 08/15/26 46346016",
+            ROSTER,
+        );
+        assert.equal(v.disposition, "needs_human");
+        assert.equal(v.payeeName, "MADISON WILKE");
+        assert.match(v.reason, /not in ProBuild/);
+    });
+
+    await t.test("a non-p2p descriptor is left alone", () => {
+        const v = classifyPersonToPersonPayment(
+            "MISCELLANEOUS DEBIT LOWE S #1632 LOWE S 1632 POS DEB 1106 C#6098",
+            ROSTER,
+        );
+        assert.equal(v.disposition, "not_p2p");
+    });
+
+    await t.test("a single shared first name is not a match", () => {
+        // The roster has two Justin Adkins records and other first-name
+        // collisions; one token must never be enough to book payroll.
+        const v = classifyPersonToPersonPayment(
+            "MISCELLANEOUS DEBIT CASH APP*JUSTIN SOMEONEELSE Oakland CA C#4297",
+            ROSTER,
+        );
+        assert.equal(v.disposition, "needs_human");
+    });
+});
+
+test("extractP2PPayee lifts the name out of the rail metadata", async t => {
+    await t.test("Cash App with city/state trailing", () => {
+        assert.equal(
+            extractP2PPayee("MISCELLANEOUS DEBIT CASH APP*MADISON WILKE Oakland       CA C#4297 DBT CRD 1257 08/15/26 46346016"),
+            "MADISON WILKE",
+        );
+    });
+    await t.test("Venmo with a long reference", () => {
+        assert.equal(
+            extractP2PPayee("PREAUTHORIZED ACH DEBIT PAYMENT    VENMO JUSTIN ADKINS 1052320032752 WEB"),
+            "JUSTIN ADKINS",
+        );
+    });
+    await t.test("returns null when the rail is absent", () => {
+        assert.equal(extractP2PPayee("MISCELLANEOUS DEBIT LOWE S #1632"), null);
+    });
 });
