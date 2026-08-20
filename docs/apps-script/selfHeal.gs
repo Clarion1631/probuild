@@ -99,8 +99,17 @@ function outageVictims_(folder) {
 
     // Never touch a file the bot judged correctly.
     if (st.nonReceipt || st.duplicateOf || st.amazonAppOwned || st.emailed) continue;
-    // Only parked files are candidates.
-    if (!st.parkReason) continue;
+    // ONLY outage victims. A file parked for zeroTotal or multiDoc was judged
+    // on its CONTENT - requeueing replays the same verdict and burns the bounded
+    // retry budget for nothing. (Kimi SHOULD-FIX: the first version requeued
+    // every parked file, so a $0.00 receipt ate both auto-requeues re-deciding
+    // what was already decided.)
+    if (st.parkReason !== PARK_AI_UNAVAILABLE && st.parkReason !== PARK_GAVE_UP) continue;
+
+    // A gaveUp park is only an outage victim if NOTHING decisive was ever learned.
+    // If the AI truly read it and failed, a healthy API changes nothing - a human
+    // must look.
+    if (st.parkReason === PARK_GAVE_UP && Number(st.busyPasses || 0) === 0) continue;
     // Bound the loop.
     if (Number(st.autoRequeues || 0) >= SELFHEAL_MAX_REQUEUES_PER_FILE) continue;
 
@@ -235,6 +244,36 @@ function pipelineDailyReport() {
     "\n\nRun auditNeedsReview() for a file-by-file verdict.");
 }
 
+/**
+ * Send to Telegram as well as email.
+ *
+ * Kimi's sharpest finding: the whole 9-day outage happened because the ONLY
+ * signal was mail to ALERT_EMAIL, an inbox nobody watches. Alerting to that
+ * same inbox fixes nothing. Telegram is what Justin actually reads.
+ * Credentials live in Script Properties (TELEGRAM_BOT_TOKEN /
+ * TELEGRAM_CHAT_ID) - never in code. Skipped silently if unset, and a
+ * Telegram failure never blocks the email.
+ */
+function telegramAlert_(text) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const token = props.getProperty("TELEGRAM_BOT_TOKEN");
+    const chat  = props.getProperty("TELEGRAM_CHAT_ID");
+    if (!token || !chat) return false;
+    const res = UrlFetchApp.fetch(
+      "https://api.telegram.org/bot" + token + "/sendMessage", {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify({ chat_id: chat, text: text.slice(0, 3900) }),
+        muteHttpExceptions: true
+      });
+    return res.getResponseCode() === 200;
+  } catch (e) {
+    Logger.log("[SELFHEAL] telegram failed: " + e);
+    return false;
+  }
+}
+
 /** One alert channel, rate-limited so a broken pipeline cannot spam. */
 function selfHealAlert_(subject, body) {
   const props = PropertiesService.getScriptProperties();
@@ -247,6 +286,8 @@ function selfHealAlert_(subject, body) {
     }
   }
   props.setProperty(SELFHEAL_PROP_LAST_ALERT, new Date().toISOString());
+  // Telegram FIRST - it is the channel that gets read.
+  telegramAlert_(subject + "\n\n" + body);
   try { MailApp.sendEmail(ALERT_EMAIL, subject, body); }
   catch (e) { Logger.log("[SELFHEAL] alert email failed: " + e); }
 }

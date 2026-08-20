@@ -103,10 +103,7 @@ const QBO_OK_MIMES = ["application/pdf", "image/jpeg", "image/png"];
 
 // The Gemini key comes from geminiApiKey_() in Config.gs, which reads Script Properties.
 // Models are tried IN ORDER — if one is overloaded (HTTP 503) or rate-limited (429),
-// the read falls through to the next, so one busy model never sinks the run. 2.5-pro
-// / 2.5-flash are GA and far more stable than the just-released 3.x models; pro leads
-// for accuracy on faded thermal receipts. (NOTE: "gemini-3.5-pro" is NOT a valid id on
-// this key — only "gemini-3.5-flash" exists, and it 503s under load.)
+// the read falls through to the next, so one busy model never sinks the run.
 // Chain verified live 2026-08-19 against a real receipt. The previous chain
 // ["gemini-2.5-pro","gemini-2.5-flash"] died ENTIRELY on 08-10: 2.5-pro was
 // RETIRED (404) while the project was simultaneously blocked (403), so nine
@@ -467,8 +464,22 @@ function processSingleFile(file, ctx, archive, needsReview) {
       var nrDateRaw = normalizeDateStr(aiData && aiData.date);
       var nrDate = isValidDate(nrDateRaw) ? nrDateRaw : driveDateStr(file);
       var nrAmount = cleanMoney(aiData && aiData.total_amount);
-      if (!state.dedupWeakOwned && isValidDate(nrDate)) {
-        var nrKey = dedupPropKey(makeWeakDedupKey(nrVendor, nrDate, nrAmount));
+      // Only claim when the identity is REAL. A null/garbage vendor or a 0.00
+      // amount collapses every unreadable non-receipt onto ONE key, so the second
+      // payroll screenshot of the day gets silently swallowed as a duplicate of an
+      // unrelated one. Better to alert twice than to lose a document. (Kimi.)
+      var nrIdentityUsable = isValidDate(nrDate) &&
+                             nrVendor !== "Unknown" && nrVendor.length > 2 &&
+                             nrAmount && nrAmount !== "0.00";
+      if (!state.dedupWeakOwned && nrIdentityUsable) {
+        // NAMESPACED so a non-receipt can never block a real purchase.
+        // (Kimi BLOCKER: the first version claimed the ordinary weak key
+        // vendor|date|amount. A payroll advance to Charles Havens for $973.25
+        // on 08-19 would then permanently quarantine a genuine receipt sharing
+        // those three values - and because this branch never calls
+        // releaseDedupClaims_, the block is FOREVER. A silently unbooked expense
+        // is far worse than the duplicate email this fix set out to stop.)
+        var nrKey = dedupPropKey("nonreceipt|" + makeWeakDedupKey(nrVendor, nrDate, nrAmount));
         state.dedupWeakPk = nrKey; // persist BEFORE claiming so a crash cannot orphan it
         setState(file, state);
         var nrOwner = claimDedupKey(nrKey, file.getId(), nrAmount);
@@ -1388,7 +1399,15 @@ function analyzeMultiPageMapWithGemini(file) {
         }
         if (code === 429 || code === 503) { Utilities.sleep(Math.pow(2, a + 1) * 1000); continue; }
         if (code === 404) break; // model id not on this key -> next model
-        return null;             // 400/403/... -> fatal
+        // 401/403 = auth/project blocked. SERVICE failure, not this document's
+        // fault - fall through to the next model, exactly like the main
+        // classifier. (Kimi SHOULD-FIX: this path still treated 403 as fatal, so
+        // during the billing outage a multi-page PDF would have been parked as
+        // unsplittable while single-page reads were correctly retried. Two
+        // classifiers disagreeing about one HTTP code is how the original bug
+        // survived review.)
+        if (code === 401 || code === 403) break;
+        return null;             // 400 (oversized/undecodable payload) -> fatal
       } catch (e) { Utilities.sleep(2000); }
     }
     Logger.log(" > [SPLIT-MAP] " + model + " unavailable; trying next model.");
