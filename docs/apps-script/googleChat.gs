@@ -165,3 +165,117 @@ function checkChatSetup() {
   Logger.log(CHAT_WEBHOOK_PROP + ": set (space " + (m ? m[1] : "?") + ")");
   return true;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * DIRECT MESSAGES — a different mechanism from webhooks. Read this.
+ *
+ * You CANNOT webhook a DM. An incoming webhook is registered inside a
+ * specific space through that space's own UI, so there is no way to create
+ * one for a 1:1 conversation with another person. Every "just make a webhook
+ * to DM someone" attempt dead-ends here.
+ *
+ * The real path is the Chat API with USER auth:
+ *   1. spaces.findDirectMessage?name=users/<email>  -> the DM space id
+ *   2. spaces.messages.create on that space
+ *
+ * Both run as the signed-in Apps Script user, so the message genuinely comes
+ * from that person's account. Requires chat.spaces.readonly + chat.messages
+ * in appsscript.json, and the Chat API enabled on the script's Cloud project.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Find the 1:1 DM space between the running user and someone else.
+ * Returns "spaces/XXXX" or null. Never throws.
+ */
+function chatFindDm(email) {
+  if (!email) { Logger.log("chatFindDm needs an email"); return null; }
+  try {
+    const res = UrlFetchApp.fetch(
+      "https://chat.googleapis.com/v1/spaces:findDirectMessage?name=" +
+      encodeURIComponent("users/" + email), {
+        method: "get",
+        headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+        muteHttpExceptions: true
+      });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    if (code !== 200) {
+      Logger.log("[CHAT] findDirectMessage HTTP " + code);
+      Logger.log(body.slice(0, 400));
+      if (code === 403) {
+        Logger.log("");
+        Logger.log("403 means one of two things, and the error does not say which:");
+        Logger.log("  a) the chat.spaces.readonly scope is missing -> re-authorize");
+        Logger.log("  b) the Chat API is not enabled on this script's Cloud project");
+        Logger.log("     -> Project Settings -> Google Cloud Platform project, then");
+        Logger.log("        enable 'Google Chat API' in that project.");
+      }
+      if (code === 404) {
+        Logger.log("No DM exists yet. Open Chat and send this person one message");
+        Logger.log("by hand, then this will find it.");
+      }
+      return null;
+    }
+    const space = JSON.parse(body);
+    Logger.log("DM space with " + email + ": " + space.name);
+    return space.name;
+  } catch (e) {
+    Logger.log("[CHAT] findDirectMessage failed: " + e);
+    return null;
+  }
+}
+
+/**
+ * Send a direct message to one person, as the running user.
+ * Returns true on success.
+ */
+function chatSendDm(email, text) {
+  const space = chatFindDm(email);
+  if (!space) return false;
+  return chatPostMessage(space, text);
+}
+
+/**
+ * THE ONE TO RUN: DM Marge the receipt-process update.
+ *
+ * Everything is baked in so this is a single click. The message is written to
+ * be openly AI-attributed — Justin asked for that explicitly ("let her know
+ * it's AI that's saying it"), and it matters: a process change that lands
+ * without a named author reads as a decree from nowhere.
+ */
+function dmMargeReceiptUpdate() {
+  const MARGE = "gtrsupport@goldentouchremodeling.com";
+
+  const msg =
+"*Hey Marge — this is Justin's AI, writing on his behalf.* He asked me to let you know what changed with receipts.\n" +
+"\n" +
+"You know how you've been hunting receipts one bank line at a time? Your Aug 14 note said you got through 08/04 and were stuck on four of them — checked Drive, checked Lowe's.com, checked email. That part is done now. The system does it.\n" +
+"\n" +
+"*What runs on its own*\n" +
+"A receipt shows up — email, photo, or dropped in a job folder. It gets read, named Job_Date_Vendor_Invoice_$Amount, checked against everything already filed, then sent to QuickBooks and archived. *14 receipts filed in the last two days with nobody touching them.*\n" +
+"\n" +
+"*What it now refuses to do*\n" +
+"• Book a Cash App payment or payroll advance as an expense — those get held and flagged for Gusto\n" +
+"• Book an Amazon order twice — Intuit's own app owns those now\n" +
+"• Book the same charge twice\n" +
+"\n" +
+"*What broke before and doesn't now*\n" +
+"The reader died for nine days in August. Receipts quietly gave up, and the only sign was email piling up. It now retries on its own and sends a text if it can't. Ten minutes is the longest a failure can go unnoticed.\n" +
+"\n" +
+"*What still needs you*\n" +
+"• The items sitting in _Needs Review — that's real judgment work\n" +
+"• Missing receipt memos — only a person can write and sign those\n" +
+"• Assigning jobs inside QuickBooks — still manual\n" +
+"\n" +
+"*What you can stop doing*\n" +
+"Working the bank line by line looking for receipts. What's left in _Needs Review is the actual work now.\n" +
+"\n" +
+"One honest note: this is intake through QuickBooks, not the whole receipt problem. The duplicate groups you found in your audit still need reconciling, and job assignment in QBO is still by hand.\n" +
+"\n" +
+"— Justin's AI";
+
+  const ok = chatSendDm(MARGE, msg);
+  Logger.log(ok ? "Sent to " + MARGE + " — check Chat."
+                : "FAILED. Read the log above; it names the cause.");
+  return ok;
+}
