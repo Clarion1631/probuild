@@ -286,6 +286,13 @@ function selfHealAlert_(subject, body) {
     }
   }
   props.setProperty(SELFHEAL_PROP_LAST_ALERT, new Date().toISOString());
+  // Fan out to every channel that is actually watched. Each is
+  // independent: one failing must never suppress the others, and none
+  // of them may throw - a broken alert path cannot break the pipeline.
+  // Google Chat is where the OFFICE sees it (Marge); Telegram is where
+  // Justin sees it; email is the archive of record.
+  try { postToChatWebhook_(subject + "\n\n" + body, { threadKey: "receipt-bot" }); }
+  catch (e) { Logger.log("[SELFHEAL] chat alert failed: " + e); }
   // Telegram FIRST - it is the channel that gets read.
   telegramAlert_(subject + "\n\n" + body);
   try { MailApp.sendEmail(ALERT_EMAIL, subject, body); }
