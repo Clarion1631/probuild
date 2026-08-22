@@ -2865,6 +2865,17 @@ model BankImage {
   /// ledger movement.
   amountCents           Int?
 
+  /// Check-payer extraction (scripts/extract-check-payers.mjs, applied via
+  /// scripts/apply-check-payer-extraction.mjs). payerName = who wrote the
+  /// check (top-left block); memoText = the memo/"for" line. The MICR line /
+  /// routing / account numbers are NEVER extracted or stored — banned in the
+  /// prompt and scrubbed in code. extractedAt+extractionModel are stamped
+  /// together (CHECK BankImage_extraction_pair) and make replays a no-op.
+  payerName       String?
+  memoText        String?
+  extractedAt     DateTime? @db.Timestamptz(6)
+  extractionModel String?
+
   createdAt DateTime @default(now()) @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(6)
 
