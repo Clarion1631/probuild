@@ -11,8 +11,14 @@
 // The MICR line / routing number / account number are NEVER extracted,
 // NEVER stored, NEVER printed. This is enforced twice:
 //   1. The prompt forbids reading the bottom MICR strip at all.
-//   2. scrubExtraction() drops ANY field containing an 8+ consecutive-digit
-//      run that is not the known check number or amount, and logs a warning.
+//   2. scrubExtraction() drops ANY field whose digit content — after
+//      collapsing EVERY common separator (space dash dot slash comma parens)
+//      AND interleaved letters — totals 8 or more digits and is not the known
+//      check number or amount, and logs a warning. Recognizable calendar
+//      dates (ISO 2026-08-13 / US 8/13/2026) are exempted before counting.
+// A field dropped by layer 2 also flips needsReview: --commit then stores
+// NULL for payerName AND memoText on that row (extractedAt/extractionModel
+// still set so replay skips it) and logs the row for human review.
 // Do not weaken either layer. Do not add columns for these values.
 // ─────────────────────────────────────────────────────────────────────────
 //
@@ -58,45 +64,80 @@ export function resolveEnv(name) {
 // ── MICR / routing / account guard ───────────────────────────────────────
 // Routing numbers are 9 digits; account numbers 8-12+. A check number is
 // short (typically 3-5 digits) and the amount's digit string is 3-7. So any
-// 8+ consecutive-digit run that isn't an explicitly allowed value is treated
-// as banked-number leakage and the WHOLE field is dropped.
-export const BANNED_DIGIT_RUN = /\d{8,}/g;
+// candidate run whose TOTAL digit count reaches 8 — after stripping every
+// common separator (space, dash, dot, slash, comma, parens) AND interleaved
+// letters — is treated as banked-number leakage unless the digit string is
+// explicitly allowed, and the WHOLE field is dropped. Consecutive-run-only
+// checks are NOT enough: "1234 5678", "123.456.789", "123/456/789" and
+// "A1B2C3D4E5F6G7H8" all hide an account/routing number without ever showing
+// 8 consecutive digits.
+export const BANNED_DIGIT_RUN = /\d{8,}/g; // kept for reference/compat; superseded by the total-count rule below
+export const BANNED_TOTAL_DIGITS = 8;
 const MICR_SYMBOLS = /[\u2446\u2447\u2448\u2449]/; // ⑆⑇⑈⑉ MICR transit/on-us glyphs
 
+// Plausible calendar dates are exempt from digit counting (an ISO date is 8
+// digits and must survive). Month/day ranges are validated so an account
+// disguised as "12/34/5678" does NOT qualify.
+const ISO_DATE = /\b(?:19|20)\d{2}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])\b/g;
+const US_DATE = /\b(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-](?:19|20)?\d{2}\b/g;
+
+// A candidate token run: maximal chunk of letters/digits joined by the
+// common separators. Letters are included so "A1B2C3D4E5F6G7H8" is one run.
+const TOKEN_RUN = /[0-9A-Za-z][0-9A-Za-z\s\-./,()]*/g;
+
 /**
- * Pure. Returns { value, dropped } — dropped is a reason string when the
- * field was discarded. `allow` lists digit strings that are legitimately
- * long (never expected in practice, but the check number is allowed on
- * principle: it is already stored openly on the row).
+ * Pure. Returns { value, dropped, truncated } — dropped is a reason string
+ * when the field was discarded; truncated is true when maxLen was applied.
+ * `allow` lists digit strings that are legitimately long (never expected in
+ * practice, but the check number is allowed on principle: it is already
+ * stored openly on the row). The allow check runs on the SEPARATOR-STRIPPED
+ * digit string, so an allowed "12345678" also covers "1234 5678".
+ *
+ * @param {unknown} value
+ * @param {string[]} [allow]
+ * @param {number | null} [maxLen]
  */
-export function scrubField(value, allow = []) {
-    if (value === null || value === undefined) return { value: null, dropped: null };
+export function scrubField(value, allow = [], maxLen = null) {
+    if (value === null || value === undefined) return { value: null, dropped: null, truncated: false };
     const text = String(value).trim();
-    if (!text) return { value: null, dropped: null };
+    if (!text) return { value: null, dropped: null, truncated: false };
     if (MICR_SYMBOLS.test(text)) {
-        return { value: null, dropped: "contains MICR symbols" };
+        return { value: null, dropped: "contains MICR symbols", truncated: false };
     }
-    // Collapse separators so "1234 5678 9012" or "1234-5678-90" is seen as
-    // one run. The collapsed threshold is 9+ (routing numbers are 9): an ISO
-    // date like 2026-08-13 collapses to exactly 8 digits and must survive,
-    // while a genuinely consecutive 8-digit account is still caught by the
-    // raw-text 8+ check above.
-    const collapsed = text.replace(/[\s-]+/g, "");
-    const runs = [...new Set([
-        ...(text.match(BANNED_DIGIT_RUN) ?? []),
-        ...(collapsed.match(/\d{9,}/g) ?? []),
-    ])];
-    const banned = runs.filter(run => !allow.includes(run));
+    // Blank out plausible calendar dates, then count TOTAL digits per token
+    // run after stripping ALL non-digits (separators and letters alike).
+    const dateless = text.replace(ISO_DATE, " ").replace(US_DATE, " ");
+    const banned = (dateless.match(TOKEN_RUN) ?? [])
+        .map(run => run.replace(/\D/g, ""))
+        .filter(digits => digits.length >= BANNED_TOTAL_DIGITS && !allow.includes(digits));
     if (banned.length) {
-        return { value: null, dropped: `contains ${banned.length} banned digit run(s) (routing/account pattern)` };
+        return {
+            value: null,
+            dropped: `contains ${banned.length} banned digit run(s) (routing/account pattern)`,
+            truncated: false,
+        };
     }
-    return { value: text, dropped: null };
+    if (maxLen !== null && text.length > maxLen) {
+        return { value: text.slice(0, maxLen).trimEnd(), dropped: null, truncated: true };
+    }
+    return { value: text, dropped: null, truncated: false };
 }
+
+export const PAYER_NAME_MAX = 120;
+export const MEMO_TEXT_MAX = 200;
 
 /**
  * Pure. Scrubs a raw Gemini response into the ONLY values we keep:
  * payerName and memoText. Everything else (date, amount, check number) is
  * used for cross-check logging only and is never stored by this script.
+ *
+ * Length caps: payerName 120 chars, memoText 200 chars — anything longer is
+ * truncated and flagged (a real name/memo line never approaches these; an
+ * overrun means the model transcribed something it shouldn't have).
+ *
+ * needsReview is true when ANY field was dropped or truncated: the caller
+ * must then store NULL for payerName/memoText and log for human review
+ * instead of trusting the surviving values.
  *
  * @param {Record<string, unknown> | null | undefined} raw
  * @param {{ checkNumber?: string | null, amountCents?: number | null }} [opts]
@@ -107,21 +148,29 @@ export function scrubExtraction(raw, { checkNumber = null, amountCents = null } 
     if (amountCents !== null && amountCents !== undefined) allow.push(String(amountCents));
 
     const warnings = [];
-    const take = (field) => {
-        const { value, dropped } = scrubField(raw?.[field], allow);
-        if (dropped) warnings.push(`${field} DROPPED: ${dropped}`);
+    let needsReview = false;
+    const take = (field, maxLen = null) => {
+        const { value, dropped, truncated } = scrubField(raw?.[field], allow, maxLen);
+        if (dropped) {
+            warnings.push(`${field} DROPPED: ${dropped}`);
+            needsReview = true;
+        }
+        if (truncated) {
+            warnings.push(`${field} TRUNCATED to ${maxLen} chars`);
+            needsReview = true;
+        }
         return value;
     };
 
-    const payerName = take("payerName");
-    const memoText = take("memoText");
+    const payerName = take("payerName", PAYER_NAME_MAX);
+    const memoText = take("memoText", MEMO_TEXT_MAX);
     // Cross-check-only fields go through the same guard so a leaked account
     // number can never even reach a console.log.
     const documentDate = take("documentDate");
     const amount = take("amount");
     const checkNo = take("checkNumber");
 
-    return { payerName, memoText, documentDate, amount, checkNumber: checkNo, warnings };
+    return { payerName, memoText, documentDate, amount, checkNumber: checkNo, warnings, needsReview };
 }
 
 // ── Gemini Vision (repo's REST pattern, src/lib/actions.ts aiGeneratePunchlist) ──
@@ -139,6 +188,18 @@ Do NOT read, extract, transcribe, or output the MICR line: the row of numbers pr
 
 Return ONLY a JSON object, nothing else:
 {"payerName": string|null, "documentDate": string|null, "amount": string|null, "memoText": string|null, "checkNumber": string|null}`;
+
+/**
+ * Pure. Parse a model response as JSON, tolerating a ```json ... ``` (or
+ * bare ```) fence wrapper — models sometimes emit fences even with
+ * responseMimeType: application/json.
+ */
+export function parseModelJson(rawText) {
+    let text = String(rawText ?? "").trim();
+    const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/i);
+    if (fenced) text = fenced[1].trim();
+    return JSON.parse(text);
+}
 
 export async function extractViaGemini(apiKey, imageBytes, mime) {
     const res = await fetch(
@@ -161,7 +222,7 @@ export async function extractViaGemini(apiKey, imageBytes, mime) {
     const data = await res.json();
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawText) throw new Error("No AI response");
-    return JSON.parse(rawText);
+    return parseModelJson(rawText);
 }
 
 // ── fuzzy matching for the REVIEW REPORT ─────────────────────────────────
@@ -406,13 +467,23 @@ async function main() {
                 console.warn(`    NOTE: image check# ${scrubbed.checkNumber} != row check# ${row.normalizedCheckNumber}`);
             }
 
-            results.push({ ...row, payerName: scrubbed.payerName, memoText: scrubbed.memoText });
+            results.push({ ...row, payerName: scrubbed.payerName, memoText: scrubbed.memoText, needsReview: scrubbed.needsReview });
 
             if (commit) {
+                // needsReview rows store NULL for BOTH kept fields: a scrub
+                // warning means the extraction is suspect (dropped digit run,
+                // truncated overrun), so nothing from it is trusted. The row
+                // is still stamped extractedAt/extractionModel so replay
+                // skips it; a human re-reads the image instead.
+                const storePayer = scrubbed.needsReview ? null : scrubbed.payerName;
+                const storeMemo = scrubbed.needsReview ? null : scrubbed.memoText;
+                if (scrubbed.needsReview) {
+                    console.warn(`    NEEDS REVIEW ${row.sourceExternalId}: stored NULL payer/memo — a human must read this image (file: ${row.fileName})`);
+                }
                 await prisma.$executeRaw`
                     UPDATE "BankImage"
-                    SET "payerName" = ${scrubbed.payerName},
-                        "memoText" = ${scrubbed.memoText},
+                    SET "payerName" = ${storePayer},
+                        "memoText" = ${storeMemo},
                         "extractedAt" = now(),
                         "extractionModel" = ${GEMINI_MODEL},
                         "updatedAt" = now()
