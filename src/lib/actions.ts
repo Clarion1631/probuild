@@ -14739,3 +14739,55 @@ export async function deletePermit(permitId: string) {
     revalidatePath(`/projects/${target.projectId}/permits`);
     return { success: true };
 }
+
+// ── Bank image match confirmation (Automation "Check images" panel) ─────────
+
+/**
+ * The ONE writer of BankImageMatch. A row in that table means a HUMAN said
+ * "this image explains this bank line" (prisma/schema.prisma) — the matchers
+ * (lib/bank-image.ts, lib/check-payer-match.ts, the extract script's
+ * --report) only ever suggest. Gated on financialReports like the Automation
+ * page itself: internal roles only, never a portal role (portal sessions
+ * carry no staff user, so assertActiveStaff already rejects them).
+ *
+ * bankImageId is @unique on BankImageMatch, so a second confirm for the same
+ * image loses the P2002 race honestly instead of double-writing.
+ */
+export async function confirmBankImageMatch(input: {
+    bankImageId: string;
+    bankLineId: string;
+    note?: string | null;
+}): Promise<{ success: true } | { success: false; error: string }> {
+    const user = await assertFinancialPermission();
+
+    const bankImageId = (input.bankImageId ?? "").trim();
+    const bankLineId = (input.bankLineId ?? "").trim();
+    if (!bankImageId || !bankLineId) {
+        return { success: false, error: "Missing image or bank line id" };
+    }
+    // The note is display/audit text from our own proposal reason — cap it so
+    // a mangled payload can't stuff arbitrary blobs into the audit trail.
+    const note = (input.note ?? "").trim().slice(0, 500) || null;
+
+    const [image, line] = await Promise.all([
+        prisma.bankImage.findUnique({ where: { id: bankImageId }, select: { id: true, sourceExternalId: true } }),
+        prisma.bankLine.findUnique({ where: { id: bankLineId }, select: { id: true } }),
+    ]);
+    if (!image) return { success: false, error: "That image no longer exists" };
+    if (!line) return { success: false, error: "That bank line no longer exists" };
+
+    const confirmedBy = user.email ?? user.name ?? "staff";
+    try {
+        await prisma.bankImageMatch.create({
+            data: { bankImageId, bankLineId, confirmedBy, note },
+        });
+    } catch (e: any) {
+        if (e?.code === "P2002") {
+            return { success: false, error: "This image is already confirmed — refresh the page" };
+        }
+        throw e;
+    }
+
+    revalidatePath("/automation");
+    return { success: true };
+}

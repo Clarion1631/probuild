@@ -13,6 +13,7 @@ import DocumentComments from "@/components/DocumentComments";
 import { toast } from "sonner";
 import { formatCurrency } from "@/lib/utils";
 import { formatMoneyDate } from "@/lib/payment-date";
+import type { CheckEvidence } from "@/lib/check-evidence";
 
 const METHOD_LABELS: Record<string, string> = {
     card: "Card",
@@ -30,7 +31,7 @@ function formatPaymentMethod(method: string | null | undefined, ref: string | nu
     return label;
 }
 
-export default function InvoiceEditor({ project, initialInvoice }: { project: any, initialInvoice: any }) {
+export default function InvoiceEditor({ project, initialInvoice, checkEvidence = {} }: { project: any, initialInvoice: any, checkEvidence?: Record<string, CheckEvidence> }) {
     const router = useRouter();
     const [isIssuing, setIsIssuing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
@@ -789,6 +790,7 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                 {initialInvoice.payments?.map((payment: any) => {
                                     const isPastDue = payment.dueDate && new Date(payment.dueDate) < new Date() && payment.status !== "Paid";
                                     const methodLabel = formatPaymentMethod(payment.paymentMethod, payment.referenceNumber);
+                                    const evidence = payment.status === "Paid" ? checkEvidence[payment.id] : undefined;
                                     const receiptSentLabel = payment.receiptSentAt
                                         ? `Last sent ${new Date(payment.receiptSentAt).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
                                         : undefined;
@@ -836,6 +838,24 @@ export default function InvoiceEditor({ project, initialInvoice }: { project: an
                                                         <div>{payment.name}</div>
                                                         {payment.status === 'Paid' && methodLabel && (
                                                             <div className="text-[11px] text-hui-textMuted font-normal mt-0.5">{methodLabel}</div>
+                                                        )}
+                                                        {evidence && (
+                                                            <div className="text-[11px] text-hui-textMuted font-normal mt-0.5" title={`Confirmed by ${evidence.confirmedBy}`}>
+                                                                Paid by {evidence.payerName ?? "(payer not readable on image)"}, chk#{evidence.checkNumber}
+                                                                {evidence.driveFileId && (
+                                                                    <>
+                                                                        {" · "}
+                                                                        <a
+                                                                            href={`https://drive.google.com/file/d/${encodeURIComponent(evidence.driveFileId)}/view`}
+                                                                            target="_blank"
+                                                                            rel="noopener noreferrer"
+                                                                            className="font-medium text-hui-primary hover:underline"
+                                                                        >
+                                                                            check image ↗
+                                                                        </a>
+                                                                    </>
+                                                                )}
+                                                            </div>
                                                         )}
                                                         {payment.status !== 'Paid' && sentLabel && (
                                                             <div className="text-[11px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-1">

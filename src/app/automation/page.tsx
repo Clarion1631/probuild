@@ -48,6 +48,8 @@ import { LinksCell } from "./components/register/links-cell";
 import { RowDrilldown } from "./components/register/row-drilldown";
 import { matchReceiptJourney, type ReceiptJourneyMatch, type ReceiptJourneyIndex } from "./components/register/match-receipt-journey";
 import { toSerializedJourney } from "./components/register/serialize-journey";
+import { fetchCheckImagePanelData, type CheckImagePanelRow } from "./check-images-data";
+import { CheckImagesPanel } from "./components/check-images-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -443,6 +445,28 @@ export default async function AutomationPage(props: {
         console.error("pipeline health inputs failed", error instanceof Error ? error.message : "UnknownError");
         pipelineHealthUnavailable = true;
     }
+
+    // Check images panel (check-payer pipeline worklist) — independent of the
+    // register/merge/pipeline-health fetches above, so it fails alone: an
+    // error here degrades to an honest "unavailable" card, never the page.
+    let checkImagesUnavailable = false;
+    let checkImageRows: CheckImagePanelRow[] = [];
+    let checkImageTotal = 0;
+    try {
+        const checkImages = await withTimeout(fetchCheckImagePanelData(), 15_000);
+        checkImageRows = checkImages.rows;
+        checkImageTotal = checkImages.totalImages;
+    } catch (error) {
+        console.error("check image panel fetch failed", error instanceof Error ? error.message : "UnknownError");
+        checkImagesUnavailable = true;
+    }
+    const checkImagesSection: ReactNode = checkImagesUnavailable ? (
+        <div className="hui-card p-5 text-sm text-hui-textMuted">
+            Check images unavailable right now — the register above is still current.
+        </div>
+    ) : (
+        <CheckImagesPanel rows={checkImageRows} totalImages={checkImageTotal} />
+    );
     const minutesSaved = summary.pushedThisMonth * 4;
     const hoursSavedRaw = Math.round((minutesSaved / 60) * 2) / 2;
     const hoursSavedLabel = Number.isInteger(hoursSavedRaw) ? String(hoursSavedRaw) : hoursSavedRaw.toFixed(1);
@@ -697,6 +721,9 @@ export default async function AutomationPage(props: {
 
             {/* Orphan receipts */}
             {orphanSection}
+
+            {/* Check images — check-payer pipeline worklist (human confirm) */}
+            {checkImagesSection}
 
             {/* Receipt pipeline — journey list, Verify in QuickBooks + AI review (plan §3) */}
             {journeySection}
