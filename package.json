@@ -11,6 +11,7 @@
     "lint": "eslint",
     "test:e2e": "playwright test",
     "test:qa": "npx playwright test e2e/quality-gate.spec.ts",
+    "test:cost-code-resolver": "tsx scripts/test-cost-code-resolver.ts",
     "assets:download": "tsx scripts/download-assets.ts",
     "assets:download:dry": "tsx scripts/download-assets.ts --dry-run",
     "download-hdri": "tsx scripts/download-hdri.ts",

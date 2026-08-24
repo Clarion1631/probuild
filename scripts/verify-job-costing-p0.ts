@@ -11,7 +11,7 @@
  * Run: npx tsx scripts/verify-job-costing-p0.ts
  */
 import { prisma } from "@/lib/prisma";
-import { resolveCostCode } from "@/lib/cost-coding";
+import { resolveCostCode } from "@/lib/cost-code-resolver";
 import { computeLaborCost, roundMoney } from "@/lib/labor-cost";
 import { notifyReview } from "@/lib/notify";
 

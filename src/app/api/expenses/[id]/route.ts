@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { EXPENSE_REVIEWER_ROLES, resolveCostCode } from "@/lib/cost-coding";
+import { EXPENSE_REVIEWER_ROLES } from "@/lib/cost-coding";
+import { resolveCostCode } from "@/lib/cost-code-resolver";
 
 /**
  * Editing/deleting an expense is a reviewer action (Expense has no submitter field, so it

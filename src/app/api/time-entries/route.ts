@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
-import { resolveCostCode } from "@/lib/cost-coding";
+import { resolveCostCode } from "@/lib/cost-code-resolver";
 import { computeLaborCost } from "@/lib/labor-cost";
 import { notifyReview } from "@/lib/notify";
 

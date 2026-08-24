@@ -5,7 +5,7 @@ import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
 import { getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
-import { resolveCostCode } from "@/lib/cost-coding";
+import { resolveCostCode } from "@/lib/cost-code-resolver";
 
 // ─── Time Entry Actions ────────────────────────────────────────
 

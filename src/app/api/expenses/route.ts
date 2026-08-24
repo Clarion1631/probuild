@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, userCanAccessProject } from "@/lib/mobile-auth";
-import { resolveCostCode } from "@/lib/cost-coding";
+import { resolveCostCode } from "@/lib/cost-code-resolver";
 import { notifyReview } from "@/lib/notify";
 
 // Hybrid auth (web + mobile). Accepts EITHER `estimateId` (web flow — caller already
