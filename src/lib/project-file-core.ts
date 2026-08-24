@@ -28,6 +28,16 @@ export type UploadProjectFileInput = {
     actor: McpActorContext;
 };
 
+// Server-side sources (for example Google Drive) must use this path instead of
+// serializing bytes back through an MCP tool. It deliberately shares target,
+// folder, visibility, Storage, ProjectFile, and activity behavior with the
+// base64 connector path below.
+export type UploadProjectFileBufferInput = Omit<UploadProjectFileInput, "contentBase64"> & {
+    buffer: Buffer;
+    activityAction?: string;
+    activityMetadata?: Record<string, unknown>;
+};
+
 export type UploadProjectFileSuccess = {
     fileId: string;
     name: string;
@@ -170,6 +180,10 @@ async function resolveTarget(projectId?: string, leadId?: string): Promise<Resol
     };
 }
 
+export async function validateProjectFileTarget(projectId?: string, leadId?: string): Promise<void> {
+    await resolveTarget(projectId, leadId);
+}
+
 async function ensureProjectScaffoldIfEmpty(projectId: string): Promise<void> {
     const folderCount = await prisma.fileFolder.count({
         where: { projectId, parentId: null },
@@ -235,10 +249,33 @@ export async function uploadProjectFileCore(
     input: UploadProjectFileInput,
     dependencies: UploadDependencies = {},
 ): Promise<UploadProjectFileResult> {
+    try {
+        validateFileExtension(input.fileName);
+    } catch (error) {
+        return { ok: false, error: (error as Error).message };
+    }
+    let validated: ValidatedUpload;
+    try {
+        validated = decodeUploadFile(input);
+    } catch (error) {
+        return { ok: false, error: (error as Error).message };
+    }
+    return uploadProjectFileBufferCore({
+        ...input,
+        buffer: validated.buffer,
+    }, dependencies);
+}
+
+export async function uploadProjectFileBufferCore(
+    input: UploadProjectFileBufferInput,
+    dependencies: UploadDependencies = {},
+): Promise<UploadProjectFileResult> {
     if ((input.projectId ? 1 : 0) + (input.leadId ? 1 : 0) !== 1) {
         return { ok: false, error: invalidTargetError() };
     }
-
+    if (input.buffer.length === 0) {
+        return { ok: false, error: "File decoded to 0 bytes." };
+    }
     try {
         validateFileExtension(input.fileName);
     } catch (error) {
@@ -248,13 +285,6 @@ export async function uploadProjectFileCore(
     let target: ResolvedTarget;
     try {
         target = await resolveTarget(input.projectId, input.leadId);
-    } catch (error) {
-        return { ok: false, error: (error as Error).message };
-    }
-
-    let validated: ValidatedUpload;
-    try {
-        validated = decodeUploadFile(input);
     } catch (error) {
         return { ok: false, error: (error as Error).message };
     }
@@ -297,7 +327,7 @@ export async function uploadProjectFileCore(
 
     const save = dependencies.saveProjectFile ?? saveProjectFile;
     const saved = await save({
-        buffer: validated.buffer,
+        buffer: input.buffer,
         fileName: input.fileName,
         mimeType: mimeTypeForFileName(input.fileName),
         projectId: target.projectId,
@@ -307,13 +337,14 @@ export async function uploadProjectFileCore(
         uploadedById: input.actor.actorUserId,
         activity: {
             actorName: mcpActivityActorName(input.actor.actorLabel),
-            action: "uploaded_file",
+            action: input.activityAction ?? "uploaded_file",
             entityType: "project_file",
             entityName: input.fileName,
             metadata: {
                 folderId,
                 visibility: fileVisibility,
-                sizeBytes: validated.buffer.length,
+                sizeBytes: input.buffer.length,
+                ...input.activityMetadata,
             },
         },
     });

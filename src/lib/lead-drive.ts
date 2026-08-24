@@ -167,6 +167,42 @@ export async function getFileMeta(fileId: string): Promise<DriveFileMeta> {
     };
 }
 
+export class DriveFileTooLargeError extends Error {
+    constructor() {
+        super("Google Drive file exceeds the configured download limit.");
+    }
+}
+
+/**
+ * Downloads Drive bytes with the server-side OAuth client; never returns a URL.
+ * A caller-supplied ceiling aborts the stream before an oversized object is
+ * buffered in a serverless worker.
+ */
+export async function downloadDriveFile(fileId: string, options: { maxBytes?: number } = {}): Promise<Buffer> {
+    const drive = await driveClient();
+    const res = await drive.files.get(
+        { fileId, alt: "media" },
+        { responseType: "stream" },
+    );
+    const stream = res.data as unknown as AsyncIterable<Buffer | Uint8Array | string> & { destroy?: (error?: Error) => void };
+    if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
+        throw new Error("Drive download did not return a readable stream.");
+    }
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    for await (const chunk of stream) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += bytes.length;
+        if (options.maxBytes !== undefined && totalBytes > options.maxBytes) {
+            const error = new DriveFileTooLargeError();
+            stream.destroy?.(error);
+            throw error;
+        }
+        chunks.push(bytes);
+    }
+    return Buffer.concat(chunks, totalBytes);
+}
+
 const MIRROR_MAX_BYTES = 25 * 1024 * 1024;
 
 /**

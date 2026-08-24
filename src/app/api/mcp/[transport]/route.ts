@@ -17,6 +17,7 @@ import {
     uploadProjectFileCore,
     uploadProjectFilesCore,
 } from "@/lib/project-file-core";
+import { importGoogleDriveFileCore } from "@/lib/google-drive-import-core";
 import {
     MCP_ACTOR_EMAILS,
     mcpActivityActorName,
@@ -169,7 +170,7 @@ const WRITE_TOOLS = new Set([
     "send_milestone_invoice", "resend_invoice", "create_invoice_from_estimate",
     "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
     "create_lead", "log_time", "log_expense",
-    "upload_file", "upload_files", "create_folder", "move_file",
+    "upload_file", "upload_files", "import_google_drive_file", "create_folder", "move_file",
     "create_daily_log", "add_punch_items",
     "create_contract", "update_contract", "send_contract",
     "plan_schedule", "update_task_dates", "set_task_status", "assign_task_crew",
@@ -191,7 +192,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     apply_change_order_to_schedule: "change_order",
     create_lead: "lead",
     plan_schedule: "task", update_task_dates: "task", set_task_status: "task", assign_task_crew: "task",
-    upload_file: "file", upload_files: "file", read_file: "file", get_file_link: "file",
+    upload_file: "file", upload_files: "file", import_google_drive_file: "file", read_file: "file", get_file_link: "file",
     create_folder: "folder", move_file: "file",
     create_daily_log: "daily_log",
     add_punch_items: "punch_item",
@@ -1497,6 +1498,37 @@ function createHandler(actor: RouteMcpActor) {
         );
 
         server.registerTool(
+            "import_google_drive_file",
+            {
+                title: "Import an existing Google Drive file to a job's Files tab",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description:
+                    "Imports one existing Google Drive file using its bare Drive file ID. ProBuild downloads it server-side through its configured Drive OAuth connection and files it on the target project's or lead's Files tab — do NOT send a Drive URL or file bytes. " +
+                    "Google-native Docs/Sheets/Slides are not supported yet. Files up to 25 MiB are allowed. Files are INTERNAL by default; use visibility 'shared' only when the user explicitly asks to make it customer-visible.",
+                inputSchema: {
+                    projectId: z.string().max(50).optional().describe("Target project id from list_projects / find_job (omit if using leadId)"),
+                    leadId: z.string().max(50).optional().describe("Target lead id from list_leads / find_job (omit if using projectId)"),
+                    driveFileId: z.string().regex(/^[A-Za-z0-9_-]{10,200}$/).describe("Bare Google Drive file ID only (not a URL, path, or file name)"),
+                    folder: z.string().max(120).optional().describe("Optional top-level folder name on the job's Files tab, found case-insensitively or created"),
+                    visibility: z.enum(["team", "shared"]).optional().describe("'team' = internal only (default); 'shared' = the customer sees it in their portal"),
+                },
+            },
+            async args => {
+                const actorUserId = actor.actorLabel === "richard-ai"
+                    ? await actor.resolveActorUserId()
+                    : null;
+                const result = await importGoogleDriveFileCore({
+                    ...args,
+                    actor: { actorLabel: actor.actorLabel, actorUserId },
+                });
+                if (!result.ok) {
+                    return { ...textResult({ error: result.error }), isError: true };
+                }
+                return textResult(result.data);
+            },
+        );
+
+        server.registerTool(
             "list_project_files",
             {
                 title: "List a job's folder tree and files",
@@ -2629,12 +2661,12 @@ function createHandler(actor: RouteMcpActor) {
             "always run the preview step, show the user exactly what will be sent and to whom, and only echo back the preview's confirmToken after their explicit approval. Never self-confirm. " +
             "Change-order lifecycle: create_change_order (draft, including cost-plus and fixed milestone schedules) → send_change_order (preview + user approval; customer signs via portal) → " +
             "once Approved, log_time/log_expense record cost-plus actuals and bill_change_order previews then bills them; fixed orders bill directly → send_milestone_invoice emails the payment link and T&M backup. " +
-            "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. " +
+            "FILES: upload_file parks documents (RFQs, RFIs, spec sheets, generated spreadsheets) on a project's or lead's Files tab — base64 content, ~3 MB max, optional folder. If the source is already in Google Drive, use import_google_drive_file with its bare Drive file ID instead: it keeps the OAuth token, temporary URL, and bytes server-side and accepts files up to 25 MiB. " +
             "Uploads default to internal visibility; only pass visibility 'shared' (customer-visible in the portal) when the user explicitly asks. " +
             "PROJECT MANAGEMENT: use find_job to resolve the project/lead; standard project folders are ensured implicitly by list_project_files and upload_files when needed. " +
             "Use upload_files for up to 8 files / ~3 MB total, then create_daily_log with already-uploaded photo ProjectFile ids so image bytes are not sent twice. " +
             "Use list_punch_items and add_punch_items for punch lists; punch completion is intentionally human-only. " +
-            "FILE ROUND TRIP: upload_file/upload_files puts documents in, list_project_files shows what's there (metadata and folder structure only, no URLs), " +
+            "FILE ROUND TRIP: upload_file/upload_files/import_google_drive_file puts documents in, list_project_files shows what's there (metadata and folder structure only, no URLs), " +
             "read_file pulls a PDF/Word/text file's actual extracted text, and get_file_link returns a view/download link for anything "
             + "(signed and expiring for private documents, a permanent public URL otherwise — the response says which). " +
             "Photos, drawings, scans and signed PDFs typically have no text layer to extract, so get_file_link (not read_file) is the right tool for them. " +
