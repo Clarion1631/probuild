@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GET as liveGET } from "../src/app/api/integrations/bank-ledger/status/route";
 import {
+    createListStatementImports,
     createBankLedgerStatusHandlers,
+    getBankLedgerStatusSecret,
     type BankLedgerStatusHandlerDependencies,
 } from "../src/app/api/integrations/bank-ledger/status/route";
 
@@ -47,16 +48,22 @@ test("bank-ledger status: authorization fails closed", async t => {
         assert.equal(listCalls.length, 0);
     });
 
-    await t.test("the production route reads only BANK_LEDGER_STATUS_SECRET for this gate", async () => {
-        const previous = process.env.BANK_LEDGER_STATUS_SECRET;
+    await t.test("the production secret getter accepts only BANK_LEDGER_STATUS_SECRET", async () => {
+        const previousStatus = process.env.BANK_LEDGER_STATUS_SECRET;
+        const previousIngest = process.env.BANK_LEDGER_INGEST_SECRET;
         process.env.BANK_LEDGER_STATUS_SECRET = "runtime-status-secret";
+        process.env.BANK_LEDGER_INGEST_SECRET = "runtime-ingest-secret";
         try {
-            const response = await liveGET(makeRequest(VALID_QUERY, { "x-ledger-status-key": "wrong" }));
-            assert.equal(response.status, 401);
-            assert.deepEqual(await response.json(), { ok: false, reason: "unauthorized" });
+            const { handlers } = makeHandlers({ getStatusSecret: getBankLedgerStatusSecret });
+            const accepted = await handlers.GET(makeRequest(VALID_QUERY, { "x-ledger-status-key": "runtime-status-secret" }));
+            const rejected = await handlers.GET(makeRequest(VALID_QUERY, { "x-ledger-status-key": "runtime-ingest-secret" }));
+            assert.equal(accepted.status, 200);
+            assert.equal(rejected.status, 401);
         } finally {
-            if (previous === undefined) delete process.env.BANK_LEDGER_STATUS_SECRET;
-            else process.env.BANK_LEDGER_STATUS_SECRET = previous;
+            if (previousStatus === undefined) delete process.env.BANK_LEDGER_STATUS_SECRET;
+            else process.env.BANK_LEDGER_STATUS_SECRET = previousStatus;
+            if (previousIngest === undefined) delete process.env.BANK_LEDGER_INGEST_SECRET;
+            else process.env.BANK_LEDGER_INGEST_SECRET = previousIngest;
         }
     });
 });
@@ -78,6 +85,7 @@ test("bank-ledger status: strict WTB scope and range validation", async t => {
             "account=WTB-0723&from=2026-08-04&to=2026-08-03",
             "account=WTB-0723&from=2026-08-03",
             "account=WTB-0723&from=2026-08-03&from=2026-08-04&to=2026-08-03",
+            "account=WTB-0723&from=2026-08-03&to=2026-08-03&unexpected=true",
         ];
         for (const query of queries) {
             const response = await handlers.GET(makeRequest(query));
@@ -100,6 +108,49 @@ test("bank-ledger status: strict WTB scope and range validation", async t => {
         assert.deepEqual(await response.json(), { ok: false, reason: "range-too-large", maxDays: 14 });
         assert.equal(listCalls.length, 0);
     });
+});
+
+test("bank-ledger status: Prisma adapter uses exact date containment and observation counts", async () => {
+    let received: { account: string; from: Date; to: Date } | undefined;
+    const listStatementImports = createListStatementImports({
+        async findMany(input) {
+            received = {
+                account: input.where.account,
+                from: input.where.periodStart.gte,
+                to: input.where.periodEnd.lte,
+            };
+            return [{
+                periodStart: new Date("2026-08-03T00:00:00.000Z"),
+                periodEnd: new Date("2026-08-03T00:00:00.000Z"),
+                status: "FINALIZED",
+                openingCents: 10000,
+                closingCents: 12345,
+                contentHash: "hash-1",
+                _count: { observations: 2 },
+            }];
+        },
+    });
+
+    const imports = await listStatementImports({
+        account: "WTB-0723",
+        from: new Date("2026-08-03T00:00:00.000Z"),
+        to: new Date("2026-08-03T00:00:00.000Z"),
+    });
+
+    assert.deepEqual(received, {
+        account: "WTB-0723",
+        from: new Date("2026-08-03T00:00:00.000Z"),
+        to: new Date("2026-08-03T00:00:00.000Z"),
+    });
+    assert.deepEqual(imports, [{
+        periodStart: new Date("2026-08-03T00:00:00.000Z"),
+        periodEnd: new Date("2026-08-03T00:00:00.000Z"),
+        status: "FINALIZED",
+        openingCents: 10000,
+        closingCents: 12345,
+        contentHash: "hash-1",
+        lineCount: 2,
+    }]);
 });
 
 test("bank-ledger status: returns only the documented DB facts", async t => {

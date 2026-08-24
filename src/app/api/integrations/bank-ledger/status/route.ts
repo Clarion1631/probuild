@@ -21,7 +21,39 @@ export interface BankLedgerStatusImport {
 
 export interface BankLedgerStatusHandlerDependencies {
     getStatusSecret(): string | undefined;
+    // eslint-disable-next-line no-unused-vars
     listStatementImports(input: { account: string; from: Date; to: Date }): Promise<BankLedgerStatusImport[]>;
+}
+
+interface StatementImportStatusRow {
+    periodStart: Date;
+    periodEnd: Date;
+    status: string;
+    openingCents: number;
+    closingCents: number;
+    contentHash: string;
+    _count: { observations: number };
+}
+
+export interface BankLedgerStatusStatementImportReader {
+    // eslint-disable-next-line no-unused-vars
+    findMany(_input: {
+        where: {
+            account: string;
+            periodStart: { gte: Date };
+            periodEnd: { lte: Date };
+        };
+        select: {
+            periodStart: true;
+            periodEnd: true;
+            status: true;
+            openingCents: true;
+            closingCents: true;
+            contentHash: true;
+            _count: { select: { observations: true } };
+        };
+        orderBy: Array<{ periodStart: "asc" } | { periodEnd: "asc" }>;
+    }): Promise<StatementImportStatusRow[]>;
 }
 
 function timingSafeCompare(provided: string | null, expected: string | undefined): boolean {
@@ -42,6 +74,36 @@ function calendarDaysInclusive(from: string, to: string): number {
 
 function dateOnly(value: Date): string {
     return value.toISOString().slice(0, 10);
+}
+
+export function getBankLedgerStatusSecret(): string | undefined {
+    return process.env.BANK_LEDGER_STATUS_SECRET;
+}
+
+export function createListStatementImports(reader: BankLedgerStatusStatementImportReader): BankLedgerStatusHandlerDependencies["listStatementImports"] {
+    return async ({ account, from, to }) => {
+        const imports = await reader.findMany({
+            where: {
+                account,
+                periodStart: { gte: from },
+                periodEnd: { lte: to },
+            },
+            select: {
+                periodStart: true,
+                periodEnd: true,
+                status: true,
+                openingCents: true,
+                closingCents: true,
+                contentHash: true,
+                _count: { select: { observations: true } },
+            },
+            orderBy: [{ periodStart: "asc" }, { periodEnd: "asc" }],
+        });
+        return imports.map(({ _count, ...statementImport }) => ({
+            ...statementImport,
+            lineCount: _count.observations,
+        }));
+    };
 }
 
 /**
@@ -82,7 +144,7 @@ export function createBankLedgerStatusHandlers(dependencies: BankLedgerStatusHan
             return NextResponse.json({
                 ok: true,
                 account: ACCOUNT,
-                imports: imports
+                imports: [...imports]
                     .sort((a, b) => a.periodStart.getTime() - b.periodStart.getTime() || a.periodEnd.getTime() - b.periodEnd.getTime())
                     .map(statementImport => ({
                         periodStart: dateOnly(statementImport.periodStart),
@@ -99,30 +161,11 @@ export function createBankLedgerStatusHandlers(dependencies: BankLedgerStatusHan
 }
 
 const handlers = createBankLedgerStatusHandlers({
-    getStatusSecret: () => process.env.BANK_LEDGER_STATUS_SECRET,
-    listStatementImports: async ({ account, from, to }) => {
-        const imports = await prisma.statementImport.findMany({
-            where: {
-                account,
-                periodStart: { gte: from },
-                periodEnd: { lte: to },
-            },
-            select: {
-                periodStart: true,
-                periodEnd: true,
-                status: true,
-                openingCents: true,
-                closingCents: true,
-                contentHash: true,
-                _count: { select: { observations: true } },
-            },
-            orderBy: [{ periodStart: "asc" }, { periodEnd: "asc" }],
-        });
-        return imports.map(statementImport => ({
-            ...statementImport,
-            lineCount: statementImport._count.observations,
-        }));
-    },
+    getStatusSecret: getBankLedgerStatusSecret,
+    // Access the Prisma proxy only when an authorized request reaches the
+    // adapter. Import-time access would make the hermetic route tests require
+    // DATABASE_URL even when they inject their own dependency.
+    listStatementImports: createListStatementImports({ findMany: input => prisma.statementImport.findMany(input) }),
 });
 
 export async function GET(request: Request) {
