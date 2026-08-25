@@ -122,9 +122,9 @@ function paymentApplicationCents(payment: QboEvidencePayment, invoiceId: string)
         .filter((amount): amount is number => amount !== null);
 }
 
-function invoiceStatus(totalCents: number | null, balanceCents: number | null, linkedTxnPaymentIds: string[]): "open" | "partially-paid" | "paid" | "voided" | "unknown" {
+function invoiceStatus(totalCents: number | null, balanceCents: number | null, linkedTxns: QboEvidenceLinkedTxn[]): "open" | "partially-paid" | "paid" | "voided" | "unknown" {
     if (totalCents === null || balanceCents === null) return "unknown";
-    if (totalCents === 0 && balanceCents === 0 && linkedTxnPaymentIds.length === 0) return "voided";
+    if (totalCents === 0 && balanceCents === 0) return linkedTxns.length === 0 ? "voided" : "unknown";
     if (balanceCents === 0) return "paid";
     if (totalCents !== null && balanceCents !== null && balanceCents > 0 && balanceCents < totalCents) return "partially-paid";
     if (totalCents !== null && balanceCents !== null) return "open";
@@ -159,7 +159,7 @@ async function normalizeInvoice(invoice: QboEvidenceInvoice, runtime: QboEvidenc
 
     const totalCents = centsOrNull(invoice.TotalAmt);
     const balanceCents = centsOrNull(invoice.Balance);
-    const status = invoiceStatus(totalCents, balanceCents, linkedTxnPaymentIds);
+    const status = invoiceStatus(totalCents, balanceCents, invoice.LinkedTxn ?? []);
     return {
         id,
         docNumber: stringOrNull(invoice.DocNumber),

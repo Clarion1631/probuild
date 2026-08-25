@@ -130,6 +130,34 @@ test("commercial-siding QBO evidence attaches linked payment facts and only the 
     }]);
 });
 
+test("commercial-siding QBO evidence treats zero-dollar invoices with any linked transaction as status unknown", async () => {
+    const evidence = await buildCommercialSidingQboEvidence({
+        queryInvoices: async (docNumber) => docNumber === "INV-00246-1" ? [{
+            Id: "invoice-zero-with-credit",
+            DocNumber: "INV-00246-1",
+            CustomerRef: { name: "April Velilla" },
+            TotalAmt: 0,
+            Balance: 0,
+            LinkedTxn: [{ TxnId: "credit-1", TxnType: "CreditMemo" }],
+        }, {
+            Id: "invoice-zero-with-payment",
+            DocNumber: "INV-00246-1",
+            CustomerRef: { name: "April Velilla" },
+            TotalAmt: 0,
+            Balance: 0,
+            LinkedTxn: [{ TxnId: "payment-1", TxnType: "Payment" }],
+        }] : [],
+        readPayment: async (paymentId) => ({ Id: paymentId, TotalAmt: 0 }),
+        now: () => new Date("2026-08-24T23:00:00.000Z"),
+    });
+
+    const invoices = evidence.candidates.find(row => row.docNumber === "INV-00246-1")?.invoices;
+    assert.deepEqual(invoices?.map(invoice => invoice ? [invoice.status, invoice.voidState] : null), [
+        ["unknown", "unknown"],
+        ["unknown", "unknown"],
+    ]);
+});
+
 test("commercial-siding QBO evidence converts finite amounts to integer cents and marks malformed amounts unknown", async () => {
     const evidence = await buildCommercialSidingQboEvidence({
         queryInvoices: async (docNumber) => docNumber === "INV-00321-1" ? [{
