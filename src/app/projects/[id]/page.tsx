@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 import ProjectHeader from "./ProjectHeader";
 import ProjectDashboardsWidget from "@/components/ProjectDashboardsWidget";
 import JobInfoCard from "./JobInfoCard";
+import InspectionsPanel from "./InspectionsPanel";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
 
@@ -94,13 +95,23 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         return rows.map(r => r.status);
     });
 
-    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses] = await Promise.all([
+    const inspectionsPromise = prisma.inspection.findMany({
+        where: { projectId: id },
+        orderBy: [{ scheduledDate: "desc" }, { createdAt: "desc" }],
+        select: {
+            id: true, type: true, result: true, scheduledDate: true, performedDate: true,
+            inspector: true, notes: true, customerNote: true, sharedToPortal: true,
+        },
+    });
+
+    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
         recentActivityPromise,
         filesPromise,
-        permitsPromise
+        permitsPromise,
+        inspectionsPromise,
     ]);
 
     console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
@@ -180,6 +191,8 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
                     <p className="text-[10px] text-slate-400 mt-1">{estimates.filter((e: any) => e.status === 'Approved').length} approved</p>
                 </div>
             </div>
+
+            <InspectionsPanel projectId={id} initialInspections={inspections} />
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
 

@@ -43,6 +43,7 @@ model User {
   addedFavorites            ProjectProductFavorite[]
   decidedProposals          SelectionProposal[]
   mcpKeys                   McpKey[]
+  createdInspections        Inspection[]              @relation("InspectionCreator")
 }
 
 model Client {
@@ -303,6 +304,7 @@ model Project {
   selectionProposals      SelectionProposal[]
   decisions               Decision[]
   permits                 Permit[]
+  inspections             Inspection[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -1115,6 +1117,7 @@ model ScheduleTask {
   punchItems     TaskPunchItem[]
   assignments    TaskAssignment[]
   subAssignments SubTaskAssignment[]
+  inspections    Inspection[]
 
   // Payment milestones anchored to this task (company dashboard start moves).
   estimatePaymentSchedules    EstimatePaymentSchedule[]
@@ -2120,10 +2123,42 @@ model Permit {
   issueDate        DateTime?
   expirationDate   DateTime?
   notes            String?
+  inspections      Inspection[]
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @default(now()) @updatedAt
 
   @@index([projectId])
+}
+
+// Field evidence remains a separate record from Permit: a permit can have
+// several inspections, and an inspection can exist without a permit.
+// Customer visibility is row-level; internal notes never cross that boundary.
+model Inspection {
+  id              String        @id @default(cuid())
+  projectId       String
+  project         Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  permitId        String?
+  permit          Permit?       @relation(fields: [permitId], references: [id], onDelete: SetNull)
+  type            String
+  scheduledDate   DateTime?      @db.Timestamptz(6)
+  performedDate   DateTime?      @db.Timestamptz(6)
+  result          String        @default("SCHEDULED") // SCHEDULED | PASSED | FAILED | PARTIAL
+  inspector       String?
+  notes           String?       @db.Text
+  customerNote    String?       @db.Text
+  sharedToPortal  Boolean       @default(false)
+  scheduleTaskId  String?
+  scheduleTask    ScheduleTask? @relation(fields: [scheduleTaskId], references: [id], onDelete: SetNull)
+  createdById     String
+  createdBy       User          @relation("InspectionCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  @@index([projectId, result])
+  @@index([projectId, sharedToPortal, result])
+  @@index([permitId])
+  @@index([scheduleTaskId])
+  @@index([createdById])
 }
 
 model Retainer {

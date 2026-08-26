@@ -118,6 +118,10 @@ export type PortalUpdate = {
     photos: PortalUpdatePhoto[];
 };
 
+function isTaskDerivedStage(stage: ClientStageDefinition): boolean {
+    return stage.taskDerived !== false;
+}
+
 export type PortalShareActor = {
     userId: string;
     role: string;
@@ -175,6 +179,7 @@ function bestStageInText(text: string): number | null {
     const haystack = text.toLowerCase();
     const hits: { position: number; length: number; stageIndex: number }[] = [];
     CLIENT_STAGES.forEach((stage, stageIndex) => {
+        if (!isTaskDerivedStage(stage)) return;
         stage.matchers.forEach(matcher => {
             const position = haystack.lastIndexOf(matcher);
             if (position >= 0) hits.push({ position, length: matcher.length, stageIndex });
@@ -262,7 +267,7 @@ function chronologicalTasks(tasks: readonly PortalTrackerTask[]): PortalTrackerT
 }
 
 /**
- * Assigns every task to the eight client stages.
+ * Assigns every task to the client stages.
  *
  * Precedence: an explicit clientStage wins outright, then a keyword match that
  * survived the schedule-order check, then interpolation. An unmatched task
@@ -273,7 +278,13 @@ function chronologicalTasks(tasks: readonly PortalTrackerTask[]): PortalTrackerT
  */
 function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, number> {
     const sorted = chronologicalTasks(tasks);
-    const pinnedStage = sorted.map(task => clientStageIndex(task.clientStage));
+    const taskStageIndexes = CLIENT_STAGES
+        .map((stage, index) => isTaskDerivedStage(stage) ? index : null)
+        .filter((index): index is number => index !== null);
+    const pinnedStage = sorted.map(task => {
+        const stageIndex = clientStageIndex(task.clientStage);
+        return stageIndex !== null && isTaskDerivedStage(CLIENT_STAGES[stageIndex]) ? stageIndex : null;
+    });
     const keywordStage = sorted.map((task, i) =>
         pinnedStage[i] === null ? keywordStageIndex(task) : null,
     );
@@ -313,8 +324,8 @@ function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, nu
         }
 
         const proportionalIndex = sorted.length <= 1
-            ? 0
-            : Math.round((taskIndex * (CLIENT_STAGES.length - 1)) / (sorted.length - 1));
+            ? taskStageIndexes[0]
+            : taskStageIndexes[Math.round((taskIndex * (taskStageIndexes.length - 1)) / (sorted.length - 1))];
         assigned.set(task.id, proportionalIndex);
     });
 
@@ -324,13 +335,19 @@ function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, nu
 export function buildProjectTracker(
     tasks: readonly PortalTrackerTask[],
     stageOverride?: string | null,
+    hasSharedScheduledInspection = false,
 ): ProjectTracker {
     const assigned = assignStageIndexes(tasks);
     const tasksByStage = CLIENT_STAGES.map((_, stageIndex) =>
         tasks.filter(task => assigned.get(task.id) === stageIndex),
     );
 
-    const allProjectTasksComplete = tasks.length > 0 && tasks.every(isComplete);
+    // A customer-shared scheduled inspection is client-facing work. Keep the
+    // rail at Inspections even if schedule tasks were marked complete early;
+    // unshared inspection rows must never influence the client view.
+    const allProjectTasksComplete = tasks.length > 0
+        && tasks.every(isComplete)
+        && !hasSharedScheduledInspection;
     const overrideIndex = stageOverride
         ? CLIENT_STAGES.findIndex(stage => stage.label === stageOverride)
         : -1;
@@ -346,6 +363,10 @@ export function buildProjectTracker(
         );
     }
     if (currentIndex < 0 && tasks.length === 0) currentIndex = 0;
+    if (hasSharedScheduledInspection && overrideIndex < 0) {
+        const inspectionIndex = clientStageIndex("Inspections");
+        if (inspectionIndex !== null) currentIndex = Math.max(currentIndex, inspectionIndex);
+    }
 
     const stages = CLIENT_STAGES.map((stage, index): ProjectTrackerStage => {
         const stageTasks = chronologicalTasks(tasksByStage[index]);
@@ -621,16 +642,23 @@ export async function getPortalProjectTrackerCore(
     projectId: string,
     now = new Date(),
 ): Promise<PortalProjectTrackerPayload> {
-    const [project, tasks] = await Promise.all([
+    const [project, tasks, sharedScheduledInspectionCount] = await Promise.all([
         prisma.project.findUnique({
             where: { id: projectId },
             select: { color: true, portalStageOverride: true },
         }),
         getPortalScheduleTasksCore(projectId),
+        prisma.inspection.count({
+            where: { projectId, result: "SCHEDULED", sharedToPortal: true },
+        }),
     ]);
     if (!project) throw new Error("Project not found");
 
-    const tracker = buildProjectTracker(tasks, project.portalStageOverride);
+    const tracker = buildProjectTracker(
+        tasks,
+        project.portalStageOverride,
+        sharedScheduledInspectionCount > 0,
+    );
     const whatsNext = chronologicalTasks(tasks)
         .filter(task =>
             task.type !== "appointment"

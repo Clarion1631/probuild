@@ -45,6 +45,7 @@ import {
     listPunchItems,
     moveFileWithConfirmation,
 } from "@/lib/mcp-pm-tools";
+import { listInspections, recordInspectionWithConfirmation } from "@/lib/mcp-inspection-tools";
 
 // MCP connector for ChatGPT (streamable HTTP at POST /api/mcp/mcp).
 //
@@ -171,7 +172,7 @@ const WRITE_TOOLS = new Set([
     "create_change_order", "update_change_order", "send_change_order", "bill_change_order",
     "create_lead", "log_time", "log_expense",
     "upload_file", "upload_files", "import_google_drive_file", "create_folder", "move_file",
-    "create_daily_log", "add_punch_items",
+    "create_daily_log", "add_punch_items", "record_inspection",
     "create_contract", "update_contract", "send_contract",
     "plan_schedule", "update_task_dates", "set_task_status", "assign_task_crew",
     "set_project_start_date", "generate_project_schedule", "assign_project_crew",
@@ -196,6 +197,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
     create_folder: "folder", move_file: "file",
     create_daily_log: "daily_log",
     add_punch_items: "punch_item",
+    record_inspection: "inspection",
 };
 
 // Args whose VALUE is payload rather than intent — recording even a prefix
@@ -1852,6 +1854,58 @@ function createHandler(actor: RouteMcpActor) {
                     return textResult(await listDailyLogs(args));
                 } catch (error) {
                     return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list daily logs" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "list_inspections",
+            {
+                title: "List project inspections",
+                annotations: { readOnlyHint: true },
+                description: "Lists a project's inspection evidence, including result, dates, internal notes, customer note, and whether each row is shared to the client portal.",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                    limit: z.number().int().min(1).max(100).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await listInspections(args));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to list inspections" }), isError: true };
+                }
+            },
+        );
+
+        server.registerTool(
+            "record_inspection",
+            {
+                title: "Record project inspection evidence",
+                annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                description: "Records a scheduled, passed, failed, or partial inspection. TWO-STEP, SINGLE-USE: show the preview to the user, then repeat the exact arguments with confirmToken after approval. PASSED defaults to client-shared; other results default private unless sharedToPortal is explicitly true.",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                    type: z.string().trim().min(1).max(300),
+                    result: z.enum(["SCHEDULED", "PASSED", "FAILED", "PARTIAL"]),
+                    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
+                    notes: z.string().max(20_000).optional(),
+                    customerNote: z.string().max(2_000).optional(),
+                    sharedToPortal: z.boolean().optional(),
+                    permitId: z.string().max(50).optional(),
+                    scheduleTaskId: z.string().max(50).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    const actorUserId = await actor.resolveActorUserId();
+                    return textResult(await recordInspectionWithConfirmation(
+                        args,
+                        { actorLabel: actor.actorLabel, actorUserId },
+                    ));
+                } catch (error) {
+                    return { ...textResult({ error: error instanceof Error ? error.message : "Failed to record inspection" }), isError: true };
                 }
             },
         );
