@@ -20,7 +20,7 @@ This is a design record only. It authorizes no DDL, application code, production
 
 ### QBO / receipt boundary
 
-The current QBO expense sync uses vendor text, does not set a ProBuild vendor ID or `purchaseOrderId`, and keys financial idempotency by `qbPurchaseId`. V1 must never infer a PO/receipt association from vendor text, amount, or date.
+The current QBO expense sync uses vendor text, does not set a ProBuild vendor ID or `purchaseOrderId`, and keys financial idempotency by `qbPurchaseId`. Its customer-name-to-project result is triage only: a `MaterialItemExpense` reviewer must independently confirm the project and may not treat the existing expense's estimate/project or `Expense.status` as that proof. `QboPurchaseClassification` is import-triage metadata, not MaterialItem evidence or review evidence. V1 must never infer a PO/receipt association from vendor text, amount, date, or that heuristic project match.
 
 No current retained API-sweep artifact proves a complete production baseline for procurement. Before DDL or rollout, the implementation card must add least-privilege authenticated count/read support, make a dated measurement, and retain that measurement with the card. Direct production SQL, Prisma console output, and dashboard estimates are not substitutes.
 
@@ -39,7 +39,7 @@ A user selects the project when creating the import run. A row with blank projec
 
 ### `MaterialItem`
 
-A stable, human-readable record with immutable ID and immutable `projectId`; material/package name; optional phase/location; quantity/unit only when known; SKU; quote reference; required-by date; optional vendor; next action/owner/due date; status/escalation; notes; and actor/timestamps.
+A stable, human-readable record with immutable ID and immutable `projectId`; material/package name; optional phase/location; quantity/unit only when known; SKU; quote reference; required-by date; optional vendor; next action/owner/due date; status; nullable `underlyingStage` and `exceptionBlocker` permitted only while status is `DELAYED`; escalation; notes; and actor/timestamps.
 
 Optional source links are allowed only under these integrity rules:
 
@@ -85,16 +85,16 @@ Names describe work assignments, never authorization. The implementation must re
 - Finance/expense review: `FINANCE` or `ADMIN` authority; the reviewer identity is stored on `MaterialItemExpense`.
 - Read-only verified-date presentation: a server-projected read surface; no client-side name check.
 
-“Richard,” “Kira,” “Mac,” and “Beverly” are operating assignments, not role names and not access-control checks.
+“Richard,” “Kira,” “Mac,” and “Beverly” are operating assignments, not role names and not access-control checks. The existing PO-create and expense-approve routes do not establish this V1 authority model; V1 must use new or explicitly tightened server actions rather than reusing their current authorization unchanged.
 
 ## Input, UI, and deferrals
 
 Before implementation, create and version a repository input contract at `docs/procurement/INPUT-CONTRACT.md` and fixtures under `tests/fixtures/procurement/xlsx/`. The contract must identify both supported layout versions, required columns, source-file acceptance rules, storage adapter/retention behavior, and the staging-to-commit action. Until then, no claim is made that an unknown XLSX layout is supported.
 
-The board displays phase, item, status, evidence, owner, next action/due date, required-by risk, escalation, and explicit links. It reads already-filed PO communication only; it must not invoke a send route, compose a message, or create a Chat/vendor message.
+The board displays phase, item, status, evidence, owner, next action/due date, required-by risk, escalation, and explicit links. It reads already-filed PO communication only; it must not invoke `src/app/api/projects/[id]/purchase-orders/[poId]/send-message/route.ts`, compose a message, or create a Chat/vendor message.
 
 Defer approval-revision graphs, immutable PO revisions, UOM conversion, automated arrival gates, heuristic QBO matching, quote-price history, OCR/AI extraction, warehouse inventory, automation, and profitability reporting.
 
 ## Implementation entry gate
 
-The implementation card must name guarded additive SQL; protected count endpoints; versioned XLSX contract and fixtures; transition, authorization, same-project, audit, and lock-order tests; explicit reviewed receipt-link rule; backup verification for any destructive correction; and fresh Codex/Kimi review outputs. It must prohibit both `prisma migrate` and `prisma db push`; after guarded DDL verification, run `powershell.exe -NoProfile -Command "npx prisma generate"`, never Git Bash. Production shipment still requires browser-verified live evidence and independent review.
+The implementation card must name guarded additive SQL; protected count endpoints; versioned XLSX contract and fixtures; transition, authorization, same-project, audit, and lock-order tests; explicit reviewed receipt-link rule; backup verification for any destructive correction; and fresh Codex/Kimi review outputs. It must prohibit both `prisma migrate` and `prisma db push`; after guarded DDL verification, from the target repository root run `powershell.exe -NoProfile -Command ".\\node_modules\\.bin\\prisma generate"` on Windows, never Git Bash. Non-Windows CI uses `npx prisma generate` from the repository root. Production shipment still requires browser-verified live evidence and independent review.

@@ -10,10 +10,10 @@ This document authorizes no DDL, code, production mutation, vendor outreach, or 
 
 - Preserve `Vendor`, `PurchaseOrder`, `PurchaseOrderItem`, `EstimateItemPurchaseOrder`, `Expense`, `Takeoff`, and `TaskMaterial` contracts.
 - PO document lifecycle and TaskMaterial schedule status are not Kira material status.
-- Never match QBO/vendor text, amount, or date to a PO/receipt. `MaterialItemExpense` requires the reviewed association record defined in the schema map.
+- Never match QBO/vendor text, amount, date, or a QBO customer-name project match to a PO/receipt. A `MaterialItemExpense` reviewer independently confirms its project; `QboPurchaseClassification` and `Expense.status` are not review evidence.
 - A parser stages data. It never assigns a material item to a blank/conflicting project or manufactures status, quantity, vendor, quote, ETA, receipt, or evidence.
 - No destructive operation proceeds without a verified backup.
-- Do not run `prisma migrate` or `prisma db push`. After guarded DDL verification, run `powershell.exe -NoProfile -Command "npx prisma generate"`; never run Prisma generation in Git Bash.
+- Do not run `prisma migrate` or `prisma db push`. From the target repository root after guarded DDL verification, run `powershell.exe -NoProfile -Command ".\\node_modules\\.bin\\prisma generate"` on Windows; never use Git Bash. Non-Windows CI uses `npx prisma generate` from the repository root.
 
 ## Gate 0 — reproducible inputs and pre-DDL proof
 
@@ -28,7 +28,7 @@ This document authorizes no DDL, code, production mutation, vendor outreach, or 
 1. Add exactly these records: `MaterialImportRun`, `MaterialImportRow`, `MaterialItem`, `MaterialItemEvidence`, `MaterialItemEvent`, `MaterialItemPurchaseOrderItem`, `MaterialItemExpense`, and `MaterialItemSource`.
 2. Add indexes for import resolution, project/status, project/phase, next-action due date, escalation, PO-item join, and source import row.
 3. Enforce the map's same-project rules in each mutation transaction. Reject a project mismatch; do not silently relink an estimate, takeoff, schedule task, PO item, or expense.
-4. Enforce server authorization using actual roles/permissions: approval/vendor decisions require `ADMIN` or `MANAGER`; expense review requires `FINANCE` or `ADMIN`; names are never authorization. Test allow and deny paths.
+4. Enforce server authorization using actual roles/permissions: approval/vendor decisions require `ADMIN` or `MANAGER`; expense review requires `FINANCE` or `ADMIN`; names are never authorization. Existing PO-create and expense-approve authorization is insufficient for this rule, so create or explicitly tighten V1 server actions. Test allow and deny paths.
 5. Add append-only `MaterialItemEvent` entries for every field, transition, association, import-resolution, and correction mutation with actor, timestamp, reason, and prior/new snapshot as applicable.
 
 ## Slice 2 — XLSX staging and review
@@ -51,7 +51,7 @@ This document authorizes no DDL, code, production mutation, vendor outreach, or 
 1. Link PO evidence only through `MaterialItemPurchaseOrderItem`; no material-level mutable `purchaseOrderId`.
 2. Link finance evidence only through `MaterialItemExpense` after an authorized reviewer records decision, identity, timestamp, reason, and `MaterialItemEvidence` reference. QBO `qbPurchaseId` idempotency remains untouched.
 3. Read `EstimateItemPurchaseOrder` for context without creating a duplicate relation or blind backfill.
-4. Show already-filed PO communication in read-only fashion only. Do not call the PO send-message route, compose a vendor email, or create any Chat/vendor message.
+4. Show already-filed PO communication in read-only fashion only. Do not call `src/app/api/projects/[id]/purchase-orders/[poId]/send-message/route.ts`, compose a vendor email, or create any Chat/vendor message.
 
 ## Slice 5 — rollout and proof
 
