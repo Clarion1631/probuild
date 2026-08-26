@@ -2594,7 +2594,7 @@ model QboPurchaseClassification {
   reason         String?
   qbSyncToken    String?
   classifiedAt   DateTime @default(now())
-  updatedAt      DateTime
+  updatedAt      DateTime @default(now()) @updatedAt
 
   @@index([classification])
 }
