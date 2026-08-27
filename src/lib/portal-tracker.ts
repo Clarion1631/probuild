@@ -348,9 +348,18 @@ export function buildProjectTracker(
     const allProjectTasksComplete = tasks.length > 0
         && tasks.every(isComplete)
         && !hasSharedScheduledInspection;
-    const overrideIndex = stageOverride
+    const requestedOverrideIndex = stageOverride
         ? CLIENT_STAGES.findIndex(stage => stage.label === stageOverride)
         : -1;
+    const inspectionIndex = hasSharedScheduledInspection
+        ? clientStageIndex("Inspections")
+        : null;
+    // A staff override can hold a project at an earlier stage, but it cannot
+    // advance the client past a customer-shared inspection that is still
+    // scheduled. Otherwise an explicit Complete override hides live work.
+    const overrideIndex = inspectionIndex !== null && requestedOverrideIndex > inspectionIndex
+        ? inspectionIndex
+        : requestedOverrideIndex;
 
     let currentIndex = tasksByStage.findIndex(stageTasks =>
         stageTasks.length > 0
@@ -364,7 +373,6 @@ export function buildProjectTracker(
     }
     if (currentIndex < 0 && tasks.length === 0) currentIndex = 0;
     if (hasSharedScheduledInspection && overrideIndex < 0) {
-        const inspectionIndex = clientStageIndex("Inspections");
         if (inspectionIndex !== null) currentIndex = Math.max(currentIndex, inspectionIndex);
     }
 

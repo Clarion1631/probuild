@@ -60,3 +60,10 @@ test("a shared scheduled inspection prevents a completed schedule from reporting
     assert.equal(current?.label, "Inspections");
     assert.notEqual(tracker.stages.find(stage => stage.label === "Complete")?.state, "current");
 });
+
+test("a shared scheduled inspection caps a later staff override at Inspections", () => {
+    const tracker = buildProjectTracker([task({ status: "Complete", progress: 100 })], "Complete", true);
+    const current = tracker.stages.find(stage => stage.state === "current");
+    assert.equal(current?.label, "Inspections");
+    assert.notEqual(tracker.stages.find(stage => stage.label === "Complete")?.state, "current");
+});

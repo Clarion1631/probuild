@@ -118,6 +118,14 @@ const statements = [
     END $$`,
 ];
 
+// pg_get_constraintdef returns PostgreSQL's canonical definition. Keep these
+// exact values in sync with prisma/prisma-blind-spots.json so a same-named,
+// weaker pre-existing CHECK cannot pass the additive rollout postflight.
+const expectedCheckDefinitions = {
+    Inspection_result_check: "CHECK ((result = ANY (ARRAY['SCHEDULED'::text, 'PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])))",
+    Inspection_required_date_check: "CHECK ((((result = 'SCHEDULED'::text) AND (\"scheduledDate\" IS NOT NULL)) OR ((result = ANY (ARRAY['PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])) AND (\"performedDate\" IS NOT NULL))))",
+};
+
 async function main() {
     if (process.argv.includes("--help")) {
         console.log("Usage: node scripts/apply-inspections-schema.mjs --yes --expect-db <database> --expect-host <host>");
@@ -149,12 +157,26 @@ async function main() {
         const verification = await prisma.$queryRawUnsafe(`
             SELECT
                 (SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('public."Inspection"')) AS "rlsEnabled",
-                ARRAY(SELECT conname FROM pg_constraint WHERE conrelid = to_regclass('public."Inspection"') ORDER BY conname) AS "constraints"
+                ARRAY(SELECT conname FROM pg_constraint WHERE conrelid = to_regclass('public."Inspection"') ORDER BY conname) AS "constraints",
+                COALESCE(json_object_agg(conname, pg_get_constraintdef(oid)) FILTER (
+                    WHERE conname IN ('Inspection_result_check', 'Inspection_required_date_check')
+                ), '{}'::json) AS "checkDefinitions"
+            FROM pg_constraint
+            WHERE conrelid = to_regclass('public."Inspection"')
         `);
         const row = Array.isArray(verification) ? verification[0] : null;
         const constraints = Array.isArray(row?.constraints) ? row.constraints : [];
-        if (row?.rlsEnabled !== true || expectedConstraints.some(name => !constraints.includes(name))) {
-            throw new Error("Inspection schema postflight verification failed");
+        const checkDefinitions = row?.checkDefinitions && typeof row.checkDefinitions === "object"
+            ? row.checkDefinitions
+            : {};
+        const mismatchedChecks = Object.entries(expectedCheckDefinitions)
+            .filter(([name, definition]) => checkDefinitions[name] !== definition)
+            .map(([name]) => name);
+        if (row?.rlsEnabled !== true || expectedConstraints.some(name => !constraints.includes(name)) || mismatchedChecks.length > 0) {
+            const suffix = mismatchedChecks.length > 0
+                ? `; canonical CHECK definitions do not match: ${mismatchedChecks.join(", ")}`
+                : "";
+            throw new Error(`Inspection schema postflight verification failed${suffix}`);
         }
         console.log("Inspection schema applied successfully.");
     } finally {
