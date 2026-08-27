@@ -1,4 +1,4 @@
-import { PDFDocument, PDFPage, PDFFont, PDFImage, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, PDFPage, PDFFont, PDFImage, degrees, rgb, StandardFonts } from 'pdf-lib';
 import { prisma } from './prisma';
 import { toNum } from './prisma-helpers';
 import { buildLetterheadConfig, type LetterheadConfig } from './letterhead';
@@ -135,6 +135,48 @@ const colors = {
     bgLight: rgb(248 / 255, 250 / 255, 252 / 255),     // slate-50
     white: rgb(1, 1, 1),
 };
+
+const GOLDEN_TOUCH_WATERMARK = 'GOLDEN TOUCH REMODELING';
+
+/**
+ * Stamps every finished page immediately before the PDF is saved. Keeping this
+ * at the document boundary means the preview/download and email-attachment
+ * paths use the same branded file, including documents that gained extra pages.
+ */
+export async function applyGoldenTouchWatermark(doc: PDFDocument): Promise<number> {
+    const font = await doc.embedFont(StandardFonts.HelveticaBold);
+    const pages = doc.getPages();
+
+    for (const page of pages) {
+        const { width, height } = page.getSize();
+        const unitTextWidth = font.widthOfTextAtSize(GOLDEN_TOUCH_WATERMARK, 1);
+        const fontSize = Math.min(48, (width * 0.78) / unitTextWidth);
+        const textWidth = font.widthOfTextAtSize(GOLDEN_TOUCH_WATERMARK, fontSize);
+        const angle = 35 * Math.PI / 180;
+        const watermarkWidth = Math.cos(angle) * textWidth + Math.sin(angle) * fontSize;
+        const watermarkHeight = Math.sin(angle) * textWidth + Math.cos(angle) * fontSize;
+
+        page.drawText(GOLDEN_TOUCH_WATERMARK, {
+            // Center the rotated bounding box, not just the unrotated baseline.
+            x: (width - watermarkWidth) / 2 + Math.sin(angle) * fontSize,
+            y: (height - watermarkHeight) / 2,
+            size: fontSize,
+            font,
+            color: rgb(0.85, 0.66, 0.08),
+            opacity: 0.10,
+            rotate: degrees(35),
+        });
+    }
+
+    return pages.length;
+}
+
+/** Adds the required watermark to a static portal-captured estimate PDF before it is sent or filed. */
+export async function applyGoldenTouchWatermarkToPdfBytes(pdfBytes: Buffer): Promise<Buffer> {
+    const document = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+    await applyGoldenTouchWatermark(document);
+    return Buffer.from(await document.save());
+}
 
 function hexToRgb(hex: string) {
     const h = hex.replace('#', '');
@@ -743,6 +785,7 @@ export async function generateEstimatePdf(estimateId: string): Promise<Buffer> {
         x: pageWidth - margin - pageLabelWidth, y: footerY, size: 7, font: helvetica, color: colors.textMuted,
     });
 
+    await applyGoldenTouchWatermark(doc);
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
 }
@@ -1184,6 +1227,7 @@ export async function generateInvoicePdf(
     const footerText = `Generated ${new Date().toLocaleDateString()} • ${company?.companyName || 'ProBuild'}`;
     page.drawText(footerText, { x: margin, y: 30, size: 7, font: helvetica, color: colors.textMuted });
 
+    await applyGoldenTouchWatermark(doc);
     const pdfBytes = await doc.save();
     return Buffer.from(pdfBytes);
 }

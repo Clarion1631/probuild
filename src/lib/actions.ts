@@ -2536,14 +2536,21 @@ export async function approveEstimate(estimateId: string, signatureName: string,
     let pdfBuffer: Buffer | null = null;
     let attachments: any = undefined;
     try {
+        const { applyGoldenTouchWatermarkToPdfBytes, generateEstimatePdf } = await import("./pdf");
         if (capturedPdfUrl) {
             pdfBuffer = await downloadDocBytes(capturedPdfUrl);
             if (!pdfBuffer) {
                 console.warn("[approveEstimate] Failed to read capturedPdfUrl:", capturedPdfUrl);
+            } else {
+                try {
+                    pdfBuffer = await applyGoldenTouchWatermarkToPdfBytes(pdfBuffer);
+                } catch (e) {
+                    console.warn("[approveEstimate] Captured PDF watermark failed; rebuilding from the server estimate:", e);
+                    pdfBuffer = null;
+                }
             }
         }
         if (!pdfBuffer) {
-            const { generateEstimatePdf } = await import("./pdf");
             pdfBuffer = await generateEstimatePdf(estimateId);
         }
         if (pdfBuffer) {
@@ -5671,17 +5678,25 @@ export async function sendEstimateToClient(
     let pdfAttached = false;
     try {
         let pdfBuffer: Buffer | undefined;
+        const { applyGoldenTouchWatermarkToPdfBytes, generateEstimatePdf } = await import("./pdf");
         if (capturedPdfUrl && (isSecureRef(capturedPdfUrl) || isAllowedCapturedPdfUrl(capturedPdfUrl))) {
             // Use the pre-captured portal PDF (high-quality, matches what client sees).
             // Read via the service key so this still works now that the capture lands in the
             // private bucket; the allowlist still gates legacy http(s) values.
-            pdfBuffer = (await downloadDocBytes(capturedPdfUrl)) ?? undefined;
+            const capturedPdf = await downloadDocBytes(capturedPdfUrl);
+            if (capturedPdf) {
+                try {
+                    pdfBuffer = await applyGoldenTouchWatermarkToPdfBytes(capturedPdf);
+                } catch (e) {
+                    console.warn("[sendEstimateToClient] Captured PDF watermark failed; rebuilding from the server estimate:", e);
+                    pdfBuffer = undefined;
+                }
+            }
         } else if (capturedPdfUrl) {
             console.warn("[sendEstimateToClient] Rejected capturedPdfUrl (failed allowlist):", capturedPdfUrl);
         }
         if (!pdfBuffer) {
             // Fall back to server-side PDF generation
-            const { generateEstimatePdf } = await import("./pdf");
             pdfBuffer = await generateEstimatePdf(estimateId);
         }
         if (pdfBuffer) {
