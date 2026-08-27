@@ -81,6 +81,16 @@
       "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
     },
     {
+      "name": "Inspection_required_date_check",
+      "table": "\"Inspection\"",
+      "def": "CHECK ((((result = 'SCHEDULED'::text) AND (\"scheduledDate\" IS NOT NULL)) OR ((result = ANY (ARRAY['PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])) AND (\"performedDate\" IS NOT NULL))))"
+    },
+    {
+      "name": "Inspection_result_check",
+      "table": "\"Inspection\"",
+      "def": "CHECK ((result = ANY (ARRAY['SCHEDULED'::text, 'PASSED'::text, 'FAILED'::text, 'PARTIAL'::text])))"
+    },
+    {
       "name": "QboPurchaseClassification_classification_check",
       "table": "\"QboPurchaseClassification\"",
       "def": "CHECK ((classification = ANY (ARRAY['job-cost'::text, 'overhead'::text, 'owner-draw'::text, 'unknown'::text])))"
@@ -190,6 +200,10 @@
     },
     {
       "name": "EstimateItemPurchaseOrder",
+      "forced": false
+    },
+    {
+      "name": "Inspection",
       "forced": false
     },
     {

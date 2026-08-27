@@ -47,7 +47,7 @@ const statements = [
         "scheduleTaskId" TEXT,
         "createdById" TEXT NOT NULL,
         "createdAt" TIMESTAMPTZ(6) NOT NULL DEFAULT now(),
-        "updatedAt" TIMESTAMPTZ(6) NOT NULL DEFAULT now(),
+        "updatedAt" TIMESTAMPTZ(6) NOT NULL,
         CONSTRAINT "Inspection_pkey" PRIMARY KEY ("id")
     )`,
     `CREATE INDEX IF NOT EXISTS "Inspection_projectId_result_idx" ON "Inspection" ("projectId", "result")`,
@@ -55,6 +55,9 @@ const statements = [
     `CREATE INDEX IF NOT EXISTS "Inspection_permitId_idx" ON "Inspection" ("permitId")`,
     `CREATE INDEX IF NOT EXISTS "Inspection_scheduleTaskId_idx" ON "Inspection" ("scheduleTaskId")`,
     `CREATE INDEX IF NOT EXISTS "Inspection_createdById_idx" ON "Inspection" ("createdById")`,
+    // Prisma's @updatedAt is application-managed, so a database default would
+    // diverge from a database created by the committed migration history.
+    `ALTER TABLE "Inspection" ALTER COLUMN "updatedAt" DROP DEFAULT`,
     // Server-only table: no policies means Supabase's exposed Data API denies
     // anon/authenticated reads even though Prisma can use the owner pool.
     `ALTER TABLE "Inspection" ENABLE ROW LEVEL SECURITY`,
@@ -73,27 +76,44 @@ const statements = [
         END IF;
     END $$`,
     `DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = to_regclass('public."Inspection"')
+              AND conname IN (
+                  'Inspection_projectId_fkey', 'Inspection_permitId_fkey',
+                  'Inspection_scheduleTaskId_fkey', 'Inspection_createdById_fkey'
+              )
+              AND confupdtype <> 'c'
+        ) THEN
+            ALTER TABLE "Inspection"
+                DROP CONSTRAINT IF EXISTS "Inspection_projectId_fkey",
+                DROP CONSTRAINT IF EXISTS "Inspection_permitId_fkey",
+                DROP CONSTRAINT IF EXISTS "Inspection_scheduleTaskId_fkey",
+                DROP CONSTRAINT IF EXISTS "Inspection_createdById_fkey";
+        END IF;
+    END $$`,
+    `DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Inspection_projectId_fkey' AND conrelid = to_regclass('public."Inspection"')) THEN
             ALTER TABLE "Inspection" ADD CONSTRAINT "Inspection_projectId_fkey"
-                FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE;
+                FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE;
         END IF;
     END $$`,
     `DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Inspection_permitId_fkey' AND conrelid = to_regclass('public."Inspection"')) THEN
             ALTER TABLE "Inspection" ADD CONSTRAINT "Inspection_permitId_fkey"
-                FOREIGN KEY ("permitId") REFERENCES "Permit"("id") ON DELETE SET NULL;
+                FOREIGN KEY ("permitId") REFERENCES "Permit"("id") ON DELETE SET NULL ON UPDATE CASCADE;
         END IF;
     END $$`,
     `DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Inspection_scheduleTaskId_fkey' AND conrelid = to_regclass('public."Inspection"')) THEN
             ALTER TABLE "Inspection" ADD CONSTRAINT "Inspection_scheduleTaskId_fkey"
-                FOREIGN KEY ("scheduleTaskId") REFERENCES "ScheduleTask"("id") ON DELETE SET NULL;
+                FOREIGN KEY ("scheduleTaskId") REFERENCES "ScheduleTask"("id") ON DELETE SET NULL ON UPDATE CASCADE;
         END IF;
     END $$`,
     `DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'Inspection_createdById_fkey' AND conrelid = to_regclass('public."Inspection"')) THEN
             ALTER TABLE "Inspection" ADD CONSTRAINT "Inspection_createdById_fkey"
-                FOREIGN KEY ("createdById") REFERENCES "User"("id") ON DELETE RESTRICT;
+                FOREIGN KEY ("createdById") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
         END IF;
     END $$`,
 ];
