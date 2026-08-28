@@ -8,6 +8,7 @@ import JobInfoCard from "./JobInfoCard";
 import InspectionsPanel from "./InspectionsPanel";
 import { formatCurrency } from "@/lib/utils";
 import { resolveDocUrl } from "@/lib/secure-storage";
+import { sortInspectionTimeline } from "@/lib/inspection-core";
 
 export const dynamic = "force-dynamic";
 
@@ -97,14 +98,15 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
 
     const inspectionsPromise = prisma.inspection.findMany({
         where: { projectId: id },
-        orderBy: [{ scheduledDate: "desc" }, { createdAt: "desc" }],
+        orderBy: { createdAt: "desc" },
         select: {
             id: true, type: true, result: true, scheduledDate: true, performedDate: true,
             inspector: true, notes: true, customerNote: true, sharedToPortal: true,
+            permitId: true, createdAt: true,
         },
     });
 
-    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspections] = await Promise.all([
+    const [project, tasks, portalVisibility, recentActivity, recentFiles, permitStatuses, inspectionRows] = await Promise.all([
         projectPromise,
         tasksPromise,
         portalVisibilityPromise,
@@ -113,6 +115,7 @@ export default async function ProjectDashboardPage({ params }: { params: Promise
         permitsPromise,
         inspectionsPromise,
     ]);
+    const inspections = sortInspectionTimeline(inspectionRows);
 
     console.log(`[DASHBOARD] TOTAL QUERY RESOLUTION TIME: ${Date.now() - t0}ms`);
 

@@ -17,6 +17,7 @@ import PortalProjectTracker from "./PortalProjectTracker";
 import { formatMoneyDate } from "@/lib/payment-date";
 import PortalStagePin from "./PortalStagePin";
 import PortalUpdatesFeed from "./PortalUpdatesFeed";
+import { hasScheduledReinspection } from "@/lib/inspection-core";
 import {
     CLIENT_STAGES,
     getPortalProjectTracker,
@@ -144,7 +145,8 @@ export default async function PortalProjectDetail(props: {
             })
             : Promise.resolve([]),
         // This is intentionally row-level sharing. Internal notes and the
-        // inspector identity never reach the client query.
+        // inspector identity never reach the client query. createdAt defines
+        // the recent-update ordering shown in the overview.
         prisma.inspection.findMany({
             where: {
                 projectId,
@@ -152,7 +154,7 @@ export default async function PortalProjectDetail(props: {
                 result: { in: ["SCHEDULED", "PASSED", "FAILED", "PARTIAL"] },
             },
             orderBy: { createdAt: "desc" },
-            select: { id: true, type: true, result: true, scheduledDate: true, performedDate: true, customerNote: true },
+            select: { id: true, type: true, result: true, scheduledDate: true, performedDate: true, customerNote: true, permitId: true, createdAt: true },
         }),
     ]);
 
@@ -299,25 +301,22 @@ export default async function PortalProjectDetail(props: {
                                     <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center" aria-hidden>
                                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.6-2.6a9 9 0 11-13.2 0 9 9 0 0113.2 0z" /></svg>
                                     </div>
-                                    <div><h2 id="portal-inspections-heading" className="font-semibold text-hui-textMain">Inspections</h2><p className="text-sm text-hui-textMuted">Latest inspection updates for your project</p></div>
+                                    <div><h2 id="portal-inspections-heading" className="font-semibold text-hui-textMain">Inspections</h2><p className="text-sm text-hui-textMuted">Recent inspection updates for your project</p></div>
                                 </div>
                                 <div className="divide-y divide-hui-border">
                                     {inspections.map(inspection => {
-                                        if (inspection.result === "FAILED") {
-                                            return <div key={inspection.id} className="px-5 py-4"><p className="font-medium text-hui-textMain">Re-inspection scheduled</p></div>;
-                                        }
-                                        if (inspection.result === "PARTIAL") {
-                                            return <div key={inspection.id} className="px-5 py-4"><p className="font-medium text-hui-textMain">Inspection follow-up in progress</p></div>;
-                                        }
                                         const scheduled = inspection.result === "SCHEDULED";
                                         const date = scheduled ? inspection.scheduledDate : inspection.performedDate;
+                                        const reinspectionScheduled = !inspection.customerNote &&
+                                            (inspection.result === "FAILED" || inspection.result === "PARTIAL") &&
+                                            hasScheduledReinspection(inspection, inspections);
                                         return (
                                             <div key={inspection.id} className="px-5 py-4 flex gap-3">
-                                                <span className={`mt-1.5 h-2 w-2 rounded-full shrink-0 ${scheduled ? "bg-blue-500" : "bg-emerald-500"}`} aria-hidden />
+                                                <span className={`mt-1.5 h-2 w-2 rounded-full shrink-0 ${scheduled ? "bg-blue-500" : inspection.result === "PASSED" ? "bg-emerald-500" : "bg-amber-500"}`} aria-hidden />
                                                 <div>
                                                     <p className="font-medium text-hui-textMain">{inspection.type}</p>
-                                                    <p className="text-sm text-hui-textMuted mt-0.5">{scheduled ? "Inspection scheduled" : "Passed"}{date ? ` · ${formatPermitDate(date)}` : ""}</p>
-                                                    {!scheduled && inspection.customerNote && <p className="text-sm text-hui-textMain mt-2">{inspection.customerNote}</p>}
+                                                    <p className="text-sm text-hui-textMuted mt-0.5">{reinspectionScheduled ? "Re-inspection scheduled" : `${scheduled ? "Inspection scheduled" : "Inspection update"}${date ? ` · ${formatPermitDate(date)}` : ""}`}</p>
+                                                    {inspection.customerNote && <p className="text-sm text-hui-textMain mt-2">{inspection.customerNote}</p>}
                                                 </div>
                                             </div>
                                         );

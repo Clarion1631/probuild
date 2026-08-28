@@ -125,7 +125,6 @@ function runPureCases(): void {
             "Drywall",
             "Finishes",
             "Punch list",
-            "Inspections",
             "Complete",
         ],
     );

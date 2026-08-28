@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
     assertInspectionLinksBelongToProject,
     defaultInspectionShare,
+    hasScheduledReinspection,
     inspectionResult,
     parseInspectionDate,
     requireInspectionDate,
@@ -23,6 +24,20 @@ test("passed inspections share by default and explicit manager choices win", () 
     assert.equal(defaultInspectionShare("FAILED", undefined), false);
     assert.equal(defaultInspectionShare("PASSED", false), false);
     assert.equal(defaultInspectionShare("PARTIAL", true), true);
+});
+
+test("a portal re-inspection message requires a later scheduled row for the same permit and type", () => {
+    const failed = {
+        id: "failed", type: "Rough electrical", result: "FAILED", permitId: "permit-a",
+        createdAt: new Date("2026-08-20T00:00:00.000Z"), scheduledDate: null, performedDate: new Date("2026-08-20T00:00:00.000Z"),
+    };
+    const followUp = {
+        id: "scheduled", type: "Rough electrical", result: "SCHEDULED", permitId: "permit-a",
+        createdAt: new Date("2026-08-21T00:00:00.000Z"), scheduledDate: new Date("2026-08-25T00:00:00.000Z"), performedDate: null,
+    };
+    assert.equal(hasScheduledReinspection(failed, [failed, followUp]), true);
+    assert.equal(hasScheduledReinspection(failed, [{ ...followUp, permitId: "permit-b" }]), false);
+    assert.equal(hasScheduledReinspection(failed, [{ ...followUp, createdAt: new Date("2026-08-19T00:00:00.000Z") }]), false);
 });
 
 test("inspection links are rejected when they do not belong to the project", async () => {

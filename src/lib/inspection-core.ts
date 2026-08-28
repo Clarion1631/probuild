@@ -32,6 +32,41 @@ export function defaultInspectionShare(result: InspectionResult, sharedToPortal:
     return sharedToPortal ?? result === "PASSED";
 }
 
+export type InspectionTimelineEntry = {
+    id: string;
+    type: string;
+    result: string;
+    permitId: string | null;
+    createdAt: Date;
+    scheduledDate: Date | null;
+    performedDate: Date | null;
+};
+
+export function inspectionTimelineDate(inspection: InspectionTimelineEntry): Date {
+    return inspection.performedDate ?? inspection.scheduledDate ?? inspection.createdAt;
+}
+
+/** A portal re-inspection message needs a real later scheduled inspection. */
+export function hasScheduledReinspection(
+    inspection: InspectionTimelineEntry,
+    inspections: readonly InspectionTimelineEntry[],
+): boolean {
+    return inspections.some(candidate =>
+        candidate.id !== inspection.id &&
+        candidate.result === "SCHEDULED" &&
+        candidate.type === inspection.type &&
+        candidate.permitId === inspection.permitId &&
+        candidate.createdAt > inspection.createdAt,
+    );
+}
+
+export function sortInspectionTimeline<T extends InspectionTimelineEntry>(inspections: readonly T[]): T[] {
+    return [...inspections].sort((a, b) => {
+        const dateDifference = inspectionTimelineDate(b).getTime() - inspectionTimelineDate(a).getTime();
+        return dateDifference || b.createdAt.getTime() - a.createdAt.getTime();
+    });
+}
+
 export async function assertInspectionLinksBelongToProject(
     db: InspectionLinkDb,
     projectId: string,
