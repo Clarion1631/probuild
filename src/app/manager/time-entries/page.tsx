@@ -5,9 +5,10 @@ import { toNum } from "@/lib/prisma-helpers";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
+import { markTimeEntryReviewed } from "@/lib/actions";
 
 interface Props {
-    searchParams: Promise<{ userId?: string; projectId?: string; dateFrom?: string; dateTo?: string; tab?: string }>;
+    searchParams: Promise<{ userId?: string; projectId?: string; dateFrom?: string; dateTo?: string; tab?: string; flagged?: string }>;
 }
 
 export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
@@ -22,11 +23,12 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
         return <div className="p-8 text-red-500">Access Denied. Managers Only.</div>;
     }
 
-    const { userId, projectId, dateFrom, dateTo, tab = 'time' } = await searchParams;
+    const { userId, projectId, dateFrom, dateTo, tab = 'time', flagged } = await searchParams;
 
     const where: any = {};
     if (userId) where.userId = userId;
     if (projectId) where.projectId = projectId;
+    if (flagged === '1') where.needsReview = true;
     if (dateFrom || dateTo) {
         where.startTime = {};
         if (dateFrom) where.startTime.gte = new Date(dateFrom);
@@ -44,6 +46,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
         prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: 'asc' } }),
     ]);
 
+    const flaggedCount = entries.filter(e => e.needsReview).length;
     const totalHours = entries.reduce((acc, e) => acc + (e.durationHours || 0), 0);
     const totalCost = entries.reduce((acc, e) => acc + toNum(e.laborCost) + toNum(e.burdenCost), 0);
     const totalBillable = entries.reduce((acc, e) => acc + toNum(e.laborCost), 0);
@@ -61,6 +64,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     if (projectId) filterParams.set('projectId', projectId);
     if (dateFrom) filterParams.set('dateFrom', dateFrom);
     if (dateTo) filterParams.set('dateTo', dateTo);
+    if (flagged === '1') filterParams.set('flagged', '1');
 
     const tabLink = (t: string) => {
         const p = new URLSearchParams(filterParams);
@@ -133,8 +137,12 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                     <label className="text-xs font-medium text-hui-textMuted">To</label>
                     <input type="date" name="dateTo" defaultValue={dateTo || ""} className="hui-input text-sm py-1.5" />
                 </div>
+                <label className="flex items-center gap-1.5 text-sm text-hui-textMain py-1.5">
+                    <input type="checkbox" name="flagged" value="1" defaultChecked={flagged === '1'} className="rounded border-hui-border" />
+                    Needs review only
+                </label>
                 <button type="submit" className="hui-btn hui-btn-primary text-sm py-1.5 px-4">Filter</button>
-                {(userId || projectId || dateFrom || dateTo) && (
+                {(userId || projectId || dateFrom || dateTo || flagged === '1') && (
                     <Link href={tabLink(tab)} className="hui-btn text-sm py-1.5 px-4">Clear</Link>
                 )}
             </form>
@@ -156,6 +164,11 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                 <div className="hui-card p-6 border-l-[3px] border-l-[#ec4899]">
                     <div className="text-xs font-medium text-hui-textMuted mb-1">Entries</div>
                     <div className="text-3xl font-bold text-hui-textMain">{entries.length}</div>
+                    {flaggedCount > 0 && (
+                        <Link href={`/manager/time-entries?${(() => { const p = new URLSearchParams(filterParams); p.set('flagged', '1'); return p.toString(); })()}`} className="text-xs font-medium text-amber-700 hover:underline">
+                            {flaggedCount} need{flaggedCount === 1 ? 's' : ''} review →
+                        </Link>
+                    )}
                 </div>
             </div>
 
@@ -229,7 +242,21 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {formatCurrency(total)}
                                                 </td>
                                                 <td className="px-5 py-3 text-center text-xs">
-                                                    {e.editedByManagerId ? (
+                                                    {e.needsReview ? (
+                                                        <div className="flex flex-col items-center gap-1">
+                                                            <span
+                                                                className="text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200"
+                                                                title={e.reviewReason || (e.mealSkipped ? "Meal break waived by worker" : "Flagged for review")}
+                                                            >
+                                                                Needs review{e.mealSkipped ? " · meal waived" : ""}
+                                                            </span>
+                                                            <form action={async () => { "use server"; await markTimeEntryReviewed(e.id); }}>
+                                                                <button type="submit" className="text-hui-textMuted hover:text-hui-textMain underline">
+                                                                    Mark reviewed
+                                                                </button>
+                                                            </form>
+                                                        </div>
+                                                    ) : e.editedByManagerId ? (
                                                         <span className="text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">Edited</span>
                                                     ) : (
                                                         <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded border border-green-200">Original</span>

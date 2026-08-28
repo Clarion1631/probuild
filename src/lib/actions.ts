@@ -14791,3 +14791,34 @@ export async function confirmBankImageMatch(input: {
     revalidatePath("/automation");
     return { success: true };
 }
+
+/**
+ * Mark a flagged time entry as reviewed by a manager. Used by the
+ * /manager/time-entries "Needs review" queue (WA meal-waiver attestations set
+ * needsReview=true at clock-out; this is the human acknowledgment that closes
+ * the loop). The waiver note in `notes` is preserved — only the flag clears —
+ * and the reviewer + timestamp are appended so the audit trail survives.
+ */
+export async function markTimeEntryReviewed(entryId: string) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true, email: true, role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+
+    const entry = await prisma.timeEntry.findUnique({ where: { id: entryId }, select: { id: true, needsReview: true, notes: true } });
+    if (!entry) throw new Error("Time entry not found");
+    if (!entry.needsReview) return { success: true }; // already reviewed — idempotent
+
+    const stamp = `[Reviewed by ${user.name || user.email} ${new Date().toISOString().slice(0, 10)}]`;
+    await prisma.timeEntry.update({
+        where: { id: entryId },
+        data: {
+            needsReview: false,
+            notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
+        },
+    });
+
+    revalidatePath("/manager/time-entries");
+    return { success: true };
+}
