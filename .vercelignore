@@ -50,11 +50,15 @@ _review-round2.diff
 
 # Gitignored locally but uploaded by CLI (Tailwind scans them on Vercel where
 # no .git exists; the mangled Users* dir name has invalid-codepoint chars)
+# ROOT-ANCHORED: an unanchored Users* also matched src/app/api/users at build
+# time (case-insensitive), silently dropping the /api/users route from every
+# deploy — the Team Members page showed "No team members found" because its
+# API did not exist in prod. Anchor junk-dir patterns to the root.
 .agents
 .superpowers
 playwright-report
 _context
-Users*
+/Users*
 *.ndjson
 
 # Leftover one-off automation scripts in repo root; their raw Windows paths

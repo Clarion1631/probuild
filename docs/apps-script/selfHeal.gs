@@ -187,6 +187,7 @@ function pipelineSelfHeal() {
       freed.join("\n  ") + "\n\n" +
       "No action needed — this message exists so the recovery is visible.");
   }
+
 }
 
 /** Hourly canary. Alerts the moment ANY model stops working. */

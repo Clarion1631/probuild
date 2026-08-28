@@ -54,29 +54,119 @@ function readFlagValue(flag) {
 export function targetMatches(actual, expectDb, expectHost) {
     if (!actual || typeof actual !== "object") return false;
     if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
-    const host = String(actual.host ?? "");
-    const wanted = String(expectHost ?? "");
-    if (host === wanted) return true;
-    return host !== "" && wanted !== "" && (host.includes(wanted) || wanted.includes(host));
+    return String(actual.host ?? "") === String(expectHost ?? "");
 }
 
 export const NEW_COLUMNS = ["payerName", "memoText", "extractedAt", "extractionModel"];
+export const FOUNDATION_TABLES = ["BankImage", "BankImageMatch"];
+
+// PostgreSQL constraint names are only unique per relation. Both the DDL
+// guard and post-DDL verification must use this exact relation predicate.
+export const BANK_IMAGE_CONSTRAINT_QUERY = `SELECT 1 AS ok
+    FROM pg_constraint
+    WHERE conname = 'BankImage_extraction_pair'
+      AND conrelid = 'public."BankImage"'::regclass`;
+
+// This is intentionally read-only. It runs before individual DDL statements,
+// because those statements cannot be one transaction with every production
+// deployment path that invokes this script.
+export const BANK_IMAGE_FOUNDATION_PREFLIGHT_QUERY = `SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_type = 'BASE TABLE'
+      AND table_name IN ('BankImage', 'BankImageMatch')`;
+
+export function missingFoundationTables(rows) {
+    const found = new Set(rows.map(row => row.table_name));
+    return FOUNDATION_TABLES.filter(table => !found.has(table));
+}
+
+export function wrongColumnDefinitions(rows) {
+    const found = new Map(rows.map(row => [row.column_name, row]));
+    const expected = new Map([
+        ["payerName", { dataType: "text" }],
+        ["memoText", { dataType: "text" }],
+        ["extractedAt", { dataType: "timestamp with time zone", datetimePrecision: 6 }],
+        ["extractionModel", { dataType: "text" }],
+    ]);
+    return NEW_COLUMNS.filter(column => {
+        const actual = found.get(column);
+        const requirement = expected.get(column);
+        return !actual || !requirement
+            || actual.data_type !== requirement.dataType
+            || (requirement.datetimePrecision !== undefined
+                && Number(actual.datetime_precision) !== requirement.datetimePrecision);
+    });
+}
+
+export function constraintDefinitionMatches(definition) {
+    const normalized = String(definition ?? "").replace(/\s+/g, "");
+    return /^CHECK\(\(+"extractedAt"ISNULL\)=\("extractionModel"ISNULL\)\)+$/.test(normalized);
+}
 
 export const statements = [
-    `ALTER TABLE "BankImage" ADD COLUMN IF NOT EXISTS "payerName" TEXT`,
-    `ALTER TABLE "BankImage" ADD COLUMN IF NOT EXISTS "memoText" TEXT`,
-    `ALTER TABLE "BankImage" ADD COLUMN IF NOT EXISTS "extractedAt" TIMESTAMPTZ(6)`,
-    `ALTER TABLE "BankImage" ADD COLUMN IF NOT EXISTS "extractionModel" TEXT`,
+    `ALTER TABLE public."BankImage" ADD COLUMN IF NOT EXISTS "payerName" TEXT`,
+    `ALTER TABLE public."BankImage" ADD COLUMN IF NOT EXISTS "memoText" TEXT`,
+    `ALTER TABLE public."BankImage" ADD COLUMN IF NOT EXISTS "extractedAt" TIMESTAMPTZ(6)`,
+    `ALTER TABLE public."BankImage" ADD COLUMN IF NOT EXISTS "extractionModel" TEXT`,
 
     // The extractor stamps extractedAt and extractionModel together — a row
     // claiming extraction without saying what did it (or vice versa) is a bug.
     `DO $$ BEGIN
-       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'BankImage_extraction_pair') THEN
-         ALTER TABLE "BankImage" ADD CONSTRAINT "BankImage_extraction_pair"
+       IF NOT EXISTS (${BANK_IMAGE_CONSTRAINT_QUERY}) THEN
+         ALTER TABLE public."BankImage" ADD CONSTRAINT "BankImage_extraction_pair"
            CHECK (("extractedAt" IS NULL) = ("extractionModel" IS NULL));
        END IF;
      END $$`,
 ];
+
+export async function runPayerExtractionMigration({ prisma, expectDb, expectHost, write = console.log }) {
+    const [actual] = await prisma.$queryRawUnsafe(
+        `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
+    );
+    write(`connected to db="${actual?.db ?? "<unknown>"}" host="${actual?.host ?? "<unknown>"}"`);
+    if (!targetMatches(actual, expectDb, expectHost)) {
+        throw new Error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual?.db ?? "<unknown>"}" host="${actual?.host ?? "<unknown>"}".`);
+    }
+
+    // Verify the pre-existing image/match foundation before the first
+    // non-transactional DDL statement can make a partial schema change.
+    const foundationRows = await prisma.$queryRawUnsafe(BANK_IMAGE_FOUNDATION_PREFLIGHT_QUERY);
+    const missingFoundation = missingFoundationTables(foundationRows);
+    if (missingFoundation.length) {
+        throw new Error(`PREFLIGHT FAILED: missing foundation table(s): ${missingFoundation.join(", ")}`);
+    }
+    write(`preflight verified ${FOUNDATION_TABLES.join(" + ")} foundation`);
+
+    for (const sql of statements) {
+        const label = sql.replace(/\s+/g, " ").slice(0, 84);
+        write(`  ${label} ...`);
+        await prisma.$executeRawUnsafe(sql);
+        write("ok");
+    }
+
+    // Verify shape rather than trusting the run. PostgreSQL reports the
+    // timestamp precision separately from data_type, so check both.
+    const rows = await prisma.$queryRawUnsafe(
+        `SELECT column_name, data_type, datetime_precision FROM information_schema.columns WHERE table_schema='public' AND table_name='BankImage'`,
+    );
+    const missing = NEW_COLUMNS.filter(column => !rows.some(row => row.column_name === column));
+    if (missing.length) {
+        throw new Error(`VERIFY FAILED: BankImage missing columns: ${missing.join(", ")}`);
+    }
+    const wrongDefinitions = wrongColumnDefinitions(rows);
+    if (wrongDefinitions.length) {
+        throw new Error(`VERIFY FAILED: BankImage has wrong column type or precision: ${wrongDefinitions.join(", ")}`);
+    }
+    const [pair] = await prisma.$queryRawUnsafe(
+        BANK_IMAGE_CONSTRAINT_QUERY.replace("SELECT 1 AS ok", "SELECT pg_get_constraintdef(oid, true) AS definition"),
+    );
+    if (!pair || !constraintDefinitionMatches(pair.definition)) {
+        throw new Error("VERIFY FAILED: BankImage_extraction_pair missing or has the wrong invariant");
+    }
+    write(`verified ${NEW_COLUMNS.length} columns + 1 constraint`);
+    write("\nCheck-payer extraction migration applied and verified.");
+}
 
 async function main() {
     if (process.argv.includes("--dry-run")) {
@@ -87,56 +177,19 @@ async function main() {
     }
 
     if (!process.argv.includes("--yes")) {
-        console.error("Refusing to run without --yes (and --expect-db / --expect-host). Use --dry-run to preview.");
-        process.exit(1);
+        throw new Error("Refusing to run without --yes (and --expect-db / --expect-host). Use --dry-run to preview.");
     }
     const expectDb = readFlagValue("--expect-db") ?? process.env.BANK_LEDGER_EXPECT_DB;
     const expectHost = readFlagValue("--expect-host") ?? process.env.BANK_LEDGER_EXPECT_HOST;
     if (!expectDb || !expectHost) {
-        console.error("Both --expect-db and --expect-host are required (or BANK_LEDGER_EXPECT_DB / BANK_LEDGER_EXPECT_HOST).");
-        process.exit(1);
+        throw new Error("Both --expect-db and --expect-host are required (or BANK_LEDGER_EXPECT_DB / BANK_LEDGER_EXPECT_HOST).");
     }
 
     const { url, from } = resolveDatabaseUrl();
     console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
     const prisma = new PrismaClient({ datasources: { db: { url } } });
-
     try {
-        const [actual] = await prisma.$queryRawUnsafe(
-            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
-        );
-        console.log(`connected to db="${actual.db}" host="${actual.host}"`);
-        if (!targetMatches(actual, expectDb, expectHost)) {
-            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
-            process.exit(1);
-        }
-
-        for (const sql of statements) {
-            const label = sql.replace(/\s+/g, " ").slice(0, 84);
-            process.stdout.write(`  ${label} ... `);
-            await prisma.$executeRawUnsafe(sql);
-            console.log("ok");
-        }
-
-        // Verify shape rather than trusting the run.
-        const rows = await prisma.$queryRawUnsafe(
-            `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='BankImage'`,
-        );
-        const found = new Set(rows.map(r => r.column_name));
-        const missing = NEW_COLUMNS.filter(c => !found.has(c));
-        if (missing.length) {
-            console.error(`VERIFY FAILED: BankImage missing columns: ${missing.join(", ")}`);
-            process.exit(1);
-        }
-        const [pair] = await prisma.$queryRawUnsafe(
-            `SELECT 1 AS ok FROM pg_constraint WHERE conname = 'BankImage_extraction_pair'`,
-        );
-        if (!pair) {
-            console.error("VERIFY FAILED: constraint BankImage_extraction_pair missing");
-            process.exit(1);
-        }
-        console.log(`verified ${NEW_COLUMNS.length} columns + 1 constraint`);
-        console.log("\nCheck-payer extraction migration applied and verified.");
+        await runPayerExtractionMigration({ prisma, expectDb, expectHost });
     } finally {
         await prisma.$disconnect();
     }

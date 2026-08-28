@@ -137,6 +137,59 @@ function chatPostMessage(spaceName, text) {
   return true;
 }
 
+/**
+ * Reply INTO an existing thread via the Chat API, instead of posting a new
+ * top-level message. Used by sweepChatReceipts.gs so "got it, thanks!" lands
+ * next to the photo it's replying to instead of at the bottom of the space.
+ * REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD means a thread that can no longer
+ * take replies (e.g. deleted) still gets the message, just as a new thread,
+ * so this never silently drops it. Requires chat.messages scope AND that
+ * this account is a member of the space. Never throws.
+ *
+ * Returns the created message's resource name (a truthy string) on success,
+ * false on failure. This runs under the jadkins@ USER token, not a bot
+ * token, so the reply it posts comes back from messages.list on a later
+ * sweep pass looking exactly like a human message from Justin. Returning the
+ * name lets the caller (chatSweepReply_ in sweepChatReceipts.gs) record it as
+ * already-SEEN immediately, so the sweep never reprocesses its own reply.
+ */
+function chatReplyInThread_(spaceName, threadName, text) {
+  if (!spaceName || !threadName) {
+    Logger.log("chatReplyInThread_ needs spaceName and threadName");
+    return false;
+  }
+  const token = ScriptApp.getOAuthToken();
+  const res = UrlFetchApp.fetch(
+    "https://chat.googleapis.com/v1/" + spaceName +
+    "/messages?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD", {
+      method: "post",
+      contentType: "application/json; charset=UTF-8",
+      headers: { Authorization: "Bearer " + token },
+      payload: JSON.stringify({
+        text: String(text).slice(0, 4000),
+        thread: { name: threadName }
+      }),
+      muteHttpExceptions: true
+    });
+  const code = res.getResponseCode();
+  if (code !== 200) {
+    Logger.log("[CHAT] reply HTTP " + code + ": " + res.getContentText().slice(0, 300));
+    return false;
+  }
+  try {
+    const body = JSON.parse(res.getContentText() || "{}");
+    if (!body.name) {
+      Logger.log("[CHAT] reply HTTP 200 but response had no message name");
+      return false;
+    }
+    Logger.log("Replied in thread " + threadName + " (message " + body.name + ")");
+    return body.name;
+  } catch (e) {
+    Logger.log("[CHAT] reply HTTP 200 but failed to parse response: " + e);
+    return false;
+  }
+}
+
 /** Store the webhook URL. Run once, then blank the argument out of history. */
 function setChatWebhook(url) {
   if (!url) {

@@ -188,6 +188,12 @@ function runReceiptAutomation() {
   }
   RECEIPT_RUN_LOCK_HELD_ = true;
   try {
+    // Sweep the "Receipts Need Review" Chat space for photo/PDF replies
+    // (sweepChatReceipts.gs). Hosted here, under this run's lock, so it runs
+    // every 10 min on a trigger that is known to fire; isolated so a sweep
+    // failure can never break receipt processing.
+    try { sweepChatReceipts(); } catch (e) { Logger.log("[CHAT SWEEP] " + e); }
+
     // Nothing this scan does is useful without mail: every path either forwards a document
     // to QuickBooks or has to tell a human why it didn't. With no quota left, processing
     // would only burn each file's retry counters — six passes of that is about an hour, and
