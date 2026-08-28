@@ -6,7 +6,6 @@ import { useRouter } from "next/navigation";
 
 type ClockInSuggestion = {
     scheduleTaskId: string;
-    clockInEstimateItemId: string;
     costCodeId: string;
     costCodeLabel: string;
     taskName: string;
@@ -25,8 +24,13 @@ export default function TimeClockPage() {
     const [projects, setProjects] = useState<any[]>([]);
     const [selectedProject, setSelectedProject] = useState<string>("");
 
-    const [budgetBuckets, setBudgetBuckets] = useState<any[]>([]);
-    const [selectedBucket, setSelectedBucket] = useState<string>("");
+    // PHASES ONLY (owner's rule, 2026-08): the crew picks a cost-code phase, never an
+    // individual estimate line item. Same endpoint and same rule set as the crew app —
+    // GET /api/projects/[id]/cost-codes, backed by src/lib/project-phases.ts, which is
+    // also what POST /api/time-entries validates against, so what this lists is exactly
+    // what the server accepts.
+    const [phases, setPhases] = useState<{ id: string; code: string; name: string; isActive?: boolean }[]>([]);
+    const [selectedPhase, setSelectedPhase] = useState<string>("");
 
     const [suggestion, setSuggestion] = useState<ClockInSuggestion | null>(null);
     // True once the user has picked a phase themselves — the suggestion preselect
@@ -79,7 +83,7 @@ export default function TimeClockPage() {
                     setStatus("Clocked In");
                     setCurrentTimeEntryId(active.id);
                     setSelectedProject(active.projectId);
-                    setSelectedBucket(active.estimateItemId || "");
+                    setSelectedPhase(active.costCodeId || "");
                 }
             })
             .catch(e => {
@@ -107,8 +111,8 @@ export default function TimeClockPage() {
 
     useEffect(() => {
         if (!selectedProject) {
-            setBudgetBuckets([]);
-            setSelectedBucket("");
+            setPhases([]);
+            setSelectedPhase("");
             setSuggestion(null);
             userPickedBucket.current = false;
             return;
@@ -121,64 +125,58 @@ export default function TimeClockPage() {
         // for the previous project must not overwrite the current one's state.
         const controller = new AbortController();
 
-        fetch(`/api/projects/${selectedProject}/estimate-items`, { signal: controller.signal })
-            .then(res => res.json())
+        setBucketsError("");
+        fetch(`/api/projects/${selectedProject}/cost-codes`, { signal: controller.signal })
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => {
                 if (Array.isArray(data)) {
-                    setBudgetBuckets(data);
+                    // Mirror the server's list EXACTLY (no extra client filtering):
+                    // POST /api/time-entries accepts precisely this list, and a
+                    // client-only filter would let a preselected suggestion point at
+                    // a phase with no <option>, clocking in behind a blank picker.
+                    setPhases(data.filter((c: any) => c && c.id));
                 }
             })
             .catch(e => {
                 if (e.name === "AbortError") return;
-                console.error("Could not fetch estimate items", e);
-                setBucketsError("Failed to load budget phases");
+                console.error("Could not fetch project phases", e);
+                setBucketsError("Failed to load phases");
             });
 
         // Suggested task for today (from the latest daily log / schedule).
-        // Best-effort: a failure here must never block clocking in.
+        // Best-effort: a failure here must never block clocking in. Skipped while
+        // clocked in — the restored shift's phase must not be overwritten by
+        // today's suggestion (the banner would then label the shift wrong).
+        if (status === "Clocked In") return () => controller.abort();
         fetch(`/api/mobile/time-suggestion?projectId=${selectedProject}`, { signal: controller.signal })
             .then(res => res.ok ? res.json() : { suggestion: null })
             .then(data => {
                 const s: ClockInSuggestion | null = data?.suggestion ?? null;
                 setSuggestion(s);
-                if (s && !userPickedBucket.current) {
-                    setSelectedBucket(s.clockInEstimateItemId);
-                }
             })
             .catch(() => { /* aborted or failed — no suggestion */ });
 
         return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- status is read only to skip the suggestion; re-running on every status flip would refetch phases mid-shift
     }, [selectedProject]);
 
-    // Phase-code-grouped picker: groups ordered by cost code; codeless items
-    // surface last, flagged — every estimate item is supposed to carry a phase
-    // code. When the project has more than one eligible estimate, the estimate
-    // title joins the group label so identical phases can't be confused.
-    const bucketGroups = useMemo(() => {
-        const estimateIds = new Set(budgetBuckets.map((b: any) => b.estimateId).filter(Boolean));
-        const multiEstimate = estimateIds.size > 1;
-        const groups = new Map<string, { label: string; items: any[] }>();
-        for (const bucket of budgetBuckets) {
-            const codeKey = bucket.costCode ? bucket.costCode.code : "~none";
-            const key = multiEstimate ? `${bucket.estimateId}|${codeKey}` : codeKey;
-            const baseLabel = bucket.costCode
-                ? `${bucket.costCode.code} — ${bucket.costCode.name}`
-                : "No phase code (fix in estimate)";
-            const label = multiEstimate && bucket.estimateTitle
-                ? `${bucket.estimateTitle}: ${baseLabel}`
-                : baseLabel;
-            if (!groups.has(key)) groups.set(key, { label, items: [] });
-            groups.get(key)!.items.push(bucket);
-        }
-        return [...groups.entries()]
-            .sort(([a], [b]) => {
-                const aNone = a.endsWith("~none");
-                const bNone = b.endsWith("~none");
-                if (aNone !== bNone) return aNone ? 1 : -1;
-                return a.localeCompare(b, undefined, { numeric: true });
-            })
-            .map(([, group]) => group);
-    }, [budgetBuckets]);
+    // Preselect today's suggested phase once BOTH the suggestion and the phase list are
+    // in (the two fetches are independent and can resolve in either order). Only if the
+    // phase is actually offered — otherwise the picker would show "Select a Phase..."
+    // over a hidden selection — and never over a manual pick.
+    useEffect(() => {
+        if (!suggestion || userPickedBucket.current) return;
+        if (phases.some(ph => ph.id === suggestion.costCodeId)) setSelectedPhase(suggestion.costCodeId);
+    }, [phases, suggestion]);
+
+    // Sorted by code — plain string sort, correct for zero-padded codes like "01-DEMO".
+    const sortedPhases = useMemo(
+        () => [...phases].sort((a, b) => a.code.localeCompare(b.code)),
+        [phases]
+    );
 
     const getLocation = (): Promise<{ lat: number, lng: number }> => {
         return new Promise((resolve, reject) => {
@@ -197,7 +195,7 @@ export default function TimeClockPage() {
         });
     };
 
-    const performClockIn = async (bucketId: string, overridden: boolean) => {
+    const performClockIn = async (phaseId: string, overridden: boolean) => {
         let loc = null;
         try {
             loc = await getLocation();
@@ -212,7 +210,9 @@ export default function TimeClockPage() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     projectId: selectedProject,
-                    estimateItemId: bucketId || null,
+                    // Phase-only punch. The server rejects any code that is not one of
+                    // this project's phases (PHASE_NOT_ON_PROJECT).
+                    costCodeId: phaseId || null,
                     latitude: loc?.lat,
                     longitude: loc?.lng,
                     ...(suggestion ? {
@@ -228,11 +228,13 @@ export default function TimeClockPage() {
 
             setStatus("Clocked In");
             setCurrentTimeEntryId(data.id);
-            if (bucketId !== selectedBucket) setSelectedBucket(bucketId);
+            if (phaseId !== selectedPhase) setSelectedPhase(phaseId);
         } catch (err: any) {
             setError(err.message);
         }
     };
+
+    const isLogistics = !!projects.find(p => p.id === selectedProject)?.isLogistics;
 
     const handleClockInOut = async () => {
         setError("");
@@ -243,12 +245,24 @@ export default function TimeClockPage() {
                 return;
             }
 
+            // A phase is required on every job EXCEPT Logistics (shop, travel,
+            // admin time has no estimate to attach to — the server's
+            // requiresPhaseForClockIn is the real rule; this only avoids a
+            // round-trip). Note an In Progress Logistics job still lists
+            // 32-SAFETY, so "has phases" alone cannot decide this.
+            if (!isLogistics && !selectedPhase) {
+                setError(phases.length > 0
+                    ? "Please select a phase before clocking in."
+                    : "This job has no phases set up yet. Contact the office to have phases added.");
+                return;
+            }
+
             // Red flag: picked something other than today's plan? Confirm first.
-            if (suggestion && selectedBucket !== suggestion.clockInEstimateItemId) {
+            if (suggestion && suggestion.costCodeId && selectedPhase !== suggestion.costCodeId) {
                 setConfirmMismatch(true);
                 return;
             }
-            await performClockIn(selectedBucket, false);
+            await performClockIn(selectedPhase, false);
         } else {
             let loc = null;
             try {
@@ -275,7 +289,7 @@ export default function TimeClockPage() {
                 setStatus("Clocked Out");
                 setCurrentTimeEntryId(null);
                 setSelectedProject("");
-                setSelectedBucket("");
+                setSelectedPhase("");
             } catch (err: any) {
                 setError(err.message);
             }
@@ -297,7 +311,14 @@ export default function TimeClockPage() {
                             <label className="block text-sm font-medium text-slate-700 mb-2">Project</label>
                             <select
                                 value={selectedProject}
-                                onChange={(e) => setSelectedProject(e.target.value)}
+                                onChange={(e) => {
+                                    // A phase belongs to one project: clear it (and the old
+                                    // list) here, not in the effect — the restore-on-load path
+                                    // sets project + phase together and must keep both.
+                                    setSelectedProject(e.target.value);
+                                    setSelectedPhase("");
+                                    setPhases([]);
+                                }}
                                 className="hui-input"
                             >
                                 <option value="">Select a Project...</option>
@@ -325,35 +346,34 @@ export default function TimeClockPage() {
                             </div>
                         )}
 
-                        {budgetBuckets.length > 0 && (
+                        {selectedProject && (
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-2">Budget Bucket (Phase)</label>
-                                <select
-                                    value={selectedBucket}
-                                    onChange={(e) => {
-                                        userPickedBucket.current = true;
-                                        setSelectedBucket(e.target.value);
-                                    }}
-                                    className="hui-input"
-                                >
-                                    <option value="">Select a Phase...</option>
-                                    {bucketGroups.map(group => (
-                                        <optgroup key={group.label} label={group.label}>
-                                            {group.items.map((b: any) => (
-                                                <option key={b.id} value={b.id}>
-                                                    {b.costCode ? `${b.costCode.code} — ` : ''}{b.name}
-                                                </option>
-                                            ))}
-                                        </optgroup>
-                                    ))}
-                                </select>
+                                <label className="block text-sm font-medium text-slate-700 mb-2">Phase</label>
+                                {sortedPhases.length > 0 ? (
+                                    <select
+                                        value={selectedPhase}
+                                        onChange={(e) => {
+                                            userPickedBucket.current = true;
+                                            setSelectedPhase(e.target.value);
+                                        }}
+                                        className="hui-input"
+                                    >
+                                        <option value="">Select a Phase...</option>
+                                        {sortedPhases.map(phase => (
+                                            <option key={phase.id} value={phase.id}>
+                                                {phase.code} — {phase.name}
+                                            </option>
+                                        ))}
+                                    </select>
+                                ) : !bucketsError ? (
+                                    // Never a bare empty list: an empty result is meaningful
+                                    // (same wording as the crew app's no-phases state).
+                                    <p className="text-xs text-amber-600">
+                                        This job&apos;s estimate has no phases set up yet. Contact the office to have phases added.
+                                    </p>
+                                ) : null}
                                 {bucketsError && (
                                     <p className="text-xs text-red-600 mt-1">{bucketsError}</p>
-                                )}
-                                {budgetBuckets.some((b: any) => !b.costCode) && (
-                                    <p className="text-xs text-amber-600 mt-1">
-                                        Some phases have no phase code — assign cost codes in the estimate.
-                                    </p>
                                 )}
                             </div>
                         )}
@@ -366,9 +386,9 @@ export default function TimeClockPage() {
                             <div className="text-sm text-green-800 font-medium">
                                 Currently working on: {projects.find(p => p.id === selectedProject)?.name || "Unknown Project"}
                             </div>
-                            {selectedBucket && (
+                            {selectedPhase && (
                                 <div className="text-xs text-green-700 mt-1">
-                                    Phase: {budgetBuckets.find(b => b.id === selectedBucket)?.name || ""}
+                                    Phase: {(() => { const p = phases.find(ph => ph.id === selectedPhase); return p ? `${p.code} — ${p.name}` : ""; })()}
                                 </div>
                             )}
                         </div>
@@ -389,7 +409,8 @@ export default function TimeClockPage() {
 
                 <button
                     onClick={handleClockInOut}
-                    className={`hui-btn w-full py-4 text-lg font-bold
+                    disabled={status === "Clocked Out" && !!selectedProject && !isLogistics && phases.length === 0}
+                    className={`hui-btn w-full py-4 text-lg font-bold disabled:opacity-50 disabled:cursor-not-allowed
                         ${status === 'Clocked In' ? 'bg-red-500 hover:bg-red-600 text-white' : 'hui-btn-green'}
                     `}
                 >
@@ -418,7 +439,8 @@ export default function TimeClockPage() {
                                 onClick={async () => {
                                     setConfirmMismatch(false);
                                     userPickedBucket.current = true;
-                                    await performClockIn(suggestion.clockInEstimateItemId, false);
+                                    setSelectedPhase(suggestion.costCodeId);
+                                    await performClockIn(suggestion.costCodeId, false);
                                 }}
                             >
                                 Use suggested task
@@ -427,7 +449,7 @@ export default function TimeClockPage() {
                                 className="hui-btn w-full"
                                 onClick={async () => {
                                     setConfirmMismatch(false);
-                                    await performClockIn(selectedBucket, true);
+                                    await performClockIn(selectedPhase, true);
                                 }}
                             >
                                 Keep my choice
