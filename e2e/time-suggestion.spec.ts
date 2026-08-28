@@ -263,9 +263,9 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             data: {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DRYW_ID,
-                // Deliberately WRONG client cost code — the server must charge
-                // the estimate item's code, not this.
-                costCodeId: COST_CODE_DEMO_ID,
+                // The selected estimate item owns the cost code. The client must
+                // submit that same code rather than a code from another phase.
+                costCodeId: COST_CODE_DRYW_ID,
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 suggestedCostCodeId: COST_CODE_DRYW_ID,
                 suggestionSource: "daily_log",
@@ -278,7 +278,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         createdEntryIds.add(created.id);
 
         const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
-        expect(entry.costCodeId).toBe(COST_CODE_DRYW_ID); // derived from estimateItemId, not the client-sent value
+        expect(entry.costCodeId).toBe(COST_CODE_DRYW_ID);
         expect(entry.suggestionOverridden).toBe(true);
         expect(entry.suggestedScheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
         expect(entry.suggestedTaskName).toBe("Hang drywall in hall bath");
@@ -286,6 +286,20 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         expect(entry.suggestionSource).toBe("daily_log");
 
         await prisma.timeEntry.delete({ where: { id: created.id } });
+    });
+
+    test("6b. POST /api/time-entries rejects a client cost code from another phase", async () => {
+        const res = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DRYW_ID,
+                costCodeId: COST_CODE_DEMO_ID,
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+
+        expect(res.status(), await res.text()).toBe(400);
+        await expect(res.json()).resolves.toMatchObject({ code: "ITEM_PHASE_MISMATCH" });
     });
 
     test("7. legacy POST without suggestion fields still derives the cost code", async () => {
@@ -309,7 +323,7 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         await prisma.timeEntry.delete({ where: { id: created.id } });
     });
 
-    test("7b. codeless estimate item never inherits a client-sent cost code", async () => {
+    test("7b. codeless estimate item rejects a stale client-sent cost code", async () => {
         await prisma.estimateItem.create({
             data: {
                 id: TSUG_ITEM_NOCODE_ID,
@@ -326,16 +340,9 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             data: { projectId: PROJECT_ID, estimateItemId: TSUG_ITEM_NOCODE_ID, costCodeId: COST_CODE_DEMO_ID },
             headers: { authorization: `Bearer ${fieldCrewToken}` },
         });
-        expect(res.ok(), await res.text()).toBeTruthy();
-        const created = await res.json();
-        createdEntryIds.add(created.id);
+        expect(res.status(), await res.text()).toBe(400);
+        expect(await res.json()).toMatchObject({ code: "ITEM_PHASE_MISMATCH" });
 
-        const entry = await prisma.timeEntry.findUniqueOrThrow({ where: { id: created.id } });
-        // The item decides the charge; a codeless item means NO cost code — the
-        // client-sent one must not sneak in.
-        expect(entry.costCodeId).toBeNull();
-
-        await prisma.timeEntry.delete({ where: { id: created.id } });
         await prisma.estimateItem.delete({ where: { id: TSUG_ITEM_NOCODE_ID } });
     });
 

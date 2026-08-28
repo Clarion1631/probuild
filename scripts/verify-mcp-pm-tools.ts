@@ -86,6 +86,7 @@ async function main() {
         "../src/lib/mcp-actor.ts",
         "../src/lib/project-folders.ts",
         "../src/lib/project-file-core.ts",
+        "../src/lib/google-drive-import-core.ts",
         "../src/lib/daily-log-core.ts",
         "../src/lib/mcp-pm-tools.ts",
         "./seed-richard-ai-user.mjs",
@@ -101,6 +102,8 @@ async function main() {
     const actorSource = source("../src/lib/mcp-actor.ts");
     const folderSource = source("../src/lib/project-folders.ts");
     const fileCoreSource = source("../src/lib/project-file-core.ts");
+    const driveImportSource = source("../src/lib/google-drive-import-core.ts");
+    const leadDriveSource = source("../src/lib/lead-drive.ts");
     const pmCoreSource = source("../src/lib/mcp-pm-tools.ts");
     const dailyCoreSource = source("../src/lib/daily-log-core.ts");
     const actionSource = source("../src/lib/actions.ts");
@@ -116,6 +119,7 @@ async function main() {
     for (const toolName of [
         "upload_file",
         "upload_files",
+        "import_google_drive_file",
         "list_project_files",
         "create_folder",
         "move_file",
@@ -155,6 +159,19 @@ async function main() {
     assert.match(folderSource, /mode:\s*"insensitive"|toLocaleLowerCase|toLowerCase/);
     assert.match(fileCoreSource, /MAX_UPLOAD_BYTES\s*=\s*3_300_000/);
     assert.match(fileCoreSource, /visibility\s*\?\?\s*"team"/);
+    assert.match(fileCoreSource, /uploadProjectFileBufferCore/);
+    assert.match(routeSource, /WRITE_TOOLS[\s\S]{0,600}"import_google_drive_file"/);
+    assert.match(routeSource, /ENTITY_TYPE_BY_TOOL[\s\S]{0,1200}import_google_drive_file:\s*"file"/);
+    assert.match(routeSource, /import_google_drive_file[\s\S]{0,1800}bare Drive file ID/);
+    assert.match(driveImportSource, /MAX_GOOGLE_DRIVE_IMPORT_BYTES\s*=\s*25\s*\*\s*1024\s*\*\s*1024/);
+    assert.match(driveImportSource, /application\/vnd\.google-apps\./);
+    assert.match(driveImportSource, /uploadProjectFileBufferCore/);
+    assert.match(driveImportSource, /validateProjectFileTarget/);
+    assert.match(driveImportSource, /maxBytes:\s*MAX_GOOGLE_DRIVE_IMPORT_BYTES/);
+    assert.match(driveImportSource, /const \{ url: _url, \.\.\.safeData \}/);
+    assert.doesNotMatch(driveImportSource, /webViewLink[\s\S]{0,250}data:/);
+    assert.match(leadDriveSource, /responseType:\s*"stream"/);
+    assert.match(leadDriveSource, /DriveFileTooLargeError/);
     assert.match(dailyCoreSource, /createdById:\s*actorUserId/);
     assert.match(actionSource, /createDailyLogCore/);
     // Customer-facing sends are "use server" exports, i.e. remotely invokable

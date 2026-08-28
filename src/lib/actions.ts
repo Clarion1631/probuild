@@ -26,6 +26,7 @@ import { canUseDevAuthFallback, currentStaffUserOrNull as currentStaffViewerOrNu
 import { logActivity } from "./activity-log";
 import { getDefaultSalesTaxRate } from "./sales-tax";
 import { withTxRetry, lockMoneyParents } from "./tx-retry";
+
 import { upsertEstimateItems, assertEstimateItemParentsInScope, EstimateStaleSaveError } from "./estimate-item-upsert";
 import { appendPunchItemsInTransaction } from "./punch-items";
 import { runDailyLogTaskMatch } from "./daily-log-task-match";
@@ -14821,4 +14822,141 @@ export async function markTimeEntryReviewed(entryId: string) {
 
     revalidatePath("/manager/time-entries");
     return { success: true };
+}
+
+// ============ Inspections CRUD ============
+
+const INSPECTION_RESULTS = ["SCHEDULED", "PASSED", "FAILED", "PARTIAL"] as const;
+type InspectionResult = (typeof INSPECTION_RESULTS)[number];
+
+type InspectionInput = {
+    type?: string;
+    result?: string;
+    scheduledDate?: string;
+    performedDate?: string;
+    inspector?: string;
+    notes?: string;
+    customerNote?: string;
+    sharedToPortal?: boolean;
+    permitId?: string;
+    scheduleTaskId?: string;
+};
+
+function inspectionResult(value: string | undefined, fallback: InspectionResult = "SCHEDULED"): InspectionResult {
+    if (value === undefined) return fallback;
+    if (!(INSPECTION_RESULTS as readonly string[]).includes(value)) throw new Error("Invalid inspection result");
+    return value as InspectionResult;
+}
+
+function parseInspectionDate(value: string | undefined, label: string): Date | null | undefined {
+    if (value === undefined) return undefined;
+    if (!value) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error(`${label} must use YYYY-MM-DD`);
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) throw new Error(`${label} is invalid`);
+    return parsed;
+}
+
+function requiredInspectionDate(result: InspectionResult, scheduledDate: Date | null, performedDate: Date | null) {
+    if (result === "SCHEDULED" && !scheduledDate) throw new Error("Scheduled inspections require a scheduled date");
+    if (result !== "SCHEDULED" && !performedDate) throw new Error(`${result} inspections require a performed date`);
+}
+
+function optionalText(value: string | undefined): string | null | undefined {
+    if (value === undefined) return undefined;
+    return value.trim() || null;
+}
+
+export async function createInspection(projectId: string, data: InspectionInput & { type: string }) {
+    const user = await assertProjectMemberStaff(projectId);
+    const type = data.type.trim();
+    if (!type) throw new Error("Inspection type is required");
+    const result = inspectionResult(data.result);
+    const scheduledDate = parseInspectionDate(data.scheduledDate, "Scheduled date") ?? null;
+    const performedDate = parseInspectionDate(data.performedDate, "Performed date") ?? null;
+    requiredInspectionDate(result, scheduledDate, performedDate);
+
+    const permitId = optionalText(data.permitId) ?? null;
+    const scheduleTaskId = optionalText(data.scheduleTaskId) ?? null;
+    if (permitId) {
+        const permit = await prisma.permit.findFirst({ where: { id: permitId, projectId }, select: { id: true } });
+        if (!permit) throw new Error("permitId does not belong to this project");
+    }
+    if (scheduleTaskId) {
+        const task = await prisma.scheduleTask.findFirst({ where: { id: scheduleTaskId, projectId }, select: { id: true } });
+        if (!task) throw new Error("scheduleTaskId does not belong to this project");
+    }
+
+    const inspection = await prisma.inspection.create({
+        data: {
+            projectId, type, result, scheduledDate, performedDate,
+            inspector: optionalText(data.inspector) ?? null,
+            notes: optionalText(data.notes) ?? null,
+            customerNote: optionalText(data.customerNote) ?? null,
+            sharedToPortal: data.sharedToPortal ?? result === "PASSED",
+            permitId,
+            scheduleTaskId,
+            createdById: user.id,
+        },
+    });
+
+    revalidatePath(`/projects/${projectId}`);
+    revalidatePath(`/portal/projects/${projectId}`);
+    return inspection;
+}
+
+export async function updateInspection(inspectionId: string, data: InspectionInput) {
+    const target = await prisma.inspection.findUnique({
+        where: { id: inspectionId },
+        select: { projectId: true, result: true, scheduledDate: true, performedDate: true, sharedToPortal: true },
+    });
+    if (!target) throw new Error("Inspection not found");
+    await assertProjectMemberStaff(target.projectId);
+
+    const result = inspectionResult(data.result, target.result as InspectionResult);
+    const scheduledDate = data.scheduledDate === undefined
+        ? target.scheduledDate
+        : parseInspectionDate(data.scheduledDate, "Scheduled date") ?? null;
+    const performedDate = data.performedDate === undefined
+        ? target.performedDate
+        : parseInspectionDate(data.performedDate, "Performed date") ?? null;
+    requiredInspectionDate(result, scheduledDate, performedDate);
+
+    const permitId = data.permitId === undefined ? null : optionalText(data.permitId) ?? null;
+    const scheduleTaskId = data.scheduleTaskId === undefined ? null : optionalText(data.scheduleTaskId) ?? null;
+    if (data.permitId !== undefined && permitId) {
+        const permit = await prisma.permit.findFirst({ where: { id: permitId, projectId: target.projectId }, select: { id: true } });
+        if (!permit) throw new Error("permitId does not belong to this project");
+    }
+    if (data.scheduleTaskId !== undefined && scheduleTaskId) {
+        const task = await prisma.scheduleTask.findFirst({ where: { id: scheduleTaskId, projectId: target.projectId }, select: { id: true } });
+        if (!task) throw new Error("scheduleTaskId does not belong to this project");
+    }
+
+    const updateData: Record<string, unknown> = {};
+    if (data.type !== undefined) {
+        const type = data.type.trim();
+        if (!type) throw new Error("Inspection type is required");
+        updateData.type = type;
+    }
+    if (data.result !== undefined) updateData.result = result;
+    if (data.scheduledDate !== undefined) updateData.scheduledDate = scheduledDate;
+    if (data.performedDate !== undefined) updateData.performedDate = performedDate;
+    if (data.inspector !== undefined) updateData.inspector = optionalText(data.inspector);
+    if (data.notes !== undefined) updateData.notes = optionalText(data.notes);
+    if (data.customerNote !== undefined) updateData.customerNote = optionalText(data.customerNote);
+    if (data.permitId !== undefined) updateData.permitId = permitId;
+    if (data.scheduleTaskId !== undefined) updateData.scheduleTaskId = scheduleTaskId;
+    if (data.sharedToPortal !== undefined) {
+        updateData.sharedToPortal = data.sharedToPortal;
+    } else if (data.result !== undefined) {
+        // Result changes re-apply the documented default. A caller that wants
+        // an exception must send sharedToPortal explicitly.
+        updateData.sharedToPortal = result === "PASSED";
+    }
+
+    const inspection = await prisma.inspection.update({ where: { id: inspectionId }, data: updateData });
+    revalidatePath(`/projects/${target.projectId}`);
+    revalidatePath(`/portal/projects/${target.projectId}`);
+    return inspection;
 }

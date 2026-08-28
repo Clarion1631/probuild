@@ -282,15 +282,16 @@ const MAX_ITERATIONS = 12;
 // iterations — a single model turn can contain many tool_use blocks at once.
 const MAX_TOOL_CALLS = 30;
 
-// Tools whose confirm step actually sends something to a client (email/etc).
-// The in-app help chat may only ever generate a preview for these — the send
-// itself must be completed from the ProBuild page, never from chat.
+// Tools whose confirm step either sends something or changes customer-visible
+// portal content. The in-app help chat may only ever generate a preview — the
+// human must complete the action from the ProBuild page or a connector.
 const UI_SEND_TOOLS = new Set([
   "send_estimate",
   "send_contract",
   "send_change_order",
   "send_milestone_invoice",
   "resend_invoice",
+  "record_inspection",
 ]);
 
 // Tools that COMMIT a billing artifact in one call — a fixed-price
