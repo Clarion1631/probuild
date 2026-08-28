@@ -203,7 +203,7 @@ const ENTITY_TYPE_BY_TOOL: Record<string, string> = {
 // Args whose VALUE is payload rather than intent — recording even a prefix
 // would turn the activity log into a document store readable by anyone with
 // ADMIN/MANAGER via get_activity_log. Logged as a marker, never the content.
-const AUDIT_REDACTED_ARGS = new Set(["contentBase64", "fileBase64", "bodyHtml", "body", "customMessage"]);
+const AUDIT_REDACTED_ARGS = new Set(["contentBase64", "fileBase64", "bodyHtml", "body", "customMessage", "notes", "customerNote"]);
 
 // Recursive sanitize (depth-capped): drop anything that looks like a
 // confirmation token, redact payload-bearing args outright, and cap remaining

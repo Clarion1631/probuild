@@ -335,31 +335,18 @@ function assignStageIndexes(tasks: readonly PortalTrackerTask[]): Map<string, nu
 export function buildProjectTracker(
     tasks: readonly PortalTrackerTask[],
     stageOverride?: string | null,
-    hasSharedScheduledInspection = false,
 ): ProjectTracker {
     const assigned = assignStageIndexes(tasks);
     const tasksByStage = CLIENT_STAGES.map((_, stageIndex) =>
         tasks.filter(task => assigned.get(task.id) === stageIndex),
     );
 
-    // A customer-shared scheduled inspection is client-facing work. Keep the
-    // rail at Inspections even if schedule tasks were marked complete early;
-    // unshared inspection rows must never influence the client view.
     const allProjectTasksComplete = tasks.length > 0
-        && tasks.every(isComplete)
-        && !hasSharedScheduledInspection;
+        && tasks.every(isComplete);
     const requestedOverrideIndex = stageOverride
         ? CLIENT_STAGES.findIndex(stage => stage.label === stageOverride)
         : -1;
-    const inspectionIndex = hasSharedScheduledInspection
-        ? clientStageIndex("Inspections")
-        : null;
-    // A staff override can hold a project at an earlier stage, but it cannot
-    // advance the client past a customer-shared inspection that is still
-    // scheduled. Otherwise an explicit Complete override hides live work.
-    const overrideIndex = inspectionIndex !== null && requestedOverrideIndex > inspectionIndex
-        ? inspectionIndex
-        : requestedOverrideIndex;
+    const overrideIndex = requestedOverrideIndex;
 
     let currentIndex = tasksByStage.findIndex(stageTasks =>
         stageTasks.length > 0
@@ -372,9 +359,6 @@ export function buildProjectTracker(
         );
     }
     if (currentIndex < 0 && tasks.length === 0) currentIndex = 0;
-    if (hasSharedScheduledInspection && overrideIndex < 0) {
-        if (inspectionIndex !== null) currentIndex = Math.max(currentIndex, inspectionIndex);
-    }
 
     const stages = CLIENT_STAGES.map((stage, index): ProjectTrackerStage => {
         const stageTasks = chronologicalTasks(tasksByStage[index]);
@@ -435,7 +419,22 @@ export function buildProjectTracker(
         // Framing sit above an unfinished Demo, and let an untouched Demo read
         // "upcoming" behind three finished stages: the backwards rail this whole
         // change exists to kill.
-        if (allProjectTasksComplete || currentIndex < 0) {
+        if (allProjectTasksComplete) {
+            // Completion is still a rail position. Leaving every stage "complete"
+            // gives consumers no current stage to render and makes a fully finished
+            // schedule appear to have no terminal state at all.
+            if (index === CLIENT_STAGES.length - 1) {
+                return {
+                    label: stage.label,
+                    state: "current",
+                    pct: 99,
+                    ...detail,
+                    activeTaskName: null,
+                };
+            }
+            return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
+        }
+        if (currentIndex < 0) {
             return { label: stage.label, state: "complete", pct: 100, ...detail, activeTaskName: null };
         }
         if (index < currentIndex) {
@@ -650,22 +649,18 @@ export async function getPortalProjectTrackerCore(
     projectId: string,
     now = new Date(),
 ): Promise<PortalProjectTrackerPayload> {
-    const [project, tasks, sharedScheduledInspectionCount] = await Promise.all([
+    const [project, tasks] = await Promise.all([
         prisma.project.findUnique({
             where: { id: projectId },
             select: { color: true, portalStageOverride: true },
         }),
         getPortalScheduleTasksCore(projectId),
-        prisma.inspection.count({
-            where: { projectId, result: "SCHEDULED", sharedToPortal: true },
-        }),
     ]);
     if (!project) throw new Error("Project not found");
 
     const tracker = buildProjectTracker(
         tasks,
         project.portalStageOverride,
-        sharedScheduledInspectionCount > 0,
     );
     const whatsNext = chronologicalTasks(tasks)
         .filter(task =>

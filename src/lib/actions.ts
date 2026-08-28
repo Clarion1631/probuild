@@ -43,6 +43,7 @@ import { emptyDoc } from "@/lib/studio/doc";
 import type { RoomType } from "@/lib/studio/templates";
 import { normalizeE164 } from "./phone";
 import { resolveCompanyTimeZone } from "./company-timezone";
+import { inspectionResult, parseInspectionDate, requireInspectionDate, type InspectionResult } from "./inspection-core";
 import {
     applySuggestedDecision as aiSortApplySuggestedDecision,
     dismissSelectionSuggestion as aiSortDismissSelectionSuggestion,
@@ -14743,9 +14744,6 @@ export async function deletePermit(permitId: string) {
 
 // ============ Inspections CRUD ============
 
-const INSPECTION_RESULTS = ["SCHEDULED", "PASSED", "FAILED", "PARTIAL"] as const;
-type InspectionResult = (typeof INSPECTION_RESULTS)[number];
-
 type InspectionInput = {
     type?: string;
     result?: string;
@@ -14759,26 +14757,6 @@ type InspectionInput = {
     scheduleTaskId?: string;
 };
 
-function inspectionResult(value: string | undefined, fallback: InspectionResult = "SCHEDULED"): InspectionResult {
-    if (value === undefined) return fallback;
-    if (!(INSPECTION_RESULTS as readonly string[]).includes(value)) throw new Error("Invalid inspection result");
-    return value as InspectionResult;
-}
-
-function parseInspectionDate(value: string | undefined, label: string): Date | null | undefined {
-    if (value === undefined) return undefined;
-    if (!value) return null;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error(`${label} must use YYYY-MM-DD`);
-    const parsed = new Date(`${value}T00:00:00.000Z`);
-    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) throw new Error(`${label} is invalid`);
-    return parsed;
-}
-
-function requiredInspectionDate(result: InspectionResult, scheduledDate: Date | null, performedDate: Date | null) {
-    if (result === "SCHEDULED" && !scheduledDate) throw new Error("Scheduled inspections require a scheduled date");
-    if (result !== "SCHEDULED" && !performedDate) throw new Error(`${result} inspections require a performed date`);
-}
-
 function optionalText(value: string | undefined): string | null | undefined {
     if (value === undefined) return undefined;
     return value.trim() || null;
@@ -14791,7 +14769,7 @@ export async function createInspection(projectId: string, data: InspectionInput 
     const result = inspectionResult(data.result);
     const scheduledDate = parseInspectionDate(data.scheduledDate, "Scheduled date") ?? null;
     const performedDate = parseInspectionDate(data.performedDate, "Performed date") ?? null;
-    requiredInspectionDate(result, scheduledDate, performedDate);
+    requireInspectionDate(result, scheduledDate, performedDate);
 
     const permitId = optionalText(data.permitId) ?? null;
     const scheduleTaskId = optionalText(data.scheduleTaskId) ?? null;
@@ -14837,7 +14815,7 @@ export async function updateInspection(inspectionId: string, data: InspectionInp
     const performedDate = data.performedDate === undefined
         ? target.performedDate
         : parseInspectionDate(data.performedDate, "Performed date") ?? null;
-    requiredInspectionDate(result, scheduledDate, performedDate);
+    requireInspectionDate(result, scheduledDate, performedDate);
 
     const permitId = data.permitId === undefined ? null : optionalText(data.permitId) ?? null;
     const scheduleTaskId = data.scheduleTaskId === undefined ? null : optionalText(data.scheduleTaskId) ?? null;
