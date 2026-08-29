@@ -157,7 +157,7 @@ Rewrite these notes into clean, professional, concise field log notes. Keep ever
 Respond ONLY with valid JSON matching the schema provided.`;
 
             const response = await ai.models.generateContent({
-                model: "gemini-3.0-flash-preview",
+                model: "gemini-3.5-flash",
                 contents: { parts: [{ text: prompt }] },
                 config: {
                     responseMimeType: "application/json",

@@ -31,6 +31,9 @@ export default function TimeClockPage() {
     // what the server accepts.
     const [phases, setPhases] = useState<{ id: string; code: string; name: string; isActive?: boolean }[]>([]);
     const [selectedPhase, setSelectedPhase] = useState<string>("");
+    // Plan 02: on a Logistics job the clock-in is a voice/typed dump of what
+    // you're doing (dictation via the OS keyboard mic). Required.
+    const [logisticsDump, setLogisticsDump] = useState<string>("");
 
     const [suggestion, setSuggestion] = useState<ClockInSuggestion | null>(null);
     // True once the user has picked a phase themselves — the suggestion preselect
@@ -213,6 +216,7 @@ export default function TimeClockPage() {
                     // Phase-only punch. The server rejects any code that is not one of
                     // this project's phases (PHASE_NOT_ON_PROJECT).
                     costCodeId: phaseId || null,
+                    ...(isLogistics ? { rawNote: logisticsDump.trim() } : {}),
                     latitude: loc?.lat,
                     longitude: loc?.lng,
                     ...(suggestion ? {
@@ -256,6 +260,10 @@ export default function TimeClockPage() {
                     : "This job has no phases set up yet. Contact the office to have phases added.");
                 return;
             }
+            if (isLogistics && !logisticsDump.trim()) {
+                setError("Tell us what you're doing before clocking into Logistics — a few words is enough.");
+                return;
+            }
 
             // Red flag: picked something other than today's plan? Confirm first.
             if (suggestion && suggestion.costCodeId && selectedPhase !== suggestion.costCodeId) {
@@ -290,6 +298,7 @@ export default function TimeClockPage() {
                 setCurrentTimeEntryId(null);
                 setSelectedProject("");
                 setSelectedPhase("");
+                setLogisticsDump("");
             } catch (err: any) {
                 setError(err.message);
             }
@@ -346,7 +355,20 @@ export default function TimeClockPage() {
                             </div>
                         )}
 
-                        {selectedProject && (
+                        {selectedProject && isLogistics && (
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-2">What are you doing? Talk or type.</label>
+                                <textarea
+                                    value={logisticsDump}
+                                    onChange={(e) => setLogisticsDump(e.target.value)}
+                                    className="hui-input min-h-[88px]"
+                                    placeholder="E.g., dump run for the ADU, then Lowe's for Mesplay"
+                                    maxLength={4000}
+                                />
+                                <p className="text-xs text-slate-500 mt-1">Shop time, runs, driving. Name the job if it was for one — you can clean it up at clock-out.</p>
+                            </div>
+                        )}
+                        {selectedProject && !isLogistics && (
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-2">Phase</label>
                                 {sortedPhases.length > 0 ? (

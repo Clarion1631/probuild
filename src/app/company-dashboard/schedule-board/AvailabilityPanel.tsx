@@ -10,6 +10,7 @@ import {
     type AvailabilityChip,
     type AvailabilityMember,
 } from "./availability";
+import { isDispatchable } from "@/lib/dispatch-roster";
 
 // Planning panel for Richard (ops manager). Pure booked-vs-soft and conflict
 // derivation lives in availability.ts so Dispatch can consume the same rules.
@@ -46,12 +47,11 @@ export function AvailabilityPanel({ data, onDrillDown }: AvailabilityPanelProps)
         ...data.pipeline.inProgress,
         ...data.pipeline.substantialCompletion,
     ];
-    // Rows = FIELD_CREW, plus any ADMIN who actually does field work (shows
-    // up on a project crew) — Richard, not Marge/Justin.
-    // Owner call 2026-07-23: only members DESIGNATED as crew are planned here
-    // — no admins/office on the availability grid (teamMembers is already
-    // FIELD_CREW-only at serialization; this filter just states the rule).
-    const members: AvailabilityMember[] = (teamMembers ?? []).filter(member => member.role === "FIELD_CREW");
+    // Rows = the dispatchable roster (FIELD_CREW, plus MANAGER/ADMIN who
+    // actually work in the field — Richard, CJ) via the shared rule in
+    // dispatch-roster.ts, never FINANCE. teamMembers is already scoped to
+    // that roster at serialization; this filter just states the rule.
+    const members: AvailabilityMember[] = (teamMembers ?? []).filter(isDispatchable);
 
     const today = todayUTC();
     const days = Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(today, i));

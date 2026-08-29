@@ -19,6 +19,8 @@ import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product
 import { isHttpUrl } from "./url-safety";
 import { parsePaymentDateInput } from "./payment-date";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
+import { LOGISTICS_COST_CODE } from "./logistics-formalize";
+import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
@@ -15030,5 +15032,59 @@ export async function setMealWaiverSigned(userId: string, signed: boolean) {
     await prisma.user.update({ where: { id: userId }, data: { mealWaiverSignedAt: signed ? new Date() : null } });
     revalidatePath("/manager/time-entries");
     revalidatePath("/company/team-members");
+    return { success: true };
+}
+
+/**
+ * Manager re-route of a Logistics entry (plan 02): send it to a real job (it
+ * becomes that job's 31-LOGISTICS labor) or back to overhead (null). Same
+ * rules as PATCH /api/time-entries/[id]/logistics, manager-only here.
+ */
+export async function rerouteLogisticsEntry(entryId: string, routeToProjectId: string | null) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, role: true } });
+    if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
+    if (typeof entryId !== "string" || !entryId) throw new Error("entryId is required");
+    if (routeToProjectId !== null && (typeof routeToProjectId !== "string" || !routeToProjectId)) throw new Error("bad target");
+
+    const entry = await prisma.timeEntry.findUnique({
+        where: { id: entryId },
+        select: { id: true, projectId: true, routedFromProjectId: true, invoiceId: true, invoicedAt: true, project: { select: { isLogistics: true } } },
+    });
+    if (!entry) throw new Error("Time entry not found");
+    if (!entry.project.isLogistics && !entry.routedFromProjectId) throw new Error("Not a logistics entry");
+    if (entry.invoiceId != null || entry.invoicedAt != null) throw new Error("This time was already invoiced and cannot be re-routed");
+
+    // Guarded at write time (Codex): an invoice landing between our read and
+    // the write must win — count 0 means "changed underneath you".
+    if (routeToProjectId === null) {
+        if (entry.routedFromProjectId) {
+            const r = await prisma.timeEntry.updateMany({
+                where: { id: entryId, invoiceId: null, invoicedAt: null },
+                data: { projectId: entry.routedFromProjectId, costCodeId: null, routedFromProjectId: null, routedAt: null, routedById: null },
+            });
+            if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+        }
+    } else {
+        const job = await prisma.project.findUnique({ where: { id: routeToProjectId }, select: { id: true, isLogistics: true, status: true } });
+        if (!job || job.isLogistics || job.status !== PROJECT_STATUS_IN_PROGRESS) throw new Error("That job is not available for routing");
+        const costCode = await prisma.costCode.findUnique({ where: { code: LOGISTICS_COST_CODE }, select: { id: true } });
+        if (!costCode) throw new Error(`${LOGISTICS_COST_CODE} cost code is missing`);
+        const r = await prisma.timeEntry.updateMany({
+            where: { id: entryId, invoiceId: null, invoicedAt: null },
+            data: {
+                projectId: job.id,
+                costCodeId: costCode.id,
+                estimateItemId: null,
+                routedFromProjectId: entry.routedFromProjectId ?? entry.projectId,
+                routedAt: new Date(),
+                routedById: user.id,
+            },
+        });
+        if (r.count === 0) throw new Error("This entry changed underneath you (invoiced?) — reload");
+    }
+    revalidatePath("/manager/logistics");
+    revalidatePath("/manager/time-entries");
     return { success: true };
 }

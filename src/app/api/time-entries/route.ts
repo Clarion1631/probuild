@@ -60,6 +60,10 @@ export async function POST(req: Request) {
         projectId, costCodeId, estimateItemId, startTime, latitude, longitude,
         // Suggestion audit (newer clients only — older app versions omit all of these)
         suggestedScheduleTaskId, suggestedCostCodeId, suggestionSource, suggestionOverridden,
+        // Logistics voice dump (plan 02) — what the worker said at clock-in.
+        // Newer clients send it; on a logistics job it is REQUIRED when sent
+        // at all (an old client that omits the key is not rejected).
+        rawNote,
     } = body;
 
     if (!projectId) {
@@ -238,6 +242,14 @@ export async function POST(req: Request) {
         estimateItemId: resolvedEstimateItemId,
     });
 
+    const dumpText = typeof rawNote === "string" ? rawNote.trim().slice(0, 4000) : undefined;
+    if (project?.isLogistics && rawNote !== undefined && !dumpText) {
+        return NextResponse.json(
+            { error: "Tell us what you're doing before clocking into Logistics", code: "LOGISTICS_NOTE_REQUIRED" },
+            { status: 400 }
+        );
+    }
+
     const timeEntry = await prisma.timeEntry.create({
         data: {
             userId: user.id,
@@ -245,6 +257,9 @@ export async function POST(req: Request) {
             costCodeId: resolvedCostCodeId,
             estimateItemId: resolvedEstimateItemId,
             startTime: entryStartTime,
+            // The dump is the note until it is formalized; storing it in `notes`
+            // too satisfies the logistics clock-out rule without a second prompt.
+            ...(dumpText ? { rawNote: dumpText, notes: dumpText } : {}),
             latitude,
             longitude,
             scheduleTaskId,

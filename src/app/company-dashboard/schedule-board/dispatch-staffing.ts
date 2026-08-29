@@ -1,4 +1,5 @@
 import { isTaskActiveOnDay } from "./dispatch-exceptions";
+import { isDispatchable } from "@/lib/dispatch-roster";
 
 export interface StaffingCrewInput {
     id: string;
@@ -49,9 +50,10 @@ export interface CardStaffing {
 /**
  * Per-card staffing derivation for the dispatch job card meter. Pure — every
  * input already lives in props (project.crew, today's tasks, crewDrafts).
- * A member reads "assigned" when they hold a solid (ACTIVATED, FIELD_CREW)
- * assignment on any of today's tasks, "drafted" when they don't but a
- * crewDraft adds them to one of today's tasks, otherwise "idle".
+ * A member reads "assigned" when they hold a solid (ACTIVATED, dispatchable
+ * role — see dispatch-roster.ts) assignment on any of today's tasks,
+ * "drafted" when they don't but a crewDraft adds them to one of today's
+ * tasks, otherwise "idle".
  */
 export function getCardStaffing(
     project: StaffingProjectInput,
@@ -73,7 +75,7 @@ export function getCardStaffing(
         const removeSet = new Set(draft?.removeUserIds ?? []);
         for (const assignment of task.assignments) {
             if (assignment.name) nameByUserId.set(assignment.userId, assignment.name);
-            if (assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW" && !removeSet.has(assignment.userId)) {
+            if (assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && !removeSet.has(assignment.userId)) {
                 assignedIds.add(assignment.userId);
             }
         }
@@ -82,15 +84,15 @@ export function getCardStaffing(
         }
     }
 
-    const activatedFieldCrew = project.crew.filter(member => member.status === "ACTIVATED" && member.role === "FIELD_CREW");
-    for (const member of activatedFieldCrew) nameByUserId.set(member.id, member.name);
+    const dispatchableCrew = project.crew.filter(isDispatchable);
+    for (const member of dispatchableCrew) nameByUserId.set(member.id, member.name);
 
     // Union project.crew with everyone who effectively holds a task today
     // (solid or drafted) — a member dragged from Available onto a job they
     // aren't crewed on must still surface in the meter as "drafted", not be
     // silently dropped because they're absent from project.crew.
     const memberIds = new Set<string>([
-        ...activatedFieldCrew.map(member => member.id),
+        ...dispatchableCrew.map(member => member.id),
         ...assignedIds,
         ...draftedIds,
     ]);
@@ -103,7 +105,7 @@ export function getCardStaffing(
     const staffedTaskCount = todayTasks.filter(task => {
         const draft = crewDrafts[task.id];
         const removeSet = new Set(draft?.removeUserIds ?? []);
-        const hasSolid = task.assignments.some(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW" && !removeSet.has(assignment.userId));
+        const hasSolid = task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && !removeSet.has(assignment.userId));
         const hasDraft = Boolean(draft?.addUserIds.length);
         return hasSolid || hasDraft;
     }).length;

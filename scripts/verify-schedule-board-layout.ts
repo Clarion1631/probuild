@@ -526,10 +526,20 @@ assert.equal(
     0,
     "an active task with a solid assignment is not unstaffed",
 );
+assert.equal(
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "manager-1", name: "Richard", status: "ACTIVATED", userRole: "ADMIN", assignmentRole: "assigned" }] })] })], dispatchDay).length,
+    0,
+    "a field-working manager/admin assigned to the task counts as staffing it (dispatch-roster rule)",
+);
 assert.deepEqual(
-    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "manager-1", name: "Richard", status: "ACTIVATED", userRole: "ADMIN", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "finance-1", name: "Books", status: "ACTIVATED", userRole: "FINANCE", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
     ["dispatch-task"],
-    "manager support does not count as schedulable field-crew capacity",
+    "finance accounts never count as crew capacity",
+);
+assert.deepEqual(
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-2", name: "Old", status: "DISABLED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    ["dispatch-task"],
+    "a disabled account does not count as crew capacity",
 );
 
 assert.deepEqual(
