@@ -6,6 +6,7 @@ import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
+import { DISPATCHABLE_ROLES } from "./dispatch-roster";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
 // (.specs/PB-pipeline-001-company-dashboard.md), shared by the permission-gated
@@ -2517,10 +2518,11 @@ export async function getCompanyDashboardData(
     // appended so the picker stays unambiguous.
     const teamMembersRaw = canEdit
         ? await prisma.user.findMany({
-            // Owner call 2026-07-23: only people DESIGNATED as crew are
-            // schedulable — no admins/office in the pickers or availability.
-            // Already-assigned non-crew still render as removable entries.
-            where: { status: "ACTIVATED", role: "FIELD_CREW" },
+            // Dispatchable roster (dispatch-roster.ts): FIELD_CREW plus the
+            // ADMIN/MANAGER accounts (Richard, CJ) who work in the field —
+            // never FINANCE. Already-assigned non-crew still render as
+            // removable entries.
+            where: { status: "ACTIVATED", role: { in: [...DISPATCHABLE_ROLES] } },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true, role: true, hourlyRate: true, burdenRate: true },
         })
