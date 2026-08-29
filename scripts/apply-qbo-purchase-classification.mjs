@@ -7,7 +7,7 @@
 // src/lib/qbo-expense-sync.ts:13-27 and src/lib/qbo-bank-register.ts:20), so
 // the table must exist and be deployed BEFORE the dual-write sync build ships.
 // Safe to re-run while the old build is live: pure CREATE IF NOT EXISTS /
-// idempotent constraint add, no existing table or row is touched.
+// idempotent constraint add; no existing classification row is touched.
 //
 //   node scripts/apply-qbo-purchase-classification.mjs
 import { PrismaClient } from "@prisma/client";
@@ -34,9 +34,15 @@ const statements = [
      "reason"         TEXT,
      "qbSyncToken"    TEXT,
      "classifiedAt"   TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-     "updatedAt"      TIMESTAMP(3) NOT NULL,
+     "updatedAt"      TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
      CONSTRAINT "QboPurchaseClassification_pkey" PRIMARY KEY ("qbPurchaseId")
    )`,
+  // Repair the initial table shape on already-deployed databases. Prisma's
+  // @updatedAt writes every Prisma create/update; this default also protects
+  // an otherwise-valid server-side create if a future raw writer is added.
+  // SET DEFAULT is idempotent and does not touch existing classifications.
+  `ALTER TABLE "QboPurchaseClassification"
+     ALTER COLUMN "updatedAt" SET DEFAULT CURRENT_TIMESTAMP`,
   // Money-path plan mandates CHECK constraints over unvalidated strings
   // (docs/UNIFIED-REGISTER-PLAN.md §4). Idempotent add: Postgres has no
   // "ADD CONSTRAINT IF NOT EXISTS", so guard with a catalog lookup — the
@@ -66,6 +72,18 @@ try {
     await prisma.$executeRawUnsafe(sql);
     console.log("applied:", sql.split("\n")[0].trim());
   }
+  const updatedAtColumns = await prisma.$queryRawUnsafe(
+    `SELECT column_default
+       FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'QboPurchaseClassification'
+        AND column_name = 'updatedAt'`,
+  );
+  const updatedAtDefault = updatedAtColumns[0]?.column_default ?? null;
+  if (!updatedAtDefault) {
+    throw new Error('QboPurchaseClassification.updatedAt default was not persisted');
+  }
+  console.log("verified: QboPurchaseClassification.updatedAt default:", updatedAtDefault);
   console.log("QboPurchaseClassification schema applied successfully.");
 } catch (error) {
   console.error("Migration failed:", error);
