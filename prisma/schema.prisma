@@ -43,6 +43,13 @@ model User {
   addedFavorites            ProjectProductFavorite[]
   decidedProposals          SelectionProposal[]
   mcpKeys                   McpKey[]
+  procurementImportRunsCreated MaterialImportRun[]       @relation("MaterialImportRunCreator")
+  materialItemsCreated      MaterialItem[]              @relation("MaterialItemCreator")
+  materialItemsUpdated      MaterialItem[]              @relation("MaterialItemUpdater")
+  materialEvidenceCreated   MaterialItemEvidence[]      @relation("MaterialItemEvidenceCreator")
+  materialItemEvents        MaterialItemEvent[]         @relation("MaterialItemEventActor")
+  procurementAuthorityUpdates ProcurementAuthorityConfig[] @relation("ProcurementAuthorityUpdater")
+  procurementAuthorityFor   ProcurementAuthorityConfig? @relation("ProcurementRichard")
 }
 
 model Client {
@@ -303,6 +310,8 @@ model Project {
   selectionProposals      SelectionProposal[]
   decisions               Decision[]
   permits                 Permit[]
+  materialImportRuns      MaterialImportRun[]
+  materialItems           MaterialItem[]
 
   @@index([viewedAt])
   @@index([clientId])
@@ -602,6 +611,7 @@ model Expense {
 
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+  materialItemLinks MaterialItemExpense[]
 
   createdAt DateTime @default(now())
 
@@ -1791,6 +1801,7 @@ model PurchaseOrderItem {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  materialItemLinks MaterialItemPurchaseOrderItem[]
 
   @@index([purchaseOrderId])
 }
@@ -2895,4 +2906,176 @@ model BankImageMatch {
   note        String?
 
   @@index([bankLineId])
+}
+
+// Procurement V1 is additive. The guarded DDL lives in
+// scripts/apply-procurement-material-item.mjs; never run prisma migrate here.
+model MaterialImportRun {
+  id                 String              @id @default(cuid())
+  ingestPath         String
+  requestKey         String
+  sourceFileName     String?
+  storagePath        String?
+  sourceRevision     String?
+  sourceHash         String
+  commitScopeHash    String
+  requestedProjectId String
+  requestedProject   Project             @relation(fields: [requestedProjectId], references: [id], onDelete: Restrict)
+  createdById        String?
+  createdBy          User?               @relation("MaterialImportRunCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  status             String              @default("STAGED")
+  rowCount           Int                 @default(0)
+  dataGapCount       Int                 @default(0)
+  conflictCount      Int                 @default(0)
+  createdAt          DateTime            @default(now()) @db.Timestamptz(6)
+  appliedAt          DateTime?           @db.Timestamptz(6)
+  rows               MaterialImportRow[]
+
+  @@unique([ingestPath, requestKey])
+  @@index([requestedProjectId, createdAt])
+}
+
+model MaterialImportRow {
+  id              String            @id @default(cuid())
+  importRunId     String
+  importRun       MaterialImportRun @relation(fields: [importRunId], references: [id], onDelete: Cascade)
+  rowNumber       Int
+  rawJson         Json
+  normalizedJson  Json?
+  validationState String
+  materialItemId  String?
+  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
+
+  @@unique([importRunId, rowNumber])
+  @@index([importRunId, validationState])
+}
+
+model MaterialItem {
+  id                 String                 @id @default(cuid())
+  projectId          String
+  project            Project                @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  estimateItemId     String?
+  scheduleTaskId     String?
+  description        String
+  vendorName         String?
+  manufacturer       String?
+  model              String?
+  sku                String?
+  quantity           Decimal                @default(1) @db.Decimal(14, 3)
+  unit               String?
+  unitCost           Decimal?               @db.Decimal(14, 2)
+  totalCost          Decimal?               @db.Decimal(14, 2)
+  currency           String                 @default("USD")
+  needByDate         DateTime?              @db.Date
+  status             String                 @default("REQUESTED")
+  receivedAt         DateTime?              @db.Date
+  isManual           Boolean                @default(false)
+  sourceProjectRef   String?
+  createdById        String?
+  createdBy          User?                  @relation("MaterialItemCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById        String?
+  updatedBy          User?                  @relation("MaterialItemUpdater", fields: [updatedById], references: [id], onDelete: SetNull)
+  createdAt          DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime               @updatedAt @db.Timestamptz(6)
+  evidence           MaterialItemEvidence[]
+  events             MaterialItemEvent[]
+  purchaseOrderLinks MaterialItemPurchaseOrderItem[]
+  expenseLinks       MaterialItemExpense[]
+  sources            MaterialItemSource[]
+
+  @@index([projectId, status])
+  @@index([needByDate])
+}
+
+model MaterialItemEvidence {
+  id                      String                 @id @default(cuid())
+  materialItemId          String
+  materialItem            MaterialItem           @relation(fields: [materialItemId], references: [id], onDelete: Cascade)
+  kind                    String
+  provenance              String
+  ingestPath              String
+  sourceIdentity          String
+  sourceRevision          String?
+  sourceHash              String
+  commitScopeHash         String
+  url                     String?
+  payload                 Json?
+  isCurrent               Boolean                @default(true)
+  approvedQuoteEvidenceId String?
+  approvedQuoteEvidence   MaterialItemEvidence?  @relation("ApprovedQuoteEvidence", fields: [approvedQuoteEvidenceId], references: [id], onDelete: Restrict)
+  approvalReferences      MaterialItemEvidence[] @relation("ApprovedQuoteEvidence")
+  createdById             String?
+  createdBy               User?                  @relation("MaterialItemEvidenceCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt               DateTime               @default(now()) @db.Timestamptz(6)
+  events                  MaterialItemEvent[]
+
+  @@unique([ingestPath, sourceIdentity])
+  @@index([materialItemId, kind, isCurrent])
+}
+
+model MaterialItemEvent {
+  id             String                @id @default(cuid())
+  materialItemId String
+  materialItem   MaterialItem          @relation(fields: [materialItemId], references: [id], onDelete: Cascade)
+  eventType      String
+  fromStatus     String?
+  toStatus       String
+  reason         String?
+  evidenceId     String?
+  evidence       MaterialItemEvidence? @relation(fields: [evidenceId], references: [id], onDelete: Restrict)
+  actorId        String?
+  actor          User?                 @relation("MaterialItemEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorRole      String?
+  ingestPath     String
+  correlationKey String
+  sourceHash     String
+  commitScopeHash String
+  createdAt      DateTime              @default(now()) @db.Timestamptz(6)
+
+  @@unique([ingestPath, correlationKey, eventType])
+
+  @@index([materialItemId, createdAt])
+}
+
+model MaterialItemPurchaseOrderItem {
+  materialItemId      String
+  materialItem        MaterialItem      @relation(fields: [materialItemId], references: [id], onDelete: Cascade)
+  purchaseOrderItemId String
+  purchaseOrderItem   PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id], onDelete: Restrict)
+  createdAt           DateTime          @default(now()) @db.Timestamptz(6)
+
+  @@id([materialItemId, purchaseOrderItemId])
+}
+
+model MaterialItemExpense {
+  materialItemId String
+  materialItem   MaterialItem @relation(fields: [materialItemId], references: [id], onDelete: Cascade)
+  expenseId      String
+  expense        Expense      @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@id([materialItemId, expenseId])
+}
+
+model MaterialItemSource {
+  id             String       @id @default(cuid())
+  materialItemId String
+  materialItem   MaterialItem @relation(fields: [materialItemId], references: [id], onDelete: Cascade)
+  sourceKind     String
+  sourceIdentity String
+  sourceRevision String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@unique([sourceKind, sourceIdentity])
+  @@unique([materialItemId, sourceKind, sourceIdentity])
+  @@index([materialItemId])
+}
+
+model ProcurementAuthorityConfig {
+  id            String   @id @default(cuid())
+  richardUserId String   @unique
+  richardUser   User     @relation("ProcurementRichard", fields: [richardUserId], references: [id], onDelete: Restrict)
+  updatedById   String?
+  updatedBy     User?    @relation("ProcurementAuthorityUpdater", fields: [updatedById], references: [id], onDelete: SetNull)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(6)
 }
