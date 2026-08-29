@@ -18,6 +18,7 @@ import { persistOwnedSignature } from "./signature-storage";
 import { parseProductUrl, MAX_PRICE as PRODUCT_PARSE_MAX_PRICE } from "./product-parse";
 import { isHttpUrl } from "./url-safety";
 import { parsePaymentDateInput } from "./payment-date";
+import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
 // estimate-item-upsert.ts, which is now its only caller on the save path.
 import { selectedBillableRows } from "./estimate-item-payload";
@@ -14807,7 +14808,7 @@ export async function markTimeEntryReviewed(entryId: string) {
     const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, name: true, email: true, role: true } });
     if (!user || (user.role !== "ADMIN" && user.role !== "MANAGER")) throw new Error("Forbidden");
 
-    const entry = await prisma.timeEntry.findUnique({ where: { id: entryId }, select: { id: true, needsReview: true, notes: true } });
+    const entry = await prisma.timeEntry.findUnique({ where: { id: entryId }, select: { id: true, needsReview: true, notes: true, reviewReason: true } });
     if (!entry) throw new Error("Time entry not found");
     if (!entry.needsReview) return { success: true }; // already reviewed — idempotent
 
@@ -14816,6 +14817,10 @@ export async function markTimeEntryReviewed(entryId: string) {
         where: { id: entryId },
         data: {
             needsReview: false,
+            // Retire the settlement-owned notes (src/lib/wa-breaks.ts) so a later
+            // day re-plan cannot read them as "still unanswered" and re-flag a row
+            // a manager already looked at. Other reasons (GPS etc.) are kept.
+            reviewReason: stripSettlementNotes(entry.reviewReason),
             notes: entry.notes ? `${entry.notes}\n${stamp}` : stamp,
         },
     });
@@ -14959,4 +14964,71 @@ export async function updateInspection(inspectionId: string, data: InspectionInp
     revalidatePath(`/projects/${target.projectId}`);
     revalidatePath(`/portal/projects/${target.projectId}`);
     return inspection;
+}
+
+/**
+ * Skip-lunch decision from the manager queue (/manager/time-entries). Same
+ * rules as PATCH /api/time-entries/[id]/meal-skip — a named approver
+ * (src/lib/wa-breaks.ts), a PENDING request, and for APPROVED an open shift
+ * plus a signed waiver on file. Guarded update so two approvers cannot race.
+ */
+export async function decideMealSkip(entryId: string, decision: "APPROVED" | "DENIED") {
+    // Server actions are callable with any payload — validate at runtime.
+    if (decision !== "APPROVED" && decision !== "DENIED") throw new Error("decision must be APPROVED or DENIED");
+    if (typeof entryId !== "string" || !entryId) throw new Error("entryId is required");
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    const user = await prisma.user.findUnique({ where: { email: session.user.email }, select: { id: true, email: true, role: true } });
+    if (!user || !canApproveMealSkip({ role: user.role, email: user.email })) throw new Error("Forbidden");
+
+    const entry = await prisma.timeEntry.findUnique({
+        where: { id: entryId },
+        select: { id: true, endTime: true, mealSkipStatus: true, user: { select: { mealWaiverSignedAt: true } } },
+    });
+    if (!entry) throw new Error("Time entry not found");
+    const check = checkMealSkipDecision({
+        decision,
+        currentStatus: entry.mealSkipStatus,
+        entryClosed: entry.endTime != null,
+        waiverSignedAt: entry.user.mealWaiverSignedAt,
+    });
+    if (!check.ok) {
+        const messages = {
+            NOT_PENDING: "No pending request on this entry",
+            WAIVER_NOT_SIGNED: "No signed meal-period waiver on file for this worker — mark it signed first",
+            ENTRY_CLOSED: "The shift already closed; the clock-out attestation applies instead",
+        } as const;
+        throw new Error(messages[check.code]);
+    }
+    const flipped = await prisma.timeEntry.updateMany({
+        // APPROVED additionally requires the shift to STILL be open at write time
+        // (a clock-out racing this decision already settled pay via attestation).
+        where: {
+            id: entryId,
+            mealSkipStatus: "PENDING",
+            ...(decision === "APPROVED" ? { endTime: null, user: { mealWaiverSignedAt: { not: null } } } : {}),
+        },
+        data: { mealSkipStatus: decision, mealSkipDecidedById: user.id, mealSkipDecidedAt: new Date() },
+    });
+    if (flipped.count === 0) throw new Error("Request was already decided or the shift closed");
+    revalidatePath("/manager/time-entries");
+    return { success: true };
+}
+
+/**
+ * Record that a worker signed Marge's meal-period waiver (the written,
+ * revocable waiver WA expects before any meal period is given up). Managers
+ * only; `signed=false` revokes it, which immediately blocks new approvals.
+ */
+export async function setMealWaiverSigned(userId: string, signed: boolean) {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) throw new Error("Not authenticated");
+    // Same gate as approving: the whole approval chain rests on this bit, so only
+    // the named approvers may assert a waiver is on file.
+    const actor = await prisma.user.findUnique({ where: { email: session.user.email }, select: { role: true, email: true } });
+    if (!actor || !canApproveMealSkip({ role: actor.role, email: actor.email })) throw new Error("Forbidden");
+    await prisma.user.update({ where: { id: userId }, data: { mealWaiverSignedAt: signed ? new Date() : null } });
+    revalidatePath("/manager/time-entries");
+    revalidatePath("/company/team-members");
+    return { success: true };
 }

@@ -170,7 +170,7 @@ function StartDateRow({
     );
 }
 
-export default function CompanyDashboardClient({ data, weather }: { data: CompanyDashboardData; weather: VancouverForecastDay[] }) {
+export default function CompanyDashboardClient({ data, weather, focus }: { data: CompanyDashboardData; weather: VancouverForecastDay[]; focus?: "dispatch" }) {
     const router = useRouter();
     const { month, canEdit, isAdmin, canSeeFinancials, pipeline, cashflow, teamMembers, crewConflicts, strip } = data;
 
@@ -287,6 +287,22 @@ export default function CompanyDashboardClient({ data, weather }: { data: Compan
     const estimatingTotal = pipeline.estimating.reduce((s, l) => s + (l.targetRevenue ?? 0), 0);
 
     const crewRows = [...pipeline.waitingToStart, ...pipeline.scheduled, ...pipeline.inProgress, ...pipeline.substantialCompletion];
+
+    if (focus === "dispatch") {
+        return (
+            <div className="px-4 py-3">
+                <ScheduleBoard
+                    data={data}
+                    weather={weather}
+                    externallyPendingProjectIds={legacyPendingProjectIds}
+                    isProjectExternallyPending={isPageProjectPending}
+                    onEffectivePendingProjectIdsChange={publishBoardPendingProjectIds}
+                    externalShiftEvents={externalShiftEvents}
+                    focus={focus}
+                />
+            </div>
+        );
+    }
 
     return (
         <div className="max-w-6xl mx-auto py-8 px-6">

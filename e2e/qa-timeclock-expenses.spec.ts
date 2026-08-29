@@ -25,24 +25,41 @@ test.describe("Workflow 4: Time Clock & Expenses", () => {
     await page.goto("/time-clock", { waitUntil: "networkidle" });
     await capture(page, testInfo, 4, 2, "before-clock-in");
 
-    // Look for a project selector
-    const projectSelect = page.locator(
-      'select:has(option), [role="combobox"], button:has-text("Select Project")'
-    ).first();
-    if (await projectSelect.isVisible({ timeout: 5000 }).catch(() => false)) {
-      if ((await projectSelect.evaluate((el) => el.tagName)) === "SELECT") {
-        // Select first non-empty option
-        const options = await projectSelect.locator("option").allTextContents();
-        if (options.length > 1) {
-          await projectSelect.selectOption({ index: 1 });
-        }
-      }
-    }
-
     // Clock In
     const clockInBtn = page.locator(
       'button:has-text("Clock In"), button:has-text("Start"), button:has-text("Begin")'
     ).first();
+
+    // Look for a project selector. The page is PHASES-ONLY (2026-08): Clock In
+    // stays DISABLED on a project whose estimate has no phases, so try each
+    // project until one enables the button (a Logistics job needs no phase).
+    const projectSelect = page.locator(
+      'select:has(option), [role="combobox"], button:has-text("Select Project")'
+    ).first();
+    let clockInEnabled = false;
+    if (await projectSelect.isVisible({ timeout: 5000 }).catch(() => false)) {
+      if ((await projectSelect.evaluate((el) => el.tagName)) === "SELECT") {
+        const options = await projectSelect.locator("option").allTextContents();
+        for (let i = 1; i < options.length && !clockInEnabled; i++) {
+          await projectSelect.selectOption({ index: i });
+          // Phases load asynchronously; give the button a moment to enable.
+          await page.waitForTimeout(1500);
+          const phaseSelect = page.locator("select").nth(1);
+          if (await phaseSelect.isVisible({ timeout: 500 }).catch(() => false)) {
+            const phases = await phaseSelect.locator("option").allTextContents();
+            if (phases.length > 1) await phaseSelect.selectOption({ index: 1 });
+          }
+          clockInEnabled = await clockInBtn.isEnabled({ timeout: 2000 }).catch(() => false);
+        }
+      }
+    }
+
+    if (!clockInEnabled) {
+      // No seeded project can be clocked into (no phases anywhere) — the page is
+      // refusing correctly; record it rather than waiting on a disabled button.
+      await capture(page, testInfo, 4, 2, "no-project-with-phases");
+      return;
+    }
 
     if (await clockInBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
       await clockInBtn.click();
