@@ -49,6 +49,17 @@ async function postDeposit(
   return { res, body: await safeJson(res) };
 }
 
+async function getDeposit(
+  request: APIRequestContext,
+  fileId: string,
+  authHeader: string | null = `Bearer ${SECRET}`,
+) {
+  const headers: Record<string, string> = {};
+  if (authHeader !== null) headers.authorization = authHeader;
+  const res = await request.get(`${DEPOSIT_INGEST_PATH}?fileId=${encodeURIComponent(fileId)}`, { headers });
+  return { res, body: await safeJson(res) };
+}
+
 async function safeJson(res: Awaited<ReturnType<APIRequestContext["post"]>>) {
   try {
     return await res.json();
@@ -432,6 +443,25 @@ test.describe.serial("Deposit-ingest pipeline (Phase B1)", () => {
 
     const scheduleAfter = await prisma.paymentSchedule.findUniqueOrThrow({ where: { id: F.qbo.schedule } });
     expect(scheduleAfter.qbPaymentId, "no state change on re-POST").toBe(qbPaymentId);
+  });
+
+  test("2b: status probe reads the persisted deposit but never returns raw QBO replay data", async ({ request }) => {
+    const unauthorized = await getDeposit(request, F.qbo.fileId, null);
+    expect(unauthorized.res.status()).toBe(401);
+
+    const found = await getDeposit(request, F.qbo.fileId);
+    expect(found.res.status()).toBe(200);
+    expect(found.body).toMatchObject({
+      ok: true,
+      deposit: {
+        status: "applied",
+        fileId: F.qbo.fileId,
+        paymentScheduleId: F.qbo.schedule,
+        amountCents: F.qbo.amount * 100,
+      },
+    });
+    expect(found.body.deposit.extracted).toBeUndefined();
+    expect(found.body.deposit.qbRequestPayload).toBeUndefined();
   });
 
   // ── 3: Concurrent duplicates, same fileId ───────────────────────────────────
