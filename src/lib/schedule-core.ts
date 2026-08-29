@@ -2523,10 +2523,11 @@ export async function getCompanyDashboardData(
     // appended so the picker stays unambiguous.
     const teamMembersRaw = canEdit
         ? await prisma.user.findMany({
-            // Dispatchable roster (dispatch-roster.ts): the owner-controlled
-            // per-user switch (Team page), ACTIVATED only. Already-assigned
-            // non-crew still render as removable entries.
-            where: { status: "ACTIVATED", showOnDispatch: true },
+            // Pickable staff: every ACTIVATED non-finance account can be put on
+            // a task. Whether they appear on the dispatch board bench/grid is
+            // the per-user switch (showOnDispatch, dispatch-roster.ts), applied
+            // client-side so the picker and the board never disagree.
+            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
             orderBy: { name: "asc" },
             select: { id: true, name: true, email: true, role: true, showOnDispatch: true, hourlyRate: true, burdenRate: true },
         })
