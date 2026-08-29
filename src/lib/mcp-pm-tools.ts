@@ -1,4 +1,5 @@
 import type { Prisma } from "@prisma/client";
+import { revalidatePath } from "next/cache";
 
 import { runAfterRequest } from "./after-request";
 import { postDailyLogSummary } from "./chat-webhook";
@@ -639,14 +640,17 @@ export async function updateDailyLogWithConfirmation(
             select: { id: true, date: true, project: { select: { name: true } } },
         });
         if (!log) throw new Error("Daily log not found");
+        const portalNote = args.workPerformed === undefined
+            ? "Portal sharing and photos will not change."
+            : "Photos and share selection will not change. Editing work performed hides a portal-shared log until it is re-shared.";
         return issueConfirmation(
             "update_daily_log",
             args,
-            `Update the ${log.date.toISOString().slice(0, 10)} daily log on "${log.project.name}". Fields: ${changedFields.join(", ")}. Portal sharing and photos will not change.`,
+            `Update the ${log.date.toISOString().slice(0, 10)} daily log on "${log.project.name}". Fields: ${changedFields.join(", ")}. ${portalNote}`,
             actor.actorLabel,
         );
     }
-    return executePmConfirmed("update_daily_log", args, input.confirmToken, actor, async tx => {
+    const result = await executePmConfirmed("update_daily_log", args, input.confirmToken, actor, async tx => {
         const existing = await tx.dailyLog.findUnique({
             where: { id: input.dailyLogId },
             select: { id: true, projectId: true, date: true, sharedToPortal: true, project: { select: { name: true } } },
@@ -657,7 +661,7 @@ export async function updateDailyLogWithConfirmation(
             data: {
                 ...(args.weather !== undefined ? { weather: args.weather } : {}),
                 ...(args.crewOnSite !== undefined ? { crewOnSite: args.crewOnSite } : {}),
-                ...(args.workPerformed !== undefined ? { workPerformed: args.workPerformed } : {}),
+                ...(args.workPerformed !== undefined ? { workPerformed: args.workPerformed, sharedContentHash: null } : {}),
                 ...(args.materialsDelivered !== undefined ? { materialsDelivered: args.materialsDelivered } : {}),
                 ...(args.issues !== undefined ? { issues: args.issues } : {}),
                 ...(args.nextSteps !== undefined ? { nextSteps: args.nextSteps } : {}),
@@ -698,6 +702,16 @@ export async function updateDailyLogWithConfirmation(
             },
         };
     });
+    const narrativeChanged = args.workPerformed !== undefined
+        || args.nextSteps !== undefined
+        || args.issues !== undefined;
+    runAfterRequest(async () => {
+        await runDailyLogTaskMatch(result.dailyLogId);
+        if (narrativeChanged) await postDailyLogSummary(result.dailyLogId);
+    });
+    revalidatePath(`/projects/${result.projectId}/dailylogs`);
+    revalidatePath(`/portal/projects/${result.projectId}`);
+    return result;
 }
 
 export async function listPunchItems(input: {

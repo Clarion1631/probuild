@@ -169,7 +169,11 @@ async function main() {
     assert.match(pmCoreSource, /issueConfirmation\(\s*"update_daily_log"/);
     assert.match(pmCoreSource, /executePmConfirmed\("update_daily_log"/);
     assert.match(pmCoreSource, /action:\s*"updated_daily_log"/);
-    assert.match(pmCoreSource, /Portal sharing and photos will not change/);
+    assert.match(pmCoreSource, /Editing work performed hides a portal-shared log until it is re-shared/);
+    assert.match(pmCoreSource, /sharedContentHash:\s*null/);
+    assert.match(pmCoreSource, /runDailyLogTaskMatch\(result\.dailyLogId\)/);
+    assert.match(pmCoreSource, /revalidatePath\(`\/projects\/\$\{result\.projectId\}\/dailylogs`\)/);
+    assert.match(pmCoreSource, /revalidatePath\(`\/portal\/projects\/\$\{result\.projectId\}`\)/);
     assert.match(routeSource, /import_google_drive_file[\s\S]{0,1800}bare Drive file ID/);
     assert.match(driveImportSource, /MAX_GOOGLE_DRIVE_IMPORT_BYTES\s*=\s*25\s*\*\s*1024\s*\*\s*1024/);
     assert.match(driveImportSource, /application\/vnd\.google-apps\./);
@@ -579,6 +583,19 @@ async function main() {
         assert.equal(updatedLog.nextSteps, "Return for final verification.");
         assert.equal(updatedLog.sharedToPortal, false);
         assert.equal(updatedLog.photos[0]?.url, photo.url);
+        await prisma.dailyLog.update({
+            where: { id: log.id },
+            data: { sharedToPortal: true, sharedContentHash: "approved-content-snapshot" },
+        });
+        const workUpdateArgs = { dailyLogId: log.id, workPerformed: "Verified the final repair work." };
+        const workUpdatePreview = await pmModule.updateDailyLogWithConfirmation(workUpdateArgs, richardActor);
+        const workUpdateToken = confirmationToken(workUpdatePreview);
+        collected.confirmationTokens.push(workUpdateToken);
+        await pmModule.updateDailyLogWithConfirmation({ ...workUpdateArgs, confirmToken: workUpdateToken }, richardActor);
+        const workUpdatedLog = await prisma.dailyLog.findUniqueOrThrow({ where: { id: log.id } });
+        assert.equal(workUpdatedLog.workPerformed, "Verified the final repair work.");
+        assert.equal(workUpdatedLog.sharedToPortal, true);
+        assert.equal(workUpdatedLog.sharedContentHash, null);
         await rejectsWith(
             () => pmModule.updateDailyLogWithConfirmation({ dailyLogId: log.id }, richardActor),
             /at least one editable/i,
