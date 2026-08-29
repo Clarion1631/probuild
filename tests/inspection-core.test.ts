@@ -40,6 +40,19 @@ test("a portal re-inspection message requires a later scheduled row for the same
     assert.equal(hasScheduledReinspection(failed, [{ ...followUp, createdAt: new Date("2026-08-19T00:00:00.000Z") }]), false);
 });
 
+test("a portal re-inspection message does not infer a match when the failed inspection has no permit", () => {
+    const failedWithoutPermit = {
+        id: "failed", type: "Rough electrical", result: "FAILED", permitId: null,
+        createdAt: new Date("2026-08-20T00:00:00.000Z"), scheduledDate: null, performedDate: new Date("2026-08-20T00:00:00.000Z"),
+    };
+    const laterUnlinkedInspection = {
+        id: "scheduled", type: "Rough electrical", result: "SCHEDULED", permitId: null,
+        createdAt: new Date("2026-08-21T00:00:00.000Z"), scheduledDate: new Date("2026-08-25T00:00:00.000Z"), performedDate: null,
+    };
+
+    assert.equal(hasScheduledReinspection(failedWithoutPermit, [failedWithoutPermit, laterUnlinkedInspection]), false);
+});
+
 test("inspection links are rejected when they do not belong to the project", async () => {
     const queries: unknown[] = [];
     const db = {

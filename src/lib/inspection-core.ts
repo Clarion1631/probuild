@@ -51,6 +51,8 @@ export function hasScheduledReinspection(
     inspection: InspectionTimelineEntry,
     inspections: readonly InspectionTimelineEntry[],
 ): boolean {
+    if (!inspection.permitId) return false;
+
     return inspections.some(candidate =>
         candidate.id !== inspection.id &&
         candidate.result === "SCHEDULED" &&
