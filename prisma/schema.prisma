@@ -922,6 +922,14 @@ model TimeEntry {
   mealSkipDecidedById String?
   mealSkipDecidedAt   DateTime?
   mealSkipReason      String?
+
+  // Logistics voice dump → formalize → route (plan 02, src/lib/logistics-formalize.ts)
+  rawNote             String?   // what the worker said/typed at clock-in, verbatim
+  formalizedNote      String?   // the AI-cleaned note the worker accepted (also mirrored into `notes`)
+  logisticsCategory   String?   // material-pickup | dump-run | shop-time | vehicle | warranty-callback | admin | other
+  routedFromProjectId String?   // set when a Logistics entry was re-costed to a real job (projectId = that job, costCodeId = 31-LOGISTICS)
+  routedAt            DateTime?
+  routedById          String?
   qbTimeActivityId   String?
   qbSyncedAt         DateTime? @db.Timestamp(6)
 
