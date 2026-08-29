@@ -119,9 +119,6 @@ export function DispatchJobCard({
                                     />
                                 ))}
                             </span>
-                            <span className="text-[10px] font-semibold text-slate-500 tabular-nums">
-                                {staffedCount} of {staffing.members.length} on tasks
-                            </span>
                         </div>
                     )}
                     {cardStaffed && (

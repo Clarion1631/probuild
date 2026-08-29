@@ -1,12 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { motion } from "framer-motion";
+import { Package } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import type { VancouverForecastDay } from "@/lib/weather";
-import { addDays, formatDate, getFallbackProjectColor, getMonday, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatDate, getFallbackProjectColor, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
+import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { isConflictedDay } from "./availability";
 import { getCrewlessJobs, getUnstaffedToday, isTaskActiveOnDay } from "./dispatch-exceptions";
 import { DispatchExceptions } from "./DispatchExceptions";
@@ -33,12 +34,15 @@ interface DispatchViewProps {
     weather: VancouverForecastDay[];
     onActivate: (taskId: string) => void;
     onCreateTask: (defaults: DispatchTaskCreationDefaults) => void;
-    onReviewDispatch: () => void;
-    draftCount: number;
-    isReviewingDispatch: boolean;
     crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
     onDraftCrewAdd: (taskId: string, userId: string) => boolean;
     onDraftCrewRemove: (taskId: string, userId: string) => void;
+    // Today|Week range — owned by ScheduleBoard so the header row (which shows
+    // the week-nav controls in the same slot as Prev/Today/Next, and the date
+    // label in the title) can read/drive them too.
+    mode: DispatchMode;
+    onModeChange: (mode: DispatchMode) => void;
+    weekStart: Date;
 }
 
 interface WeekChip {
@@ -142,16 +146,13 @@ export function DispatchView({
     weather,
     onActivate,
     onCreateTask,
-    onReviewDispatch,
-    draftCount,
-    isReviewingDispatch,
     crewDrafts,
     onDraftCrewAdd,
     onDraftCrewRemove,
+    mode,
+    onModeChange,
+    weekStart,
 }: DispatchViewProps) {
-    const [mode, setMode] = useState<DispatchMode>("today");
-    const currentMonday = useMemo(() => getMonday(todayUTC()), []);
-    const [weekStart, setWeekStart] = useState(currentMonday);
     const [highlightedProjectId, setHighlightedProjectId] = useState<string | null>(null);
     const [taskBankProjectId, setTaskBankProjectId] = useState(
         () => data.pipeline.inProgress[0]?.id
@@ -163,30 +164,6 @@ export function DispatchView({
     const [crewChooser, setCrewChooser] = useState<CrewChooserState | null>(null);
     const crewChooserAnchorRef = useRef<HTMLElement | null>(null);
     const activeCrewDragCleanupRef = useRef<(() => void) | null>(null);
-
-    useEffect(() => {
-        let restoreFrame: number | null = null;
-        try {
-            const stored = localStorage.getItem(DISPATCH_MODE_STORAGE_KEY);
-            if (stored === "today" || stored === "week") {
-                restoreFrame = window.requestAnimationFrame(() => setMode(stored));
-            }
-        } catch {
-            // The default Today mode remains usable when storage is unavailable.
-        }
-        return () => {
-            if (restoreFrame !== null) window.cancelAnimationFrame(restoreFrame);
-        };
-    }, []);
-
-    function selectMode(nextMode: DispatchMode) {
-        setMode(nextMode);
-        try {
-            localStorage.setItem(DISPATCH_MODE_STORAGE_KEY, nextMode);
-        } catch {
-            // The selected mode still applies for this session.
-        }
-    }
 
     const projects = useMemo(() => [
         ...data.pipeline.waitingToStart,
@@ -280,7 +257,7 @@ export function DispatchView({
     }, [highlightedProjectId, mode]);
 
     function focusProject(projectId: string) {
-        selectMode("today");
+        onModeChange("today");
         setHighlightedProjectId(projectId);
     }
 
@@ -439,60 +416,25 @@ export function DispatchView({
                 onProjectFocus={focusProject}
             />
 
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hui-border px-4 py-3">
-                <div>
-                    <h3 className="text-sm font-semibold text-hui-textMain">Dispatch</h3>
-                    <p className="mt-0.5 text-xs text-hui-textMuted">Jobs first today. People first across the week.</p>
-                    <p className="mt-1 text-[10px] font-medium text-slate-500">
-                        Vancouver forecast{headerForecast ? ` \u00B7 ${headerForecast.glyph} ${headerForecast.precipitationProbability}% rain \u00B7 ${headerForecast.high}\u00B0/${headerForecast.low}\u00B0` : " unavailable"}
-                    </p>
-                </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-hui-border px-4 py-2.5">
+                <p className="text-xs text-hui-textMuted">
+                    {headerForecast ? `Vancouver: ${headerForecast.precipitationProbability}% rain \u00B7 ${headerForecast.high}\u00B0/${headerForecast.low}\u00B0` : "Vancouver forecast unavailable"}
+                    {"  \u00B7  Jobs first today, people across the week."}
+                </p>
                 <div className="flex flex-wrap items-center gap-2">
-                    <Link href="/company-dashboard/staging" className="hui-btn hui-btn-secondary text-xs">
-                        {"\u{1F4E6}"} Staging queue
+                    <SegmentedControl
+                        ariaLabel="Dispatch range"
+                        value={mode}
+                        onChange={onModeChange}
+                        options={[
+                            { value: "today", label: "Today" },
+                            { value: "week", label: "Week" },
+                        ]}
+                    />
+                    <Link href="/company-dashboard/staging" className="hui-btn hui-btn-secondary text-xs h-8 inline-flex items-center gap-1.5">
+                        <Package className="h-3.5 w-3.5" aria-hidden="true" />
+                        Staging queue
                     </Link>
-                    {data.canEdit && (
-                        <button
-                            type="button"
-                            onClick={onReviewDispatch}
-                            disabled={draftCount === 0 || isReviewingDispatch}
-                            className="hui-btn hui-btn-green text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                            {isReviewingDispatch ? (
-                                "Reviewing..."
-                            ) : draftCount > 0 ? (
-                                <>
-                                    {"Review dispatch ("}
-                                    <motion.span
-                                        key={draftCount}
-                                        data-motion-scope="dispatch-count"
-                                        initial={{ opacity: 0, scale: 0.85 }}
-                                        animate={{ opacity: 1, scale: 1 }}
-                                        transition={{ duration: 0.16 }}
-                                        className="inline-block tabular-nums"
-                                    >
-                                        {draftCount}
-                                    </motion.span>
-                                    {")"}
-                                </>
-                            ) : (
-                                "Review dispatch"
-                            )}
-                        </button>
-                    )}
-                    <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Dispatch range">
-                        {(["today", "week"] as const).map(nextMode => (
-                            <button
-                                key={nextMode}
-                                type="button"
-                                onClick={() => selectMode(nextMode)}
-                                aria-pressed={mode === nextMode}
-                                className={`rounded px-3 py-1.5 text-xs font-semibold capitalize transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${mode === nextMode ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
-                            >
-                                {nextMode}
-                            </button>
-                        ))}
-                    </div>
                 </div>
             </div>
 
@@ -570,17 +512,6 @@ export function DispatchView({
                 </div>
             ) : (
                 <div className="p-4">
-                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-sm font-semibold text-hui-textMain">
-                            Week of {dayLabel(weekStart)}
-                        </p>
-                        <div className="flex items-center gap-2">
-                            <button type="button" onClick={() => setWeekStart(current => addDays(current, -7))} className="hui-btn hui-btn-secondary text-xs" aria-label="Previous week">{"\u2190"}</button>
-                            <button type="button" onClick={() => setWeekStart(currentMonday)} className="hui-btn hui-btn-secondary text-xs">This week</button>
-                            <button type="button" onClick={() => setWeekStart(current => addDays(current, 7))} className="hui-btn hui-btn-secondary text-xs" aria-label="Next week">{"\u2192"}</button>
-                        </div>
-                    </div>
-
                     <div className="max-w-full overflow-x-auto rounded-lg border border-hui-border">
                         <div
                             role="table"

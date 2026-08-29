@@ -4,15 +4,14 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useTransit
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import type { CompanyDashboardData, DashboardProjectRow } from "@/lib/schedule-core";
+import type { CompanyDashboardData } from "@/lib/schedule-core";
 import type { VancouverForecastDay } from "@/lib/weather";
 import { PROJECT_STATUSES } from "@/lib/project-status";
-import { applyChangeOrderToScheduleAction, generateProjectScheduleAction, updateProjectStartDateAction } from "@/lib/actions";
+import { applyChangeOrderToScheduleAction, generateProjectScheduleAction } from "@/lib/actions";
 import { formatCurrency, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 import { ScheduleBoard } from "./schedule-board/ScheduleBoard";
 import { CrewPicker, TaskCrewPicker } from "./schedule-board/CrewPickers";
 import {
-    mergeProjectPendingIds,
     projectIdSetsEqual,
     projectRefreshMatches,
     type ProjectRefreshExpectation,
@@ -89,102 +88,20 @@ interface LegacyProjectMutation {
     expectation: ProjectRefreshExpectation | null;
 }
 
-interface StartDateRowProps {
-    project: DashboardProjectRow;
-    isProjectPending: boolean;
-    beginProjectMutation: (projectId: string) => boolean;
-    awaitProjectRefresh: (projectId: string, expectation: ProjectRefreshExpectation) => void;
-    clearProjectMutation: (projectId: string) => void;
-}
-
-// Inline date setter for one waiting-to-start project (P1).
-function StartDateRow({
-    project,
-    isProjectPending,
-    beginProjectMutation,
-    awaitProjectRefresh,
-    clearProjectMutation,
-}: StartDateRowProps) {
-    const router = useRouter();
-    const [date, setDate] = useState("");
-    const [isPending, startTransition] = useTransition();
-
-    function handleSet() {
-        if (!date) {
-            toast.error("Pick a start date first");
-            return;
-        }
-        if (!beginProjectMutation(project.id)) return;
-        startTransition(async () => {
-            try {
-                const result = await updateProjectStartDateAction(project.id, date, true);
-                awaitProjectRefresh(project.id, {
-                    projectStartDate: result.startDate,
-                    taskDates: result.shiftedTaskDates,
-                });
-                toast.success(
-                    result.shiftedTasks > 0
-                        ? `Start set — ${result.shiftedTasks} job task${result.shiftedTasks === 1 ? "" : "s"} shifted`
-                        : "Start date set"
-                );
-                // Surface core-side side notes (e.g. "saved end date cleared").
-                if (result.notes?.length) toast.info(result.notes.join(" "));
-                router.refresh();
-            } catch (error) {
-                clearProjectMutation(project.id);
-                toast.error(error instanceof Error ? error.message : "Failed to set start date");
-            }
-        });
-    }
-
-    return (
-        <tr className="hover:bg-slate-50 transition">
-            <td className="px-4 py-3">
-                <Link href={`/projects/${project.id}`} className="text-sm font-medium text-hui-textMain hover:text-hui-primary">
-                    {project.name}
-                </Link>
-            </td>
-            <td className="px-4 py-3 text-sm text-hui-textMuted">{project.client ?? "—"}</td>
-            <td className="px-4 py-3 text-sm text-hui-textMain">
-                {project.contractValue != null ? formatCurrency(project.contractValue) : "—"}
-            </td>
-            <td className="px-4 py-3">
-                <div className="flex items-center gap-2">
-                    <input
-                        type="date"
-                        value={date}
-                        onChange={e => setDate(e.target.value)}
-                        className="hui-input text-sm"
-                        disabled={isPending || isProjectPending}
-                    />
-                    <button
-                        onClick={handleSet}
-                        disabled={isPending || isProjectPending}
-                        className="hui-btn hui-btn-green text-sm whitespace-nowrap"
-                    >
-                        {isPending ? "Setting..." : isProjectPending ? "Refreshing..." : "Set"}
-                    </button>
-                </div>
-            </td>
-        </tr>
-    );
-}
-
 export default function CompanyDashboardClient({ data, weather, focus }: { data: CompanyDashboardData; weather: VancouverForecastDay[]; focus?: "dispatch" }) {
     const router = useRouter();
-    const { month, canEdit, isAdmin, canSeeFinancials, pipeline, cashflow, teamMembers, crewConflicts, strip } = data;
+    const { month, canEdit, isAdmin, canSeeFinancials, pipeline, cashflow, teamMembers, strip } = data;
 
     const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
     const pageMountedRef = useRef(true);
     const boardPendingProjectIdsRef = useRef<Set<string>>(new Set());
     const legacyProjectMutationsRef = useRef<Map<string, LegacyProjectMutation>>(new Map());
-    const externalShiftNonceRef = useRef(0);
     // Append-only event queue (functional updates compose within a React
     // batch — a single "latest payload" slot would drop one of two legacy
     // shifts resolving in the same batch). Capped: the board applies events
     // within a render, so older entries are long-consumed.
-    const [externalShiftEvents, setExternalShiftEvents] = useState<{ nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[]>([]);
-    const [boardPendingProjectIds, setBoardPendingProjectIds] = useState<Set<string>>(() => new Set());
+    const [externalShiftEvents] = useState<{ nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[]>([]);
+    const [, setBoardPendingProjectIds] = useState<Set<string>>(() => new Set());
     const [legacyProjectMutations, setLegacyProjectMutations] = useState<Map<string, LegacyProjectMutation>>(() => new Map());
     const canonicalProjects = useMemo(() => [
         ...pipeline.waitingToStart,
@@ -194,10 +111,6 @@ export default function CompanyDashboardClient({ data, weather, focus }: { data:
     ], [pipeline]);
     const canonicalProjectById = useMemo(() => new Map(canonicalProjects.map(project => [project.id, project])), [canonicalProjects]);
     const legacyPendingProjectIds = useMemo(() => new Set(legacyProjectMutations.keys()), [legacyProjectMutations]);
-    const pagePendingProjectIds = useMemo(
-        () => mergeProjectPendingIds(boardPendingProjectIds, legacyPendingProjectIds),
-        [boardPendingProjectIds, legacyPendingProjectIds],
-    );
     const legacyRefreshCount = useMemo(
         () => [...legacyProjectMutations.values()].filter(mutation => mutation.expectation !== null).length,
         [legacyProjectMutations],
@@ -213,35 +126,6 @@ export default function CompanyDashboardClient({ data, weather, focus }: { data:
         if (projectIdSetsEqual(boardPendingProjectIdsRef.current, next)) return;
         boardPendingProjectIdsRef.current = next;
         if (pageMountedRef.current) setBoardPendingProjectIds(next);
-    }, []);
-
-    const beginLegacyProjectMutation = useCallback((projectId: string) => {
-        if (!pageMountedRef.current || isPageProjectPending(projectId)) return false;
-        const next = new Map(legacyProjectMutationsRef.current);
-        next.set(projectId, { expectation: null });
-        legacyProjectMutationsRef.current = next;
-        setLegacyProjectMutations(next);
-        return true;
-    }, [isPageProjectPending]);
-
-    const awaitLegacyProjectRefresh = useCallback((projectId: string, expectation: ProjectRefreshExpectation) => {
-        if (!pageMountedRef.current || !legacyProjectMutationsRef.current.has(projectId)) return;
-        const next = new Map(legacyProjectMutationsRef.current);
-        next.set(projectId, { expectation });
-        legacyProjectMutationsRef.current = next;
-        setLegacyProjectMutations(next);
-        // Publish the persisted shift to the board: a saved-awaiting task the
-        // board is tracking may have just been moved by this legacy shift, and
-        // its pinned override must follow the persisted dates to reconcile.
-        if (expectation.taskDates.length > 0) {
-            externalShiftNonceRef.current += 1;
-            const event = { nonce: externalShiftNonceRef.current, taskDates: expectation.taskDates };
-            // No cap: any truncation can silently drop an unseen event while
-            // the board's nonce ref advances past it. Growth is bounded by
-            // actual legacy saves in this page's lifetime (tiny objects) and
-            // reclaimed on unmount.
-            setExternalShiftEvents(current => [...current, event]);
-        }
     }, []);
 
     const clearLegacyProjectMutation = useCallback((projectId: string) => {
@@ -451,80 +335,6 @@ export default function CompanyDashboardClient({ data, weather, focus }: { data:
                     </table>
                 )}
             </div>
-
-            {/* Waiting to start — ADMIN/MANAGER editor only (P1) */}
-            {canEdit && (
-                <div className="hui-card mb-6">
-                    <div className="px-4 py-3 border-b border-hui-border">
-                        <h2 className="text-base font-semibold text-hui-textMain">Waiting to start</h2>
-                        <p className="text-xs text-hui-textMuted mt-1">
-                            Set a project start date to move it onto the calendar. Moving a start date also shifts the job&apos;s
-                            tasks and any linked milestones (milestones already pushed to QuickBooks are skipped and reported).
-                        </p>
-                    </div>
-                    {pipeline.waitingToStart.length === 0 ? (
-                        <p className="px-4 py-8 text-sm text-hui-textMuted text-center">No projects waiting to start.</p>
-                    ) : (
-                        <table className="w-full">
-                            <thead>
-                                <tr className="border-b border-hui-border bg-slate-50">
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Project</th>
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Client</th>
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Contract Value</th>
-                                    <th className="text-left px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Start Date</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-100">
-                                {pipeline.waitingToStart.map(p => (
-                                    <StartDateRow
-                                        key={p.id}
-                                        project={p}
-                                        isProjectPending={pagePendingProjectIds.has(p.id)}
-                                        beginProjectMutation={beginLegacyProjectMutation}
-                                        awaitProjectRefresh={awaitLegacyProjectRefresh}
-                                        clearProjectMutation={clearLegacyProjectMutation}
-                                    />
-                                ))}
-                            </tbody>
-                        </table>
-                    )}
-                </div>
-            )}
-
-            {/* Crew conflicts — ADMIN/MANAGER (read-only) */}
-            {canEdit && crewConflicts && (
-                <div className="hui-card mb-6">
-                    <div className="px-4 py-3 border-b border-hui-border">
-                        <h2 className="text-base font-semibold text-hui-textMain">Crew conflicts</h2>
-                    </div>
-                    {crewConflicts.length === 0 ? (
-                        <p className="px-4 py-8 text-sm text-hui-textMuted text-center">No crew conflicts this month.</p>
-                    ) : (
-                        <ul className="divide-y divide-slate-100">
-                            {crewConflicts.map(c => (
-                                <li key={c.userId} className="px-4 py-3">
-                                    <p className="text-sm font-semibold text-hui-textMain">{c.name}</p>
-                                    <ul className="mt-1 space-y-0.5">
-                                        {c.pairs.map((pair, i) => (
-                                            <li key={i} className="text-xs text-hui-textMuted">
-                                                <Link href={`/projects/${pair.projectA.id}`} className="text-hui-primary hover:underline">{pair.projectA.name}</Link>
-                                                {" × "}
-                                                <Link href={`/projects/${pair.projectB.id}`} className="text-hui-primary hover:underline">{pair.projectB.name}</Link>
-                                                {` — ${pair.overlapStart.slice(0, 10)} → ${pair.overlapEnd.slice(0, 10)}`}
-                                                {(pair.taskA || pair.taskB) && (
-                                                    <span className="block pl-3 text-[11px] text-slate-500">
-                                                        {[pair.taskA, pair.taskB].filter(Boolean).map(task => `${task!.name} (${task!.startDate.slice(0, 10)} → ${task!.endDate.slice(0, 10)})`).join(" × ")}
-                                                    </span>
-                                                )}
-                                            </li>
-                                        ))}
-                                    </ul>
-                                </li>
-                            ))}
-                        </ul>
-                    )}
-                </div>
-            )}
 
             {/* Cashflow outlook — ADMIN only (never serialized for other roles) */}
             {cashflow && (
