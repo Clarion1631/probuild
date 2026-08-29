@@ -30,6 +30,7 @@ import {
 } from "./quickbooks";
 import { isE2eQboMockEnabled, MOCK_QB_TOKENS } from "./quickbooks-mock";
 import type { QBSyncIssue } from "./payment-notifications";
+import { qbShipAddrFor } from "./wa-tax";
 
 export class QBNotConnectedError extends Error {
     constructor() {
@@ -140,8 +141,8 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         include: {
             invoice: {
                 include: {
-                    client: { select: { id: true, name: true, email: true, qbCustomerId: true } },
-                    project: { select: { id: true, name: true } },
+                    client: { select: { id: true, name: true, email: true, qbCustomerId: true, addressLine1: true, city: true, state: true, zipCode: true } },
+                    project: { select: { id: true, name: true, location: true } },
                     payments: { select: { id: true, createdAt: true }, orderBy: { createdAt: "asc" } },
                 },
             },
@@ -223,13 +224,22 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,
+        shipAddr: qbShipAddrFor(invoice.project?.location, invoice.client),
     });
 
-    // QBO Automated Sales Tax can recalculate on top of what we send — verify the
-    // grand total still equals the milestone. A drift means the client would be
-    // asked for a different amount than ProBuild expects; flag it loudly.
-    if (Math.abs(total - amount) > 0.05) {
-        console.warn(`[quickbooks-payments] QBO total drift on ${docNumber}: ProBuild ${amount} vs QBO ${total}`);
+    // QBO Automated Sales Tax can recalculate on top of what we send (it rates
+    // by ShipAddr) — verify the grand total still equals the milestone. A drift
+    // means the client would be asked for a different amount than ProBuild
+    // expects (Berg ADU INV-00177-2: $15,125 for a $15,000 milestone), so the
+    // invoice is deleted and the push fails instead of linking it.
+    // Tolerance is one cent: QBO may round its recomputed tax a cent away from
+    // ProBuild's pre-tax/tax split; anything more is a rate mismatch.
+    if (!Number.isFinite(total) || Math.abs(Math.round(total * 100) - Math.round(amount * 100)) > 1) {
+        const compensated = await deleteQBInvoice(tokens, qbId).catch(() => false);
+        throw new Error(
+            `QuickBooks computed ${total.toFixed(2)} for ${docNumber} but ProBuild expects ${amount.toFixed(2)} — check the project's job-site address and tax rate, then retry.` +
+            (compensated ? "" : ` The mismatched QuickBooks invoice (id ${qbId}) could not be deleted — remove it in QuickBooks by hand first.`)
+        );
     }
 
     const payLink = await getQBInvoicePaymentLink(tokens, qbId);

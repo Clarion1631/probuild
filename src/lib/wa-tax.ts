@@ -30,7 +30,7 @@ type ClientAddress = {
 
 // "204 SW Kerron St, Winlock, WA 98596" → parts the DOR service understands.
 // Null without a WA-shaped 5-digit zip (the service rejects zip-less queries).
-function parseLocationText(text: string | null | undefined): AddressQuery | null {
+export function parseLocationText(text: string | null | undefined): AddressQuery | null {
     if (!text) return null;
     // Last WA-shaped zip (980xx–994xx live in 98/99): house numbers can be five
     // digits too, so first-match breaks "12345 NE 8th St Bellevue WA 98005".
@@ -69,6 +69,50 @@ function parseLocationText(text: string | null | undefined): AddressQuery | null
         }
     }
     return { addr: street, city, zip };
+}
+
+/** QBO PhysicalAddress shape (the subset Automated Sales Tax reads). */
+export type QBShipAddr = { Line1: string; City?: string; CountrySubDivisionCode?: string; PostalCode?: string };
+
+// Job-site address for a pushed QBO invoice. Automated Sales Tax rates the
+// invoice by ShipAddr; without one it falls back to the company address
+// (Vancouver), which mis-rated Berg ADU (Winlock, 8.0%) at 8.9% — INV-00177-2,
+// 2026-07. Prefer the project location; fall back to the client's address.
+//
+// Only a street-level address with a WA zip is sent. A partial or
+// project-name-prefixed one ("Berg ADU, 204 SW Kerron St, …" parses to no
+// street) could steer AST to a wrong jurisdiction, which is worse than the
+// company-address default — so anything less yields null and the invoice
+// carries no ShipAddr (the pre-existing behavior). The callers still verify
+// QBO's grand total against the milestone either way.
+export function qbShipAddrFor(location: string | null | undefined, client?: ClientAddress | null): QBShipAddr | null {
+    const parsed = parseLocationText(location);
+    if (parsed && parsed.addr && isWaZip(parsed.zip)) {
+        return {
+            Line1: parsed.addr.slice(0, 500),
+            ...(parsed.city ? { City: parsed.city } : {}),
+            CountrySubDivisionCode: "WA",
+            PostalCode: parsed.zip,
+        };
+    }
+    const line1 = client?.addressLine1?.trim();
+    const zip = client?.zipCode?.match(/\b(\d{5})\b/)?.[1];
+    const state = client?.state?.trim().toUpperCase() ?? "";
+    const inWa = state === "" || state === "WA" || state === "WASHINGTON";
+    if (!line1 || !zip || !inWa || !isWaZip(zip)) return null;
+    return {
+        Line1: line1.slice(0, 500),
+        ...(client?.city?.trim() ? { City: client.city.trim() } : {}),
+        CountrySubDivisionCode: "WA",
+        PostalCode: zip,
+    };
+}
+
+// WA zips are 98001–99403; parseLocationText's looser 98/99 match also admits
+// Alaska (995xx–999xx), which must not be labeled WA.
+function isWaZip(zip: string): boolean {
+    const n = Number(zip);
+    return /^\d{5}$/.test(zip) && n >= 98001 && n <= 99403;
 }
 
 function titleCase(name: string): string {
