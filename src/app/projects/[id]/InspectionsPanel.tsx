@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { createInspection, updateInspection } from "@/lib/actions";
 import { toast } from "sonner";
@@ -78,15 +78,21 @@ export default function InspectionsPanel({ projectId, initialInspections }: {
     const [editing, setEditing] = useState<Inspection | null>(null);
     const [showForm, setShowForm] = useState(false);
     const [form, setForm] = useState<FormState>(emptyForm);
+    const typeInputRef = useRef<HTMLInputElement>(null);
+    const scheduledDateRef = useRef<HTMLInputElement>(null);
+    const performedDateRef = useRef<HTMLInputElement>(null);
+    const shareChoiceTouched = useRef(false);
 
     const openNew = () => {
         setEditing(null);
+        shareChoiceTouched.current = false;
         setForm(emptyForm);
         setShowForm(true);
     };
 
     const openEdit = (inspection: Inspection) => {
         setEditing(inspection);
+        shareChoiceTouched.current = false;
         setForm({
             type: inspection.type,
             result: inspection.result,
@@ -110,11 +116,13 @@ export default function InspectionsPanel({ projectId, initialInspections }: {
         event.preventDefault();
         if (!form.type.trim()) {
             toast.error("Inspection type is required");
+            typeInputRef.current?.focus();
             return;
         }
         const date = form.result === "SCHEDULED" ? form.scheduledDate : form.performedDate;
         if (!date) {
             toast.error(form.result === "SCHEDULED" ? "Choose the scheduled date" : "Choose the performed date");
+            (form.result === "SCHEDULED" ? scheduledDateRef : performedDateRef).current?.focus();
             return;
         }
         startTransition(async () => {
@@ -209,18 +217,18 @@ export default function InspectionsPanel({ projectId, initialInspections }: {
                         </div>
                         <div className="p-5 space-y-4">
                             <div className="grid gap-4 sm:grid-cols-2">
-                                <label className="text-sm font-medium text-hui-textMain">Type<input autoFocus value={form.type} onChange={event => setForm(current => ({ ...current, type: event.target.value }))} className="hui-input w-full mt-1" placeholder="Electrical rough-in" /></label>
-                                <label className="text-sm font-medium text-hui-textMain">Result<select value={form.result} onChange={event => setForm(current => ({ ...current, result: event.target.value, sharedToPortal: event.target.value === "PASSED" }))} className="hui-input w-full mt-1">{RESULTS.map(result => <option key={result.value} value={result.value}>{result.label}</option>)}</select></label>
+                                <label className="text-sm font-medium text-hui-textMain">Type<input ref={typeInputRef} autoFocus value={form.type} onChange={event => setForm(current => ({ ...current, type: event.target.value }))} className="hui-input w-full mt-1" placeholder="Electrical rough-in" /></label>
+                                <label className="text-sm font-medium text-hui-textMain">Result<select value={form.result} onChange={event => setForm(current => ({ ...current, result: event.target.value, sharedToPortal: shareChoiceTouched.current ? current.sharedToPortal : event.target.value === "PASSED" }))} className="hui-input w-full mt-1">{RESULTS.map(result => <option key={result.value} value={result.value}>{result.label}</option>)}</select></label>
                             </div>
                             {form.result === "SCHEDULED" ? (
-                                <label className="block text-sm font-medium text-hui-textMain">Scheduled date<input type="date" value={form.scheduledDate} onChange={event => setForm(current => ({ ...current, scheduledDate: event.target.value }))} className="hui-input w-full mt-1" required /></label>
+                                <label className="block text-sm font-medium text-hui-textMain">Scheduled date<input ref={scheduledDateRef} type="date" value={form.scheduledDate} onChange={event => setForm(current => ({ ...current, scheduledDate: event.target.value }))} className="hui-input w-full mt-1" required /></label>
                             ) : (
-                                <label className="block text-sm font-medium text-hui-textMain">Performed date<input type="date" value={form.performedDate} onChange={event => setForm(current => ({ ...current, performedDate: event.target.value }))} className="hui-input w-full mt-1" required /></label>
+                                <label className="block text-sm font-medium text-hui-textMain">Performed date<input ref={performedDateRef} type="date" value={form.performedDate} onChange={event => setForm(current => ({ ...current, performedDate: event.target.value }))} className="hui-input w-full mt-1" required /></label>
                             )}
                             <label className="block text-sm font-medium text-hui-textMain">Inspector<input value={form.inspector} onChange={event => setForm(current => ({ ...current, inspector: event.target.value }))} className="hui-input w-full mt-1" placeholder="Name or agency" /></label>
                             <label className="block text-sm font-medium text-hui-textMain">Internal notes<textarea value={form.notes} onChange={event => setForm(current => ({ ...current, notes: event.target.value }))} className="hui-input w-full mt-1" rows={3} /></label>
                             <label className="block text-sm font-medium text-hui-textMain">Client note <span className="font-normal text-hui-textMuted">(optional)</span><textarea value={form.customerNote} onChange={event => setForm(current => ({ ...current, customerNote: event.target.value }))} className="hui-input w-full mt-1" rows={2} placeholder="What the client should know" /></label>
-                            <label className="flex items-start gap-3 rounded-lg bg-slate-50 border border-hui-border p-3 cursor-pointer"><input type="checkbox" checked={form.sharedToPortal} onChange={event => setForm(current => ({ ...current, sharedToPortal: event.target.checked }))} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /><span><span className="block text-sm font-medium text-hui-textMain">Share to client portal</span><span className="block text-xs text-hui-textMuted mt-0.5">Passed inspections share by default. Failed and partial results remain private unless you choose to share them.</span></span></label>
+                            <label className="flex items-start gap-3 rounded-lg bg-slate-50 border border-hui-border p-3 cursor-pointer"><input type="checkbox" checked={form.sharedToPortal} onChange={event => { shareChoiceTouched.current = true; setForm(current => ({ ...current, sharedToPortal: event.target.checked })); }} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /><span><span className="block text-sm font-medium text-hui-textMain">Share to client portal</span><span className="block text-xs text-hui-textMuted mt-0.5">Passed inspections share by default. Failed and partial results remain private unless you choose to share them.</span></span></label>
                         </div>
                         <div className="p-5 border-t border-hui-border flex justify-end gap-3"><button type="button" onClick={closeForm} className="hui-btn hui-btn-secondary">Cancel</button><button type="submit" disabled={isPending} className="hui-btn hui-btn-primary">{isPending ? "Saving…" : editing ? "Save result" : "Add inspection"}</button></div>
                     </form>

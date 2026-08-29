@@ -1,4 +1,4 @@
-// The nine client-facing stages on the portal project tracker.
+// The eight client-facing stages on the portal project tracker.
 //
 // Pure data with no Prisma import, so client components and server code can
 // both use it. lib/portal-tracker.ts re-exports these for existing callers.
@@ -6,8 +6,6 @@
 export type ClientStageDefinition = {
     label: string;
     matchers: readonly string[];
-    // Inspections comes from an explicit shared Inspection record, never from
-    // a task name, an explicit ScheduleTask.clientStage, or interpolation.
     taskDerived?: boolean;
 };
 
@@ -52,11 +50,7 @@ export const CLIENT_STAGES = [
             "final walk", "correction",
         ],
     },
-    {
-        label: "Inspections",
-        matchers: [],
-        taskDerived: false,
-    },
+
     {
         label: "Complete",
         matchers: ["complete", "completion", "closeout", "close out", "handover", "handoff"],

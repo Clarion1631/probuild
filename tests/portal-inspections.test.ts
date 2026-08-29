@@ -25,45 +25,37 @@ function task(overrides: Partial<PortalTrackerTask> = {}): PortalTrackerTask {
     };
 }
 
-test("Inspections is the ninth stage immediately before Complete", () => {
-    assert.equal(CLIENT_STAGE_LABELS.length, 9);
-    assert.deepEqual(CLIENT_STAGE_LABELS.slice(-2), ["Inspections", "Complete"]);
-    assert.equal(clientStageIndex("Inspections"), 7);
-    assert.equal(clientStageIndex("Complete"), 8);
+test("Inspections is not a client tracker stage", () => {
+    assert.equal(CLIENT_STAGE_LABELS.length, 8);
+    assert.deepEqual(CLIENT_STAGE_LABELS.slice(-2), ["Punch list", "Complete"]);
+    assert.equal(clientStageIndex("Inspections"), null);
+    assert.equal(clientStageIndex("Complete"), 7);
 });
 
-test("a client-shared scheduled inspection advances the automatic tracker to Inspections", () => {
-    const tracker = buildProjectTracker([task()], null, true);
-    const current = tracker.stages.find(stage => stage.state === "current");
-    assert.equal(current?.label, "Inspections");
-});
-
-test("an unshared scheduled inspection cannot affect the client tracker", () => {
-    const tracker = buildProjectTracker([task()], null, false);
+test("inspection records do not participate in automatic tracker state", () => {
+    const tracker = buildProjectTracker([task()]);
     const current = tracker.stages.find(stage => stage.state === "current");
     assert.equal(current?.label, "Framing");
 });
 
-test("schedule task names and clientStage values cannot derive the Inspections stage", () => {
+test("a stale Inspections clientStage value cannot create a tracker stage", () => {
     const tracker = buildProjectTracker([
         task({ name: "Final inspection", clientStage: "Inspections", costCodeName: "Inspection" }),
-    ], null, false);
+    ]);
     const current = tracker.stages.find(stage => stage.state === "current");
     const inspections = tracker.stages.find(stage => stage.label === "Inspections");
     assert.notEqual(current?.label, "Inspections");
-    assert.equal(inspections?.taskCount, 0);
+    assert.equal(inspections, undefined);
 });
 
-test("a shared scheduled inspection prevents a completed schedule from reporting Complete", () => {
-    const tracker = buildProjectTracker([task({ status: "Complete", progress: 100 })], null, true);
+test("a completed schedule reports Complete", () => {
+    const tracker = buildProjectTracker([task({ status: "Complete", progress: 100 })]);
     const current = tracker.stages.find(stage => stage.state === "current");
-    assert.equal(current?.label, "Inspections");
-    assert.notEqual(tracker.stages.find(stage => stage.label === "Complete")?.state, "current");
+    assert.equal(current?.label, "Complete");
 });
 
-test("a shared scheduled inspection caps a later staff override at Inspections", () => {
-    const tracker = buildProjectTracker([task({ status: "Complete", progress: 100 })], "Complete", true);
+test("a staff override can pin the tracker at Complete", () => {
+    const tracker = buildProjectTracker([task({ status: "Complete", progress: 100 })], "Complete");
     const current = tracker.stages.find(stage => stage.state === "current");
-    assert.equal(current?.label, "Inspections");
-    assert.notEqual(tracker.stages.find(stage => stage.label === "Complete")?.state, "current");
+    assert.equal(current?.label, "Complete");
 });

@@ -1,12 +1,9 @@
 import type { Prisma } from "@prisma/client";
 
 import type { McpActorContext } from "./mcp-actor";
-import { assertInspectionLinksBelongToProject } from "./inspection-core";
+import { assertInspectionLinksBelongToProject, inspectionResult, parseInspectionDate, type InspectionResult } from "./inspection-core";
 import { executeConfirmed, issueConfirmation } from "./mcp-schedule-tools";
 import { prisma } from "./prisma";
-
-export const MCP_INSPECTION_RESULTS = ["SCHEDULED", "PASSED", "FAILED", "PARTIAL"] as const;
-type InspectionResult = (typeof MCP_INSPECTION_RESULTS)[number];
 
 type RecordInspectionInput = {
     projectId: string;
@@ -22,9 +19,8 @@ type RecordInspectionInput = {
 };
 
 function dateOnly(value: string): Date {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error("date must use YYYY-MM-DD");
-    const date = new Date(`${value}T00:00:00.000Z`);
-    if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) throw new Error("date is invalid");
+    const date = parseInspectionDate(value, "date");
+    if (!date) throw new Error("date is required");
     return date;
 }
 
@@ -49,12 +45,12 @@ function preview(input: Omit<RecordInspectionInput, "confirmToken">): string {
 function canonicalInput(input: RecordInspectionInput): Omit<RecordInspectionInput, "confirmToken"> {
     const type = input.type.trim();
     if (!type) throw new Error("type is required");
-    if (!(MCP_INSPECTION_RESULTS as readonly string[]).includes(input.result)) throw new Error("result is invalid");
+    const result = inspectionResult(input.result);
     dateOnly(input.date);
     return {
         projectId: input.projectId,
         type,
-        result: input.result,
+        result,
         date: input.date,
         notes: cleanOptional(input.notes) ?? undefined,
         customerNote: cleanOptional(input.customerNote) ?? undefined,
