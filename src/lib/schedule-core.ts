@@ -6,7 +6,6 @@ import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
-import { DISPATCHABLE_ROLES } from "./dispatch-roster";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
 // (.specs/PB-pipeline-001-company-dashboard.md), shared by the permission-gated
@@ -128,6 +127,10 @@ export interface PipelineCrewMember {
     // User role — the picker renders an assigned FINANCE user (excluded from
     // the pickable teamMembers list) as a removable "(finance)" entry.
     role: string;
+    // Owner-controlled dispatch-roster switch (Team page). isDispatchable()
+    // (dispatch-roster.ts) is the single source of truth for who counts as
+    // crew on the Dispatch board — this field is what it reads.
+    showOnDispatch: boolean;
 }
 
 export interface PipelineProject {
@@ -202,7 +205,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
                 location: true,
                 locationLat: true, locationLng: true,
                 client: { select: { name: true } },
-                crew: { select: { id: true, name: true, email: true, status: true, role: true } },
+                crew: { select: { id: true, name: true, email: true, status: true, role: true, showOnDispatch: true } },
                 estimates: {
                     where: { status: { in: CONTRACT_ESTIMATE_STATUSES } },
                     orderBy: { createdAt: "desc" },
@@ -224,7 +227,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         endDate: p.endDate ? p.endDate.toISOString() : null,
         color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
-        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role })),
+        crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role, showOnDispatch: u.showOnDispatch })),
         distanceMilesFromShop: p.locationLat != null && p.locationLng != null
             ? Math.round(haversineMiles(SHOP_LAT, SHOP_LNG, p.locationLat, p.locationLng))
             : null,
@@ -2070,6 +2073,7 @@ export interface DashboardTaskAssignment {
     status: string;
     userRole: string;
     assignmentRole: string;
+    showOnDispatch: boolean;
 }
 
 export interface DashboardTaskComment {
@@ -2160,7 +2164,7 @@ export interface CompanyDashboardData {
     // burdenedHourlyRate is MONEY (hourlyRate + burdenRate) — present only
     // when canSeeFinancials is true; absent (never null) otherwise, same
     // redaction convention as contractValue/targetRevenue below.
-    teamMembers: { id: string; name: string; email: string; role: string; burdenedHourlyRate?: number }[] | null;
+    teamMembers: { id: string; name: string; email: string; role: string; showOnDispatch: boolean; burdenedHourlyRate?: number }[] | null;
     crewConflicts: CrewConflict[] | null;
     overlays: CalendarOverlays | null;
     strip: ProjectMonthStripRow[] | null;
@@ -2374,7 +2378,7 @@ export async function getCompanyDashboardData(
                 doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true } } },
+                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
                 },
                 // Hover-card notes (item 3): capped at 2, newest first — same
                 // audience as the project schedule page's own comment thread
@@ -2481,6 +2485,7 @@ export async function getCompanyDashboardData(
                 status: a.user.status,
                 userRole: a.user.role,
                 assignmentRole: a.role,
+                showOnDispatch: a.user.showOnDispatch,
             })),
             latestComments: task.comments.map(c => ({
                 text: c.text,
@@ -2518,13 +2523,13 @@ export async function getCompanyDashboardData(
     // appended so the picker stays unambiguous.
     const teamMembersRaw = canEdit
         ? await prisma.user.findMany({
-            // Dispatchable roster (dispatch-roster.ts): FIELD_CREW plus the
-            // ADMIN/MANAGER accounts (Richard, CJ) who work in the field —
-            // never FINANCE. Already-assigned non-crew still render as
-            // removable entries.
-            where: { status: "ACTIVATED", role: { in: [...DISPATCHABLE_ROLES] } },
+            // Pickable staff: every ACTIVATED non-finance account can be put on
+            // a task. Whether they appear on the dispatch board bench/grid is
+            // the per-user switch (showOnDispatch, dispatch-roster.ts), applied
+            // client-side so the picker and the board never disagree.
+            where: { status: "ACTIVATED", role: { not: "FINANCE" } },
             orderBy: { name: "asc" },
-            select: { id: true, name: true, email: true, role: true, hourlyRate: true, burdenRate: true },
+            select: { id: true, name: true, email: true, role: true, showOnDispatch: true, hourlyRate: true, burdenRate: true },
         })
         : [];
     const teamMembers = canEdit
@@ -2534,6 +2539,7 @@ export async function getCompanyDashboardData(
                 name: u.name || u.email,
                 email: u.email,
                 role: u.role,
+                showOnDispatch: u.showOnDispatch,
                 // MONEY — only serialized for financialReports holders (the
                 // availability panel's planned-$ row needs it; the picker UI
                 // ignores the extra field).

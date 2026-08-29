@@ -23,6 +23,7 @@ import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { DispatchView, DISPATCH_MODE_STORAGE_KEY } from "./DispatchView";
 import type { DispatchMode, DispatchTaskCreationDefaults } from "./DispatchView";
+import { shiftDayKey, formatDayLabel, isTodayKey } from "./dispatch-day";
 import { DispatchReviewDialog } from "./DispatchReviewDialog";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
@@ -304,6 +305,10 @@ export function ScheduleBoard({
     // Prev/Today/Next, and its date label in the title.
     const [dispatchMode, setDispatchMode] = useState<DispatchMode>("today");
     const [dispatchWeekStart, setDispatchWeekStart] = useState(() => getMonday(todayUTC()));
+    // Dispatch's Day lens selected date — defaults to today, paged with the
+    // header's ←/Today/→ nav (never persisted; every fresh visit starts on
+    // today, mirroring dispatchWeekStart's reset-on-enter behavior below).
+    const [dispatchDayKey, setDispatchDayKey] = useState(() => formatDate(todayUTC()));
     // Same day key DispatchView derives (formatDate(todayUTC())), kept as state
     // (not a plain const) and refreshed on mount/visibility/focus so a tab left
     // open across midnight still shows the right day — a bare call inside a
@@ -414,6 +419,7 @@ export function ScheduleBoard({
     useEffect(() => {
         if (boardView === "dispatch") {
             setDispatchWeekStart(getMonday(todayUTC()));
+            setDispatchDayKey(formatDate(todayUTC()));
         }
     }, [boardView]);
     function selectDispatchMode(nextMode: DispatchMode) {
@@ -441,16 +447,15 @@ export function ScheduleBoard({
     }
     const anchor = parseUTCDate(`${month}-01`);
     const monthLabel = `${MONTH_LABELS[anchor.getUTCMonth()]} ${anchor.getUTCFullYear()}`;
-    // In-page (non-focus) Dispatch title label — "Friday, Aug 28" in Today mode,
-    // "Week of Mon, Aug 24" in Week mode, so the title always states WHEN.
-    // Depends on todayKey (below) rather than calling todayUTC() directly so it
-    // recomputes if the tab is left open across midnight.
+    // In-page (non-focus) Dispatch title label — "Saturday, Aug 29" in Day
+    // mode (the selected dispatchDayKey, not necessarily today), "Week of
+    // Mon, Aug 24" in Week mode, so the title always states WHEN.
     const dispatchDateLabel = useMemo(() => {
         if (dispatchMode === "week") {
             return `Week of ${new Intl.DateTimeFormat("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }).format(dispatchWeekStart)}`;
         }
-        return new Intl.DateTimeFormat("en-US", { weekday: "long", month: "short", day: "numeric", timeZone: "UTC" }).format(parseUTCDate(todayKey));
-    }, [dispatchMode, dispatchWeekStart, todayKey]);
+        return formatDayLabel(dispatchDayKey);
+    }, [dispatchMode, dispatchWeekStart, dispatchDayKey]);
     // Focus-mode header label — mirrors dispatchDateLabel's Today/Week logic
     // (not just today's date) so ← / This week / → have a visible, correct
     // label in focus mode too, the same as the normal in-page header.
@@ -577,6 +582,7 @@ export function ScheduleBoard({
                             name: existing?.name ?? member?.name ?? member?.email ?? "Crew member",
                             status: existing?.status ?? "ACTIVATED",
                             userRole: existing?.userRole ?? member?.role ?? "FIELD_CREW",
+                            showOnDispatch: existing?.showOnDispatch ?? member?.showOnDispatch ?? false,
                             assignmentRole: assignment.role,
                         };
                     })
@@ -2501,6 +2507,23 @@ export function ScheduleBoard({
                             </div>
                         </>
                     )}
+                    {boardView === "dispatch" && dispatchMode === "today" && (
+                        <>
+                            <div className="h-6 w-px bg-hui-border" aria-hidden="true" />
+                            <div className="flex items-center gap-2">
+                                <button type="button" onClick={() => setDispatchDayKey(current => shiftDayKey(current, -1))} className="hui-btn hui-btn-secondary h-8 text-sm" aria-label="Previous day">←</button>
+                                <button
+                                    type="button"
+                                    onClick={() => setDispatchDayKey(formatDate(todayUTC()))}
+                                    disabled={isTodayKey(dispatchDayKey, todayKey)}
+                                    className="hui-btn hui-btn-secondary h-8 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    Today
+                                </button>
+                                <button type="button" onClick={() => setDispatchDayKey(current => shiftDayKey(current, 1))} className="hui-btn hui-btn-secondary h-8 text-sm" aria-label="Next day">→</button>
+                            </div>
+                        </>
+                    )}
                 </div>
             </div>
             <AnimatePresence initial={false}>
@@ -2572,6 +2595,7 @@ export function ScheduleBoard({
                     mode={dispatchMode}
                     onModeChange={selectDispatchMode}
                     weekStart={dispatchWeekStart}
+                    dayKey={dispatchDayKey}
                 />
             ) : boardView === "month" ? (
                 <MonthBarsView

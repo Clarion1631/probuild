@@ -34,6 +34,7 @@ interface User {
     role: string;
     hourlyRate: number;
     burdenRate: number;
+    showOnDispatch: boolean;
     hasPin: boolean;
     permissions: UserPermission | null;
     projectAccess?: { projectId: string; project?: { id: string } | null }[];
@@ -74,6 +75,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
     const [hourlyRate, setHourlyRate] = useState(0);
     const [burdenRate, setBurdenRate] = useState(0);
     const [pinCode, setPinCode] = useState("");
+    const [showOnDispatch, setShowOnDispatch] = useState(false);
     const [permissions, setPermissions] = useState<UserPermission>(DEFAULT_PERMISSIONS);
 
     useEffect(() => {
@@ -95,6 +97,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                     setRole(found.role);
                     setHourlyRate(found.hourlyRate ?? 0);
                     setBurdenRate(found.burdenRate ?? 0);
+                    setShowOnDispatch(found.showOnDispatch ?? false);
                     if (found.permissions) {
                         setPermissions({ ...DEFAULT_PERMISSIONS, ...found.permissions });
                     }
@@ -125,7 +128,7 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    userInfo: { name: fullName, role, hourlyRate, burdenRate },
+                    userInfo: { name: fullName, role, hourlyRate, burdenRate, showOnDispatch: role === "FINANCE" ? false : showOnDispatch },
                     permissions,
                     pinCode,
                 })
@@ -275,6 +278,20 @@ export default function TeamMemberEditPage({ params }: { params: Promise<{ id: s
                             <option value="FIELD_CREW">Field Crew</option>
                         </select>
                     </div>
+                    {role !== "FINANCE" && (
+                        <>
+                            <label className="mt-4 flex items-center gap-3 cursor-pointer select-none text-sm text-hui-textMain">
+                                <input
+                                    type="checkbox"
+                                    checked={showOnDispatch}
+                                    onChange={() => setShowOnDispatch(prev => !prev)}
+                                    className="rounded text-blue-600 cursor-pointer"
+                                />
+                                Show on dispatch board
+                            </label>
+                            <p className="mt-1 text-xs text-hui-textMuted">Appears in the Available bench and Week grid on the Dispatch board.</p>
+                        </>
+                    )}
                 </div>
 
                 {/* Administrative Permissions */}

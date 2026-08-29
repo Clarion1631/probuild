@@ -8,6 +8,7 @@ export interface DispatchAssignmentInput {
     status: string;
     userRole: string;
     assignmentRole: string;
+    showOnDispatch: boolean;
 }
 
 export interface DispatchTaskInput {
@@ -31,6 +32,7 @@ export interface DispatchCrewInput {
     name: string;
     status: string;
     role: string;
+    showOnDispatch: boolean;
 }
 
 export interface DispatchProjectInput {
@@ -107,15 +109,15 @@ function taskException(project: DispatchProjectInput, task: DispatchTaskInput): 
 export function getUnstaffedToday(projects: readonly DispatchProjectInput[], dayKey: string): DispatchTaskException[] {
     return projects.flatMap(project => project.tasks
         .filter(task => isTaskActiveOnDay(task, dayKey))
-        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status })))
+        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch })))
         .map(task => taskException(project, task)));
 }
 
 export function getNoLeadToday(projects: readonly DispatchProjectInput[], dayKey: string): DispatchTaskException[] {
     return projects.flatMap(project => project.tasks
         .filter(task => isTaskActiveOnDay(task, dayKey))
-        .filter(task => task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status })))
-        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && assignment.assignmentRole === "lead"))
+        .filter(task => task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch })))
+        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }) && assignment.assignmentRole === "lead"))
         .map(task => taskException(project, task)));
 }
 

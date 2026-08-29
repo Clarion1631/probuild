@@ -69,6 +69,12 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                 if (userInfo.status !== undefined) data.status = userInfo.status;
                 if (userInfo.hourlyRate !== undefined) data.hourlyRate = Number(userInfo.hourlyRate);
                 if (userInfo.burdenRate !== undefined) data.burdenRate = Number(userInfo.burdenRate);
+                // FINANCE accounts must never be offered as dispatch-board crew —
+                // guard server-side even though the Team page hides the toggle.
+                if (userInfo.showOnDispatch !== undefined) {
+                    const targetRole = userInfo.role !== undefined ? userInfo.role : (await prisma.user.findUnique({ where: { id }, select: { role: true } }))?.role;
+                    data.showOnDispatch = targetRole === "FINANCE" ? false : Boolean(userInfo.showOnDispatch);
+                }
             }
             if (pinCode !== undefined) data.pinCode = pinCode ? await bcrypt.hash(pinCode, 10) : null;
             if (Object.keys(data).length > 0) {
