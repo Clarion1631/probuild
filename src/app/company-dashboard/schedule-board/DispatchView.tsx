@@ -38,12 +38,18 @@ interface DispatchViewProps {
     crewDrafts: Readonly<Record<string, { addUserIds: string[]; removeUserIds: string[] }>>;
     onDraftCrewAdd: (taskId: string, userId: string) => boolean;
     onDraftCrewRemove: (taskId: string, userId: string) => void;
-    // Today|Week range — owned by ScheduleBoard so the header row (which shows
-    // the week-nav controls in the same slot as Prev/Today/Next, and the date
-    // label in the title) can read/drive them too.
+    // Day|Week range — owned by ScheduleBoard so the header row (which shows
+    // the day/week-nav controls in the same slot as Prev/Today/Next, and the
+    // date label in the title) can read/drive them too.
     mode: DispatchMode;
     onModeChange: (mode: DispatchMode) => void;
     weekStart: Date;
+    // The Day lens's selected day (YYYY-MM-DD) — defaults to today but can be
+    // paged with the header's ←/Today/→ nav. Drives active-task filtering,
+    // the Available bench, staffing, job cards, and task-creation defaults.
+    // Independent of `mode`, whose "today" value just picks the single-day
+    // (vs. weekly matrix) layout.
+    dayKey: string;
 }
 
 interface WeekChip {
@@ -153,6 +159,7 @@ export function DispatchView({
     mode,
     onModeChange,
     weekStart,
+    dayKey,
 }: DispatchViewProps) {
     const [highlightedProjectId, setHighlightedProjectId] = useState<string | null>(null);
     const [taskBankProjectId, setTaskBankProjectId] = useState(
@@ -175,26 +182,28 @@ export function DispatchView({
 
     useEffect(() => () => activeCrewDragCleanupRef.current?.(), []);
 
-    const today = todayUTC();
-    const todayKey = formatDate(today);
+    // Real "today" — distinct from `dayKey` (the selected Day-lens date) —
+    // used only to decide whether the selected day IS today (e.g. the
+    // Exceptions strip's "Unstaffed today" vs. "Unstaffed" label).
+    const trueTodayKey = formatDate(todayUTC());
     const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
     const roster = useMemo(() => (data.teamMembers ?? []).filter(isDispatchable), [data.teamMembers]);
-    const activeTodayByProject = new Map(projects.map(project => [
+    const activeDayByProject = new Map(projects.map(project => [
         project.id,
-        project.tasks.filter(task => isTaskActiveOnDay(task, todayKey)),
+        project.tasks.filter(task => isTaskActiveOnDay(task, dayKey)),
     ]));
-    const todayTasks = projects.flatMap(project => activeTodayByProject.get(project.id) ?? []);
-    const assignedTodayIds = new Set(todayTasks.flatMap(task => task.assignments
-        .filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }))
+    const dayTasks = projects.flatMap(project => activeDayByProject.get(project.id) ?? []);
+    const assignedDayIds = new Set(dayTasks.flatMap(task => task.assignments
+        .filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }))
         .map(assignment => assignment.userId)));
-    const available = roster.filter(member => !assignedTodayIds.has(member.id));
-    const managerSupport = [...new Map(todayTasks.flatMap(task => task.assignments)
+    const available = roster.filter(member => !assignedDayIds.has(member.id));
+    const managerSupport = [...new Map(dayTasks.flatMap(task => task.assignments)
         .filter(assignment => assignment.status === "ACTIVATED" && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER"))
         .map(assignment => [assignment.userId, assignment] as const)).values()];
-    const crewlessProjectIds = new Set(getCrewlessJobs(projects, todayKey).map(item => item.projectId));
-    const hasUnstaffedTaskToday = getUnstaffedToday(projects, todayKey).length > 0;
-    const todayProjects = projects
-        .filter(project => (activeTodayByProject.get(project.id)?.length ?? 0) > 0 || crewlessProjectIds.has(project.id))
+    const crewlessProjectIds = new Set(getCrewlessJobs(projects, dayKey).map(item => item.projectId));
+    const hasUnstaffedTaskToday = getUnstaffedToday(projects, dayKey).length > 0;
+    const dayProjects = projects
+        .filter(project => (activeDayByProject.get(project.id)?.length ?? 0) > 0 || crewlessProjectIds.has(project.id))
         .sort((left, right) => left.name.localeCompare(right.name));
 
     // Memoized so the day arrays hold a stable reference across re-renders
@@ -240,7 +249,7 @@ export function DispatchView({
         return matrix;
     }, [projects, visibleWeekDays, roster, crewConflicts]);
     const headerForecast = mode === "today"
-        ? weatherByDate.get(todayKey)
+        ? weatherByDate.get(dayKey)
         : visibleWeekDays
             .map(day => weatherByDate.get(formatDate(day)))
             .find((forecast): forecast is VancouverForecastDay => Boolean(forecast));
@@ -391,7 +400,7 @@ export function DispatchView({
         if (!data.canEdit || (event.key !== "Enter" && event.key !== " ")) return;
         event.preventDefault();
         const choices = mode === "today"
-            ? taskChoicesForDay(projects, todayKey)
+            ? taskChoicesForDay(projects, dayKey)
             : visibleWeekDays.flatMap(day => taskChoicesForDay(projects, formatDate(day)));
         openCrewChooser(crew, choices, event.currentTarget, null);
     }
@@ -400,7 +409,7 @@ export function DispatchView({
         onCreateTask({
             defaultProjectId: selectedTaskBankProjectId,
             lockProject: true,
-            defaultStartDate: todayKey,
+            defaultStartDate: dayKey,
             defaultName: item.name,
             defaultEstimatedHours: item.estimatedHours,
             estimateItemId: item.estimateItemId,
@@ -412,7 +421,8 @@ export function DispatchView({
             <DispatchExceptions
                 projects={projects}
                 crewConflicts={data.crewConflicts}
-                dayKey={todayKey}
+                dayKey={dayKey}
+                isToday={dayKey === trueTodayKey}
                 onActivate={onActivate}
                 onProjectFocus={focusProject}
             />
@@ -428,7 +438,7 @@ export function DispatchView({
                         value={mode}
                         onChange={onModeChange}
                         options={[
-                            { value: "today", label: "Today" },
+                            { value: "today", label: "Day" },
                             { value: "week", label: "Week" },
                         ]}
                     />
@@ -481,19 +491,19 @@ export function DispatchView({
                         )}
                     </div>
 
-                    {todayProjects.length === 0 ? (
+                    {dayProjects.length === 0 ? (
                         <div className="rounded-lg border border-dashed border-hui-border px-4 py-10 text-center">
                             <p className="text-sm font-semibold text-hui-textMain">No jobs on dispatch today</p>
                             <p className="mt-1 text-xs text-hui-textMuted">Add a task or move work onto today to build the run.</p>
                         </div>
                     ) : (
                         <div className="grid gap-4 xl:grid-cols-2">
-                            {todayProjects.map(project => (
+                            {dayProjects.map(project => (
                                 <DispatchJobCard
                                     key={project.id}
                                     project={project}
-                                    tasks={activeTodayByProject.get(project.id) ?? []}
-                                    dayKey={todayKey}
+                                    tasks={activeDayByProject.get(project.id) ?? []}
+                                    dayKey={dayKey}
                                     highlighted={highlightedProjectId === project.id}
                                     canCreate={data.canEdit}
                                     crewDrafts={crewDrafts}
@@ -504,7 +514,7 @@ export function DispatchView({
                                     onAddTask={() => onCreateTask({
                                         defaultProjectId: project.id,
                                         lockProject: true,
-                                        defaultStartDate: todayKey,
+                                        defaultStartDate: dayKey,
                                     })}
                                 />
                             ))}

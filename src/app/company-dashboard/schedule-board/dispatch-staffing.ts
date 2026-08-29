@@ -6,12 +6,14 @@ export interface StaffingCrewInput {
     name: string;
     status: string;
     role: string;
+    showOnDispatch: boolean;
 }
 
 export interface StaffingAssignmentInput {
     userId: string;
     status: string;
     userRole: string;
+    showOnDispatch: boolean;
     /** Optional — used to name a drafted addition who isn't on project.crew. */
     name?: string;
 }
@@ -75,7 +77,7 @@ export function getCardStaffing(
         const removeSet = new Set(draft?.removeUserIds ?? []);
         for (const assignment of task.assignments) {
             if (assignment.name) nameByUserId.set(assignment.userId, assignment.name);
-            if (assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && !removeSet.has(assignment.userId)) {
+            if (assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }) && !removeSet.has(assignment.userId)) {
                 assignedIds.add(assignment.userId);
             }
         }
@@ -105,7 +107,7 @@ export function getCardStaffing(
     const staffedTaskCount = todayTasks.filter(task => {
         const draft = crewDrafts[task.id];
         const removeSet = new Set(draft?.removeUserIds ?? []);
-        const hasSolid = task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && !removeSet.has(assignment.userId));
+        const hasSolid = task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }) && !removeSet.has(assignment.userId));
         const hasDraft = Boolean(draft?.addUserIds.length);
         return hasSolid || hasDraft;
     }).length;

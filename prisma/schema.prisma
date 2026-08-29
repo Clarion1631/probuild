@@ -17,6 +17,7 @@ model User {
   hourlyRate                Decimal                  @default(0)
   burdenRate                Decimal                  @default(0)
   mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
+  showOnDispatch            Boolean                  @default(false) // Appears on the dispatch board bench/grid. Owner-controlled on Company → Team members.
   pinCode                   String? // Used for mobile app quick login
   invitedAt                 DateTime?                @default(now())
   timeEntries               TimeEntry[]

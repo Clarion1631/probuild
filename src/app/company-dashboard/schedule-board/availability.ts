@@ -6,6 +6,7 @@ export interface AvailabilityMember {
     id: string;
     name: string;
     role: string;
+    showOnDispatch: boolean;
     burdenedHourlyRate?: number;
 }
 

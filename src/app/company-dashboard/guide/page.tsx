@@ -75,7 +75,7 @@ export default async function CompanyDashboardGuidePage() {
             <div className="hui-card p-6 mb-6">
                 <h2 className="text-base font-semibold text-hui-textMain mb-4">Dispatch — running the day</h2>
                 <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
-                    <li><strong>Today</strong> shows one card per job with work on: the task, its status and progress, who&apos;s on it, and a materials count. People with nothing assigned sit on the <strong>Available</strong> bench up top.</li>
+                    <li><strong>Day</strong> shows one card per job with work on that day: the task, its status and progress, who&apos;s on it, and a materials count. People with nothing assigned sit on the <strong>Available</strong> bench up top. Use the <strong>←</strong> <strong>→</strong> arrows to plan tomorrow or next Monday the same way; <strong>Today</strong> jumps back.</li>
                     <li>The strip above the cards is the morning checklist — it flags jobs with no one on them, tasks with no lead, double-bookings, and anything Blocked. Click a flag to jump to the problem. &quot;Day clear&quot; means today runs.</li>
                     <li><strong>Week</strong> flips it: one row per person across the week, so you can see everyone&apos;s week at a glance. Click an empty day to give someone a task.</li>
                     <li><strong>Drag a crew chip onto a task</strong> to assign them. Chip changes pile up as drafts just like date moves.</li>
@@ -95,7 +95,7 @@ export default async function CompanyDashboardGuidePage() {
                     </li>
                     <li>
                         <Step n={2} title="Give every job a task for today">
-                            <p>A card that says &quot;No task planned today&quot; has crew but nothing to do. Click <strong>+ Task</strong> on the card, or pick the project in the Task bank and hit <strong>Schedule</strong> next to an unscheduled item.</p>
+                            <p>A card that says &quot;No task planned today&quot; has crew but nothing to do. Click <strong>+ Task</strong> on the card, or pick the project in the Task bank and hit <strong>Schedule</strong> next to an unscheduled item. Planning ahead? Arrow to that day first.</p>
                         </Step>
                     </li>
                     <li>
@@ -150,6 +150,7 @@ export default async function CompanyDashboardGuidePage() {
                 <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
                     <li>Hover any phase block for a quick three-line summary — dates, status, crew. The full story is one click away in its panel.</li>
                     <li>Right-clicking a phase block opens a small quick menu (dates, crew, note, delete) if you prefer it — same actions as the panel.</li>
+                    <li>Who shows up on the bench and in the Week rows is a switch per person: <strong>Company → Team members → Show on dispatch board</strong>. Turn it on for anyone who works in the field, off for office-only or test logins.</li>
                     <li>Every move is logged on the project&apos;s activity feed — <strong>nothing here emails a customer</strong>. Clients only ever see saved work on their portal, never your drafts.</li>
                     <li>Diamond markers and the money toggles (Income, Expenses, Projected CO, Hours) only appear for admin logins.</li>
                     <li>Anything deeper — dependencies, baselines, punch lists — lives on the job&apos;s own Schedule page (panel → Open project).</li>
