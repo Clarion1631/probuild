@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
             orderBy: [{ role: "asc" }, { name: "asc" }],
             select: {
                 id: true, name: true, email: true, role: true, status: true,
-                hourlyRate: true, burdenRate: true, pinCode: true, invitedAt: true,
+                hourlyRate: true, burdenRate: true, showOnDispatch: true, pinCode: true, invitedAt: true,
                 permissions: true,
                 projectAccess: { select: { projectId: true } },
                 assignedProjects: { select: { id: true } },

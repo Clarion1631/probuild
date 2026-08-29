@@ -9,16 +9,19 @@ interface DispatchExceptionsProps {
     projects: DashboardProjectRow[];
     crewConflicts: CrewConflict[] | null;
     dayKey: string;
+    // Whether `dayKey` is today — drives the "Unstaffed today" vs. "Unstaffed"
+    // label now that the Dispatch Day lens can show a day other than today.
+    isToday: boolean;
     onActivate: (taskId: string) => void;
     onProjectFocus: (projectId: string) => void;
 }
 
-export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate, onProjectFocus }: DispatchExceptionsProps) {
+export function DispatchExceptions({ projects, crewConflicts, dayKey, isToday, onActivate, onProjectFocus }: DispatchExceptionsProps) {
     const groups = getDispatchExceptions(projects, crewConflicts ?? [], dayKey);
     const pills = [
         {
             key: "unstaffed",
-            label: "Unstaffed today",
+            label: isToday ? "Unstaffed today" : "Unstaffed",
             count: groups.unstaffed.length,
             tone: "border-amber-300 bg-amber-50 text-amber-800",
             title: groups.unstaffed.map(item => `${item.projectName}: ${item.taskName}`).join("\n"),

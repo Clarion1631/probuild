@@ -142,13 +142,13 @@ export function DispatchJobCard({
 
             {tasks.length === 0 ? (
                 <div className="px-4 py-5">
-                    <p className="text-sm font-medium text-slate-500">No task planned today</p>
+                    <p className="text-sm font-medium text-slate-500">No task planned for this day</p>
                     <p className="mt-1 text-xs text-slate-400">This in-progress job has field crew but no active work item.</p>
                 </div>
             ) : (
                 <div className="divide-y divide-slate-100">
                     {tasks.map(task => {
-                        const solidAssignments = task.assignments.filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }));
+                        const solidAssignments = task.assignments.filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }));
                         const assignedIds = new Set(solidAssignments.map(assignment => assignment.userId));
                         const outlinedCrew = project.crew.filter(member => isDispatchable(member) && !assignedIds.has(member.id));
                         const statusTitle = task.status === "Blocked" && task.blockedReason ? `Blocked \u2014 ${task.blockedReason}` : task.status;
