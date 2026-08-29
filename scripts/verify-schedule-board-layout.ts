@@ -500,7 +500,7 @@ const dispatchProject = (overrides: Partial<DispatchProjectInput> = {}): Dispatc
     id: "dispatch-project",
     name: "Kitchen",
     status: "In Progress",
-    crew: [{ id: "crew-1", name: "Ava", status: "ACTIVATED", role: "FIELD_CREW" }],
+    crew: [{ id: "crew-1", name: "Ava", status: "ACTIVATED", role: "FIELD_CREW", showOnDispatch: true }],
     tasks: [],
     ...overrides,
 });
@@ -522,33 +522,33 @@ assert.deepEqual(
     "an active task with no solid assignment is unstaffed",
 );
 assert.equal(
-    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).length,
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true }] })] })], dispatchDay).length,
     0,
     "an active task with a solid assignment is not unstaffed",
 );
 assert.equal(
-    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "manager-1", name: "Richard", status: "ACTIVATED", userRole: "ADMIN", assignmentRole: "assigned" }] })] })], dispatchDay).length,
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "manager-1", name: "Richard", status: "ACTIVATED", userRole: "ADMIN", assignmentRole: "assigned", showOnDispatch: true }] })] })], dispatchDay).length,
     0,
-    "a field-working manager/admin assigned to the task counts as staffing it (dispatch-roster rule)",
+    "a manager/admin with the dispatch-board flag on counts as staffing it (dispatch-roster rule)",
 );
 assert.deepEqual(
-    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "finance-1", name: "Books", status: "ACTIVATED", userRole: "FINANCE", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "finance-1", name: "Books", status: "ACTIVATED", userRole: "FINANCE", assignmentRole: "assigned", showOnDispatch: true }] })] })], dispatchDay).map(item => item.taskId),
     ["dispatch-task"],
-    "finance accounts never count as crew capacity",
+    "finance accounts never count as crew capacity, even with the dispatch-board flag on",
 );
 assert.deepEqual(
-    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-2", name: "Old", status: "DISABLED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    getUnstaffedToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-2", name: "Old", status: "DISABLED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true }] })] })], dispatchDay).map(item => item.taskId),
     ["dispatch-task"],
     "a disabled account does not count as crew capacity",
 );
 
 assert.deepEqual(
-    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned" }] })] })], dispatchDay).map(item => item.taskId),
+    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true }] })] })], dispatchDay).map(item => item.taskId),
     ["dispatch-task"],
     "a staffed active task without a lead is flagged",
 );
 assert.equal(
-    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "lead" }] })] })], dispatchDay).length,
+    getNoLeadToday([dispatchProject({ tasks: [dispatchTask({ assignments: [{ userId: "crew-1", name: "Ava", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "lead", showOnDispatch: true }] })] })], dispatchDay).length,
     0,
     "a staffed active task with a lead is not flagged",
 );

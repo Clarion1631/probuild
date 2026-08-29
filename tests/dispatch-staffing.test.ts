@@ -17,17 +17,17 @@ function task(over: Partial<Parameters<typeof getCardStaffing>[1][number]> = {})
 
 const project = {
     crew: [
-        { id: "u1", name: "Ann", status: "ACTIVATED", role: "FIELD_CREW" },
-        { id: "u2", name: "Bo", status: "ACTIVATED", role: "FIELD_CREW" },
-        { id: "u3", name: "Cy", status: "ACTIVATED", role: "FIELD_CREW" },
-        { id: "u4", name: "Deactivated", status: "PENDING", role: "FIELD_CREW" },
-        { id: "u5", name: "Manager", status: "ACTIVATED", role: "MANAGER" },
+        { id: "u1", name: "Ann", status: "ACTIVATED", role: "FIELD_CREW", showOnDispatch: true },
+        { id: "u2", name: "Bo", status: "ACTIVATED", role: "FIELD_CREW", showOnDispatch: true },
+        { id: "u3", name: "Cy", status: "ACTIVATED", role: "FIELD_CREW", showOnDispatch: true },
+        { id: "u4", name: "Deactivated", status: "PENDING", role: "FIELD_CREW", showOnDispatch: true },
+        { id: "u5", name: "Manager", status: "ACTIVATED", role: "MANAGER", showOnDispatch: true },
     ],
 };
 
 test("members reflect solid assignment, draft addition, or idle", () => {
     const tasks = [
-        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW" }] }),
+        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW", showOnDispatch: true }] }),
     ];
     const crewDrafts = { t1: { addUserIds: ["u2"], removeUserIds: [] } };
     const staffing = getCardStaffing(project, tasks, crewDrafts, DAY);
@@ -43,7 +43,7 @@ test("members reflect solid assignment, draft addition, or idle", () => {
 
 test("a manager who holds a solid assignment reads assigned and their task counts as staffed", () => {
     const tasks = [
-        task({ id: "t1", assignments: [{ userId: "u5", status: "ACTIVATED", userRole: "MANAGER" }] }),
+        task({ id: "t1", assignments: [{ userId: "u5", status: "ACTIVATED", userRole: "MANAGER", showOnDispatch: true }] }),
     ];
     const staffing = getCardStaffing(project, tasks, {}, DAY);
 
@@ -53,9 +53,9 @@ test("a manager who holds a solid assignment reads assigned and their task count
 });
 
 test("FINANCE is never dispatchable, even with a solid assignment", () => {
-    const financeProject = { crew: [...project.crew, { id: "u6", name: "Bookkeeper", status: "ACTIVATED", role: "FINANCE" }] };
+    const financeProject = { crew: [...project.crew, { id: "u6", name: "Bookkeeper", status: "ACTIVATED", role: "FINANCE", showOnDispatch: true }] };
     const tasks = [
-        task({ id: "t1", assignments: [{ userId: "u6", status: "ACTIVATED", userRole: "FINANCE" }] }),
+        task({ id: "t1", assignments: [{ userId: "u6", status: "ACTIVATED", userRole: "FINANCE", showOnDispatch: true }] }),
     ];
     const staffing = getCardStaffing(financeProject, tasks, {}, DAY);
 
@@ -66,7 +66,7 @@ test("FINANCE is never dispatchable, even with a solid assignment", () => {
 
 test("staffedTaskCount counts tasks with a solid OR drafted crew member", () => {
     const tasks = [
-        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW" }] }),
+        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW", showOnDispatch: true }] }),
         task({ id: "t2", assignments: [] }),
         task({ id: "t3", assignments: [] }),
     ];
@@ -79,7 +79,7 @@ test("staffedTaskCount counts tasks with a solid OR drafted crew member", () => 
 
 test("tasks outside the given day are excluded from both member state and counts", () => {
     const tasks = [
-        task({ id: "t1", startDate: "2026-08-27T00:00:00.000Z", endDate: "2026-08-28T00:00:00.000Z", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW" }] }),
+        task({ id: "t1", startDate: "2026-08-27T00:00:00.000Z", endDate: "2026-08-28T00:00:00.000Z", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW", showOnDispatch: true }] }),
     ];
     const staffing = getCardStaffing(project, tasks, {}, DAY);
 
@@ -107,7 +107,7 @@ test("no tasks today yields zero counts and every crew member idle", () => {
 
 test("removing the last worker on a task reads idle and the task drops to unstaffed", () => {
     const tasks = [
-        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW" }] }),
+        task({ id: "t1", assignments: [{ userId: "u1", status: "ACTIVATED", userRole: "FIELD_CREW", showOnDispatch: true }] }),
     ];
     const crewDrafts = { t1: { addUserIds: [], removeUserIds: ["u1"] } };
     const staffing = getCardStaffing(project, tasks, crewDrafts, DAY);
@@ -121,7 +121,7 @@ test("a non-crew user dragged onto a task appears as a drafted member, named fro
     const tasks = [
         task({
             id: "t1",
-            assignments: [{ userId: "uX", status: "PENDING", userRole: "FIELD_CREW", name: "Xavier" }],
+            assignments: [{ userId: "uX", status: "PENDING", userRole: "FIELD_CREW", name: "Xavier", showOnDispatch: true }],
         }),
     ];
     const crewDrafts = { t1: { addUserIds: ["uX"], removeUserIds: [] } };
