@@ -32,13 +32,36 @@ test("members reflect solid assignment, draft addition, or idle", () => {
     const crewDrafts = { t1: { addUserIds: ["u2"], removeUserIds: [] } };
     const staffing = getCardStaffing(project, tasks, crewDrafts, DAY);
 
-    assert.equal(staffing.members.length, 3); // only ACTIVATED FIELD_CREW project crew
+    assert.equal(staffing.members.length, 4); // ACTIVATED dispatchable project crew (FIELD_CREW + MANAGER)
     const byId = new Map(staffing.members.map(m => [m.id, m.state]));
     assert.equal(byId.get("u1"), "assigned");
     assert.equal(byId.get("u2"), "drafted");
     assert.equal(byId.get("u3"), "idle");
     assert.equal(byId.has("u4"), false);
-    assert.equal(byId.has("u5"), false);
+    assert.equal(byId.get("u5"), "idle"); // ACTIVATED MANAGER is dispatchable, unassigned today
+});
+
+test("a manager who holds a solid assignment reads assigned and their task counts as staffed", () => {
+    const tasks = [
+        task({ id: "t1", assignments: [{ userId: "u5", status: "ACTIVATED", userRole: "MANAGER" }] }),
+    ];
+    const staffing = getCardStaffing(project, tasks, {}, DAY);
+
+    const byId = new Map(staffing.members.map(m => [m.id, m.state]));
+    assert.equal(byId.get("u5"), "assigned");
+    assert.equal(staffing.staffedTaskCount, 1);
+});
+
+test("FINANCE is never dispatchable, even with a solid assignment", () => {
+    const financeProject = { crew: [...project.crew, { id: "u6", name: "Bookkeeper", status: "ACTIVATED", role: "FINANCE" }] };
+    const tasks = [
+        task({ id: "t1", assignments: [{ userId: "u6", status: "ACTIVATED", userRole: "FINANCE" }] }),
+    ];
+    const staffing = getCardStaffing(financeProject, tasks, {}, DAY);
+
+    const byId = new Map(staffing.members.map(m => [m.id, m.state]));
+    assert.equal(byId.has("u6"), false);
+    assert.equal(staffing.staffedTaskCount, 0);
 });
 
 test("staffedTaskCount counts tasks with a solid OR drafted crew member", () => {
@@ -108,6 +131,7 @@ test("a non-crew user dragged onto a task appears as a drafted member, named fro
     assert.ok(member, "non-crew drafted addition must appear in members");
     assert.equal(member?.state, "drafted");
     assert.equal(member?.name, "Xavier");
-    // Still 4: the 3 activated field crew plus the drafted non-crew addition.
-    assert.equal(staffing.members.length, 4);
+    // Still 5: the 4 activated dispatchable crew (u1-u3 FIELD_CREW + u5 MANAGER)
+    // plus the drafted non-crew addition.
+    assert.equal(staffing.members.length, 5);
 });

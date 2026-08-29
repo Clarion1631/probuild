@@ -10,6 +10,7 @@ import { addDays, formatDate, getFallbackProjectColor, todayUTC } from "@/app/pr
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { isConflictedDay } from "./availability";
 import { getCrewlessJobs, getUnstaffedToday, isTaskActiveOnDay } from "./dispatch-exceptions";
+import { isDispatchable } from "@/lib/dispatch-roster";
 import { DispatchExceptions } from "./DispatchExceptions";
 import { DispatchCrewTaskChooser, type DispatchCrewTaskChoice } from "./DispatchCrewTaskChooser";
 import { DispatchJobCard } from "./DispatchJobCard";
@@ -96,7 +97,7 @@ function taskLabel(task: DashboardTaskRow): string {
 function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, dayKey: string): WeekChip[] {
     const chips: WeekChip[] = [];
     for (const project of projects) {
-        const isProjectCrew = project.crew.some(member => member.id === memberId && member.status === "ACTIVATED" && member.role === "FIELD_CREW");
+        const isProjectCrew = project.crew.some(member => member.id === memberId && isDispatchable(member));
         for (const task of project.tasks) {
             if (!isTaskActiveOnDay(task, dayKey)) continue;
             const assignment = task.assignments.find(candidate => candidate.userId === memberId && candidate.status === "ACTIVATED");
@@ -177,16 +178,16 @@ export function DispatchView({
     const today = todayUTC();
     const todayKey = formatDate(today);
     const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
-    const fieldCrew = useMemo(() => (data.teamMembers ?? []).filter(member => member.role === "FIELD_CREW"), [data.teamMembers]);
+    const roster = useMemo(() => (data.teamMembers ?? []).filter(isDispatchable), [data.teamMembers]);
     const activeTodayByProject = new Map(projects.map(project => [
         project.id,
         project.tasks.filter(task => isTaskActiveOnDay(task, todayKey)),
     ]));
     const todayTasks = projects.flatMap(project => activeTodayByProject.get(project.id) ?? []);
     const assignedTodayIds = new Set(todayTasks.flatMap(task => task.assignments
-        .filter(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW")
+        .filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }))
         .map(assignment => assignment.userId)));
-    const available = fieldCrew.filter(member => !assignedTodayIds.has(member.id));
+    const available = roster.filter(member => !assignedTodayIds.has(member.id));
     const managerSupport = [...new Map(todayTasks.flatMap(task => task.assignments)
         .filter(assignment => assignment.status === "ACTIVATED" && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER"))
         .map(assignment => [assignment.userId, assignment] as const)).values()];
@@ -221,7 +222,7 @@ export function DispatchView({
     // that re-render this view don't rescan every project per cell.
     const memberDayMatrix = useMemo(() => {
         const matrix = new Map<string, Map<string, MemberDayCell>>();
-        for (const member of fieldCrew) {
+        for (const member of roster) {
             const byDay = new Map<string, MemberDayCell>();
             for (const day of visibleWeekDays) {
                 const dayKey = formatDate(day);
@@ -237,7 +238,7 @@ export function DispatchView({
             matrix.set(member.id, byDay);
         }
         return matrix;
-    }, [projects, visibleWeekDays, fieldCrew, crewConflicts]);
+    }, [projects, visibleWeekDays, roster, crewConflicts]);
     const headerForecast = mode === "today"
         ? weatherByDate.get(todayKey)
         : visibleWeekDays
@@ -533,9 +534,9 @@ export function DispatchView({
                                 <div role="columnheader" className="border-b border-hui-border px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-wide text-slate-500">Assigned</div>
                             </div>
 
-                            {fieldCrew.length === 0 ? (
+                            {roster.length === 0 ? (
                                 <p className="px-4 py-8 text-center text-sm text-hui-textMuted">No field crew to dispatch.</p>
-                            ) : fieldCrew.map(member => {
+                            ) : roster.map(member => {
                                 const weekdaySegments = mondayToFriday.map(day => (
                                     memberDayMatrix.get(member.id)?.get(formatDate(day))?.segment ?? "free"
                                 ));
