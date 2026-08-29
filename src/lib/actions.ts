@@ -112,6 +112,7 @@ import {
     type UpdateScheduleTaskInput,
 } from "./schedule-task-core";
 import { convertLeadToProjectCore } from "./lead-conversion-core";
+import { recomputeProjectProjectionInTransaction } from "./project-projection";
 import { buildContractMergeData, normalizeContractBody, resolveMergeFields, createContractFromTemplateCore, createContractBlankCore } from "./contract-creation-core";
 import { executedContractPdfFor } from "./contract-files-core";
 import { createDailyLogCore } from "./daily-log-core";
@@ -7479,12 +7480,18 @@ export async function updateTaskStatusAsSub(taskId: string, subcontractorId: str
     if (!allowed.includes(status)) throw new Error("Invalid status");
     const assignment = await prisma.subTaskAssignment.findUnique({
         where: { subcontractorId_taskId: { subcontractorId, taskId } },
+        select: { task: { select: { projectId: true } } },
     });
     if (!assignment) throw new Error("Not assigned to this task");
-    const task = await prisma.scheduleTask.update({
-        where: { id: taskId },
-        data: { status },
-    });
+    const task = await withTxRetry(() => prisma.$transaction(tx =>
+        updateScheduleTaskInTransaction(
+            tx,
+            taskId,
+            { status },
+            { type: "TEAM", name: "Subcontractor" },
+            assignment.task.projectId ?? undefined,
+        ),
+    ));
     revalidatePath(`/projects`);
     return task;
 }
@@ -7551,8 +7558,13 @@ export async function updateScheduleTask(taskId: string, data: UpdateScheduleTas
     return task;
 }
 export async function deleteScheduleTask(taskId: string) {
-    await assertScheduleTaskAccess(taskId);
-    const task = await prisma.scheduleTask.delete({ where: { id: taskId } });
+    const { projectId } = await assertScheduleTaskAccess(taskId);
+    const task = await withTxRetry(() => prisma.$transaction(async tx => {
+        await lockTaskAssignmentParent(tx, taskId, projectId);
+        const deleted = await tx.scheduleTask.delete({ where: { id: taskId } });
+        await recomputeProjectProjectionInTransaction(tx, projectId);
+        return deleted;
+    }));
     revalidatePath(`/projects/${task.projectId}/schedule`);
     return task;
 }
@@ -7590,11 +7602,16 @@ export async function linkTasks(predecessorId: string, dependentId: string) {
         assertScheduleTaskAccess(dependentId),
     ]);
     if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
-    const dep = await prisma.taskDependency.create({
-        data: { predecessorId, dependentId },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: predecessorId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const projectId = predecessor.projectId;
+    const dep = await withTxRetry(() => prisma.$transaction(async tx => {
+        for (const taskId of [predecessorId, dependentId].sort()) {
+            await lockTaskAssignmentParent(tx, taskId, projectId);
+        }
+        const created = await tx.taskDependency.create({ data: { predecessorId, dependentId } });
+        await recomputeProjectProjectionInTransaction(tx, projectId);
+        return created;
+    }));
+    revalidatePath(`/projects/${projectId}/schedule`);
     return dep;
 }
 
@@ -7604,11 +7621,15 @@ export async function unlinkTasks(predecessorId: string, dependentId: string) {
         assertScheduleTaskAccess(dependentId),
     ]);
     if (predecessor.projectId !== dependent.projectId) throw new Error("Tasks must belong to the same project");
-    await prisma.taskDependency.deleteMany({
-        where: { predecessorId, dependentId },
-    });
-    const task = await prisma.scheduleTask.findUnique({ where: { id: predecessorId } });
-    if (task) revalidatePath(`/projects/${task.projectId}/schedule`);
+    const projectId = predecessor.projectId;
+    await withTxRetry(() => prisma.$transaction(async tx => {
+        for (const taskId of [predecessorId, dependentId].sort()) {
+            await lockTaskAssignmentParent(tx, taskId, projectId);
+        }
+        await tx.taskDependency.deleteMany({ where: { predecessorId, dependentId } });
+        await recomputeProjectProjectionInTransaction(tx, projectId);
+    }));
+    revalidatePath(`/projects/${projectId}/schedule`);
 }
 
 export async function importEstimateToSchedule(projectId: string, estimateId: string) {
@@ -8081,6 +8102,7 @@ Rules:
             }
         }
 
+        await recomputeProjectProjectionInTransaction(tx, projectId);
         return createdTasks;
     }, { maxWait: 10000, timeout: 30000 }));
 

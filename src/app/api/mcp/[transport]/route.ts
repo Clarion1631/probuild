@@ -32,7 +32,9 @@ import {
     listCrewAvailability,
     planSchedule,
     setProjectStartDateWithConfirmation,
+    setPortalStage,
     setTaskStatus,
+    updateTaskProgress,
     updateTaskDates,
 } from "@/lib/mcp-schedule-tools";
 import {
@@ -122,7 +124,15 @@ type RouteMcpActor = {
 // action is what proves the actor server-side — the action derives the audit
 // label from whichever secret matches, so it can never be spoofed by an argument.
 function secretForActor(actorLabel: McpActorLabel): string | undefined {
-    return actorLabel === "richard-ai" ? process.env.MCP_SECRET_RICHARD : process.env.MCP_SECRET;
+    // One explicit secret per actor. A two-branch ternary let every new actor
+    // (mac-ai first) fall through to the justin-ai connector secret, so a Mac
+    // send would have been signed and audited as SYSTEM:justin-ai.
+    switch (actorLabel) {
+        case "richard-ai": return process.env.MCP_SECRET_RICHARD;
+        case "mac-ai": return process.env.MCP_SECRET_MAC;
+        case "justin-ai": return process.env.MCP_SECRET;
+        default: return undefined;
+    }
 }
 
 function createRouteMcpActor(actorLabel: McpActorLabel, onBehalfOfId?: string | null): RouteMcpActor {
@@ -1380,6 +1390,55 @@ function createHandler(actor: RouteMcpActor) {
         );
 
         server.registerTool(
+            "list_expenses",
+            {
+                title: "List project expenses",
+                annotations: { readOnlyHint: true },
+                description:
+                    "Returns a project's recorded expenses, newest first. Includes vendor, date, amount, and cost code only; QuickBooks identifiers and receipt links are never returned. " +
+                    "Optionally restrict results to expenses dated on or after since (YYYY-MM-DD).",
+                inputSchema: {
+                    projectId: z.string().max(50),
+                    since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD").optional(),
+                },
+            },
+            async ({ projectId, since }) => {
+                const project = await prisma.project.findUnique({
+                    where: { id: projectId },
+                    select: { id: true, name: true },
+                });
+                if (!project) return { ...textResult({ error: "Project not found" }), isError: true };
+                const sinceDate = since ? new Date(`${since}T00:00:00.000Z`) : undefined;
+                const expenses = await prisma.expense.findMany({
+                    where: {
+                        estimate: { projectId },
+                        ...(sinceDate ? { date: { gte: sinceDate } } : {}),
+                    },
+                    orderBy: [{ date: "desc" }, { createdAt: "desc" }],
+                    take: 500,
+                    select: {
+                        vendor: true,
+                        date: true,
+                        createdAt: true,
+                        amount: true,
+                        costCode: { select: { code: true } },
+                    },
+                });
+                return textResult({
+                    projectId: project.id,
+                    projectName: project.name,
+                    since: since ?? null,
+                    expenses: expenses.map(expense => ({
+                        vendor: expense.vendor,
+                        date: (expense.date ?? expense.createdAt).toISOString().slice(0, 10),
+                        amount: Number(expense.amount),
+                        costCode: expense.costCode?.code ?? null,
+                    })),
+                });
+            },
+        );
+
+        server.registerTool(
             "bill_change_order",
             {
                 title: "Bill an approved change order",
@@ -2312,6 +2371,8 @@ function createHandler(actor: RouteMcpActor) {
                         name: p.name,
                         status: p.status,
                         startDate: p.startDate?.slice(0, 10) ?? null,
+                        projectedEndDate: p.projectedEndDate?.slice(0, 10) ?? null,
+                        projectedEndComputedAt: p.projectedEndComputedAt ?? null,
                         crew: p.crew,
                         unappliedChangeOrders: unappliedChangeOrders[p.id] ?? { count: 0, items: [] },
                     })),
@@ -2433,6 +2494,54 @@ function createHandler(actor: RouteMcpActor) {
                 }
             },
         );
+
+        server.registerTool(
+            "update_task_progress",
+            {
+                title: "Update a schedule task's field progress",
+                description:
+                    "Records a whole-number 0–100 percent progress update and an optional field note on one schedule task. " +
+                    "TWO-STEP, SINGLE-USE: first call without confirmToken for a preview, show it to the user, then repeat the exact arguments with the returned token after approval.",
+                inputSchema: {
+                    taskId: z.string().max(50),
+                    progress: z.number().int().min(0).max(100),
+                    note: z.string().trim().min(1).max(1000).optional(),
+                    confirmToken: z.string().length(64).optional(),
+                },
+            },
+            async args => {
+                try {
+                    return textResult(await updateTaskProgress(args, actor.actorLabel));
+                } catch (e: any) {
+                    return { ...textResult({ error: e?.message ?? "Failed to update task progress" }), isError: true };
+                }
+            },
+        );
+
+        // Mac Field Ops may report task progress, but never pin what a client sees.
+        if (actor.actorLabel !== "mac-ai") {
+            server.registerTool(
+                "set_portal_stage",
+                {
+                    title: "Set the customer portal's current project stage",
+                    description:
+                        "Sets the portal's customer-visible current stage to one registered client-stage label, or clears it to return to the schedule-derived stage. " +
+                        "This is restricted to office humans and Richard AI; Mac Field Ops cannot call it. TWO-STEP, SINGLE-USE: preview first, then repeat the exact arguments with confirmToken after explicit approval.",
+                    inputSchema: {
+                        projectId: z.string().max(50),
+                        stage: z.string().trim().min(1).max(200).nullable().describe("Registered client-stage label, or null to clear the override"),
+                        confirmToken: z.string().length(64).optional(),
+                    },
+                },
+                async args => {
+                    try {
+                        return textResult(await setPortalStage(args, actor.actorLabel));
+                    } catch (e: any) {
+                        return { ...textResult({ error: e?.message ?? "Failed to set portal stage" }), isError: true };
+                    }
+                },
+            );
+        }
 
         server.registerTool(
             "assign_task_crew",
@@ -2698,6 +2807,7 @@ export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
     const candidates: Array<[McpActorLabel, string | undefined]> = [
         ["justin-ai", process.env.MCP_SECRET],
         ["richard-ai", process.env.MCP_SECRET_RICHARD],
+        ["mac-ai", process.env.MCP_SECRET_MAC],
     ];
     for (const [actorLabel, secret] of candidates) {
         const configuredHash = createHash("sha256").update(secret ?? "").digest();
@@ -2708,7 +2818,7 @@ export function resolveMcpActorLabel(req: Request): McpActorLabel | null {
 }
 
 function guarded(req: Request) {
-    if (!process.env.MCP_SECRET && !process.env.MCP_SECRET_RICHARD) {
+    if (!process.env.MCP_SECRET && !process.env.MCP_SECRET_RICHARD && !process.env.MCP_SECRET_MAC) {
         return Response.json({ error: "MCP connector not configured" }, { status: 503 });
     }
     const actorLabel = resolveMcpActorLabel(req);

@@ -2,6 +2,7 @@ import { revalidatePath as nextRevalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import { geocodeJobSiteAddress } from "./geocode";
 import { ensureStandardFolders } from "./project-folders";
+import { recomputeProjectProjectionInTransaction } from "./project-projection";
 
 // Session-free core of lead → project conversion, shared by the permission-gated
 // `convertLeadToProject` server action in actions.ts and by callers that have
@@ -77,6 +78,7 @@ export async function convertLeadToProjectCore(leadId: string) {
         await tx.projectFile.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.fileFolder.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.scheduleTask.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
+        await recomputeProjectProjectionInTransaction(tx, project.id);
         await tx.takeoff.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
         await tx.clientMessage.updateMany({ where: { leadId }, data: { projectId: project.id, leadId: null } });
 

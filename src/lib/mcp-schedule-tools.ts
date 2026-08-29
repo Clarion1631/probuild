@@ -23,6 +23,7 @@ import {
     type ScheduleTaskStatus,
     type ScheduleTaskType,
 } from "./schedule-task-core";
+import { CLIENT_STAGES, clientStageIndex } from "./client-stages";
 import { withTxRetry } from "./tx-retry";
 import {
     mcpActivityActorName,
@@ -507,6 +508,102 @@ export async function setTaskStatus(input: {
             blockedReason,
         }, actor);
         return { taskId: task.id, status: task.status, blockedReason: task.blockedReason };
+    }, actorLabel);
+}
+
+/** Record crew-reported progress through MCP without allowing an unreviewed write. */
+export async function updateTaskProgress(input: {
+    taskId: string;
+    progress: number;
+    note?: string;
+    confirmToken?: string;
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    if (!Number.isInteger(input.progress) || input.progress < 0 || input.progress > 100) {
+        throw new Error("Progress must be a whole-number percentage from 0 to 100");
+    }
+    const progress = Math.round(input.progress);
+    const note = input.note?.trim() || undefined;
+    if (note && note.length > 1_000) throw new Error("Progress note must be 1,000 characters or fewer");
+    const args = { taskId: input.taskId, progress, note };
+    if (!input.confirmToken) {
+        const task = await prisma.scheduleTask.findUnique({
+            where: { id: input.taskId },
+            select: { id: true, name: true, progress: true },
+        });
+        if (!task) throw new Error("Task not found");
+        return issueConfirmation(
+            "update_task_progress",
+            args,
+            `Set "${task.name}" progress from ${task.progress}% to ${progress}%${note ? ` — note: ${note}` : ""}.`,
+            actorLabel,
+        );
+    }
+    const actor = scheduleActor(actorLabel);
+    return executeConfirmed("update_task_progress", args, input.confirmToken, async tx => {
+        const task = await updateScheduleTaskInTransaction(tx, input.taskId, { progress }, actor);
+        await tx.activityLog.create({
+            data: {
+                projectId: task.projectId,
+                actorType: actor.type,
+                actorName: actor.name,
+                action: "updated_schedule_task_progress",
+                entityType: "task",
+                entityId: task.id,
+                entityName: task.name,
+                metadata: JSON.stringify({ progress, note: note ?? null }),
+            },
+        });
+        return { taskId: task.id, progress: task.progress, note: note ?? null };
+    }, actorLabel);
+}
+
+/** Pin or clear the customer-visible current stage; only registered client stages are valid. */
+export async function setPortalStage(input: {
+    projectId: string;
+    stage: string | null;
+    confirmToken?: string;
+}, actorLabel: McpActorLabel = DEFAULT_MCP_ACTOR_LABEL) {
+    const stage = input.stage?.trim() || null;
+    if (stage !== null && clientStageIndex(stage) === null) {
+        throw new Error(`Unknown portal stage "${stage}"`);
+    }
+    const canonicalStage = stage === null ? null : CLIENT_STAGES[clientStageIndex(stage)!].label;
+    const args = { projectId: input.projectId, stage: canonicalStage };
+    if (!input.confirmToken) {
+        const project = await prisma.project.findUnique({
+            where: { id: input.projectId },
+            select: { id: true, name: true, portalStageOverride: true },
+        });
+        if (!project) throw new Error("Project not found");
+        return issueConfirmation(
+            "set_portal_stage",
+            args,
+            canonicalStage
+                ? `Show "${canonicalStage}" as the current stage for portal project "${project.name}" (was ${project.portalStageOverride ?? "auto-derived"}).`
+                : `Clear the portal stage override for "${project.name}" and return to the auto-derived schedule stage.`,
+            actorLabel,
+        );
+    }
+    const actor = scheduleActor(actorLabel);
+    return executeConfirmed("set_portal_stage", args, input.confirmToken, async tx => {
+        const project = await tx.project.update({
+            where: { id: input.projectId },
+            data: { portalStageOverride: canonicalStage },
+            select: { id: true, name: true, portalStageOverride: true },
+        });
+        await tx.activityLog.create({
+            data: {
+                projectId: project.id,
+                actorType: actor.type,
+                actorName: actor.name,
+                action: "updated_portal_stage_override",
+                entityType: "project",
+                entityId: project.id,
+                entityName: project.name,
+                metadata: JSON.stringify({ stage: project.portalStageOverride }),
+            },
+        });
+        return { projectId: project.id, stage: project.portalStageOverride };
     }, actorLabel);
 }
 

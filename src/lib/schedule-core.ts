@@ -5,6 +5,7 @@ import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
+import { recomputeProjectProjectionInTransaction } from "./project-projection";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
@@ -142,6 +143,8 @@ export interface PipelineProject {
     // conflict rule) via the same raw Date value — see effectiveWorkEnd's
     // doc comment for the shared semantics.
     endDate: string | null;
+    projectedEndDate: string | null;
+    projectedEndComputedAt: string | null;
     color: string | null;
     // totalAmount of the project's most recent Approved/Invoiced/Partially
     // Paid/Paid estimate; null when none exists.
@@ -197,7 +200,7 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
             where: { status: { in: OPEN_PROJECT_STATUSES } },
             orderBy: { createdAt: "desc" },
             select: {
-                id: true, name: true, status: true, startDate: true, endDate: true, updatedAt: true, color: true,
+                id: true, name: true, status: true, startDate: true, endDate: true, projectedEndDate: true, projectedEndComputedAt: true, updatedAt: true, color: true,
                 location: true,
                 locationLat: true, locationLng: true,
                 client: { select: { name: true } },
@@ -221,6 +224,8 @@ export async function getCompanyPipeline(): Promise<CompanyPipeline> {
         status: p.status,
         startDate: p.startDate ? p.startDate.toISOString() : null,
         endDate: p.endDate ? p.endDate.toISOString() : null,
+        projectedEndDate: p.projectedEndDate ? p.projectedEndDate.toISOString() : null,
+        projectedEndComputedAt: p.projectedEndComputedAt ? p.projectedEndComputedAt.toISOString() : null,
         color: p.color,
         contractValue: p.estimates[0] ? Number(p.estimates[0].totalAmount) : null,
         crew: p.crew.map(u => ({ id: u.id, name: u.name || u.email, status: u.status, role: u.role })),
@@ -651,6 +656,8 @@ async function runSetProjectStartDate(
             }
         }
 
+        await recomputeProjectProjectionInTransaction(tx, projectId);
+
         if (input.writeActivityLog !== false) {
             await tx.activityLog.create({
                 data: {
@@ -856,6 +863,8 @@ async function runShiftNotStartedTasks(
                 notes.push(`Change-order milestone "${milestone.name}" (${milestone.id}) has an explicit due date and was not shifted.`);
             }
         }
+
+        await recomputeProjectProjectionInTransaction(tx, projectId);
 
         if (input.writeActivityLog !== false) {
             await tx.activityLog.create({
@@ -1498,6 +1507,7 @@ async function runGenerateScheduleFromEstimate(
             }
         }
 
+        await recomputeProjectProjectionInTransaction(tx, projectId);
         await tx.activityLog.create({
             data: {
                 projectId,
@@ -3100,6 +3110,7 @@ async function runApplyChangeOrderToSchedule(
             `;
         }
 
+        await recomputeProjectProjectionInTransaction(tx, projectId);
         await tx.activityLog.create({
             data: {
                 projectId,
