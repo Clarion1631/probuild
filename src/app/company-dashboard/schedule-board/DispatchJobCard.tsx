@@ -1,10 +1,12 @@
 "use client";
 
 import Link from "next/link";
+import { motion } from "framer-motion";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import type { DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import { getFallbackProjectColor } from "@/app/projects/[id]/schedule/schedule-utils";
 import { classifyTaskEvidence, findContradiction, type EvidenceState } from "@/lib/task-evidence";
+import { getCardStaffing } from "./dispatch-staffing";
 
 const STATUS_STYLES: Record<string, string> = {
     "Not Started": "bg-slate-100 text-slate-700",
@@ -83,6 +85,10 @@ export function DispatchJobCard({
     // Parents come from the FULL project task list, not today's filtered subset —
     // a phase parent whose children are elsewhere in the week must still be excluded.
     const taskParentIds = new Set(project.tasks.map(task => task.parentId).filter((id): id is string => !!id));
+    const staffing = getCardStaffing(project, tasks, crewDrafts, dayKey);
+    const staffedCount = staffing.members.filter(member => member.state !== "idle").length;
+    const cardStaffed = staffing.taskCount > 0 && staffing.staffedTaskCount === staffing.taskCount;
+    const cardUnstaffed = staffing.taskCount > 0 && staffing.staffedTaskCount === 0;
 
     return (
         <article
@@ -97,11 +103,43 @@ export function DispatchJobCard({
                     </Link>
                     {project.location && <p className="mt-0.5 truncate text-xs text-hui-textMuted">{project.location}</p>}
                 </div>
-                {canCreate && (
-                    <button type="button" onClick={onAddTask} className="hui-btn hui-btn-secondary shrink-0 text-xs">
-                        + Task
-                    </button>
-                )}
+                <div className="flex shrink-0 items-center gap-2">
+                    {staffing.members.length > 0 && (
+                        <div
+                            className="flex items-center gap-1.5"
+                            aria-label={`${staffedCount} of ${staffing.members.length} crew on today's tasks`}
+                            title={`${staffedCount} of ${staffing.members.length} on tasks`}
+                        >
+                            <span className="flex items-center gap-0.5" aria-hidden="true">
+                                {staffing.members.map(member => (
+                                    <span
+                                        key={member.id}
+                                        className={`inline-block h-1.5 w-1.5 rounded-full ${member.state === "idle" ? "border border-slate-300 bg-transparent" : member.state === "drafted" ? "border border-dashed border-indigo-400 bg-indigo-200" : ""}`}
+                                        style={member.state === "assigned" ? { backgroundColor: projectColor } : undefined}
+                                    />
+                                ))}
+                            </span>
+                            <span className="text-[10px] font-semibold text-slate-500 tabular-nums">
+                                {staffedCount} of {staffing.members.length} on tasks
+                            </span>
+                        </div>
+                    )}
+                    {cardStaffed && (
+                        <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-semibold text-green-700">
+                            {"Staffed ✓"}
+                        </span>
+                    )}
+                    {cardUnstaffed && (
+                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                            Unstaffed
+                        </span>
+                    )}
+                    {canCreate && (
+                        <button type="button" onClick={onAddTask} className="hui-btn hui-btn-secondary text-xs">
+                            + Task
+                        </button>
+                    )}
+                </div>
             </div>
 
             {tasks.length === 0 ? (
@@ -162,10 +200,27 @@ export function DispatchJobCard({
                                         </div>
                                         {task.doneWhen && <p className="mt-2 text-xs text-hui-textMuted"><span className="font-semibold text-slate-600">Done when:</span> {task.doneWhen}</p>}
                                         <div className="mt-2 flex flex-wrap items-center gap-1.5" aria-label={`${task.name} crew`}>
+                                            {(() => {
+                                                const draftedCount = crewDrafts[task.id]?.addUserIds.length ?? 0;
+                                                if (solidAssignments.length === 0 && draftedCount === 0) {
+                                                    return <span className="text-[10px] font-semibold text-amber-700">No one yet</span>;
+                                                }
+                                                if (draftedCount > 0) {
+                                                    return <span className="text-[10px] font-semibold text-indigo-600">{draftedCount} drafted</span>;
+                                                }
+                                                return null;
+                                            })()}
                                             {solidAssignments.map(assignment => {
                                                 const draftedAddition = crewDrafts[task.id]?.addUserIds.includes(assignment.userId) ?? false;
                                                 return (
-                                                    <span key={assignment.id} className="group relative inline-flex">
+                                                    <motion.span
+                                                        key={assignment.id}
+                                                        data-motion-scope={draftedAddition ? "crew-draft" : undefined}
+                                                        initial={draftedAddition ? { opacity: 0, scale: 0.85 } : false}
+                                                        animate={{ opacity: 1, scale: 1 }}
+                                                        transition={{ duration: 0.16 }}
+                                                        className="group relative inline-flex"
+                                                    >
                                                         <button
                                                             type="button"
                                                             data-dispatch-crew-chip="true"
@@ -190,7 +245,7 @@ export function DispatchJobCard({
                                                                 {"\u00D7"}
                                                             </button>
                                                         )}
-                                                    </span>
+                                                    </motion.span>
                                                 );
                                             })}
                                             {outlinedCrew.map(member => (

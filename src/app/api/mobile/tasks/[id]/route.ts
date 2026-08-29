@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
+import { toMobileCrew } from "@/lib/mobile-task-crew";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +24,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             progress: true,
             status: true,
             estimatedHours: true,
+            doneWhen: true,
+            blockedReason: true,
+            scheduledTime: true,
             projectId: true,
             project: { select: { id: true, name: true, color: true, location: true } },
+            assignments: {
+                select: { role: true, user: { select: { id: true, name: true } } },
+            },
             // Linked estimate line item + its cost code — lets the mobile geofence
             // "clock in here?" nudge preselect the matching phase for one-tap clock-in.
             estimateItemId: true,
@@ -60,10 +67,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             progress: task.progress,
             status: task.status,
             estimatedHours: task.estimatedHours ?? null,
+            doneWhen: task.doneWhen ?? null,
+            blockedReason: task.blockedReason ?? null,
+            scheduledTime: task.scheduledTime ?? null,
             projectId: task.projectId,
             projectName: task.project?.name ?? "",
             projectColor: task.project?.color ?? null,
             projectLocation: task.project?.location ?? null,
+            crew: toMobileCrew(task.assignments),
             estimateItemId: task.estimateItemId ?? null,
             costCode: task.estimateItem?.costCode ? { code: task.estimateItem.costCode.code, name: task.estimateItem.costCode.name } : null,
             punchItems: task.punchItems,

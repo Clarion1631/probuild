@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
+import { motion } from "framer-motion";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { toast } from "sonner";
 import type { CompanyDashboardData, DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
 import type { VancouverForecastDay } from "@/lib/weather";
 import { addDays, formatDate, getFallbackProjectColor, getMonday, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { isConflictedDay } from "./availability";
-import { getCrewlessJobs, isTaskActiveOnDay } from "./dispatch-exceptions";
+import { getCrewlessJobs, getUnstaffedToday, isTaskActiveOnDay } from "./dispatch-exceptions";
 import { DispatchExceptions } from "./DispatchExceptions";
 import { DispatchCrewTaskChooser, type DispatchCrewTaskChoice } from "./DispatchCrewTaskChooser";
 import { DispatchJobCard } from "./DispatchJobCard";
@@ -45,6 +46,19 @@ interface WeekChip {
     task: DashboardTaskRow;
     solid: boolean;
     lead: boolean;
+}
+
+type MemberDaySegment = "assigned" | "conflict" | "free";
+
+interface MemberDayCell {
+    chips: WeekChip[];
+    shownChips: WeekChip[];
+    overflow: number;
+    hasSolid: boolean;
+    isFree: boolean;
+    isSoftOnly: boolean;
+    conflicted: boolean;
+    segment: MemberDaySegment;
 }
 
 interface CrewIdentity {
@@ -87,6 +101,26 @@ function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, d
         }
     }
     return chips;
+}
+
+export const WEEK_CELL_MAX_CHIPS = 2;
+
+export interface VisibleWeekChips {
+    chips: WeekChip[];
+    overflow: number;
+}
+
+/**
+ * Filters a cell's chips down to just the solid (task-assigned) ones, capped at
+ * WEEK_CELL_MAX_CHIPS with the rest folded into an overflow count. Soft (job-crew-only)
+ * chips are never rendered in the grid — they're the noise this exists to cut.
+ */
+export function visibleWeekChips(chips: WeekChip[]): VisibleWeekChips {
+    const solid = chips.filter(chip => chip.solid);
+    return {
+        chips: solid.slice(0, WEEK_CELL_MAX_CHIPS),
+        overflow: Math.max(0, solid.length - WEEK_CELL_MAX_CHIPS),
+    };
 }
 
 function taskChoicesForDay(projects: DashboardProjectRow[], dayKey: string): DispatchCrewTaskChoice[] {
@@ -164,7 +198,7 @@ export function DispatchView({
     const today = todayUTC();
     const todayKey = formatDate(today);
     const weatherByDate = new Map(weather.map(forecast => [forecast.date, forecast]));
-    const fieldCrew = (data.teamMembers ?? []).filter(member => member.role === "FIELD_CREW");
+    const fieldCrew = useMemo(() => (data.teamMembers ?? []).filter(member => member.role === "FIELD_CREW"), [data.teamMembers]);
     const activeTodayByProject = new Map(projects.map(project => [
         project.id,
         project.tasks.filter(task => isTaskActiveOnDay(task, todayKey)),
@@ -178,21 +212,53 @@ export function DispatchView({
         .filter(assignment => assignment.status === "ACTIVATED" && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER"))
         .map(assignment => [assignment.userId, assignment] as const)).values()];
     const crewlessProjectIds = new Set(getCrewlessJobs(projects, todayKey).map(item => item.projectId));
+    const hasUnstaffedTaskToday = getUnstaffedToday(projects, todayKey).length > 0;
     const todayProjects = projects
         .filter(project => (activeTodayByProject.get(project.id)?.length ?? 0) > 0 || crewlessProjectIds.has(project.id))
         .sort((left, right) => left.name.localeCompare(right.name));
 
-    const mondayToFriday = Array.from({ length: 5 }, (_, index) => addDays(weekStart, index));
-    const saturday = addDays(weekStart, 5);
-    const sunday = addDays(weekStart, 6);
+    // Memoized so the day arrays hold a stable reference across re-renders
+    // (they only actually change when the week or the weekend-visibility
+    // inputs change) — the member×day chip matrix below is keyed on
+    // visibleWeekDays, and an unstable array reference there would defeat the
+    // memoization by invalidating it on every render.
+    const mondayToFriday = useMemo(() => Array.from({ length: 5 }, (_, index) => addDays(weekStart, index)), [weekStart]);
+    const saturday = useMemo(() => addDays(weekStart, 5), [weekStart]);
+    const sunday = useMemo(() => addDays(weekStart, 6), [weekStart]);
     const showSaturday = projects.some(project => project.tasks.some(task => isTaskActiveOnDay(task, formatDate(saturday))));
     const showSunday = projects.some(project => project.tasks.some(task => isTaskActiveOnDay(task, formatDate(sunday))));
-    const visibleWeekDays = [...mondayToFriday, ...(showSaturday ? [saturday] : []), ...(showSunday ? [sunday] : [])];
+    const visibleWeekDays = useMemo(
+        () => [...mondayToFriday, ...(showSaturday ? [saturday] : []), ...(showSunday ? [sunday] : [])],
+        [mondayToFriday, saturday, sunday, showSaturday, showSunday],
+    );
     const selectedTaskBankProjectId = projects.some(project => project.id === taskBankProjectId)
         ? taskBankProjectId
         : data.pipeline.inProgress[0]?.id ?? projects[0]?.id ?? "";
     const taskBankRefreshKey = projects.reduce((sum, project) => sum + project.tasks.length, 0);
     const crewConflicts = data.crewConflicts;
+    // Member×day chip matrix — one weekChipsForMember scan per member/day
+    // instead of the two-to-three redundant scans the cell + summary bar
+    // used to run independently, so keystrokes elsewhere (search, filters)
+    // that re-render this view don't rescan every project per cell.
+    const memberDayMatrix = useMemo(() => {
+        const matrix = new Map<string, Map<string, MemberDayCell>>();
+        for (const member of fieldCrew) {
+            const byDay = new Map<string, MemberDayCell>();
+            for (const day of visibleWeekDays) {
+                const dayKey = formatDate(day);
+                const chips = weekChipsForMember(projects, member.id, dayKey);
+                const { chips: shownChips, overflow } = visibleWeekChips(chips);
+                const hasSolid = shownChips.length > 0;
+                const isFree = chips.length === 0;
+                const isSoftOnly = !hasSolid && !isFree;
+                const conflicted = isConflictedDay(crewConflicts, member.id, dayKey, true);
+                const segment: MemberDaySegment = conflicted ? "conflict" : chips.some(chip => chip.solid) ? "assigned" : "free";
+                byDay.set(dayKey, { chips, shownChips, overflow, hasSolid, isFree, isSoftOnly, conflicted, segment });
+            }
+            matrix.set(member.id, byDay);
+        }
+        return matrix;
+    }, [projects, visibleWeekDays, fieldCrew, crewConflicts]);
     const headerForecast = mode === "today"
         ? weatherByDate.get(todayKey)
         : visibleWeekDays
@@ -390,11 +456,26 @@ export function DispatchView({
                             disabled={draftCount === 0 || isReviewingDispatch}
                             className="hui-btn hui-btn-green text-xs disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                            {isReviewingDispatch
-                                ? "Reviewing..."
-                                : draftCount > 0
-                                    ? `Review dispatch (${draftCount})`
-                                    : "Review dispatch"}
+                            {isReviewingDispatch ? (
+                                "Reviewing..."
+                            ) : draftCount > 0 ? (
+                                <>
+                                    {"Review dispatch ("}
+                                    <motion.span
+                                        key={draftCount}
+                                        data-motion-scope="dispatch-count"
+                                        initial={{ opacity: 0, scale: 0.85 }}
+                                        animate={{ opacity: 1, scale: 1 }}
+                                        transition={{ duration: 0.16 }}
+                                        className="inline-block tabular-nums"
+                                    >
+                                        {draftCount}
+                                    </motion.span>
+                                    {")"}
+                                </>
+                            ) : (
+                                "Review dispatch"
+                            )}
                         </button>
                     )}
                     <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Dispatch range">
@@ -420,6 +501,17 @@ export function DispatchView({
                     <div className="rounded-lg border border-hui-border bg-slate-50 px-3 py-2.5">
                         <div className="flex flex-wrap items-center gap-2">
                             <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Available</span>
+                            {available.length === 0 ? (
+                                <span className="inline-flex items-center gap-1.5 rounded-full border border-green-300 bg-green-50 px-2 py-0.5 text-[10px] font-semibold text-green-700">
+                                    {"Everyone placed ✓"}
+                                </span>
+                            ) : (
+                                <span
+                                    className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold tabular-nums ${hasUnstaffedTaskToday ? "border-amber-300 bg-amber-50 text-amber-800" : "border-slate-300 bg-slate-100 text-slate-600"}`}
+                                >
+                                    {available.length} available
+                                </span>
+                            )}
                             {available.length === 0 ? <span className="text-xs text-slate-400">No unassigned field crew</span> : available.map(member => (
                                 <button
                                     key={member.id}
@@ -511,7 +603,13 @@ export function DispatchView({
                             {fieldCrew.length === 0 ? (
                                 <p className="px-4 py-8 text-center text-sm text-hui-textMuted">No field crew to dispatch.</p>
                             ) : fieldCrew.map(member => {
-                                const weekdayAssignedCount = mondayToFriday.filter(day => weekChipsForMember(projects, member.id, formatDate(day)).some(chip => chip.solid)).length;
+                                const weekdaySegments = mondayToFriday.map(day => (
+                                    memberDayMatrix.get(member.id)?.get(formatDate(day))?.segment ?? "free"
+                                ));
+                                // A conflict day is still an assigned day (double-booked, not idle) —
+                                // it just also carries a double-booking, called out separately below.
+                                const weekdayAssignedCount = weekdaySegments.filter(segment => segment === "assigned" || segment === "conflict").length;
+                                const weekdayConflictCount = weekdaySegments.filter(segment => segment === "conflict").length;
                                 return (
                                     <div key={member.id} className="grid" role="row" style={{ gridTemplateColumns: `180px repeat(${visibleWeekDays.length}, minmax(140px, 1fr)) 110px` }}>
                                         <div role="rowheader" className="border-b border-r border-hui-border bg-white px-3 py-3 text-xs font-semibold text-hui-textMain">
@@ -529,8 +627,15 @@ export function DispatchView({
                                         </div>
                                         {visibleWeekDays.map(day => {
                                             const dayKey = formatDate(day);
-                                            const chips = weekChipsForMember(projects, member.id, dayKey);
-                                            const conflicted = isConflictedDay(crewConflicts, member.id, dayKey, true);
+                                            const cell = memberDayMatrix.get(member.id)?.get(dayKey);
+                                            const chips = cell?.chips ?? [];
+                                            const shownChips = cell?.shownChips ?? [];
+                                            const overflow = cell?.overflow ?? 0;
+                                            const hasSolid = cell?.hasSolid ?? false;
+                                            const isFree = cell?.isFree ?? true;
+                                            const isSoftOnly = cell?.isSoftOnly ?? false;
+                                            const softOnlyLabel = `On job crew for ${chips.length} job${chips.length === 1 ? "" : "s"}, no task yet`;
+                                            const conflicted = cell?.conflicted ?? false;
                                             return (
                                                 <div
                                                     key={`${member.id}-${dayKey}`}
@@ -538,26 +643,43 @@ export function DispatchView({
                                                     data-dispatch-week-cell="true"
                                                     data-dispatch-member-id={member.id}
                                                     data-dispatch-day={dayKey}
+                                                    title={isSoftOnly ? softOnlyLabel : isFree ? "Free" : undefined}
+                                                    aria-label={isSoftOnly ? softOnlyLabel : isFree ? "Free" : undefined}
                                                     className="min-h-16 border-b border-r border-hui-border bg-white p-1.5"
                                                 >
-                                                    <div className={`flex min-h-12 flex-col gap-1 rounded ${conflicted ? "ring-2 ring-red-500 ring-inset" : ""}`}>
-                                                        {chips.map(chip => {
+                                                    <div
+                                                        className={`relative flex min-h-12 flex-col gap-1 rounded ${conflicted ? "ring-2 ring-red-500 ring-inset" : ""}`}
+                                                    >
+                                                        {isSoftOnly && (
+                                                            <span aria-hidden="true" className="pointer-events-none absolute left-0.5 top-0.5 text-[10px] leading-none text-slate-300">
+                                                                {"\u00b7"}
+                                                            </span>
+                                                        )}
+                                                        {shownChips.map(chip => {
                                                             const color = chip.project.color || getFallbackProjectColor(chip.project.id);
                                                             return (
                                                                 <button
-                                                                    key={`${chip.task.id}-${chip.solid ? "solid" : "soft"}`}
+                                                                    key={chip.task.id}
                                                                     type="button"
                                                                     data-dispatch-task-id={chip.task.id}
                                                                     onClick={() => onActivate(chip.task.id)}
                                                                     title={`${chip.project.name} \u2014 ${taskLabel(chip.task)}`}
-                                                                    className={`block truncate rounded px-1.5 py-1 text-left text-[11px] font-semibold leading-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${chip.solid ? "text-white" : "border-2 bg-white"}`}
-                                                                    style={chip.solid ? { backgroundColor: color } : { borderColor: color, color }}
+                                                                    className="block truncate rounded px-1.5 py-1 text-left text-[11px] font-semibold leading-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary"
+                                                                    style={{ backgroundColor: color }}
                                                                 >
                                                                     {chip.lead ? "\u2605 " : ""}{chip.project.name}
                                                                 </button>
                                                             );
                                                         })}
-                                                        {chips.length === 0 && data.canEdit && (
+                                                        {overflow > 0 && (
+                                                            <span
+                                                                className="block truncate rounded border-2 border-dashed border-slate-300 px-1.5 py-1 text-left text-[11px] font-semibold leading-tight text-slate-400"
+                                                                title={`${overflow} more job${overflow === 1 ? "" : "s"}`}
+                                                            >
+                                                                +{overflow}
+                                                            </span>
+                                                        )}
+                                                        {!hasSolid && data.canEdit && (
                                                             <button
                                                                 type="button"
                                                                 onClick={() => onCreateTask({ defaultStartDate: dayKey, defaultCrewIds: [member.id] })}
@@ -571,7 +693,21 @@ export function DispatchView({
                                                 </div>
                                             );
                                         })}
-                                        <div role="cell" className="border-b border-hui-border bg-white px-2 py-3 text-center text-xs font-semibold text-slate-600">{weekdayAssignedCount} of 5 days assigned</div>
+                                        <div
+                                            role="cell"
+                                            className="border-b border-hui-border bg-white px-2 py-3"
+                                            title={`${weekdayAssignedCount} of 5 days assigned${weekdayConflictCount > 0 ? `, ${weekdayConflictCount} double-booked` : ""}`}
+                                        >
+                                            <div className="flex items-center justify-center gap-0.5" aria-hidden="true">
+                                                {weekdaySegments.map((segment, index) => (
+                                                    <span
+                                                        key={index}
+                                                        className={`h-1.5 w-4 rounded-full ${segment === "assigned" ? "bg-green-500" : segment === "conflict" ? "bg-red-500" : "bg-slate-200"}`}
+                                                    />
+                                                ))}
+                                            </div>
+                                            <span className="sr-only">{weekdayAssignedCount} of 5 days assigned{weekdayConflictCount > 0 ? `, ${weekdayConflictCount} double-booked` : ""}</span>
+                                        </div>
                                     </div>
                                 );
                             })}

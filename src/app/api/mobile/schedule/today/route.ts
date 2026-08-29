@@ -1,11 +1,18 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
+import { resolveScheduleRange } from "@/lib/mobile-schedule-range";
+import { toMobileCrew } from "@/lib/mobile-task-crew";
 
 export const dynamic = "force-dynamic";
 
 // GET /api/mobile/schedule/today
-// Returns the caller's tasks scheduled to be active today (or today ± 1 day for slop).
+// Returns the caller's tasks scheduled to be active in the given date range.
+// With no `start`/`end` query params, defaults to today ± 1 day for slop.
+// With both `start` and `end` (YYYY-MM-DD, UTC calendar dates, max 14-day span),
+// returns tasks active within that explicit range instead, so the crew app can
+// show one week at a time. Response includes `range` with the effective
+// YYYY-MM-DD start/end actually used.
 // ADMIN/MANAGER see all open projects' tasks; FIELD_CREW see only tasks on projects
 // they're crew-assigned to or assigned to via TaskAssignment.
 // Hybrid auth: Bearer token (mobile) OR NextAuth session (web debug).
@@ -14,13 +21,12 @@ export async function GET(req: Request) {
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
 
-    const now = new Date();
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - 1);
-    const end = new Date(now);
-    end.setHours(23, 59, 59, 999);
-    end.setDate(end.getDate() + 1);
+    const { searchParams } = new URL(req.url);
+    const range = resolveScheduleRange(searchParams, new Date());
+    if (!range.ok) {
+        return NextResponse.json({ error: range.error }, { status: 400 });
+    }
+    const { start, end, startKey, endKey } = range;
 
     const baseWhere: any = {
         startDate: { lte: end },
@@ -57,12 +63,13 @@ export async function GET(req: Request) {
             progress: true,
             status: true,
             estimatedHours: true,
+            doneWhen: true,
+            blockedReason: true,
+            scheduledTime: true,
             projectId: true,
             project: { select: { id: true, name: true, color: true, location: true } },
             assignments: {
-                where: { userId: user.id },
-                select: { role: true },
-                take: 1,
+                select: { role: true, user: { select: { id: true, name: true } } },
             },
             // Linked estimate line item + its cost code — lets the mobile geofence
             // "clock in here?" nudge preselect the matching phase for one-tap clock-in.
@@ -80,14 +87,18 @@ export async function GET(req: Request) {
         progress: t.progress,
         status: t.status,
         estimatedHours: t.estimatedHours ?? null,
+        doneWhen: t.doneWhen ?? null,
+        blockedReason: t.blockedReason ?? null,
+        scheduledTime: t.scheduledTime ?? null,
         projectId: t.projectId,
         projectName: t.project?.name ?? "",
         projectColor: t.project?.color ?? null,
         projectLocation: t.project?.location ?? null,
-        isAssignedToMe: t.assignments.length > 0,
+        isAssignedToMe: t.assignments.some(a => a.user?.id === user.id),
+        crew: toMobileCrew(t.assignments),
         estimateItemId: t.estimateItemId ?? null,
         costCode: t.estimateItem?.costCode ? { code: t.estimateItem.costCode.code, name: t.estimateItem.costCode.name } : null,
     }));
 
-    return NextResponse.json({ tasks: out });
+    return NextResponse.json({ tasks: out, range: { start: startKey, end: endKey } });
 }
