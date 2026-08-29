@@ -194,6 +194,8 @@ export const NO_ATTESTATION_NOTE = "Meal auto-deducted with no lunch answer capt
 export const STALE_DEFERRED_NOTE = "Mid-day close was the last of its day — meal never settled (worker did not clock back in)";
 /** A DEFERRED close older than this with no later entry is treated as the end of that day. */
 export const STALE_DEFERRED_AFTER_HOURS = 2;
+/** Sentinel — this row overlaps another of the worker's rows the same day (duplicate punch?): both pay in full until a manager fixes it. */
+export const OVERLAP_NOTE = "Overlaps another time entry the same day — duplicate punch? both are paid until corrected";
 /** Sentinel — the day re-plan could not be written after a close/edit; the row holds close-time values. Verify by hand. */
 export const SETTLEMENT_FAILED_NOTE = "Day settlement failed after this close — verify paid hours";
 
@@ -398,9 +400,25 @@ export interface SettleDayUpdate {
  * edit that moved the row) must not erase the record that its old day failed;
  * only "Mark reviewed" (stripSettlementNotes) retires it.
  */
-const SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE];
+const SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE, OVERLAP_NOTE];
 /** Everything settlement owns — what "Mark reviewed" clears so a re-plan cannot re-flag a reviewed row. */
-export const ALL_SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE, SETTLEMENT_FAILED_NOTE];
+export const ALL_SETTLEMENT_NOTES = [NO_ATTESTATION_NOTE, STALE_DEFERRED_NOTE, OVERLAP_NOTE, SETTLEMENT_FAILED_NOTE];
+
+/** Ids of rows whose interval intersects another row's (open-interval test; abutting rows do not overlap). */
+export function overlappingEntryIds(entries: { id: string; startTime: Date; endTime: Date }[]): Set<string> {
+    const out = new Set<string>();
+    for (let i = 0; i < entries.length; i++) {
+        for (let j = i + 1; j < entries.length; j++) {
+            const a = entries[i];
+            const b = entries[j];
+            if (a.startTime.getTime() < b.endTime.getTime() && b.startTime.getTime() < a.endTime.getTime()) {
+                out.add(a.id);
+                out.add(b.id);
+            }
+        }
+    }
+    return out;
+}
 
 /** Drop settlement-owned notes from a reviewReason (a manager reviewed the row — a later re-plan must not re-flag it). */
 export function stripSettlementNotes(reviewReason: string | null | undefined): string {
@@ -419,7 +437,10 @@ function dayAttestation(entries: SettleDayEntry[]): { workedThrough: boolean; an
     let answered = false;
     let approved = false;
     for (const entry of entries) {
-        if (entry.mealSkipStatus === "APPROVED" || entry.mealOutcome === "WAIVED_APPROVED") approved = true;
+        // Approval evidence is the authoritative request status ONLY — never a
+        // previously DERIVED outcome, which a moved row would otherwise carry
+        // into a second day as a second exemption.
+        if (entry.mealSkipStatus === "APPROVED") approved = true;
         if (entry.mealOutcome === "WORKED_THROUGH") {
             workedThrough = true;
             answered = true;
@@ -495,6 +516,11 @@ export function settleDayPlan(input: {
         remaining -= take;
     }
 
+    // Overlapping rows (duplicate punches the app could not de-duplicate) are
+    // each paid their own span — the union merge above only protects the MEAL
+    // math. Pay is a manager's call, so both rows are flagged, never silent.
+    const overlapping = overlappingEntryIds(entries);
+
     return entries.map((entry): SettleDayUpdate => {
         const shiftHours = hoursBetween(entry.startTime, entry.endTime);
         const mealDeductionHours = deductions.get(entry.id) ?? 0;
@@ -506,16 +532,22 @@ export function settleDayPlan(input: {
             paidHours: Math.max(0, shiftHours - mealDeductionHours),
             mealOutcome: isLast ? dayOutcome : "DEFERRED",
         };
+        // Settlement-owned notes wanted on this row right now; everything else
+        // on the row (GPS, waiver, failed-settle…) is preserved verbatim.
+        const wanted: string[] = [];
+        if (isLast && dayOutcome === "AUTO_DEDUCTED" && !answered) wanted.push(NO_ATTESTATION_NOTE);
+        if (overlapping.has(entry.id)) wanted.push(OVERLAP_NOTE);
         const parts = reviewReasonParts(entry.reviewReason);
-        if (isLast && dayOutcome === "AUTO_DEDUCTED" && !answered) {
+        const others = parts.filter((part) => !SETTLEMENT_NOTES.includes(part));
+        const desired = [...others, ...wanted];
+        const unchanged = desired.length === parts.length && desired.every((part, i) => part === parts[i]);
+        if (wanted.length > 0) {
             update.needsReview = true;
-            update.reviewReason = parts.includes(NO_ATTESTATION_NOTE) ? parts.join("; ") : [...parts, NO_ATTESTATION_NOTE].join("; ");
-        } else if (parts.some((part) => SETTLEMENT_NOTES.includes(part))) {
-            // The day no longer owes an unanswered deduction here — retire our
-            // own notes, keep everyone else's, clear the flag only if nothing remains.
-            const remaining = parts.filter((part) => !SETTLEMENT_NOTES.includes(part));
-            update.reviewReason = remaining.join("; ");
-            if (remaining.length === 0) update.needsReview = false;
+            if (!unchanged) update.reviewReason = desired.join("; ");
+        } else if (!unchanged) {
+            // Our notes retired; keep everyone else's, clear the flag only if nothing remains.
+            update.reviewReason = desired.join("; ");
+            if (desired.length === 0) update.needsReview = false;
         }
         return update;
     });

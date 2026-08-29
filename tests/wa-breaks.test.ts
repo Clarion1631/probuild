@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+    OVERLAP_NOTE,
+    overlappingEntryIds,
     settleDayPlan,
     applyNoAttestationNotice,
     staleDeferredReview,
@@ -362,9 +364,28 @@ test("staleDeferredReview (codex r3 #3): a DEFERRED close on a DIFFERENT company
 
 test("settleDayPlan (codex r3 #5): two rows ending at the same instant — flag and deduction land on the SAME row", () => {
     const plan = settleDayPlan({ entries: [E("a", "07:00", "15:00"), E("b", "14:00", "15:00")], closing: null });
-    const flagged = plan.filter((u) => u.needsReview);
+    // Both rows overlap (so both carry OVERLAP_NOTE); the NO-ANSWER note and the deduction must share one row.
+    const flagged = plan.filter((u) => (u.reviewReason ?? "").includes(NO_ATTESTATION_NOTE));
     const deducted = plan.filter((u) => u.mealDeductionHours > 0);
     assert.equal(flagged.length, 1);
     assert.equal(deducted.length, 1);
     assert.equal(flagged[0].id, deducted[0].id);
+});
+
+test("codex r6 #1: overlapping duplicate rows are BOTH flagged with the overlap note; abutting rows are not", () => {
+    const dup = settleDayPlan({ entries: [E("a", "07:00", "15:00"), E("b", "07:00", "15:00")], closing: { id: "b", mealSkipped: false } });
+    for (const u of dup) {
+        assert.equal(u.needsReview, true, u.id);
+        assert.ok(u.reviewReason?.includes(OVERLAP_NOTE), u.id);
+    }
+    assert.deepEqual([...overlappingEntryIds([E("a", "07:00", "12:00"), E("b", "12:00", "15:00")])], []);
+    const clean = settleDayPlan({ entries: [E("a", "07:00", "12:00", { reviewReason: OVERLAP_NOTE }), E("b", "12:30", "15:00")], closing: null });
+    assert.equal(clean.find((u) => u.id === "a")!.reviewReason, "");
+    assert.equal(clean.find((u) => u.id === "a")!.needsReview, false);
+});
+
+test("codex r6 #3: a derived WAIVED_APPROVED outcome is NOT approval evidence — only mealSkipStatus APPROVED is", () => {
+    const plan = settleDayPlan({ entries: [E("a", "07:00", "11:00", { mealOutcome: "WAIVED_APPROVED" }), E("b", "11:05", "15:00")], closing: { id: "b", mealSkipped: false } });
+    assert.equal(plan.find((u) => u.id === "b")!.mealOutcome, "AUTO_DEDUCTED");
+    assert.equal(plan.find((u) => u.id === "b")!.mealDeductionHours, 0.5);
 });
