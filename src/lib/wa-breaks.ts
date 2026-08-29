@@ -21,6 +21,18 @@
 // manager tables, variance — reads it as such); `shiftHours` is the raw
 // clock-in→clock-out span; `mealDeductionHours` is the difference.
 
+/**
+ * No single punch is longer than a day. A span past this means the end landed
+ * on the wrong DATE (a manager closing yesterday's forgotten punch from today —
+ * real incident 2026-08-19: 8:51 AM → next-day 7:50 PM = 34.9 paid hours).
+ * Both clock-out and edit refuse it; the client says "check the day".
+ */
+export const MAX_SHIFT_HOURS = 24;
+
+/** True when a punch from `start` to `end` would exceed MAX_SHIFT_HOURS (exactly 24h is allowed). Shared by PUT clock-out and PATCH edit. */
+export function exceedsMaxShift(start: Date, end: Date): boolean {
+    return end.getTime() - start.getTime() > MAX_SHIFT_HOURS * 3_600_000;
+}
 export const MEAL_REQUIRED_AFTER_HOURS = 5;
 export const SECOND_MEAL_AFTER_HOURS = 11;
 export const MEAL_DEDUCTION_HOURS = 0.5;
@@ -194,6 +206,8 @@ export const NO_ATTESTATION_NOTE = "Meal auto-deducted with no lunch answer capt
 export const STALE_DEFERRED_NOTE = "Mid-day close was the last of its day — meal never settled (worker did not clock back in)";
 /** A DEFERRED close older than this with no later entry is treated as the end of that day. */
 export const STALE_DEFERRED_AFTER_HOURS = 2;
+/** Sentinel — the worker closed this punch from History more than a day after it started (forgot to clock out). */
+export const CLOSED_LATE_NOTE = "Closed by worker more than 24h after clock-in (forgot to clock out) — verify the end time";
 /** Sentinel — this row overlaps another of the worker's rows the same day (duplicate punch?): both pay in full until a manager fixes it. */
 export const OVERLAP_NOTE = "Overlaps another time entry the same day — duplicate punch? both are paid until corrected";
 /** Sentinel — the day re-plan could not be written after a close/edit; the row holds close-time values. Verify by hand. */
