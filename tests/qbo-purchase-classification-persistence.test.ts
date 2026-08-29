@@ -23,6 +23,19 @@ function assertDisposableLocalDatabase(url: string): void {
         false,
         "persistence integration test must never target Supabase",
     );
+    // A localhost URL is not proof of disposability: a tunnel or port-forward to a
+    // real database also answers on 127.0.0.1, and this suite DROPs a table. Require
+    // the database itself to be named as disposable, and require an explicit ack.
+    assert.match(
+        parsed.pathname,
+        /(disposable|scratch|_test|-test)/i,
+        "QBO_CLASSIFICATION_PERSISTENCE_TEST_URL database name must contain disposable, scratch, or test",
+    );
+    assert.equal(
+        process.env.QBO_CLASSIFICATION_PERSISTENCE_TEST_DISPOSABLE,
+        "yes",
+        "set QBO_CLASSIFICATION_PERSISTENCE_TEST_DISPOSABLE=yes to confirm the target database may be dropped",
+    );
 }
 
 test(
