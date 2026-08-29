@@ -8,7 +8,7 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
-import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
+import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 
 export async function GET(req: Request) {
@@ -390,6 +390,14 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 end = parsedEnd;
             } else {
                 end = new Date();
+            }
+            if (exceedsMaxShift(existing.startTime, end)) {
+                // A punch left open for over a day is a forgotten clock-out, not a
+                // 24h+ shift — it must be closed by an edit with the right day.
+                return NextResponse.json(
+                    { error: `Shift would be longer than ${MAX_SHIFT_HOURS} hours — check the day`, code: "SHIFT_TOO_LONG" },
+                    { status: 400 }
+                );
             }
 
             // PUT always closes the entry (endTime resolved above), so every

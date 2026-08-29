@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+    exceedsMaxShift,
     OVERLAP_NOTE,
     overlappingEntryIds,
     settleDayPlan,
@@ -388,4 +389,13 @@ test("codex r6 #3: a derived WAIVED_APPROVED outcome is NOT approval evidence â€
     const plan = settleDayPlan({ entries: [E("a", "07:00", "11:00", { mealOutcome: "WAIVED_APPROVED" }), E("b", "11:05", "15:00")], closing: { id: "b", mealSkipped: false } });
     assert.equal(plan.find((u) => u.id === "b")!.mealOutcome, "AUTO_DEDUCTED");
     assert.equal(plan.find((u) => u.id === "b")!.mealDeductionHours, 0.5);
+});
+
+test("exceedsMaxShift (codex r8 #4): exactly 24h is allowed, 24h + 1 min is not; a normal overnight shift passes", () => {
+    const start = new Date("2026-08-10T15:00:00.000Z");
+    assert.equal(exceedsMaxShift(start, new Date(start.getTime() + 24 * 3_600_000)), false);
+    assert.equal(exceedsMaxShift(start, new Date(start.getTime() + 24 * 3_600_000 + 60_000)), true);
+    assert.equal(exceedsMaxShift(new Date("2026-08-10T22:00:00-07:00"), new Date("2026-08-11T06:30:00-07:00")), false);
+    // The incident: 8:51 AM -> next-day 7:50 PM
+    assert.equal(exceedsMaxShift(new Date("2026-08-18T08:51:00-07:00"), new Date("2026-08-19T19:50:00-07:00")), true);
 });
