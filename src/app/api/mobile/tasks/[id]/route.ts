@@ -30,6 +30,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             projectId: true,
             project: { select: { id: true, name: true, color: true, location: true } },
             assignments: {
+                // Only activated accounts are crew the field should see; deactivated
+                // users stay in the assignment table for history but never in the app.
+                where: { user: { status: "ACTIVATED" } },
                 select: { role: true, user: { select: { id: true, name: true } } },
             },
             // Linked estimate line item + its cost code — lets the mobile geofence

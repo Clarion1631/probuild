@@ -103,7 +103,9 @@ function weekChipsForMember(projects: DashboardProjectRow[], memberId: string, d
     return chips;
 }
 
-export const WEEK_CELL_MAX_CHIPS = 2;
+// Chips are the only way to open a task from the grid, so the cap is a safety valve
+// for pathological days, not a design limit: four solid assignments in one day is rare.
+export const WEEK_CELL_MAX_CHIPS = 4;
 
 export interface VisibleWeekChips {
     chips: WeekChip[];
