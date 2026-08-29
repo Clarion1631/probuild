@@ -307,7 +307,7 @@ async function judgeReasonableness(input: ReasonablenessInput): Promise<Reasonab
         (async () => {
             const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
             const response = await ai.models.generateContent({
-                model: "gemini-3.0-flash-preview",
+                model: "gemini-3.5-flash",
                 contents: [{ role: "user", parts: [{ text: reasonablenessPrompt(input) }] }],
             });
             return parseReasonablenessJson(response.text ?? "") ?? REASONABLENESS_UNKNOWN;
@@ -460,7 +460,7 @@ async function tier1Gemini(base64: string, mediaType: string): Promise<ModelRead
         (async () => {
             const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
             const response = await ai.models.generateContent({
-                model: "gemini-3.0-flash-preview",
+                model: "gemini-3.5-flash",
                 contents: [{
                     role: "user",
                     parts: [
