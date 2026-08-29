@@ -1,8 +1,9 @@
 name: Claude PR Gate (Codex review + Gauntlet visual verify + deploy)
-# Triggered on PRs opened by the auto-fix loop (label: claude-fix).
-# Gate 1: Codex (gpt-5.6-sol, xhigh) adversarial code review — must APPROVE.
-# Gate 2: Gauntlet visual verification against the Vercel preview deployment.
-# Then: auto-merge -> Vercel production deploy -> post-deploy visual re-verify.
+# Codex review runs on EVERY non-draft PR (Justin, 2026-08-29: "make sure codex
+# reviews" — bot PRs 425/426 merged with no reviewable evidence). The job below
+# is a REQUIRED status check on main: no APPROVE, no merge, no exceptions.
+# The auto-fix loop, gauntlet visual verify, and auto-merge stay gated on the
+# claude-fix label exactly as before.
 #
 # Auth: subscriptions only, no API keys.
 # - Claude: CLAUDE_CODE_OAUTH_TOKEN secret (needs id-token: write below)
@@ -10,7 +11,7 @@ name: Claude PR Gate (Codex review + Gauntlet visual verify + deploy)
 
 on:
   pull_request:
-    types: [opened, synchronize, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 permissions:
   contents: write
@@ -21,8 +22,12 @@ permissions:
 
 jobs:
   codex-review:
-    if: contains(github.event.pull_request.labels.*.name, 'claude-fix')
+    name: Codex Review Gate
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    concurrency:
+      group: codex-gate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     outputs:
       verdict: ${{ steps.review.outputs.verdict }}
     steps:
@@ -47,9 +52,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          # effort high, not xhigh: xhigh blew the review budget on ~40KB diffs
+          # (same finding as the fleet's review_chain.py, 2026-08-28)
           codex exec \
             --model gpt-5.6-sol \
-            -c model_reasoning_effort="xhigh" \
+            -c model_reasoning_effort="high" \
             --sandbox read-only \
             "You are a harsh, skeptical code reviewer. Review the diff in /tmp/pr.diff
              against the PR intent below. Look for bugs, security issues, missed edge
@@ -67,13 +74,14 @@ jobs:
 
       - name: Fail gate if changes requested
         if: steps.review.outputs.verdict != 'APPROVE'
-        run: exit 1
-        # A failed gate triggers the fix-review-feedback job below; its push
-        # re-triggers this workflow, closing the review loop automatically.
+        run: |
+          echo "Codex did not APPROVE. Read its newest PR comment, address every"
+          echo "numbered item (or dispute it in a reply), push, and this gate re-runs."
+          exit 1
 
   fix-review-feedback:
     needs: codex-review
-    if: failure()
+    if: failure() && contains(github.event.pull_request.labels.*.name, 'claude-fix')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,7 +108,7 @@ jobs:
 
   gauntlet-visual-verify:
     needs: codex-review
-    if: needs.codex-review.outputs.verdict == 'APPROVE'
+    if: needs.codex-review.outputs.verdict == 'APPROVE' && contains(github.event.pull_request.labels.*.name, 'claude-fix')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -138,7 +146,7 @@ jobs:
 
   merge-and-deploy:
     needs: [codex-review, gauntlet-visual-verify]
-    if: needs.codex-review.outputs.verdict == 'APPROVE'
+    if: needs.codex-review.outputs.verdict == 'APPROVE' && contains(github.event.pull_request.labels.*.name, 'claude-fix')
     runs-on: ubuntu-latest
     steps:
       - name: Auto-merge (production deploy happens via Vercel Git integration)
