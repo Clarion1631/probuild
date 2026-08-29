@@ -5,7 +5,8 @@ import { toNum } from "@/lib/prisma-helpers";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
-import { markTimeEntryReviewed } from "@/lib/actions";
+import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
+import { canApproveMealSkip } from "@/lib/wa-breaks";
 
 interface Props {
     searchParams: Promise<{ userId?: string; projectId?: string; dateFrom?: string; dateTo?: string; tab?: string; flagged?: string }>;
@@ -35,7 +36,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
         if (dateTo) where.startTime.lte = new Date(dateTo + "T23:59:59");
     }
 
-    const [entries, allUsers, allProjects] = await Promise.all([
+    const [entries, allUsers, allProjects, pendingSkips] = await Promise.all([
         prisma.timeEntry.findMany({
             where,
             include: { user: true, project: true, costCode: true, estimateItem: true },
@@ -44,7 +45,19 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
         }),
         prisma.user.findMany({ select: { id: true, name: true, email: true }, orderBy: { name: 'asc' } }),
         prisma.project.findMany({ select: { id: true, name: true }, orderBy: { name: 'asc' } }),
+        // Skip-lunch requests waiting on an approver — always shown, regardless
+        // of the filters, because a worker is standing on a job site waiting.
+        prisma.timeEntry.findMany({
+            where: { mealSkipStatus: 'PENDING', endTime: null },
+            select: {
+                id: true, startTime: true, mealSkipRequestedAt: true,
+                user: { select: { id: true, name: true, email: true, mealWaiverSignedAt: true } },
+                project: { select: { name: true } },
+            },
+            orderBy: { mealSkipRequestedAt: 'asc' },
+        }),
     ]);
+    const viewerCanApprove = !!user && canApproveMealSkip({ role: user.role, email: user.email });
 
     const flaggedCount = entries.filter(e => e.needsReview).length;
     const totalHours = entries.reduce((acc, e) => acc + (e.durationHours || 0), 0);
@@ -91,6 +104,64 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                     </Link>
                 </div>
             </div>
+
+            {/* Skip-lunch requests (WA express permission — src/lib/wa-breaks.ts) */}
+            {pendingSkips.length > 0 && (
+                <div className="hui-card p-5 border-amber-300 bg-amber-50/40">
+                    <div className="flex items-center justify-between mb-3">
+                        <h2 className="text-base font-semibold text-hui-textMain">
+                            🍽️ Skip-lunch requests waiting ({pendingSkips.length})
+                        </h2>
+                        {!viewerCanApprove && (
+                            <span className="text-xs text-hui-textMuted">Only CJ, Richard, or Justin can approve</span>
+                        )}
+                    </div>
+                    <ul className="divide-y divide-hui-border">
+                        {pendingSkips.map((r) => {
+                            const waiverOnFile = !!r.user.mealWaiverSignedAt;
+                            return (
+                                <li key={r.id} className="py-3 flex flex-wrap items-center gap-3 text-sm">
+                                    <div className="flex-1 min-w-[220px]">
+                                        <div className="font-medium text-hui-textMain">{r.user.name || r.user.email}</div>
+                                        <div className="text-xs text-hui-textMuted">
+                                            {r.project.name} · clocked in {new Date(r.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                                            {r.mealSkipRequestedAt && <> · asked {new Date(r.mealSkipRequestedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</>}
+                                        </div>
+                                    </div>
+                                    <div className="text-xs">
+                                        {waiverOnFile ? (
+                                            <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded border border-green-200">Waiver signed</span>
+                                        ) : (
+                                            <span className="inline-flex items-center gap-2">
+                                                <span className="text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200">No waiver on file</span>
+                                                {viewerCanApprove && (
+                                                    <form action={async () => { "use server"; await setMealWaiverSigned(r.user.id, true); }}>
+                                                        <button type="submit" className="underline text-hui-textMuted hover:text-hui-textMain" title="Marge's signed meal-period waiver is in hand">
+                                                            Mark signed
+                                                        </button>
+                                                    </form>
+                                                )}
+                                            </span>
+                                        )}
+                                    </div>
+                                    {viewerCanApprove && (
+                                        <div className="flex items-center gap-2">
+                                            <form action={async () => { "use server"; await decideMealSkip(r.id, "APPROVED"); }}>
+                                                <button type="submit" disabled={!waiverOnFile} className="hui-btn hui-btn-primary text-xs disabled:opacity-40" title={waiverOnFile ? "Approve — paid, no deduction, no review flag" : "Needs a signed waiver first"}>
+                                                    Approve
+                                                </button>
+                                            </form>
+                                            <form action={async () => { "use server"; await decideMealSkip(r.id, "DENIED"); }}>
+                                                <button type="submit" className="hui-btn hui-btn-secondary text-xs">Deny</button>
+                                            </form>
+                                        </div>
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>
+                </div>
+            )}
 
             {/* Tabs */}
             <div className="flex border-b border-hui-border gap-0">
@@ -202,7 +273,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                         <th className="px-5 py-3 font-medium">Reported By</th>
                                         <th className="px-5 py-3 font-medium">Date</th>
                                         <th className="px-5 py-3 font-medium">Service / Phase</th>
-                                        <th className="px-5 py-3 font-medium text-right">Hours</th>
+                                        <th className="px-5 py-3 font-medium text-right" title="Paid hours (after any automatic 30-min meal deduction)">Paid hrs</th>
+                                        <th className="px-5 py-3 font-medium text-center">Meal</th>
                                         <th className="px-5 py-3 font-medium text-right">Rate</th>
                                         <th className="px-5 py-3 font-medium text-right">Total</th>
                                         <th className="px-5 py-3 font-medium text-center">Status</th>
@@ -232,8 +304,19 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                 <td className="px-5 py-3 text-hui-textMuted text-xs">
                                                     {e.estimateItem?.name || e.costCode?.name || <span className="italic">—</span>}
                                                 </td>
-                                                <td className="px-5 py-3 text-right font-medium text-hui-textMain tabular-nums">
+                                                <td className="px-5 py-3 text-right font-medium text-hui-textMain tabular-nums" title={e.shiftHours != null && e.mealDeductionHours ? `${e.shiftHours.toFixed(2)} on the clock − ${e.mealDeductionHours.toFixed(2)} meal` : undefined}>
                                                     {e.durationHours ? `${e.durationHours.toFixed(2)}` : '—'}
+                                                </td>
+                                                <td className="px-5 py-3 text-center text-xs">
+                                                    {e.mealOutcome === 'AUTO_DEDUCTED' ? <span className="text-hui-textMuted" title={`${Math.round((e.mealDeductionHours ?? 0.5) * 60)} min unpaid meal deducted automatically`}>−{Math.round((e.mealDeductionHours ?? 0.5) * 60)}m</span>
+                                                        : e.mealOutcome === 'DEFERRED' ? <span className="text-hui-textMuted" title="Mid-day close (lunch / task switch) — the day settles on the final clock-out">mid-day</span>
+                                                        : e.mealOutcome === 'PUNCHED' ? <span className="text-hui-textMuted" title="Worker clocked out for a meal">taken</span>
+                                                        : e.mealOutcome === 'WORKED_THROUGH' ? <span className="text-red-700" title="Worker reported working through lunch — paid, needs review">worked thru</span>
+                                                        : e.mealOutcome === 'WAIVED_APPROVED' ? <span className="text-green-700" title="Skip approved in advance by a manager">approved skip</span>
+                                                        : e.mealOutcome === 'NOT_REQUIRED' ? <span className="text-hui-textMuted">—</span>
+                                                        : e.mealSkipStatus === 'PENDING' ? <span className="text-amber-700">skip pending</span>
+                                                        : <span className="text-hui-textMuted">—</span>}
+                                                    {e.restBreaksMissed && <div className="text-red-700" title="Worker reported a missed 10-min rest break — paid, needs review">rest missed</div>}
                                                 </td>
                                                 <td className="px-5 py-3 text-right text-hui-textMuted tabular-nums text-xs">
                                                     {formatCurrency(rate)}/h

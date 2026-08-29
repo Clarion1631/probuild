@@ -6,6 +6,9 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
+import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, type MealOutcome } from "@/lib/wa-breaks";
+import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -129,9 +132,17 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // notes are the only record of what was actually done — require one
     // (already on the entry, or supplied in this request) before the entry can
     // be clocked out.
+    //
+    // "Clocked out" means OPEN → CLOSED. The mobile edit screen always sends
+    // endTime for an already-closed entry (it re-sends both times with the
+    // reason), and it has no job-notes field — so demanding logistics notes on
+    // that edit made every old logistics punch un-editable from the phone
+    // ("Update failed", CJ 2026-08-28). A closed entry keeps whatever notes it
+    // has; only a genuine close-out is gated.
     const settingEndTime = body.endTime !== undefined && body.endTime !== null;
+    const closingOpenEntry = settingEndTime && existing.endTime == null;
     let projectIsLogistics = false;
-    if (settingEndTime) {
+    if (closingOpenEntry) {
         const entryProject = await prisma.project.findUnique({
             where: { id: existing.projectId },
             select: { isLogistics: true },
@@ -140,7 +151,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
     const logisticsCheck = checkLogisticsClockOutNotes({
         isLogistics: projectIsLogistics,
-        settingEndTime,
+        settingEndTime: closingOpenEntry,
         existingNotes: existing.notes,
         suppliedNotes: typeof body.notes === "string" ? body.notes : undefined,
     });
@@ -158,7 +169,48 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         : await prisma.user.findUnique({ where: { id: existing.userId } });
     if (!owner) return NextResponse.json({ error: "Entry owner not found" }, { status: 404 });
 
-    const durationHours = newEnd ? (newEnd.getTime() - newStart.getTime()) / 3_600_000 : null;
+    // Automatic-break model (src/lib/wa-breaks.ts): the meal is re-settled on
+    // EVERY edit that leaves the entry closed — a manager closing a forgotten
+    // punch gets the same deduction a normal clock-out would, and shrinking an
+    // 8h entry to 4h drops a deduction the shorter day no longer owes. Inputs
+    // are the entry's own recorded state: an intermediate (DEFERRED) close
+    // stays deferred, a worked-through attestation stays honored. durationHours
+    // = PAID hours, shiftHours = raw — same contract as the PUT path.
+    const shiftHours = newEnd ? (newEnd.getTime() - newStart.getTime()) / 3_600_000 : null;
+    let durationHours: number | null = null;
+    let mealFields: Record<string, unknown> = {};
+    let mealOutcomeForNotice: MealOutcome | null = null;
+    // The attestation to honor: an explicit boolean in this request; else, for
+    // an entry that already CLOSED with a worker answer, that answer; else
+    // nothing (an OPEN entry's stored `mealSkipped` is just the column default
+    // — the worker was never asked, and the notice below must say so).
+    // Only the OWNER's answer counts; a closed row's durable answer is read
+    // off its outcome (WORKED_THROUGH = "worked through"; AUTO_DEDUCTED without
+    // the no-answer note = "took lunch"), never off the column default.
+    const storedAnswer: boolean | undefined =
+        existing.mealOutcome === "WORKED_THROUGH"
+            ? true
+            : existing.mealOutcome === "AUTO_DEDUCTED" && !(existing.reviewReason ?? "").includes(NO_ATTESTATION_NOTE)
+              ? false
+              : undefined;
+    const mealSkippedForEdit: boolean | undefined =
+        isOwner && typeof body.mealSkipped === "boolean" ? body.mealSkipped : storedAnswer;
+    if (newEnd) {
+        const dayEntries = await loadDayEntries(existing.userId, toCompanyDayKey(newStart), existing.id);
+        const meal = computeMealDeduction({
+            dayEntries,
+            closing: { startTime: newStart, endTime: newEnd },
+            mealSkipped: mealSkippedForEdit,
+            mealSkipStatus: existing.mealSkipStatus,
+            deferMeal: existing.mealOutcome === "DEFERRED",
+        });
+        durationHours = meal.paidHours;
+        mealFields = { mealDeductionHours: meal.mealDeductionHours, mealOutcome: meal.outcome };
+        mealOutcomeForNotice = meal.outcome;
+    } else {
+        // Re-opened entry: nothing is settled until it closes again.
+        mealFields = { mealDeductionHours: null, mealOutcome: null };
+    }
     const laborCost = durationHours != null ? durationHours * toNum(owner.hourlyRate) : null;
     const burdenCost = durationHours != null ? durationHours * toNum(owner.burdenRate) : null;
 
@@ -166,6 +218,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         startTime: newStart,
         endTime: newEnd,
         durationHours,
+        shiftHours,
+        ...mealFields,
         laborCost,
         burdenCost,
         editNotes: body.editNotes.trim(),
@@ -180,14 +234,32 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // this PATCH is actually setting endTime (a clock-out), never on a plain
     // edit. Defense in depth for a call site mobile doesn't currently use for
     // this flag (see PUT), same posture as the notes check above.
-    Object.assign(
-        data,
-        applyMealSkippedWaiver({
-            mealSkipped: body.mealSkipped,
-            settingEndTime,
-            existingReviewReason: existing.reviewReason,
-        })
-    );
+    // Same owner-gated value the settlement uses — never the raw body from a manager.
+    const mealWaiver = applyMealSkippedWaiver({
+        mealSkipped: mealOutcomeForNotice === "WORKED_THROUGH" ? true : mealSkippedForEdit === false ? false : undefined,
+        settingEndTime,
+        existingReviewReason: existing.reviewReason,
+    });
+    Object.assign(data, mealWaiver);
+    const rest = applyRestBreakAttestation({
+        // The worker's word only — a manager cannot answer for them.
+        restBreaksMissed: isOwner ? body.restBreaksMissed : undefined,
+        settingEndTime,
+        existingReviewReason: mealWaiver.reviewReason ?? existing.reviewReason,
+    });
+    Object.assign(data, rest);
+    // Same rule as the PUT clock-out: a deduction nobody asked the worker about
+    // is flagged — a manager closing a forgotten punch included.
+    if (mealOutcomeForNotice) {
+        Object.assign(
+            data,
+            applyNoAttestationNotice({
+                outcome: mealOutcomeForNotice,
+                mealSkipped: mealSkippedForEdit,
+                existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
+            })
+        );
+    }
 
     // Capture the as-clocked values exactly once. Subsequent edits update the latest
     // times but never overwrite the original snapshot.
@@ -215,7 +287,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const updated = await prisma.timeEntry.update({ where: { id }, data });
-    return NextResponse.json(JSON.parse(JSON.stringify(updated)));
+
+    // Re-plan every day this edit touched (the row may have moved days).
+    const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
+    for (const dayKey of days) {
+        const result = await settleDay(existing.userId, dayKey, newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null);
+        if (result < 0) await flagSettlementFailed(id);
+    }
+    const settled = await prisma.timeEntry.findUnique({ where: { id } });
+    return NextResponse.json(JSON.parse(JSON.stringify(settled ?? updated)));
 }
 
 // Manager/admin only. Field crew correct mistakes via PATCH (with editNotes audit);
@@ -236,6 +316,9 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
-    await prisma.timeEntry.delete({ where: { id } });
+    // Delete + re-plan the day in one transaction under the day lock — a
+    // concurrent edit that moved this row is seen inside the lock and its new
+    // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
+    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
     return NextResponse.json({ ok: true });
 }
