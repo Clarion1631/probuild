@@ -127,6 +127,33 @@ export function buildAvailabilityRows(
         .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+export const MAX_VISIBLE_BOOKED_CHIPS = 2;
+
+export interface AvailabilityCellSummary {
+    /** Booked chips to render, already truncated to MAX_VISIBLE_BOOKED_CHIPS. */
+    booked: AvailabilityChip[];
+    /** Booked chips beyond the visible cap — render as a "+N" chip. */
+    overflow: number;
+    /** Count of soft (job-crew, no task) chips for this cell. */
+    softCount: number;
+}
+
+/**
+ * Reduces a cell's raw chip list to the information-design rules: booked
+ * chips are the only thing ever rendered as a chip (capped, with a "+N"
+ * overflow marker); soft membership collapses to a count so five identical
+ * outlined pills don't wallpaper the cell.
+ */
+export function summarizeCell(chips: AvailabilityChip[]): AvailabilityCellSummary {
+    const bookedAll = chips.filter(chip => chip.kind === "booked");
+    const softCount = chips.filter(chip => chip.kind === "soft").length;
+    return {
+        booked: bookedAll.slice(0, MAX_VISIBLE_BOOKED_CHIPS),
+        overflow: Math.max(0, bookedAll.length - MAX_VISIBLE_BOOKED_CHIPS),
+        softCount,
+    };
+}
+
 /**
  * Reads the canonical serialized conflict windows. `solidOnly` narrows the
  * result to pairs backed by two task assignments, excluding project-crew

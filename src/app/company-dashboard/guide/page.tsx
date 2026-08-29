@@ -7,6 +7,16 @@ export const dynamic = "force-dynamic";
 // Plain-English "how to use" for the company schedule board — written so a
 // PM/field lead can be sent this link cold (probuild.goldentouchremodeling.com
 // /company-dashboard/guide) and start scheduling. Same gate as the dashboard.
+const Step = ({ n, title, children }: { n: number; title: string; children: React.ReactNode }) => (
+    <div className="flex gap-4">
+        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-hui-primary text-white flex items-center justify-center text-sm font-bold">{n}</div>
+        <div className="pb-6">
+            <h3 className="text-sm font-semibold text-hui-textMain mb-1">{title}</h3>
+            <div className="text-sm text-hui-textMuted space-y-1">{children}</div>
+        </div>
+    </div>
+);
+
 export default async function CompanyDashboardGuidePage() {
     const session = await getSessionOrDev();
     const user = session?.user?.email ? await getUserWithPermissionsByEmail(session.user.email) : null;
@@ -14,16 +24,6 @@ export default async function CompanyDashboardGuidePage() {
     if (!effectiveUser || (!hasPermission(effectiveUser, "financialReports") && !hasPermission(effectiveUser, "schedules"))) {
         return <div className="p-8 text-red-500">Access Denied.</div>;
     }
-
-    const Step = ({ n, title, children }: { n: number; title: string; children: React.ReactNode }) => (
-        <div className="flex gap-4">
-            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-hui-primary text-white flex items-center justify-center text-sm font-bold">{n}</div>
-            <div className="pb-6">
-                <h3 className="text-sm font-semibold text-hui-textMain mb-1">{title}</h3>
-                <div className="text-sm text-hui-textMuted space-y-1">{children}</div>
-            </div>
-        </div>
-    );
 
     return (
         <div className="max-w-3xl mx-auto py-8 px-6">
@@ -77,10 +77,52 @@ export default async function CompanyDashboardGuidePage() {
                 <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
                     <li><strong>Today</strong> shows one card per job with work on: the task, its status and progress, who&apos;s on it, and a materials count. People with nothing assigned sit on the <strong>Available</strong> bench up top.</li>
                     <li>The strip above the cards is the morning checklist — it flags jobs with no one on them, tasks with no lead, double-bookings, and anything Blocked. Click a flag to jump to the problem. &quot;Day clear&quot; means today runs.</li>
-                    <li><strong>Week</strong> flips it: one row per person, Monday to Friday, so you can see everyone&apos;s week at a glance. Click an empty day to give someone a task.</li>
+                    <li><strong>Week</strong> flips it: one row per person across the week, so you can see everyone&apos;s week at a glance. Click an empty day to give someone a task.</li>
                     <li><strong>Drag a crew chip onto a task</strong> to assign them. Chip changes pile up as drafts just like date moves.</li>
                     <li><strong>Review dispatch</strong> shows every change in plain English — &quot;Kevin → Framing (add)&quot; — before anything commits. One confirm saves it all together, or nothing at all if the schedule changed under you. Your drafts survive either way.</li>
                     <li>The <strong>Task bank</strong> lists estimate items that have no task yet, with a count like &quot;7 of 9 scheduled&quot; — so nothing that was sold goes unplanned.</li>
+                </ul>
+            </div>
+
+            <div className="hui-card p-6 mb-6">
+                <h2 className="text-base font-semibold text-hui-textMain mb-1">Every morning, in order</h2>
+                <p className="text-sm text-hui-textMuted mb-5">The crew app only shows what you confirm here. A job with no task for today is an empty screen for whoever is standing on it.</p>
+                <ol className="list-none p-0 m-0">
+                    <li>
+                        <Step n={1} title="Check the strip">
+                            <p>Unstaffed today, Crewless job, Needs review, No field update. Click a flag to jump to it.</p>
+                        </Step>
+                    </li>
+                    <li>
+                        <Step n={2} title="Give every job a task for today">
+                            <p>A card that says &quot;No task planned today&quot; has crew but nothing to do. Click <strong>+ Task</strong> on the card, or pick the project in the Task bank and hit <strong>Schedule</strong> next to an unscheduled item.</p>
+                        </Step>
+                    </li>
+                    <li>
+                        <Step n={3} title="Put people on tasks">
+                            <p>Drag chips from the Available bench onto tasks. Use <strong>Week</strong> to plan the rest of the week.</p>
+                        </Step>
+                    </li>
+                    <li>
+                        <Step n={4} title="Review dispatch, then confirm">
+                            <p>Nothing is saved while you arrange. One confirm saves it all. Crew see it in the app on their next refresh.</p>
+                        </Step>
+                    </li>
+                    <li>
+                        <Step n={5} title="Staging queue for tomorrow&apos;s truck">
+                            <p>Big checkboxes, grouped by job. Works on a phone.</p>
+                        </Step>
+                    </li>
+                </ol>
+                <p className="text-sm text-hui-textMuted">Daily logs don&apos;t move the schedule by themselves. If a phase slips or finishes early, update the task here.</p>
+            </div>
+
+            <div className="hui-card p-6 mb-6">
+                <h2 className="text-base font-semibold text-hui-textMain mb-4">What the crew sees</h2>
+                <ul className="text-sm text-hui-textMuted space-y-2 list-disc pl-5">
+                    <li>In the ProBuild Field app, the <strong>Today</strong> tab lists today&apos;s tasks by job, with a <strong>YOU</strong> badge on theirs. Tapping a task opens details, comments, and photos.</li>
+                    <li><strong>This Week</strong> shows one week at a time, Sunday to Saturday (same as the pay period), with arrows to look ahead. The Week grid on this board starts on Monday, so the two views cover slightly different days.</li>
+                    <li>The app has its own short how-to behind the <strong>?</strong> on the Today tab.</li>
                 </ul>
             </div>
 

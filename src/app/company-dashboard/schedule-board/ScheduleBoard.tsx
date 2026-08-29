@@ -16,7 +16,7 @@ import type {
     PersistedDispatchTaskState,
 } from "@/lib/dispatch-intent";
 import type { VancouverForecastDay } from "@/lib/weather";
-import { addDays, formatDate, getDaysBetween, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import { addDays, formatDate, getDaysBetween, parseUTCDate, todayUTC } from "@/app/projects/[id]/schedule/schedule-utils";
 import { MonthBarsView } from "./MonthBarsView";
 import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { DispatchView } from "./DispatchView";
@@ -91,6 +91,11 @@ interface ScheduleBoardProps {
     // React batch each keep their event (a single latest-payload slot would
     // drop all but the last).
     externalShiftEvents: { nonce: number; taskDates: { id: string; startDate: string; endDate: string }[] }[];
+    // Full-screen dispatch focus mode (see /company-dashboard/dispatch):
+    // forces the Dispatch view, strips the surrounding chrome (view toggle,
+    // money toggles, month nav, unscheduled tray, availability panel), and
+    // fills the viewport.
+    focus?: "dispatch";
 }
 
 interface TaskKeyboardEditState {
@@ -279,6 +284,7 @@ export function ScheduleBoard({
     isProjectExternallyPending,
     onEffectivePendingProjectIdsChange,
     externalShiftEvents,
+    focus,
 }: ScheduleBoardProps) {
     if (process.env.NODE_ENV !== "production") {
         scheduleBoardRenderCount += 1;
@@ -290,7 +296,7 @@ export function ScheduleBoard({
     const [showProjectedCo, setShowProjectedCo] = useState(true);
     const [showExpenses, setShowExpenses] = useState(false);
     const [showHours, setShowHours] = useState(false);
-    const [boardView, setBoardView] = useState<BoardView>("month");
+    const [boardView, setBoardView] = useState<BoardView>(focus === "dispatch" ? "dispatch" : "month");
     const [openTaskId, setOpenTaskId] = useState<string | null>(null);
     const [openProjectId, setOpenProjectId] = useState<string | null>(null);
     const [taskCreationOpen, setTaskCreationOpen] = useState(false);
@@ -349,13 +355,14 @@ export function ScheduleBoard({
     // time) back into the sequential save loop below.
     const confirmResolverRef = useRef<((choice: ProjectMoveChoice | "cancel") => void) | null>(null);
     useEffect(() => {
+        if (focus === "dispatch") return; // Forced dispatch view — never restore/override from storage.
         try {
             const stored = localStorage.getItem(BOARD_VIEW_STORAGE_KEY);
             if (stored === "month" || stored === "timeline" || stored === "dispatch") setBoardView(stored);
         } catch {
             // Storage can be unavailable in privacy-restricted browser contexts.
         }
-    }, []);
+    }, [focus]);
     useEffect(() => {
         try {
             const stored = localStorage.getItem(CREW_MODE_STORAGE_KEY);
@@ -381,6 +388,19 @@ export function ScheduleBoard({
     }
     const anchor = parseUTCDate(`${month}-01`);
     const monthLabel = `${MONTH_LABELS[anchor.getUTCMonth()]} ${anchor.getUTCFullYear()}`;
+    // Focus-mode header label — today's date, not the month anchor (Dispatch
+    // is a day/week working view, not a month view).
+    const dispatchHeaderLabel = useMemo(() => {
+        // Same day key Dispatch's todayKey uses (formatDate(todayUTC())), so the
+        // focus-mode header can never show a different day than the board below
+        // it. Formatted with an explicit timeZone (not the runtime's implicit
+        // locale zone) so the label can't drift across server/browser timezones —
+        // "UTC" here matches todayUTC's UTC-day-space encoding, the same
+        // convention DispatchView's own dayLabel() uses.
+        const todayKey = formatDate(todayUTC());
+        const label = new Intl.DateTimeFormat("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" }).format(parseUTCDate(todayKey));
+        return `Dispatch — ${label}`;
+    }, []);
     const canonicalProjects = useMemo(() => [
         ...data.pipeline.waitingToStart,
         ...data.pipeline.scheduled,
@@ -756,6 +776,7 @@ export function ScheduleBoard({
     }, []);
 
     function selectBoardView(nextView: BoardView) {
+        if (focus === "dispatch") return; // Forced dispatch view — the toggle is hidden, but stay inert if ever called.
         cancelActiveProjectEdit();
         cancelActiveTaskEdit();
         setBoardView(nextView);
@@ -2287,47 +2308,84 @@ export function ScheduleBoard({
 
     return (
         <MotionConfig reducedMotion="user">
-        <div ref={boardContainerRef} className="hui-card mb-6 overflow-hidden">
+        <div ref={boardContainerRef} className={focus === "dispatch" ? "hui-card overflow-hidden min-h-[calc(100vh-4rem)]" : "hui-card mb-6 overflow-hidden"}>
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-hui-border">
                 <div className="flex items-baseline gap-3">
-                    <h2 className="text-base font-semibold text-hui-textMain">Project Schedule — {monthLabel}</h2>
-                    <Link href="/company-dashboard/guide" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
-                        How to use
-                    </Link>
+                    <h2 className="text-base font-semibold text-hui-textMain">{focus === "dispatch" ? dispatchHeaderLabel : `Project Schedule — ${monthLabel}`}</h2>
+                    {focus === "dispatch" ? (
+                        draftCount > 0 ? (
+                            <button
+                                type="button"
+                                aria-disabled="true"
+                                title={`Confirm or discard your ${draftCount} draft${draftCount === 1 ? "" : "s"} first`}
+                                className="text-xs text-hui-textMuted/60 underline underline-offset-2 whitespace-nowrap cursor-not-allowed"
+                            >
+                                Exit full screen
+                            </button>
+                        ) : (
+                            <Link href="/company-dashboard" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
+                                Exit full screen
+                            </Link>
+                        )
+                    ) : (
+                        <>
+                            <Link href="/company-dashboard/guide" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
+                                How to use
+                            </Link>
+                            {boardView === "dispatch" && (
+                                draftCount > 0 ? (
+                                    <button
+                                        type="button"
+                                        aria-disabled="true"
+                                        title={`Confirm or discard your ${draftCount} draft${draftCount === 1 ? "" : "s"} first`}
+                                        className="text-xs text-hui-textMuted/60 underline underline-offset-2 whitespace-nowrap cursor-not-allowed"
+                                    >
+                                        Full screen
+                                    </button>
+                                ) : (
+                                    <Link href="/company-dashboard/dispatch" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
+                                        Full screen
+                                    </Link>
+                                )
+                            )}
+                        </>
+                    )}
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
-                    <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Schedule view">
-                        <button
-                            type="button"
-                            onClick={() => selectBoardView("month")}
-                            aria-pressed={boardView === "month"}
-                            className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "month" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
-                        >
-                            Month
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => selectBoardView("timeline")}
-                            aria-pressed={boardView === "timeline"}
-                            className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "timeline" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
-                        >
-                            Timeline
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => selectBoardView("dispatch")}
-                            aria-pressed={boardView === "dispatch"}
-                            className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "dispatch" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
-                        >
-                            Dispatch
-                        </button>
-                    </div>
+                    {focus !== "dispatch" && (
+                        <div className="inline-flex rounded-md border border-hui-border bg-white p-0.5" role="group" aria-label="Schedule view">
+                            <button
+                                type="button"
+                                onClick={() => selectBoardView("month")}
+                                aria-pressed={boardView === "month"}
+                                className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "month" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                            >
+                                Month
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => selectBoardView("timeline")}
+                                aria-pressed={boardView === "timeline"}
+                                className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "timeline" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                            >
+                                Timeline
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => selectBoardView("dispatch")}
+                                aria-pressed={boardView === "dispatch"}
+                                className={`rounded px-2 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${boardView === "dispatch" ? "bg-hui-primary text-white" : "text-hui-textMuted hover:bg-slate-50"}`}
+                            >
+                                Dispatch
+                            </button>
+                        </div>
+                    )}
                     {data.canEdit && (
                         <button type="button" onClick={() => openTaskCreation()} className="hui-btn hui-btn-primary text-sm">
                             + Task
                         </button>
                     )}
-                    {isAdmin && overlays && (
+                    {focus !== "dispatch" && isAdmin && overlays && (
                         <div className="flex flex-wrap items-center gap-1 mr-1">
                             <button type="button" onClick={() => setShowIncome(value => !value)} className={`text-xs font-semibold px-2 py-1 rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${showIncome ? "bg-green-100 text-green-700 border-green-300" : "bg-white text-hui-textMuted border-hui-border"}`}>Income</button>
                             <button type="button" onClick={() => setShowExpenses(value => !value)} className={`text-xs font-semibold px-2 py-1 rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${showExpenses ? "bg-red-100 text-red-700 border-red-300" : "bg-white text-hui-textMuted border-hui-border"}`}>Expenses</button>
@@ -2335,9 +2393,13 @@ export function ScheduleBoard({
                             <button type="button" onClick={() => setShowHours(value => !value)} className={`text-xs font-semibold px-2 py-1 rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-hui-primary ${showHours ? "bg-blue-100 text-blue-700 border-blue-300" : "bg-white text-hui-textMuted border-hui-border"}`}>Hours</button>
                         </div>
                     )}
-                    <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, -1))} className="hui-btn hui-btn-secondary text-sm">← Prev</button>
-                    <button type="button" onClick={() => { router.push("/company-dashboard"); setScrollToTodayNonce(n => n + 1); }} className="hui-btn hui-btn-secondary text-sm">Today</button>
-                    <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
+                    {focus !== "dispatch" && (
+                        <>
+                            <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, -1))} className="hui-btn hui-btn-secondary text-sm">← Prev</button>
+                            <button type="button" onClick={() => { router.push("/company-dashboard"); setScrollToTodayNonce(n => n + 1); }} className="hui-btn hui-btn-secondary text-sm">Today</button>
+                            <button type="button" onClick={() => router.push('/company-dashboard?month=' + shiftMonth(month, 1))} className="hui-btn hui-btn-secondary text-sm">Next →</button>
+                        </>
+                    )}
                 </div>
             </div>
             <AnimatePresence initial={false}>
@@ -2366,12 +2428,14 @@ export function ScheduleBoard({
                 </motion.div>
             )}
             </AnimatePresence>
-            <UnscheduledTray
-                projects={data.pipeline.waitingToStart}
-                canEdit={data.canEdit}
-                pendingProjectIds={externallyPendingProjectIds}
-                onMoveProject={scheduleUnscheduledProject}
-            />
+            {focus !== "dispatch" && (
+                <UnscheduledTray
+                    projects={data.pipeline.waitingToStart}
+                    canEdit={data.canEdit}
+                    pendingProjectIds={externallyPendingProjectIds}
+                    onMoveProject={scheduleUnscheduledProject}
+                />
+            )}
             <AnimatePresence initial={false}>
             {(Object.keys(projectRefreshExpectations).length > 0 || awaitingTaskRefreshIds.size > 0 || dispatchReconciliationExpectation) && (
                 <motion.div
@@ -2484,7 +2548,7 @@ export function ScheduleBoard({
                     onActivate={handleBlockActivate}
                 />
             )}
-            {data.canEdit && <AvailabilityPanel data={data} onDrillDown={drillDownToCrewTimeline} />}
+            {focus !== "dispatch" && data.canEdit && <AvailabilityPanel data={data} onDrillDown={drillDownToCrewTimeline} />}
             <ShiftConfirmDialog
                 intent={confirmIntent}
                 isPending={false}

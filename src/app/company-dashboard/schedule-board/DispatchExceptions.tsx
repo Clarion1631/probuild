@@ -81,6 +81,7 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
             activate: () => groups.staleEvidence[0] && onActivate(groups.staleEvidence[0].taskId),
         },
     ].filter(pill => pill.count > 0);
+    const totalExceptions = pills.reduce((sum, pill) => sum + pill.count, 0);
 
     // Counts, deliberately not a single "% true" score: recent activity proves
     // someone worked, not that dates/crew/status are right, so a percentage
@@ -108,17 +109,22 @@ export function DispatchExceptions({ projects, crewConflicts, dayKey, onActivate
     return (
         <motion.div
             data-motion-scope="exceptions-strip"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+            initial={{ opacity: 0, scale: 0.98 }}
+            animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.16 }}
             className="border-b border-hui-border bg-slate-50/80 px-4 py-2.5"
             aria-label="Dispatch exceptions"
         >
             {pills.length === 0 ? (
-                <p className="text-xs font-medium text-slate-500">{"Day clear \u2713"}</p>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-green-300 bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-700">
+                    {"Day clear \u2713"}
+                </span>
             ) : (
                 <div className="flex flex-wrap items-center gap-2">
                     <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Exceptions</span>
+                    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-300 bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-700">
+                        {totalExceptions} flag{totalExceptions === 1 ? "" : "s"}
+                    </span>
                     {pills.map(pill => (
                         <button
                             key={pill.key}
