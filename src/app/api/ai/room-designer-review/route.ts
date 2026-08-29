@@ -133,7 +133,7 @@ ${JSON.stringify(assets.map(a => ({
 Please respond ONLY with valid JSON matching the schema provided. Make the assessment, warnings, and fixes read extremely premium, technical, yet reassuring and professional.`;
 
         const response = await ai.models.generateContent({
-            model: "gemini-3.0-flash-preview",
+            model: "gemini-3.5-flash",
             contents: prompt,
             config: {
                 responseMimeType: "application/json",
