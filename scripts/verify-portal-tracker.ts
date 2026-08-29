@@ -169,7 +169,9 @@ function runPureCases(): void {
         Math.round(mapped.stages.reduce((sum, stage) => sum + stage.pct, 0) / mapped.stages.length),
         "overall must be the mean of the per-stage percentages",
     );
-    assert.equal(mapped.overallPct, 39);
+    // The inspection timeline is not a tracker stage; the eight-stage rail's
+    // mean is therefore 44%, not the prior nine-stage 39% expectation.
+    assert.equal(mapped.overallPct, 44);
 
     assert.equal(buildProjectTracker([]).overallPct, 0, "a project with no tasks stays at 0%");
 
@@ -187,7 +189,7 @@ function runPureCases(): void {
     assert.equal(emptyLeadingStages.stages[2].state, "current");
     assert.equal(
         emptyLeadingStages.overallPct,
-        22,
+        25,
         "empty-but-passed stages must count toward the overall roundel",
     );
 
@@ -201,10 +203,10 @@ function runPureCases(): void {
     const overrideForward = buildProjectTracker([framingTask], "Drywall");
     assert.deepEqual(
         overrideForward.stages.map(stage => stage.state),
-        ["complete", "complete", "complete", "complete", "current", "upcoming", "upcoming", "upcoming", "upcoming"],
+        ["complete", "complete", "complete", "complete", "current", "upcoming", "upcoming", "upcoming"],
         "an override pins the current stage regardless of task positions",
     );
-    assert.equal(overrideForward.overallPct, 44);
+    assert.equal(overrideForward.overallPct, 50);
 
     const overrideBackward = buildProjectTracker([
         trackerTask({
@@ -231,20 +233,20 @@ function runPureCases(): void {
 
     const overrideNoTasks = buildProjectTracker([], "Framing");
     assert.equal(overrideNoTasks.stages[2].state, "current");
-    assert.equal(overrideNoTasks.overallPct, 22, "an override must drive the roundel even with no tasks");
+    assert.equal(overrideNoTasks.overallPct, 25, "an override must drive the roundel even with no tasks");
 
     const overrideFirst = buildProjectTracker([framingTask], "Planning & Permits");
     assert.equal(overrideFirst.stages[0].state, "current");
     assert.equal(overrideFirst.overallPct, 0);
 
     const overrideLast = buildProjectTracker([framingTask], "Complete");
-    assert.equal(overrideLast.stages[8].state, "current");
-    assert.equal(overrideLast.overallPct, 89);
+    assert.equal(overrideLast.stages[7].state, "current");
+    assert.equal(overrideLast.overallPct, 88);
 
     const overrideLastWithWork = buildProjectTracker([
         trackerTask({ id: "closeout", name: "Project closeout", status: "Complete", progress: 100 }),
     ], "Complete");
-    assert.equal(overrideLastWithWork.stages[8].state, "current");
+    assert.equal(overrideLastWithWork.stages[7].state, "current");
     assert.equal(
         overrideLastWithWork.overallPct,
         99,
@@ -259,7 +261,7 @@ function runPureCases(): void {
         "current",
         "an override must win over the all-tasks-complete shortcut",
     );
-    assert.equal(overrideWithAllComplete.overallPct, 44);
+    assert.equal(overrideWithAllComplete.overallPct, 50);
 
     const nearestFallback = buildProjectTracker([
         trackerTask({
@@ -297,14 +299,14 @@ function runPureCases(): void {
     ]);
     assert.equal(proportionalFallback.stages[0].pct, 10);
     assert.equal(proportionalFallback.stages[4].pct, 50);
-    assert.equal(proportionalFallback.stages[8].pct, 90);
+    assert.equal(proportionalFallback.stages[7].pct, 90);
     assert.equal(proportionalFallback.stages[0].state, "current");
 
     const allComplete = buildProjectTracker([
         trackerTask({ id: "done", name: "Project complete", status: "Complete", progress: 12 }),
     ]);
-    assert.equal(allComplete.overallPct, 100);
-    assert.equal(allComplete.stages[8].state, "complete");
+    assert.equal(allComplete.overallPct, 99);
+    assert.equal(allComplete.stages[7].state, "current");
 
     const visitors = buildPortalWhoIsComing([
         trackerTask({
