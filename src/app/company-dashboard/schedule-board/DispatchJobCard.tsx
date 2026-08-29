@@ -7,6 +7,7 @@ import type { DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core"
 import { getFallbackProjectColor } from "@/app/projects/[id]/schedule/schedule-utils";
 import { classifyTaskEvidence, findContradiction, type EvidenceState } from "@/lib/task-evidence";
 import { getCardStaffing } from "./dispatch-staffing";
+import { isDispatchable } from "@/lib/dispatch-roster";
 
 const STATUS_STYLES: Record<string, string> = {
     "Not Started": "bg-slate-100 text-slate-700",
@@ -147,9 +148,9 @@ export function DispatchJobCard({
             ) : (
                 <div className="divide-y divide-slate-100">
                     {tasks.map(task => {
-                        const solidAssignments = task.assignments.filter(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW");
+                        const solidAssignments = task.assignments.filter(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }));
                         const assignedIds = new Set(solidAssignments.map(assignment => assignment.userId));
-                        const outlinedCrew = project.crew.filter(member => member.status === "ACTIVATED" && member.role === "FIELD_CREW" && !assignedIds.has(member.id));
+                        const outlinedCrew = project.crew.filter(member => isDispatchable(member) && !assignedIds.has(member.id));
                         const statusTitle = task.status === "Blocked" && task.blockedReason ? `Blocked \u2014 ${task.blockedReason}` : task.status;
                         const progress = Math.max(0, Math.min(100, task.progress));
                         const materialCount = task.pendingMaterials + task.stagedMaterials + task.missingMaterials;

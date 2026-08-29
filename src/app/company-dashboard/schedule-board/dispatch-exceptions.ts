@@ -1,5 +1,6 @@
 import { isConflictedDay } from "./availability";
 import { classifyTaskEvidence, findContradiction, type EvidenceTaskInput } from "@/lib/task-evidence";
+import { isDispatchable } from "@/lib/dispatch-roster";
 
 export interface DispatchAssignmentInput {
     userId: string;
@@ -106,15 +107,15 @@ function taskException(project: DispatchProjectInput, task: DispatchTaskInput): 
 export function getUnstaffedToday(projects: readonly DispatchProjectInput[], dayKey: string): DispatchTaskException[] {
     return projects.flatMap(project => project.tasks
         .filter(task => isTaskActiveOnDay(task, dayKey))
-        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW"))
+        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status })))
         .map(task => taskException(project, task)));
 }
 
 export function getNoLeadToday(projects: readonly DispatchProjectInput[], dayKey: string): DispatchTaskException[] {
     return projects.flatMap(project => project.tasks
         .filter(task => isTaskActiveOnDay(task, dayKey))
-        .filter(task => task.assignments.some(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW"))
-        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && assignment.userRole === "FIELD_CREW" && assignment.assignmentRole === "lead"))
+        .filter(task => task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status })))
+        .filter(task => !task.assignments.some(assignment => assignment.status === "ACTIVATED" && isDispatchable({ role: assignment.userRole, status: assignment.status }) && assignment.assignmentRole === "lead"))
         .map(task => taskException(project, task)));
 }
 
@@ -140,7 +141,7 @@ export function getBlockedTasks(projects: readonly DispatchProjectInput[]): Disp
 export function getCrewlessJobs(projects: readonly DispatchProjectInput[], dayKey: string): DispatchProjectException[] {
     return projects
         .filter(project => project.status === "In Progress")
-        .filter(project => project.crew.some(member => member.status === "ACTIVATED" && member.role === "FIELD_CREW"))
+        .filter(project => project.crew.some(isDispatchable))
         .filter(project => !project.tasks.some(task => isTaskActiveOnDay(task, dayKey)))
         .map(project => ({ projectId: project.id, projectName: project.name }));
 }

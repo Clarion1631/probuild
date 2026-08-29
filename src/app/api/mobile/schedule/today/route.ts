@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleRange } from "@/lib/mobile-schedule-range";
+import { buildMobileScheduleWhere } from "@/lib/mobile-schedule-scope";
 import { toMobileCrew } from "@/lib/mobile-task-crew";
 
 export const dynamic = "force-dynamic";
@@ -13,8 +14,10 @@ export const dynamic = "force-dynamic";
 // returns tasks active within that explicit range instead, so the crew app can
 // show one week at a time. Response includes `range` with the effective
 // YYYY-MM-DD start/end actually used.
-// ADMIN/MANAGER see all open projects' tasks; FIELD_CREW see only tasks on projects
-// they're crew-assigned to or assigned to via TaskAssignment.
+// ADMIN/MANAGER see all open projects' tasks. Everyone else sees ONLY the tasks
+// they're individually dispatched to that day via TaskAssignment — a field
+// worker should only see the job and task they're dispatched to, so it isn't
+// confusing to also see every other task on jobs they're merely on the crew for.
 // Hybrid auth: Bearer token (mobile) OR NextAuth session (web debug).
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -28,28 +31,7 @@ export async function GET(req: Request) {
     }
     const { start, end, startKey, endKey } = range;
 
-    const baseWhere: any = {
-        startDate: { lte: end },
-        endDate: { gte: start },
-    };
-
-    const isFullAccess = user.role === "ADMIN" || user.role === "MANAGER";
-    if (!isFullAccess) {
-        // FIELD_CREW: tasks on projects they're crew on OR tasks they're individually assigned to
-        const crewProjects = await prisma.project.findMany({
-            where: { crew: { some: { id: user.id } } },
-            select: { id: true },
-        });
-        const access = await prisma.projectAccess.findMany({
-            where: { userId: user.id },
-            select: { projectId: true },
-        });
-        const projectIds = Array.from(new Set([...crewProjects.map(p => p.id), ...access.map(a => a.projectId)]));
-        baseWhere.OR = [
-            { projectId: { in: projectIds } },
-            { assignments: { some: { userId: user.id } } },
-        ];
-    }
+    const baseWhere = buildMobileScheduleWhere(user, { start, end });
 
     const tasks = await prisma.scheduleTask.findMany({
         where: baseWhere,
