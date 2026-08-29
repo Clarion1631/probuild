@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getGustoSettings } from "@/lib/integration-store";
+import { toCompanyDayKey } from "@/lib/company-day";
+import { settleDay } from "@/lib/wa-breaks-db";
 
 /**
  * Generates a Gusto-compatible CSV for time entries.
@@ -24,6 +26,31 @@ export async function GET(req: NextRequest) {
         where.startTime = {};
         if (dateFrom) (where.startTime as Record<string, unknown>).gte = new Date(dateFrom);
         if (dateTo) (where.startTime as Record<string, unknown>).lte = new Date(dateTo + "T23:59:59");
+    }
+
+    // WA meal settlement (src/lib/wa-breaks.ts): a lunch punch or task switch
+    // the worker never followed with a clock-in leaves the day unsettled
+    // (DEFERRED, paid in full). Payroll must not export that as-is — settle
+    // every such worker/day in range first (idempotent; no-op on settled days).
+    const unsettled = await prisma.timeEntry.findMany({
+        where: { ...where, mealOutcome: "DEFERRED", endTime: { not: null } },
+        select: { userId: true, startTime: true },
+    });
+    // Never settle a day still in progress (today, or a worker with an open
+    // punch — they may simply be at lunch): that would export a mid-shift
+    // value the evening clock-out then re-plans.
+    const todayKey = toCompanyDayKey(new Date());
+    const openByUser = new Set(
+        (await prisma.timeEntry.findMany({ where: { endTime: null }, select: { userId: true } })).map((r) => r.userId)
+    );
+    const days = new Map<string, { userId: string; dayKey: string }>();
+    for (const row of unsettled) {
+        const dayKey = toCompanyDayKey(row.startTime);
+        if (dayKey === todayKey || openByUser.has(row.userId)) continue;
+        days.set(`${row.userId}|${dayKey}`, { userId: row.userId, dayKey });
+    }
+    for (const { userId: uid, dayKey } of days.values()) {
+        await settleDay(uid, dayKey, null);
     }
 
     const entries = await prisma.timeEntry.findMany({

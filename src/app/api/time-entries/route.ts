@@ -8,6 +8,8 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
+import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
+import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -66,6 +68,33 @@ export async function POST(req: Request) {
 
     const fail = await assertProjectAccess(user, projectId);
     if (fail) return fail;
+
+    // A mid-day (DEFERRED) close that was never followed by a clock-in is the
+    // end of that day with no meal settled — flag it now that the worker is
+    // back (src/lib/wa-breaks.ts staleDeferredReview). Best-effort, never
+    // blocks the clock-in.
+    try {
+        const latest = await prisma.timeEntry.findFirst({
+            where: { userId: user.id, endTime: { not: null } },
+            orderBy: { endTime: "desc" },
+            select: { id: true, mealOutcome: true, startTime: true, endTime: true, needsReview: true, reviewReason: true },
+        });
+        const stale = staleDeferredReview({
+            latest,
+            now: new Date(),
+            latestDayKey: latest ? toCompanyDayKey(latest.startTime) : undefined,
+            todayKey: toCompanyDayKey(new Date()),
+        });
+        if (stale && latest) {
+            // Optimistic: only if nobody composed a reason onto the row meanwhile.
+            await prisma.timeEntry.updateMany({ where: { id: latest.id, reviewReason: latest.reviewReason }, data: stale });
+            // And settle that day for real — the deferred close WAS the day's end.
+            // Day keyed by START time, like every other reader of a row's day.
+            await settleDay(user.id, toCompanyDayKey(latest.startTime), null);
+        }
+    } catch (error) {
+        console.error("[time-entries] stale DEFERRED review check failed", error);
+    }
 
     const project = await prisma.project.findUnique({
         where: { id: projectId },
@@ -249,6 +278,8 @@ export interface ClockOutTimeEntryRow {
     endTime: Date | null;
     notes: string | null;
     reviewReason: string | null;
+    /** Skip-lunch request state (PENDING | APPROVED | DENIED | null) — feeds the meal rule. */
+    mealSkipStatus?: string | null;
 }
 
 /** Client clock skew allowance for a supplied endTime — see the PUT handler. */
@@ -259,6 +290,22 @@ export interface ClockOutDependencies {
     findTimeEntry(id: string): Promise<ClockOutTimeEntryRow | null>;
     findProjectIsLogistics(projectId: string): Promise<boolean>;
     findOwnerRates(userId: string): Promise<{ hourlyRate: number; burdenRate: number } | null>;
+    /**
+     * The worker's OTHER closed entries on the same company-local day as the
+     * entry being closed — the WA meal rule is a per-DAY rule (Switch Task
+     * splits a shift into several entries), so the closing entry alone can
+     * never decide it. See src/lib/wa-breaks.ts computeMealDeduction.
+     */
+    findDayEntries(userId: string, dayKey: string, excludeEntryId: string): Promise<DayEntry[]>;
+    /**
+     * Re-settle the worker's whole company-local day AFTER the close commits
+     * (src/lib/wa-breaks-db.ts settleDay): moves the deduction to the day's
+     * last entry, refunds an earlier one a later punched meal covers, and
+     * serializes concurrent closes. Best-effort; never fails the response.
+     */
+    settleDay(userId: string, dayKey: string, closing: { id: string; mealSkipped: unknown }): Promise<number>;
+    /** Flag the row when settleDay reports failure (-1) — visible, never silent. */
+    flagSettlementFailed(entryId: string): Promise<void>;
     /**
      * Atomically close the entry: applies `data` (which always sets endTime)
      * ONLY IF the row is still open (endTime IS NULL) at the database — the
@@ -284,7 +331,12 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             const { user } = auth;
 
             const body = await req.json();
-            const { id, endTime, latitude, longitude, notes, mealSkipped } = body;
+            const { id, endTime, latitude, longitude, notes, deferMeal } = body;
+            // Attestations are the WORKER's word: a manager closing someone
+            // else's punch cannot answer the lunch/rest questions for them —
+            // those land as "no answer" and get the review flag instead.
+            let mealSkipped: unknown = body.mealSkipped;
+            let restBreaksMissed: unknown = body.restBreaksMissed;
 
             if (!id) return NextResponse.json({ error: "Time Entry ID is required" }, { status: 400 });
 
@@ -293,6 +345,10 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
 
             if (existing.userId !== user.id && user.role !== "MANAGER" && user.role !== "ADMIN") {
                 return NextResponse.json({ error: "Unauthorized to edit this entry" }, { status: 403 });
+            }
+            if (existing.userId !== user.id) {
+                mealSkipped = undefined;
+                restBreaksMissed = undefined;
             }
 
             // A closed entry can never be re-closed via PUT — the client must
@@ -355,9 +411,22 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
-            const durationMs = end.getTime() - existing.startTime.getTime();
-            let durationHours = durationMs / (1000 * 60 * 60);
-            if (durationHours < 0) durationHours = 0;
+            // WA automatic-break model (src/lib/wa-breaks.ts): the meal is deducted
+            // HERE, at clock-out, against the whole company-local day — unless a
+            // punched meal, a manager-approved skip, or the worker's own
+            // worked-through attestation covers it. durationHours is PAID hours
+            // (what payroll/export/summary read); shiftHours keeps the raw span.
+            const dayEntries = await dependencies.findDayEntries(existing.userId, toCompanyDayKey(existing.startTime), existing.id);
+            const meal = computeMealDeduction({
+                dayEntries,
+                closing: { startTime: existing.startTime, endTime: end },
+                mealSkipped,
+                mealSkipStatus: existing.mealSkipStatus ?? null,
+                // Intermediate close (meal break / Switch Task / duplicate cleanup):
+                // nothing settles here — see wa-breaks.ts MealDeductionInput.deferMeal.
+                deferMeal: deferMeal === true,
+            });
+            const durationHours = meal.paidHours;
 
             // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
             // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
@@ -369,6 +438,9 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             const updateData: Record<string, unknown> = {
                 endTime: end,
                 durationHours,
+                shiftHours: meal.shiftHours,
+                mealDeductionHours: meal.mealDeductionHours,
+                mealOutcome: meal.outcome,
                 laborCost,
                 burdenCost,
             };
@@ -378,13 +450,35 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
             if (logisticsCheck.notes !== undefined) updateData.notes = logisticsCheck.notes;
 
             // WA meal-break voluntary waiver attestation — PUT always closes the
-            // entry, so this is always a clock-out.
+            // entry, so this is always a clock-out. A manager-APPROVED skip is
+            // express permission already on record: it is paid without a review
+            // flag, so the worked-through attestation is not applied on top of it
+            // (the outcome column still says WAIVED_APPROVED for the audit trail).
+            // The waiver note is only meaningful when a meal was actually owed and
+            // worked through — a "worked through" answer on a 4h day is not a
+            // waiver of anything, and an APPROVED skip is permission already on
+            // record (WAIVED_APPROVED, paid, unflagged).
+            const mealWaiver = applyMealSkippedWaiver({
+                mealSkipped: meal.outcome === "WORKED_THROUGH" ? true : mealSkipped === false ? false : undefined,
+                settingEndTime: true,
+                existingReviewReason: existing.reviewReason,
+            });
+            Object.assign(updateData, mealWaiver);
+            // Rest-break attestation composes onto the same reviewReason string
+            // (rest breaks are paid — this only ever documents and flags).
+            const rest = applyRestBreakAttestation({
+                restBreaksMissed,
+                settingEndTime: true,
+                existingReviewReason: mealWaiver.reviewReason ?? existing.reviewReason,
+            });
+            Object.assign(updateData, rest);
+            // A deduction the worker was never asked about is flagged, never silent.
             Object.assign(
                 updateData,
-                applyMealSkippedWaiver({
+                applyNoAttestationNotice({
+                    outcome: meal.outcome,
                     mealSkipped,
-                    settingEndTime: true,
-                    existingReviewReason: existing.reviewReason,
+                    existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
                 })
             );
 
@@ -410,7 +504,17 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
-            return NextResponse.json(JSON.parse(JSON.stringify(closeResult.entry)));
+            // The day, not the row, is the unit the law cares about — re-plan it
+            // now that this close is committed (no-op on a single-entry day).
+            if (deferMeal !== true) {
+                const settled = await dependencies.settleDay(existing.userId, toCompanyDayKey(existing.startTime), { id: existing.id, mealSkipped });
+                if (settled < 0) await dependencies.flagSettlementFailed(existing.id);
+            }
+
+            // Return what is STORED after settlement — the phone's "last entry"
+            // card must never disagree with payroll about paid hours.
+            const settled = deferMeal !== true ? await dependencies.findTimeEntry(existing.id) : null;
+            return NextResponse.json(JSON.parse(JSON.stringify(settled ?? closeResult.entry)));
         },
     };
 }
@@ -443,6 +547,9 @@ const clockOutHandler = createClockOutHandler({
         if (!owner) return null;
         return { hourlyRate: toNum(owner.hourlyRate), burdenRate: toNum(owner.burdenRate) };
     },
+    findDayEntries: loadDayEntries,
+    settleDay,
+    flagSettlementFailed,
     closeTimeEntry: async (id, userId, data) => {
         return prisma.$transaction(async (t) => {
             // The guard: only rows still open (endTime IS NULL), scoped to

@@ -46,6 +46,7 @@ function createDeps(overrides: {
     ownerRates?: { hourlyRate: number; burdenRate: number } | null;
     /** Simulate a concurrent PUT winning the atomic close guard first. */
     closeRaceLost?: boolean;
+    dayEntries?: import("../src/lib/wa-breaks").DayEntry[];
 } = {}) {
     const updateCalls: Array<{ id: string; userId: string; data: Record<string, unknown> }> = [];
     const dependencies: ClockOutDependencies = {
@@ -57,6 +58,11 @@ function createDeps(overrides: {
         findProjectIsLogistics: async () => overrides.isLogistics ?? false,
         findOwnerRates: async () =>
             overrides.ownerRates !== undefined ? overrides.ownerRates : { hourlyRate: 20, burdenRate: 5 },
+        // No other entries on the day unless a test says so — the WA meal rule
+        // (src/lib/wa-breaks.ts) then sees only the closing entry.
+        findDayEntries: async () => overrides.dayEntries ?? [],
+        settleDay: async () => 0,
+        flagSettlementFailed: async () => {},
         closeTimeEntry: async (id, userId, data) => {
             updateCalls.push({ id, userId, data });
             if (overrides.closeRaceLost) {
@@ -206,7 +212,9 @@ test("mealSkipped absent leaves mealSkipped/needsReview/reviewReason untouched",
     const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1" }));
+    // A 3h punch: no meal is owed, so the automatic-break model has nothing to
+    // say and the legacy "absent = untouched" contract holds verbatim.
+    const res = await PUT(putReq({ id: "te1", endTime: new Date(START.getTime() + 3 * 3_600_000).toISOString() }));
     assert.equal(res.status, 200);
     const data = updateCalls[0].data;
     assert.equal("mealSkipped" in data, false);
@@ -218,7 +226,7 @@ test("non-boolean mealSkipped value is ignored", async () => {
     const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1", mealSkipped: "true" }));
+    const res = await PUT(putReq({ id: "te1", mealSkipped: "true", endTime: new Date(START.getTime() + 3 * 3_600_000).toISOString() }));
     assert.equal(res.status, 200);
     const data = updateCalls[0].data;
     assert.equal("mealSkipped" in data, false);
@@ -405,4 +413,115 @@ test("normal clock-out with a valid past-of-now endTime is unaffected", async ()
     const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T19:00:00.000Z" }));
     assert.equal(res.status, 200);
     assert.equal(updateCalls[0].data.durationHours, 4);
+});
+
+// ── WA automatic-break model (src/lib/wa-breaks.ts) at the route level ──────
+
+test("8h clock-out with no attestation auto-deducts the 30-min meal: paid 7.5h, cost from paid hours, outcome AUTO_DEDUCTED", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z" }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.shiftHours, 8);
+    assert.equal(data.mealDeductionHours, 0.5);
+    assert.equal(data.durationHours, 7.5);
+    assert.equal(data.laborCost, 7.5 * 20);
+    assert.equal(data.mealOutcome, "AUTO_DEDUCTED");
+    // No yes/no captured → deducted but FLAGGED (review finding #2), never silent.
+    assert.equal(data.needsReview, true);
+});
+
+test("8h clock-out with mealSkipped=true (worked through) pays the full 8h and flags for review", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.durationHours, 8);
+    assert.equal(data.mealDeductionHours, 0);
+    assert.equal(data.mealOutcome, "WORKED_THROUGH");
+    assert.equal(data.needsReview, true);
+    assert.equal(data.mealSkipped, true);
+});
+
+test("8h clock-out on an APPROVED skip pays 8h with NO review flag (express permission already on record)", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z"), mealSkipStatus: "APPROVED" }),
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z", mealSkipped: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.durationHours, 8);
+    assert.equal(data.mealOutcome, "WAIVED_APPROVED");
+    assert.notEqual(data.needsReview, true);
+});
+
+test("short 4h clock-out: no meal required, no deduction; restBreaksMissed=true still flags (paid)", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T18:00:00.000Z", restBreaksMissed: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.durationHours, 4);
+    assert.equal(data.mealOutcome, "NOT_REQUIRED");
+    assert.equal(data.restBreaksMissed, true);
+    assert.equal(data.needsReview, true);
+    assert.match(String(data.reviewReason), /rest break/);
+});
+
+test("Switch-Task day (4h earlier entry + 4h closing, 10-min gap) still deducts ONE meal on the closing entry", async () => {
+    const { dependencies, updateCalls } = createDeps({
+        entry: baseEntry({ startTime: new Date("2026-08-10T18:10:00.000Z") }),
+        dayEntries: [{ startTime: new Date("2026-08-10T14:00:00.000Z"), endTime: new Date("2026-08-10T18:00:00.000Z"), mealDeductionHours: null }],
+    });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:10:00.000Z" }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.mealDeductionHours, 0.5);
+    assert.equal(data.durationHours, 3.5);
+});
+
+test("REVIEW #1 (route): deferMeal=true on a 5.5h intermediate close deducts nothing and settles nothing", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T13:30:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T19:00:00.000Z", deferMeal: true }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.mealOutcome, "DEFERRED");
+    assert.equal(data.mealDeductionHours, 0);
+    assert.equal(data.durationHours, 5.5);
+    assert.notEqual(data.needsReview, true);
+});
+
+test("REVIEW #2 (route): an 8h auto-deduction with NO attestation captured is flagged, never silent", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z" }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.mealOutcome, "AUTO_DEDUCTED");
+    assert.equal(data.needsReview, true);
+    assert.match(String(data.reviewReason), /no lunch answer/);
+});
+
+test("REVIEW #2 (route): an 8h auto-deduction WITH a 'took lunch' answer (mealSkipped=false) is NOT flagged", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-10T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T22:00:00.000Z", mealSkipped: false, restBreaksMissed: false }));
+    assert.equal(res.status, 200);
+    const data = updateCalls[0].data as Record<string, unknown>;
+    assert.equal(data.mealOutcome, "AUTO_DEDUCTED");
+    assert.equal(data.durationHours, 7.5);
+    assert.notEqual(data.needsReview, true);
 });

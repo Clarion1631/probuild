@@ -16,6 +16,7 @@ model User {
   status                    String                   @default("PENDING") // PENDING, ACTIVATED, DISABLED
   hourlyRate                Decimal                  @default(0)
   burdenRate                Decimal                  @default(0)
+  mealWaiverSignedAt        DateTime? // signed WA meal-period waiver on file (skip-lunch approval precondition)
   pinCode                   String? // Used for mobile app quick login
   invitedAt                 DateTime?                @default(now())
   timeEntries               TimeEntry[]
@@ -909,6 +910,18 @@ model TimeEntry {
   mealDeductionHours Float?
   needsReview        Boolean   @default(false)
   reviewReason       String?
+
+  // Automatic-break model (src/lib/wa-breaks.ts). durationHours = PAID hours;
+  // shiftHours = raw clock-in→clock-out span; mealDeductionHours = the difference.
+  shiftHours          Float?
+  mealOutcome         String?   // NOT_REQUIRED | PUNCHED | AUTO_DEDUCTED | WORKED_THROUGH | WAIVED_APPROVED
+  restBreaksMissed    Boolean   @default(false) // clock-out attestation — documentation only, never pay
+  // Skip-lunch request → manager approval trail (express permission, WA)
+  mealSkipRequestedAt DateTime?
+  mealSkipStatus      String?   // PENDING | APPROVED | DENIED
+  mealSkipDecidedById String?
+  mealSkipDecidedAt   DateTime?
+  mealSkipReason      String?
   qbTimeActivityId   String?
   qbSyncedAt         DateTime? @db.Timestamp(6)
 
