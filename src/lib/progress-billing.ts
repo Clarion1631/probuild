@@ -611,7 +611,8 @@ export async function stageProgressBillingToQuickBooksCore(
         include: {
             invoice: {
                 include: {
-                    client: { select: { id: true, name: true, email: true, qbCustomerId: true } },
+                    client: { select: { id: true, name: true, email: true, qbCustomerId: true, addressLine1: true, city: true, state: true, zipCode: true } },
+                    project: { select: { location: true } },
                 },
             },
         },
@@ -627,6 +628,7 @@ export async function stageProgressBillingToQuickBooksCore(
     const invoice = billing.invoice;
     const { getFreshQBTokens, resolveCustomerAndItem } = await import("./quickbooks-payments");
     const { createQBMilestoneInvoice, getQBInvoicePaymentLink, deleteQBInvoice } = await import("./quickbooks");
+    const { qbShipAddrFor } = await import("./wa-tax");
 
     const tokens = await getFreshQBTokens();
     const { customerId, itemId } = await resolveCustomerAndItem(tokens, invoice.clientId);
@@ -635,7 +637,7 @@ export async function stageProgressBillingToQuickBooksCore(
     const taxAmount = toNum(billing.taxAmount);
     const total = toNum(billing.total);
 
-    const { qbId } = await createQBMilestoneInvoice(tokens, {
+    const { qbId, total: qbTotal } = await createQBMilestoneInvoice(tokens, {
         docNumber: billing.code,
         customerId,
         itemId,
@@ -644,9 +646,22 @@ export async function stageProgressBillingToQuickBooksCore(
         tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
+        shipAddr: qbShipAddrFor(invoice.project?.location, invoice.client),
     });
 
     try {
+        // QBO Automated Sales Tax can recompute the tax we sent (it rates by
+        // ShipAddr). A different grand total would bill the client the wrong
+        // amount — fail here (the catch deletes the QBO invoice) rather than
+        // stage it.
+        // One-cent tolerance: QBO may round its recomputed tax a cent away from
+        // ProBuild's split; anything more is a rate mismatch.
+        if (!Number.isFinite(qbTotal) || Math.abs(Math.round(qbTotal * 100) - Math.round(total * 100)) > 1) {
+            throw new Error(
+                `QuickBooks computed ${qbTotal.toFixed(2)} for ${billing.code} but ProBuild expects ${total.toFixed(2)} — check the project's job-site address and tax rate, then retry.`
+            );
+        }
+
         const payLink = await getQBInvoicePaymentLink(tokens, qbId);
 
         // Conditional claim mirroring pushMilestoneToQuickBooks: guards pin id,

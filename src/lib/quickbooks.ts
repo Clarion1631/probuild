@@ -10,6 +10,7 @@ import {
     mockSendQBPaymentCreate,
 } from "./quickbooks-mock";
 import { isEstimateSectionRow } from "./estimate-item-payload";
+import type { QBShipAddr } from "./wa-tax";
 
 export const QB_API_BASE = process.env.QB_SANDBOX === "true"
     ? "https://sandbox-quickbooks.api.intuit.com/v3/company"
@@ -258,6 +259,9 @@ export async function createQBMilestoneInvoice(
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
+        // Job-site address. QBO Automated Sales Tax rates the invoice by this;
+        // omitted, it uses the company address and mis-rates non-Vancouver jobs.
+        shipAddr?: QBShipAddr | null;
     }
 ): Promise<{ qbId: string; qbUrl: string; total: number }> {
     const withTax = !!input.tax && input.tax.taxAmount > 0;
@@ -275,6 +279,7 @@ export async function createQBMilestoneInvoice(
         ...(input.billEmail ? { BillEmail: { Address: input.billEmail } } : {}),
         ...(input.dueDate ? { DueDate: input.dueDate.toISOString().split("T")[0] } : {}),
         ...(input.privateNote ? { PrivateNote: input.privateNote.slice(0, 4000) } : {}),
+        ...(input.shipAddr ? { ShipAddr: input.shipAddr } : {}),
         Line: [
             {
                 LineNum: 1,
