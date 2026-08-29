@@ -2329,7 +2329,7 @@ export function ScheduleBoard({
                         )
                     ) : (
                         <>
-                            <Link href="/company-dashboard/guide" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
+                            <Link href="/company-dashboard/guide" target="_blank" rel="noopener" className="text-xs text-hui-textMuted hover:text-hui-primary underline underline-offset-2 whitespace-nowrap">
                                 How to use
                             </Link>
                             {boardView === "dispatch" && (
