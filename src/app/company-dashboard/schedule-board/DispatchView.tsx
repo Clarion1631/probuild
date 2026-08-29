@@ -198,7 +198,9 @@ export function DispatchView({
         .map(assignment => assignment.userId)));
     const available = roster.filter(member => !assignedDayIds.has(member.id));
     const managerSupport = [...new Map(dayTasks.flatMap(task => task.assignments)
-        .filter(assignment => assignment.status === "ACTIVATED" && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER"))
+        .filter(assignment => assignment.status === "ACTIVATED"
+            && (assignment.userRole === "ADMIN" || assignment.userRole === "MANAGER")
+            && isDispatchable({ role: assignment.userRole, status: assignment.status, showOnDispatch: assignment.showOnDispatch }))
         .map(assignment => [assignment.userId, assignment] as const)).values()];
     const crewlessProjectIds = new Set(getCrewlessJobs(projects, dayKey).map(item => item.projectId));
     const hasUnstaffedTaskToday = getUnstaffedToday(projects, dayKey).length > 0;
@@ -493,8 +495,8 @@ export function DispatchView({
 
                     {dayProjects.length === 0 ? (
                         <div className="rounded-lg border border-dashed border-hui-border px-4 py-10 text-center">
-                            <p className="text-sm font-semibold text-hui-textMain">No jobs on dispatch today</p>
-                            <p className="mt-1 text-xs text-hui-textMuted">Add a task or move work onto today to build the run.</p>
+                            <p className="text-sm font-semibold text-hui-textMain">No jobs on dispatch for this day</p>
+                            <p className="mt-1 text-xs text-hui-textMuted">Add a task or move work onto this day to build the run.</p>
                         </div>
                     ) : (
                         <div className="grid gap-4 xl:grid-cols-2">
