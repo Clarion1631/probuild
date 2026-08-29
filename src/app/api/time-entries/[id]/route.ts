@@ -6,7 +6,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
-import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, type MealOutcome } from "@/lib/wa-breaks";
+import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 
@@ -126,6 +126,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
     if (newEnd && newEnd.getTime() <= newStart.getTime()) {
         return NextResponse.json({ error: "endTime must be after startTime" }, { status: 400 });
+    }
+    if (newEnd && exceedsMaxShift(newStart, newEnd)) {
+        return NextResponse.json(
+            { error: `Shift would be longer than ${MAX_SHIFT_HOURS} hours — check the day`, code: "SHIFT_TOO_LONG" },
+            { status: 400 }
+        );
     }
 
     // Logistics jobs carry no cost-code/estimate-item context on the entry, so
@@ -259,6 +265,20 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 existingReviewReason: rest.reviewReason ?? mealWaiver.reviewReason ?? existing.reviewReason,
             })
         );
+    }
+
+    // A punch the worker closes from History more than a day after it started is
+    // a forgotten clock-out with a remembered end time — pay it, but a manager
+    // looks at it. Runs LAST so it composes onto whatever reason the meal/rest
+    // notices above already wrote.
+    if (closingOpenEntry && isOwner && Date.now() - existing.startTime.getTime() > MAX_SHIFT_HOURS * 3_600_000) {
+        const parts = String((data.reviewReason as string | undefined) ?? existing.reviewReason ?? "")
+            .split("; ")
+            .map((part) => part.trim())
+            .filter(Boolean);
+        if (!parts.includes(CLOSED_LATE_NOTE)) parts.push(CLOSED_LATE_NOTE);
+        data.reviewReason = parts.join("; ");
+        data.needsReview = true;
     }
 
     // Capture the as-clocked values exactly once. Subsequent edits update the latest

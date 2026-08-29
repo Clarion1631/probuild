@@ -75,10 +75,18 @@ function createDeps(overrides: {
     return { dependencies, updateCalls };
 }
 
-function putReq(body: unknown) {
+// Tests that don't care about the clock-out instant get a same-day endTime
+// (START + 4h) injected — the route now refuses a punch longer than 24h, and
+// the fixture entry starts on 2026-08-10, so "defaults to now" would trip it.
+// Pass { raw: true } to send the body untouched.
+function putReq(body: unknown, opts: { raw?: boolean } = {}) {
+    const payload =
+        !opts.raw && body && typeof body === "object" && !("endTime" in (body as object))
+            ? { ...(body as object), endTime: new Date(START.getTime() + 4 * 3_600_000).toISOString() }
+            : body;
     return new Request("https://example.test/api/time-entries", {
         method: "PUT",
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
     });
 }
 
@@ -188,7 +196,7 @@ test("mealSkipped: true persists it and sets needsReview + reviewReason", async 
     const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ reviewReason: null }) });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true, endTime: new Date(START.getTime() + 8 * 3_600_000).toISOString() }));
     assert.equal(res.status, 200);
     const data = updateCalls[0].data;
     assert.equal(data.mealSkipped, true);
@@ -240,7 +248,7 @@ test("mealSkipped: true appends to an existing reviewReason instead of clobberin
     });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true, endTime: new Date(START.getTime() + 8 * 3_600_000).toISOString() }));
     assert.equal(res.status, 200);
     assert.equal(updateCalls[0].data.reviewReason, `Flagged for missing GPS ping; ${WAIVER_NOTE}`);
 });
@@ -251,7 +259,7 @@ test("mealSkipped: true repeated does not duplicate the waiver reason", async ()
     });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1", mealSkipped: true }));
+    const res = await PUT(putReq({ id: "te1", mealSkipped: true, endTime: new Date(START.getTime() + 8 * 3_600_000).toISOString() }));
     assert.equal(res.status, 200);
     assert.equal(updateCalls[0].data.reviewReason, WAIVER_NOTE);
     assert.equal(updateCalls[0].data.needsReview, true);
@@ -360,7 +368,7 @@ test("a future endTime beyond the clock-skew allowance is rejected with 400", as
 });
 
 test("an endTime within the small clock-skew allowance is accepted", async () => {
-    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date(Date.now() - 3_600_000) }) });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
     const withinSkew = new Date(Date.now() + 2 * 60 * 1000).toISOString(); // 2 minutes ahead
@@ -398,10 +406,11 @@ test("an unparseable endTime is rejected with 400", async () => {
 });
 
 test("normal clock-out with no endTime supplied (defaults to now) is unaffected", async () => {
-    const { dependencies, updateCalls } = createDeps({ entry: baseEntry() });
+    // A punch that started an hour ago — "now" is a legitimate same-day end.
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date(Date.now() - 3_600_000) }) });
     const { createClockOutHandler } = await routeModulePromise;
     const { PUT } = createClockOutHandler(dependencies);
-    const res = await PUT(putReq({ id: "te1" }));
+    const res = await PUT(putReq({ id: "te1" }, { raw: true }));
     assert.equal(res.status, 200);
     assert.equal(updateCalls.length, 1);
 });
@@ -524,4 +533,14 @@ test("REVIEW #2 (route): an 8h auto-deduction WITH a 'took lunch' answer (mealSk
     assert.equal(data.mealOutcome, "AUTO_DEDUCTED");
     assert.equal(data.durationHours, 7.5);
     assert.notEqual(data.needsReview, true);
+});
+
+test("a clock-out that would make the punch longer than 24h is rejected with SHIFT_TOO_LONG (forgotten clock-out, not a shift)", async () => {
+    const { dependencies, updateCalls } = createDeps({ entry: baseEntry({ startTime: new Date("2026-08-08T14:00:00.000Z") }) });
+    const { createClockOutHandler } = await routeModulePromise;
+    const { PUT } = createClockOutHandler(dependencies);
+    const res = await PUT(putReq({ id: "te1", endTime: "2026-08-10T02:00:00.000Z" }));
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "SHIFT_TOO_LONG");
+    assert.equal(updateCalls.length, 0);
 });
