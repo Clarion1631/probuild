@@ -9,6 +9,7 @@ import {
     buildDispatchDayCollisions,
     buildDispatchDayJobGroups,
     chipLabelsForRow,
+    collisionDelta,
     disambiguateMemberNames,
     finalTaskUserIds,
     findConflictOtherProject,
@@ -396,6 +397,70 @@ test("findReviewCollisions: no tasks/no shared users → empty", () => {
         reviewTask({ id: "t1", projectId: "p1", savedUserIds: ["u1"] }),
         reviewTask({ id: "t2", projectId: "p2", savedUserIds: ["u2"] }),
     ]), []);
+});
+
+// ── collisionDelta ────────────────────────────────────────────────────────
+
+test("collisionDelta: a pre-existing collision untouched by the review is not flagged", () => {
+    const canonical = findReviewCollisions([
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", savedUserIds: ["u1"] }),
+    ]);
+    // Review's final state is identical — nothing in this review touched
+    // either task's crew or dates.
+    const final = findReviewCollisions([
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", savedUserIds: ["u1"] }),
+    ]);
+    assert.deepEqual(collisionDelta(canonical, final), []);
+});
+
+test("collisionDelta: a new collision from a drafted add is flagged", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", savedUserIds: [] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []); // no collision yet — t2 has no crew
+    const final = findReviewCollisions(tasks, [{ taskId: "t2", afterUserIds: ["u1"] }]);
+    const delta = collisionDelta(canonical, final);
+    assert.equal(delta.length, 1);
+    assert.equal(delta[0].userId, "u1");
+    assert.equal(delta[0].pairs.length, 1);
+});
+
+test("collisionDelta: a drafted removal that resolves a collision is not flagged", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", savedUserIds: ["u1"] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.equal(canonical.length, 1); // collision exists before the review
+    const final = findReviewCollisions(tasks, [{ taskId: "t2", afterUserIds: [] }]);
+    assert.deepEqual(collisionDelta(canonical, final), []);
+});
+
+test("collisionDelta: a widened overlap window on an already-colliding pair is flagged as worsened", () => {
+    const canonicalTasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+    ];
+    const canonical = findReviewCollisions(canonicalTasks);
+    assert.equal(canonical.length, 1);
+    // Same tasks, both windows extended by the review so the overlap itself
+    // widens from 08-29—08-30 to 08-29—08-31 (a same-length shift of just
+    // one task wouldn't change the *overlap*, since overlap = min(ends)).
+    const finalTasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-31T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-31T00:00:00.000Z", savedUserIds: ["u1"] }),
+    ];
+    const final = findReviewCollisions(finalTasks);
+    const delta = collisionDelta(canonical, final);
+    assert.equal(delta.length, 1);
+});
+
+test("collisionDelta: empty before/after → empty", () => {
+    assert.deepEqual(collisionDelta([], []), []);
 });
 
 // ── buildDispatchDayCollisions ───────────────────────────────────────────

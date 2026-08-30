@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
     AUTO_ASSIGN_PROJECT_STATUS,
+    AUTO_ASSIGN_STATUS_VALUES,
+    autoAssignStatusWhere,
     crewIdsToConnect,
     isAutoAssignProjectStatus,
     selectAutoAssignUsers,
@@ -9,6 +14,8 @@ import {
     type AutoAssignUser,
 } from "../src/lib/crew-auto-assign";
 import { PROJECT_STATUS_VALUES } from "../src/lib/project-status";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function user(overrides: Partial<AutoAssignUser> = {}): AutoAssignUser {
     return {
@@ -79,6 +86,44 @@ test('legacy statuses that canonicalize to "In Progress" count', () => {
     assert.equal(isAutoAssignProjectStatus("Open"), true);
     assert.equal(isAutoAssignProjectStatus("Active"), true);
     assert.equal(isAutoAssignProjectStatus("Done"), false);
+});
+
+// ── AUTO_ASSIGN_STATUS_VALUES / autoAssignStatusWhere ─────────────────────
+
+test("AUTO_ASSIGN_STATUS_VALUES contains the canonical status plus every legacy status that maps to it", () => {
+    assert.deepEqual(new Set(AUTO_ASSIGN_STATUS_VALUES), new Set(["In Progress", "Open", "Active"]));
+});
+
+test("AUTO_ASSIGN_STATUS_VALUES agrees with isAutoAssignProjectStatus for every value it contains, and disagrees for everything else", () => {
+    for (const status of AUTO_ASSIGN_STATUS_VALUES) {
+        assert.equal(isAutoAssignProjectStatus(status), true, `expected "${status}" to be a recognized auto-assign status`);
+    }
+    const allKnown = [...PROJECT_STATUS_VALUES, "Open", "Active", "Paid Ready to Start", "Done", "Closed", "Completed"];
+    for (const status of allKnown.filter((s) => !AUTO_ASSIGN_STATUS_VALUES.includes(s))) {
+        assert.equal(isAutoAssignProjectStatus(status), false, `expected "${status}" to be excluded`);
+    }
+});
+
+test("autoAssignStatusWhere is a Prisma `in` filter over AUTO_ASSIGN_STATUS_VALUES", () => {
+    assert.deepEqual(autoAssignStatusWhere, { status: { in: AUTO_ASSIGN_STATUS_VALUES } });
+});
+
+// ── scripts/sync-crew-to-in-progress.mjs stays in lockstep ───────────────
+// That script can't import this TS module (bare `node scripts/*.mjs`, no
+// alias/TS transform), so it mirrors AUTO_ASSIGN_STATUS_VALUES as a plain JS
+// literal. Assert the two never drift apart by reading the script's source.
+
+test("sync-crew-to-in-progress.mjs's TARGET_STATUSES literal matches AUTO_ASSIGN_STATUS_VALUES", () => {
+    const scriptPath = join(__dirname, "..", "scripts", "sync-crew-to-in-progress.mjs");
+    const source = readFileSync(scriptPath, "utf8");
+    const match = source.match(/const TARGET_STATUSES = (\[[^\]]*\]);/);
+    assert.ok(match, "expected to find a `const TARGET_STATUSES = [...]` literal in sync-crew-to-in-progress.mjs");
+    const scriptStatuses: string[] = JSON.parse(match[1].replace(/'/g, '"'));
+    assert.deepEqual(
+        new Set(scriptStatuses),
+        new Set(AUTO_ASSIGN_STATUS_VALUES),
+        "scripts/sync-crew-to-in-progress.mjs's TARGET_STATUSES has drifted from AUTO_ASSIGN_STATUS_VALUES in src/lib/crew-auto-assign.ts",
+    );
 });
 
 // ── selection + idempotency ───────────────────────────────────────────────

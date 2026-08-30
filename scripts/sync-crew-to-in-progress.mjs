@@ -54,7 +54,13 @@ if (!process.env.DATABASE_URL) {
 
 const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
 
-const TARGET_STATUS = "In Progress";      // src/lib/project-status.ts
+// Mirrors AUTO_ASSIGN_STATUS_VALUES in src/lib/crew-auto-assign.ts: the
+// canonical "In Progress" plus every legacy Project.status value that
+// canonicalProjectStatus (src/lib/project-status.ts LEGACY_PROJECT_STATUS_MAP)
+// maps onto it. Keep this literal in lockstep with that list — scripts/*.mjs
+// can't import TS. tests/crew-auto-assign.test.ts asserts the two agree by
+// reading this file's source.
+const TARGET_STATUSES = ["In Progress", "Open", "Active"];
 const ELIGIBLE_USER_STATUS = "ACTIVATED"; // STATUS_LABELS, src/lib/permissions.ts
 const EXCLUDED_ROLE = "FINANCE";          // never dispatchable, isDispatchable in dispatch-roster.ts
 
@@ -86,11 +92,11 @@ async function main() {
     const eligibleIds = eligible.map((u) => u.id);
 
     const projects = await prisma.project.findMany({
-        where: { status: TARGET_STATUS },
+        where: { status: { in: TARGET_STATUSES } },
         select: { id: true, name: true, crew: { select: { id: true } } },
         orderBy: { id: "asc" },
     });
-    console.log(`  "${TARGET_STATUS}" projects: ${projects.length}`);
+    console.log(`  In Progress (incl. legacy ${TARGET_STATUSES.slice(1).join("/")}) projects: ${projects.length}`);
 
     let totalConnected = 0;
     let projectsChanged = 0;

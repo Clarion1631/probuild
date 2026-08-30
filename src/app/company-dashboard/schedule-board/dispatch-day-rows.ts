@@ -425,6 +425,44 @@ export function findReviewCollisions(
 }
 
 /**
+ * Identity key for one collision pair, scoped to the user it double-books:
+ * {userId, the two project ids (order-independent), overlap window}. Two
+ * pairs with the same key are "the same collision" — a task's crew or dates
+ * changing so the overlap window shifts/widens produces a DIFFERENT key
+ * (correctly read as "worsened", not "still the same"), and a project pair
+ * flipping order (A/B swapped) still matches (ids are sorted first).
+ */
+function collisionPairKey(userId: string, pair: DispatchDayConflictPairInput): string {
+    const [projectIdA, projectIdB] = [pair.projectA.id, pair.projectB.id].sort();
+    return `${userId}|${projectIdA}|${projectIdB}|${pair.overlapStart}|${pair.overlapEnd}`;
+}
+
+/**
+ * Collisions present in `after` (the review's final state) that were NOT
+ * already present in `before` (the canonical, pre-review state) — i.e.
+ * collisions this review introduces or worsens. A pre-existing collision the
+ * review leaves untouched is excluded (its pair key is unchanged, so it's in
+ * both sets); a drafted removal that resolves a collision simply doesn't
+ * appear in `after` at all, so it's excluded too. Used by DispatchReviewDialog
+ * so the warning banner reflects only what THIS review is responsible for.
+ */
+export function collisionDelta(
+    before: readonly DispatchDayCrewConflictInput[],
+    after: readonly DispatchDayCrewConflictInput[],
+): DispatchDayCrewConflictInput[] {
+    const beforeKeys = new Set<string>();
+    for (const entry of before) {
+        for (const pair of entry.pairs) beforeKeys.add(collisionPairKey(entry.userId, pair));
+    }
+    const result: DispatchDayCrewConflictInput[] = [];
+    for (const entry of after) {
+        const newPairs = entry.pairs.filter(pair => !beforeKeys.has(collisionPairKey(entry.userId, pair)));
+        if (newPairs.length > 0) result.push({ ...entry, pairs: newPairs });
+    }
+    return result;
+}
+
+/**
  * Draft-aware collision scan across EVERY task of every project passed in
  * (not just today's active ones — a collision can span days beyond the
  * viewed day). Feeds findReviewCollisions with each task's draft-applied

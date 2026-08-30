@@ -17,7 +17,7 @@
 
 import { prisma } from "@/lib/prisma";
 import {
-    AUTO_ASSIGN_PROJECT_STATUS,
+    autoAssignStatusWhere,
     crewIdsToConnect,
     isAutoAssignProjectStatus,
     shouldAutoAssignUser,
@@ -114,7 +114,7 @@ export async function syncProjectsForUser(userId: string): Promise<string[]> {
 
     const already = new Set(user.assignedProjects.map((p) => p.id));
     const inProgress = await prisma.project.findMany({
-        where: { status: AUTO_ASSIGN_PROJECT_STATUS },
+        where: autoAssignStatusWhere,
         select: { id: true },
     });
     const toConnect = inProgress.map((p) => p.id).filter((id) => !already.has(id));
@@ -161,5 +161,3 @@ export async function autoAssignProjectsOnUserChange(
     if (touchedShowOnDispatch && changed.showOnDispatch !== true) return;
     await autoAssignProjectsForUser(userId);
 }
-
-export { AUTO_ASSIGN_PROJECT_STATUS };

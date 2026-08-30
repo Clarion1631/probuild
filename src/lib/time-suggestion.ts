@@ -38,6 +38,8 @@ export interface TimeSuggestion {
 export interface UncostedPlannedTask {
     id: string;
     name: string;
+    /** The uncosted task's completion criteria — same meaning as TimeSuggestion.note. */
+    note: string | null;
 }
 
 export interface TimeSuggestionResult {
@@ -346,8 +348,14 @@ export async function loadSuggestableTasks(
 
 // ── Ranking ─────────────────────────────────────────────────────────────────
 
-/** role "lead" first, then earliest startDate, then name — the dispatch tie-break rule. */
-function pickDispatchWinner<T extends { assignmentRole?: string | null; startDate: Date; taskName?: string; name?: string }>(
+/**
+ * role "lead" first, then earliest startDate, then name — the dispatch
+ * tie-break rule. Applied across ALL of the caller's active dispatched
+ * assignments for today, chargeable or not — a lead assignment on an
+ * uncosted task must be able to beat an ordinary chargeable one. Exported
+ * for the pure regression test in scripts/verify-time-suggestion.ts.
+ */
+export function pickDispatchWinner<T extends { assignmentRole?: string | null; startDate: Date; taskName?: string; name?: string }>(
     candidates: T[],
 ): T {
     return [...candidates].sort((a, b) => {
@@ -360,18 +368,31 @@ function pickDispatchWinner<T extends { assignmentRole?: string | null; startDat
     })[0];
 }
 
+/** One of the caller's active-today dispatched assignments, ranked alongside every other one regardless of chargeability. */
+interface DispatchCandidate {
+    taskId: string;
+    taskName: string;
+    startDate: Date;
+    assignmentRole: string | null;
+    doneWhen: string | null;
+    chargeable: boolean;
+    /** Populated only when `chargeable` — the full suggestable row, for building the TimeSuggestion. */
+    suggestable: SuggestableTask | null;
+}
+
 /**
  * Raw (not-necessarily-chargeable) leaf tasks the caller is dispatched to
- * today, restricted to ones that DON'T resolve to a chargeable item —
- * "dispatch" above already claims the chargeable ones. Used only to power
- * `uncostedPlannedTask` when dispatch itself found nothing to suggest.
+ * today, restricted to ones that DON'T resolve to a chargeable item — the
+ * chargeable ones are already present in `suggestable`. Merged with those in
+ * `loadDispatchCandidates` so the tie-break ranks the caller's ENTIRE active
+ * dispatch together, not chargeable-first.
  */
-async function loadUncostedDispatchedTask(
+async function loadUncostedDispatchedCandidates(
     projectId: string,
     userId: string,
     todayKey: string,
     db: DbClient,
-): Promise<UncostedPlannedTask | null> {
+): Promise<DispatchCandidate[]> {
     const [assigned, allTasks, { targetByItemId }] = await Promise.all([
         db.scheduleTask.findMany({
             where: { projectId, type: "task", status: { not: "Complete" }, assignments: { some: { userId } } },
@@ -382,6 +403,7 @@ async function loadUncostedDispatchedTask(
                 endDate: true,
                 type: true,
                 estimateItemId: true,
+                doneWhen: true,
                 assignments: { where: { userId }, select: { role: true } },
             },
         }),
@@ -390,7 +412,7 @@ async function loadUncostedDispatchedTask(
     ]);
     const parentIds = new Set(allTasks.map(task => task.parentId).filter((id): id is string => !!id));
 
-    const candidates = assigned
+    return assigned
         .filter(task => !parentIds.has(task.id))
         .filter(task => isTaskActiveOnDay(
             { startDate: task.startDate.toISOString(), endDate: task.endDate.toISOString(), type: task.type },
@@ -401,11 +423,48 @@ async function loadUncostedDispatchedTask(
             const target = targetByItemId.get(task.estimateItemId);
             return !target || !target.costCodeId || !target.costCode; // linked, but not chargeable
         })
-        .map(task => ({ ...task, assignmentRole: task.assignments[0]?.role ?? null }));
+        .map(task => ({
+            taskId: task.id,
+            taskName: task.name,
+            startDate: task.startDate,
+            assignmentRole: task.assignments[0]?.role ?? null,
+            doneWhen: task.doneWhen,
+            chargeable: false as const,
+            suggestable: null,
+        }));
+}
 
-    if (candidates.length === 0) return null;
-    const winner = pickDispatchWinner(candidates);
-    return { id: winner.id, name: winner.name };
+/**
+ * ALL of the caller's active-today dispatched assignments, chargeable and
+ * uncosted alike, as one ranking pool — so the tie-break (lead, then
+ * earliest start, then name) decides across the whole dispatch rather than
+ * only within the chargeable subset.
+ */
+async function loadDispatchCandidates(
+    projectId: string,
+    userId: string,
+    todayKey: string,
+    suggestable: SuggestableTask[],
+    db: DbClient,
+): Promise<DispatchCandidate[]> {
+    const chargeable: DispatchCandidate[] = suggestable
+        .filter(task =>
+            task.assignedToUser
+            && isTaskActiveOnDay(
+                { startDate: task.startDate.toISOString(), endDate: task.endDate.toISOString(), type: task.type },
+                todayKey,
+            ))
+        .map(task => ({
+            taskId: task.taskId,
+            taskName: task.taskName,
+            startDate: task.startDate,
+            assignmentRole: task.assignmentRole,
+            doneWhen: task.doneWhen,
+            chargeable: true,
+            suggestable: task,
+        }));
+    const uncosted = await loadUncostedDispatchedCandidates(projectId, userId, todayKey, db);
+    return [...chargeable, ...uncosted];
 }
 
 export async function suggestTaskForClockIn(
@@ -417,11 +476,6 @@ export async function suggestTaskForClockIn(
     const todayKey = toCompanyDayKey(now);
 
     const suggestable = await loadSuggestableTasks(projectId, userId, db);
-    if (suggestable.length === 0) {
-        // Still worth checking for an uncosted dispatched task — the picker
-        // has nothing chargeable at all, but the crew may still be dispatched.
-        return { suggestion: null, uncostedPlannedTask: await loadUncostedDispatchedTask(projectId, userId, todayKey, db) };
-    }
     const byTaskId = new Map(suggestable.map(task => [task.taskId, task]));
 
     const toSuggestion = (
@@ -442,24 +496,24 @@ export async function suggestTaskForClockIn(
         plannedByOffice: source === "dispatch",
     });
 
-    // 0 — dispatch: a task active today that the caller is assigned to (any
-    // role), chargeable per the same invariant as every other tier. Ranked
-    // first — "this is what was planned for you today" beats everything
-    // inferred from logs or history. Ties (more than one active assignment)
-    // resolve deterministically: lead role wins, then earliest start, then name.
-    const dispatchCandidates = suggestable.filter(task =>
-        task.assignedToUser
-        && isTaskActiveOnDay(
-            { startDate: task.startDate.toISOString(), endDate: task.endDate.toISOString(), type: task.type },
-            todayKey,
-        ));
+    // 0 — dispatch: EVERY task active today that the caller is assigned to
+    // (any role), chargeable or not, ranked together — "this is what was
+    // planned for you today" beats everything inferred from logs or history,
+    // and a lead assignment on an uncosted task must be able to beat an
+    // ordinary chargeable one rather than losing by being considered second.
+    // Ties resolve deterministically: lead role wins, then earliest start,
+    // then name. If the winner is chargeable it becomes `suggestion`. If not,
+    // it can never be `suggestion` — it's surfaced as `uncostedPlannedTask`
+    // instead, and `suggestion` falls through to the lower tiers below.
+    const dispatchCandidates = await loadDispatchCandidates(projectId, userId, todayKey, suggestable, db);
+    let uncostedPlannedTask: UncostedPlannedTask | null = null;
     if (dispatchCandidates.length > 0) {
         const winner = pickDispatchWinner(dispatchCandidates);
-        return { suggestion: toSuggestion(winner, "dispatch", "high", "Dispatched to you today"), uncostedPlannedTask: null };
+        if (winner.chargeable && winner.suggestable) {
+            return { suggestion: toSuggestion(winner.suggestable, "dispatch", "high", "Dispatched to you today"), uncostedPlannedTask: null };
+        }
+        uncostedPlannedTask = { id: winner.taskId, name: winner.taskName, note: winner.doneWhen };
     }
-    // No chargeable dispatch pick — surface an uncosted one (if any) alongside
-    // whatever the lower tiers below come up with.
-    const uncostedPlannedTask = await loadUncostedDispatchedTask(projectId, userId, todayKey, db);
 
     // 1 + 2 — the latest daily log (within lookback), AI pick first, keywords
     // second. DailyLog.date is stored as UTC midnight of a date-only input, so

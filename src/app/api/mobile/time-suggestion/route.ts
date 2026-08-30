@@ -8,10 +8,12 @@ import { suggestTaskForClockIn } from "@/lib/time-suggestion";
 // today's dispatch (what the office planned for the caller today), then the
 // latest daily log (AI match, then keywords), today's schedule, then the
 // caller's own recent entries. Deterministic — no AI call happens here.
-// Response: { suggestion: TimeSuggestion | null, uncostedPlannedTask: { id, name } | null }.
-// `uncostedPlannedTask` is set when the caller is dispatched to a task today
-// that has no chargeable estimate item/cost code — never a `suggestion`, but
-// still worth telling the crew ("Planned: drywall start (not costed)").
+// Response: { suggestion: TimeSuggestion | null, uncostedPlannedTask: { id, name, note } | null }.
+// `uncostedPlannedTask` is set when the caller's top-ranked active dispatch
+// today has no chargeable estimate item/cost code — never a `suggestion`, but
+// still worth telling the crew ("Planned: drywall start (not costed)"). Ranking
+// considers ALL of the caller's active dispatched assignments together
+// (chargeable or not) before deciding which bucket the winner falls into.
 // Hybrid auth: Bearer token (mobile) OR NextAuth session (web time clock).
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);

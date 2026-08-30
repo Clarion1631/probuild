@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
     tokenizeForMatch,
     keywordMatchTasks,
+    pickDispatchWinner,
     type KeywordCandidate,
 } from "../src/lib/time-suggestion";
 import { isValidChatWebhookUrl } from "../src/lib/chat-webhook";
@@ -94,6 +95,31 @@ function verifyDuplicateTokensDontStack(): void {
     console.log("PASS ranking: repeated tokens don't stack per-candidate");
 }
 
+function verifyDispatchWinnerMixedChargeableAndUncosted(): void {
+    // A LEAD assignment on an uncosted task must beat an ordinary (non-lead)
+    // chargeable assignment when both are active dispatched candidates today —
+    // ranking pools ALL of the caller's dispatch together before checking
+    // chargeability, rather than only considering uncosted tasks once the
+    // chargeable subset comes up empty.
+    const leadUncostedWinsOverOrdinaryChargeable = pickDispatchWinner([
+        { taskName: "Ordinary chargeable task", assignmentRole: "assigned", startDate: new Date("2026-08-20"), chargeable: true },
+        { taskName: "Lead uncosted task", assignmentRole: "lead", startDate: new Date("2026-08-25"), chargeable: false },
+    ]);
+    assert.equal(leadUncostedWinsOverOrdinaryChargeable.taskName, "Lead uncosted task");
+    assert.equal(leadUncostedWinsOverOrdinaryChargeable.chargeable, false);
+
+    // Without a lead role in play, the existing tie-break (earliest startDate,
+    // then name) still governs regardless of chargeability.
+    const earlierUncostedWinsOnDate = pickDispatchWinner([
+        { taskName: "Later chargeable task", assignmentRole: "assigned", startDate: new Date("2026-08-25"), chargeable: true },
+        { taskName: "Earlier uncosted task", assignmentRole: "assigned", startDate: new Date("2026-08-20"), chargeable: false },
+    ]);
+    assert.equal(earlierUncostedWinsOnDate.taskName, "Earlier uncosted task");
+    assert.equal(earlierUncostedWinsOnDate.chargeable, false);
+
+    console.log("PASS ranking: dispatch tie-break ranks chargeable and uncosted candidates together");
+}
+
 function verifyWebhookUrlGuard(): void {
     assert.ok(isValidChatWebhookUrl("https://chat.googleapis.com/v1/spaces/AAQA123/messages?key=k&token=t"));
     assert.ok(!isValidChatWebhookUrl("http://chat.googleapis.com/v1/spaces/AAQA123/messages")); // not https
@@ -110,5 +136,6 @@ verifyNoMatchAndTieReturnNull();
 verifyCostCodeTokensMatch();
 verifyDistinctTokenCount();
 verifyDuplicateTokensDontStack();
+verifyDispatchWinnerMixedChargeableAndUncosted();
 verifyWebhookUrlGuard();
 console.log("\nverify-time-suggestion: all checks passed");

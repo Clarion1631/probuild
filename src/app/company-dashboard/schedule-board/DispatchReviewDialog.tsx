@@ -4,7 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
 import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
-import { findReviewCollisions, type DispatchReviewCrewChangeInput, type DispatchReviewTaskInput } from "./dispatch-day-rows";
+import { collisionDelta, findReviewCollisions, type DispatchReviewCrewChangeInput, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
@@ -115,13 +115,16 @@ export function DispatchReviewDialog({
     const changeCount = reviewRows.length;
     const deliveryCount = result?.deliveryCount ?? 0;
     const crewChanges = crewChangesFromResult(result);
-    const touchedTaskIds = new Set(crewChanges.map(change => change.taskId));
-    const collisions = findReviewCollisions(tasks, crewChanges);
-    // Flag the banner only when a collision pair actually touches a task
-    // this review changed — a pre-existing double-booking on two untouched
-    // tasks isn't this review's problem to surface.
-    const hasCollision = collisions.some(entry =>
-        entry.pairs.some(pair => touchedTaskIds.has(pair.taskA?.id ?? "") || touchedTaskIds.has(pair.taskB?.id ?? "")));
+    // Compare the canonical, pre-review state (no crewChanges overlay)
+    // against the review's final state (crewChanges applied) and flag only
+    // collisions THIS review introduces or worsens — a pre-existing
+    // double-booking the review leaves untouched, or one a drafted removal
+    // resolves, isn't this review's problem to surface. See
+    // dispatch-day-rows.ts's collisionDelta for the identity semantics.
+    const canonicalCollisions = findReviewCollisions(tasks);
+    const finalCollisions = findReviewCollisions(tasks, crewChanges);
+    const newCollisions = collisionDelta(canonicalCollisions, finalCollisions);
+    const hasCollision = newCollisions.length > 0;
 
     return (
         <Dialog.Root open={Boolean(result)} onOpenChange={open => { if (!open && !isPending) onClose(); }}>

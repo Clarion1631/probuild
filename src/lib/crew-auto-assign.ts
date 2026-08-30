@@ -23,10 +23,32 @@
 // already grants read access without us touching ProjectAccess.)
 
 import { isDispatchable } from "./dispatch-roster";
-import { canonicalProjectStatus } from "./project-status";
+import { canonicalProjectStatus, LEGACY_PROJECT_STATUS_MAP } from "./project-status";
 
 /** The one project status that gets automatic crew assignment. */
 export const AUTO_ASSIGN_PROJECT_STATUS = "In Progress";
+
+/**
+ * Every raw `Project.status` value that counts as "In Progress" for
+ * auto-assign purposes: the canonical value itself, plus every legacy value
+ * (e.g. "Open", "Active") that `canonicalProjectStatus` maps onto it. Derived
+ * from LEGACY_PROJECT_STATUS_MAP so it can't drift from `isAutoAssignProjectStatus`
+ * below — a raw Prisma `where: { status: ... }` query needs this list (or the
+ * `autoAssignStatusWhere` helper) instead of the bare AUTO_ASSIGN_PROJECT_STATUS
+ * constant, or it silently misses legacy-status projects. See
+ * crew-auto-assign-sync.ts (syncProjectsForUser) and
+ * scripts/sync-crew-to-in-progress.mjs (which mirrors this list in plain JS —
+ * see the comment there — since scripts/*.mjs can't import TS).
+ */
+export const AUTO_ASSIGN_STATUS_VALUES: string[] = [
+    AUTO_ASSIGN_PROJECT_STATUS,
+    ...Object.entries(LEGACY_PROJECT_STATUS_MAP)
+        .filter(([, canonical]) => canonical === AUTO_ASSIGN_PROJECT_STATUS)
+        .map(([legacy]) => legacy),
+];
+
+/** Prisma `where` fragment selecting every project that counts as In Progress for auto-assign. */
+export const autoAssignStatusWhere = { status: { in: AUTO_ASSIGN_STATUS_VALUES } } as const;
 
 export type AutoAssignUser = {
     id: string;

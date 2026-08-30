@@ -26,6 +26,8 @@ const TSUG_STALE_TASK_ID = `e2e-tsug-stale-${RUN}`;
 const TSUG_ITEM_NOCODE_ID = `e2e-tsug-nocode-${RUN}`;
 const TSUG_ITEM_UNCODED_ID = `e2e-tsug-uncoded-item-${RUN}`;
 const TSUG_UNCODED_TASK_ID = `e2e-tsug-uncoded-task-${RUN}`;
+const TSUG_ITEM_MIXED_UNCODED_ID = `e2e-tsug-mixed-uncoded-item-${RUN}`;
+const TSUG_MIXED_UNCODED_TASK_ID = `e2e-tsug-mixed-uncoded-task-${RUN}`;
 const TSUG_LOG_ID = `e2e-tsug-log-${RUN}`;
 const TSUG_PROJECT_AUTH_ID = `e2e-tsug-projauth-${RUN}`;
 const TSUG_CLIENT_AUTH_ID = `e2e-tsug-cliauth-${RUN}`;
@@ -90,9 +92,9 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
         if (createdEntryIds.size > 0) {
             await prisma.timeEntry.deleteMany({ where: { id: { in: [...createdEntryIds] } } }).catch(() => {});
         }
-        await prisma.taskAssignment.deleteMany({ where: { taskId: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID, TSUG_UNCODED_TASK_ID] } } });
-        await prisma.scheduleTask.deleteMany({ where: { id: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID, TSUG_UNCODED_TASK_ID] } } });
-        await prisma.estimateItem.deleteMany({ where: { id: { in: [TSUG_ITEM_NOCODE_ID, TSUG_ITEM_UNCODED_ID] } } });
+        await prisma.taskAssignment.deleteMany({ where: { taskId: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID, TSUG_UNCODED_TASK_ID, TSUG_MIXED_UNCODED_TASK_ID] } } });
+        await prisma.scheduleTask.deleteMany({ where: { id: { in: [TSUG_TASK2_ID, TSUG_STALE_TASK_ID, TSUG_UNCODED_TASK_ID, TSUG_MIXED_UNCODED_TASK_ID] } } });
+        await prisma.estimateItem.deleteMany({ where: { id: { in: [TSUG_ITEM_NOCODE_ID, TSUG_ITEM_UNCODED_ID, TSUG_ITEM_MIXED_UNCODED_ID] } } });
         await prisma.dailyLogPhoto.deleteMany({ where: { dailyLogId: TSUG_LOG_ID } });
         await prisma.dailyLog.deleteMany({ where: { id: TSUG_LOG_ID } });
         await prisma.dailyLog.deleteMany({ where: { workPerformed: DAILYLOG_MARKER } });
@@ -335,6 +337,68 @@ test.describe.serial("Mobile clock-in time suggestion", () => {
             update: {},
             create: { taskId: MOBILE_TASK_DRYW_ID, userId: fieldCrewId },
         });
+    });
+
+    test("6b. mixed dispatch: LEAD on an uncosted task beats a plain-assignee chargeable task", async () => {
+        // MOBILE_TASK_DRYW_ID is already dispatched to the field crew as a plain
+        // assignee (role default "assigned", restored at the end of test 6) —
+        // that's the chargeable candidate. Add a second active dispatch, an
+        // uncosted task where the caller is "lead". If ranking considered the
+        // chargeable subset first (the old bug), the drywall task would win as
+        // `suggestion.source === "dispatch"`. Ranked together, lead beats
+        // ordinary regardless of chargeability, so the uncosted task must win
+        // the tie-break — surfaced via `uncostedPlannedTask`, never `suggestion`
+        // — and `suggestion` falls through to the lower tiers (daily_log here,
+        // same keyword match as test 4/6).
+        await prisma.estimateItem.create({
+            data: {
+                id: TSUG_ITEM_MIXED_UNCODED_ID,
+                estimateId: "e2e-mob-estimate",
+                name: "Mixed uncoded prep phase",
+                parentId: null,
+                quantity: 1,
+                unitCost: 100,
+                total: 100,
+            },
+        });
+        await prisma.scheduleTask.create({
+            data: {
+                id: TSUG_MIXED_UNCODED_TASK_ID,
+                projectId: PROJECT_ID,
+                name: "Mixed uncoded lead task",
+                type: "task",
+                status: "In Progress",
+                startDate: daysAgo(1),
+                endDate: daysFromNow(1),
+                estimateItemId: TSUG_ITEM_MIXED_UNCODED_ID,
+                doneWhen: "Confirm layout with PM before starting",
+            },
+        });
+        await prisma.taskAssignment.create({
+            data: { taskId: TSUG_MIXED_UNCODED_TASK_ID, userId: fieldCrewId, role: "lead" },
+        });
+
+        const res = await api.get(`/api/mobile/time-suggestion?projectId=${PROJECT_ID}`, {
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(res.ok(), await res.text()).toBeTruthy();
+        const { suggestion, uncostedPlannedTask } = await res.json();
+
+        expect(uncostedPlannedTask).toMatchObject({
+            id: TSUG_MIXED_UNCODED_TASK_ID,
+            name: "Mixed uncoded lead task",
+            note: "Confirm layout with PM before starting",
+        });
+        // The chargeable drywall dispatch must NOT win — it lost the tie-break
+        // to the lead-assigned uncosted task.
+        expect(suggestion?.source).not.toBe("dispatch");
+        expect(suggestion).not.toBeNull();
+        expect(suggestion.source).toBe("daily_log");
+        expect(suggestion.scheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
+
+        await prisma.taskAssignment.deleteMany({ where: { taskId: TSUG_MIXED_UNCODED_TASK_ID } });
+        await prisma.scheduleTask.delete({ where: { id: TSUG_MIXED_UNCODED_TASK_ID } });
+        await prisma.estimateItem.delete({ where: { id: TSUG_ITEM_MIXED_UNCODED_ID } });
     });
 
     test("7a. no bearer token -> 401", async () => {
