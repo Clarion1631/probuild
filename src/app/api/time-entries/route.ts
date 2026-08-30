@@ -5,8 +5,7 @@ import { toNum } from "@/lib/prisma-helpers";
 import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
-import { isTaskActiveOnDay } from "@/app/company-dashboard/schedule-board/dispatch-exceptions";
-import { resolveChargeableItems } from "@/lib/time-suggestion";
+import { resolveChargeableItems, computeDispatchWinnerForUser } from "@/lib/time-suggestion";
 import { requiresPhaseForClockIn, checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -21,8 +20,12 @@ export interface SuggestionAuditInput {
     /** Raw client-supplied `body.suggestedCostCodeId` — untyped, unvalidated. */
     suggestedCostCodeIdRaw: unknown;
     /**
-     * Server-confirmed: the caller has a TaskAssignment on the request's
-     * `suggestedScheduleTaskId` AND that task is active on the punch day.
+     * Server-confirmed: `suggestedScheduleTaskId` EQUALS the actual dispatch
+     * winner the suggestion engine would compute for this user/project/day
+     * right now (time-suggestion.ts computeDispatchWinnerForUser — same
+     * eligibility + ranking the picker's tier-0 suggestion uses). Being
+     * merely assigned+active is not enough: an ambiguous tie the caller
+     * happened to name, or a lower-tier task, must not pass as "dispatch".
      * The only fact that can substantiate a "dispatch" claim.
      */
     dispatchConfirmed: boolean;
@@ -67,18 +70,64 @@ export function resolveSuggestionAudit(input: SuggestionAuditInput): SuggestionA
 
     let suggestedCostCodeId = typeof suggestedCostCodeIdRaw === "string" ? suggestedCostCodeIdRaw : null;
     // Only refute against real ground truth. `undefined` (no valid suggested
-    // task, or no chargeable item to resolve) means there's nothing to check
-    // against — leave the client's value as-is, same as today.
+    // task at all) means there's nothing to check against — leave the
+    // client's value as-is, same as today. `null` IS ground truth (the task
+    // resolved but has no chargeable cost code) and must refute a forged
+    // non-null claim just like a disagreeing real code would — an uncosted
+    // task can't substantiate ANY suggestedCostCodeId.
     if (
         suggestedCostCodeId &&
         suggestedTaskResolvedCostCodeId !== undefined &&
-        suggestedTaskResolvedCostCodeId !== null &&
         suggestedCostCodeId !== suggestedTaskResolvedCostCodeId
     ) {
         suggestedCostCodeId = null;
     }
 
     return { suggestionSource, suggestedCostCodeId };
+}
+
+export interface PunchBindingHintInput {
+    /** Server-confirmed via computeDispatchWinnerForUser — see SuggestionAuditInput.dispatchConfirmed. */
+    dispatchConfirmed: boolean;
+    /** Raw client-supplied `body.suggestionOverridden` — "Keep my choice" sends `false`. */
+    suggestionOverridden: unknown;
+    /** resolveSuggestionAudit's OUTPUT source — post-provenance-check, not the raw client claim. */
+    finalSuggestionSource: string | null;
+    suggestedScheduleTaskId: unknown;
+}
+
+/**
+ * Gate P1: decide whether the client-claimed `suggestedScheduleTaskId` may be
+ * passed to the punch binder (punch-task-binding.ts) as its "accepted
+ * suggestion" tie-break hint.
+ *
+ * All three must hold, independently of each other:
+ *  - `dispatchConfirmed` — the server itself verified this id IS today's real
+ *    dispatch winner (time-suggestion.ts computeDispatchWinnerForUser), not
+ *    merely assigned+active. Without this, an ambiguous tie or a lower-tier
+ *    (daily_log/today_schedule/user_history) suggestion the caller merely
+ *    named could pick among ambiguous tasks.
+ *  - `suggestionOverridden !== true` — "Keep my choice" (the crew member
+ *    rejecting the suggestion and picking their own task) must never roll
+ *    hours onto the suggestion they turned down.
+ *  - `finalSuggestionSource === "dispatch"` — the PERSISTED source, after
+ *    resolveSuggestionAudit's own provenance check, not the client's raw
+ *    claim (a forged "dispatch" claim that failed that check must not reach
+ *    here either).
+ *
+ * Pure — no I/O, unit-tested directly in tests/time-entries-suggestion-audit.test.ts.
+ */
+export function resolvePunchBindingHint(input: PunchBindingHintInput): string | null {
+    const { dispatchConfirmed, suggestionOverridden, finalSuggestionSource, suggestedScheduleTaskId } = input;
+    if (
+        dispatchConfirmed
+        && suggestionOverridden !== true
+        && finalSuggestionSource === "dispatch"
+        && typeof suggestedScheduleTaskId === "string"
+    ) {
+        return suggestedScheduleTaskId;
+    }
+    return null;
 }
 
 export async function GET(req: Request) {
@@ -297,10 +346,13 @@ export async function POST(req: Request) {
     // roll-up, so a forged claim here can misfile real labor).
     let auditSuggestedTaskId: string | null = null;
     let auditSuggestedTaskName: string | null = null;
-    // True only when the server itself confirms the caller is assigned to the
-    // suggested task and it's active on the punch day — the same "dispatched
-    // to you today" fact dispatch's own ranking is built on. A client cannot
-    // manufacture this by sending suggestionSource: "dispatch" alone.
+    // True only when `suggestedScheduleTaskId` EQUALS the real dispatch
+    // winner (time-suggestion.ts computeDispatchWinnerForUser — the same
+    // eligibility + ranking the engine's own tier-0 suggestion uses). Being
+    // merely assigned+active is NOT enough: an ambiguous tie the caller
+    // happened to name, or a lower-tier task, must not pass as "dispatch". A
+    // client cannot manufacture this by sending suggestionSource: "dispatch"
+    // alone.
     let dispatchConfirmed = false;
     // The cost code the suggested task's chargeable item actually resolves
     // to, when it has one — the ground truth suggestedCostCodeId is checked
@@ -311,25 +363,11 @@ export async function POST(req: Request) {
     if (suggestedScheduleTaskId && typeof suggestedScheduleTaskId === "string") {
         const suggestedTask = await prisma.scheduleTask.findFirst({
             where: { id: suggestedScheduleTaskId, projectId },
-            select: {
-                id: true, name: true, estimateItemId: true,
-                startDate: true, endDate: true, type: true,
-                assignments: { where: { userId: user.id }, select: { id: true } },
-            },
+            select: { id: true, name: true, estimateItemId: true },
         });
         if (suggestedTask) {
             auditSuggestedTaskId = suggestedTask.id;
             auditSuggestedTaskName = suggestedTask.name;
-            const isAssigned = suggestedTask.assignments.length > 0;
-            const isActive = isTaskActiveOnDay(
-                {
-                    startDate: suggestedTask.startDate.toISOString(),
-                    endDate: suggestedTask.endDate.toISOString(),
-                    type: suggestedTask.type,
-                },
-                punchDayKey,
-            );
-            dispatchConfirmed = isAssigned && isActive;
 
             if (suggestedTask.estimateItemId) {
                 const { targetByItemId } = await resolveChargeableItems(projectId);
@@ -337,6 +375,9 @@ export async function POST(req: Request) {
                 suggestedTaskResolvedCostCodeId = target?.costCodeId ?? null;
             }
         }
+
+        const dispatchWinner = await computeDispatchWinnerForUser(user.id, projectId, punchDayKey);
+        dispatchConfirmed = dispatchWinner?.taskId === suggestedScheduleTaskId;
     }
     const { suggestionSource: finalSuggestionSource, suggestedCostCodeId: finalSuggestedCostCodeId } =
         resolveSuggestionAudit({
@@ -346,18 +387,27 @@ export async function POST(req: Request) {
             suggestedTaskResolvedCostCodeId,
         });
 
+    // Gate P1: see resolvePunchBindingHint — a binding hint is only ever
+    // passed to the punch binder when the server has independently confirmed
+    // it is today's dispatch winner, the caller didn't override the
+    // suggestion, and the source survived provenance checking. Anything less
+    // is exactly how a forged/overridden/lower-tier suggestion could pick
+    // among ambiguous tasks or roll hours onto a rejected one —
+    // punch-task-binding.ts trusts this value outright for its
+    // "acceptedSuggestion" tie-break.
+    const bindingSuggestedTaskId = resolvePunchBindingHint({
+        dispatchConfirmed,
+        suggestionOverridden,
+        finalSuggestionSource,
+        suggestedScheduleTaskId,
+    });
+
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
         userId: user.id,
         projectId,
         dayKey: punchDayKey,
         estimateItemId: resolvedEstimateItemId,
-        // Only ever offered as a tie-break among candidates the resolver
-        // itself already verified are assigned+active+on this project — see
-        // punch-task-binding.ts "acceptedSuggestion". Passing the raw,
-        // not-yet-project-checked id here is safe for that same reason: an
-        // id that doesn't belong to this project's candidate set is simply
-        // never a member of `candidateIds` and is ignored.
-        suggestedScheduleTaskId: typeof suggestedScheduleTaskId === "string" ? suggestedScheduleTaskId : null,
+        suggestedScheduleTaskId: bindingSuggestedTaskId,
     });
 
     const dumpText = typeof rawNote === "string" ? rawNote.trim().slice(0, 4000) : undefined;

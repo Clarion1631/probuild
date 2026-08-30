@@ -565,6 +565,43 @@ async function loadDispatchCandidates(
     return [...chargeable, ...uncosted];
 }
 
+export interface DispatchWinner {
+    taskId: string;
+    /** True when the winner resolves to a chargeable item (has a real cost code). */
+    chargeable: boolean;
+    /** The winner's chargeable cost code, when `chargeable` — null otherwise. */
+    costCodeId: string | null;
+}
+
+/**
+ * THE dispatch-winner computation — the same eligibility + ranking
+ * `suggestTaskForClockIn`'s tier 0 uses (loadDispatchCandidates +
+ * pickDispatchWinner), exposed standalone so the punch-provenance check in
+ * the time-entries route (gate P2) can ask "is the id the client claims
+ * actually today's dispatch winner for this user?" without re-deriving or
+ * drifting from the engine's own ranking. Returns null when the caller has
+ * no active-today dispatched assignment at all — completed/milestone/
+ * appointment/parent tasks and anything not assigned to `userId` are never
+ * candidates (see loadSuggestableTasks / loadUncostedDispatchedCandidates),
+ * so those can never come back as the winner.
+ */
+export async function computeDispatchWinnerForUser(
+    userId: string,
+    projectId: string,
+    dayKey: string,
+    db: DbClient = prisma,
+): Promise<DispatchWinner | null> {
+    const suggestable = await loadSuggestableTasks(projectId, userId, db);
+    const dispatchCandidates = await loadDispatchCandidates(projectId, userId, dayKey, suggestable, db);
+    if (dispatchCandidates.length === 0) return null;
+    const winner = pickDispatchWinner(dispatchCandidates);
+    return {
+        taskId: winner.taskId,
+        chargeable: winner.chargeable,
+        costCodeId: winner.chargeable && winner.suggestable ? winner.suggestable.costCodeId : null,
+    };
+}
+
 export async function suggestTaskForClockIn(
     input: { userId: string; projectId: string; now?: Date },
     db: DbClient = prisma,

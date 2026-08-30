@@ -229,6 +229,121 @@ test.describe.serial("Mobile API contract", () => {
         expect(created.suggestionSource).toBe("today_schedule");
     });
 
+    // Gate P1: whether a binding hint actually reaches the punch binder
+    // (punch-task-binding.ts "acceptedSuggestion") end-to-end. Needs a real
+    // ambiguous tie — a SECOND active-today task assigned to the field-crew
+    // fixture user alongside MOBILE_TASK_DRYW_ID — so soleAssignedTask can't
+    // resolve it on its own and the binding outcome actually depends on
+    // whether the route decided to pass a hint. Self-contained: creates and
+    // tears down its own extra task so it can't perturb any other test's
+    // assumption that MOBILE_TASK_DRYW_ID is the caller's only active task.
+    test.describe("gate P1: punch binding hint end-to-end", () => {
+        const EXTRA_TASK_ID = `e2e-tsug-p1-task-${RUN}`;
+        const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+        const daysFromNow = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
+
+        test.beforeAll(async () => {
+            // Later startDate than MOBILE_TASK_DRYW_ID's (daysAgo(3)) and
+            // same "assigned" role, so dispatch's own tie-break (lead, then
+            // earliest startDate) deterministically makes MOBILE_TASK_DRYW_ID
+            // the real dispatch winner in every scenario below — the extra
+            // task exists only to make the punch-binder's candidate set
+            // ambiguous (>1), never to contend for the winner slot.
+            await prisma.scheduleTask.upsert({
+                where: { id: EXTRA_TASK_ID },
+                update: { startDate: daysAgo(1), endDate: daysFromNow(4), status: "In Progress" },
+                create: {
+                    id: EXTRA_TASK_ID,
+                    projectId: PROJECT_ID,
+                    name: "Extra ambiguous task (gate P1 fixture)",
+                    type: "task",
+                    status: "In Progress",
+                    startDate: daysAgo(1),
+                    endDate: daysFromNow(4),
+                },
+            });
+            await prisma.taskAssignment.upsert({
+                where: { taskId_userId: { taskId: EXTRA_TASK_ID, userId: fieldCrewId } },
+                update: {},
+                create: { taskId: EXTRA_TASK_ID, userId: fieldCrewId },
+            });
+        });
+
+        test.afterAll(async () => {
+            await prisma.taskAssignment.deleteMany({ where: { taskId: EXTRA_TASK_ID } });
+            await prisma.scheduleTask.delete({ where: { id: EXTRA_TASK_ID } });
+        });
+
+        test("confirmed dispatch winner, not overridden -> binds via the suggestion (acceptedSuggestion)", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID, // the real dispatch winner
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: false,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            expect(created.suggestionSource).toBe("dispatch");
+            expect(created.scheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
+        });
+
+        test("'Keep my choice' (suggestionOverridden: true) -> never rolls hours onto the rejected suggestion", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    // Names the real dispatch winner, but the crew member
+                    // rejected it and picked their own task instead.
+                    suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: true,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            // The audit field still records what was suggested and confirmed...
+            expect(created.suggestionSource).toBe("dispatch");
+            // ...but the ambiguous candidate set (2 active assigned tasks) is
+            // never broken by it — no hint reached the binder.
+            expect(created.scheduleTaskId).toBe(null);
+        });
+
+        test("forged/lower-tier suggestion naming the NON-winning ambiguous candidate -> never binds", async () => {
+            const postRes = await api.post("/api/time-entries", {
+                data: {
+                    projectId: PROJECT_ID,
+                    startTime: new Date().toISOString(),
+                    // EXTRA_TASK_ID is a real candidate (assigned + active),
+                    // but it is NOT the dispatch winner (MOBILE_TASK_DRYW_ID's
+                    // earlier startDate wins the tie-break) — a caller cannot
+                    // pick among ambiguous tasks by simply naming one of them
+                    // and claiming "dispatch".
+                    suggestedScheduleTaskId: EXTRA_TASK_ID,
+                    suggestionSource: "dispatch",
+                    suggestionOverridden: false,
+                },
+                headers: { authorization: `Bearer ${fieldCrewToken}` },
+            });
+            expect(postRes.ok(), await postRes.text()).toBeTruthy();
+            const created = await postRes.json();
+            createdEntryIds.add(created.id);
+
+            // Provenance check downgrades the forged "dispatch" claim...
+            expect(created.suggestionSource).toBe(null);
+            // ...and the binder is left with a genuine, unresolved ambiguity.
+            expect(created.scheduleTaskId).toBe(null);
+        });
+    });
+
     test("PUT — FIELD_CREW cannot edit another user's entry -> 403", async () => {
         await prisma.timeEntry.create({
             data: { id: MGR_OWNED_ENTRY_ID, userId: managerId, projectId: PROJECT_ID, startTime: new Date() },

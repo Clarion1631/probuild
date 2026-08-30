@@ -471,18 +471,6 @@ function toIsoDayString(yyyyMmDd: string): string {
     return `${yyyyMmDd}T00:00:00.000Z`;
 }
 
-/** Shifts an ISO day string (either bare "YYYY-MM-DD" or full "…T00:00:00.000Z") by `days`, always returning the full ISO form — keeps every DispatchReviewTaskInput date in the one format findReviewCollisions compares as plain strings. */
-function shiftIsoDate(value: string, days: number): string {
-    if (days === 0) return toIsoDayString(value.slice(0, 10));
-    return toIsoDayString(formatDate(addDays(parseUTCDate(value.slice(0, 10)), days)));
-}
-
-function dayDeltaBetween(before: string, after: string): number {
-    const beforeMs = parseUTCDate(before.slice(0, 10)).getTime();
-    const afterMs = parseUTCDate(after.slice(0, 10)).getTime();
-    return Math.round((afterMs - beforeMs) / 86_400_000);
-}
-
 function crewUserIdsFromChange(change: DispatchChange): string[] {
     const value = change.after.assignments;
     if (!Array.isArray(value)) return [];
@@ -504,36 +492,33 @@ function crewUserIdsFromChange(change: DispatchChange): string[] {
  * into another job's window by a reviewed date/project change could publish
  * with no warning even though it now double-books someone.
  *
- * Applied in the same precedence buildDispatchPlan itself uses: a
- * PROJECT_START shifts every task of that project by the before→after start
- * delta first, then a TASK_DATES change overrides that task's dates
- * outright (it's already the plan's final absolute date, not a further
- * delta), then TASK_CREW overrides that task's crew. A change naming a task
- * not present in `tasks` is ignored — the collision scan simply won't see
- * it, matching a task the caller didn't include in the first place.
+ * A PROJECT_START change does NOT imply every task of that project moved —
+ * buildDispatchPlan (dispatch-intent.ts) only shifts a task's own dates when
+ * `shiftMode !== "MARKER_ONLY"` AND (shiftMode === "ALL_TASKS" OR the task's
+ * `status === "Not Started"` under NOT_STARTED_TASKS) — see the shiftDays
+ * loop over `tasksById` in buildDispatchPlan, and shiftMode's definition on
+ * `ProjectStartIntent` itself. Whatever a task's final window actually
+ * becomes, buildDispatchPlan always emits it as that task's own TASK_DATES
+ * change (the "changedTaskIds" / task-date diff loop right after
+ * `projectOperations` is built) — so a PROJECT_START change here never needs
+ * to be applied to tasks itself: MARKER_ONLY and untouched/already-started
+ * tasks correctly get no TASK_DATES change and so no move; tasks that do
+ * move already carry their own emitted TASK_DATES change below. If a
+ * PROJECT_START change is ever extended to carry explicit per-task outcomes
+ * of its own, prefer those over the emitted TASK_DATES changes; today it
+ * doesn't, so PROJECT_START changes are intentionally skipped here.
+ *
+ * A TASK_DATES change overrides that task's dates outright (it's already
+ * the plan's final absolute date, not a delta to apply), then TASK_CREW
+ * overrides that task's crew. A change naming a task not present in `tasks`
+ * is ignored — the collision scan simply won't see it, matching a task the
+ * caller didn't include in the first place.
  */
 export function applyReviewChangesToTasks(
     tasks: readonly DispatchReviewTaskInput[],
     changes: readonly DispatchChange[],
 ): DispatchReviewTaskInput[] {
     const byId = new Map(tasks.map(task => [task.id, { ...task }]));
-
-    for (const change of changes) {
-        if (change.kind !== "PROJECT_START") continue;
-        const beforeStart = typeof change.before.startDate === "string" ? change.before.startDate : null;
-        const afterStart = typeof change.after.startDate === "string" ? change.after.startDate : null;
-        if (!beforeStart || !afterStart) continue;
-        const shiftDays = dayDeltaBetween(beforeStart, afterStart);
-        if (shiftDays === 0) continue;
-        for (const task of byId.values()) {
-            if (task.projectId !== change.projectId) continue;
-            byId.set(task.id, {
-                ...task,
-                startDate: shiftIsoDate(task.startDate, shiftDays),
-                endDate: shiftIsoDate(task.endDate, shiftDays),
-            });
-        }
-    }
 
     for (const change of changes) {
         if (change.kind !== "TASK_DATES") continue;

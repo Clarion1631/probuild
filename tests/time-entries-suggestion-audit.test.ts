@@ -134,6 +134,19 @@ test("a non-string suggestedCostCodeId is dropped to null", async () => {
     assert.equal(result.suggestedCostCodeId, null);
 });
 
+test("gate P3: an uncosted resolved task (null ground truth) downgrades a forged non-null suggestedCostCodeId", async () => {
+    const { resolveSuggestionAudit } = await routeModulePromise;
+    const result = resolveSuggestionAudit({
+        suggestionSourceRaw: "today_schedule",
+        suggestedCostCodeIdRaw: "cc-forged-nonnull",
+        dispatchConfirmed: false,
+        // The suggested task resolved fine, but it has no chargeable cost
+        // code at all — null IS ground truth here, not "nothing to check".
+        suggestedTaskResolvedCostCodeId: null,
+    });
+    assert.equal(result.suggestedCostCodeId, null);
+});
+
 test("combined forged case: forged dispatch source AND forged cost code both get downgraded independently", async () => {
     const { resolveSuggestionAudit } = await routeModulePromise;
     const result = resolveSuggestionAudit({
@@ -143,4 +156,64 @@ test("combined forged case: forged dispatch source AND forged cost code both get
         suggestedTaskResolvedCostCodeId: "cc-real",
     });
     assert.deepEqual(result, { suggestionSource: null, suggestedCostCodeId: null });
+});
+
+// ── Gate P1: resolvePunchBindingHint — when a binding hint reaches the punch binder ──
+
+test("gate P1: confirmed dispatch winner, not overridden, source survived -> hint is passed", async () => {
+    const { resolvePunchBindingHint } = await routeModulePromise;
+    const hint = resolvePunchBindingHint({
+        dispatchConfirmed: true,
+        suggestionOverridden: false,
+        finalSuggestionSource: "dispatch",
+        suggestedScheduleTaskId: "task-winner",
+    });
+    assert.equal(hint, "task-winner");
+});
+
+test("gate P1: overridden suggestion ('Keep my choice' rejected it) -> no hint, even if otherwise confirmed", async () => {
+    const { resolvePunchBindingHint } = await routeModulePromise;
+    const hint = resolvePunchBindingHint({
+        dispatchConfirmed: true,
+        suggestionOverridden: true,
+        finalSuggestionSource: "dispatch",
+        suggestedScheduleTaskId: "task-winner",
+    });
+    assert.equal(hint, null);
+});
+
+test("gate P1: forged/lower-tier suggestion (dispatchConfirmed false) -> no hint", async () => {
+    const { resolvePunchBindingHint } = await routeModulePromise;
+    const hint = resolvePunchBindingHint({
+        dispatchConfirmed: false,
+        suggestionOverridden: false,
+        finalSuggestionSource: "dispatch",
+        suggestedScheduleTaskId: "task-not-the-winner",
+    });
+    assert.equal(hint, null);
+});
+
+test("gate P1: source downgraded away from 'dispatch' by provenance checking -> no hint even if dispatchConfirmed", async () => {
+    const { resolvePunchBindingHint } = await routeModulePromise;
+    // Can't actually happen together in practice (dispatchConfirmed=true
+    // implies resolveSuggestionAudit keeps "dispatch"), but the gate must
+    // stand on finalSuggestionSource on its own merits, not assume that.
+    const hint = resolvePunchBindingHint({
+        dispatchConfirmed: true,
+        suggestionOverridden: false,
+        finalSuggestionSource: "today_schedule",
+        suggestedScheduleTaskId: "task-winner",
+    });
+    assert.equal(hint, null);
+});
+
+test("gate P1: no suggestion sent at all -> no hint", async () => {
+    const { resolvePunchBindingHint } = await routeModulePromise;
+    const hint = resolvePunchBindingHint({
+        dispatchConfirmed: false,
+        suggestionOverridden: false,
+        finalSuggestionSource: null,
+        suggestedScheduleTaskId: undefined,
+    });
+    assert.equal(hint, null);
 });

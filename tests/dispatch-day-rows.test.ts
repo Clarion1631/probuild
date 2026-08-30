@@ -443,7 +443,7 @@ test("applyReviewChangesToTasks: a TASK_DATES move that lands a task inside anot
     assert.equal(delta[0].userId, "u1");
 });
 
-test("applyReviewChangesToTasks: a PROJECT_START shift that lands a project's task inside another job's window is caught as a new collision", () => {
+test("applyReviewChangesToTasks: a MARKER_ONLY PROJECT_START change moves no tasks and raises no new collision", () => {
     const tasks = [
         reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
         reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-05T00:00:00.000Z", endDate: "2026-09-06T00:00:00.000Z", savedUserIds: ["u1"] }),
@@ -451,8 +451,9 @@ test("applyReviewChangesToTasks: a PROJECT_START shift that lands a project's ta
     const canonical = findReviewCollisions(tasks);
     assert.deepEqual(canonical, []);
 
-    // Whole-project move: p2 shifts 7 days earlier, dragging t2 with it
-    // (mirrors buildDispatchPlan's ALL_TASKS shift) onto t1's window.
+    // MARKER_ONLY: buildDispatchPlan moves the project's own startDate/endDate
+    // but never touches task rows for this shiftMode, so it emits a
+    // PROJECT_START change with no accompanying TASK_DATES changes for t2.
     const changes: DispatchChange[] = [{
         projectId: "p2",
         targetType: "PROJECT",
@@ -463,14 +464,83 @@ test("applyReviewChangesToTasks: a PROJECT_START shift that lands a project's ta
         summary: "",
     }];
     const finalTasks = applyReviewChangesToTasks(tasks, changes);
-    const shiftedTask = finalTasks.find(task => task.id === "t2")!;
-    assert.equal(shiftedTask.startDate, "2026-08-29T00:00:00.000Z");
-    assert.equal(shiftedTask.endDate, "2026-08-30T00:00:00.000Z");
+    const untouchedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.equal(untouchedTask.startDate, "2026-09-05T00:00:00.000Z");
+    assert.equal(untouchedTask.endDate, "2026-09-06T00:00:00.000Z");
+
+    const final = findReviewCollisions(finalTasks);
+    assert.deepEqual(collisionDelta(canonical, final), []);
+});
+
+test("applyReviewChangesToTasks: a PROJECT_START change with emitted TASK_DATES for two not-started tasks moves only those tasks", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-05T00:00:00.000Z", endDate: "2026-09-06T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t3", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-12T00:00:00.000Z", endDate: "2026-09-13T00:00:00.000Z", savedUserIds: [] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []);
+
+    // NOT_STARTED_TASKS: buildDispatchPlan shifts the project marker plus a
+    // TASK_DATES change for every Not Started task that actually moved (t2
+    // and t3 here) — the emitted TASK_DATES changes are the only thing this
+    // function needs to move tasks.
+    const changes: DispatchChange[] = [
+        {
+            projectId: "p2",
+            targetType: "PROJECT",
+            targetId: "p2",
+            kind: "PROJECT_START",
+            before: { startDate: "2026-09-05", endDate: null },
+            after: { startDate: "2026-08-29", endDate: null },
+            summary: "",
+        },
+        dateChange({ targetId: "t2", before: { startDate: "2026-09-05", endDate: "2026-09-06" }, after: { startDate: "2026-08-29", endDate: "2026-08-30" } }),
+        dateChange({ targetId: "t3", before: { startDate: "2026-09-12", endDate: "2026-09-13" }, after: { startDate: "2026-09-05", endDate: "2026-09-06" } }),
+    ];
+    const finalTasks = applyReviewChangesToTasks(tasks, changes);
+    const movedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.equal(movedTask.startDate, "2026-08-29T00:00:00.000Z");
+    assert.equal(movedTask.endDate, "2026-08-30T00:00:00.000Z");
+    const alsoMovedTask = finalTasks.find(task => task.id === "t3")!;
+    assert.equal(alsoMovedTask.startDate, "2026-09-05T00:00:00.000Z");
+    assert.equal(alsoMovedTask.endDate, "2026-09-06T00:00:00.000Z");
 
     const final = findReviewCollisions(finalTasks);
     const delta = collisionDelta(canonical, final);
     assert.equal(delta.length, 1);
     assert.equal(delta[0].userId, "u1");
+});
+
+test("applyReviewChangesToTasks: an already-started task with no emitted TASK_DATES change stays put under a PROJECT_START change", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+        // DispatchReviewTaskInput carries no status field — the task's status
+        // lives server-side; this represents an already-started task purely
+        // by the absence of a TASK_DATES change for it below.
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-05T00:00:00.000Z", endDate: "2026-09-06T00:00:00.000Z", savedUserIds: ["u1"] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []);
+
+    // NOT_STARTED_TASKS: buildDispatchPlan skips an already-started task, so
+    // no TASK_DATES change is emitted for t2 even though its project moved.
+    const changes: DispatchChange[] = [{
+        projectId: "p2",
+        targetType: "PROJECT",
+        targetId: "p2",
+        kind: "PROJECT_START",
+        before: { startDate: "2026-09-05", endDate: null },
+        after: { startDate: "2026-08-29", endDate: null },
+        summary: "",
+    }];
+    const finalTasks = applyReviewChangesToTasks(tasks, changes);
+    const startedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.equal(startedTask.startDate, "2026-09-05T00:00:00.000Z");
+    assert.equal(startedTask.endDate, "2026-09-06T00:00:00.000Z");
+
+    const final = findReviewCollisions(finalTasks);
+    assert.deepEqual(collisionDelta(canonical, final), []);
 });
 
 test("applyReviewChangesToTasks: a TASK_CREW-only change keeps prior collisionDelta behaviour unchanged", () => {
