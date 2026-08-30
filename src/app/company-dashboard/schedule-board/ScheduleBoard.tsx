@@ -24,7 +24,7 @@ import { TimelineView, CREW_MODE_STORAGE_KEY } from "./TimelineView";
 import { DispatchView, DISPATCH_MODE_STORAGE_KEY } from "./DispatchView";
 import type { DispatchMode, DispatchTaskCreationDefaults } from "./DispatchView";
 import { shiftDayKey, formatDayLabel, isTodayKey } from "./dispatch-day";
-import { finalTaskUserIds, type DispatchReviewTaskInput } from "./dispatch-day-rows";
+import { assertDispatchableTarget, finalTaskUserIds, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 import { DispatchReviewDialog } from "./DispatchReviewDialog";
 import { AvailabilityPanel } from "./AvailabilityPanel";
 import { ShiftConfirmDialog, type ProjectMoveChoice } from "./ShiftConfirmDialog";
@@ -485,6 +485,12 @@ export function ScheduleBoard({
     const canonicalTaskProjectById = useMemo(() => new Map(canonicalProjects.flatMap(project => (
         project.tasks.map(task => [task.id, project.id] as const)
     ))), [canonicalProjects]);
+    // "Has at least one child" set, scoped per-project like dispatch-day-rows.ts's
+    // own private parentIdsOf — feeds assertDispatchableTarget below (a phase
+    // parent can never be a crew-draft add target).
+    const taskHasChildrenById = useMemo(() => new Set(
+        canonicalProjects.flatMap(project => project.tasks.map(task => task.parentId).filter((id): id is string => Boolean(id))),
+    ), [canonicalProjects]);
     const dispatchTaskNamesById = useMemo(
         () => new Map(canonicalProjects.flatMap(project => project.tasks.map(task => [task.id, task.name] as const))),
         [canonicalProjects],
@@ -1019,6 +1025,11 @@ export function ScheduleBoard({
     function queueCrewAddition(taskId: string, userId: string): boolean {
         const task = canonicalTaskById.get(taskId);
         if (!data.canEdit || isTaskLocked(taskId) || !task) return false;
+        const notDispatchableReason = assertDispatchableTarget({ type: task.type, status: task.status, hasChildren: taskHasChildrenById.has(taskId) });
+        if (notDispatchableReason) {
+            toast.error(`That task can't be dispatched: ${notDispatchableReason}`);
+            return false;
+        }
         const existingDraft = crewDrafts[taskId];
         const expectedAssignments = existingDraft?.expectedAssignments ?? dashboardTaskAssignments(task);
         const addUserIds = new Set(existingDraft?.addUserIds ?? []);

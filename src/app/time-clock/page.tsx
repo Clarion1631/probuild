@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { decideClockInDisplay, type ClockInDisplay, type ClockInSuggestionResponse } from "@/lib/time-suggestion-display";
+import { decideClockInDisplay, buildClockInAuditFields, type ClockInDisplay, type ClockInSuggestionResponse } from "@/lib/time-suggestion-display";
 
 type ClockInSuggestion = {
     scheduleTaskId: string;
@@ -210,7 +210,7 @@ export default function TimeClockPage() {
         });
     };
 
-    const performClockIn = async (phaseId: string, overridden: boolean) => {
+    const performClockIn = async (phaseId: string) => {
         let loc = null;
         try {
             loc = await getLocation();
@@ -231,12 +231,7 @@ export default function TimeClockPage() {
                     ...(isLogistics ? { rawNote: logisticsDump.trim() } : {}),
                     latitude: loc?.lat,
                     longitude: loc?.lng,
-                    ...(suggestion ? {
-                        suggestedScheduleTaskId: suggestion.scheduleTaskId,
-                        suggestedCostCodeId: suggestion.costCodeId,
-                        suggestionSource: suggestion.source,
-                        suggestionOverridden: overridden,
-                    } : {}),
+                    ...buildClockInAuditFields(display, phaseId),
                 })
             });
             const data = await res.json();
@@ -284,7 +279,7 @@ export default function TimeClockPage() {
                 setConfirmMismatch(true);
                 return;
             }
-            await performClockIn(selectedPhase, false);
+            await performClockIn(selectedPhase);
         } else {
             let loc = null;
             try {
@@ -501,7 +496,7 @@ export default function TimeClockPage() {
                                     setConfirmMismatch(false);
                                     userPickedBucket.current = true;
                                     setSelectedPhase(display.costCodeId);
-                                    await performClockIn(display.costCodeId, false);
+                                    await performClockIn(display.costCodeId);
                                 }}
                             >
                                 Use suggested task
@@ -510,7 +505,7 @@ export default function TimeClockPage() {
                                 className="hui-btn w-full"
                                 onClick={async () => {
                                     setConfirmMismatch(false);
-                                    await performClockIn(selectedPhase, true);
+                                    await performClockIn(selectedPhase);
                                 }}
                             >
                                 Keep my choice

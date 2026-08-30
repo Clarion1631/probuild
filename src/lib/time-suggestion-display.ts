@@ -14,7 +14,7 @@
 //      current behaviour: show and preselect.
 //   4. else nothing to show.
 
-import type { TimeSuggestion, UncostedPlannedTask } from "@/lib/time-suggestion";
+import type { TimeSuggestion, TimeSuggestionSource, UncostedPlannedTask } from "@/lib/time-suggestion";
 
 export interface ClockInSuggestionResponse {
     suggestion: TimeSuggestion | null;
@@ -29,9 +29,11 @@ export type ClockInDisplay =
           costCodeId: string;
           scheduleTaskId: string;
           note: string | null;
+          source: TimeSuggestionSource;
       }
     | {
           mode: "uncosted";
+          taskId: string;
           taskName: string;
           note: string | null;
       }
@@ -43,6 +45,7 @@ export type ClockInDisplay =
           scheduleTaskId: string;
           note: string | null;
           reason: string | null;
+          source: TimeSuggestionSource;
       }
     | { mode: "none" };
 
@@ -57,12 +60,14 @@ export function decideClockInDisplay(response: ClockInSuggestionResponse): Clock
             costCodeId: suggestion.costCodeId,
             scheduleTaskId: suggestion.scheduleTaskId,
             note: suggestion.note,
+            source: suggestion.source,
         };
     }
 
     if (uncostedPlannedTask) {
         return {
             mode: "uncosted",
+            taskId: uncostedPlannedTask.id,
             taskName: uncostedPlannedTask.name,
             note: uncostedPlannedTask.note,
         };
@@ -77,8 +82,58 @@ export function decideClockInDisplay(response: ClockInSuggestionResponse): Clock
             scheduleTaskId: suggestion.scheduleTaskId,
             note: suggestion.note,
             reason: suggestion.reason,
+            source: suggestion.source,
         };
     }
 
     return { mode: "none" };
+}
+
+// ── Clock-in POST audit fields ──────────────────────────────────────────────
+//
+// The clock-in form must submit suggestion audit fields that match what was
+// actually SHOWN and offered to the user, not the raw (possibly lower-tier,
+// unrelated) `suggestion` the API returned — a suppressed suggestion behind
+// an `uncosted` display must never be recorded as an accepted suggestion.
+// Mirrors POST /api/time-entries' accepted shape (src/app/api/time-entries/route.ts):
+// suggestedScheduleTaskId is re-validated server-side against the project, so
+// only an id needs to travel here — no need to also carry the task name.
+
+export interface ClockInAuditFields {
+    suggestedScheduleTaskId?: string;
+    suggestedCostCodeId?: string;
+    suggestionSource?: TimeSuggestionSource;
+    suggestionOverridden?: boolean;
+}
+
+/**
+ * Build the suggestion audit fields for the clock-in POST from the display
+ * decision actually shown to the user (never from the raw API response).
+ *   - "planned"/"suggested" — the shown suggestion's own fields; overridden
+ *     is true iff the selected phase differs from the suggestion's cost code.
+ *   - "uncosted" — nothing chargeable to compare against, so there's no
+ *     cost-code field to submit; the dispatched task id is still recorded
+ *     as accepted (there is no lower phase to fall back to and the user was
+ *     never shown one), tagged with source "dispatch".
+ *   - "none" — no suggestion was shown; nothing to submit.
+ */
+export function buildClockInAuditFields(decision: ClockInDisplay, selectedPhaseId: string): ClockInAuditFields {
+    switch (decision.mode) {
+        case "planned":
+        case "suggested":
+            return {
+                suggestedScheduleTaskId: decision.scheduleTaskId,
+                suggestedCostCodeId: decision.costCodeId,
+                suggestionSource: decision.source,
+                suggestionOverridden: selectedPhaseId !== decision.costCodeId,
+            };
+        case "uncosted":
+            return {
+                suggestedScheduleTaskId: decision.taskId,
+                suggestionSource: "dispatch",
+                suggestionOverridden: true,
+            };
+        case "none":
+            return {};
+    }
 }

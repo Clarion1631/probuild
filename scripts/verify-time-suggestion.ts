@@ -122,6 +122,33 @@ function verifyDispatchWinnerMixedChargeableAndUncosted(): void {
     console.log("PASS ranking: dispatch tie-break ranks chargeable and uncosted candidates together");
 }
 
+function verifyDispatchWinnerStableOnFullTie(): void {
+    // Same role, same startDate, same name (two schedule rows can share a
+    // name) — role/startDate/name all tie, so the comparator must not return
+    // 0 and fall out to DB order. `order` breaks it first...
+    const orderBreaksTie = pickDispatchWinner([
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 5, taskId: "z-later-id" },
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 2, taskId: "a-earlier-id" },
+    ]);
+    assert.equal(orderBreaksTie.taskId, "a-earlier-id");
+    assert.equal(orderBreaksTie.order, 2);
+
+    // ...and when order ALSO ties, task id is the final deterministic key —
+    // repeated calls on the same input must always pick the same winner.
+    const idBreaksTie = pickDispatchWinner([
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 2, taskId: "z-id" },
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 2, taskId: "a-id" },
+    ]);
+    assert.equal(idBreaksTie.taskId, "a-id");
+    const idBreaksTieReversed = pickDispatchWinner([
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 2, taskId: "a-id" },
+        { taskName: "Punch list", assignmentRole: "assigned", startDate: new Date("2026-08-20"), order: 2, taskId: "z-id" },
+    ]);
+    assert.equal(idBreaksTieReversed.taskId, "a-id");
+
+    console.log("PASS ranking: dispatch tie-break is fully deterministic (order, then task id, as final keys)");
+}
+
 function verifyResolveEstimateChargeableItems(): void {
     // Fixture graph: a coded parent with an uncoded leaf, on TWO separate
     // estimates (standing in for two different projects) — the batch
@@ -184,6 +211,7 @@ verifyCostCodeTokensMatch();
 verifyDistinctTokenCount();
 verifyDuplicateTokensDontStack();
 verifyDispatchWinnerMixedChargeableAndUncosted();
+verifyDispatchWinnerStableOnFullTie();
 verifyResolveEstimateChargeableItems();
 verifyWebhookUrlGuard();
 console.log("\nverify-time-suggestion: all checks passed");

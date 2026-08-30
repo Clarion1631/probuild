@@ -197,7 +197,7 @@ export function DispatchDayView({
                 // Hypothetical, not just "already conflicted" — someone on
                 // exactly one other job today still needs the warning, since
                 // adding them here is what WOULD create the collision.
-                conflictTitle: wouldCollide(member.id, { id: target.taskId, projectId: target.projectId }, allProjects, crewDrafts),
+                conflictTitle: wouldCollide(member.id, { id: target.taskId, projectId: target.projectId }, allProjects, crewDrafts, dayKey),
             }));
     }
 

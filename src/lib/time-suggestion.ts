@@ -372,6 +372,7 @@ export async function loadSuggestableTasks(
     const [tasks, { targetByItemId }] = await Promise.all([
         db.scheduleTask.findMany({
             where: { projectId },
+            orderBy: { order: "asc" },
             select: {
                 id: true,
                 name: true,
@@ -423,13 +424,26 @@ export async function loadSuggestableTasks(
 // ── Ranking ─────────────────────────────────────────────────────────────────
 
 /**
- * role "lead" first, then earliest startDate, then name — the dispatch
- * tie-break rule. Applied across ALL of the caller's active dispatched
- * assignments for today, chargeable or not — a lead assignment on an
- * uncosted task must be able to beat an ordinary chargeable one. Exported
- * for the pure regression test in scripts/verify-time-suggestion.ts.
+ * role "lead" first, then earliest startDate, then name, then schedule
+ * `order`, then task id — the dispatch tie-break rule. The last two keys
+ * exist only to make the sort deterministic when role/startDate/name are
+ * ALL equal (e.g. two same-named tasks split across schedule rows); without
+ * them the comparator returns 0 for that pair and the winner falls out to
+ * whatever order the DB happened to return, which can flip between calls.
+ * Applied across ALL of the caller's active dispatched assignments for
+ * today, chargeable or not — a lead assignment on an uncosted task must be
+ * able to beat an ordinary chargeable one. Exported for the pure regression
+ * test in scripts/verify-time-suggestion.ts.
  */
-export function pickDispatchWinner<T extends { assignmentRole?: string | null; startDate: Date; taskName?: string; name?: string }>(
+export function pickDispatchWinner<T extends {
+    assignmentRole?: string | null;
+    startDate: Date;
+    taskName?: string;
+    name?: string;
+    order?: number;
+    taskId?: string;
+    id?: string;
+}>(
     candidates: T[],
 ): T {
     return [...candidates].sort((a, b) => {
@@ -438,7 +452,11 @@ export function pickDispatchWinner<T extends { assignmentRole?: string | null; s
         if (aLead !== bLead) return aLead - bLead;
         const dateDiff = a.startDate.getTime() - b.startDate.getTime();
         if (dateDiff !== 0) return dateDiff;
-        return (a.taskName ?? a.name ?? "").localeCompare(b.taskName ?? b.name ?? "");
+        const nameDiff = (a.taskName ?? a.name ?? "").localeCompare(b.taskName ?? b.name ?? "");
+        if (nameDiff !== 0) return nameDiff;
+        const orderDiff = (a.order ?? 0) - (b.order ?? 0);
+        if (orderDiff !== 0) return orderDiff;
+        return (a.taskId ?? a.id ?? "").localeCompare(b.taskId ?? b.id ?? "");
     })[0];
 }
 
@@ -449,6 +467,8 @@ interface DispatchCandidate {
     startDate: Date;
     assignmentRole: string | null;
     doneWhen: string | null;
+    /** ScheduleTask.order — final stable tie-break key, after role/startDate/name. */
+    order: number;
     chargeable: boolean;
     /** Populated only when `chargeable` — the full suggestable row, for building the TimeSuggestion. */
     suggestable: SuggestableTask | null;
@@ -470,6 +490,7 @@ async function loadUncostedDispatchedCandidates(
     const [assigned, allTasks, { targetByItemId }] = await Promise.all([
         db.scheduleTask.findMany({
             where: { projectId, type: "task", status: { not: "Complete" }, assignments: { some: { userId } } },
+            orderBy: { order: "asc" },
             select: {
                 id: true,
                 name: true,
@@ -478,6 +499,7 @@ async function loadUncostedDispatchedCandidates(
                 type: true,
                 estimateItemId: true,
                 doneWhen: true,
+                order: true,
                 assignments: { where: { userId }, select: { role: true } },
             },
         }),
@@ -503,6 +525,7 @@ async function loadUncostedDispatchedCandidates(
             startDate: task.startDate,
             assignmentRole: task.assignments[0]?.role ?? null,
             doneWhen: task.doneWhen,
+            order: task.order,
             chargeable: false as const,
             suggestable: null,
         }));
@@ -534,6 +557,7 @@ async function loadDispatchCandidates(
             startDate: task.startDate,
             assignmentRole: task.assignmentRole,
             doneWhen: task.doneWhen,
+            order: task.order,
             chargeable: true,
             suggestable: task,
         }));

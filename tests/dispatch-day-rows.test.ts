@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    assertDispatchableTarget,
     buildDispatchDayCollisions,
     buildDispatchDayJobGroups,
     chipLabelsForRow,
@@ -33,6 +34,7 @@ function task(overrides: Partial<DispatchDayProjectInput["tasks"][number]> = {})
         name: "Hang drywall in hall bath",
         type: "task",
         parentId: null,
+        status: "Not Started",
         startDate: "2026-08-29T00:00:00.000Z",
         endDate: "2026-08-30T00:00:00.000Z",
         doneWhen: null,
@@ -510,23 +512,64 @@ test("buildDispatchDayCollisions: no drafts, no overlaps beyond same-project →
 // ── isDispatchableRow / notDispatchableReason ────────────────────────────
 
 test("isDispatchableRow: a plain leaf task is dispatchable", () => {
-    assert.equal(isDispatchableRow({ type: "task" }, false), true);
-    assert.equal(notDispatchableReason({ type: "task" }, false), null);
+    assert.equal(isDispatchableRow({ type: "task", status: "Not Started" }, false), true);
+    assert.equal(notDispatchableReason({ type: "task", status: "Not Started" }, false), null);
 });
 
 test("isDispatchableRow: a milestone is never dispatchable", () => {
-    assert.equal(isDispatchableRow({ type: "milestone" }, false), false);
-    assert.match(notDispatchableReason({ type: "milestone" }, false) ?? "", /Milestone/);
+    assert.equal(isDispatchableRow({ type: "milestone", status: "Not Started" }, false), false);
+    assert.match(notDispatchableReason({ type: "milestone", status: "Not Started" }, false) ?? "", /Milestone/);
 });
 
 test("isDispatchableRow: an appointment is never dispatchable", () => {
-    assert.equal(isDispatchableRow({ type: "appointment" }, false), false);
-    assert.match(notDispatchableReason({ type: "appointment" }, false) ?? "", /Appointment/);
+    assert.equal(isDispatchableRow({ type: "appointment", status: "Not Started" }, false), false);
+    assert.match(notDispatchableReason({ type: "appointment", status: "Not Started" }, false) ?? "", /Appointment/);
 });
 
 test("isDispatchableRow: a task type with children (a phase parent) is never dispatchable", () => {
-    assert.equal(isDispatchableRow({ type: "task" }, true), false);
-    assert.match(notDispatchableReason({ type: "task" }, true) ?? "", /sub-tasks/);
+    assert.equal(isDispatchableRow({ type: "task", status: "Not Started" }, true), false);
+    assert.match(notDispatchableReason({ type: "task", status: "Not Started" }, true) ?? "", /sub-tasks/);
+});
+
+test("isDispatchableRow: a completed task is never dispatchable — mirrors loadSuggestableTasks' status !== \"Complete\" rule", () => {
+    assert.equal(isDispatchableRow({ type: "task", status: "Complete" }, false), false);
+    assert.match(notDispatchableReason({ type: "task", status: "Complete" }, false) ?? "", /Completed/);
+});
+
+test("isDispatchableRow: a completed leaf with no children still reports the completed reason, not the sub-tasks one", () => {
+    assert.equal(isDispatchableRow({ type: "task", status: "Complete" }, false), false);
+    assert.doesNotMatch(notDispatchableReason({ type: "task", status: "Complete" }, false) ?? "", /sub-tasks/);
+});
+
+test("buildDispatchDayJobGroups: a completed task's row comes back non-dispatchable", () => {
+    const groups = buildDispatchDayJobGroups(
+        [project({ tasks: [task({ id: "t1", status: "Complete" })] })],
+        dayKey, {}, null, new Map(),
+    );
+    assert.equal(groups[0].rows[0].dispatchable, false);
+    assert.match(groups[0].rows[0].notDispatchableReason ?? "", /Completed/);
+});
+
+// ── assertDispatchableTarget ──────────────────────────────────────────────
+
+test("assertDispatchableTarget: a plain leaf task is a valid target", () => {
+    assert.equal(assertDispatchableTarget({ type: "task", status: "Not Started", hasChildren: false }), null);
+});
+
+test("assertDispatchableTarget: a milestone is refused", () => {
+    assert.match(assertDispatchableTarget({ type: "milestone", status: "Not Started", hasChildren: false }) ?? "", /Milestone/);
+});
+
+test("assertDispatchableTarget: an appointment is refused", () => {
+    assert.match(assertDispatchableTarget({ type: "appointment", status: "Not Started", hasChildren: false }) ?? "", /Appointment/);
+});
+
+test("assertDispatchableTarget: a completed task is refused", () => {
+    assert.match(assertDispatchableTarget({ type: "task", status: "Complete", hasChildren: false }) ?? "", /Completed/);
+});
+
+test("assertDispatchableTarget: a phase parent is refused", () => {
+    assert.match(assertDispatchableTarget({ type: "task", status: "Not Started", hasChildren: true }) ?? "", /sub-tasks/);
 });
 
 test("buildDispatchDayJobGroups: a phase parent's row comes back non-dispatchable with its children as leaves", () => {
@@ -578,7 +621,7 @@ test("wouldCollide: candidate on exactly one other job today → adding them her
     ];
     // u1 has exactly one job today (p2/t2) — no EXISTING collision pair yet,
     // but adding them to p1/t1 would create one.
-    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), "Mesplay");
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, dayKey), "Mesplay");
 });
 
 test("wouldCollide: candidate with no other assignment today → no collision", () => {
@@ -586,7 +629,7 @@ test("wouldCollide: candidate with no other assignment today → no collision", 
         project({ id: "p1", name: "Hoppe", tasks: [task({ id: "t1", assignments: [] })] }),
         project({ id: "p2", name: "Mesplay", tasks: [task({ id: "t2", assignments: [] })] }),
     ];
-    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), null);
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, dayKey), null);
 });
 
 test("wouldCollide: candidate already on the SAME job today → no collision (not a double-booking)", () => {
@@ -598,5 +641,39 @@ test("wouldCollide: candidate already on the SAME job today → no collision (no
             ] }),
         ] }),
     ];
-    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), null);
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, dayKey), null);
+});
+
+test("wouldCollide: candidate's overlap with another job is Friday-only → no warning on a Monday check (day-specific, not whole-window)", () => {
+    const monday = "2026-08-24";
+    const projects = [
+        project({ id: "p1", name: "Hoppe", tasks: [
+            // Multi-day task active both Monday and Friday.
+            task({ id: "t1", startDate: "2026-08-24T00:00:00.000Z", endDate: "2026-08-29T00:00:00.000Z", assignments: [] }),
+        ] }),
+        project({ id: "p2", name: "Mesplay", tasks: [
+            // u1 is on p2 only on Friday — never Monday.
+            task({ id: "t2", startDate: "2026-08-28T00:00:00.000Z", endDate: "2026-08-29T00:00:00.000Z", assignments: [
+                { userId: "u1", name: "Garrett", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true },
+            ] }),
+        ] }),
+    ];
+    // A whole-window check (the old behavior) would see p1/t1's Mon–Fri span
+    // overlap p2/t2's Friday slice and warn even on a Monday check —
+    // day-specific must not, since t2 isn't active on Monday at all.
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, monday), null);
+});
+
+test("wouldCollide: same-day overlap on the checked day → warning", () => {
+    const monday = "2026-08-24";
+    const projects = [
+        project({ id: "p1", name: "Hoppe", tasks: [
+            task({ id: "t1", startDate: "2026-08-24T00:00:00.000Z", endDate: "2026-08-25T00:00:00.000Z", assignments: [] }),
+        ] }),
+        project({ id: "p2", name: "Mesplay", tasks: [task({
+            id: "t2", startDate: "2026-08-24T00:00:00.000Z", endDate: "2026-08-29T00:00:00.000Z",
+            assignments: [{ userId: "u1", name: "Garrett", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true }],
+        })] }),
+    ];
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, monday), "Mesplay");
 });

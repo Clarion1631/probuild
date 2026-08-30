@@ -8,6 +8,7 @@
 import { isTaskActiveOnDay } from "./dispatch-exceptions";
 import { isDispatchable } from "@/lib/dispatch-roster";
 import { isConflictedDay } from "./availability";
+import { addDays, formatDate, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
 
 export interface DispatchDayCrewInput {
     id: string;
@@ -32,6 +33,8 @@ export interface DispatchDayTaskInput {
     type: string;
     /** Set on a sub-task; null on a top-level task. Used to tell a phase parent (has children) from a leaf — mirrors the `parentIds` check in time-suggestion.ts's loadSuggestableTasks. */
     parentId: string | null;
+    /** Mirrors time-suggestion.ts's loadSuggestableTasks `task.status === "Complete"` rejection — see isDispatchableRow. */
+    status: string;
     startDate: string;
     endDate: string;
     doneWhen: string | null;
@@ -172,23 +175,42 @@ export interface DispatchDayRow {
 /**
  * True when a task can actually be picked on a time card — mirrors the
  * candidate rule in src/lib/time-suggestion.ts's loadSuggestableTasks:
- * `type === "task"` (excludes milestone/appointment) and a leaf (excludes a
- * phase parent — `hasChildren` is true when some other task in the project
- * has this one as its parentId). Deliberately does NOT also require a
- * resolved cost code — DispatchDayRow already surfaces that separately via
- * `isCosted`/"not costed", and an uncosted-but-assignable task still reaches
- * a time card (it just doesn't charge anywhere yet).
+ * `type === "task"` (excludes milestone/appointment), `status !== "Complete"`
+ * (a finished task has nothing left to clock in against), and a leaf
+ * (excludes a phase parent — `hasChildren` is true when some other task in
+ * the project has this one as its parentId). Deliberately does NOT also
+ * require a resolved cost code — DispatchDayRow already surfaces that
+ * separately via `isCosted`/"not costed", and an uncosted-but-assignable
+ * task still reaches a time card (it just doesn't charge anywhere yet).
  */
-export function isDispatchableRow(task: Pick<DispatchDayTaskInput, "type">, hasChildren: boolean): boolean {
-    return task.type === "task" && !hasChildren;
+export function isDispatchableRow(task: Pick<DispatchDayTaskInput, "type" | "status">, hasChildren: boolean): boolean {
+    return task.type === "task" && task.status !== "Complete" && !hasChildren;
 }
 
 /** Why `isDispatchableRow` said no, for the row's muted tag title. Null when dispatchable. */
-export function notDispatchableReason(task: Pick<DispatchDayTaskInput, "type">, hasChildren: boolean): string | null {
+export function notDispatchableReason(task: Pick<DispatchDayTaskInput, "type" | "status">, hasChildren: boolean): string | null {
     if (task.type === "milestone") return "Milestone — has no time card to assign to.";
     if (task.type === "appointment") return "Appointment — has no time card to assign to.";
+    if (task.status === "Complete") return "Completed — has no time card to assign to.";
     if (hasChildren) return "Has sub-tasks — assign to the sub-tasks instead.";
     return null;
+}
+
+/** Task shape `assertDispatchableTarget` needs — `hasChildren` precomputed by the caller (scoped to the task's own project's task list, same as `isDispatchableRow`/`notDispatchableReason`). */
+export interface DispatchTargetTask extends Pick<DispatchDayTaskInput, "type" | "status"> {
+    hasChildren: boolean;
+}
+
+/**
+ * Pure guard for a crew-draft add: the reason `task` can't be dispatched
+ * (same wording as `notDispatchableReason`), or null when it's a valid
+ * target. Used by the draft writer (ScheduleBoard's `onDraftCrewAdd`) to
+ * refuse adding crew onto a milestone, appointment, completed task, or phase
+ * parent instead of silently drafting an assignment that can never reach a
+ * time card.
+ */
+export function assertDispatchableTarget(task: DispatchTargetTask): string | null {
+    return notDispatchableReason(task, task.hasChildren);
 }
 
 /** parentId → "has at least one child" set, scoped to one project's task list. */
@@ -544,24 +566,34 @@ export function collisionDelta(
 /**
  * Hypothetical collision check for the assign popover: "if `candidateUserId`
  * were added to `task` right now, would that create or worsen a collision on
- * this day?" — unlike findConflictOtherProject (which only flags someone
- * ALREADY double-booked from an existing collision pair), this evaluates the
- * candidate against every other project's draft-applied crew even when they
- * currently have exactly one job today and adding this one would be their
- * first collision. Reuses the same finalTaskUserIds/findReviewCollisions
- * machinery buildDispatchDayCollisions does, with the candidate injected
- * onto `task`'s final crew. Returns the other job's name for the "Also on
- * <job> today" hint, or null when no collision would result.
+ * `dayKey` specifically?" — unlike findConflictOtherProject (which only
+ * flags someone ALREADY double-booked from an existing collision pair), this
+ * evaluates the candidate against every other project's draft-applied crew
+ * even when they currently have exactly one job today and adding this one
+ * would be their first collision. Reuses the same
+ * finalTaskUserIds/findReviewCollisions machinery buildDispatchDayCollisions
+ * does, with the candidate injected onto `task`'s final crew — but every
+ * task's window is clipped down to just `dayKey` (only tasks active that day
+ * are considered at all, per isTaskActiveOnDay) so a multi-day task's
+ * overlap on a DIFFERENT day (e.g. a Friday-only clash on a task that also
+ * runs Monday) never surfaces a warning on a day it doesn't actually
+ * conflict. (The review dialog's own window-based check, over the task's
+ * full multi-day span, is unaffected — see findReviewCollisions.) Returns
+ * the other job's name for the "Also on <job> today" hint, or null when no
+ * collision would result.
  */
 export function wouldCollide(
     candidateUserId: string,
     task: Pick<DispatchDayTaskInput, "id"> & { projectId: string },
     allProjects: readonly DispatchDayProjectInput[],
     crewDrafts: Readonly<Record<string, DispatchDayCrewDraft>>,
+    dayKey: string,
 ): string | null {
+    const nextDayKey = formatDate(addDays(parseUTCDate(dayKey), 1));
     const tasks: DispatchReviewTaskInput[] = [];
     for (const project of allProjects) {
         for (const projectTask of project.tasks) {
+            if (!isTaskActiveOnDay(projectTask, dayKey)) continue;
             const finalIds = finalTaskUserIds(projectTask, crewDrafts[projectTask.id]);
             const userIds = projectTask.id === task.id && !finalIds.includes(candidateUserId)
                 ? [...finalIds, candidateUserId]
@@ -571,8 +603,9 @@ export function wouldCollide(
                 projectId: project.id,
                 projectName: project.name,
                 name: projectTask.name,
-                startDate: projectTask.startDate,
-                endDate: projectTask.endDate,
+                // Clipped to just this one day — see doc comment above.
+                startDate: dayKey,
+                endDate: nextDayKey,
                 savedUserIds: userIds,
             });
         }

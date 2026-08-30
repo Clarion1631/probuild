@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideClockInDisplay, type ClockInSuggestionResponse } from "../src/lib/time-suggestion-display";
+import { decideClockInDisplay, buildClockInAuditFields, type ClockInSuggestionResponse } from "../src/lib/time-suggestion-display";
 import type { TimeSuggestion } from "../src/lib/time-suggestion";
 
 function suggestion(overrides: Partial<TimeSuggestion> = {}): TimeSuggestion {
@@ -100,4 +100,78 @@ test("nothing at all -> mode 'none'", () => {
     const response: ClockInSuggestionResponse = { suggestion: null, uncostedPlannedTask: null };
     const display = decideClockInDisplay(response);
     assert.equal(display.mode, "none");
+});
+
+// ── buildClockInAuditFields — the POST payload must match the display, not the raw API response ──
+
+test("audit fields: mode 'planned', selected phase matches -> accepted, not overridden", () => {
+    const response: ClockInSuggestionResponse = {
+        suggestion: suggestion({ plannedByOffice: true, source: "dispatch" }),
+        uncostedPlannedTask: null,
+    };
+    const display = decideClockInDisplay(response);
+    const fields = buildClockInAuditFields(display, "code-1");
+    assert.deepEqual(fields, {
+        suggestedScheduleTaskId: "task-1",
+        suggestedCostCodeId: "code-1",
+        suggestionSource: "dispatch",
+        suggestionOverridden: false,
+    });
+});
+
+test("audit fields: mode 'planned', user picked a different phase -> recorded as overridden", () => {
+    const response: ClockInSuggestionResponse = {
+        suggestion: suggestion({ plannedByOffice: true, source: "dispatch" }),
+        uncostedPlannedTask: null,
+    };
+    const display = decideClockInDisplay(response);
+    const fields = buildClockInAuditFields(display, "some-other-phase");
+    assert.equal(fields.suggestionOverridden, true);
+    assert.equal(fields.suggestedScheduleTaskId, "task-1");
+    assert.equal(fields.suggestedCostCodeId, "code-1");
+    assert.equal(fields.suggestionSource, "dispatch");
+});
+
+test("audit fields: mode 'suggested' carries the suggestion's own source, not 'dispatch'", () => {
+    const response: ClockInSuggestionResponse = {
+        suggestion: suggestion({ plannedByOffice: false, source: "today_schedule", costCodeId: "code-3" }),
+        uncostedPlannedTask: null,
+    };
+    const display = decideClockInDisplay(response);
+    const fields = buildClockInAuditFields(display, "code-3");
+    assert.deepEqual(fields, {
+        suggestedScheduleTaskId: "task-1",
+        suggestedCostCodeId: "code-3",
+        suggestionSource: "today_schedule",
+        suggestionOverridden: false,
+    });
+});
+
+test("audit fields: mode 'uncosted' records the dispatched task, never the hidden lower-tier suggestion", () => {
+    // This is the gate bug: previously the raw `suggestion` (daily_log,
+    // unrelated) was submitted with suggestionOverridden: false, recording an
+    // unrelated fallback as an accepted plan.
+    const response: ClockInSuggestionResponse = {
+        suggestion: suggestion({
+            plannedByOffice: false,
+            source: "daily_log",
+            taskName: "Unrelated log-matched task",
+            costCodeId: "code-unrelated",
+        }),
+        uncostedPlannedTask: { id: "task-2", name: "Drywall start", note: null },
+    };
+    const display = decideClockInDisplay(response);
+    const fields = buildClockInAuditFields(display, "whatever-phase-user-picked");
+    assert.equal(fields.suggestedScheduleTaskId, "task-2");
+    assert.equal(fields.suggestionSource, "dispatch");
+    assert.equal(fields.suggestionOverridden, true);
+    assert.equal(fields.suggestedCostCodeId, undefined);
+    assert.notEqual(fields.suggestedScheduleTaskId, "task-1"); // never the suppressed suggestion's task
+});
+
+test("audit fields: mode 'none' submits nothing", () => {
+    const response: ClockInSuggestionResponse = { suggestion: null, uncostedPlannedTask: null };
+    const display = decideClockInDisplay(response);
+    const fields = buildClockInAuditFields(display, "some-phase");
+    assert.deepEqual(fields, {});
 });
