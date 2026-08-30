@@ -4,7 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
 import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
-import { collisionDelta, findReviewCollisions, type DispatchReviewCrewChangeInput, type DispatchReviewTaskInput } from "./dispatch-day-rows";
+import { applyReviewChangesToTasks, collisionDelta, findReviewCollisions, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
@@ -79,23 +79,6 @@ function crewChangeRows(
     return rows.length > 0 ? rows : [{ key: "crew", summary: change.summary }];
 }
 
-/**
- * Every TASK_CREW change in the review, reduced to the shape
- * findReviewCollisions wants: the task's final crew AFTER the draft. This
- * overrides that task's canonical `savedUserIds` for the collision scan, so
- * a task touched twice in the same review (or two different tasks each
- * gaining a drafted add) are both checked against their real final state.
- */
-function crewChangesFromResult(result: PublishDispatchSuccess | null): DispatchReviewCrewChangeInput[] {
-    if (!result) return [];
-    return result.changes
-        .filter((change): change is DispatchChange & { kind: "TASK_CREW" } => change.kind === "TASK_CREW")
-        .map(change => ({
-            taskId: change.targetId,
-            afterUserIds: assignmentsFromChange(change.after.assignments).map(a => a.userId),
-        }));
-}
-
 export function DispatchReviewDialog({
     result,
     published,
@@ -114,15 +97,17 @@ export function DispatchReviewDialog({
     ) ?? [];
     const changeCount = reviewRows.length;
     const deliveryCount = result?.deliveryCount ?? 0;
-    const crewChanges = crewChangesFromResult(result);
-    // Compare the canonical, pre-review state (no crewChanges overlay)
-    // against the review's final state (crewChanges applied) and flag only
-    // collisions THIS review introduces or worsens — a pre-existing
-    // double-booking the review leaves untouched, or one a drafted removal
-    // resolves, isn't this review's problem to surface. See
-    // dispatch-day-rows.ts's collisionDelta for the identity semantics.
+    // Compare the canonical, pre-review state against the review's FINAL
+    // state — every reviewed change kind (TASK_DATES, PROJECT_START,
+    // TASK_CREW) applied on top of the canonical snapshot via
+    // applyReviewChangesToTasks — and flag only collisions THIS review
+    // introduces or worsens. A pre-existing double-booking the review
+    // leaves untouched, or one a drafted removal resolves, isn't this
+    // review's problem to surface. See dispatch-day-rows.ts's
+    // collisionDelta for the identity semantics.
+    const finalTasks = applyReviewChangesToTasks(tasks, result?.changes ?? []);
     const canonicalCollisions = findReviewCollisions(tasks);
-    const finalCollisions = findReviewCollisions(tasks, crewChanges);
+    const finalCollisions = findReviewCollisions(finalTasks);
     const newCollisions = collisionDelta(canonicalCollisions, finalCollisions);
     const hasCollision = newCollisions.length > 0;
 

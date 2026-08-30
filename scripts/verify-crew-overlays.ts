@@ -136,15 +136,22 @@ async function main() {
     });
     await prisma.estimateItem.create({ data: { estimateId: estimateH.id, name: "Only line", type: "Material", quantity: 1, total: 100, order: 0 } });
 
-    // Conflict fixtures (e).
+    // Conflict fixtures (e). C2/C3 carry ONLY project-level crew membership
+    // (no ScheduleTask, no TaskAssignment) — the "on job crew, no task" soft
+    // signal, which must never itself manufacture a conflict. C4 gets a real
+    // overlapping TaskAssignment against projectG's taskA1 to prove the
+    // task-based rule still fires.
     const projectC2 = await prisma.project.create({
         data: { name: "Crew verify C2 — delete me", clientId: client.id, status: "Waiting to Start", startDate: new Date(base + 10 * DAY), crew: { connect: { id: userA.id } } },
     });
     const projectC3 = await prisma.project.create({
         data: { name: "Crew verify C3 — delete me", clientId: client.id, status: "Waiting to Start", startDate: new Date(base + 60 * DAY), crew: { connect: { id: userA.id } } },
     });
+    const projectC4 = await prisma.project.create({
+        data: { name: "Crew verify C4 — delete me", clientId: client.id, status: "Waiting to Start", startDate: new Date(base) },
+    });
 
-    const allProjectIds = [projectG.id, projectM.id, projectF.id, projectF2.id, projectH.id, projectC2.id, projectC3.id];
+    const allProjectIds = [projectG.id, projectM.id, projectF.id, projectF2.id, projectH.id, projectC2.id, projectC3.id, projectC4.id];
 
     try {
         // ── (a) generation: structure, dates, provenance, links; merge idempotent ──
@@ -278,15 +285,30 @@ async function main() {
         checks.push(["(d) picker list is ACTIVATED-filtered",
             (dashAdminForPicker.teamMembers ?? []).some(u => u.id === userA.id) && !(dashAdminForPicker.teamMembers ?? []).some(u => u.id === userB.id)]);
 
-        // ── (e) crew conflicts ──
+        // ── (e) crew conflicts — TaskAssignment windows ONLY, never project-crew membership ──
+        // C2/C3 share userA on project-level crew with projectG, with NO task
+        // assignment anywhere on them — the auto-crew rule puts every
+        // dispatchable user on every In Progress project, so treating that
+        // membership itself as a scheduling window would flag the whole
+        // roster whenever two active projects' date ranges merely overlap.
+        const taskC4 = await prisma.scheduleTask.create({
+            data: { projectId: projectC4.id, name: "C4 overlapping task", startDate: new Date(base + 5 * DAY), endDate: new Date(base + 20 * DAY) },
+        });
+        await prisma.taskAssignment.create({ data: { taskId: taskA1.id, userId: userA.id } });
+        await prisma.taskAssignment.create({ data: { taskId: taskC4.id, userId: userA.id } });
+
         const conflicts = await getCrewConflicts(new Date(base), new Date(base + 90 * DAY));
         const conflictA = conflicts.find(c => c.userId === userA.id);
-        checks.push(["(e) overlapping two-project crew flagged",
+        checks.push(["(e) two projects sharing a crew member with NO task assignments produce zero conflicts",
+            !conflicts.some(c => c.pairs.some(pr =>
+                [pr.projectA.id, pr.projectB.id].includes(projectC2.id) ||
+                [pr.projectA.id, pr.projectB.id].includes(projectC3.id)))]);
+        checks.push(["(e) overlapping TaskAssignment windows on different projects flagged",
             !!conflictA && conflictA.pairs.some(pr =>
-                (pr.projectA.id === projectG.id && pr.projectB.id === projectC2.id) ||
-                (pr.projectA.id === projectC2.id && pr.projectB.id === projectG.id))]);
-        checks.push(["(e) non-overlapping project not flagged",
-            !conflicts.some(c => c.pairs.some(pr => pr.projectA.id === projectC3.id || pr.projectB.id === projectC3.id))]);
+                (pr.projectA.id === projectG.id && pr.projectB.id === projectC4.id) ||
+                (pr.projectA.id === projectC4.id && pr.projectB.id === projectG.id))]);
+        checks.push(["(e) flagged conflict pair carries taskA/taskB (task-based, no fallback pairs exist)",
+            !!conflictA && conflictA.pairs.every(pr => !!pr.taskA && !!pr.taskB)]);
 
         // ── (d2) inactive assigned crew member is a removable picker entry ──
         await prisma.project.update({ where: { id: projectH.id }, data: { crew: { connect: [{ id: userA.id }, { id: userC.id }] } } });

@@ -10,6 +10,7 @@ const BASE_URL = "http://localhost:3000";
 
 const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
 const COST_CODE_DEMO_ID = "e2e-mob-cc-demo";
+const COST_CODE_DRYW_ID = "e2e-mob-cc-dryw";
 const MOBILE_ITEM_DEMO_ID = "e2e-mob-item-demo";
 const MOBILE_TASK_DRYW_ID = "e2e-mob-task-dryw";
 const FIELD_CREW_EMAIL = "field-crew@test.local";
@@ -156,6 +157,76 @@ test.describe.serial("Mobile API contract", () => {
 
         await prisma.timeEntry.delete({ where: { id: created.id } });
         createdEntryIds.delete(created.id);
+    });
+
+    // Gate P2: server-side provenance of the suggestion audit fields.
+    // MOBILE_TASK_DRYW_ID is upserted in data.setup.ts as active "today" and
+    // assigned to the field-crew fixture user, resolving to COST_CODE_DRYW_ID
+    // via MOBILE_ITEM_DRYW_ID — real ground truth to check the server's
+    // confirm/downgrade behaviour against.
+    test("POST /api/time-entries — accepted dispatch suggestion is persisted as-is", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                suggestedCostCodeId: COST_CODE_DRYW_ID,
+                suggestionSource: "dispatch",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestionSource).toBe("dispatch");
+        expect(created.suggestedCostCodeId).toBe(COST_CODE_DRYW_ID);
+        expect(created.suggestedScheduleTaskId).toBe(MOBILE_TASK_DRYW_ID);
+    });
+
+    test("POST /api/time-entries — forged dispatch source (caller not assigned to the named task) is downgraded to null", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                // A schedule task id the field-crew fixture user has no
+                // TaskAssignment on (and that may not even resolve) — the
+                // server must never persist a "planned by office" claim it
+                // cannot itself confirm.
+                suggestedScheduleTaskId: "e2e-mob-task-not-assigned-to-crew",
+                suggestionSource: "dispatch",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestionSource).toBe(null);
+    });
+
+    test("POST /api/time-entries — forged suggestedCostCodeId (disagrees with the task's real cost code) is downgraded to null", async () => {
+        const postRes = await api.post("/api/time-entries", {
+            data: {
+                projectId: PROJECT_ID,
+                estimateItemId: MOBILE_ITEM_DEMO_ID,
+                startTime: new Date().toISOString(),
+                suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
+                // Real cost code for this task is COST_CODE_DRYW_ID — this claims a different one.
+                suggestedCostCodeId: COST_CODE_DEMO_ID,
+                suggestionSource: "today_schedule",
+            },
+            headers: { authorization: `Bearer ${fieldCrewToken}` },
+        });
+        expect(postRes.ok(), await postRes.text()).toBeTruthy();
+        const created = await postRes.json();
+        createdEntryIds.add(created.id);
+
+        expect(created.suggestedCostCodeId).toBe(null);
+        // Non-dispatch sources aren't subject to the assignment check.
+        expect(created.suggestionSource).toBe("today_schedule");
     });
 
     test("PUT — FIELD_CREW cannot edit another user's entry -> 403", async () => {

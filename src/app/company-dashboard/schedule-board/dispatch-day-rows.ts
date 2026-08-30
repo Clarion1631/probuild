@@ -9,6 +9,7 @@ import { isTaskActiveOnDay } from "./dispatch-exceptions";
 import { isDispatchable } from "@/lib/dispatch-roster";
 import { isConflictedDay } from "./availability";
 import { addDays, formatDate, parseUTCDate } from "@/app/projects/[id]/schedule/schedule-utils";
+import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
 
 export interface DispatchDayCrewInput {
     id: string;
@@ -466,6 +467,93 @@ export interface DispatchReviewCrewChangeInput {
  * uses, so downstream consumers (findConflictOtherProject) don't need to know
  * which source produced their conflict data.
  */
+function toIsoDayString(yyyyMmDd: string): string {
+    return `${yyyyMmDd}T00:00:00.000Z`;
+}
+
+/** Shifts an ISO day string (either bare "YYYY-MM-DD" or full "…T00:00:00.000Z") by `days`, always returning the full ISO form — keeps every DispatchReviewTaskInput date in the one format findReviewCollisions compares as plain strings. */
+function shiftIsoDate(value: string, days: number): string {
+    if (days === 0) return toIsoDayString(value.slice(0, 10));
+    return toIsoDayString(formatDate(addDays(parseUTCDate(value.slice(0, 10)), days)));
+}
+
+function dayDeltaBetween(before: string, after: string): number {
+    const beforeMs = parseUTCDate(before.slice(0, 10)).getTime();
+    const afterMs = parseUTCDate(after.slice(0, 10)).getTime();
+    return Math.round((afterMs - beforeMs) / 86_400_000);
+}
+
+function crewUserIdsFromChange(change: DispatchChange): string[] {
+    const value = change.after.assignments;
+    if (!Array.isArray(value)) return [];
+    return value
+        .filter((row): row is DispatchAssignment =>
+            Boolean(row)
+            && typeof row === "object"
+            && "userId" in row
+            && typeof (row as { userId?: unknown }).userId === "string")
+        .map(row => row.userId);
+}
+
+/**
+ * Builds the review's FINAL task snapshot by applying every reviewed change
+ * kind on top of `tasks` (the canonical, currently-saved snapshot) — the
+ * input findReviewCollisions needs to catch a collision that a TASK_DATES
+ * move or a PROJECT_START shift introduces, not just one from a TASK_CREW
+ * change. Without this, only crew changes were overlaid and a task moved
+ * into another job's window by a reviewed date/project change could publish
+ * with no warning even though it now double-books someone.
+ *
+ * Applied in the same precedence buildDispatchPlan itself uses: a
+ * PROJECT_START shifts every task of that project by the before→after start
+ * delta first, then a TASK_DATES change overrides that task's dates
+ * outright (it's already the plan's final absolute date, not a further
+ * delta), then TASK_CREW overrides that task's crew. A change naming a task
+ * not present in `tasks` is ignored — the collision scan simply won't see
+ * it, matching a task the caller didn't include in the first place.
+ */
+export function applyReviewChangesToTasks(
+    tasks: readonly DispatchReviewTaskInput[],
+    changes: readonly DispatchChange[],
+): DispatchReviewTaskInput[] {
+    const byId = new Map(tasks.map(task => [task.id, { ...task }]));
+
+    for (const change of changes) {
+        if (change.kind !== "PROJECT_START") continue;
+        const beforeStart = typeof change.before.startDate === "string" ? change.before.startDate : null;
+        const afterStart = typeof change.after.startDate === "string" ? change.after.startDate : null;
+        if (!beforeStart || !afterStart) continue;
+        const shiftDays = dayDeltaBetween(beforeStart, afterStart);
+        if (shiftDays === 0) continue;
+        for (const task of byId.values()) {
+            if (task.projectId !== change.projectId) continue;
+            byId.set(task.id, {
+                ...task,
+                startDate: shiftIsoDate(task.startDate, shiftDays),
+                endDate: shiftIsoDate(task.endDate, shiftDays),
+            });
+        }
+    }
+
+    for (const change of changes) {
+        if (change.kind !== "TASK_DATES") continue;
+        const task = byId.get(change.targetId);
+        if (!task) continue;
+        const startDate = typeof change.after.startDate === "string" ? change.after.startDate : task.startDate;
+        const endDate = typeof change.after.endDate === "string" ? change.after.endDate : task.endDate;
+        byId.set(task.id, { ...task, startDate: toIsoDayString(startDate.slice(0, 10)), endDate: toIsoDayString(endDate.slice(0, 10)) });
+    }
+
+    for (const change of changes) {
+        if (change.kind !== "TASK_CREW") continue;
+        const task = byId.get(change.targetId);
+        if (!task) continue;
+        byId.set(task.id, { ...task, savedUserIds: crewUserIdsFromChange(change) });
+    }
+
+    return [...byId.values()];
+}
+
 export function findReviewCollisions(
     tasks: readonly DispatchReviewTaskInput[],
     crewChanges: readonly DispatchReviewCrewChangeInput[] = [],

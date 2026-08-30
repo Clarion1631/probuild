@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    applyReviewChangesToTasks,
     assertDispatchableTarget,
     buildDispatchDayCollisions,
     buildDispatchDayJobGroups,
@@ -25,6 +26,7 @@ import {
     type DispatchDayProjectInput,
     type DispatchReviewTaskInput,
 } from "../src/app/company-dashboard/schedule-board/dispatch-day-rows";
+import type { DispatchChange } from "../src/lib/dispatch-intent";
 
 const dayKey = "2026-08-29";
 
@@ -404,6 +406,106 @@ test("findReviewCollisions: no tasks/no shared users → empty", () => {
         reviewTask({ id: "t1", projectId: "p1", savedUserIds: ["u1"] }),
         reviewTask({ id: "t2", projectId: "p2", savedUserIds: ["u2"] }),
     ]), []);
+});
+
+// ── applyReviewChangesToTasks ────────────────────────────────────────────
+
+function dateChange(overrides: Partial<DispatchChange> = {}): DispatchChange {
+    return {
+        projectId: "p2",
+        targetType: "TASK",
+        targetId: "t2",
+        kind: "TASK_DATES",
+        before: { startDate: "2026-09-05", endDate: "2026-09-06" },
+        after: { startDate: "2026-08-29", endDate: "2026-08-30" },
+        summary: "",
+        ...overrides,
+    };
+}
+
+test("applyReviewChangesToTasks: a TASK_DATES move that lands a task inside another job's window is caught as a new collision", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-05T00:00:00.000Z", endDate: "2026-09-06T00:00:00.000Z", savedUserIds: ["u1"] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []); // no overlap yet — t2 is in September
+
+    const changes: DispatchChange[] = [dateChange()]; // moves t2 onto t1's window, same crew
+    const finalTasks = applyReviewChangesToTasks(tasks, changes);
+    const movedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.equal(movedTask.startDate, "2026-08-29T00:00:00.000Z");
+    assert.equal(movedTask.endDate, "2026-08-30T00:00:00.000Z");
+
+    const final = findReviewCollisions(finalTasks);
+    const delta = collisionDelta(canonical, final);
+    assert.equal(delta.length, 1);
+    assert.equal(delta[0].userId, "u1");
+});
+
+test("applyReviewChangesToTasks: a PROJECT_START shift that lands a project's task inside another job's window is caught as a new collision", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", startDate: "2026-08-29T00:00:00.000Z", endDate: "2026-08-30T00:00:00.000Z", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", startDate: "2026-09-05T00:00:00.000Z", endDate: "2026-09-06T00:00:00.000Z", savedUserIds: ["u1"] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []);
+
+    // Whole-project move: p2 shifts 7 days earlier, dragging t2 with it
+    // (mirrors buildDispatchPlan's ALL_TASKS shift) onto t1's window.
+    const changes: DispatchChange[] = [{
+        projectId: "p2",
+        targetType: "PROJECT",
+        targetId: "p2",
+        kind: "PROJECT_START",
+        before: { startDate: "2026-09-05", endDate: null },
+        after: { startDate: "2026-08-29", endDate: null },
+        summary: "",
+    }];
+    const finalTasks = applyReviewChangesToTasks(tasks, changes);
+    const shiftedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.equal(shiftedTask.startDate, "2026-08-29T00:00:00.000Z");
+    assert.equal(shiftedTask.endDate, "2026-08-30T00:00:00.000Z");
+
+    const final = findReviewCollisions(finalTasks);
+    const delta = collisionDelta(canonical, final);
+    assert.equal(delta.length, 1);
+    assert.equal(delta[0].userId, "u1");
+});
+
+test("applyReviewChangesToTasks: a TASK_CREW-only change keeps prior collisionDelta behaviour unchanged", () => {
+    const tasks = [
+        reviewTask({ id: "t1", projectId: "p1", projectName: "Hoppe", savedUserIds: ["u1"] }),
+        reviewTask({ id: "t2", projectId: "p2", projectName: "Mesplay", savedUserIds: [] }),
+    ];
+    const canonical = findReviewCollisions(tasks);
+    assert.deepEqual(canonical, []);
+
+    const changes: DispatchChange[] = [{
+        projectId: "p2",
+        targetType: "TASK",
+        targetId: "t2",
+        kind: "TASK_CREW",
+        before: { assignments: [] },
+        after: { assignments: [{ userId: "u1", role: "assigned" }] },
+        summary: "",
+    }];
+    const finalTasks = applyReviewChangesToTasks(tasks, changes);
+    const crewedTask = finalTasks.find(task => task.id === "t2")!;
+    assert.deepEqual(crewedTask.savedUserIds, ["u1"]);
+    // Dates are untouched by a crew-only change.
+    assert.equal(crewedTask.startDate, tasks[1].startDate);
+
+    const final = findReviewCollisions(finalTasks);
+    const delta = collisionDelta(canonical, final);
+    assert.equal(delta.length, 1);
+    assert.equal(delta[0].userId, "u1");
+});
+
+test("applyReviewChangesToTasks: a change naming a task not in the snapshot is ignored, not thrown", () => {
+    const tasks = [reviewTask({ id: "t1", projectId: "p1", savedUserIds: ["u1"] })];
+    const changes: DispatchChange[] = [dateChange({ targetId: "ghost", projectId: "p9" })];
+    assert.deepEqual(applyReviewChangesToTasks(tasks, changes), tasks);
 });
 
 // ── collisionDelta ────────────────────────────────────────────────────────

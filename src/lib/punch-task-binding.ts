@@ -18,7 +18,14 @@ export type PunchBindingBasis =
     /** Punch carries an estimateItemId mapping 1:1 to a LEAF task. Strongest signal. */
     | "estimateItem"
     /** Exactly one active assigned non-complete leaf task on the punch's local day. */
-    | "soleAssignedTask";
+    | "soleAssignedTask"
+    /**
+     * Several active assigned leaf tasks tied ("ambiguous"), but the caller's
+     * accepted dispatch suggestion names one of them — the dispatch ranking
+     * already broke that same tie for the picker, so trust its pick instead
+     * of dropping the binding.
+     */
+    | "acceptedSuggestion";
 
 export type PunchBindingSkipReason =
     /** No eligible task at all for this user/project/day. */
@@ -42,6 +49,15 @@ export interface PunchBindingInput {
     dayKey: string;
     /** Budget bucket chosen at clock-in, when the surface collects one. */
     estimateItemId?: string | null;
+    /**
+     * The scheduleTaskId the client claims dispatch suggested and the crew
+     * member accepted (request body `suggestedScheduleTaskId`). Only ever
+     * used to break a tie among the SAME candidate set the ambiguous case
+     * already computed (assigned to this user, active on this day, on this
+     * project) — never trusted to widen who or what can bind. See the
+     * "acceptedSuggestion" basis above.
+     */
+    suggestedScheduleTaskId?: string | null;
 }
 
 export type PunchBindingResult =
@@ -66,7 +82,7 @@ export async function resolveScheduleTaskForPunch(
     input: PunchBindingInput,
     db: DbClient = prisma,
 ): Promise<PunchBindingResult> {
-    const { userId, projectId, dayKey, estimateItemId } = input;
+    const { userId, projectId, dayKey, estimateItemId, suggestedScheduleTaskId } = input;
 
     const projectTasks = await db.scheduleTask.findMany({
         where: { projectId },
@@ -117,6 +133,15 @@ export async function resolveScheduleTaskForPunch(
     const candidateIds = candidates.map(task => task.id);
     if (candidateIds.length === 1) {
         return { taskId: candidateIds[0], basis: "soleAssignedTask", candidateIds };
+    }
+    // Multiple tied candidates: the ambiguity is exactly what dispatch's own
+    // ranking already resolved for the picker (pickDispatchWinner in
+    // time-suggestion.ts). If the caller's punch names that winner, it is
+    // still a member of `candidates` — same assigned/active/on-this-project
+    // filter above — so binding to it never trusts anything the query above
+    // didn't already verify itself.
+    if (candidateIds.length > 1 && suggestedScheduleTaskId && candidateIds.includes(suggestedScheduleTaskId)) {
+        return { taskId: suggestedScheduleTaskId, basis: "acceptedSuggestion", candidateIds };
     }
     return {
         taskId: null,
