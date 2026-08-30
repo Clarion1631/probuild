@@ -170,6 +170,7 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 suggestedCostCodeId: COST_CODE_DRYW_ID,
                 suggestionSource: "dispatch",
@@ -191,6 +192,7 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 // A schedule task id the field-crew fixture user has no
                 // TaskAssignment on (and that may not even resolve) — the
                 // server must never persist a "planned by office" claim it
@@ -213,6 +215,7 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 // Real cost code for this task is COST_CODE_DRYW_ID — this claims a different one.
                 suggestedCostCodeId: COST_CODE_DEMO_ID,
@@ -279,6 +282,7 @@ test.describe.serial("Mobile API contract", () => {
                 data: {
                     projectId: PROJECT_ID,
                     startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                     suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID, // the real dispatch winner
                     suggestionSource: "dispatch",
                     suggestionOverridden: false,
@@ -298,6 +302,7 @@ test.describe.serial("Mobile API contract", () => {
                 data: {
                     projectId: PROJECT_ID,
                     startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                     // Names the real dispatch winner, but the crew member
                     // rejected it and picked their own task instead.
                     suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
@@ -322,6 +327,7 @@ test.describe.serial("Mobile API contract", () => {
                 data: {
                     projectId: PROJECT_ID,
                     startTime: new Date().toISOString(),
+                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                     // EXTRA_TASK_ID is a real candidate (assigned + active),
                     // but it is NOT the dispatch winner (MOBILE_TASK_DRYW_ID's
                     // earlier startDate wins the tie-break) — a caller cannot
