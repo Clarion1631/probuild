@@ -5,7 +5,7 @@ import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
-import { resolveChargeableItems } from "./time-suggestion";
+import { resolveChargeableItemsForProjects } from "./time-suggestion";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
@@ -2381,28 +2381,29 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches, chargeableTargetsByProject] = await Promise.all([
-        prisma.scheduleTask.findMany({
-            where: { projectId: { in: rowIds } },
-            orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
-            select: {
-                id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
-                doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
-                estimateItemId: true,
-                assignments: {
-                    orderBy: { createdAt: "asc" },
-                    select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
-                },
-                // Hover-card notes (item 3): capped at 2, newest first — same
-                // audience as the project schedule page's own comment thread
-                // (not money, no extra gate).
-                comments: {
-                    orderBy: { createdAt: "desc" },
-                    take: 2,
-                    select: { text: true, createdAt: true, subcontractorName: true, user: { select: { name: true, email: true } } },
-                },
+    const taskRowsPromise = prisma.scheduleTask.findMany({
+        where: { projectId: { in: rowIds } },
+        orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
+        select: {
+            id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
+            doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
+            estimateItemId: true,
+            assignments: {
+                orderBy: { createdAt: "asc" },
+                select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
             },
-        }),
+            // Hover-card notes (item 3): capped at 2, newest first — same
+            // audience as the project schedule page's own comment thread
+            // (not money, no extra gate).
+            comments: {
+                orderBy: { createdAt: "desc" },
+                take: 2,
+                select: { text: true, createdAt: true, subcontractorName: true, user: { select: { name: true, email: true } } },
+            },
+        },
+    });
+    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches, chargeableTargetsByProject] = await Promise.all([
+        taskRowsPromise,
         prisma.estimate.groupBy({ by: ["projectId"], where: { projectId: { in: rowIds }, status: { in: CONTRACT_ESTIMATE_STATUSES } }, _count: { id: true } }),
         getUnappliedChangeOrders(rowIds),
         // All statuses, not just the three counted ones: `resolved` is the final
@@ -2442,14 +2443,21 @@ export async function getCompanyDashboardData(
             },
             _count: { id: true },
         }),
-        // Cost-code resolution, batched PER PROJECT (not per task) — one
-        // resolveChargeableItems call per project regardless of task count,
-        // reusing the same resolver the clock-in picker uses so Dispatch Day
-        // can never disagree with what a punch actually charges to.
-        Promise.all(rowIds.map(async projectId => {
-            const { targetByItemId } = await resolveChargeableItems(projectId);
-            return [projectId, targetByItemId] as const;
-        })).then(entries => new Map(entries)),
+        // Cost-code resolution — ONE query for every project's eligible
+        // estimates+items (resolveChargeableItemsForProjects), not one
+        // resolveChargeableItems call per project. Reuses the same
+        // per-estimate resolver the clock-in picker uses (via
+        // resolveEstimateChargeableItems) so Dispatch Day can never disagree
+        // with what a punch actually charges to. Restricted to projects that
+        // actually have a task with estimateItemId set — a project with zero
+        // costed tasks has no use for the resolution map, so it's skipped
+        // entirely rather than resolving estimates nothing will look up.
+        taskRowsPromise.then(taskRows => {
+            const costedProjectIds = [...new Set(
+                taskRows.filter(t => t.estimateItemId).map(t => t.projectId).filter((id): id is string => !!id),
+            )];
+            return resolveChargeableItemsForProjects(costedProjectIds);
+        }),
     ]);
     const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
     const materialStatusAtByTask = new Map<string, Date>();
@@ -2481,7 +2489,7 @@ export async function getCompanyDashboardData(
         const rows = tasksByProject.get(task.projectId) ?? [];
         const taskMaterialCounts = materialCountsByTask.get(task.id) ?? { pending: 0, staged: 0, missing: 0 };
         const chargeableTarget = task.estimateItemId
-            ? chargeableTargetsByProject.get(task.projectId)?.get(task.estimateItemId) ?? null
+            ? chargeableTargetsByProject.get(task.projectId)?.targetByItemId.get(task.estimateItemId) ?? null
             : null;
         rows.push({
             id: task.id,

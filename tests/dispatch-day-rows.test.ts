@@ -11,10 +11,14 @@ import {
     chipLabelsForRow,
     collisionDelta,
     disambiguateMemberNames,
+    dispatchableTaskChoicesForDay,
     finalTaskUserIds,
     findConflictOtherProject,
     findReviewCollisions,
     getRosterNotOnJobToday,
+    isDispatchableRow,
+    notDispatchableReason,
+    wouldCollide,
     type DispatchDayCrewConflictInput,
     type DispatchDayCrewDraft,
     type DispatchDayProjectInput,
@@ -28,6 +32,7 @@ function task(overrides: Partial<DispatchDayProjectInput["tasks"][number]> = {})
         id: "t1",
         name: "Hang drywall in hall bath",
         type: "task",
+        parentId: null,
         startDate: "2026-08-29T00:00:00.000Z",
         endDate: "2026-08-30T00:00:00.000Z",
         doneWhen: null,
@@ -500,4 +505,98 @@ test("buildDispatchDayCollisions: no drafts, no overlaps beyond same-project →
         { userId: "u1", name: "Garrett", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true },
     ] })] })];
     assert.deepEqual(buildDispatchDayCollisions(projects, {}), []);
+});
+
+// ── isDispatchableRow / notDispatchableReason ────────────────────────────
+
+test("isDispatchableRow: a plain leaf task is dispatchable", () => {
+    assert.equal(isDispatchableRow({ type: "task" }, false), true);
+    assert.equal(notDispatchableReason({ type: "task" }, false), null);
+});
+
+test("isDispatchableRow: a milestone is never dispatchable", () => {
+    assert.equal(isDispatchableRow({ type: "milestone" }, false), false);
+    assert.match(notDispatchableReason({ type: "milestone" }, false) ?? "", /Milestone/);
+});
+
+test("isDispatchableRow: an appointment is never dispatchable", () => {
+    assert.equal(isDispatchableRow({ type: "appointment" }, false), false);
+    assert.match(notDispatchableReason({ type: "appointment" }, false) ?? "", /Appointment/);
+});
+
+test("isDispatchableRow: a task type with children (a phase parent) is never dispatchable", () => {
+    assert.equal(isDispatchableRow({ type: "task" }, true), false);
+    assert.match(notDispatchableReason({ type: "task" }, true) ?? "", /sub-tasks/);
+});
+
+test("buildDispatchDayJobGroups: a phase parent's row comes back non-dispatchable with its children as leaves", () => {
+    const groups = buildDispatchDayJobGroups(
+        [project({ tasks: [
+            task({ id: "parent", name: "Phase 1", type: "task" }),
+            task({ id: "child", name: "Hang drywall", type: "task", parentId: "parent" }),
+        ] })],
+        dayKey, {}, null, new Map(),
+    );
+    const rows = groups[0].rows;
+    const parentRow = rows.find(row => row.taskId === "parent")!;
+    const childRow = rows.find(row => row.taskId === "child")!;
+    assert.equal(parentRow.dispatchable, false);
+    assert.match(parentRow.notDispatchableReason ?? "", /sub-tasks/);
+    assert.equal(childRow.dispatchable, true);
+    assert.equal(childRow.notDispatchableReason, null);
+});
+
+test("buildDispatchDayJobGroups: a milestone row is non-dispatchable", () => {
+    const groups = buildDispatchDayJobGroups(
+        [project({ tasks: [task({ id: "m1", type: "milestone" })] })],
+        dayKey, {}, null, new Map(),
+    );
+    assert.equal(groups[0].rows[0].dispatchable, false);
+});
+
+// ── dispatchableTaskChoicesForDay ─────────────────────────────────────────
+
+test("dispatchableTaskChoicesForDay: excludes milestones, appointments, and phase parents, keeps leaf tasks", () => {
+    const projects = [project({ id: "p1", name: "Hoppe", tasks: [
+        task({ id: "parent", type: "task" }),
+        task({ id: "child", type: "task", parentId: "parent" }),
+        task({ id: "m1", type: "milestone" }),
+        task({ id: "a1", type: "appointment" }),
+    ] })];
+    const choices = dispatchableTaskChoicesForDay(projects, dayKey);
+    assert.deepEqual(choices.map(choice => choice.taskId), ["child"]);
+});
+
+// ── wouldCollide ──────────────────────────────────────────────────────────
+
+test("wouldCollide: candidate on exactly one other job today → adding them here would collide", () => {
+    const projects = [
+        project({ id: "p1", name: "Hoppe", tasks: [task({ id: "t1", assignments: [] })] }),
+        project({ id: "p2", name: "Mesplay", tasks: [task({ id: "t2", assignments: [
+            { userId: "u1", name: "Garrett", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true },
+        ] })] }),
+    ];
+    // u1 has exactly one job today (p2/t2) — no EXISTING collision pair yet,
+    // but adding them to p1/t1 would create one.
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), "Mesplay");
+});
+
+test("wouldCollide: candidate with no other assignment today → no collision", () => {
+    const projects = [
+        project({ id: "p1", name: "Hoppe", tasks: [task({ id: "t1", assignments: [] })] }),
+        project({ id: "p2", name: "Mesplay", tasks: [task({ id: "t2", assignments: [] })] }),
+    ];
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), null);
+});
+
+test("wouldCollide: candidate already on the SAME job today → no collision (not a double-booking)", () => {
+    const projects = [
+        project({ id: "p1", name: "Hoppe", tasks: [
+            task({ id: "t1", assignments: [] }),
+            task({ id: "t2", assignments: [
+                { userId: "u1", name: "Garrett", status: "ACTIVATED", userRole: "FIELD_CREW", assignmentRole: "assigned", showOnDispatch: true },
+            ] }),
+        ] }),
+    ];
+    assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}), null);
 });

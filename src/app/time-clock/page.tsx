@@ -3,6 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
+import { decideClockInDisplay, type ClockInDisplay, type ClockInSuggestionResponse } from "@/lib/time-suggestion-display";
 
 type ClockInSuggestion = {
     scheduleTaskId: string;
@@ -12,6 +13,8 @@ type ClockInSuggestion = {
     source: "dispatch" | "daily_log" | "today_schedule" | "user_history";
     confidence: "high" | "medium" | "low";
     reason: string | null;
+    note: string | null;
+    plannedByOffice: boolean;
 };
 
 export default function TimeClockPage() {
@@ -36,6 +39,11 @@ export default function TimeClockPage() {
     const [logisticsDump, setLogisticsDump] = useState<string>("");
 
     const [suggestion, setSuggestion] = useState<ClockInSuggestion | null>(null);
+    const [uncostedPlannedTask, setUncostedPlannedTask] = useState<ClockInSuggestionResponse["uncostedPlannedTask"]>(null);
+    const display: ClockInDisplay = useMemo(
+        () => decideClockInDisplay({ suggestion: suggestion as ClockInSuggestionResponse["suggestion"], uncostedPlannedTask }),
+        [suggestion, uncostedPlannedTask],
+    );
     // True once the user has picked a phase themselves — the suggestion preselect
     // must never fight a manual choice.
     const userPickedBucket = useRef(false);
@@ -117,12 +125,14 @@ export default function TimeClockPage() {
             setPhases([]);
             setSelectedPhase("");
             setSuggestion(null);
+            setUncostedPlannedTask(null);
             userPickedBucket.current = false;
             return;
         }
 
         userPickedBucket.current = false;
         setSuggestion(null);
+        setUncostedPlannedTask(null);
 
         // Abort both per-project fetches on project switch — a slow response
         // for the previous project must not overwrite the current one's state.
@@ -155,10 +165,11 @@ export default function TimeClockPage() {
         // today's suggestion (the banner would then label the shift wrong).
         if (status === "Clocked In") return () => controller.abort();
         fetch(`/api/mobile/time-suggestion?projectId=${selectedProject}`, { signal: controller.signal })
-            .then(res => res.ok ? res.json() : { suggestion: null })
+            .then(res => res.ok ? res.json() : { suggestion: null, uncostedPlannedTask: null })
             .then(data => {
                 const s: ClockInSuggestion | null = data?.suggestion ?? null;
                 setSuggestion(s);
+                setUncostedPlannedTask(data?.uncostedPlannedTask ?? null);
             })
             .catch(() => { /* aborted or failed — no suggestion */ });
 
@@ -171,9 +182,10 @@ export default function TimeClockPage() {
     // phase is actually offered — otherwise the picker would show "Select a Phase..."
     // over a hidden selection — and never over a manual pick.
     useEffect(() => {
-        if (!suggestion || userPickedBucket.current) return;
-        if (phases.some(ph => ph.id === suggestion.costCodeId)) setSelectedPhase(suggestion.costCodeId);
-    }, [phases, suggestion]);
+        if (userPickedBucket.current) return;
+        if (display.mode !== "planned" && display.mode !== "suggested") return;
+        if (phases.some(ph => ph.id === display.costCodeId)) setSelectedPhase(display.costCodeId);
+    }, [phases, display]);
 
     // Sorted by code — plain string sort, correct for zero-padded codes like "01-DEMO".
     const sortedPhases = useMemo(
@@ -266,7 +278,9 @@ export default function TimeClockPage() {
             }
 
             // Red flag: picked something other than today's plan? Confirm first.
-            if (suggestion && suggestion.costCodeId && selectedPhase !== suggestion.costCodeId) {
+            // Only for a chargeable plan/suggestion — an uncosted planned task has
+            // nothing to compare the picked phase against.
+            if ((display.mode === "planned" || display.mode === "suggested") && selectedPhase !== display.costCodeId) {
                 setConfirmMismatch(true);
                 return;
             }
@@ -343,14 +357,39 @@ export default function TimeClockPage() {
                             )}
                         </div>
 
-                        {suggestion && (
+                        {display.mode === "planned" && (
                             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
                                 <div className="text-sm text-blue-800 font-medium">
-                                    Suggested: {suggestion.taskName}
+                                    Planned for you today: {display.taskName} ({display.costCodeLabel})
                                 </div>
-                                <div className="text-xs text-blue-700 mt-0.5">{suggestion.costCodeLabel}</div>
-                                {suggestion.reason && (
-                                    <div className="text-xs text-blue-600 mt-1">{suggestion.reason}</div>
+                                {display.note && (
+                                    <div className="text-xs text-blue-600 mt-1">{display.note}</div>
+                                )}
+                            </div>
+                        )}
+
+                        {display.mode === "uncosted" && (
+                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+                                <div className="text-sm text-amber-800 font-medium">
+                                    Planned: {display.taskName} (not costed yet) — pick a phase.
+                                </div>
+                                {display.note && (
+                                    <div className="text-xs text-amber-700 mt-1">{display.note}</div>
+                                )}
+                            </div>
+                        )}
+
+                        {display.mode === "suggested" && (
+                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                                <div className="text-sm text-blue-800 font-medium">
+                                    Suggested: {display.taskName}
+                                </div>
+                                <div className="text-xs text-blue-700 mt-0.5">{display.costCodeLabel}</div>
+                                {display.reason && (
+                                    <div className="text-xs text-blue-600 mt-1">{display.reason}</div>
+                                )}
+                                {display.note && (
+                                    <div className="text-xs text-blue-600 mt-1">{display.note}</div>
                                 )}
                             </div>
                         )}
@@ -446,14 +485,14 @@ export default function TimeClockPage() {
                 )}
             </div>
 
-            {confirmMismatch && suggestion && (
+            {confirmMismatch && (display.mode === "planned" || display.mode === "suggested") && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-6">
                     <div className="hui-card w-full max-w-sm p-6 text-left">
                         <h2 className="text-lg font-bold text-hui-textMain mb-2">
                             Are you sure this is the correct task?
                         </h2>
                         <p className="text-sm text-slate-600 mb-5">
-                            Today&apos;s plan is <span className="font-semibold">{suggestion.taskName}</span> ({suggestion.costCodeLabel}).
+                            Today&apos;s plan is <span className="font-semibold">{display.taskName}</span> ({display.costCodeLabel}).
                         </p>
                         <div className="space-y-2">
                             <button
@@ -461,8 +500,8 @@ export default function TimeClockPage() {
                                 onClick={async () => {
                                     setConfirmMismatch(false);
                                     userPickedBucket.current = true;
-                                    setSelectedPhase(suggestion.costCodeId);
-                                    await performClockIn(suggestion.costCodeId, false);
+                                    setSelectedPhase(display.costCodeId);
+                                    await performClockIn(display.costCodeId, false);
                                 }}
                             >
                                 Use suggested task

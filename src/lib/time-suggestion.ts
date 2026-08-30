@@ -166,19 +166,113 @@ export interface ChargeableItem {
     costCode: { code: string; name: string } | null;
 }
 
+const CHARGEABLE_ESTIMATE_SELECT = {
+    id: true,
+    title: true,
+    items: {
+        orderBy: { order: "asc" as const },
+        select: {
+            id: true,
+            name: true,
+            total: true,
+            parentId: true,
+            costCodeId: true,
+            costCode: { select: { code: true, name: true } },
+        },
+    },
+} as const;
+
+/** Raw estimate shape (Prisma result of CHARGEABLE_ESTIMATE_SELECT) the pure resolver below works over. */
+export interface ChargeableEstimateInput {
+    id: string;
+    title: string | null;
+    items: {
+        id: string;
+        name: string;
+        total: unknown;
+        parentId: string | null;
+        costCodeId: string | null;
+        costCode: { code: string; name: string } | null;
+    }[];
+}
+
+/**
+ * PURE per-estimate resolver — no I/O, exercised directly by
+ * scripts/verify-time-suggestion.ts. Shared by both `resolveChargeableItems`
+ * (single project) and `resolveChargeableItemsForProjects` (batch) so their
+ * eligibility rules and leaf→nearest-coded-ancestor logic can never drift
+ * apart.
+ *
+ * Enumerate LEAF items, resolve each leaf to its nearest coded item
+ * at-or-above (same estimate only, visited-set guarded), and dedupe those
+ * targets. A coded parent whose children are also coded is therefore never
+ * offered alongside them (the children win), and a summary parent is offered
+ * exactly once when its children are uncoded. An estimate with no coded
+ * items at all falls back to its own top-level rows (legacy, chargeless).
+ */
+export function resolveEstimateChargeableItems(
+    estimate: ChargeableEstimateInput,
+): { offered: ChargeableItem[]; targetByItemId: Map<string, ChargeableItem> } {
+    const offered: ChargeableItem[] = [];
+    const targetByItemId = new Map<string, ChargeableItem>();
+
+    const byId = new Map(estimate.items.map(item => [item.id, item]));
+    const hasChildren = new Set(
+        estimate.items.map(item => item.parentId).filter((id): id is string => !!id),
+    );
+
+    const toChargeable = (item: (typeof estimate.items)[number]): ChargeableItem => ({
+        id: item.id,
+        name: item.name,
+        total: item.total,
+        estimateId: estimate.id,
+        estimateTitle: estimate.title ?? null,
+        costCodeId: item.costCodeId,
+        costCode: item.costCode,
+    });
+
+    // Nearest coded item at-or-above, WITHIN this estimate, cycle-safe.
+    const nearestCoded = (itemId: string): (typeof estimate.items)[number] | null => {
+        const visited = new Set<string>();
+        let current = byId.get(itemId);
+        while (current && !visited.has(current.id)) {
+            visited.add(current.id);
+            if (current.costCodeId && current.costCode) return current;
+            current = current.parentId ? byId.get(current.parentId) : undefined;
+        }
+        return null;
+    };
+
+    const seenTargets = new Set<string>();
+    for (const item of estimate.items) {
+        if (hasChildren.has(item.id)) continue; // leaves only drive the offer
+        const target = nearestCoded(item.id);
+        if (target && !seenTargets.has(target.id)) {
+            seenTargets.add(target.id);
+            offered.push(toChargeable(target));
+        }
+    }
+
+    if (seenTargets.size === 0) {
+        // Fully uncoded estimate — legacy top-level rows, chargeless.
+        for (const item of estimate.items) {
+            if (item.parentId === null) offered.push(toChargeable(item));
+        }
+    }
+
+    // Resolution map for EVERY item on the estimate (engine + chat use it).
+    for (const item of estimate.items) {
+        const target = nearestCoded(item.id);
+        if (target) targetByItemId.set(item.id, toChargeable(target));
+    }
+
+    return { offered, targetByItemId };
+}
+
 /**
  * THE one resolver for "what can a punch charge to" — used by the picker
  * route, the suggestion engine, and the chat post-back so they can never
- * disagree.
- *
- * Per eligible estimate: enumerate LEAF items, resolve each leaf to its
- * nearest coded item at-or-above (same estimate only, visited-set guarded),
- * and dedupe those targets. A coded parent whose children are also coded is
- * therefore never offered alongside them (the children win), and a summary
- * parent is offered exactly once when its children are uncoded. An estimate
- * with no coded items at all falls back to its own top-level rows (legacy,
- * chargeless) — per estimate, so one coded estimate can't suppress another's
- * fallback.
+ * disagree. See `resolveEstimateChargeableItems` for the per-estimate rules.
  */
 export async function resolveChargeableItems(
     projectId: string,
@@ -187,79 +281,59 @@ export async function resolveChargeableItems(
     const estimates = await db.estimate.findMany({
         where: { projectId, status: { in: ELIGIBLE_ESTIMATE_STATUSES }, archivedAt: null },
         orderBy: { createdAt: "asc" },
-        select: {
-            id: true,
-            title: true,
-            items: {
-                orderBy: { order: "asc" },
-                select: {
-                    id: true,
-                    name: true,
-                    total: true,
-                    parentId: true,
-                    costCodeId: true,
-                    costCode: { select: { code: true, name: true } },
-                },
-            },
-        },
+        select: CHARGEABLE_ESTIMATE_SELECT,
     });
 
     const offered: ChargeableItem[] = [];
     const targetByItemId = new Map<string, ChargeableItem>();
 
     for (const estimate of estimates) {
-        const byId = new Map(estimate.items.map(item => [item.id, item]));
-        const hasChildren = new Set(
-            estimate.items.map(item => item.parentId).filter((id): id is string => !!id),
-        );
-
-        const toChargeable = (item: (typeof estimate.items)[number]): ChargeableItem => ({
-            id: item.id,
-            name: item.name,
-            total: item.total,
-            estimateId: estimate.id,
-            estimateTitle: estimate.title ?? null,
-            costCodeId: item.costCodeId,
-            costCode: item.costCode,
-        });
-
-        // Nearest coded item at-or-above, WITHIN this estimate, cycle-safe.
-        const nearestCoded = (itemId: string): (typeof estimate.items)[number] | null => {
-            const visited = new Set<string>();
-            let current = byId.get(itemId);
-            while (current && !visited.has(current.id)) {
-                visited.add(current.id);
-                if (current.costCodeId && current.costCode) return current;
-                current = current.parentId ? byId.get(current.parentId) : undefined;
-            }
-            return null;
-        };
-
-        const seenTargets = new Set<string>();
-        for (const item of estimate.items) {
-            if (hasChildren.has(item.id)) continue; // leaves only drive the offer
-            const target = nearestCoded(item.id);
-            if (target && !seenTargets.has(target.id)) {
-                seenTargets.add(target.id);
-                offered.push(toChargeable(target));
-            }
-        }
-
-        if (seenTargets.size === 0) {
-            // Fully uncoded estimate — legacy top-level rows, chargeless.
-            for (const item of estimate.items) {
-                if (item.parentId === null) offered.push(toChargeable(item));
-            }
-        }
-
-        // Resolution map for EVERY item on the estimate (engine + chat use it).
-        for (const item of estimate.items) {
-            const target = nearestCoded(item.id);
-            if (target) targetByItemId.set(item.id, toChargeable(target));
+        const resolved = resolveEstimateChargeableItems(estimate);
+        offered.push(...resolved.offered);
+        for (const [itemId, target] of resolved.targetByItemId) {
+            targetByItemId.set(itemId, target);
         }
     }
 
     return { items: offered, targetByItemId };
+}
+
+/**
+ * Batch form of `resolveChargeableItems` — ONE query loads eligible
+ * estimates + items for every project in `projectIds`, instead of one query
+ * per project. Same eligibility rules and per-estimate leaf→nearest-coded-
+ * ancestor logic (both call `resolveEstimateChargeableItems`), so callers
+ * get identical output to calling the single-project version once per id.
+ *
+ * Used by the company dashboard, which only needs `targetByItemId` for
+ * projects that actually have tasks with `estimateItemId` set — callers
+ * should filter `projectIds` down to that set before calling.
+ */
+export async function resolveChargeableItemsForProjects(
+    projectIds: string[],
+    db: DbClient = prisma,
+): Promise<Map<string, { items: ChargeableItem[]; targetByItemId: Map<string, ChargeableItem> }>> {
+    const result = new Map<string, { items: ChargeableItem[]; targetByItemId: Map<string, ChargeableItem> }>();
+    if (projectIds.length === 0) return result;
+
+    const estimates = await db.estimate.findMany({
+        where: { projectId: { in: projectIds }, status: { in: ELIGIBLE_ESTIMATE_STATUSES }, archivedAt: null },
+        orderBy: { createdAt: "asc" },
+        select: { ...CHARGEABLE_ESTIMATE_SELECT, projectId: true },
+    });
+
+    for (const estimate of estimates) {
+        if (!estimate.projectId) continue; // filtered on projectId: {in: projectIds} above, but the column is nullable
+        const resolved = resolveEstimateChargeableItems(estimate);
+        const entry = result.get(estimate.projectId) ?? { items: [], targetByItemId: new Map<string, ChargeableItem>() };
+        entry.items.push(...resolved.offered);
+        for (const [itemId, target] of resolved.targetByItemId) {
+            entry.targetByItemId.set(itemId, target);
+        }
+        result.set(estimate.projectId, entry);
+    }
+
+    return result;
 }
 
 export interface SuggestableTask {

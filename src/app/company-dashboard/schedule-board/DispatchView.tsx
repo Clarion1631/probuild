@@ -14,7 +14,7 @@ import { isDispatchable } from "@/lib/dispatch-roster";
 import { DispatchExceptions } from "./DispatchExceptions";
 import { DispatchCrewTaskChooser, type DispatchCrewTaskChoice } from "./DispatchCrewTaskChooser";
 import { DispatchDayView } from "./DispatchDayView";
-import { disambiguateMemberNames } from "./dispatch-day-rows";
+import { disambiguateMemberNames, dispatchableTaskChoicesForDay } from "./dispatch-day-rows";
 import { DispatchTaskBank, type DispatchTaskBankItem } from "./DispatchTaskBank";
 import { createDragVisualLayer, crewChipDragSourceSelector, type DragVisualLayer } from "./dragVisualLayer";
 
@@ -141,16 +141,13 @@ export function visibleWeekChips(chips: WeekChip[]): VisibleWeekChips {
     };
 }
 
+// Wraps dispatch-day-rows.ts's pure builder so every crew-chooser choice
+// list (drag-drop onto a Week cell, keyboard Enter in either mode) excludes
+// milestones, appointments, and phase parents the same way the Day list's
+// "+ Assign" does (item 1's isDispatchableRow rule) — a task that can't
+// reach a time card is never offered as a chooser target either.
 function taskChoicesForDay(projects: DashboardProjectRow[], dayKey: string): DispatchCrewTaskChoice[] {
-    return projects.flatMap(project => project.tasks
-        .filter(task => isTaskActiveOnDay(task, dayKey))
-        .map(task => ({
-            projectId: project.id,
-            projectName: project.name,
-            taskId: task.id,
-            taskName: task.name,
-            dayLabel: dayKey,
-        })));
+    return dispatchableTaskChoicesForDay(projects, dayKey);
 }
 
 export function DispatchView({
@@ -409,8 +406,13 @@ export function DispatchView({
     function handleCrewKeyboardActivate(event: ReactKeyboardEvent<HTMLElement>, crew: CrewIdentity) {
         if (!data.canEdit || (event.key !== "Enter" && event.key !== " ")) return;
         event.preventDefault();
+        // Day mode's own list only ever renders data.pipeline.inProgress
+        // (see DispatchDayView's dayProjects prop) — the keyboard chooser's
+        // choices must come from that same set, not the full
+        // Waiting/Scheduled/In-Progress/Substantial pipeline `projects`
+        // holds, or Enter could offer a task the Day list never shows.
         const choices = mode === "today"
-            ? taskChoicesForDay(projects, dayKey)
+            ? taskChoicesForDay(data.pipeline.inProgress, dayKey)
             : visibleWeekDays.flatMap(day => taskChoicesForDay(projects, formatDate(day)));
         openCrewChooser(crew, choices, event.currentTarget, null);
     }

@@ -8,7 +8,9 @@ import {
     tokenizeForMatch,
     keywordMatchTasks,
     pickDispatchWinner,
+    resolveEstimateChargeableItems,
     type KeywordCandidate,
+    type ChargeableEstimateInput,
 } from "../src/lib/time-suggestion";
 import { isValidChatWebhookUrl } from "../src/lib/chat-webhook";
 
@@ -120,6 +122,51 @@ function verifyDispatchWinnerMixedChargeableAndUncosted(): void {
     console.log("PASS ranking: dispatch tie-break ranks chargeable and uncosted candidates together");
 }
 
+function verifyResolveEstimateChargeableItems(): void {
+    // Fixture graph: a coded parent with an uncoded leaf, on TWO separate
+    // estimates (standing in for two different projects) — the batch
+    // resolver (resolveChargeableItemsForProjects) calls this same pure
+    // per-estimate function once per estimate and merges by projectId, so
+    // proving it's correct per-estimate and side-effect-free per call is
+    // exactly what guarantees the batch path can't cross-contaminate
+    // projects or disagree with the single-project resolver.
+    const estimateA: ChargeableEstimateInput = {
+        id: "est-a",
+        title: "Project A Estimate",
+        items: [
+            { id: "a-parent", name: "Framing", total: 1000, parentId: null, costCodeId: "cc-frame", costCode: { code: "02-FRAME", name: "Framing" } },
+            { id: "a-leaf", name: "Rough frame walls", total: 1000, parentId: "a-parent", costCodeId: null, costCode: null },
+        ],
+    };
+    const estimateB: ChargeableEstimateInput = {
+        id: "est-b",
+        title: "Project B Estimate",
+        items: [
+            { id: "b-parent", name: "Demo", total: 500, parentId: null, costCodeId: "cc-demo", costCode: { code: "01-DEMO", name: "Demolition" } },
+            { id: "b-leaf", name: "Tear out cabinets", total: 500, parentId: "b-parent", costCodeId: null, costCode: null },
+        ],
+    };
+
+    const resultA = resolveEstimateChargeableItems(estimateA);
+    assert.equal(resultA.offered.length, 1);
+    assert.equal(resultA.offered[0].id, "a-parent");
+    assert.equal(resultA.targetByItemId.get("a-leaf")?.id, "a-parent");
+    assert.equal(resultA.targetByItemId.get("a-parent")?.id, "a-parent");
+
+    const resultB = resolveEstimateChargeableItems(estimateB);
+    assert.equal(resultB.offered.length, 1);
+    assert.equal(resultB.offered[0].id, "b-parent");
+    assert.equal(resultB.targetByItemId.get("b-leaf")?.id, "b-parent");
+
+    // Estimate A's resolution must not leak into estimate B's — proves the
+    // per-estimate call is pure/stateless, which is what makes merging many
+    // of these (one per project, in resolveChargeableItemsForProjects) safe.
+    assert.equal(resultB.targetByItemId.has("a-leaf"), false);
+    assert.equal(resultA.targetByItemId.has("b-leaf"), false);
+
+    console.log("PASS resolver: leaf resolves to nearest coded ancestor, per-estimate results don't cross-contaminate");
+}
+
 function verifyWebhookUrlGuard(): void {
     assert.ok(isValidChatWebhookUrl("https://chat.googleapis.com/v1/spaces/AAQA123/messages?key=k&token=t"));
     assert.ok(!isValidChatWebhookUrl("http://chat.googleapis.com/v1/spaces/AAQA123/messages")); // not https
@@ -137,5 +184,6 @@ verifyCostCodeTokensMatch();
 verifyDistinctTokenCount();
 verifyDuplicateTokensDontStack();
 verifyDispatchWinnerMixedChargeableAndUncosted();
+verifyResolveEstimateChargeableItems();
 verifyWebhookUrlGuard();
 console.log("\nverify-time-suggestion: all checks passed");

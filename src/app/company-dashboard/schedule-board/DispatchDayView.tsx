@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { updateScheduleTask } from "@/lib/actions";
 import type { DashboardProjectRow, DashboardTaskRow } from "@/lib/schedule-core";
-import { buildDispatchDayCollisions, buildDispatchDayJobGroups, chipLabelsForRow, getRosterNotOnJobToday, findConflictOtherProject } from "./dispatch-day-rows";
+import { buildDispatchDayCollisions, buildDispatchDayJobGroups, chipLabelsForRow, getRosterNotOnJobToday, wouldCollide } from "./dispatch-day-rows";
 import { DispatchAssignPopover, type DispatchAssignChoice } from "./DispatchAssignPopover";
 import { DispatchAddFromEstimatePopover } from "./DispatchAddFromEstimatePopover";
 import type { DispatchTaskBankItem } from "./DispatchTaskBank";
@@ -194,7 +194,10 @@ export function DispatchDayView({
                 id: member.id,
                 name: member.name,
                 email: member.email,
-                conflictTitle: findConflictOtherProject(dispatchDayCollisions, member.id, dayKey, target.projectId),
+                // Hypothetical, not just "already conflicted" — someone on
+                // exactly one other job today still needs the warning, since
+                // adding them here is what WOULD create the collision.
+                conflictTitle: wouldCollide(member.id, { id: target.taskId, projectId: target.projectId }, allProjects, crewDrafts),
             }));
     }
 
@@ -311,7 +314,12 @@ export function DispatchDayView({
                             return (
                                 <tr
                                     key={row.taskId}
-                                    data-dispatch-task-id={row.taskId}
+                                    // A non-dispatchable row (milestone,
+                                    // appointment, phase parent) has no time
+                                    // card to receive a crew chip drop onto —
+                                    // omit the marker entirely so it's not a
+                                    // resolveCrewDrop target (see DispatchView).
+                                    data-dispatch-task-id={row.dispatchable ? row.taskId : undefined}
                                     className="min-h-10"
                                 >
                                     <td className="px-4 py-2 align-middle">
@@ -364,7 +372,7 @@ export function DispatchDayView({
                                                             type="button"
                                                             onPointerDown={event => event.stopPropagation()}
                                                             onClick={() => onDraftCrewRemove(row.taskId, person.id)}
-                                                            className="absolute -right-1.5 -top-1.5 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-slate-700 text-[9px] font-bold leading-none text-white opacity-0 shadow transition hover:bg-red-600 focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+                                                            className="absolute -right-1.5 -top-1.5 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-slate-700 text-[9px] font-bold leading-none text-white opacity-0 pointer-events-none shadow transition hover:bg-red-600 focus:opacity-100 focus:pointer-events-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 group-hover:opacity-100 group-hover:pointer-events-auto [@media(hover:none)]:opacity-100 [@media(hover:none)]:pointer-events-auto"
                                                             aria-label={`Remove ${person.name} from ${row.taskName}`}
                                                         >
                                                             {"×"}
@@ -372,7 +380,7 @@ export function DispatchDayView({
                                                     )}
                                                 </span>
                                             ))}
-                                            {canEdit && (
+                                            {row.dispatchable && canEdit && (
                                                 <button
                                                     type="button"
                                                     aria-haspopup="dialog"
@@ -382,6 +390,14 @@ export function DispatchDayView({
                                                 >
                                                     + Assign
                                                 </button>
+                                            )}
+                                            {!row.dispatchable && (
+                                                <span
+                                                    className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-400"
+                                                    title={row.notDispatchableReason ?? "Not dispatchable"}
+                                                >
+                                                    not dispatchable
+                                                </span>
                                             )}
                                         </div>
                                     </td>

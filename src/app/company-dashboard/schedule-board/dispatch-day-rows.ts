@@ -30,6 +30,8 @@ export interface DispatchDayTaskInput {
     id: string;
     name: string;
     type: string;
+    /** Set on a sub-task; null on a top-level task. Used to tell a phase parent (has children) from a leaf — mirrors the `parentIds` check in time-suggestion.ts's loadSuggestableTasks. */
+    parentId: string | null;
     startDate: string;
     endDate: string;
     doneWhen: string | null;
@@ -161,6 +163,70 @@ export interface DispatchDayRow {
     isCosted: boolean;
     people: DispatchDayPerson[];
     doneWhen: string | null;
+    /** False when the task can never be named on a time card — see isDispatchableRow. */
+    dispatchable: boolean;
+    /** Human reason for a non-dispatchable row ("Milestone" / "Appointment" / "Has sub-tasks"), else null. */
+    notDispatchableReason: string | null;
+}
+
+/**
+ * True when a task can actually be picked on a time card — mirrors the
+ * candidate rule in src/lib/time-suggestion.ts's loadSuggestableTasks:
+ * `type === "task"` (excludes milestone/appointment) and a leaf (excludes a
+ * phase parent — `hasChildren` is true when some other task in the project
+ * has this one as its parentId). Deliberately does NOT also require a
+ * resolved cost code — DispatchDayRow already surfaces that separately via
+ * `isCosted`/"not costed", and an uncosted-but-assignable task still reaches
+ * a time card (it just doesn't charge anywhere yet).
+ */
+export function isDispatchableRow(task: Pick<DispatchDayTaskInput, "type">, hasChildren: boolean): boolean {
+    return task.type === "task" && !hasChildren;
+}
+
+/** Why `isDispatchableRow` said no, for the row's muted tag title. Null when dispatchable. */
+export function notDispatchableReason(task: Pick<DispatchDayTaskInput, "type">, hasChildren: boolean): string | null {
+    if (task.type === "milestone") return "Milestone — has no time card to assign to.";
+    if (task.type === "appointment") return "Appointment — has no time card to assign to.";
+    if (hasChildren) return "Has sub-tasks — assign to the sub-tasks instead.";
+    return null;
+}
+
+/** parentId → "has at least one child" set, scoped to one project's task list. */
+function parentIdsOf(tasks: readonly Pick<DispatchDayTaskInput, "id" | "parentId">[]): Set<string> {
+    return new Set(tasks.map(task => task.parentId).filter((id): id is string => Boolean(id)));
+}
+
+export interface DispatchDayTaskChoice {
+    projectId: string;
+    projectName: string;
+    taskId: string;
+    taskName: string;
+    dayLabel: string;
+}
+
+/**
+ * The keyboard/drag crew-chooser's task list for one day: every task active
+ * on `dayKey` across `projects` that's actually dispatchable (item 1's
+ * rule) — a milestone, appointment, or phase parent never appears as a
+ * choice, matching the row-level "+ Assign" gating in DispatchDayView.
+ */
+export function dispatchableTaskChoicesForDay(
+    projects: readonly DispatchDayProjectInput[],
+    dayKey: string,
+): DispatchDayTaskChoice[] {
+    return projects.flatMap(project => {
+        const parentIds = parentIdsOf(project.tasks);
+        return project.tasks
+            .filter(task => isTaskActiveOnDay(task, dayKey))
+            .filter(task => isDispatchableRow(task, parentIds.has(task.id)))
+            .map(task => ({
+                projectId: project.id,
+                projectName: project.name,
+                taskId: task.id,
+                taskName: task.name,
+                dayLabel: dayKey,
+            }));
+    });
 }
 
 export interface DispatchDayJobGroup {
@@ -217,8 +283,10 @@ export function buildDispatchDayJobGroups(
     const groups: DispatchDayJobGroup[] = [];
     for (const project of projects) {
         const activeTasks = project.tasks.filter(task => isTaskActiveOnDay(task, dayKey));
+        const parentIds = parentIdsOf(project.tasks);
 
         const rows: DispatchDayRow[] = activeTasks.map(task => {
+            const hasChildren = parentIds.has(task.id);
             const draft = crewDrafts[task.id];
             const removeSet = new Set(draft?.removeUserIds ?? []);
             const addIds = draft?.addUserIds ?? [];
@@ -276,6 +344,8 @@ export function buildDispatchDayJobGroups(
                 isCosted: task.costCode != null,
                 people,
                 doneWhen: task.doneWhen,
+                dispatchable: isDispatchableRow(task, hasChildren),
+                notDispatchableReason: notDispatchableReason(task, hasChildren),
             };
         });
 
@@ -471,6 +541,52 @@ export function collisionDelta(
  * the server's committed crewConflicts, so two drafted adds collide live,
  * before either is saved.
  */
+/**
+ * Hypothetical collision check for the assign popover: "if `candidateUserId`
+ * were added to `task` right now, would that create or worsen a collision on
+ * this day?" — unlike findConflictOtherProject (which only flags someone
+ * ALREADY double-booked from an existing collision pair), this evaluates the
+ * candidate against every other project's draft-applied crew even when they
+ * currently have exactly one job today and adding this one would be their
+ * first collision. Reuses the same finalTaskUserIds/findReviewCollisions
+ * machinery buildDispatchDayCollisions does, with the candidate injected
+ * onto `task`'s final crew. Returns the other job's name for the "Also on
+ * <job> today" hint, or null when no collision would result.
+ */
+export function wouldCollide(
+    candidateUserId: string,
+    task: Pick<DispatchDayTaskInput, "id"> & { projectId: string },
+    allProjects: readonly DispatchDayProjectInput[],
+    crewDrafts: Readonly<Record<string, DispatchDayCrewDraft>>,
+): string | null {
+    const tasks: DispatchReviewTaskInput[] = [];
+    for (const project of allProjects) {
+        for (const projectTask of project.tasks) {
+            const finalIds = finalTaskUserIds(projectTask, crewDrafts[projectTask.id]);
+            const userIds = projectTask.id === task.id && !finalIds.includes(candidateUserId)
+                ? [...finalIds, candidateUserId]
+                : finalIds;
+            tasks.push({
+                id: projectTask.id,
+                projectId: project.id,
+                projectName: project.name,
+                name: projectTask.name,
+                startDate: projectTask.startDate,
+                endDate: projectTask.endDate,
+                savedUserIds: userIds,
+            });
+        }
+    }
+    const collisions = findReviewCollisions(tasks);
+    const entry = collisions.find(collision => collision.userId === candidateUserId);
+    if (!entry) return null;
+    for (const pair of entry.pairs) {
+        if (pair.projectA.id === task.projectId) return pair.projectB.name;
+        if (pair.projectB.id === task.projectId) return pair.projectA.name;
+    }
+    return null;
+}
+
 export function buildDispatchDayCollisions(
     projects: readonly DispatchDayProjectInput[],
     crewDrafts: Readonly<Record<string, DispatchDayCrewDraft>>,
