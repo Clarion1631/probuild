@@ -3,10 +3,7 @@ import assert from "node:assert/strict";
 import {
     AUTO_ASSIGN_PROJECT_STATUS,
     crewIdsToConnect,
-    isAlwaysAssignUser,
     isAutoAssignProjectStatus,
-    nameMatchesAlwaysKey,
-    parseAlwaysAssignKeys,
     selectAutoAssignUsers,
     shouldAutoAssignUser,
     type AutoAssignUser,
@@ -16,117 +13,50 @@ import { PROJECT_STATUS_VALUES } from "../src/lib/project-status";
 function user(overrides: Partial<AutoAssignUser> = {}): AutoAssignUser {
     return {
         id: "u1",
-        name: "Some Person",
-        email: "some.person@example.com",
         role: "FIELD_CREW",
         status: "ACTIVATED",
+        showOnDispatch: true,
         ...overrides,
     };
 }
 
-// ── the core rule: ACTIVATED FIELD_CREW ───────────────────────────────────
+// ── the core rule: exactly isDispatchable ─────────────────────────────────
 
-test("ACTIVATED FIELD_CREW is assigned", () => {
+test("ACTIVATED FIELD_CREW with the dispatch switch on is assigned", () => {
     assert.equal(shouldAutoAssignUser(user()), true);
 });
 
-test("DISABLED FIELD_CREW is NOT assigned", () => {
-    assert.equal(shouldAutoAssignUser(user({ status: "DISABLED" })), false);
+test("a manager with the dispatch switch on is assigned", () => {
+    assert.equal(shouldAutoAssignUser(user({ role: "MANAGER", showOnDispatch: true })), true);
 });
 
-test("PENDING FIELD_CREW is NOT assigned", () => {
-    assert.equal(shouldAutoAssignUser(user({ status: "PENDING" })), false);
+test("an admin with the dispatch switch on is assigned", () => {
+    assert.equal(shouldAutoAssignUser(user({ role: "ADMIN", showOnDispatch: true })), true);
+});
+
+test("field crew with the dispatch switch off is NOT assigned", () => {
+    assert.equal(shouldAutoAssignUser(user({ role: "FIELD_CREW", showOnDispatch: false })), false);
+});
+
+test("a manager with the dispatch switch off is NOT assigned", () => {
+    assert.equal(shouldAutoAssignUser(user({ role: "MANAGER", showOnDispatch: false })), false);
+});
+
+test("FINANCE is never assigned, even with the switch on", () => {
+    assert.equal(shouldAutoAssignUser(user({ role: "FINANCE", showOnDispatch: true })), false);
+});
+
+test("DISABLED users are NOT assigned, even with the switch on", () => {
+    assert.equal(shouldAutoAssignUser(user({ status: "DISABLED", showOnDispatch: true })), false);
+});
+
+test("PENDING users are NOT assigned, even with the switch on", () => {
+    assert.equal(shouldAutoAssignUser(user({ status: "PENDING", showOnDispatch: true })), false);
 });
 
 test("a missing/unknown status is NOT assigned (fail closed)", () => {
-    assert.equal(shouldAutoAssignUser(user({ status: null })), false);
-    assert.equal(shouldAutoAssignUser(user({ status: "activated" })), false);
-});
-
-// ── CJ, by name, despite not being FIELD_CREW ─────────────────────────────
-
-test("CJ as a MANAGER is assigned", () => {
-    assert.equal(shouldAutoAssignUser(user({ id: "cj", name: "CJ", role: "MANAGER" })), true);
-});
-
-test("CJ as an ADMIN is assigned", () => {
-    assert.equal(shouldAutoAssignUser(user({ id: "cj", name: "CJ", role: "ADMIN" })), true);
-});
-
-test("CJ name matching is case- and punctuation-insensitive, and matches a full name", () => {
-    for (const name of ["CJ", "cj", "Cj", "C.J.", "CJ Adkins", "c.j. adkins"]) {
-        assert.equal(
-            shouldAutoAssignUser(user({ name, role: "MANAGER" })),
-            true,
-            `expected "${name}" to match`,
-        );
-    }
-});
-
-test("names that merely contain the letters cj do NOT match", () => {
-    for (const name of ["Cjay Miller", "Marcj", "Jason CJell"]) {
-        assert.equal(
-            shouldAutoAssignUser(user({ name, role: "MANAGER" })),
-            false,
-            `expected "${name}" NOT to match`,
-        );
-    }
-});
-
-test("CJ is still NOT assigned when DISABLED — the status gate beats the name rule", () => {
-    assert.equal(shouldAutoAssignUser(user({ name: "CJ", role: "MANAGER", status: "DISABLED" })), false);
-    assert.equal(shouldAutoAssignUser(user({ name: "CJ", role: "MANAGER", status: "PENDING" })), false);
-});
-
-// ── everybody else is excluded ────────────────────────────────────────────
-
-test("other MANAGER / ADMIN / FINANCE users are NOT assigned", () => {
-    for (const role of ["MANAGER", "ADMIN", "FINANCE"]) {
-        assert.equal(
-            shouldAutoAssignUser(user({ name: "Dana Example", role })),
-            false,
-            `expected role ${role} NOT to be assigned`,
-        );
-    }
-});
-
-test("an unknown role is NOT assigned", () => {
-    assert.equal(shouldAutoAssignUser(user({ name: "Dana Example", role: "SUBCONTRACTOR" })), false);
-    assert.equal(shouldAutoAssignUser(user({ name: "Dana Example", role: null })), false);
-});
-
-// ── configurable always-assign keys ───────────────────────────────────────
-
-test("an email key matches only on email, never fuzzily on name", () => {
-    const opts = { alwaysAssignKeys: ["cj@goldentouchremodeling.com"] };
-    assert.equal(
-        isAlwaysAssignUser(user({ name: "Nobody", email: "CJ@GoldenTouchRemodeling.com" }), opts),
-        true,
-    );
-    assert.equal(isAlwaysAssignUser(user({ name: "CJ", email: "other@example.com" }), opts), false);
-});
-
-test("parseAlwaysAssignKeys: unset -> default CJ; empty string -> nobody extra", () => {
-    assert.deepEqual(parseAlwaysAssignKeys(undefined), ["CJ"]);
-    assert.deepEqual(parseAlwaysAssignKeys(null), ["CJ"]);
-    assert.deepEqual(parseAlwaysAssignKeys(""), []);
-    assert.deepEqual(parseAlwaysAssignKeys("CJ, dana@example.com"), ["CJ", "dana@example.com"]);
-});
-
-test("with an empty key list, CJ the MANAGER is no longer assigned", () => {
-    assert.equal(
-        shouldAutoAssignUser(user({ name: "CJ", role: "MANAGER" }), { alwaysAssignKeys: [] }),
-        false,
-    );
-    // ...but FIELD_CREW still is — the role rule is independent.
-    assert.equal(shouldAutoAssignUser(user({ role: "FIELD_CREW" }), { alwaysAssignKeys: [] }), true);
-});
-
-test("nameMatchesAlwaysKey ignores blank names and blank keys", () => {
-    assert.equal(nameMatchesAlwaysKey(null, "CJ"), false);
-    assert.equal(nameMatchesAlwaysKey("", "CJ"), false);
-    assert.equal(nameMatchesAlwaysKey("CJ", ""), false);
-    assert.equal(nameMatchesAlwaysKey("CJ", "   "), false);
+    assert.equal(shouldAutoAssignUser(user({ status: null, showOnDispatch: true })), false);
+    assert.equal(shouldAutoAssignUser(user({ status: "activated", showOnDispatch: true })), false);
 });
 
 // ── project status gate ───────────────────────────────────────────────────
@@ -154,22 +84,26 @@ test('legacy statuses that canonicalize to "In Progress" count', () => {
 // ── selection + idempotency ───────────────────────────────────────────────
 
 const ROSTER: AutoAssignUser[] = [
-    user({ id: "crew-a", name: "Alex Crew", role: "FIELD_CREW", status: "ACTIVATED" }),
-    user({ id: "crew-b", name: "Bella Crew", role: "FIELD_CREW", status: "ACTIVATED" }),
-    user({ id: "crew-disabled", name: "Gone Crew", role: "FIELD_CREW", status: "DISABLED" }),
-    user({ id: "crew-pending", name: "New Crew", role: "FIELD_CREW", status: "PENDING" }),
-    user({ id: "cj", name: "CJ", role: "MANAGER", status: "ACTIVATED" }),
-    user({ id: "mgr", name: "Other Manager", role: "MANAGER", status: "ACTIVATED" }),
-    user({ id: "admin", name: "Justin Admin", role: "ADMIN", status: "ACTIVATED" }),
-    user({ id: "fin", name: "Fin Ance", role: "FINANCE", status: "ACTIVATED" }),
+    user({ id: "crew-a", role: "FIELD_CREW", status: "ACTIVATED", showOnDispatch: true }),
+    user({ id: "crew-b", role: "FIELD_CREW", status: "ACTIVATED", showOnDispatch: true }),
+    user({ id: "crew-off", role: "FIELD_CREW", status: "ACTIVATED", showOnDispatch: false }),
+    user({ id: "crew-disabled", role: "FIELD_CREW", status: "DISABLED", showOnDispatch: true }),
+    user({ id: "crew-pending", role: "FIELD_CREW", status: "PENDING", showOnDispatch: true }),
+    user({ id: "mgr-on", role: "MANAGER", status: "ACTIVATED", showOnDispatch: true }),
+    user({ id: "mgr-off", role: "MANAGER", status: "ACTIVATED", showOnDispatch: false }),
+    user({ id: "admin-on", role: "ADMIN", status: "ACTIVATED", showOnDispatch: true }),
+    user({ id: "fin-on", role: "FINANCE", status: "ACTIVATED", showOnDispatch: true }),
 ];
 
-test("selectAutoAssignUsers picks exactly the two crew plus CJ", () => {
-    assert.deepEqual(selectAutoAssignUsers(ROSTER).map((u) => u.id), ["crew-a", "crew-b", "cj"]);
+test("selectAutoAssignUsers picks exactly the dispatchable ones", () => {
+    assert.deepEqual(
+        selectAutoAssignUsers(ROSTER).map((u) => u.id),
+        ["crew-a", "crew-b", "mgr-on", "admin-on"],
+    );
 });
 
 test("crewIdsToConnect returns everyone eligible when the project has no crew", () => {
-    assert.deepEqual(crewIdsToConnect(ROSTER, []), ["crew-a", "crew-b", "cj"]);
+    assert.deepEqual(crewIdsToConnect(ROSTER, []), ["crew-a", "crew-b", "mgr-on", "admin-on"]);
 });
 
 test("re-running is a no-op: nothing to connect when all eligible users are already crew", () => {
@@ -182,7 +116,7 @@ test("crewIdsToConnect only returns the missing ids, and never removes anyone", 
     // "stranger" is on the crew by hand and is not eligible — we must not
     // propose anything about them (this helper only ever adds).
     const toConnect = crewIdsToConnect(ROSTER, ["crew-a", "stranger"]);
-    assert.deepEqual(toConnect, ["crew-b", "cj"]);
+    assert.deepEqual(toConnect, ["crew-b", "mgr-on", "admin-on"]);
 });
 
 test("crewIdsToConnect drops blank ids and dedupes", () => {

@@ -1,15 +1,16 @@
-// DB side of the "all field crew + CJ on every In Progress job" rule.
-// The decision itself is pure and lives in crew-auto-assign.ts; this file only
-// does the Prisma reads/writes and the fail-soft guarding.
+// DB side of the "everyone with the dispatch switch on, on every In Progress
+// job" rule. The decision itself is pure and lives in crew-auto-assign.ts;
+// this file only does the Prisma reads/writes and the fail-soft guarding.
 //
 // Every export here is:
 //   - IDEMPOTENT — it diffs against the project's current crew and connects
 //     only the missing ids. `connect` on a many-to-many is itself tolerant of
 //     an already-present link, so even a lost race just re-writes the same row.
 //   - FAIL-SOFT — errors are caught, logged and swallowed. These run as hooks
-//     off a project save / user activation, and an auto-assign failure must
-//     never fail the save the user actually asked for. Same contract as
-//     autoAssignPhasesForEstimate in auto-assign-phases.ts.
+//     off a project save / user activation / dispatch-switch toggle, and an
+//     auto-assign failure must never fail the save the user actually asked
+//     for. Same contract as autoAssignPhasesForEstimate in
+//     auto-assign-phases.ts.
 //
 // Call sites deliberately `void`/`after()` these — never `await` them inside a
 // transaction.
@@ -17,30 +18,23 @@
 import { prisma } from "@/lib/prisma";
 import {
     AUTO_ASSIGN_PROJECT_STATUS,
-    AUTO_ASSIGN_ROLE,
-    AUTO_ASSIGN_USER_STATUS,
     crewIdsToConnect,
     isAutoAssignProjectStatus,
-    parseAlwaysAssignKeys,
     shouldAutoAssignUser,
-    type AutoAssignOptions,
 } from "@/lib/crew-auto-assign";
 
 const LOG = "[crew-auto-assign]";
 
-function options(): AutoAssignOptions {
-    return { alwaysAssignKeys: parseAlwaysAssignKeys(process.env.CREW_AUTO_ASSIGN_ALWAYS) };
-}
-
 /**
- * Every ACTIVATED user who could possibly qualify. Deliberately NOT filtered
- * to FIELD_CREW in SQL — the always-assign names (CJ) are MANAGER/ADMIN, and
- * the pure rule owns which of these actually qualify.
+ * Every user who could possibly qualify — pre-filtered in SQL to the same
+ * shape as `isDispatchable` (dispatch-roster.ts) for efficiency; the pure
+ * rule in crew-auto-assign.ts is still the source of truth and is re-applied
+ * below.
  */
 async function loadCandidateUsers() {
     return prisma.user.findMany({
-        where: { status: AUTO_ASSIGN_USER_STATUS },
-        select: { id: true, name: true, email: true, role: true, status: true },
+        where: { showOnDispatch: true, status: "ACTIVATED", role: { not: "FINANCE" } },
+        select: { id: true, role: true, status: true, showOnDispatch: true },
     });
 }
 
@@ -59,7 +53,7 @@ export async function syncCrewForProject(projectId: string): Promise<string[]> {
     if (!isAutoAssignProjectStatus(project.status)) return [];
 
     const users = await loadCandidateUsers();
-    const toConnect = crewIdsToConnect(users, project.crew.map((c) => c.id), options());
+    const toConnect = crewIdsToConnect(users, project.crew.map((c) => c.id));
     if (toConnect.length === 0) return [];
 
     await prisma.project.update({
@@ -98,9 +92,10 @@ export async function autoAssignCrewOnStatusChange(
 }
 
 /**
- * The other direction: a user just became (or may have just become) an
- * ACTIVATED FIELD_CREW member — or is CJ — so put them on every project that
- * is currently "In Progress".
+ * The other direction: a user just became (or may have just become)
+ * dispatchable — the Team page turned `showOnDispatch` on, or a role/status
+ * change made them eligible — so put them on every project that is currently
+ * "In Progress".
  */
 export async function syncProjectsForUser(userId: string): Promise<string[]> {
     if (!userId) return [];
@@ -108,15 +103,14 @@ export async function syncProjectsForUser(userId: string): Promise<string[]> {
         where: { id: userId },
         select: {
             id: true,
-            name: true,
-            email: true,
             role: true,
             status: true,
+            showOnDispatch: true,
             assignedProjects: { select: { id: true } },
         },
     });
     if (!user) return [];
-    if (!shouldAutoAssignUser(user, options())) return [];
+    if (!shouldAutoAssignUser(user)) return [];
 
     const already = new Set(user.assignedProjects.map((p) => p.id));
     const inProgress = await prisma.project.findMany({
@@ -147,22 +141,25 @@ export async function autoAssignProjectsForUser(userId: string): Promise<void> {
 
 /**
  * Same as above but skips the DB read entirely unless the write that just
- * happened could plausibly have made the user eligible (role and/or status
- * touched, or we don't know). Callers pass what they wrote.
+ * happened could plausibly have made the user eligible (role, status, and/or
+ * showOnDispatch touched, or we don't know). Callers pass what they wrote.
  */
 export async function autoAssignProjectsOnUserChange(
     userId: string,
-    changed: { role?: unknown; status?: unknown } = {},
+    changed: { role?: unknown; status?: unknown; showOnDispatch?: unknown } = {},
 ): Promise<void> {
     const touchedRole = changed.role !== undefined;
     const touchedStatus = changed.status !== undefined;
-    if (!touchedRole && !touchedStatus) return;
-    // Cheap pre-filter: a write that sets a non-ACTIVATED status can never make
-    // someone eligible. Anything else falls through to the authoritative read.
-    if (touchedStatus && typeof changed.status === "string" && changed.status !== AUTO_ASSIGN_USER_STATUS) {
-        return;
-    }
+    const touchedShowOnDispatch = changed.showOnDispatch !== undefined;
+    if (!touchedRole && !touchedStatus && !touchedShowOnDispatch) return;
+    // Cheap pre-filter: a write that turns any of these off can never make
+    // someone eligible now. Anything else falls through to the authoritative
+    // read (which also covers "flipped to false" — shouldAutoAssignUser will
+    // just find nothing to add, per the "never remove" contract).
+    if (touchedStatus && typeof changed.status === "string" && changed.status !== "ACTIVATED") return;
+    if (touchedRole && changed.role === "FINANCE") return;
+    if (touchedShowOnDispatch && changed.showOnDispatch !== true) return;
     await autoAssignProjectsForUser(userId);
 }
 
-export { AUTO_ASSIGN_PROJECT_STATUS, AUTO_ASSIGN_ROLE, AUTO_ASSIGN_USER_STATUS };
+export { AUTO_ASSIGN_PROJECT_STATUS };

@@ -4,9 +4,14 @@ import { authenticateMobileOrSession, assertProjectAccess } from "@/lib/mobile-a
 import { suggestTaskForClockIn } from "@/lib/time-suggestion";
 
 // GET /api/mobile/time-suggestion?projectId=...
-// Suggested clock-in task for the caller on this project, derived from the
+// Suggested clock-in task for the caller on this project, derived first from
+// today's dispatch (what the office planned for the caller today), then the
 // latest daily log (AI match, then keywords), today's schedule, then the
 // caller's own recent entries. Deterministic — no AI call happens here.
+// Response: { suggestion: TimeSuggestion | null, uncostedPlannedTask: { id, name } | null }.
+// `uncostedPlannedTask` is set when the caller is dispatched to a task today
+// that has no chargeable estimate item/cost code — never a `suggestion`, but
+// still worth telling the crew ("Planned: drywall start (not costed)").
 // Hybrid auth: Bearer token (mobile) OR NextAuth session (web time clock).
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -23,11 +28,11 @@ export async function GET(req: Request) {
     if (fail) return fail;
 
     try {
-        const suggestion = await suggestTaskForClockIn({ userId: user.id, projectId });
-        return NextResponse.json({ suggestion });
+        const result = await suggestTaskForClockIn({ userId: user.id, projectId });
+        return NextResponse.json(result);
     } catch (error) {
         // A suggestion fault must never break the clock-in screen.
         console.error("[time-suggestion] failed", { projectId, error });
-        return NextResponse.json({ suggestion: null });
+        return NextResponse.json({ suggestion: null, uncostedPlannedTask: null });
     }
 }

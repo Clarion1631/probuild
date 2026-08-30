@@ -9,7 +9,7 @@ type ClockInSuggestion = {
     costCodeId: string;
     costCodeLabel: string;
     taskName: string;
-    source: "daily_log" | "today_schedule" | "user_history";
+    source: "dispatch" | "daily_log" | "today_schedule" | "user_history";
     confidence: "high" | "medium" | "low";
     reason: string | null;
 };

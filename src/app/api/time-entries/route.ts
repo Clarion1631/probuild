@@ -232,7 +232,7 @@ export async function POST(req: Request) {
             auditSuggestedTaskName = suggestedTask.name;
         }
     }
-    const validSources = ["daily_log", "today_schedule", "user_history"];
+    const validSources = ["dispatch", "daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({

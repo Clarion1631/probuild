@@ -569,6 +569,17 @@ async function main() {
         check("updateProjectColor is gated behind assertScheduleProjectAccess (schedules permission + project access)",
             colorActionStart >= 0 && colorActionBody.includes("await assertScheduleProjectAccess(projectId)"));
 
+        // ── getTaskBank previously only checked that a session existed, so
+        // any authenticated caller could read the task bank of any project.
+        // Tightened to the same assertScheduleProjectAccess gate used above. ──
+        const taskBankActionStart = actionsSource.indexOf("export async function getTaskBank(");
+        const taskBankActionEnd = actionsSource.indexOf("export async function", taskBankActionStart + 1);
+        const taskBankActionBody = actionsSource.slice(taskBankActionStart, taskBankActionEnd);
+        check("getTaskBank is gated behind assertScheduleProjectAccess (schedules permission + project access)",
+            taskBankActionStart >= 0
+            && taskBankActionBody.includes("await assertScheduleProjectAccess(projectId)")
+            && !taskBankActionBody.includes("getSessionOrDev()"));
+
         // ── PB-schedule-002 item 3: updateProjectEndDateAction — ADMIN/MANAGER
         // gate, end<=start rejection, single ActivityLog row, revalidation.
         // The write/validation path is asserted at the source level (like the

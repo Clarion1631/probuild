@@ -4,6 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
 import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
+import { findReviewCollisions, type DispatchReviewCrewChangeInput, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
@@ -12,6 +13,13 @@ interface DispatchReviewDialogProps {
     conflictTargetIds: ReadonlySet<string>;
     taskNamesById: ReadonlyMap<string, string>;
     memberNamesById: ReadonlyMap<string, string>;
+    // Day-mode collision warning: computed from the review's FINAL
+    // assignment state (every canonical task's currently-saved crew, with
+    // this review's own TASK_CREW changes overlaid) via findReviewCollisions
+    // — catches two conflicting drafted adds in the same review and
+    // multi-day overlaps, not just a change that collides with an
+    // already-committed double-booking.
+    tasks: readonly DispatchReviewTaskInput[];
     onConfirm: () => void;
     onClose: () => void;
 }
@@ -71,6 +79,23 @@ function crewChangeRows(
     return rows.length > 0 ? rows : [{ key: "crew", summary: change.summary }];
 }
 
+/**
+ * Every TASK_CREW change in the review, reduced to the shape
+ * findReviewCollisions wants: the task's final crew AFTER the draft. This
+ * overrides that task's canonical `savedUserIds` for the collision scan, so
+ * a task touched twice in the same review (or two different tasks each
+ * gaining a drafted add) are both checked against their real final state.
+ */
+function crewChangesFromResult(result: PublishDispatchSuccess | null): DispatchReviewCrewChangeInput[] {
+    if (!result) return [];
+    return result.changes
+        .filter((change): change is DispatchChange & { kind: "TASK_CREW" } => change.kind === "TASK_CREW")
+        .map(change => ({
+            taskId: change.targetId,
+            afterUserIds: assignmentsFromChange(change.after.assignments).map(a => a.userId),
+        }));
+}
+
 export function DispatchReviewDialog({
     result,
     published,
@@ -78,6 +103,7 @@ export function DispatchReviewDialog({
     conflictTargetIds,
     taskNamesById,
     memberNamesById,
+    tasks,
     onConfirm,
     onClose,
 }: DispatchReviewDialogProps) {
@@ -88,6 +114,14 @@ export function DispatchReviewDialog({
     ) ?? [];
     const changeCount = reviewRows.length;
     const deliveryCount = result?.deliveryCount ?? 0;
+    const crewChanges = crewChangesFromResult(result);
+    const touchedTaskIds = new Set(crewChanges.map(change => change.taskId));
+    const collisions = findReviewCollisions(tasks, crewChanges);
+    // Flag the banner only when a collision pair actually touches a task
+    // this review changed — a pre-existing double-booking on two untouched
+    // tasks isn't this review's problem to surface.
+    const hasCollision = collisions.some(entry =>
+        entry.pairs.some(pair => touchedTaskIds.has(pair.taskA?.id ?? "") || touchedTaskIds.has(pair.taskB?.id ?? "")));
 
     return (
         <Dialog.Root open={Boolean(result)} onOpenChange={open => { if (!open && !isPending) onClose(); }}>
@@ -127,6 +161,11 @@ export function DispatchReviewDialog({
                             </div>
                         ) : (
                             <>
+                                {hasCollision && (
+                                    <div className="border-b border-amber-200 bg-amber-50 px-5 py-2.5 text-xs font-medium text-amber-800">
+                                        One or more of these changes double-books a crew member on the day their task falls — check the names below before confirming.
+                                    </div>
+                                )}
                                 <div className="border-b border-hui-border bg-slate-50 px-5 py-4">
                                     <div className="flex items-start justify-between gap-4">
                                         <div>

@@ -5,6 +5,7 @@ import { OPEN_PROJECT_STATUSES } from "./project-status";
 import { CLOSED_PROJECT_STATUSES, CLOSED_LEAD_STAGES } from "./gpt-estimate";
 import { coSignedAmount, coTaxRate } from "./co-tax";
 import { foldTaskEvidence } from "./task-evidence";
+import { resolveChargeableItems } from "./time-suggestion";
 import { formatDate, parseUTCDate, addDays, getMonthGrid, getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 
 // Session-free core of the company pipeline dashboard + start-calendar flows
@@ -2098,6 +2099,17 @@ export interface DashboardTaskRow {
     clientStage: string | null;
     scheduledTime: string | null;
     confirmationStatus: string | null;
+    // Dispatch Day mode: tasks clock in and job-cost against an estimate line.
+    // estimateItemId is the task's raw link; costCode/chargeableItemId are
+    // resolved through resolveChargeableItems (src/lib/time-suggestion.ts) —
+    // THE single authority for "what does this charge to" — so a leaf under a
+    // coded parent resolves to the parent's code, and an item on an
+    // ineligible estimate resolves to null ("not costed"), matching the
+    // clock-in picker exactly. Both costCode and chargeableItemId are null
+    // when the task isn't costed.
+    estimateItemId: string | null;
+    costCode: string | null;
+    chargeableItemId: string | null;
     pendingMaterials: number;
     stagedMaterials: number;
     missingMaterials: number;
@@ -2369,13 +2381,14 @@ export async function getCompanyDashboardData(
         ...pipeline.inProgress.map(p => p.id),
         ...pipeline.substantialCompletion.map(p => p.id),
     ];
-    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches] = await Promise.all([
+    const [taskRows, qualifying, unappliedByProject, materialCounts, punchEvidence, punchItemEvidence, dailyLogEvidence, unboundPunches, chargeableTargetsByProject] = await Promise.all([
         prisma.scheduleTask.findMany({
             where: { projectId: { in: rowIds } },
             orderBy: [{ order: "asc" }, { startDate: "asc" }, { id: "asc" }],
             select: {
                 id: true, projectId: true, name: true, startDate: true, endDate: true, updatedAt: true, color: true, parentId: true, progress: true, status: true, type: true,
                 doneWhen: true, blockedReason: true, clientStage: true, scheduledTime: true, confirmationStatus: true,
+                estimateItemId: true,
                 assignments: {
                     orderBy: { createdAt: "asc" },
                     select: { id: true, userId: true, role: true, user: { select: { name: true, email: true, status: true, role: true, showOnDispatch: true } } },
@@ -2429,6 +2442,14 @@ export async function getCompanyDashboardData(
             },
             _count: { id: true },
         }),
+        // Cost-code resolution, batched PER PROJECT (not per task) — one
+        // resolveChargeableItems call per project regardless of task count,
+        // reusing the same resolver the clock-in picker uses so Dispatch Day
+        // can never disagree with what a punch actually charges to.
+        Promise.all(rowIds.map(async projectId => {
+            const { targetByItemId } = await resolveChargeableItems(projectId);
+            return [projectId, targetByItemId] as const;
+        })).then(entries => new Map(entries)),
     ]);
     const materialCountsByTask = new Map<string, { pending: number; staged: number; missing: number }>();
     const materialStatusAtByTask = new Map<string, Date>();
@@ -2459,6 +2480,9 @@ export async function getCompanyDashboardData(
         if (!task.projectId) continue;
         const rows = tasksByProject.get(task.projectId) ?? [];
         const taskMaterialCounts = materialCountsByTask.get(task.id) ?? { pending: 0, staged: 0, missing: 0 };
+        const chargeableTarget = task.estimateItemId
+            ? chargeableTargetsByProject.get(task.projectId)?.get(task.estimateItemId) ?? null
+            : null;
         rows.push({
             id: task.id,
             name: task.name,
@@ -2475,6 +2499,9 @@ export async function getCompanyDashboardData(
             clientStage: task.clientStage,
             scheduledTime: task.scheduledTime,
             confirmationStatus: task.confirmationStatus,
+            estimateItemId: task.estimateItemId,
+            costCode: chargeableTarget?.costCode?.code ?? null,
+            chargeableItemId: chargeableTarget?.id ?? null,
             pendingMaterials: taskMaterialCounts.pending,
             stagedMaterials: taskMaterialCounts.staged,
             missingMaterials: taskMaterialCounts.missing,
