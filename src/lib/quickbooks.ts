@@ -241,6 +241,29 @@ export async function ensureQBServiceItem(tokens: QBTokens): Promise<string> {
 }
 
 /**
+ * Map ProBuild's tax jurisdiction label (Estimate.taxRateName, e.g. "Winlock") to the
+ * QBO TaxCode with the same name. Null when the estimate has no name or QBO has no
+ * matching active code — callers then omit TxnTaxCodeRef, i.e. today's behavior.
+ * Fail-soft on lookup errors: a QBO query hiccup must not block billing.
+ */
+export async function resolveQBTaxCodeId(tokens: QBTokens, taxRateName: string | null | undefined): Promise<string | null> {
+    const name = taxRateName?.trim();
+    if (!name) return null;
+    try {
+        const rows = await qbQuery<{ Id: string; Name?: string; Active?: boolean }>(
+            tokens,
+            `SELECT Id, Name, Active FROM TaxCode WHERE Name = '${escapeQBString(name)}'`,
+        );
+        const hit = rows.find(r => r.Active !== false && (r.Name ?? "").trim().toLowerCase() === name.toLowerCase());
+        if (!hit) console.warn(`[quickbooks] no QBO TaxCode named "${name}" — invoice will use QBO's default tax code`);
+        return hit?.Id ?? null;
+    } catch (err) {
+        console.warn(`[quickbooks] TaxCode lookup for "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+
+/**
  * Create a QBO invoice for ONE payment milestone, with QuickBooks Payments
  * (card + ACH) enabled so the customer gets Intuit's hosted "Review & Pay" page.
  */
@@ -256,6 +279,11 @@ export async function createQBMilestoneInvoice(
         // a pre-tax taxable line + TxnTaxDetail, so QBO's sales-tax reporting
         // sees the liability and the invoice total still equals `amount`.
         tax?: { preTaxAmount: number; taxAmount: number } | null;
+        // QBO TaxCode id for the job's jurisdiction (from resolveQBTaxCodeId). Without it
+        // QBO falls back to the customer's/company default code and recomputes TotalTax at
+        // THAT code's rate — INV-00177-2 (Aug 2026) came out at Vancouver 8.9% on a Winlock
+        // 8.0% job, leaving a phantom $125 balance.
+        taxCodeId?: string | null;
         dueDate?: Date | null;
         billEmail?: string | null;
         privateNote?: string;
@@ -294,7 +322,14 @@ export async function createQBMilestoneInvoice(
                 },
             },
         ],
-        ...(withTax ? { TxnTaxDetail: { TotalTax: input.tax!.taxAmount } } : {}),
+        ...(withTax
+            ? {
+                TxnTaxDetail: {
+                    ...(input.taxCodeId ? { TxnTaxCodeRef: { value: input.taxCodeId } } : {}),
+                    TotalTax: input.tax!.taxAmount,
+                },
+            }
+            : {}),
     };
 
     const res = await qbFetch("/invoice", tokens, { method: "POST", body: JSON.stringify(payload) });

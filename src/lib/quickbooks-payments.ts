@@ -22,6 +22,7 @@ import {
     ensureQBCustomer,
     ensureQBServiceItem,
     createQBMilestoneInvoice,
+    resolveQBTaxCodeId,
     getQBInvoicePaymentLink,
     getQBInvoiceStatus,
     probeQBInvoice,
@@ -143,6 +144,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
                 include: {
                     client: { select: { id: true, name: true, email: true, qbCustomerId: true, addressLine1: true, city: true, state: true, zipCode: true } },
                     project: { select: { id: true, name: true, location: true } },
+                    estimate: { select: { taxRateName: true } },
                     payments: { select: { id: true, createdAt: true }, orderBy: { createdAt: "asc" } },
                 },
             },
@@ -214,6 +216,9 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         if (taxRate > 0 && taxAmount > 0) tax = { preTaxAmount, taxAmount };
     }
 
+    // Pin the jurisdiction so QBO doesn't recompute at its default code's rate.
+    const taxCodeId = tax ? await resolveQBTaxCodeId(tokens, invoice.estimate?.taxRateName) : null;
+
     const { qbId, total } = await createQBMilestoneInvoice(tokens, {
         docNumber,
         customerId,
@@ -221,6 +226,7 @@ export async function pushMilestoneToQuickBooks(paymentScheduleId: string, passe
         description: `${projectName} — ${schedule.name}`,
         amount,
         tax,
+        taxCodeId,
         dueDate: schedule.dueDate,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${schedule.name} · ${projectName}`,

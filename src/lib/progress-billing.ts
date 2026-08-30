@@ -613,6 +613,7 @@ export async function stageProgressBillingToQuickBooksCore(
                 include: {
                     client: { select: { id: true, name: true, email: true, qbCustomerId: true, addressLine1: true, city: true, state: true, zipCode: true } },
                     project: { select: { location: true } },
+                    estimate: { select: { taxRateName: true } },
                 },
             },
         },
@@ -627,7 +628,7 @@ export async function stageProgressBillingToQuickBooksCore(
 
     const invoice = billing.invoice;
     const { getFreshQBTokens, resolveCustomerAndItem } = await import("./quickbooks-payments");
-    const { createQBMilestoneInvoice, getQBInvoicePaymentLink, deleteQBInvoice } = await import("./quickbooks");
+    const { createQBMilestoneInvoice, resolveQBTaxCodeId, getQBInvoicePaymentLink, deleteQBInvoice } = await import("./quickbooks");
     const { qbShipAddrFor } = await import("./wa-tax");
 
     const tokens = await getFreshQBTokens();
@@ -636,6 +637,8 @@ export async function stageProgressBillingToQuickBooksCore(
     const subtotal = toNum(billing.subtotal);
     const taxAmount = toNum(billing.taxAmount);
     const total = toNum(billing.total);
+    // Pin the jurisdiction so QBO doesn't recompute at its default code's rate.
+    const taxCodeId = taxAmount > 0 ? await resolveQBTaxCodeId(tokens, invoice.estimate?.taxRateName) : null;
 
     const { qbId, total: qbTotal } = await createQBMilestoneInvoice(tokens, {
         docNumber: billing.code,
@@ -644,6 +647,7 @@ export async function stageProgressBillingToQuickBooksCore(
         description: billing.description,
         amount: total,
         tax: taxAmount > 0 ? { preTaxAmount: subtotal, taxAmount } : null,
+        taxCodeId,
         billEmail: invoice.client?.email || null,
         privateNote: `ProBuild ${invoice.code} · ${billing.code}`,
         shipAddr: qbShipAddrFor(invoice.project?.location, invoice.client),
