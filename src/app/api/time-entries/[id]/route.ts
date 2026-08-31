@@ -6,6 +6,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
+import { privilegedEditStamp } from "@/lib/time-entry-edit-audit";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
@@ -17,7 +18,8 @@ import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 //              (so the audit trail preserves the as-clocked values), recomputes
 //              durationHours / laborCost / burdenCost from the OWNER's rates
 //              (not the editor's), and stamps `editedByManagerId` + `editedAt`
-//              when a manager edits someone else's punch.
+//              on EVERY privileged (MANAGER/ADMIN) edit — their own punch included
+//              (src/lib/time-entry-edit-audit.ts; changed 2026-08-31, PR #437).
 //
 //   2. Offsite telemetry — body has `offsiteMs` / `isOffsite` / `lastLocationCheck`.
 //                          Mobile geofence watcher hits this every minute or on
@@ -112,6 +114,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
     if (!body.editNotes || typeof body.editNotes !== "string" || !body.editNotes.trim()) {
         return NextResponse.json({ error: "editNotes is required for time-entry edits" }, { status: 400 });
+    }
+    // An entry already snapshotted onto an invoice is billing source data — editing it
+    // leaves the invoice amount describing hours that no longer exist. Same rule the
+    // project-tab actions enforce (Codex gate, PR #437).
+    if (existing.invoiceId || existing.invoicedAt) {
+        return NextResponse.json(
+            { error: "This entry is on an invoice — it can't be edited. Remove it from the invoice first.", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
+    // Explicit endTime:null means "re-open". On an entry that is CLOSED that's almost
+    // never intended — it's the stale-props race (the worker clocked out while the
+    // editor's page sat open) and it would wipe settled hours/costs. Refuse; a real
+    // correction sets a new end time instead (Codex gate, PR #437).
+    if (body.endTime === null && existing.endTime != null) {
+        return NextResponse.json(
+            { error: "This entry is already closed — set a corrected end time instead of clearing it", code: "ALREADY_CLOSED" },
+            { status: 409 }
+        );
     }
 
     const newStart = body.startTime ? new Date(body.startTime) : existing.startTime;
@@ -288,10 +309,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.originalEndTime = existing.endTime;
     }
 
-    if (isPrivileged && !isOwner) {
-        data.editedByManagerId = user.id;
-        data.editedAt = new Date();
-    }
+    // Attribution matrix lives in src/lib/time-entry-edit-audit.ts (pure, tested):
+    // every privileged edit is stamped — a manager's own punch included.
+    Object.assign(data, privilegedEditStamp(user.id, isPrivileged));
 
     // Re-resolve the schedule-task binding only when the edit moves the punch to a
     // different local day — the board may have changed mid-shift, so we must not
@@ -306,7 +326,28 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         });
     }
 
-    const updated = await prisma.timeEntry.update({ where: { id }, data });
+    // Compare-and-swap, not a blind update (Codex gate, PR #437): `data` was derived
+    // from the `existing` snapshot, so it only applies if the row's timestamps are
+    // STILL what we read — a worker's clock-out (or another edit) landing in between
+    // must win, not be silently overwritten with a stale endTime. The invoice fields
+    // are in the guard too, so a row invoiced mid-edit cannot be rewritten.
+    const swapped = await prisma.timeEntry.updateMany({
+        where: {
+            id,
+            startTime: existing.startTime,
+            endTime: existing.endTime,
+            invoiceId: null,
+            invoicedAt: null,
+        },
+        data,
+    });
+    if (swapped.count === 0) {
+        return NextResponse.json(
+            { error: "This entry changed while you were editing (a clock-out, another edit, or an invoice) — refresh and try again", code: "EDIT_CONFLICT" },
+            { status: 409 }
+        );
+    }
+    const updated = await prisma.timeEntry.findUniqueOrThrow({ where: { id } });
 
     // Re-plan every day this edit touched (the row may have moved days).
     const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
@@ -336,9 +377,25 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
+    // An invoiced entry is the invoice's source record — deleting it orphans the
+    // billed amount. Same rule the project-tab delete enforces (Codex gate, PR #437).
+    if (existing.invoiceId || existing.invoicedAt) {
+        return NextResponse.json(
+            { error: "This entry is on an invoice — it can't be deleted. Remove it from the invoice first.", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
+
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
-    // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    // day is re-planned too. The invoice claim is re-verified INSIDE the
+    // transaction (the pre-check above is only a fast 409).
+    const outcome = await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    if (outcome === "invoiced") {
+        return NextResponse.json(
+            { error: "This entry was invoiced while it was being deleted — nothing was removed", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
     return NextResponse.json({ ok: true });
 }

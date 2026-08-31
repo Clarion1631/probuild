@@ -6,6 +6,9 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
+import EntryActions from "./EntryActions";
+import { COMPANY_TIME_ZONE } from "@/lib/company-day";
+import { companyDayRange } from "@/lib/company-wall-time";
 import { canApproveMealSkip } from "@/lib/wa-breaks";
 
 interface Props {
@@ -31,9 +34,11 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     if (projectId) where.projectId = projectId;
     if (flagged === '1') where.needsReview = true;
     if (dateFrom || dateTo) {
-        where.startTime = {};
-        if (dateFrom) where.startTime.gte = new Date(dateFrom);
-        if (dateTo) where.startTime.lte = new Date(dateTo + "T23:59:59");
+        // Company-local day boundaries, not UTC (Codex gate, PR #437): the table shows
+        // Pacific dates, so a 7pm Pacific punch must stay inside its displayed date
+        // even though its UTC timestamp is the next day.
+        const range = companyDayRange(dateFrom, dateTo);
+        if (range.gte || range.lt) where.startTime = range;
     }
 
     const [entries, allUsers, allProjects, pendingSkips] = await Promise.all([
@@ -127,8 +132,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                     <div className="flex-1 min-w-[220px]">
                                         <div className="font-medium text-hui-textMain">{r.user.name || r.user.email}</div>
                                         <div className="text-xs text-hui-textMuted">
-                                            {r.project.name} · clocked in {new Date(r.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-                                            {r.mealSkipRequestedAt && <> · asked {new Date(r.mealSkipRequestedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</>}
+                                            {r.project.name} · clocked in {new Date(r.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}
+                                            {r.mealSkipRequestedAt && <> · asked {new Date(r.mealSkipRequestedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}</>}
                                         </div>
                                     </div>
                                     <div className="text-xs">
@@ -281,6 +286,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                         <th className="px-5 py-3 font-medium text-right">Rate</th>
                                         <th className="px-5 py-3 font-medium text-right">Total</th>
                                         <th className="px-5 py-3 font-medium text-center">Status</th>
+                                        <th className="px-5 py-3 font-medium text-center">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-hui-border">
@@ -295,12 +301,12 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {e.user.name || e.user.email}
                                                 </td>
                                                 <td className="px-5 py-3 text-hui-textMuted text-xs whitespace-nowrap">
-                                                    <div>{new Date(e.startTime).toLocaleDateString()}</div>
+                                                    <div>{new Date(e.startTime).toLocaleDateString('en-US', { timeZone: COMPANY_TIME_ZONE })}</div>
                                                     <div className="text-hui-textMuted">
-                                                        {new Date(e.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                        {new Date(e.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}
                                                         {' → '}
                                                         {e.endTime
-                                                            ? new Date(e.endTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                                            ? new Date(e.endTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })
                                                             : <span className="text-green-600 font-medium">Active</span>}
                                                     </div>
                                                 </td>
@@ -342,11 +348,24 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                                 </button>
                                                             </form>
                                                         </div>
-                                                    ) : e.editedByManagerId ? (
-                                                        <span className="text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">Edited</span>
+                                                    ) : e.isEdited ? (
+                                                        <span className="text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200" title={e.editedByManagerId ? "Edited by a manager/admin" : "Edited by the worker"}>
+                                                            {e.editedByManagerId ? "Edited" : "Edited (worker)"}
+                                                        </span>
                                                     ) : (
                                                         <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded border border-green-200">Original</span>
                                                     )}
+                                                </td>
+                                                <td className="px-5 py-3 text-center text-xs">
+                                                    <EntryActions
+                                                        entryId={e.id}
+                                                        userName={e.user.name || e.user.email}
+                                                        startTime={new Date(e.startTime).toISOString()}
+                                                        endTime={e.endTime ? new Date(e.endTime).toISOString() : null}
+                                                        isLogistics={!!e.project?.isLogistics}
+                                                        existingNotes={e.notes ?? ""}
+                                                        invoiced={!!(e.invoiceId || e.invoicedAt)}
+                                                    />
                                                 </td>
                                             </tr>
                                         );
@@ -354,11 +373,12 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                 </tbody>
                                 <tfoot className="border-t border-hui-border bg-slate-50">
                                     <tr>
+                                        {/* 9 columns: label×3, Paid hrs, Meal+Rate, Total, Status+Actions */}
                                         <td colSpan={3} className="px-5 py-2 text-xs font-semibold text-hui-textMuted">Subtotal</td>
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{pHours.toFixed(2)}</td>
-                                        <td />
+                                        <td colSpan={2} />
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{formatCurrency(pCost)}</td>
-                                        <td />
+                                        <td colSpan={2} />
                                     </tr>
                                 </tfoot>
                             </table>
