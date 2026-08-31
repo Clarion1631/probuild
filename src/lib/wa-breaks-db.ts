@@ -2,7 +2,7 @@
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
 import { prisma } from "@/lib/prisma";
-import { companyDayBounds, toCompanyDayKey } from "@/lib/company-day";
+import { toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { checkDeleteAllowed, DeleteRefusedError, type DeleteActor } from "@/lib/time-entry-delete-policy";
@@ -168,56 +168,62 @@ export async function deleteEntryAndSettleInTx(
     ownerGuard?: DeleteActor,
     now: () => Date = () => new Date()
 ): Promise<"deleted" | "gone"> {
+    // 1. Day lock(s). A plain read tells us which day(s) the row is on; advisory
+    //    locks are always taken BEFORE the row lock (never while holding it), so
+    //    lock order against the settle paths stays day-lock → row-lock.
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
-    const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
-    if (!victim) return "gone"; // already gone
-    const actualDay = toCompanyDayKey(victim.startTime);
-    if (actualDay !== knownDayKey) {
+    const peek = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
+    if (!peek) return "gone"; // already gone
+    const peekDay = toCompanyDayKey(peek.startTime);
+    if (peekDay !== knownDayKey) {
         // Moved since the caller read it — take that day's lock as well
         // (deterministic order: keys sorted, so two deletes cannot deadlock).
-        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${peek.userId}:${peekDay}`);
+    }
+
+    // 2. Row lock. From here until commit nothing else can update or delete this row,
+    //    so every check below is made against exactly the row that gets deleted — no
+    //    window for an invoice/QBO sync, a reassignment, a startTime move, or (owner
+    //    path) the company day rolling over between check and delete (Codex gate,
+    //    PR #436: a conditional WHERE with pre-computed bounds was not enough, since
+    //    the delete itself can wait on a row lock across midnight).
+    const victim = await lockTimeEntryRow(tx, entryId);
+    if (!victim) return "gone"; // vanished between the peek and the lock
+    const actualDay = toCompanyDayKey(victim.startTime);
+    if (actualDay !== knownDayKey && actualDay !== peekDay) {
+        // Moved AGAIN between the peek and the row lock, onto a day we do not hold
+        // the lock for. Never take an advisory lock while holding a row lock — refuse,
+        // and let the caller retry (409).
+        throw new DeleteRefusedError("CLAIM_LOST");
     }
     if (ownerGuard) {
-        // Policy re-check AFTER every lock is held (waiting on a lock can cross the
-        // company-day boundary), on the row as read inside this transaction.
+        // Owner policy, judged on the LOCKED row with the clock read AFTER all locks —
+        // this is the check that decides; the route's pre-check was only a fast 403.
         const check = checkDeleteAllowed(ownerGuard, victim, now());
         if (!check.ok) throw new DeleteRefusedError(check.code);
-        // Atomic claim: only a row that STILL belongs to the owner, STILL has no
-        // downstream link, and was created on TODAY's company day is deleted (Postgres
-        // re-evaluates the predicate against the committed row if a concurrent writer
-        // touched it). The day window is in the WHERE too (Codex round 2): the delete
-        // itself can wait on a row lock across midnight, and then "today" as checked
-        // above would already be yesterday.
-        const today = companyDayBounds(toCompanyDayKey(now()));
-        const claimed = await tx.timeEntry.deleteMany({
-            where: {
-                id: entryId,
-                userId: ownerGuard.id,
-                invoiceId: null,
-                invoicedAt: null,
-                qbTimeActivityId: null,
-                qbSyncedAt: null,
-                createdAt: { gte: today.start, lt: today.end },
-            },
-        });
-        if (claimed.count === 0) {
-            // Lost the claim: explain with the row as it is now (or it vanished meanwhile).
-            // If the re-read still passes the policy, don't invent a reason — it's a conflict.
-            const current = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
-            if (!current) return "gone";
-            const check2 = checkDeleteAllowed(ownerGuard, current, now());
-            throw new DeleteRefusedError(check2.ok ? "CLAIM_LOST" : check2.code);
-        }
-    } else {
-        // Privileged: unconditional — but deleteMany, so a row that vanished between the
-        // read above and here is "gone" rather than a Prisma P2025 throw.
-        const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
-        if (removed.count === 0) return "gone";
     }
-    for (const dayKey of new Set([knownDayKey, actualDay])) {
+
+    // 3. Delete the locked row (deleteMany: a count, never a P2025 throw) and re-plan
+    //    every day it may have touched.
+    const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
+    if (removed.count === 0) return "gone";
+    for (const dayKey of new Set([knownDayKey, peekDay, actualDay])) {
         await settleDayInTx(tx, victim.userId, dayKey, null);
     }
     return "deleted";
+}
+
+type LockedTimeEntryRow = {
+    userId: string; startTime: Date; createdAt: Date;
+    invoiceId: string | null; invoicedAt: Date | null; qbTimeActivityId: string | null; qbSyncedAt: Date | null;
+};
+
+/** `SELECT … FOR UPDATE` on one TimeEntry — the row lock the delete relies on. Null when the row is gone. */
+async function lockTimeEntryRow(tx: Tx, entryId: string): Promise<LockedTimeEntryRow | null> {
+    const rows = await tx.$queryRaw<LockedTimeEntryRow[]>`
+        SELECT "userId", "startTime", "createdAt", "invoiceId", "invoicedAt", "qbTimeActivityId", "qbSyncedAt"
+        FROM "TimeEntry" WHERE id = ${entryId} FOR UPDATE`;
+    return rows[0] ?? null;
 }
 
 /** Id of the worker's latest CLOSED entry on a company-local day (null when none) — the row that carries the day's outcome. */

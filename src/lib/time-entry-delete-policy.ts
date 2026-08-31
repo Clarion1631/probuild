@@ -37,6 +37,14 @@ export function isPrivilegedDeleter(role: string): boolean {
     return role === "MANAGER" || role === "ADMIN";
 }
 
+/**
+ * Roles with ANY delete path. The route refuses everyone else before it looks the
+ * entry up, so a FINANCE/unknown caller cannot use 404-vs-403 to probe which ids exist.
+ */
+export function canAttemptDelete(role: string): boolean {
+    return isPrivilegedDeleter(role) || role === OWNER_DELETE_ROLE;
+}
+
 /** True when an invoice or QuickBooks already references the entry. */
 export function isLockedDownstream(victim: Pick<DeleteVictim, "invoiceId" | "invoicedAt" | "qbTimeActivityId" | "qbSyncedAt">): boolean {
     return (

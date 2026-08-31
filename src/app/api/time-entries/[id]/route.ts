@@ -8,7 +8,7 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
-import { checkDeleteAllowed, DELETE_REFUSAL_MESSAGES, DeleteRefusedError, isPrivilegedDeleter } from "@/lib/time-entry-delete-policy";
+import { canAttemptDelete, checkDeleteAllowed, DELETE_REFUSAL_MESSAGES, DeleteRefusedError, isPrivilegedDeleter, type DeleteActor, type DeleteVictim } from "@/lib/time-entry-delete-policy";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
@@ -322,48 +322,89 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 // Manager/admin only. Field crew correct mistakes via PATCH (with editNotes audit);
 // outright deletion is a separate, stronger action that needs the audit-log gap to be
 // explicit on the record (we just remove it; payroll already accounts for `isEdited`).
-export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
-    const auth = await authenticateMobileOrSession(req);
-    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
-    const { user } = auth;
 
-    const { id } = await params;
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+// ---------------------------------------------------------------------------
+// DELETE — who may remove an entry is decided by src/lib/time-entry-delete-policy.ts
+// (managers/admins: any entry; FIELD_CREW: their own, created today, not invoiced or
+// QBO-synced; every other role fails closed). Dependency-injected like the clock-out
+// handler in ../route.ts so the role rejection and the 403/409 mapping are unit-tested
+// (tests/time-entries-delete-route.test.ts) without a database.
+// ---------------------------------------------------------------------------
 
-    const existing = await prisma.timeEntry.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+type DeleteAuthResult =
+    | { ok: true; user: { id: string; role: string } }
+    | { ok: false; status: number; error: string };
 
-    // Owner decision 2026-08-30: field crew may delete their OWN entry outright (a
-    // wrong-job or duplicate punch) — but only while it is still TODAY's entry (company
-    // day, judged by the un-editable createdAt) and only if no invoice / QuickBooks
-    // record references it yet. Anything else needs a manager/admin, who may delete
-    // anyone's. The rule lives in src/lib/time-entry-delete-policy.ts; this is the
-    // fast pre-check for a clean 403, and the SAME rule is re-checked inside the
-    // delete transaction below, where the delete is conditional on the row still
-    // qualifying (Codex gate, PR #434: a pre-check alone is a TOCTOU).
-    const actor = { id: user.id, role: user.role };
-    const pre = checkDeleteAllowed(actor, existing);
-    if (!pre.ok) {
-        return NextResponse.json({ error: DELETE_REFUSAL_MESSAGES[pre.code], code: pre.code }, { status: 403 });
-    }
+export type DeleteTimeEntryRow = DeleteVictim & { startTime: Date };
 
-    // Delete + re-plan the day in one transaction under the day lock — a
-    // concurrent edit that moved this row is seen inside the lock and its new
-    // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    try {
-        await deleteEntryAndSettle(
-            id,
-            toCompanyDayKey(existing.startTime),
-            existing.userId,
-            isPrivilegedDeleter(user.role) ? undefined : actor
-        );
-    } catch (error) {
-        if (error instanceof DeleteRefusedError) {
-            // Lost the claim inside the transaction (invoiced / synced / reassigned
-            // between the pre-check and the delete). Nothing was deleted.
-            return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+export interface DeleteDependencies {
+    authenticate(req: Request): Promise<DeleteAuthResult>;
+    findTimeEntry(id: string): Promise<DeleteTimeEntryRow | null>;
+    /** src/lib/wa-breaks-db.ts deleteEntryAndSettle — throws DeleteRefusedError on a refused owner claim. */
+    deleteEntryAndSettle(id: string, dayKey: string, userId: string, ownerGuard?: DeleteActor): Promise<"deleted" | "gone">;
+}
+
+export function createDeleteHandler(dependencies: DeleteDependencies) {
+    return async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
+        const auth = await dependencies.authenticate(req);
+        if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+        const { user } = auth;
+
+        // Roles with no delete path at all are refused BEFORE any lookup, so the
+        // response cannot double as an existence oracle (Codex gate, PR #436).
+        if (!canAttemptDelete(user.role)) {
+            return NextResponse.json({ error: "Not allowed to delete time entries" }, { status: 403 });
         }
-        throw error;
-    }
-    return NextResponse.json({ ok: true });
+
+        const { id } = await params;
+        if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+
+        const existing = await dependencies.findTimeEntry(id);
+        if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+
+        // Fast pre-check for a clean 403. The SAME rule is re-checked inside the delete
+        // transaction on the row locked FOR UPDATE, which is what actually decides.
+        const actor: DeleteActor = { id: user.id, role: user.role };
+        const pre = checkDeleteAllowed(actor, existing);
+        if (!pre.ok) {
+            return NextResponse.json({ error: DELETE_REFUSAL_MESSAGES[pre.code], code: pre.code }, { status: 403 });
+        }
+
+        // Delete + re-plan the day in one transaction under the day lock — a
+        // concurrent edit that moved this row is seen inside the lock and its new
+        // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
+        try {
+            await dependencies.deleteEntryAndSettle(
+                id,
+                toCompanyDayKey(existing.startTime),
+                existing.userId,
+                isPrivilegedDeleter(user.role) ? undefined : actor
+            );
+        } catch (error) {
+            if (error instanceof DeleteRefusedError) {
+                // The row changed between the pre-check and the locked delete (invoiced,
+                // synced, reassigned, moved, or the day rolled over). Nothing was deleted.
+                return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+            }
+            throw error;
+        }
+        return NextResponse.json({ ok: true });
+    };
+}
+
+const deleteHandler = createDeleteHandler({
+    authenticate: authenticateMobileOrSession,
+    findTimeEntry: (id) =>
+        prisma.timeEntry.findUnique({
+            where: { id },
+            select: {
+                userId: true, startTime: true, createdAt: true,
+                invoiceId: true, invoicedAt: true, qbTimeActivityId: true, qbSyncedAt: true,
+            },
+        }),
+    deleteEntryAndSettle,
+});
+
+export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }> }) {
+    return deleteHandler(req, ctx);
 }
