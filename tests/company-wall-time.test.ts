@@ -7,7 +7,31 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { companyDayRange, companyWallToInstant, companyWallToInstants, instantToCompanyWall } from "../src/lib/company-wall-time";
+import { companyDayRange, companyWallToInstant, companyWallToInstants, instantToCompanyWall, occurrenceOf, pickInstant } from "../src/lib/company-wall-time";
+
+test("pickInstant/occurrenceOf: an ambiguous fall-back time is only resolved by an explicit choice — and either occurrence is reachable", () => {
+    // Unambiguous: pick is ignored.
+    assert.equal(pickInstant("2026-08-30T12:00", "")!.toISOString(), "2026-08-30T19:00:00.000Z");
+    assert.equal(pickInstant("2026-08-30T12:00", "second")!.toISOString(), "2026-08-30T19:00:00.000Z");
+    // Ambiguous without a pick → null (the UI must ask, never guess).
+    assert.equal(pickInstant("2026-11-01T01:30", ""), null);
+    assert.equal(pickInstant("2026-11-01T01:30", "first")!.toISOString(), "2026-11-01T08:30:00.000Z");
+    assert.equal(pickInstant("2026-11-01T01:30", "second")!.toISOString(), "2026-11-01T09:30:00.000Z");
+    // The gap stays unreachable regardless of pick.
+    assert.equal(pickInstant("2026-03-08T02:30", "first"), null);
+    // Regression (PR #437 round 5): a punch stored in the WRONG occurrence can be
+    // corrected without changing the wall-time string — seed the picker from the
+    // stored instant, then flip it.
+    const wrong = new Date("2026-11-01T08:30:00.000Z"); // stored as the PDT occurrence
+    const wall = instantToCompanyWall(wrong);
+    assert.equal(wall, "2026-11-01T01:30");
+    assert.equal(occurrenceOf(wall, wrong), "first");
+    const corrected = pickInstant(wall, "second")!;
+    assert.equal(corrected.toISOString(), "2026-11-01T09:30:00.000Z");
+    assert.equal(occurrenceOf(wall, corrected), "second");
+    // occurrenceOf is "" when nothing is ambiguous.
+    assert.equal(occurrenceOf("2026-08-30T12:00", new Date("2026-08-30T19:00:00.000Z")), "");
+});
 import { toCompanyDayKey } from "../src/lib/company-day";
 
 test("companyWallToInstants: one instant normally, two in the fall-back hour (earliest first), zero in the gap", () => {

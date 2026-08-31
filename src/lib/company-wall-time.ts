@@ -63,6 +63,33 @@ export function companyWallToInstant(value: string): Date | null {
     return companyWallToInstants(value)[0] ?? null;
 }
 
+export type DstPick = "" | "first" | "second";
+
+/**
+ * Resolve a wall time with an explicit occurrence choice for the fall-back hour.
+ *  - unambiguous wall time → its instant (pick is ignored);
+ *  - ambiguous + pick "first"/"second" → that occurrence;
+ *  - ambiguous with no pick, the DST gap, or junk → null (the caller must ask).
+ */
+export function pickInstant(wall: string, pick: DstPick): Date | null {
+    const instants = companyWallToInstants(wall);
+    if (instants.length === 1) return instants[0];
+    if (instants.length === 2) {
+        if (pick === "first") return instants[0];
+        if (pick === "second") return instants[1];
+    }
+    return null;
+}
+
+/** Which occurrence of an ambiguous wall time `instant` is ("" when unambiguous or no match). */
+export function occurrenceOf(wall: string, instant: Date): DstPick {
+    const instants = companyWallToInstants(wall);
+    if (instants.length !== 2) return "";
+    if (instants[0].getTime() === instant.getTime()) return "first";
+    if (instants[1].getTime() === instant.getTime()) return "second";
+    return "";
+}
+
 /**
  * Prisma range for date-only filter inputs ("YYYY-MM-DD"), as COMPANY-local calendar
  * days: [00:00 of `dateFrom`, 00:00 of the day after `dateTo`). Built from wall times,

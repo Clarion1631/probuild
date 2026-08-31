@@ -364,6 +364,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                         endTime={e.endTime ? new Date(e.endTime).toISOString() : null}
                                                         isLogistics={!!e.project?.isLogistics}
                                                         existingNotes={e.notes ?? ""}
+                                                        invoiced={!!(e.invoiceId || e.invoicedAt)}
                                                     />
                                                 </td>
                                             </tr>

@@ -8,24 +8,34 @@
 //   PATCH  /api/time-entries/[id]  — privileged edit; requires editNotes, recomputes
 //          paid hours/costs from the OWNER's rates, stamps editedByManagerId
 //          (src/lib/time-entry-edit-audit.ts), and re-settles the day server-side.
-//          Closing an OPEN logistics entry requires job notes — the modal shows them
-//          PREFILLED with the entry's existing notes so a close never wipes the
-//          worker's record (Codex gate, PR #437).
 //   DELETE /api/time-entries/[id]  — MANAGER/ADMIN only; deletes and re-settles the
 //          day in one transaction (deleteEntryAndSettle).
 // The page itself is already MANAGER/ADMIN-gated server-side.
 //
+// Invoiced entries are billing source data — the row shows "Invoiced" instead of
+// actions, and the server refuses edits/deletes of them anyway (Codex gate, PR #437).
+//
+// Stale-props hygiene (the page can sit open while workers punch): the save sends ONLY
+// what the manager actually changed — an untouched start/end is omitted entirely, and
+// a blank end is never sent as an explicit null, so a clock-out that landed meanwhile
+// cannot be silently undone (the server additionally refuses re-opening).
+//
 // Times are entered in COMPANY time (America/Los_Angeles, labeled Pacific), never the
 // browser's zone (src/lib/company-wall-time.ts). DST rules: a nonexistent
-// spring-forward time is refused outright; a fall-back time that happens twice makes
-// the modal show an explicit first/second choice — payroll never guesses the hour.
-// An UNCHANGED field resends the row's original instant verbatim, so the
-// minute-granular input cannot round an untouched timestamp's seconds away.
+// spring-forward time is refused; a fall-back time that happens twice shows an
+// explicit first/second choice — seeded from the STORED occurrence, so a punch saved
+// in the wrong occurrence can be corrected without changing the wall-time string.
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { companyWallToInstants, instantToCompanyWall } from "@/lib/company-wall-time";
+import {
+    companyWallToInstants,
+    instantToCompanyWall,
+    occurrenceOf,
+    pickInstant,
+    type DstPick,
+} from "@/lib/company-wall-time";
 
 type Props = {
     entryId: string;
@@ -37,24 +47,11 @@ type Props = {
     isLogistics: boolean;
     /** The entry's current job notes — prefill so a logistics close preserves them. */
     existingNotes: string;
+    /** On an invoice: no actions here (server refuses too). */
+    invoiced: boolean;
 };
 
-/** "" = unambiguous or not yet needed; "first" | "second" = the user's pick for a fall-back time. */
-type DstPick = "" | "first" | "second";
-
-function resolveField(
-    wall: string,
-    pick: DstPick
-): { kind: "ok"; instant: Date } | { kind: "nonexistent" } | { kind: "ambiguous" } {
-    const instants = companyWallToInstants(wall);
-    if (instants.length === 0) return { kind: "nonexistent" };
-    if (instants.length === 1) return { kind: "ok", instant: instants[0] };
-    if (pick === "first") return { kind: "ok", instant: instants[0] };
-    if (pick === "second") return { kind: "ok", instant: instants[1] };
-    return { kind: "ambiguous" };
-}
-
-export default function EntryActions({ entryId, userName, startTime, endTime, isLogistics, existingNotes }: Props) {
+export default function EntryActions({ entryId, userName, startTime, endTime, isLogistics, existingNotes, invoiced }: Props) {
     const router = useRouter();
     const [open, setOpen] = useState(false);
     const [busy, setBusy] = useState(false);
@@ -64,9 +61,9 @@ export default function EntryActions({ entryId, userName, startTime, endTime, is
     const [endPick, setEndPick] = useState<DstPick>("");
     const [reason, setReason] = useState("");
     const [jobNotes, setJobNotes] = useState("");
-    // The wall-time strings the modal OPENED with — an unchanged field resends the
-    // original instant, preserving seconds the minute input cannot represent.
-    const initial = useRef({ start: "", end: "" });
+    // What the modal OPENED with — a field (wall string AND occurrence pick) that
+    // matches its initial value is treated as untouched and OMITTED from the PATCH.
+    const initial = useRef({ start: "", end: "", startPick: "" as DstPick, endPick: "" as DstPick });
     const dialogRef = useRef<HTMLDialogElement>(null);
     const openerRef = useRef<HTMLButtonElement>(null);
 
@@ -75,11 +72,15 @@ export default function EntryActions({ entryId, userName, startTime, endTime, is
     function openModal() {
         const s = instantToCompanyWall(startTime);
         const e = endTime ? instantToCompanyWall(endTime) : "";
-        initial.current = { start: s, end: e };
+        // Seed the DST picks from the STORED instants, so an ambiguous punch shows
+        // which occurrence it currently is — and flipping the radio alone is an edit.
+        const sPick = occurrenceOf(s, new Date(startTime));
+        const ePick = endTime ? occurrenceOf(e, new Date(endTime)) : "";
+        initial.current = { start: s, end: e, startPick: sPick, endPick: ePick };
         setStart(s);
         setEnd(e);
-        setStartPick("");
-        setEndPick("");
+        setStartPick(sPick);
+        setEndPick(ePick);
         setReason("");
         setJobNotes(existingNotes);
         setOpen(true);
@@ -98,54 +99,55 @@ export default function EntryActions({ entryId, userName, startTime, endTime, is
         if (!open && dialog?.open) dialog.close();
     }, [open]);
 
-    const startAmbiguous = start !== initial.current.start && companyWallToInstants(start).length === 2;
-    const endAmbiguous = end !== "" && end !== initial.current.end && companyWallToInstants(end).length === 2;
+    const startAmbiguous = companyWallToInstants(start).length === 2;
+    const endAmbiguous = end !== "" && companyWallToInstants(end).length === 2;
+    const startTouched = start !== initial.current.start || startPick !== initial.current.startPick;
+    const endTouched = end !== initial.current.end || endPick !== initial.current.endPick;
     const closingOpenEntry = !endTime && end !== "";
 
     async function saveEdit() {
         if (!reason.trim()) { toast.error("A reason is required for every edit"); return; }
-        let startIso: string;
-        if (start === initial.current.start) {
-            startIso = startTime; // untouched — keep the exact original instant
-        } else {
-            const r = resolveField(start, startPick);
-            if (r.kind === "nonexistent") { toast.error("That start time doesn't exist (clocks spring forward that night)"); return; }
-            if (r.kind === "ambiguous") { toast.error("That start time happens twice that night — pick first or second below"); return; }
-            startIso = r.instant.toISOString();
-        }
-        let endIso: string | null = null;
-        if (end) {
-            if (end === initial.current.end && endTime) {
-                endIso = endTime;
-            } else {
-                const r = resolveField(end, endPick);
-                if (r.kind === "nonexistent") { toast.error("That end time doesn't exist (clocks spring forward that night)"); return; }
-                if (r.kind === "ambiguous") { toast.error("That end time happens twice that night — pick first or second below"); return; }
-                endIso = r.instant.toISOString();
+        // Only what changed is sent — untouched fields are omitted so a concurrent
+        // change (a worker's clock-out, newer notes) is never overwritten by stale props.
+        const patch: Record<string, unknown> = { editNotes: reason.trim() };
+        let startMs = new Date(startTime).getTime();
+        if (startTouched) {
+            const parsed = pickInstant(start, startPick);
+            if (!parsed) {
+                toast.error(startAmbiguous ? "That start time happens twice that night — pick first or second" : "That start time doesn't exist (clocks spring forward that night)");
+                return;
             }
-            if (new Date(endIso).getTime() <= new Date(startIso).getTime()) { toast.error("End must be after start"); return; }
-        } else if (endTime) {
-            // Blank end on a CLOSED entry would silently re-open it — refuse, like mobile does.
-            toast.error("This entry is closed — give it an end time");
-            return;
+            patch.startTime = parsed.toISOString();
+            startMs = parsed.getTime();
         }
-        if (closingOpenEntry && isLogistics && !jobNotes.trim()) {
-            toast.error("Closing a logistics entry needs job notes — what was the work?");
-            return;
+        if (end === "") {
+            if (endTime) {
+                // Blank end on a CLOSED entry would re-open it — refuse, like mobile does
+                // (the server refuses this too).
+                toast.error("This entry is closed — give it an end time");
+                return;
+            }
+            // Open entry, left open: send nothing about the end at all.
+        } else if (endTouched) {
+            const parsed = pickInstant(end, endPick);
+            if (!parsed) {
+                toast.error(endAmbiguous ? "That end time happens twice that night — pick first or second" : "That end time doesn't exist (clocks spring forward that night)");
+                return;
+            }
+            if (parsed.getTime() <= startMs) { toast.error("End must be after start"); return; }
+            patch.endTime = parsed.toISOString();
         }
+        if (closingOpenEntry && isLogistics) {
+            if (!jobNotes.trim()) { toast.error("Closing a logistics entry needs job notes — what was the work?"); return; }
+            patch.notes = jobNotes.trim();
+        }
+        if (Object.keys(patch).length === 1) { toast.error("Nothing changed — adjust a time first"); return; }
         setBusy(true);
         try {
             const res = await fetch(`/api/time-entries/${encodeURIComponent(entryId)}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    startTime: startIso,
-                    endTime: endIso,
-                    editNotes: reason.trim(),
-                    // Only a genuine close-out of a logistics entry sends notes, and they
-                    // start from the existing ones — never a silent replacement.
-                    ...(closingOpenEntry && isLogistics && jobNotes.trim() ? { notes: jobNotes.trim() } : {}),
-                }),
+                body: JSON.stringify(patch),
             });
             const body = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(body?.error || `Edit failed (${res.status})`);
@@ -174,6 +176,14 @@ export default function EntryActions({ entryId, userName, startTime, endTime, is
         } finally {
             setBusy(false);
         }
+    }
+
+    if (invoiced) {
+        return (
+            <span className="text-xs text-hui-textMuted" title="On an invoice — remove it from the invoice before editing or deleting">
+                Invoiced
+            </span>
+        );
     }
 
     function dstPicker(value: DstPick, onChange: (v: DstPick) => void, label: string) {
@@ -223,7 +233,7 @@ export default function EntryActions({ entryId, userName, startTime, endTime, is
                     <div>
                         <h3 className="font-semibold text-hui-textMain">Edit time entry</h3>
                         <p className="text-xs text-hui-textMuted">
-                            {userName} — times are Pacific (company time). Paid hours and costs recompute from the worker&apos;s rates; the edit is stamped with your name.
+                            {userName} — times are Pacific (company time). Only the fields you change are saved. Paid hours and costs recompute from the worker&apos;s rates; the edit is stamped with your name.
                         </p>
                     </div>
                     <label className="block text-sm">

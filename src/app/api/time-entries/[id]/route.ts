@@ -115,6 +115,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (!body.editNotes || typeof body.editNotes !== "string" || !body.editNotes.trim()) {
         return NextResponse.json({ error: "editNotes is required for time-entry edits" }, { status: 400 });
     }
+    // An entry already snapshotted onto an invoice is billing source data — editing it
+    // leaves the invoice amount describing hours that no longer exist. Same rule the
+    // project-tab actions enforce (Codex gate, PR #437).
+    if (existing.invoiceId || existing.invoicedAt) {
+        return NextResponse.json(
+            { error: "This entry is on an invoice — it can't be edited. Remove it from the invoice first.", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
+    // Explicit endTime:null means "re-open". On an entry that is CLOSED that's almost
+    // never intended — it's the stale-props race (the worker clocked out while the
+    // editor's page sat open) and it would wipe settled hours/costs. Refuse; a real
+    // correction sets a new end time instead (Codex gate, PR #437).
+    if (body.endTime === null && existing.endTime != null) {
+        return NextResponse.json(
+            { error: "This entry is already closed — set a corrected end time instead of clearing it", code: "ALREADY_CLOSED" },
+            { status: 409 }
+        );
+    }
 
     const newStart = body.startTime ? new Date(body.startTime) : existing.startTime;
     const newEnd =
@@ -336,6 +355,15 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
 
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+
+    // An invoiced entry is the invoice's source record — deleting it orphans the
+    // billed amount. Same rule the project-tab delete enforces (Codex gate, PR #437).
+    if (existing.invoiceId || existing.invoicedAt) {
+        return NextResponse.json(
+            { error: "This entry is on an invoice — it can't be deleted. Remove it from the invoice first.", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
