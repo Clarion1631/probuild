@@ -14,6 +14,7 @@ import {
     DeleteRefusedError,
     isLockedDownstream,
     isPrivilegedDeleter,
+    OWNER_DELETE_ROLE,
     type DeleteVictim,
 } from "../src/lib/time-entry-delete-policy";
 
@@ -93,6 +94,13 @@ test("managers and admins bypass every owner restriction; other roles do not", (
         assert.equal(isPrivilegedDeleter(role), false, JSON.stringify(role));
         assert.equal(checkDeleteAllowed({ id: "u-x", role }, locked, NOW).ok, false, JSON.stringify(role));
     }
+});
+
+test("only FIELD_CREW takes the owner path — FINANCE or an unknown role is refused even for its OWN same-day entry (fail closed)", () => {
+    for (const role of ["FINANCE", "", "SUPERVISOR", "field_crew"]) {
+        assert.deepEqual(checkDeleteAllowed({ id: "u-crew", role }, victim(), NOW), { ok: false, code: "NOT_OWNER" }, JSON.stringify(role));
+    }
+    assert.deepEqual(checkDeleteAllowed({ id: "u-crew", role: OWNER_DELETE_ROLE }, victim(), NOW), { ok: true });
 });
 
 test("DeleteRefusedError carries the code and the user-facing message", () => {

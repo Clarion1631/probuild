@@ -2,7 +2,7 @@
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
 import { prisma } from "@/lib/prisma";
-import { toCompanyDayKey } from "@/lib/company-day";
+import { companyDayBounds, toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { checkDeleteAllowed, DeleteRefusedError, type DeleteActor } from "@/lib/time-entry-delete-policy";
@@ -182,10 +182,13 @@ export async function deleteEntryAndSettleInTx(
         // company-day boundary), on the row as read inside this transaction.
         const check = checkDeleteAllowed(ownerGuard, victim, now());
         if (!check.ok) throw new DeleteRefusedError(check.code);
-        // Atomic claim: only a row that STILL belongs to the owner and STILL has no
-        // downstream link is deleted (Postgres re-evaluates the predicate against the
-        // committed row if a concurrent writer touched it). createdAt is immutable, so
-        // the day check above cannot be raced by a field change.
+        // Atomic claim: only a row that STILL belongs to the owner, STILL has no
+        // downstream link, and was created on TODAY's company day is deleted (Postgres
+        // re-evaluates the predicate against the committed row if a concurrent writer
+        // touched it). The day window is in the WHERE too (Codex round 2): the delete
+        // itself can wait on a row lock across midnight, and then "today" as checked
+        // above would already be yesterday.
+        const today = companyDayBounds(toCompanyDayKey(now()));
         const claimed = await tx.timeEntry.deleteMany({
             where: {
                 id: entryId,
@@ -194,6 +197,7 @@ export async function deleteEntryAndSettleInTx(
                 invoicedAt: null,
                 qbTimeActivityId: null,
                 qbSyncedAt: null,
+                createdAt: { gte: today.start, lt: today.end },
             },
         });
         if (claimed.count === 0) {

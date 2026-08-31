@@ -64,6 +64,7 @@ function fakeTx(opts: { first: Row | null; after?: Row | null; claimCount?: numb
 }
 
 const dayOf = async (d: Date) => (await import("../src/lib/company-day")).toCompanyDayKey(d);
+const boundsOf = async (d: Date) => { const cd = await import("../src/lib/company-day"); return cd.companyDayBounds(cd.toCompanyDayKey(d)); };
 
 test("owner path: same-day unlinked entry is claimed with a conditional deleteMany", async () => {
     const { deleteEntryAndSettleInTx } = await load();
@@ -74,7 +75,13 @@ test("owner path: same-day unlinked entry is claimed with a conditional deleteMa
     const claim = calls.find((c) => c.startsWith("deleteMany:"));
     assert.ok(claim, "used the conditional deleteMany");
     const where = JSON.parse(claim!.slice("deleteMany:".length));
-    assert.deepEqual(where, { id: "te1", userId: "u-crew", invoiceId: null, invoicedAt: null, qbTimeActivityId: null, qbSyncedAt: null });
+    const today = await boundsOf(NOW);
+    // The company-day window rides INSIDE the atomic delete (Codex round 2): a delete
+    // that waits on a row lock across midnight must not remove yesterday's entry.
+    assert.deepEqual(where, {
+        id: "te1", userId: "u-crew", invoiceId: null, invoicedAt: null, qbTimeActivityId: null, qbSyncedAt: null,
+        createdAt: { gte: today.start.toISOString(), lt: today.end.toISOString() },
+    });
     assert.equal(calls.includes("delete"), false, "never the unconditional delete");
 });
 
@@ -91,16 +98,21 @@ test("owner path: a claim lost while the re-read still passes the policy is repo
     assert.equal(calls.includes("update"), false);
 });
 
-test("owner path: the day is judged at delete time — a clock past midnight refuses even a row read as 'today'", async () => {
+test("owner path: the day is judged AFTER both locks — a clock that crosses midnight while locking refuses, no delete", async () => {
     const { deleteEntryAndSettleInTx } = await load();
     const { DeleteRefusedError } = await policy();
-    const victim = row();
+    // Row moved to another day so the second advisory lock is taken; the clock reads
+    // pre-midnight when the route pre-checked and post-midnight once the locks are held.
+    const victim = row({ startTime: new Date(NOW.getTime() - 3 * 24 * 3_600_000) });
+    const knownDay = await dayOf(NOW);
+    assert.notEqual(knownDay, await dayOf(victim.startTime));
     const { tx, calls } = fakeTx({ first: victim });
     const afterMidnight = () => new Date("2026-08-31T08:30:00.000Z"); // 01:30 PDT next day
     await assert.rejects(
-        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, afterMidnight),
+        deleteEntryAndSettleInTx(tx, "te1", knownDay, "u-crew", CREW, afterMidnight),
         (err: unknown) => err instanceof DeleteRefusedError && err.code === "NOT_TODAY"
     );
+    assert.equal(calls.filter((c) => c.startsWith("lock:")).length, 2, "both day locks were taken before the refusal");
     assert.equal(calls.some((c) => c.startsWith("deleteMany")), false);
 });
 

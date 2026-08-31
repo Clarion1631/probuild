@@ -24,6 +24,45 @@ const DAY_PARTS = new Intl.DateTimeFormat("en-CA", {
     day: "2-digit",
 });
 
+const TIME_PARTS = new Intl.DateTimeFormat("en-CA", {
+    timeZone: COMPANY_TIME_ZONE,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hourCycle: "h23",
+});
+
+/** UTC instant of company-local midnight that starts `dayKey` (YYYY-MM-DD). DST-correct. */
+function companyMidnightUtc(dayKey: string): Date {
+    const [y, m, d] = dayKey.split("-").map(Number);
+    const wanted = Date.UTC(y, m - 1, d, 0, 0, 0);
+    // Start from a guess and correct by however far the local wall-clock reading of the
+    // guess is from 00:00:00 — converges in one step except across a DST switch, where
+    // a second pass lands it.
+    let guess = Date.UTC(y, m - 1, d, 8, 0, 0); // Pacific midnight is 07:00Z (PDT) or 08:00Z (PST)
+    for (let i = 0; i < 3; i++) {
+        const parts = TIME_PARTS.formatToParts(new Date(guess));
+        const get = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? "0");
+        const localAsUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
+        const diff = localAsUtc - wanted;
+        if (diff === 0) break;
+        guess -= diff;
+    }
+    return new Date(guess);
+}
+
+/**
+ * Half-open UTC window [start, end) of instants whose company-local day is `dayKey`.
+ * `toCompanyDayKey(start) === dayKey`, `toCompanyDayKey(new Date(start - 1)) !== dayKey`,
+ * likewise at `end`. Use it to put a company-day condition into a database WHERE
+ * (e.g. `createdAt: { gte: start, lt: end }`), which toCompanyDayKey alone cannot do.
+ */
+export function companyDayBounds(dayKey: string): { start: Date; end: Date } {
+    const [y, m, d] = dayKey.split("-").map(Number);
+    const next = new Date(Date.UTC(y, m - 1, d + 1));
+    const nextKey = `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, "0")}-${String(next.getUTCDate()).padStart(2, "0")}`;
+    return { start: companyMidnightUtc(dayKey), end: companyMidnightUtc(nextKey) };
+}
+
 /** Calendar day an instant falls on in company-local time. DST-correct. */
 export function toCompanyDayKey(instant: Date | string): string {
     const date = typeof instant === "string" ? new Date(instant) : instant;

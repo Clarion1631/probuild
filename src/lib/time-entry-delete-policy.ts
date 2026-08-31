@@ -49,8 +49,14 @@ export function isLockedDownstream(victim: Pick<DeleteVictim, "invoiceId" | "inv
 
 export type DeleteCheck = { ok: true } | { ok: false; code: DeleteRefusalCode };
 
+/** The one non-privileged role that may take the owner path. Any other (FINANCE, unknown) fails closed. */
+export const OWNER_DELETE_ROLE = "FIELD_CREW";
+
 export function checkDeleteAllowed(actor: DeleteActor, victim: DeleteVictim, now: Date = new Date()): DeleteCheck {
     if (isPrivilegedDeleter(actor.role)) return { ok: true };
+    // Fail closed (Codex): a role that is neither privileged nor FIELD_CREW — FINANCE
+    // today, anything added later — gets no owner-delete by default.
+    if (actor.role !== OWNER_DELETE_ROLE) return { ok: false, code: "NOT_OWNER" };
     if (victim.userId !== actor.id) return { ok: false, code: "NOT_OWNER" };
     if (toCompanyDayKey(victim.createdAt) !== toCompanyDayKey(now)) return { ok: false, code: "NOT_TODAY" };
     if (isLockedDownstream(victim)) return { ok: false, code: "LOCKED_DOWNSTREAM" };
