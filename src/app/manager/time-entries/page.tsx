@@ -6,6 +6,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
+import EntryActions from "./EntryActions";
 import { canApproveMealSkip } from "@/lib/wa-breaks";
 
 interface Props {
@@ -281,6 +282,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                         <th className="px-5 py-3 font-medium text-right">Rate</th>
                                         <th className="px-5 py-3 font-medium text-right">Total</th>
                                         <th className="px-5 py-3 font-medium text-center">Status</th>
+                                        <th className="px-5 py-3 font-medium text-center">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-hui-border">
@@ -348,6 +350,14 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                         <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded border border-green-200">Original</span>
                                                     )}
                                                 </td>
+                                                <td className="px-5 py-3 text-center text-xs">
+                                                    <EntryActions
+                                                        entryId={e.id}
+                                                        userName={e.user.name || e.user.email}
+                                                        startTime={new Date(e.startTime).toISOString()}
+                                                        endTime={e.endTime ? new Date(e.endTime).toISOString() : null}
+                                                    />
+                                                </td>
                                             </tr>
                                         );
                                     })}
@@ -358,7 +368,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{pHours.toFixed(2)}</td>
                                         <td />
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{formatCurrency(pCost)}</td>
-                                        <td />
+                                        <td colSpan={2} />
                                     </tr>
                                 </tfoot>
                             </table>
