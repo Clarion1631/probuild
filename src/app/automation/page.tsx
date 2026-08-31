@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import { redirect } from "next/navigation";
 import { formatCurrency } from "@/lib/utils";
+import { prisma } from "@/lib/prisma";
 import { getCurrentUserWithPermissions, hasPermission, isAdminOrManager } from "@/lib/permissions";
+import { toDepositReviewItem, type DepositReviewItem } from "@/lib/deposit-review";
 import { getFreshQBTokens, QBNotConnectedError } from "@/lib/quickbooks-payments";
 import { fetchBankRegister, type BankRegisterRow } from "@/lib/qbo-bank-register";
 import { isPurchaseType } from "@/lib/register-types";
@@ -43,6 +45,7 @@ import { OrphanReceipts } from "./components/register/orphan-receipts";
 import { JourneySection } from "./components/register/journey-section";
 import type { SerializedJourney } from "./components/journey-list";
 import { PipelineHealth } from "./components/pipeline-health";
+import { DepositReviewPanel } from "./components/deposit-review";
 import { ExpandableRow } from "./components/register/expandable-row";
 import { LinksCell } from "./components/register/links-cell";
 import { RowDrilldown } from "./components/register/row-drilldown";
@@ -161,6 +164,31 @@ export default async function AutomationPage(props: {
     // independently during SSR vs. hydration.
     const nowMs = Date.now();
 
+    // Incoming-check exceptions must remain visible when QBO is down. This
+    // is a deliberately read-only panel; it exposes no retry or payment-write
+    // control, and a failed panel query degrades honestly instead of blocking
+    // the rest of Automation.
+    let depositReviews: DepositReviewItem[] = [];
+    let depositReviewUnavailable = false;
+    if (isAdmin) {
+        try {
+            const deposits = await prisma.depositIngest.findMany({
+                where: { status: { not: "applied" } },
+                orderBy: { updatedAt: "desc" },
+                take: 25,
+                select: {
+                    id: true, status: true, extracted: true, paymentScheduleId: true,
+                    qbPaymentId: true, officeTaskId: true, attempts: true, lastError: true,
+                    createdAt: true, updatedAt: true,
+                },
+            });
+            depositReviews = deposits.map(toDepositReviewItem);
+        } catch (error) {
+            depositReviewUnavailable = true;
+            console.error("deposit review fetch failed", error instanceof Error ? error.name : "UnknownError");
+        }
+    }
+
     function filterHref(overrides: { range?: string; type?: string; review?: string }) {
         const params = new URLSearchParams();
         const nextRange = overrides.range ?? range;
@@ -215,6 +243,7 @@ export default async function AutomationPage(props: {
                     <h1 className="text-xl font-bold text-hui-textMain">Automation</h1>
                 </div>
                 {errorCard}
+                {isAdmin && <DepositReviewPanel items={depositReviews} unavailable={depositReviewUnavailable} />}
             </div>
         );
     }
@@ -541,6 +570,8 @@ export default async function AutomationPage(props: {
                 <StatCard label="Needs review" value={mergeUnavailable ? "—" : String(needsReview)} />
                 <StatCard label="Receipts stuck outside the bank" value={mergeUnavailable ? "—" : String(orphanCount)} />
             </div>
+
+            {isAdmin && <DepositReviewPanel items={depositReviews} unavailable={depositReviewUnavailable} />}
 
             {/* Secondary counts — nothing hides, plan §2 */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

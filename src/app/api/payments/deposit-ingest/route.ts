@@ -9,6 +9,7 @@ import { recordPaymentCore } from "@/lib/payment-record-core";
 import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
 import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
+import { toDepositReviewItem } from "@/lib/deposit-review";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -78,20 +79,32 @@ interface MatchedSchedule {
     invoiceCode: string;
 }
 
+/** The receipt bot can poll a deposit by Drive file ID. This read uses the
+ * same bearer secret as ingest and only returns a sanitized review projection,
+ * never the raw extraction snapshot or a QBO replay request body. */
+export async function GET(req: Request) {
+    const unauthorized = requireDepositIngestAuth(req);
+    if (unauthorized) return unauthorized;
+
+    const fileId = new URL(req.url).searchParams.get("fileId")?.trim() ?? "";
+    if (!fileId || fileId.length > 200) {
+        return NextResponse.json({ ok: false, reason: "invalid-file-id" }, { status: 400 });
+    }
+    const row = await prisma.depositIngest.findUnique({
+        where: { fileId },
+        select: {
+            id: true, status: true, extracted: true, paymentScheduleId: true,
+            qbPaymentId: true, officeTaskId: true, attempts: true, lastError: true,
+            createdAt: true, updatedAt: true,
+        },
+    });
+    if (!row) return NextResponse.json({ ok: false, reason: "not-found" }, { status: 404 });
+    return NextResponse.json({ ok: true, deposit: toDepositReviewItem(row) });
+}
+
 export async function POST(req: Request) {
-    const secret = process.env.DEPOSIT_INGEST_SECRET;
-    if (!secret) {
-        console.error("DEPOSIT_INGEST_SECRET is not configured");
-        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
-    }
-    // Hash both sides to fixed length so timingSafeEqual is usable regardless of
-    // header length — removes the string-compare timing side channel.
-    const authHeader = req.headers.get("authorization") ?? "";
-    const expectedDigest = createHash("sha256").update(`Bearer ${secret}`).digest();
-    const gotDigest = createHash("sha256").update(authHeader).digest();
-    if (!timingSafeEqual(expectedDigest, gotDigest)) {
-        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
-    }
+    const unauthorized = requireDepositIngestAuth(req);
+    if (unauthorized) return unauthorized;
 
     let raw: Record<string, unknown>;
     try {
@@ -313,6 +326,23 @@ export async function POST(req: Request) {
         });
         return NextResponse.json({ ok: false, status: retryStatus, reason: message });
     }
+}
+
+function requireDepositIngestAuth(req: Request): NextResponse | null {
+    const secret = process.env.DEPOSIT_INGEST_SECRET;
+    if (!secret) {
+        console.error("DEPOSIT_INGEST_SECRET is not configured");
+        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
+    }
+    // Hash both sides to fixed length so timingSafeEqual is usable regardless of
+    // header length — removes the string-compare timing side channel.
+    const authHeader = req.headers.get("authorization") ?? "";
+    const expectedDigest = createHash("sha256").update(`Bearer ${secret}`).digest();
+    const gotDigest = createHash("sha256").update(authHeader).digest();
+    if (!timingSafeEqual(expectedDigest, gotDigest)) {
+        return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
+    }
+    return null;
 }
 
 // ── Matching + apply ─────────────────────────────────────────────────────────

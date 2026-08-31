@@ -14,6 +14,7 @@ type User = {
     status: string;
     hourlyRate: number;
     burdenRate: number;
+    showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
 };
@@ -141,6 +142,7 @@ export default function TeamPage() {
                                     <th className="px-6 py-4 font-normal">Status</th>
                                     <th className="px-6 py-4 font-normal hidden sm:table-cell">Projects</th>
                                     <th className="px-6 py-4 font-normal hidden sm:table-cell">Hourly Rate</th>
+                                    <th className="px-6 py-4 font-normal hidden sm:table-cell text-center">Dispatch</th>
                                     <th className="px-6 py-4 font-normal text-right">Actions</th>
                                 </tr>
                             </thead>
@@ -202,6 +204,9 @@ export default function TeamPage() {
                                             </td>
                                             <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell">
                                                 {formatCurrency(user.hourlyRate ?? 0)}
+                                            </td>
+                                            <td className="px-6 py-4 text-hui-textMuted hidden sm:table-cell text-center" title={user.showOnDispatch ? "Shows on the dispatch board" : "Not on the dispatch board"}>
+                                                {user.showOnDispatch ? "✓" : "—"}
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <Link
