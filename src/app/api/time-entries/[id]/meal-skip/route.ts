@@ -27,12 +27,18 @@ async function notifyApprovers(text: string): Promise<void> {
     const url = process.env.MEAL_SKIP_CHAT_WEBHOOK_URL;
     if (!url || !isValidChatWebhookUrl(url)) return;
     try {
-        await fetch(url, {
+        const res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text }),
             signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
         });
+        // Google Chat answers a bad/revoked webhook with 4xx JSON — log it so a
+        // silent "nobody got pinged" can be traced in the Vercel runtime logs.
+        if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            console.error("[meal-skip] approver notify rejected", res.status, body.slice(0, 300));
+        }
     } catch (error) {
         console.error("[meal-skip] approver notify failed", error);
     }

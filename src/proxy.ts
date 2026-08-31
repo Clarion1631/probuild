@@ -11,7 +11,12 @@ const MOBILE_AUTHENTICATED_ROUTE_PATTERNS = [
     /^\/api\/calendar\/sync\/?$/,
     /^\/api\/manager\/dashboard\/?$/,
     /^\/api\/manager\/(?:jobs|employees)(?:\/[^/]+)?\/?$/,
-    /^\/api\/time-entries(?:\/[^/]+)?\/?$/,
+    // /api/time-entries, /api/time-entries/[id], and the two per-entry sub-routes the
+    // crew app calls with a Bearer token: [id]/meal-skip (skip-lunch request/decision)
+    // and [id]/logistics (voice-dump clean-up). Both handlers call
+    // authenticateMobileOrSession. Without them here the proxy answered the app's
+    // POST with a 307 to /login — the "Couldn't send" skip-lunch failure (2026-08-30).
+    /^\/api\/time-entries(?:\/[^/]+(?:\/(?:meal-skip|logistics))?)?\/?$/,
     /^\/api\/files\/(?:signed-upload|register)\/?$/,
     /^\/api\/(?:expenses|receipts\/parse)\/?$/,
     /^\/api\/rooms\/scan-import\/?$/,
@@ -66,6 +71,11 @@ const TEST_ONLY_DISPATCHER_PATHS = new Set([
 
 export function isPublicProxyBypass(pathname: string) {
     return PUBLIC_PROXY_BYPASS_PATTERN.test(pathname);
+}
+
+/** True when the route handler at `pathname` verifies mobile Bearer tokens itself. */
+export function isMobileAuthenticatedRoute(pathname: string) {
+    return MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
 }
 
 function hasNextAuthSessionCookie(req: any) {
@@ -150,11 +160,15 @@ export default async function proxy(req: any, event: any) {
     // Approved shared API routes verify mobile JWTs in their own handlers. Do not
     // extend this to arbitrary Bearer requests: many web routes rely on Proxy as
     // their authentication boundary.
+    // `!isServerAction` is load-bearing (Codex gate, PR #434): the crew app never
+    // dispatches Server Actions, and a Bearer header must not let an anonymous caller
+    // replay a global action ID against an allowlisted path — the route handler's token
+    // check never runs for an action dispatch.
     const authHeader = req.headers?.get?.("authorization");
-    const handlerVerifiesBearer = typeof pathname === "string"
-        && MOBILE_AUTHENTICATED_ROUTE_PATTERNS.some((pattern) => pattern.test(pathname));
+    const handlerVerifiesBearer = typeof pathname === "string" && isMobileAuthenticatedRoute(pathname);
     if (
-        handlerVerifiesBearer
+        !isServerAction
+        && handlerVerifiesBearer
         && typeof authHeader === "string"
         && authHeader.toLowerCase().startsWith("bearer ")
     ) {
