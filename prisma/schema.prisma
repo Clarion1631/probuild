@@ -252,6 +252,9 @@ model Project {
   // project start shown on the start calendar; endDate reserved for Phase 2.
   startDate               DateTime?
   endDate                 DateTime?
+  // Derived from open schedule tasks; never user-entered.
+  projectedEndDate        DateTime?
+  projectedEndComputedAt  DateTime?
   type                    String? // Kitchen Remodeling, Patio, Water Damage
   code                    String?
   tags                    String?

@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { getDefaultColorForTaskName } from "@/app/projects/[id]/schedule/schedule-utils";
 import { CLOSED_PROJECT_STATUSES } from "./gpt-estimate";
 import { CLIENT_STAGES, clientStageIndex } from "./client-stages";
+import { recomputeProjectProjectionInTransaction } from "./project-projection";
 import {
     deriveEstimateItemHours,
     lockTaskAssignmentParent,
@@ -250,6 +251,7 @@ export async function createScheduleTaskInTransaction(
             }),
         },
     });
+    await recomputeProjectProjectionInTransaction(tx, projectId);
     return created;
 }
 
@@ -403,6 +405,7 @@ export async function updateScheduleTaskInTransaction(
             },
         });
     }
+    await recomputeProjectProjectionInTransaction(tx, locked.projectId);
     return saved;
 }
 

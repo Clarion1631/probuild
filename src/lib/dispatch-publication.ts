@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { withTxRetry } from "./tx-retry";
+import { recomputeProjectProjectionInTransaction } from "./project-projection";
 import {
     setProjectStartDateInTransaction,
     shiftNotStartedTasksInTransaction,
@@ -251,6 +252,15 @@ async function applyPlan(
                 endDate: new Date(`${state.endDate}T00:00:00.000Z`),
             },
         });
+    }
+
+    const dateProjectIds = [...new Set(
+        [...dateTaskIds]
+            .map(taskId => tasksById.get(taskId)?.projectId)
+            .filter((projectId): projectId is string => Boolean(projectId)),
+    )].sort();
+    for (const projectId of dateProjectIds) {
+        await recomputeProjectProjectionInTransaction(tx, projectId);
     }
 
     const crewTaskIds = changedCrewTaskIds(plan.changes);
