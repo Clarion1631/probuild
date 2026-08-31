@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { rerouteLogisticsEntry } from "@/lib/actions";
 import { LOGISTICS_CATEGORY_LABELS, type LogisticsCategory } from "@/lib/logistics-formalize";
+import { applyManagerRouteForm } from "@/lib/logistics-clock-flow";
 import { PROJECT_STATUS_IN_PROGRESS } from "@/lib/project-status";
 
 // Plan 02 (decision D2): Logistics is the overhead bucket. This is where a
@@ -102,7 +103,7 @@ export default async function ManagerLogisticsPage({ searchParams }: Props) {
                                             <td className="px-4 py-3 whitespace-nowrap text-xs">{category ? LOGISTICS_CATEGORY_LABELS[category] ?? category : <span className="text-hui-textMuted">—</span>}</td>
                                             <td className="px-4 py-3 text-right tabular-nums">{e.durationHours != null ? e.durationHours.toFixed(2) : "—"}</td>
                                             <td className="px-4 py-3 whitespace-nowrap">
-                                                <form action={async (fd: FormData) => { "use server"; const v = String(fd.get("target") ?? ""); await rerouteLogisticsEntry(e.id, v ? v : null); }} className="flex items-center gap-2">
+                                                <form action={async (fd: FormData) => { "use server"; const target = fd.get("target"); await applyManagerRouteForm(typeof target === "string" ? target : null, (routeTarget) => rerouteLogisticsEntry(e.id, routeTarget)); }} className="flex items-center gap-2">
                                                     <select name="target" defaultValue={e.project.isLogistics ? "" : e.project.id} className="hui-input text-xs py-1">
                                                         <option value="">Overhead (Logistics)</option>
                                                         {!e.project.isLogistics && !jobs.some((j) => j.id === e.project.id) && (

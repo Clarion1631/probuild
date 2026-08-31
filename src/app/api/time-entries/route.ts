@@ -10,6 +10,7 @@ import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/li
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { normalizeClockInAttribution } from "@/lib/logistics-clock-flow";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -50,14 +51,29 @@ export async function GET(req: Request) {
     return NextResponse.json(JSON.parse(JSON.stringify(timeEntries)));
 }
 
-export async function POST(req: Request) {
-    const auth = await authenticateMobileOrSession(req);
-    if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
-    const { user } = auth;
+export interface ClockInDependencies {
+    authenticate(req: Request): Promise<{ ok: true; user: { id: string; role: string } } | { ok: false; status: number; error: string }>;
+    assertProjectAccess(user: { id: string; role: string }, projectId: string): Promise<Response | null>;
+    findLatestClosed(userId: string): Promise<any>;
+    flagStaleDeferred(id: string, reviewReason: string | null, data: Record<string, unknown>): Promise<unknown>;
+    settleDay(userId: string, dayKey: string, closing: null): Promise<unknown>;
+    findProject(projectId: string): Promise<{ isLogistics: boolean } | null>;
+    findEstimateItem(projectId: string, estimateItemId: string): Promise<{ id: string; costCodeId: string | null } | null>;
+    isCostCodeAllowedForProject(projectId: string, costCodeId: string): Promise<boolean>;
+    resolveScheduleTaskId(input: { userId: string; projectId: string; dayKey: string; estimateItemId: string | null }): Promise<string | null>;
+    createTimeEntry(data: Record<string, unknown>): Promise<unknown>;
+}
+
+export function createClockInHandler(dependencies: ClockInDependencies) {
+    return {
+        async POST(req: Request) {
+            const auth = await dependencies.authenticate(req);
+            if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
+            const { user } = auth;
 
     const body = await req.json();
     const {
-        projectId, costCodeId, estimateItemId, startTime, latitude, longitude,
+        projectId, costCodeId: rawCostCodeId, estimateItemId: rawEstimateItemId, startTime, latitude, longitude,
         // Suggestion audit (newer clients only — older app versions omit all of these)
         suggestedScheduleTaskId, suggestedCostCodeId, suggestionSource, suggestionOverridden,
         // Logistics voice dump (plan 02) — what the worker said at clock-in.
@@ -70,7 +86,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "Project ID is required" }, { status: 400 });
     }
 
-    const fail = await assertProjectAccess(user, projectId);
+    const fail = await dependencies.assertProjectAccess(user, projectId);
     if (fail) return fail;
 
     // A mid-day (DEFERRED) close that was never followed by a clock-in is the
@@ -78,11 +94,7 @@ export async function POST(req: Request) {
     // back (src/lib/wa-breaks.ts staleDeferredReview). Best-effort, never
     // blocks the clock-in.
     try {
-        const latest = await prisma.timeEntry.findFirst({
-            where: { userId: user.id, endTime: { not: null } },
-            orderBy: { endTime: "desc" },
-            select: { id: true, mealOutcome: true, startTime: true, endTime: true, needsReview: true, reviewReason: true },
-        });
+        const latest = await dependencies.findLatestClosed(user.id);
         const stale = staleDeferredReview({
             latest,
             now: new Date(),
@@ -91,18 +103,28 @@ export async function POST(req: Request) {
         });
         if (stale && latest) {
             // Optimistic: only if nobody composed a reason onto the row meanwhile.
-            await prisma.timeEntry.updateMany({ where: { id: latest.id, reviewReason: latest.reviewReason }, data: stale });
+            await dependencies.flagStaleDeferred(latest.id, latest.reviewReason, stale);
             // And settle that day for real — the deferred close WAS the day's end.
             // Day keyed by START time, like every other reader of a row's day.
-            await settleDay(user.id, toCompanyDayKey(latest.startTime), null);
+            await dependencies.settleDay(user.id, toCompanyDayKey(latest.startTime), null);
         }
     } catch (error) {
         console.error("[time-entries] stale DEFERRED review check failed", error);
     }
 
-    const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { isLogistics: true },
+    const project = await dependencies.findProject(projectId);
+
+    if (!project) {
+        return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    }
+
+    // The Logistics project is an overhead holding bucket. Never accept a
+    // phase/item supplied by a client here: that would put its labor cost onto
+    // a real job before a manager deliberately routes it.
+    const { costCodeId, estimateItemId } = normalizeClockInAttribution({
+        isLogistics: project.isLogistics,
+        costCodeId: rawCostCodeId,
+        estimateItemId: rawEstimateItemId,
     });
 
     // Cost attribution: the estimate item is what actually gets charged, so it
@@ -112,22 +134,7 @@ export async function POST(req: Request) {
     let resolvedEstimateItemId: string | null = null;
     let resolvedCostCodeId: string | null = null;
     if (estimateItemId) {
-        const item = await prisma.estimateItem.findFirst({
-            where: {
-                id: estimateItemId,
-                estimate: {
-                    projectId,
-                    // Shared constant, NOT an inline copy. Review finding: this list
-                    // was duplicated here while GET .../cost-codes/[id]/items used
-                    // PHASE_ELIGIBLE_ESTIMATE_WHERE. Identical today, but if
-                    // eligibility ever changed in one place the picker would offer
-                    // items this endpoint then rejects — turning a one-line config
-                    // change into a crew-facing clock-in dead end.
-                    ...PHASE_ELIGIBLE_ESTIMATE_WHERE,
-                },
-            },
-            select: { id: true, costCodeId: true },
-        });
+        const item = await dependencies.findEstimateItem(projectId, estimateItemId);
         if (!item) {
             return NextResponse.json(
                 {
@@ -192,7 +199,7 @@ export async function POST(req: Request) {
         // /api/projects/[id]/cost-codes serves, computed by the same shared
         // helper so the picker and this check can never disagree. That includes
         // the Safety Meeting phase, but only on an In Progress project.
-        const allowed = await isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId);
+        const allowed = await dependencies.isCostCodeAllowedForProject(projectId, costCodeId);
         if (!allowed) {
             return NextResponse.json(
                 { error: "That phase is not available on this project", code: "PHASE_NOT_ON_PROJECT" },
@@ -235,7 +242,7 @@ export async function POST(req: Request) {
     const validSources = ["daily_log", "today_schedule", "user_history"];
 
     const entryStartTime = startTime ? new Date(startTime) : new Date();
-    const scheduleTaskId = await resolveScheduleTaskIdForPunch({
+    const scheduleTaskId = await dependencies.resolveScheduleTaskId({
         userId: user.id,
         projectId,
         dayKey: toCompanyDayKey(entryStartTime),
@@ -250,8 +257,7 @@ export async function POST(req: Request) {
         );
     }
 
-    const timeEntry = await prisma.timeEntry.create({
-        data: {
+    const timeEntry = await dependencies.createTimeEntry({
             userId: user.id,
             projectId,
             costCodeId: resolvedCostCodeId,
@@ -268,11 +274,42 @@ export async function POST(req: Request) {
             suggestedCostCodeId: typeof suggestedCostCodeId === "string" ? suggestedCostCodeId : null,
             suggestionSource: validSources.includes(suggestionSource) ? suggestionSource : null,
             suggestionOverridden: suggestionOverridden === true,
-        }
     });
 
     return NextResponse.json(timeEntry);
+        }
+    };
 }
+
+export const POST = createClockInHandler({
+    authenticate: authenticateMobileOrSession,
+    assertProjectAccess: (user, projectId) => assertProjectAccess(user as any, projectId),
+    findLatestClosed: (userId) => prisma.timeEntry.findFirst({
+        where: { userId, endTime: { not: null } },
+        orderBy: { endTime: "desc" },
+        select: { id: true, mealOutcome: true, startTime: true, endTime: true, needsReview: true, reviewReason: true },
+    }),
+    flagStaleDeferred: (id, reviewReason, data) => prisma.timeEntry.updateMany({
+        where: { id, reviewReason },
+        data: data as any,
+    }),
+    settleDay,
+    findProject: (projectId) => prisma.project.findUnique({
+        where: { id: projectId },
+        select: { isLogistics: true },
+    }),
+    findEstimateItem: (projectId, estimateItemId) => prisma.estimateItem.findFirst({
+        where: {
+            id: estimateItemId,
+            estimate: { projectId, ...PHASE_ELIGIBLE_ESTIMATE_WHERE },
+        },
+        select: { id: true, costCodeId: true },
+    }),
+    isCostCodeAllowedForProject: (projectId, costCodeId) =>
+        isCostCodeAllowedForProject(prismaPhaseDataSource, projectId, costCodeId),
+    resolveScheduleTaskId: resolveScheduleTaskIdForPunch,
+    createTimeEntry: (data) => prisma.timeEntry.create({ data: data as any }),
+});
 
 // ── PUT (clock-out) — extracted into a DI-testable factory ──────────────────
 // This is the real clock-out path the mobile app calls (lib/api.ts
