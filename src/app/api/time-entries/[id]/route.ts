@@ -339,7 +339,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     // worker erase paid history; the same-day gate is the bound.)
     const isPrivileged = user.role === "MANAGER" || user.role === "ADMIN";
     const entryDay = toCompanyDayKey(existing.startTime);
-    const isOwnerToday = existing.userId === user.id && entryDay === toCompanyDayKey(new Date());
+    // "Today" is judged by createdAt, which the owner cannot edit — startTime is
+    // PATCH-able, so gating on it would let a worker move an old punch into today and
+    // then delete it (Codex round 2, 2026-08-30).
+    const isOwnerToday = existing.userId === user.id && toCompanyDayKey(existing.createdAt) === toCompanyDayKey(new Date());
     if (!isOwnerToday && !isPrivileged) {
         return NextResponse.json(
             { error: "Only today's own entries can be deleted here — ask a manager to remove this one" },
