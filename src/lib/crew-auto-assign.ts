@@ -93,3 +93,36 @@ export function crewIdsToConnect(users: AutoAssignUser[], existingCrewIds: Itera
         .filter((id) => !!id && !existing.has(id));
     return [...new Set(ids)];
 }
+
+// ── revoke (ProjectCrewAutoLink provenance) ────────────────────────────────
+//
+// The Team toggle used to be add-only: `Project.crew` grants project access,
+// so a user who was auto-connected kept that access forever, even after
+// becoming ineligible. `ProjectCrewAutoLink` (prisma/schema.prisma) records
+// which crew connections the sync itself made, so it — and only it — can be
+// undone. A manual connection (made by hand on Team Access, no auto-link row)
+// is never revoked by this rule.
+
+export type AutoLinkRevokeInput = {
+    /** Does a ProjectCrewAutoLink row exist for this (project, user) pair? */
+    hasAutoLink: boolean;
+    /** Would this user currently be auto-assigned (shouldAutoAssignUser)? */
+    userEligible: boolean;
+    /** Is the project currently an auto-assign status (isAutoAssignProjectStatus)? */
+    projectEligible: boolean;
+    /** Does the user hold a TaskAssignment (real scheduled work) on this project? */
+    hasTaskAssignment: boolean;
+};
+
+/**
+ * Should this crew connection be revoked (Project.crew disconnect + the
+ * auto-link row deleted)? Only ever true for a connection the sync itself
+ * made, that has gone stale (the user is no longer eligible, or the project
+ * is no longer an auto-assign status), and where the user isn't relying on
+ * it for a real schedule assignment.
+ */
+export function shouldRevokeAutoLink(input: AutoLinkRevokeInput): boolean {
+    if (!input.hasAutoLink) return false; // manual connection — never touched
+    if (input.hasTaskAssignment) return false; // keep — real scheduled work depends on it
+    return !input.userEligible || !input.projectEligible;
+}

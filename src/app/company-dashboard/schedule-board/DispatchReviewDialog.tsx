@@ -4,7 +4,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import type { PublishDispatchSuccess } from "@/lib/dispatch-publication";
 import type { DispatchAssignment, DispatchChange } from "@/lib/dispatch-intent";
-import { applyReviewChangesToTasks, collisionDelta, findReviewCollisions, type DispatchReviewTaskInput } from "./dispatch-day-rows";
+import { applyReviewChangesToTasks, collisionDelta, findReviewCollisions, formatCollisionLines, type DispatchReviewTaskInput } from "./dispatch-day-rows";
 
 interface DispatchReviewDialogProps {
     result: PublishDispatchSuccess | null;
@@ -110,6 +110,8 @@ export function DispatchReviewDialog({
     const finalCollisions = findReviewCollisions(finalTasks);
     const newCollisions = collisionDelta(canonicalCollisions, finalCollisions);
     const hasCollision = newCollisions.length > 0;
+    const collisionLines = formatCollisionLines(newCollisions, memberNamesById);
+    const collisionTaskIds = new Set(collisionLines.flatMap(line => line.taskIds));
 
     return (
         <Dialog.Root open={Boolean(result)} onOpenChange={open => { if (!open && !isPending) onClose(); }}>
@@ -151,7 +153,10 @@ export function DispatchReviewDialog({
                             <>
                                 {hasCollision && (
                                     <div className="border-b border-amber-200 bg-amber-50 px-5 py-2.5 text-xs font-medium text-amber-800">
-                                        One or more of these changes double-books a crew member on the day their task falls — check the names below before confirming.
+                                        <p>This dispatch double-books a crew member:</p>
+                                        <ul className="mt-1 space-y-0.5">
+                                            {collisionLines.map(line => <li key={line.key}>{line.text}</li>)}
+                                        </ul>
                                     </div>
                                 )}
                                 <div className="border-b border-hui-border bg-slate-50 px-5 py-4">
@@ -181,11 +186,12 @@ export function DispatchReviewDialog({
                                     <div className="space-y-2" role="list" aria-label="Dispatch changes">
                                         {reviewRows.map(({ change, key, summary }, index) => {
                                             const conflicted = conflictTargetIds.has(change.targetId);
+                                            const collides = collisionTaskIds.has(change.targetId);
                                             return (
                                                 <div
                                                     key={`${change.kind}-${change.targetId}-${key}`}
                                                     role="listitem"
-                                                    className={`grid grid-cols-[auto_1fr] gap-3 rounded-lg border px-3 py-3 ${conflicted ? "border-amber-300 bg-amber-50" : "border-hui-border bg-white"}`}
+                                                    className={`grid grid-cols-[auto_1fr] gap-3 rounded-lg border px-3 py-3 ${conflicted ? "border-amber-300 bg-amber-50" : collides ? "border-hui-border border-l-4 border-l-amber-400 bg-white" : "border-hui-border bg-white"}`}
                                                 >
                                                     <span className="mt-0.5 inline-flex h-6 min-w-14 items-center justify-center rounded bg-slate-100 px-2 text-[10px] font-bold uppercase tracking-wide text-slate-600">
                                                         {changeLabel(change.kind)}

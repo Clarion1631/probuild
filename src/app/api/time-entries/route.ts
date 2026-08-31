@@ -31,9 +31,11 @@ export interface SuggestionAuditInput {
     dispatchConfirmed: boolean;
     /**
      * The cost code the suggested task's chargeable item actually resolves
-     * to. `null` = task resolved but has no chargeable cost code.
-     * `undefined` = no ground truth available at all (no valid suggested
-     * task, or it carries no estimate item) — nothing to cross-check against.
+     * to. `null` = the task resolved but has no chargeable cost code —
+     * either it has no estimate link at all (free-text/uncosted task) or its
+     * link doesn't resolve to a chargeable target. `undefined` = no ground
+     * truth available at all (no valid/on-project suggested task) — nothing
+     * to cross-check against.
      */
     suggestedTaskResolvedCostCodeId: string | null | undefined;
 }
@@ -57,6 +59,29 @@ export interface SuggestionAuditResult {
  * Pure — no I/O, unit-tested directly in tests/punch-task-binding.test.ts
  * style (tests/time-entries-suggestion-audit.test.ts) without a database.
  */
+/**
+ * Ground-truth cost code for a resolved `suggestedScheduleTaskId`, i.e. what
+ * `SuggestionAuditInput.suggestedTaskResolvedCostCodeId` must be once a valid
+ * on-project task has been found (gate P2 continued). Pure — the caller does
+ * the DB lookups (finding the task, resolving its estimate item's chargeable
+ * target) and hands the results in here.
+ *
+ * `suggestedTask: null` means no valid/on-project task was found at all —
+ * `undefined` (no ground truth) is correct there. Once a task IS found,
+ * ground truth is always a defined `string | null`:
+ *  - no `estimateItemId` at all (free-text/uncosted task) -> `null`
+ *  - linked but the resolver has no chargeable target for that item -> `null`
+ *  - linked and resolves -> that target's cost code id (itself possibly `null`)
+ */
+export function resolveSuggestedTaskGroundTruthCostCodeId(
+    suggestedTask: { estimateItemId: string | null } | null,
+    resolvedTargetCostCodeId: string | null | undefined,
+): string | null | undefined {
+    if (!suggestedTask) return undefined;
+    if (!suggestedTask.estimateItemId) return null;
+    return resolvedTargetCostCodeId ?? null;
+}
+
 export function resolveSuggestionAudit(input: SuggestionAuditInput): SuggestionAuditResult {
     const { suggestionSourceRaw, suggestedCostCodeIdRaw, dispatchConfirmed, suggestedTaskResolvedCostCodeId } = input;
 
@@ -356,9 +381,12 @@ export async function POST(req: Request) {
     let dispatchConfirmed = false;
     // The cost code the suggested task's chargeable item actually resolves
     // to, when it has one — the ground truth suggestedCostCodeId is checked
-    // against below. `undefined` = not resolvable (no valid task, or its
-    // estimate item doesn't resolve to a chargeable target); in that case
-    // there is nothing to cross-check.
+    // against below. `undefined` = not resolvable at all (no valid/on-project
+    // task — auditSuggestedTaskId stays null too), the only case with
+    // nothing to cross-check. Once a valid task is found, ground truth is
+    // always a defined `string | null`: no estimate link, or a link that
+    // resolves to no chargeable target, is definitive "no cost code" (null),
+    // not "unknown".
     let suggestedTaskResolvedCostCodeId: string | null | undefined;
     if (suggestedScheduleTaskId && typeof suggestedScheduleTaskId === "string") {
         const suggestedTask = await prisma.scheduleTask.findFirst({
@@ -369,11 +397,16 @@ export async function POST(req: Request) {
             auditSuggestedTaskId = suggestedTask.id;
             auditSuggestedTaskName = suggestedTask.name;
 
+            let resolvedTargetCostCodeId: string | null | undefined;
             if (suggestedTask.estimateItemId) {
                 const { targetByItemId } = await resolveChargeableItems(projectId);
                 const target = targetByItemId.get(suggestedTask.estimateItemId);
-                suggestedTaskResolvedCostCodeId = target?.costCodeId ?? null;
+                resolvedTargetCostCodeId = target?.costCodeId ?? null;
             }
+            suggestedTaskResolvedCostCodeId = resolveSuggestedTaskGroundTruthCostCodeId(
+                suggestedTask,
+                resolvedTargetCostCodeId,
+            );
         }
 
         const dispatchWinner = await computeDispatchWinnerForUser(user.id, projectId, punchDayKey);

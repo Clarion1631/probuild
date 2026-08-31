@@ -207,6 +207,75 @@ test("gate P1: source downgraded away from 'dispatch' by provenance checking -> 
     assert.equal(hint, null);
 });
 
+// ── Gate P2 continued: resolveSuggestedTaskGroundTruthCostCodeId + the full
+// pipeline through resolveSuggestionAudit for a free-text/uncoded suggested
+// task. Before this fix, a resolved task with no `estimateItemId` left
+// ground truth `undefined` ("nothing to check against"), so a forged
+// suggestedCostCodeId rode through unchecked. It must be `null` (definitive
+// ground truth: no cost code) like any other uncosted resolution. ──
+
+test("ground truth: a resolved task with no estimateItemId at all (free-text) is definitive null, not unknown", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: null }, undefined);
+    assert.equal(groundTruth, null);
+});
+
+test("ground truth: a task linked to an estimate item with no chargeable target is null", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId } = await routeModulePromise;
+    // estimateItemId is set, but the caller's resolver found no chargeable
+    // target for it (resolvedTargetCostCodeId undefined) — still definitive null.
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: "item-1" }, undefined);
+    assert.equal(groundTruth, null);
+});
+
+test("ground truth: a task linked to a resolving chargeable item returns its cost code id", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: "item-1" }, "cc-real");
+    assert.equal(groundTruth, "cc-real");
+});
+
+test("ground truth: no valid/on-project suggested task at all stays undefined (nothing to check)", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId(null, undefined);
+    assert.equal(groundTruth, undefined);
+});
+
+test("gate P2: free-text suggested task (no estimateItemId) + forged non-null suggestedCostCodeId -> downgraded to null", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId, resolveSuggestionAudit } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: null }, undefined);
+    const result = resolveSuggestionAudit({
+        suggestionSourceRaw: "today_schedule",
+        suggestedCostCodeIdRaw: "cc-forged",
+        dispatchConfirmed: false,
+        suggestedTaskResolvedCostCodeId: groundTruth,
+    });
+    assert.equal(result.suggestedCostCodeId, null);
+});
+
+test("gate P2: linked-but-uncoded suggested task + forged non-null suggestedCostCodeId -> downgraded to null", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId, resolveSuggestionAudit } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: "item-1" }, undefined);
+    const result = resolveSuggestionAudit({
+        suggestionSourceRaw: "today_schedule",
+        suggestedCostCodeIdRaw: "cc-forged",
+        dispatchConfirmed: false,
+        suggestedTaskResolvedCostCodeId: groundTruth,
+    });
+    assert.equal(result.suggestedCostCodeId, null);
+});
+
+test("gate P2: linked+coded suggested task with a matching suggestedCostCodeId is kept", async () => {
+    const { resolveSuggestedTaskGroundTruthCostCodeId, resolveSuggestionAudit } = await routeModulePromise;
+    const groundTruth = resolveSuggestedTaskGroundTruthCostCodeId({ estimateItemId: "item-1" }, "cc-real");
+    const result = resolveSuggestionAudit({
+        suggestionSourceRaw: "today_schedule",
+        suggestedCostCodeIdRaw: "cc-real",
+        dispatchConfirmed: false,
+        suggestedTaskResolvedCostCodeId: groundTruth,
+    });
+    assert.equal(result.suggestedCostCodeId, "cc-real");
+});
+
 test("gate P1: no suggestion sent at all -> no hint", async () => {
     const { resolvePunchBindingHint } = await routeModulePromise;
     const hint = resolvePunchBindingHint({

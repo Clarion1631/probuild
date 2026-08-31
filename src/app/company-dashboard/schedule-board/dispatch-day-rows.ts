@@ -693,6 +693,60 @@ export function wouldCollide(
     return null;
 }
 
+export interface DispatchCollisionLine {
+    key: string;
+    text: string;
+    /** Task ids implicated by this collision — the review dialog uses these to highlight the changed rows that produced it. */
+    taskIds: readonly string[];
+}
+
+function formatMonthDay(yyyyMmDd: string): string {
+    const [, month, day] = yyyyMmDd.slice(0, 10).split("-");
+    return `${Number(month)}/${Number(day)}`;
+}
+
+/**
+ * The overlap window is the same half-open [start, end) shape as a task's
+ * own dates elsewhere in this file, so the last actually-overlapping day is
+ * `end - 1`. A single-day overlap renders as one date ("8/29"); a
+ * multi-day overlap renders as a range ("8/29–8/31").
+ */
+function formatOverlapDateRange(overlapStart: string, overlapEnd: string): string {
+    const startKey = overlapStart.slice(0, 10);
+    const lastInclusiveKey = formatDate(addDays(parseUTCDate(overlapEnd.slice(0, 10)), -1));
+    if (lastInclusiveKey <= startKey) return formatMonthDay(startKey);
+    return `${formatMonthDay(startKey)}–${formatMonthDay(lastInclusiveKey)}`;
+}
+
+/**
+ * Turns collisionDelta's output into actionable review-dialog lines — one
+ * per colliding pair: "<Member> · <Job A: task> ↔ <Job B: task> ·
+ * <overlap date(s)>". Replaces the old banner's bare "check the names below",
+ * which gave a date/project-shift collision no way to tell which rows were
+ * responsible. A pair missing task detail (shouldn't happen post-
+ * applyReviewChangesToTasks, but `taskA`/`taskB` are optional on the shared
+ * type) is skipped rather than rendered with holes. `memberNamesById` misses
+ * fall back to the raw userId so a line still renders.
+ */
+export function formatCollisionLines(
+    collisions: readonly DispatchDayCrewConflictInput[],
+    memberNamesById: ReadonlyMap<string, string>,
+): DispatchCollisionLine[] {
+    const lines: DispatchCollisionLine[] = [];
+    for (const entry of collisions) {
+        const memberName = memberNamesById.get(entry.userId) ?? entry.userId;
+        for (const pair of entry.pairs) {
+            if (!pair.taskA || !pair.taskB) continue;
+            lines.push({
+                key: `${entry.userId}-${pair.taskA.id}-${pair.taskB.id}`,
+                text: `${memberName} · ${pair.projectA.name}: ${pair.taskA.name} ↔ ${pair.projectB.name}: ${pair.taskB.name} · ${formatOverlapDateRange(pair.overlapStart, pair.overlapEnd)}`,
+                taskIds: [pair.taskA.id, pair.taskB.id],
+            });
+        }
+    }
+    return lines;
+}
+
 export function buildDispatchDayCollisions(
     projects: readonly DispatchDayProjectInput[],
     crewDrafts: Readonly<Record<string, DispatchDayCrewDraft>>,

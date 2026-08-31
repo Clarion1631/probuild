@@ -17,6 +17,7 @@ import {
     finalTaskUserIds,
     findConflictOtherProject,
     findReviewCollisions,
+    formatCollisionLines,
     getRosterNotOnJobToday,
     isDispatchableRow,
     notDispatchableReason,
@@ -848,4 +849,42 @@ test("wouldCollide: same-day overlap on the checked day → warning", () => {
         })] }),
     ];
     assert.equal(wouldCollide("u1", { id: "t1", projectId: "p1" }, projects, {}, monday), "Mesplay");
+});
+
+// ── formatCollisionLines ──────────────────────────────────────────────────
+
+test("formatCollisionLines: renders member, both job:task pairs, and a single overlap date", () => {
+    const memberNamesById = new Map([["u1", "Garrett"]]);
+    const lines = formatCollisionLines(conflicts, memberNamesById);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].text, "Garrett · Hoppe Bathroom Remodel: Drywall ↔ Mesplay Kitchen: Cabs · 8/29");
+    assert.deepEqual(lines[0].taskIds, ["t1", "t2"]);
+});
+
+test("formatCollisionLines: a multi-day overlap renders as a date range", () => {
+    const pair = { ...conflictPair, overlapStart: "2026-08-29T00:00:00.000Z", overlapEnd: "2026-09-01T00:00:00.000Z" };
+    const lines = formatCollisionLines([{ userId: "u1", name: "Garrett", pairs: [pair] }], new Map([["u1", "Garrett"]]));
+    assert.equal(lines[0].text, "Garrett · Hoppe Bathroom Remodel: Drywall ↔ Mesplay Kitchen: Cabs · 8/29–8/31");
+});
+
+test("formatCollisionLines: falls back to the raw userId when the member name is unknown", () => {
+    const lines = formatCollisionLines(conflicts, new Map());
+    assert.match(lines[0].text, /^u1 ·/);
+});
+
+test("formatCollisionLines: a pair missing task detail is skipped", () => {
+    const pair = { ...conflictPair, taskA: undefined, taskB: undefined };
+    const lines = formatCollisionLines([{ userId: "u1", name: "Garrett", pairs: [pair] }], new Map());
+    assert.deepEqual(lines, []);
+});
+
+test("formatCollisionLines: multiple entries and pairs each produce their own line", () => {
+    const entryTwo = { userId: "u2", name: "Vanessa", pairs: [{ ...conflictPair, taskA: { id: "t3", name: "Tile", startDate: conflictPair.taskA.startDate, endDate: conflictPair.taskA.endDate } }] };
+    const lines = formatCollisionLines([conflicts[0], entryTwo], new Map([["u1", "Garrett"], ["u2", "Vanessa"]]));
+    assert.equal(lines.length, 2);
+    assert.deepEqual(lines.map(line => line.key), ["u1-t1-t2", "u2-t3-t2"]);
+});
+
+test("formatCollisionLines: empty input → empty output", () => {
+    assert.deepEqual(formatCollisionLines([], new Map()), []);
 });

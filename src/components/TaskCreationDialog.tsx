@@ -188,11 +188,18 @@ export default function TaskCreationDialog({
                             </div>
                             <div>
                                 <label className="text-xs font-semibold uppercase tracking-wider text-hui-textMuted" htmlFor="create-task-type">Type</label>
-                                <select id="create-task-type" value={type} onChange={event => setType(event.target.value as CreationType)} className="hui-input mt-1.5 w-full text-sm">
+                                <select
+                                    id="create-task-type"
+                                    value={type}
+                                    onChange={event => setType(event.target.value as CreationType)}
+                                    disabled={Boolean(estimateItemId)}
+                                    className="hui-input mt-1.5 w-full text-sm disabled:bg-slate-100 disabled:text-slate-500"
+                                >
                                     <option value="task">Task</option>
                                     <option value="milestone">Milestone</option>
                                     <option value="appointment">Appointment</option>
                                 </select>
+                                {estimateItemId && <p className="mt-1.5 text-xs text-hui-textMuted">Estimate lines are always tasks.</p>}
                             </div>
                         </div>
 

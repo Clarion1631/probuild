@@ -100,28 +100,52 @@ async function main() {
 
     let totalConnected = 0;
     let projectsChanged = 0;
+    let totalAutoLinksWritten = 0;
     for (const project of projects) {
         const existing = new Set(project.crew.map((c) => c.id));
         const toConnect = eligibleIds.filter((id) => !existing.has(id));
-        if (toConnect.length === 0) continue;
 
-        projectsChanged++;
-        totalConnected += toConnect.length;
-        const names = toConnect
-            .map((id) => eligible.find((u) => u.id === id))
-            .map((u) => u?.name || u?.email || u?.id);
-        console.log(`    ${project.name || project.id}: +${toConnect.length} crew (${names.join(", ")})`);
+        // ProjectCrewAutoLink provenance: every eligible pair on this project
+        // — both the ones we're about to connect and the ones already
+        // sitting on the crew that match this same shape — gets an auto-link
+        // row, so src/lib/crew-auto-assign-sync.ts can later revoke it if the
+        // pair goes stale. `createMany`/`skipDuplicates` makes this
+        // idempotent, same as the crew `connect` below.
+        const alreadyEligible = eligibleIds.filter((id) => existing.has(id));
+        const autoLinkPairs = [...toConnect, ...alreadyEligible];
+
+        if (toConnect.length > 0) {
+            projectsChanged++;
+            totalConnected += toConnect.length;
+            const names = toConnect
+                .map((id) => eligible.find((u) => u.id === id))
+                .map((u) => u?.name || u?.email || u?.id);
+            console.log(`    ${project.name || project.id}: +${toConnect.length} crew (${names.join(", ")})`);
+        }
         if (!dryRun) {
-            await prisma.project.update({
-                where: { id: project.id },
-                data: { crew: { connect: toConnect.map((id) => ({ id })) } },
-            });
+            if (toConnect.length > 0) {
+                await prisma.project.update({
+                    where: { id: project.id },
+                    data: { crew: { connect: toConnect.map((id) => ({ id })) } },
+                });
+            }
+            if (autoLinkPairs.length > 0) {
+                const written = await prisma.projectCrewAutoLink.createMany({
+                    data: autoLinkPairs.map((userId) => ({ projectId: project.id, userId })),
+                    skipDuplicates: true,
+                });
+                totalAutoLinksWritten += written.count;
+            }
+        } else {
+            totalAutoLinksWritten += autoLinkPairs.length; // best-effort estimate under --dry-run
         }
     }
 
     console.log(
         `[sync-crew-to-in-progress] ${dryRun ? "would connect" : "connected"} ` +
         `${totalConnected} assignment(s) across ${projectsChanged} project(s). ` +
+        `${dryRun ? "would write" : "wrote"} up to ${totalAutoLinksWritten} ProjectCrewAutoLink row(s) ` +
+        `(new + already-eligible existing pairs; skipDuplicates makes re-runs a no-op). ` +
         `Re-running is a no-op.`
     );
 }

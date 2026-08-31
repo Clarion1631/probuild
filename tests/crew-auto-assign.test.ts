@@ -11,6 +11,7 @@ import {
     isAutoAssignProjectStatus,
     selectAutoAssignUsers,
     shouldAutoAssignUser,
+    shouldRevokeAutoLink,
     type AutoAssignUser,
 } from "../src/lib/crew-auto-assign";
 import { PROJECT_STATUS_VALUES } from "../src/lib/project-status";
@@ -171,4 +172,79 @@ test("crewIdsToConnect drops blank ids and dedupes", () => {
         user({ id: "", role: "FIELD_CREW" }),
     ];
     assert.deepEqual(crewIdsToConnect(dupes, []), ["crew-a"]);
+});
+
+// ── shouldRevokeAutoLink (gate item: Team toggle is add-only, so a user
+// keeps project access forever unless something undoes it) ───────────────
+
+test("auto-linked, ineligible now, no TaskAssignment → revoke", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: true,
+            userEligible: false,
+            projectEligible: true,
+            hasTaskAssignment: false,
+        }),
+        true,
+    );
+});
+
+test("auto-linked, project left the auto-assign statuses, no TaskAssignment → revoke", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: true,
+            userEligible: true,
+            projectEligible: false,
+            hasTaskAssignment: false,
+        }),
+        true,
+    );
+});
+
+test("auto-linked but ineligible with a real TaskAssignment on the project → keep", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: true,
+            userEligible: false,
+            projectEligible: true,
+            hasTaskAssignment: true,
+        }),
+        false,
+    );
+});
+
+test("auto-linked, project no longer eligible, but a real TaskAssignment exists → keep", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: true,
+            userEligible: true,
+            projectEligible: false,
+            hasTaskAssignment: true,
+        }),
+        false,
+    );
+});
+
+test("manual connection (no auto-link row) is never revoked, even if ineligible", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: false,
+            userEligible: false,
+            projectEligible: false,
+            hasTaskAssignment: false,
+        }),
+        false,
+    );
+});
+
+test("still eligible on all axes → keep (nothing stale to revoke)", () => {
+    assert.equal(
+        shouldRevokeAutoLink({
+            hasAutoLink: true,
+            userEligible: true,
+            projectEligible: true,
+            hasTaskAssignment: false,
+        }),
+        false,
+    );
 });
