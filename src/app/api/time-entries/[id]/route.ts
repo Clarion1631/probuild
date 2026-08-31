@@ -326,7 +326,28 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         });
     }
 
-    const updated = await prisma.timeEntry.update({ where: { id }, data });
+    // Compare-and-swap, not a blind update (Codex gate, PR #437): `data` was derived
+    // from the `existing` snapshot, so it only applies if the row's timestamps are
+    // STILL what we read — a worker's clock-out (or another edit) landing in between
+    // must win, not be silently overwritten with a stale endTime. The invoice fields
+    // are in the guard too, so a row invoiced mid-edit cannot be rewritten.
+    const swapped = await prisma.timeEntry.updateMany({
+        where: {
+            id,
+            startTime: existing.startTime,
+            endTime: existing.endTime,
+            invoiceId: null,
+            invoicedAt: null,
+        },
+        data,
+    });
+    if (swapped.count === 0) {
+        return NextResponse.json(
+            { error: "This entry changed while you were editing (a clock-out, another edit, or an invoice) — refresh and try again", code: "EDIT_CONFLICT" },
+            { status: 409 }
+        );
+    }
+    const updated = await prisma.timeEntry.findUniqueOrThrow({ where: { id } });
 
     // Re-plan every day this edit touched (the row may have moved days).
     const days = new Set<string>([toCompanyDayKey(existing.startTime), toCompanyDayKey(newStart)]);
@@ -367,7 +388,14 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
-    // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    // day is re-planned too. The invoice claim is re-verified INSIDE the
+    // transaction (the pre-check above is only a fast 409).
+    const outcome = await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    if (outcome === "invoiced") {
+        return NextResponse.json(
+            { error: "This entry was invoiced while it was being deleted — nothing was removed", code: "INVOICED" },
+            { status: 409 }
+        );
+    }
     return NextResponse.json({ ok: true });
 }

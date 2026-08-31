@@ -41,7 +41,11 @@ export function companyWallToInstants(value: string): Date[] {
     const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
     if (!m) return [];
     const [y, mo, d, h, mi] = m.slice(1).map(Number);
-    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59) return [];
+    if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59) return [];
+    // Real-calendar check: Date.UTC silently normalizes (2026-02-31 → March 3), which
+    // would corrupt crafted inputs instead of rejecting them (Codex gate, PR #437).
+    const probe = new Date(Date.UTC(y, mo - 1, d));
+    if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) return [];
     const wanted = Date.UTC(y, mo - 1, d, h, mi, 0);
     // Pacific is UTC-7 or UTC-8. Both candidate offsets are checked EXACTLY, rather than
     // trusting a fixed-point search that can oscillate inside the spring-forward gap.
@@ -104,10 +108,14 @@ export function companyDayRange(dateFrom?: string | null, dateTo?: string | null
         if (start) range.gte = start;
     }
     if (dateTo && /^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
-        const [y, mo, d] = dateTo.split("-").map(Number);
-        const next = new Date(Date.UTC(y, mo - 1, d + 1));
-        const end = companyWallToInstant(`${next.toISOString().slice(0, 10)}T00:00`);
-        if (end) range.lt = end;
+        // The day itself must be a real calendar day BEFORE computing "the day after" —
+        // Date.UTC normalization would otherwise turn 2026-02-31 into a valid March range.
+        if (companyWallToInstant(`${dateTo}T00:00`)) {
+            const [y, mo, d] = dateTo.split("-").map(Number);
+            const next = new Date(Date.UTC(y, mo - 1, d + 1));
+            const end = companyWallToInstant(`${next.toISOString().slice(0, 10)}T00:00`);
+            if (end) range.lt = end;
+        }
     }
     return range;
 }

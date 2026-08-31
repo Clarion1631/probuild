@@ -131,21 +131,34 @@ async function settleDayInTx(
  * too), then deleted, then every affected day re-planned. Throws on failure
  * (the caller answers 500 and nothing is deleted).
  */
-export async function deleteEntryAndSettle(entryId: string, knownDayKey: string, userId: string): Promise<void> {
-    await prisma.$transaction(async (tx) => {
+export async function deleteEntryAndSettle(
+    entryId: string,
+    knownDayKey: string,
+    userId: string
+): Promise<"deleted" | "gone" | "invoiced"> {
+    return prisma.$transaction(async (tx) => {
         await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
         const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
-        if (!victim) return; // already gone
+        if (!victim) return "gone"; // already gone
         const actualDay = toCompanyDayKey(victim.startTime);
         if (actualDay !== knownDayKey) {
             // Moved since the caller read it — take that day's lock as well
             // (deterministic order: keys sorted, so two deletes cannot deadlock).
             await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
         }
-        await tx.timeEntry.delete({ where: { id: entryId } });
+        // Conditional, not blind (Codex gate, PR #437): the route's invoiced pre-check
+        // is a TOCTOU on its own — the claim here re-verifies at write time, so an
+        // entry invoiced between the check and this transaction survives. Postgres
+        // re-evaluates the predicate against the committed row on conflict.
+        const removed = await tx.timeEntry.deleteMany({ where: { id: entryId, invoiceId: null, invoicedAt: null } });
+        if (removed.count === 0) {
+            const still = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { id: true } });
+            return still ? "invoiced" : "gone";
+        }
         for (const dayKey of new Set([knownDayKey, actualDay])) {
             await settleDayInTx(tx, victim.userId, dayKey, null);
         }
+        return "deleted";
     });
 }
 

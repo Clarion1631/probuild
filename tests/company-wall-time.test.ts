@@ -107,6 +107,15 @@ test("junk is rejected, seconds are truncated in display only", () => {
     for (const bad of ["", "yesterday", "2026-13-01T10:00", "2026-08-30T24:00", "2026-08-30T10:60", "2026-08-30 10:00"]) {
         assert.equal(companyWallToInstant(bad), null, JSON.stringify(bad));
     }
+    // Impossible calendar days are REJECTED, not normalized (Date.UTC would silently
+    // turn 2026-02-31 into March 3 — Codex gate, PR #437).
+    for (const bad of ["2026-02-31T10:00", "2026-02-29T10:00", "2026-04-31T10:00", "2026-11-31T10:00", "2026-06-00T10:00"]) {
+        assert.equal(companyWallToInstant(bad), null, JSON.stringify(bad));
+        assert.deepEqual(companyWallToInstants(bad), [], JSON.stringify(bad));
+    }
+    // Leap day in an actual leap year stays valid.
+    assert.equal(companyWallToInstant("2028-02-29T10:00")!.toISOString(), "2028-02-29T18:00:00.000Z");
+    assert.deepEqual(companyDayRange("2026-02-31", "2026-02-31"), {}, "filters reject impossible days too");
     // Display drops seconds (datetime-local has minute granularity)…
     assert.equal(instantToCompanyWall("2026-08-30T19:00:42.123Z"), "2026-08-30T12:00");
     // …which is why callers must resend the ORIGINAL instant when a field is unchanged.
