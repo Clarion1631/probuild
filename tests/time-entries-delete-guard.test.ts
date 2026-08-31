@@ -21,7 +21,10 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 const load = () => import("../src/lib/wa-breaks-db");
 const policy = () => import("../src/lib/time-entry-delete-policy");
 
-const NOW = new Date();
+// Fixed clock (Codex: `new Date()` inside the helper made "same day" flaky for the first
+// hours after Pacific midnight). Every call passes `clock`, and createdAt === NOW.
+const NOW = new Date("2026-08-30T19:00:00.000Z");
+const clock = () => NOW;
 const CREW = { id: "u-crew", role: "FIELD_CREW" };
 type Row = DeleteVictim & { startTime: Date };
 
@@ -29,7 +32,7 @@ function row(overrides: Partial<Row> = {}): Row {
     return {
         userId: "u-crew",
         startTime: new Date(NOW.getTime() - 2 * 3_600_000),
-        createdAt: new Date(NOW.getTime() - 2 * 3_600_000),
+        createdAt: NOW,
         invoiceId: null,
         invoicedAt: null,
         qbTimeActivityId: null,
@@ -66,7 +69,7 @@ test("owner path: same-day unlinked entry is claimed with a conditional deleteMa
     const { deleteEntryAndSettleInTx } = await load();
     const victim = row();
     const { tx, calls } = fakeTx({ first: victim });
-    const result = await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW);
+    const result = await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock);
     assert.equal(result, "deleted");
     const claim = calls.find((c) => c.startsWith("deleteMany:"));
     assert.ok(claim, "used the conditional deleteMany");
@@ -75,13 +78,47 @@ test("owner path: same-day unlinked entry is claimed with a conditional deleteMa
     assert.equal(calls.includes("delete"), false, "never the unconditional delete");
 });
 
+test("owner path: a claim lost while the re-read still passes the policy is reported as CLAIM_LOST, not a guessed reason", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const { DeleteRefusedError } = await policy();
+    const victim = row();
+    // Row changed and changed back (or a writer is mid-flight): count 0, but nothing to blame.
+    const { tx, calls } = fakeTx({ first: victim, after: row(), claimCount: 0 });
+    await assert.rejects(
+        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
+        (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST"
+    );
+    assert.equal(calls.includes("update"), false);
+});
+
+test("owner path: the day is judged at delete time — a clock past midnight refuses even a row read as 'today'", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const { DeleteRefusedError } = await policy();
+    const victim = row();
+    const { tx, calls } = fakeTx({ first: victim });
+    const afterMidnight = () => new Date("2026-08-31T08:30:00.000Z"); // 01:30 PDT next day
+    await assert.rejects(
+        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, afterMidnight),
+        (err: unknown) => err instanceof DeleteRefusedError && err.code === "NOT_TODAY"
+    );
+    assert.equal(calls.some((c) => c.startsWith("deleteMany")), false);
+});
+
+test("privileged path: a row that vanished between read and delete is 'gone', not a throw", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const victim = row({ userId: "u-other" });
+    const { tx, calls } = fakeTx({ first: victim, claimCount: 0 });
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-other", undefined, clock), "gone");
+    assert.equal(calls.includes("update"), false, "no re-plan for a no-op");
+});
+
 test("owner path: a claim lost to an invoice/QBO sync throws LOCKED_DOWNSTREAM and deletes nothing", async () => {
     const { deleteEntryAndSettleInTx } = await load();
     const { DeleteRefusedError } = await policy();
     const victim = row();
     const { tx, calls } = fakeTx({ first: victim, after: row({ qbSyncedAt: NOW }), claimCount: 0 });
     await assert.rejects(
-        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW),
+        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
         (err: unknown) => err instanceof DeleteRefusedError && err.code === "LOCKED_DOWNSTREAM"
     );
     assert.equal(calls.includes("delete"), false);
@@ -94,7 +131,7 @@ test("owner path: a claim lost to a reassignment throws NOT_OWNER", async () => 
     const victim = row();
     const { tx } = fakeTx({ first: victim, after: row({ userId: "u-other" }), claimCount: 0 });
     await assert.rejects(
-        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW),
+        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
         (err: unknown) => err instanceof DeleteRefusedError && err.code === "NOT_OWNER"
     );
 });
@@ -103,7 +140,7 @@ test("owner path: a claim lost because the row vanished reports 'gone'", async (
     const { deleteEntryAndSettleInTx } = await load();
     const victim = row();
     const { tx } = fakeTx({ first: victim, after: null, claimCount: 0 });
-    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW), "gone");
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock), "gone");
 });
 
 test("owner path: the in-transaction re-check refuses BEFORE any delete is attempted", async () => {
@@ -117,11 +154,12 @@ test("owner path: the in-transaction re-check refuses BEFORE any delete is attem
     ] as Array<[Row, string]>) {
         const { tx, calls } = fakeTx({ first: victim });
         await assert.rejects(
-            deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW),
+            deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
             (err: unknown) => err instanceof DeleteRefusedError && err.code === code,
             code
         );
         assert.equal(calls.some((c) => c.startsWith("deleteMany") || c === "delete"), false, `${code}: nothing deleted`);
+        assert.equal(calls.filter((c) => c.startsWith("lock:")).length >= 1, true, `${code}: refused only after the day lock was taken`);
     }
 });
 
@@ -129,15 +167,17 @@ test("privileged path (no guard): unconditional delete, even of a locked, older,
     const { deleteEntryAndSettleInTx } = await load();
     const victim = row({ userId: "u-other", createdAt: new Date(NOW.getTime() - 3 * 24 * 3_600_000), invoiceId: "inv1", qbSyncedAt: NOW });
     const { tx, calls } = fakeTx({ first: victim });
-    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-other"), "deleted");
-    assert.equal(calls.includes("delete"), true);
-    assert.equal(calls.some((c) => c.startsWith("deleteMany")), false);
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-other", undefined, clock), "deleted");
+    const claim = calls.find((c) => c.startsWith("deleteMany:"));
+    assert.ok(claim, "privileged delete is a deleteMany too (P2025-safe)");
+    assert.deepEqual(JSON.parse(claim!.slice("deleteMany:".length)), { id: "te1" }, "…but unconditional");
+    assert.equal(calls.includes("delete"), false);
 });
 
 test("a victim that is already gone returns 'gone' without deleting", async () => {
     const { deleteEntryAndSettleInTx } = await load();
     const { tx, calls } = fakeTx({ first: null });
-    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", "2026-08-30", "u-crew", CREW), "gone");
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", "2026-08-30", "u-crew", CREW, clock), "gone");
     assert.equal(calls.some((c) => c.startsWith("deleteMany") || c === "delete"), false);
 });
 
@@ -148,7 +188,7 @@ test("a row moved to another day takes that day's lock too (both days re-planned
     const actualDay = await dayOf(victim.startTime);
     assert.notEqual(knownDay, actualDay);
     const { tx, calls } = fakeTx({ first: victim });
-    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", knownDay, "u-crew", CREW), "deleted");
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", knownDay, "u-crew", CREW, clock), "deleted");
     const locks = calls.filter((c) => c.startsWith("lock:"));
     assert.deepEqual(locks, [`lock:wa-breaks:u-crew:${knownDay}`, `lock:wa-breaks:u-crew:${actualDay}`]);
 });

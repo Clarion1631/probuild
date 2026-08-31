@@ -21,12 +21,16 @@ export type DeleteVictim = {
     qbSyncedAt: Date | null;
 };
 
-export type DeleteRefusalCode = "NOT_OWNER" | "NOT_TODAY" | "LOCKED_DOWNSTREAM";
+// CLAIM_LOST: the conditional delete removed nothing, yet the row as re-read still
+// passes the policy (it changed and changed back, or a concurrent writer is mid-flight).
+// Reported honestly as a conflict rather than guessing a reason.
+export type DeleteRefusalCode = "NOT_OWNER" | "NOT_TODAY" | "LOCKED_DOWNSTREAM" | "CLAIM_LOST";
 
 export const DELETE_REFUSAL_MESSAGES: Record<DeleteRefusalCode, string> = {
     NOT_OWNER: "You can only delete your own time entries — ask a manager to remove this one",
     NOT_TODAY: "Only today's entries can be deleted here — ask a manager to remove this one",
     LOCKED_DOWNSTREAM: "This entry is already invoiced or synced to QuickBooks — ask a manager to remove it",
+    CLAIM_LOST: "This entry changed while it was being deleted — refresh and try again",
 };
 
 export function isPrivilegedDeleter(role: string): boolean {

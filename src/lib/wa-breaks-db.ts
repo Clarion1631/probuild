@@ -165,15 +165,12 @@ export async function deleteEntryAndSettleInTx(
     entryId: string,
     knownDayKey: string,
     userId: string,
-    ownerGuard?: DeleteActor
+    ownerGuard?: DeleteActor,
+    now: () => Date = () => new Date()
 ): Promise<"deleted" | "gone"> {
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
     const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
     if (!victim) return "gone"; // already gone
-    if (ownerGuard) {
-        const check = checkDeleteAllowed(ownerGuard, victim);
-        if (!check.ok) throw new DeleteRefusedError(check.code);
-    }
     const actualDay = toCompanyDayKey(victim.startTime);
     if (actualDay !== knownDayKey) {
         // Moved since the caller read it — take that day's lock as well
@@ -181,6 +178,14 @@ export async function deleteEntryAndSettleInTx(
         await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
     }
     if (ownerGuard) {
+        // Policy re-check AFTER every lock is held (waiting on a lock can cross the
+        // company-day boundary), on the row as read inside this transaction.
+        const check = checkDeleteAllowed(ownerGuard, victim, now());
+        if (!check.ok) throw new DeleteRefusedError(check.code);
+        // Atomic claim: only a row that STILL belongs to the owner and STILL has no
+        // downstream link is deleted (Postgres re-evaluates the predicate against the
+        // committed row if a concurrent writer touched it). createdAt is immutable, so
+        // the day check above cannot be raced by a field change.
         const claimed = await tx.timeEntry.deleteMany({
             where: {
                 id: entryId,
@@ -193,13 +198,17 @@ export async function deleteEntryAndSettleInTx(
         });
         if (claimed.count === 0) {
             // Lost the claim: explain with the row as it is now (or it vanished meanwhile).
+            // If the re-read still passes the policy, don't invent a reason — it's a conflict.
             const current = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
             if (!current) return "gone";
-            const check = checkDeleteAllowed(ownerGuard, current);
-            throw new DeleteRefusedError(check.ok ? "LOCKED_DOWNSTREAM" : check.code);
+            const check2 = checkDeleteAllowed(ownerGuard, current, now());
+            throw new DeleteRefusedError(check2.ok ? "CLAIM_LOST" : check2.code);
         }
     } else {
-        await tx.timeEntry.delete({ where: { id: entryId } });
+        // Privileged: unconditional — but deleteMany, so a row that vanished between the
+        // read above and here is "gone" rather than a Prisma P2025 throw.
+        const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
+        if (removed.count === 0) return "gone";
     }
     for (const dayKey of new Set([knownDayKey, actualDay])) {
         await settleDayInTx(tx, victim.userId, dayKey, null);
