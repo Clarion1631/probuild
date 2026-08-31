@@ -288,7 +288,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.originalEndTime = existing.endTime;
     }
 
-    if (isPrivileged && !isOwner) {
+    // Every privileged edit is stamped — including a manager editing their OWN punch.
+    // The manager page's "Edited"/"Original" badge reads this field, and a manager's
+    // self-edit staying "Original" hid the audit trail (Codex gate, PR #437).
+    if (isPrivileged) {
         data.editedByManagerId = user.id;
         data.editedAt = new Date();
     }

@@ -364,9 +364,10 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                 </tbody>
                                 <tfoot className="border-t border-hui-border bg-slate-50">
                                     <tr>
+                                        {/* 9 columns: label×3, Paid hrs, Meal+Rate, Total, Status+Actions */}
                                         <td colSpan={3} className="px-5 py-2 text-xs font-semibold text-hui-textMuted">Subtotal</td>
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{pHours.toFixed(2)}</td>
-                                        <td />
+                                        <td colSpan={2} />
                                         <td className="px-5 py-2 text-right font-bold text-hui-textMain tabular-nums">{formatCurrency(pCost)}</td>
                                         <td colSpan={2} />
                                     </tr>
