@@ -332,17 +332,35 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
-    // Same rule as PATCH (owner decision 2026-08-30): field crew may delete their OWN
-    // entry outright (a wrong-job or duplicate punch); managers/admins may delete anyone's.
-    const isOwner = existing.userId === user.id;
+    // Owner decision 2026-08-30: field crew may delete their OWN entry outright (a
+    // wrong-job or duplicate punch) — but only while it is still TODAY's entry (company
+    // day). Anything older may already be in a pay run, so it needs a manager/admin,
+    // who may delete anyone's. (Codex 2026-08-30: unbounded owner-delete would let a
+    // worker erase paid history; the same-day gate is the bound.)
     const isPrivileged = user.role === "MANAGER" || user.role === "ADMIN";
-    if (!isOwner && !isPrivileged) {
-        return NextResponse.json({ error: "Unauthorized to delete this entry" }, { status: 403 });
+    const entryDay = toCompanyDayKey(existing.startTime);
+    const isOwnerToday = existing.userId === user.id && entryDay === toCompanyDayKey(new Date());
+    if (!isOwnerToday && !isPrivileged) {
+        return NextResponse.json(
+            { error: "Only today's own entries can be deleted here — ask a manager to remove this one" },
+            { status: 403 }
+        );
+    }
+    // An entry already on an invoice or pushed to QuickBooks is downstream state a
+    // worker must not erase from the phone; a manager handles those (Codex gate, PR #434).
+    const isLockedDownstream =
+        existing.invoiceId != null || existing.invoicedAt != null
+        || existing.qbTimeActivityId != null || existing.qbSyncedAt != null;
+    if (!isPrivileged && isLockedDownstream) {
+        return NextResponse.json(
+            { error: "This entry is already invoiced or synced — ask a manager to remove it" },
+            { status: 403 }
+        );
     }
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
     // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    await deleteEntryAndSettle(id, entryDay, existing.userId);
     return NextResponse.json({ ok: true });
 }

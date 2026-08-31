@@ -35,6 +35,24 @@ test("time-entry routes the crew app calls with a Bearer token are allowlisted",
     }
 });
 
+// Codex gate (PR #434): a Bearer header must NOT let a Server Action dispatch
+// (`next-action` header) skip the proxy on an allowlisted path — the route handler's
+// token check never runs for an action. NextResponse.next() carries
+// `x-middleware-next: 1`; anything else (redirect/403) means the proxy kept control.
+test("Bearer bypass is refused for Server Action dispatches on an allowlisted path", async () => {
+    const { default: proxy } = await loadProxy();
+    const { NextRequest } = await import("next/server");
+    const make = (headers: Record<string, string>) =>
+        new NextRequest("https://probuild.test/api/time-entries/abc123/meal-skip", { method: "POST", headers });
+    const event = { waitUntil() {} } as any;
+
+    const plain = await proxy(make({ authorization: "Bearer fake" }), event);
+    assert.equal(plain?.headers.get("x-middleware-next"), "1", "Bearer alone passes through to the handler");
+
+    const action = await proxy(make({ authorization: "Bearer fake", "next-action": "deadbeef" }), event);
+    assert.notEqual(action?.headers.get("x-middleware-next"), "1", "Bearer + next-action must not bypass");
+});
+
 test("the allowlist does not widen to other time-entry descendants", async () => {
     const { isMobileAuthenticatedRoute } = await loadProxy();
     for (const path of [

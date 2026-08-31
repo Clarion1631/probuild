@@ -160,10 +160,15 @@ export default async function proxy(req: any, event: any) {
     // Approved shared API routes verify mobile JWTs in their own handlers. Do not
     // extend this to arbitrary Bearer requests: many web routes rely on Proxy as
     // their authentication boundary.
+    // `!isServerAction` is load-bearing (Codex gate, PR #434): the crew app never
+    // dispatches Server Actions, and a Bearer header must not let an anonymous caller
+    // replay a global action ID against an allowlisted path — the route handler's token
+    // check never runs for an action dispatch.
     const authHeader = req.headers?.get?.("authorization");
     const handlerVerifiesBearer = typeof pathname === "string" && isMobileAuthenticatedRoute(pathname);
     if (
-        handlerVerifiesBearer
+        !isServerAction
+        && handlerVerifiesBearer
         && typeof authHeader === "string"
         && authHeader.toLowerCase().startsWith("bearer ")
     ) {
