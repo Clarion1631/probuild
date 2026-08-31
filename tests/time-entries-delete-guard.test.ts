@@ -50,10 +50,19 @@ function row(overrides: Partial<Row> = {}): Row {
  * the design closes. deleteMany reports `deleteCount` (default 1). settleDayInTx's owner
  * lookup returns null so it writes nothing.
  */
-function fakeTx(opts: { peek: Row | null; locked?: Row | null; deleteCount?: number }) {
+function fakeTx(opts: { peek: Row | null; locked?: Row | null; deleteCount?: number; siblings?: Row[] }) {
     const calls: string[] = [];
     const tx = {
         $executeRawUnsafe: async (_sql: string, key: string) => { calls.push(`lock:${key}`); return 0; },
+        // Owner-path delete: the day condition is evaluated by the DATABASE at statement time.
+        $executeRaw: async (strings: TemplateStringsArray, ..._values: unknown[]) => {
+            const sql = strings.join("?");
+            assert.match(sql, /DELETE FROM "TimeEntry"/);
+            assert.match(sql, /clock_timestamp\(\)/, "day condition uses statement time, not the app clock");
+            assert.match(sql, /"createdAt" AT TIME ZONE 'UTC'/, "createdAt (UTC timestamp) is converted before the date compare");
+            calls.push("dbDelete");
+            return opts.deleteCount ?? 1;
+        },
         $queryRaw: async (strings: TemplateStringsArray, ..._values: unknown[]) => {
             assert.match(strings.join("?"), /FOR UPDATE/, "row read is a SELECT … FOR UPDATE");
             calls.push("rowlock");
@@ -64,7 +73,9 @@ function fakeTx(opts: { peek: Row | null; locked?: Row | null; deleteCount?: num
             findUnique: async () => { calls.push("peek"); return opts.peek; },
             deleteMany: async (args: { where: Record<string, unknown> }) => { calls.push(`deleteMany:${JSON.stringify(args.where)}`); return { count: opts.deleteCount ?? 1 }; },
             delete: async () => { calls.push("delete"); return {}; },
-            findMany: async () => [],
+            // hasDownstreamLockedSibling (owner path); settleDayInTx never reaches findMany here
+            // because the fake owner lookup below returns null first.
+            findMany: async () => { calls.push("siblings"); return opts.siblings ?? []; },
             update: async () => { calls.push("update"); return {}; },
         },
         // settleDayInTx starts by loading the worker's rates — logging it shows WHICH
@@ -74,22 +85,24 @@ function fakeTx(opts: { peek: Row | null; locked?: Row | null; deleteCount?: num
     return { tx: tx as any, calls };
 }
 
-const deleted = (calls: string[]) => calls.some((c) => c.startsWith("deleteMany:"));
-const order = (calls: string[]) => calls.filter((c) => c === "peek" || c === "rowlock" || c.startsWith("lock:") || c.startsWith("deleteMany")).map((c) => c.split(":")[0]);
+const deleted = (calls: string[]) => calls.some((c) => c.startsWith("deleteMany:") || c === "dbDelete");
+const order = (calls: string[]) => calls.filter((c) => c === "peek" || c === "rowlock" || c === "dbDelete" || c.startsWith("lock:") || c.startsWith("deleteMany")).map((c) => c.split(":")[0]);
+// Duck-typed (name + code), never instanceof: source imports the policy via "@/lib", this
+// file relatively — under tsx in CI those are two class identities (Codex gate, PR #436).
+const refusal = (code: string) => (err: unknown) => (err as { name?: string }).name === "DeleteRefusedError" && (err as { code?: string }).code === code;
 
 test("owner path: day lock → peek → row lock → policy on the locked row → delete", async () => {
     const { deleteEntryAndSettleInTx } = await load();
     const victim = row();
     const { tx, calls } = fakeTx({ peek: victim });
     assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock), "deleted");
-    assert.deepEqual(order(calls), ["lock", "peek", "rowlock", "deleteMany"]);
-    assert.deepEqual(JSON.parse(calls.find((c) => c.startsWith("deleteMany:"))!.slice("deleteMany:".length)), { id: "te1" }, "deletes exactly the locked row");
-    assert.equal(calls.includes("delete"), false, "never the P2025-throwing delete()");
+    assert.deepEqual(order(calls), ["lock", "peek", "rowlock", "dbDelete"], "owner path deletes with the DB-evaluated day condition");
+    assert.equal(calls.includes("siblings"), true, "checked the day's other entries for downstream locks first");
+    assert.equal(calls.some((c) => c.startsWith("deleteMany")), false, "owner path never uses the unconditional delete");
 });
 
 test("owner path: the policy is judged on the LOCKED row — an invoice/QBO link that landed after the peek refuses, nothing deleted", async () => {
     const { deleteEntryAndSettleInTx } = await load();
-    const { DeleteRefusedError } = await policy();
     for (const [locked, code] of [
         [row({ qbSyncedAt: NOW }), "LOCKED_DOWNSTREAM"],
         [row({ invoiceId: "inv1" }), "LOCKED_DOWNSTREAM"],
@@ -99,7 +112,7 @@ test("owner path: the policy is judged on the LOCKED row — an invoice/QBO link
         const { tx, calls } = fakeTx({ peek, locked });
         await assert.rejects(
             deleteEntryAndSettleInTx(tx, "te1", await dayOf(peek.startTime), "u-crew", CREW, clock),
-            (err: unknown) => err instanceof DeleteRefusedError && err.code === code,
+            refusal(code),
             code
         );
         assert.equal(calls.includes("rowlock"), true, `${code}: refused only after the row lock`);
@@ -110,25 +123,23 @@ test("owner path: the policy is judged on the LOCKED row — an invoice/QBO link
 
 test("owner path: the clock is read AFTER the row lock — midnight passing while waiting for the row refuses NOT_TODAY", async () => {
     const { deleteEntryAndSettleInTx } = await load();
-    const { DeleteRefusedError } = await policy();
     const victim = row();
     const { tx, calls } = fakeTx({ peek: victim });
     // The route pre-checked at 12:00 PDT; by the time the row lock is granted it is 01:30 PDT next day.
     await assert.rejects(
         deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, AFTER_MIDNIGHT),
-        (err: unknown) => err instanceof DeleteRefusedError && err.code === "NOT_TODAY"
+        refusal("NOT_TODAY")
     );
     assert.deepEqual(order(calls), ["lock", "peek", "rowlock"], "refused after the row lock, before any delete");
 });
 
 test("owner path: an older entry is refused on the locked row (createdAt is immutable, so no field race exists)", async () => {
     const { deleteEntryAndSettleInTx } = await load();
-    const { DeleteRefusedError } = await policy();
     const victim = row({ createdAt: new Date(NOW.getTime() - 24 * 3_600_000) });
     const { tx, calls } = fakeTx({ peek: victim });
     await assert.rejects(
         deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
-        (err: unknown) => err instanceof DeleteRefusedError && err.code === "NOT_TODAY"
+        refusal("NOT_TODAY")
     );
     assert.equal(deleted(calls), false);
 });
@@ -148,13 +159,12 @@ test("a row moved to another day between the caller's read and the peek takes th
 
 test("a row moved AGAIN between the peek and the row lock (onto a day we hold no lock for) is refused CLAIM_LOST — never lock a day while holding the row", async () => {
     const { deleteEntryAndSettleInTx } = await load();
-    const { DeleteRefusedError } = await policy();
     const peek = row();
     const locked = row({ startTime: new Date(NOW.getTime() - 5 * 24 * 3_600_000) }); // manager moved it meanwhile
     const { tx, calls } = fakeTx({ peek, locked });
     await assert.rejects(
         deleteEntryAndSettleInTx(tx, "te1", await dayOf(peek.startTime), "u-crew", CREW, clock),
-        (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST"
+        refusal("CLAIM_LOST")
     );
     assert.equal(deleted(calls), false);
     assert.equal(calls.filter((c) => c.startsWith("lock:")).length, 1, "no advisory lock was taken after the row lock");
@@ -162,7 +172,7 @@ test("a row moved AGAIN between the peek and the row lock (onto a day we hold no
     const p = fakeTx({ peek, locked });
     await assert.rejects(
         deleteEntryAndSettleInTx(p.tx, "te1", await dayOf(peek.startTime), "u-crew", undefined, clock),
-        (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST"
+        refusal("CLAIM_LOST")
     );
     assert.equal(deleted(p.calls), false);
 });
@@ -181,14 +191,13 @@ test("reassigned to another worker BEFORE the peek (same day): both (worker, day
 
 test("reassigned to another worker BETWEEN the peek and the row lock (same day): CLAIM_LOST, nothing deleted, no lock taken after the row", async () => {
     const { deleteEntryAndSettleInTx } = await load();
-    const { DeleteRefusedError } = await policy();
     const peek = row();
     const locked = row({ userId: "u-other" }); // same day, different worker
     for (const guard of [undefined, CREW]) {
         const { tx, calls } = fakeTx({ peek, locked });
         await assert.rejects(
             deleteEntryAndSettleInTx(tx, "te1", await dayOf(peek.startTime), "u-crew", guard, clock),
-            (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST",
+            refusal("CLAIM_LOST"),
             guard ? "owner" : "privileged"
         );
         assert.equal(deleted(calls), false);
@@ -197,12 +206,43 @@ test("reassigned to another worker BETWEEN the peek and the row lock (same day):
     }
 });
 
+test("owner path: another entry of the same day already invoiced/synced → SIBLING_LOCKED, nothing deleted (re-plan would rewrite billed history)", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const victim = row(); // unlinked itself
+    for (const sibling of [row({ invoiceId: "inv9" }), row({ qbSyncedAt: NOW }), row({ invoicedAt: NOW }), row({ qbTimeActivityId: "qb9" })]) {
+        const { tx, calls } = fakeTx({ peek: victim, siblings: [sibling] });
+        await assert.rejects(
+            deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
+            refusal("SIBLING_LOCKED")
+        );
+        assert.equal(deleted(calls), false);
+        assert.equal(calls.some((c) => c.startsWith("settle:")), false, "nothing re-planned");
+    }
+    // A sibling on a DIFFERENT day (the findMany window is wider than the day) does not count.
+    const other = fakeTx({ peek: victim, siblings: [row({ invoiceId: "inv9", startTime: new Date(NOW.getTime() - 40 * 3_600_000) })] });
+    assert.equal(await deleteEntryAndSettleInTx(other.tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock), "deleted");
+});
+
+test("owner path: midnight passing BETWEEN the policy check and the delete statement → the DB day condition deletes nothing → NOT_TODAY", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const victim = row();
+    // App clock says today at check time; the database (statement time) says the day rolled.
+    const { tx, calls } = fakeTx({ peek: victim, deleteCount: 0 });
+    await assert.rejects(
+        deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-crew", CREW, clock),
+        refusal("NOT_TODAY")
+    );
+    assert.equal(calls.includes("dbDelete"), true, "the conditional delete ran");
+    assert.equal(calls.some((c) => c.startsWith("settle:")), false, "no re-plan after a zero-row delete");
+});
+
 test("privileged path (no guard): locked, older, other-user row is deleted — policy is skipped, locking is not", async () => {
     const { deleteEntryAndSettleInTx } = await load();
     const victim = row({ userId: "u-other", createdAt: new Date(NOW.getTime() - 3 * 24 * 3_600_000), invoiceId: "inv1", qbSyncedAt: NOW });
     const { tx, calls } = fakeTx({ peek: victim });
     assert.equal(await deleteEntryAndSettleInTx(tx, "te1", await dayOf(victim.startTime), "u-other", undefined, AFTER_MIDNIGHT), "deleted");
-    assert.deepEqual(order(calls), ["lock", "peek", "rowlock", "deleteMany"]);
+    assert.deepEqual(order(calls), ["lock", "peek", "rowlock", "deleteMany"], "privileged path: unconditional deleteMany by id");
+    assert.equal(calls.includes("siblings"), false, "no sibling gate for managers");
 });
 
 test("a victim that is already gone at the peek returns 'gone' without locking or deleting", async () => {

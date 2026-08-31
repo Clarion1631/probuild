@@ -24,12 +24,17 @@ export type DeleteVictim = {
 // CLAIM_LOST: the conditional delete removed nothing, yet the row as re-read still
 // passes the policy (it changed and changed back, or a concurrent writer is mid-flight).
 // Reported honestly as a conflict rather than guessing a reason.
-export type DeleteRefusalCode = "NOT_OWNER" | "NOT_TODAY" | "LOCKED_DOWNSTREAM" | "CLAIM_LOST";
+// SIBLING_LOCKED: deleting re-plans the worker's whole day (meal deduction moves, paid
+// hours/costs are rewritten on the remaining entries). If ANOTHER entry of that day is
+// already invoiced or synced, an owner delete would silently rewrite billed history —
+// refuse; a manager handles it.
+export type DeleteRefusalCode = "NOT_OWNER" | "NOT_TODAY" | "LOCKED_DOWNSTREAM" | "SIBLING_LOCKED" | "CLAIM_LOST";
 
 export const DELETE_REFUSAL_MESSAGES: Record<DeleteRefusalCode, string> = {
     NOT_OWNER: "You can only delete your own time entries — ask a manager to remove this one",
     NOT_TODAY: "Only today's entries can be deleted here — ask a manager to remove this one",
     LOCKED_DOWNSTREAM: "This entry is already invoiced or synced to QuickBooks — ask a manager to remove it",
+    SIBLING_LOCKED: "Another entry from this day is already invoiced or synced — ask a manager to remove this one",
     CLAIM_LOST: "This entry changed while it was being deleted — refresh and try again",
 };
 
@@ -79,4 +84,19 @@ export class DeleteRefusedError extends Error {
         this.name = "DeleteRefusedError";
         this.code = code;
     }
+}
+
+const REFUSAL_CODES: ReadonlySet<string> = new Set<DeleteRefusalCode>(["NOT_OWNER", "NOT_TODAY", "LOCKED_DOWNSTREAM", "SIBLING_LOCKED", "CLAIM_LOST"]);
+
+/**
+ * Duck-typed check — NOT `instanceof`. Source files import this module through the
+ * `@/lib/...` alias while tests import it relatively; under tsx in CI those resolve to
+ * two module instances with two class identities, and `instanceof` failed every
+ * `catch` (Codex gate, PR #436). name + code is stable across module copies.
+ */
+export function isDeleteRefusedError(error: unknown): error is DeleteRefusedError {
+    if (error instanceof DeleteRefusedError) return true;
+    if (typeof error !== "object" || error === null) return false;
+    const e = error as { name?: unknown; code?: unknown };
+    return e.name === "DeleteRefusedError" && typeof e.code === "string" && REFUSAL_CODES.has(e.code);
 }

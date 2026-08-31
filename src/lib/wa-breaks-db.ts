@@ -2,7 +2,7 @@
 // paths (PUT /api/time-entries and PATCH /api/time-entries/[id]) must see the
 // SAME "rest of the day", so they share this rather than each hand-rolling it.
 import { prisma } from "@/lib/prisma";
-import { toCompanyDayKey } from "@/lib/company-day";
+import { COMPANY_TIME_ZONE, toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
 import { checkDeleteAllowed, DeleteRefusedError, type DeleteActor } from "@/lib/time-entry-delete-policy";
@@ -207,19 +207,63 @@ export async function deleteEntryAndSettleInTx(
     }
     if (ownerGuard) {
         // Owner policy, judged on the LOCKED row with the clock read AFTER all locks —
-        // this is the check that decides; the route's pre-check was only a fast 403.
+        // the route's pre-check was only a fast 403.
         const check = checkDeleteAllowed(ownerGuard, victim, now());
         if (!check.ok) throw new DeleteRefusedError(check.code);
+        // Step 4 re-plans the whole day and REWRITES the remaining entries' paid hours,
+        // meal deduction and costs. If any other entry on a held (worker, day) pair is
+        // already invoiced / synced, an owner delete would silently change billed
+        // history — refuse (Codex gate, PR #436). We hold the pair locks, so the settle
+        // paths cannot slip a change in between this check and step 4.
+        for (const pair of held) {
+            if (await hasDownstreamLockedSibling(tx, pair.userId, pair.dayKey, entryId)) {
+                throw new DeleteRefusedError("SIBLING_LOCKED");
+            }
+        }
+        // 3a. Delete with the day condition evaluated by the DATABASE at statement time.
+        //     A row lock stops writers, not the clock: the check above can pass at
+        //     23:59:59 and this statement run at 00:00:00. createdAt is a UTC
+        //     `timestamp(3)`; compare its company-local date to clock_timestamp()'s.
+        const removed = await tx.$executeRaw`
+            DELETE FROM "TimeEntry"
+            WHERE id = ${entryId}
+              AND (("createdAt" AT TIME ZONE 'UTC') AT TIME ZONE ${COMPANY_TIME_ZONE})::date
+                = (clock_timestamp() AT TIME ZONE ${COMPANY_TIME_ZONE})::date`;
+        if (removed === 0) {
+            // The row is locked by us, so the only way to delete nothing is the day
+            // condition: midnight passed between the check and the statement.
+            throw new DeleteRefusedError("NOT_TODAY");
+        }
+    } else {
+        // 3b. Privileged: unconditional (deleteMany: a count, never a P2025 throw).
+        const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
+        if (removed.count === 0) return "gone";
     }
 
-    // 3. Delete the locked row (deleteMany: a count, never a P2025 throw) and re-plan
-    //    every (worker, day) pair it may have touched — all of which we hold.
-    const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
-    if (removed.count === 0) return "gone";
+    // 4. Re-plan every (worker, day) pair the row may have touched — all of which we hold.
     for (const pair of held) {
         await settleDayInTx(tx, pair.userId, pair.dayKey, null);
     }
     return "deleted";
+}
+
+/** Any OTHER entry of the worker on that company day that an invoice or QuickBooks already references. */
+async function hasDownstreamLockedSibling(tx: Tx, userId: string, dayKey: string, excludeEntryId: string): Promise<boolean> {
+    const rows = await tx.timeEntry.findMany({
+        where: {
+            userId,
+            id: { not: excludeEntryId },
+            startTime: dayWindow(dayKey),
+            OR: [
+                { invoiceId: { not: null } },
+                { invoicedAt: { not: null } },
+                { qbTimeActivityId: { not: null } },
+                { qbSyncedAt: { not: null } },
+            ],
+        },
+        select: { startTime: true },
+    });
+    return rows.some((row) => toCompanyDayKey(row.startTime) === dayKey);
 }
 
 type LockedTimeEntryRow = {

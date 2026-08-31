@@ -8,7 +8,7 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
-import { canAttemptDelete, checkDeleteAllowed, DELETE_REFUSAL_MESSAGES, DeleteRefusedError, isPrivilegedDeleter, type DeleteActor, type DeleteVictim } from "@/lib/time-entry-delete-policy";
+import { canAttemptDelete, checkDeleteAllowed, DELETE_REFUSAL_MESSAGES, isDeleteRefusedError, isPrivilegedDeleter, type DeleteActor, type DeleteVictim } from "@/lib/time-entry-delete-policy";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
@@ -381,7 +381,7 @@ export function createDeleteHandler(dependencies: DeleteDependencies) {
                 isPrivilegedDeleter(user.role) ? undefined : actor
             );
         } catch (error) {
-            if (error instanceof DeleteRefusedError) {
+            if (isDeleteRefusedError(error)) {
                 // The row changed between the pre-check and the locked delete (invoiced,
                 // synced, reassigned, moved, or the day rolled over). Nothing was deleted.
                 return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });

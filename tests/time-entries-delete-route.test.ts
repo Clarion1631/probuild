@@ -134,13 +134,18 @@ test("FIELD_CREW pre-check refusals → 403 with the policy code, transaction ne
 
 test("a claim refused INSIDE the transaction → 409 with the code; other errors propagate", async () => {
     const { DeleteRefusedError } = await policyModule();
-    for (const code of ["LOCKED_DOWNSTREAM", "NOT_OWNER", "NOT_TODAY", "CLAIM_LOST"] as const) {
+    for (const code of ["LOCKED_DOWNSTREAM", "NOT_OWNER", "NOT_TODAY", "SIBLING_LOCKED", "CLAIM_LOST"] as const) {
         const { dependencies } = deps({ role: "FIELD_CREW", tx: new DeleteRefusedError(code) });
         const r = await call(dependencies);
         assert.equal(r.status, 409, code);
         assert.equal(r.body.code, code);
         assert.equal(typeof r.body.error, "string");
     }
+    // A refusal thrown by a DIFFERENT module instance (no shared class identity) must still map to 409.
+    const foreign = Object.assign(new Error("changed"), { name: "DeleteRefusedError", code: "CLAIM_LOST" });
+    const f = await call(deps({ role: "FIELD_CREW", tx: foreign }).dependencies);
+    assert.equal(f.status, 409);
+    assert.equal(f.body.code, "CLAIM_LOST");
     const boom = deps({ role: "FIELD_CREW", tx: new Error("db down") });
     const { createDeleteHandler } = await routeModule();
     await assert.rejects(createDeleteHandler(boom.dependencies)(req(), ctx), /db down/);
