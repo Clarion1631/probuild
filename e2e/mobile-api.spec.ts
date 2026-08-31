@@ -170,7 +170,6 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
-                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 suggestedCostCodeId: COST_CODE_DRYW_ID,
                 suggestionSource: "dispatch",
@@ -192,7 +191,6 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
-                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 // A schedule task id the field-crew fixture user has no
                 // TaskAssignment on (and that may not even resolve) — the
                 // server must never persist a "planned by office" claim it
@@ -215,7 +213,6 @@ test.describe.serial("Mobile API contract", () => {
                 projectId: PROJECT_ID,
                 estimateItemId: MOBILE_ITEM_DEMO_ID,
                 startTime: new Date().toISOString(),
-                    costCodeId: COST_CODE_DRYW_ID, // a phase is required to clock in
                 suggestedScheduleTaskId: MOBILE_TASK_DRYW_ID,
                 // Real cost code for this task is COST_CODE_DRYW_ID — this claims a different one.
                 suggestedCostCodeId: COST_CODE_DEMO_ID,
