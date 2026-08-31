@@ -168,31 +168,40 @@ export async function deleteEntryAndSettleInTx(
     ownerGuard?: DeleteActor,
     now: () => Date = () => new Date()
 ): Promise<"deleted" | "gone"> {
-    // 1. Day lock(s). A plain read tells us which day(s) the row is on; advisory
-    //    locks are always taken BEFORE the row lock (never while holding it), so
-    //    lock order against the settle paths stays day-lock → row-lock.
-    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
+    // The settle paths serialize on (worker, company day) — that PAIR is the guarded
+    // identity here too (Codex gate, PR #436: a manager can reassign userId without
+    // changing the day, so locking by day alone could settle the new worker's day
+    // without its lock and never settle the old worker's).
+    const held: Array<{ userId: string; dayKey: string }> = [];
+    const lockPair = async (uid: string, dayKey: string) => {
+        if (held.some((p) => p.userId === uid && p.dayKey === dayKey)) return;
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${uid}:${dayKey}`);
+        held.push({ userId: uid, dayKey });
+    };
+    const isHeld = (uid: string, dayKey: string) => held.some((p) => p.userId === uid && p.dayKey === dayKey);
+
+    // 1. Pair lock(s). A plain read tells us which (worker, day) the row is on now;
+    //    advisory locks are always taken BEFORE the row lock (never while holding it),
+    //    so lock order against the settle paths stays pair-lock → row-lock.
+    await lockPair(userId, knownDayKey);
     const peek = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
     if (!peek) return "gone"; // already gone
-    const peekDay = toCompanyDayKey(peek.startTime);
-    if (peekDay !== knownDayKey) {
-        // Moved since the caller read it — take that day's lock as well
-        // (deterministic order: keys sorted, so two deletes cannot deadlock).
-        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${peek.userId}:${peekDay}`);
-    }
+    // Moved and/or reassigned since the caller read it — hold that pair as well
+    // (no-op when it is the same pair).
+    await lockPair(peek.userId, toCompanyDayKey(peek.startTime));
 
     // 2. Row lock. From here until commit nothing else can update or delete this row,
     //    so every check below is made against exactly the row that gets deleted — no
     //    window for an invoice/QBO sync, a reassignment, a startTime move, or (owner
-    //    path) the company day rolling over between check and delete (Codex gate,
-    //    PR #436: a conditional WHERE with pre-computed bounds was not enough, since
-    //    the delete itself can wait on a row lock across midnight).
+    //    path) the company day rolling over between check and delete (a conditional
+    //    WHERE with pre-computed bounds was not enough, since the delete itself can
+    //    wait on a row lock across midnight).
     const victim = await lockTimeEntryRow(tx, entryId);
     if (!victim) return "gone"; // vanished between the peek and the lock
     const actualDay = toCompanyDayKey(victim.startTime);
-    if (actualDay !== knownDayKey && actualDay !== peekDay) {
-        // Moved AGAIN between the peek and the row lock, onto a day we do not hold
-        // the lock for. Never take an advisory lock while holding a row lock — refuse,
+    if (!isHeld(victim.userId, actualDay)) {
+        // Moved or reassigned AGAIN between the peek and the row lock, onto a pair we
+        // do not hold. Never take an advisory lock while holding a row lock — refuse,
         // and let the caller retry (409).
         throw new DeleteRefusedError("CLAIM_LOST");
     }
@@ -204,11 +213,11 @@ export async function deleteEntryAndSettleInTx(
     }
 
     // 3. Delete the locked row (deleteMany: a count, never a P2025 throw) and re-plan
-    //    every day it may have touched.
+    //    every (worker, day) pair it may have touched — all of which we hold.
     const removed = await tx.timeEntry.deleteMany({ where: { id: entryId } });
     if (removed.count === 0) return "gone";
-    for (const dayKey of new Set([knownDayKey, peekDay, actualDay])) {
-        await settleDayInTx(tx, victim.userId, dayKey, null);
+    for (const pair of held) {
+        await settleDayInTx(tx, pair.userId, pair.dayKey, null);
     }
     return "deleted";
 }

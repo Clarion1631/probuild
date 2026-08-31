@@ -67,7 +67,9 @@ function fakeTx(opts: { peek: Row | null; locked?: Row | null; deleteCount?: num
             findMany: async () => [],
             update: async () => { calls.push("update"); return {}; },
         },
-        user: { findUnique: async () => null },
+        // settleDayInTx starts by loading the worker's rates — logging it shows WHICH
+        // (worker, day) pairs were re-planned; returning null makes it write nothing.
+        user: { findUnique: async (args: { where: { id: string } }) => { calls.push(`settle:${args.where.id}`); return null; } },
     };
     return { tx: tx as any, calls };
 }
@@ -91,7 +93,7 @@ test("owner path: the policy is judged on the LOCKED row — an invoice/QBO link
     for (const [locked, code] of [
         [row({ qbSyncedAt: NOW }), "LOCKED_DOWNSTREAM"],
         [row({ invoiceId: "inv1" }), "LOCKED_DOWNSTREAM"],
-        [row({ userId: "u-other" }), "NOT_OWNER"],
+        // (a reassignment in this window is CLAIM_LOST — the new pair is unlocked; see below)
     ] as Array<[Row, string]>) {
         const peek = row(); // looked clean when peeked (and when the route pre-checked)
         const { tx, calls } = fakeTx({ peek, locked });
@@ -141,6 +143,7 @@ test("a row moved to another day between the caller's read and the peek takes th
     assert.equal(await deleteEntryAndSettleInTx(tx, "te1", knownDay, "u-crew", CREW, clock), "deleted");
     assert.deepEqual(calls.filter((c) => c.startsWith("lock:")), [`lock:wa-breaks:u-crew:${knownDay}`, `lock:wa-breaks:u-crew:${actualDay}`]);
     assert.equal(calls.indexOf("rowlock") > calls.lastIndexOf(`lock:wa-breaks:u-crew:${actualDay}`), true, "advisory locks are all taken BEFORE the row lock");
+    assert.deepEqual(calls.filter((c) => c.startsWith("settle:")), ["settle:u-crew", "settle:u-crew"], "both days re-planned");
 });
 
 test("a row moved AGAIN between the peek and the row lock (onto a day we hold no lock for) is refused CLAIM_LOST — never lock a day while holding the row", async () => {
@@ -162,6 +165,36 @@ test("a row moved AGAIN between the peek and the row lock (onto a day we hold no
         (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST"
     );
     assert.equal(deleted(p.calls), false);
+});
+
+test("reassigned to another worker BEFORE the peek (same day): both (worker, day) pairs are locked and both are re-planned", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const moved = row({ userId: "u-other" }); // manager reassigned it after the caller read it
+    const day = await dayOf(moved.startTime);
+    const { tx, calls } = fakeTx({ peek: moved });
+    // Privileged (no guard) — the caller still passes the OLD owner it read.
+    assert.equal(await deleteEntryAndSettleInTx(tx, "te1", day, "u-crew", undefined, clock), "deleted");
+    assert.deepEqual(calls.filter((c) => c.startsWith("lock:")), [`lock:wa-breaks:u-crew:${day}`, `lock:wa-breaks:u-other:${day}`], "both pairs locked, old first");
+    assert.deepEqual(calls.filter((c) => c.startsWith("settle:")), ["settle:u-crew", "settle:u-other"], "both workers' days re-planned");
+    assert.equal(calls.indexOf("rowlock") > calls.lastIndexOf(`lock:wa-breaks:u-other:${day}`), true, "pair locks before the row lock");
+});
+
+test("reassigned to another worker BETWEEN the peek and the row lock (same day): CLAIM_LOST, nothing deleted, no lock taken after the row", async () => {
+    const { deleteEntryAndSettleInTx } = await load();
+    const { DeleteRefusedError } = await policy();
+    const peek = row();
+    const locked = row({ userId: "u-other" }); // same day, different worker
+    for (const guard of [undefined, CREW]) {
+        const { tx, calls } = fakeTx({ peek, locked });
+        await assert.rejects(
+            deleteEntryAndSettleInTx(tx, "te1", await dayOf(peek.startTime), "u-crew", guard, clock),
+            (err: unknown) => err instanceof DeleteRefusedError && err.code === "CLAIM_LOST",
+            guard ? "owner" : "privileged"
+        );
+        assert.equal(deleted(calls), false);
+        assert.equal(calls.filter((c) => c.startsWith("lock:")).length, 1, "only the caller's pair was locked");
+        assert.equal(calls.some((c) => c.startsWith("settle:")), false, "nothing re-planned");
+    }
 });
 
 test("privileged path (no guard): locked, older, other-user row is deleted — policy is skipped, locking is not", async () => {
