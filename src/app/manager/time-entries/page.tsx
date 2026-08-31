@@ -7,6 +7,7 @@ import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
 import EntryActions from "./EntryActions";
+import { COMPANY_TIME_ZONE } from "@/lib/company-day";
 import { canApproveMealSkip } from "@/lib/wa-breaks";
 
 interface Props {
@@ -128,8 +129,8 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                     <div className="flex-1 min-w-[220px]">
                                         <div className="font-medium text-hui-textMain">{r.user.name || r.user.email}</div>
                                         <div className="text-xs text-hui-textMuted">
-                                            {r.project.name} · clocked in {new Date(r.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-                                            {r.mealSkipRequestedAt && <> · asked {new Date(r.mealSkipRequestedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</>}
+                                            {r.project.name} · clocked in {new Date(r.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}
+                                            {r.mealSkipRequestedAt && <> · asked {new Date(r.mealSkipRequestedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}</>}
                                         </div>
                                     </div>
                                     <div className="text-xs">
@@ -297,12 +298,12 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {e.user.name || e.user.email}
                                                 </td>
                                                 <td className="px-5 py-3 text-hui-textMuted text-xs whitespace-nowrap">
-                                                    <div>{new Date(e.startTime).toLocaleDateString()}</div>
+                                                    <div>{new Date(e.startTime).toLocaleDateString('en-US', { timeZone: COMPANY_TIME_ZONE })}</div>
                                                     <div className="text-hui-textMuted">
-                                                        {new Date(e.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                        {new Date(e.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })}
                                                         {' → '}
                                                         {e.endTime
-                                                            ? new Date(e.endTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                                            ? new Date(e.endTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: COMPANY_TIME_ZONE })
                                                             : <span className="text-green-600 font-medium">Active</span>}
                                                     </div>
                                                 </td>
@@ -344,8 +345,10 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                                 </button>
                                                             </form>
                                                         </div>
-                                                    ) : e.editedByManagerId ? (
-                                                        <span className="text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">Edited</span>
+                                                    ) : e.isEdited ? (
+                                                        <span className="text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200" title={e.editedByManagerId ? "Edited by a manager/admin" : "Edited by the worker"}>
+                                                            {e.editedByManagerId ? "Edited" : "Edited (worker)"}
+                                                        </span>
                                                     ) : (
                                                         <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded border border-green-200">Original</span>
                                                     )}
@@ -356,6 +359,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                         userName={e.user.name || e.user.email}
                                                         startTime={new Date(e.startTime).toISOString()}
                                                         endTime={e.endTime ? new Date(e.endTime).toISOString() : null}
+                                                        isLogistics={!!e.project?.isLogistics}
                                                     />
                                                 </td>
                                             </tr>
