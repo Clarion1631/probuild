@@ -8,6 +8,7 @@ import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { checkDeleteAllowed, DELETE_REFUSAL_MESSAGES, DeleteRefusedError, isPrivilegedDeleter } from "@/lib/time-entry-delete-policy";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
@@ -326,19 +327,43 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
 
-    if (user.role !== "MANAGER" && user.role !== "ADMIN") {
-        return NextResponse.json({ error: "Only managers can delete time entries" }, { status: 403 });
-    }
-
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
 
+    // Owner decision 2026-08-30: field crew may delete their OWN entry outright (a
+    // wrong-job or duplicate punch) — but only while it is still TODAY's entry (company
+    // day, judged by the un-editable createdAt) and only if no invoice / QuickBooks
+    // record references it yet. Anything else needs a manager/admin, who may delete
+    // anyone's. The rule lives in src/lib/time-entry-delete-policy.ts; this is the
+    // fast pre-check for a clean 403, and the SAME rule is re-checked inside the
+    // delete transaction below, where the delete is conditional on the row still
+    // qualifying (Codex gate, PR #434: a pre-check alone is a TOCTOU).
+    const actor = { id: user.id, role: user.role };
+    const pre = checkDeleteAllowed(actor, existing);
+    if (!pre.ok) {
+        return NextResponse.json({ error: DELETE_REFUSAL_MESSAGES[pre.code], code: pre.code }, { status: 403 });
+    }
+
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
     // day is re-planned too (src/lib/wa-breaks-db.ts deleteEntryAndSettle).
-    await deleteEntryAndSettle(id, toCompanyDayKey(existing.startTime), existing.userId);
+    try {
+        await deleteEntryAndSettle(
+            id,
+            toCompanyDayKey(existing.startTime),
+            existing.userId,
+            isPrivilegedDeleter(user.role) ? undefined : actor
+        );
+    } catch (error) {
+        if (error instanceof DeleteRefusedError) {
+            // Lost the claim inside the transaction (invoiced / synced / reassigned
+            // between the pre-check and the delete). Nothing was deleted.
+            return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+        }
+        throw error;
+    }
     return NextResponse.json({ ok: true });
 }

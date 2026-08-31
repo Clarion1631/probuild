@@ -1,0 +1,64 @@
+// Who may delete a time entry outright (owner decision 2026-08-30):
+//   - MANAGER / ADMIN: any entry (unchanged from before).
+//   - the entry's OWNER: only while it is still TODAY's entry (company day, judged by
+//     the un-editable createdAt — startTime is PATCH-able) and only if nothing
+//     downstream references it yet (invoice, QuickBooks time activity). Older or
+//     downstream-linked entries need a manager, who leaves their name on the action.
+//
+// Pure — no I/O — so the route's fast pre-check and the in-transaction re-check in
+// src/lib/wa-breaks-db.ts (deleteEntryAndSettleInTx) run the SAME rule, and the rule
+// is unit-tested in tests/time-entry-delete-policy.test.ts.
+import { toCompanyDayKey } from "@/lib/company-day";
+
+export type DeleteActor = { id: string; role: string };
+
+export type DeleteVictim = {
+    userId: string;
+    createdAt: Date;
+    invoiceId: string | null;
+    invoicedAt: Date | null;
+    qbTimeActivityId: string | null;
+    qbSyncedAt: Date | null;
+};
+
+export type DeleteRefusalCode = "NOT_OWNER" | "NOT_TODAY" | "LOCKED_DOWNSTREAM";
+
+export const DELETE_REFUSAL_MESSAGES: Record<DeleteRefusalCode, string> = {
+    NOT_OWNER: "You can only delete your own time entries — ask a manager to remove this one",
+    NOT_TODAY: "Only today's entries can be deleted here — ask a manager to remove this one",
+    LOCKED_DOWNSTREAM: "This entry is already invoiced or synced to QuickBooks — ask a manager to remove it",
+};
+
+export function isPrivilegedDeleter(role: string): boolean {
+    return role === "MANAGER" || role === "ADMIN";
+}
+
+/** True when an invoice or QuickBooks already references the entry. */
+export function isLockedDownstream(victim: Pick<DeleteVictim, "invoiceId" | "invoicedAt" | "qbTimeActivityId" | "qbSyncedAt">): boolean {
+    return (
+        victim.invoiceId != null
+        || victim.invoicedAt != null
+        || victim.qbTimeActivityId != null
+        || victim.qbSyncedAt != null
+    );
+}
+
+export type DeleteCheck = { ok: true } | { ok: false; code: DeleteRefusalCode };
+
+export function checkDeleteAllowed(actor: DeleteActor, victim: DeleteVictim, now: Date = new Date()): DeleteCheck {
+    if (isPrivilegedDeleter(actor.role)) return { ok: true };
+    if (victim.userId !== actor.id) return { ok: false, code: "NOT_OWNER" };
+    if (toCompanyDayKey(victim.createdAt) !== toCompanyDayKey(now)) return { ok: false, code: "NOT_TODAY" };
+    if (isLockedDownstream(victim)) return { ok: false, code: "LOCKED_DOWNSTREAM" };
+    return { ok: true };
+}
+
+/** Thrown inside the delete transaction when the owner's claim is refused — the transaction rolls back, nothing is deleted. */
+export class DeleteRefusedError extends Error {
+    readonly code: DeleteRefusalCode;
+    constructor(code: DeleteRefusalCode) {
+        super(DELETE_REFUSAL_MESSAGES[code]);
+        this.name = "DeleteRefusedError";
+        this.code = code;
+    }
+}

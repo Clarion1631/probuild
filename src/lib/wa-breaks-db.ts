@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { toNum } from "@/lib/prisma-helpers";
 import { SETTLEMENT_FAILED_NOTE, settleDayPlan, type DayEntry } from "@/lib/wa-breaks";
+import { checkDeleteAllowed, DeleteRefusedError, type DeleteActor } from "@/lib/time-entry-delete-policy";
 
 function dayWindow(dayKey: string) {
     const dayStartUtc = new Date(`${dayKey}T00:00:00.000Z`).getTime();
@@ -131,22 +132,79 @@ async function settleDayInTx(
  * too), then deleted, then every affected day re-planned. Throws on failure
  * (the caller answers 500 and nothing is deleted).
  */
-export async function deleteEntryAndSettle(entryId: string, knownDayKey: string, userId: string): Promise<void> {
-    await prisma.$transaction(async (tx) => {
-        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
-        const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
-        if (!victim) return; // already gone
-        const actualDay = toCompanyDayKey(victim.startTime);
-        if (actualDay !== knownDayKey) {
-            // Moved since the caller read it — take that day's lock as well
-            // (deterministic order: keys sorted, so two deletes cannot deadlock).
-            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
+export async function deleteEntryAndSettle(
+    entryId: string,
+    knownDayKey: string,
+    userId: string,
+    ownerGuard?: DeleteActor
+): Promise<"deleted" | "gone"> {
+    return prisma.$transaction((tx) => deleteEntryAndSettleInTx(tx, entryId, knownDayKey, userId, ownerGuard));
+}
+
+const DELETE_VICTIM_SELECT = {
+    userId: true, startTime: true, createdAt: true,
+    invoiceId: true, invoicedAt: true, qbTimeActivityId: true, qbSyncedAt: true,
+} as const;
+
+/**
+ * The body of deleteEntryAndSettle, on a caller-supplied transaction (exported so
+ * tests can drive it with a fake `tx`).
+ *
+ * `ownerGuard` = the non-privileged actor deleting their OWN entry
+ * (src/lib/time-entry-delete-policy.ts). When set, the policy is re-checked on the
+ * row as read INSIDE the transaction, and the delete itself is a conditional
+ * `deleteMany` that only removes a row which STILL belongs to that user and STILL has
+ * no invoice / QuickBooks link — so an invoice or QBO sync landing between the
+ * route's pre-check and this delete cannot be erased (Codex gate, PR #434: the
+ * pre-check alone was a TOCTOU). A lost claim throws DeleteRefusedError, which rolls
+ * the transaction back; the route answers 409. Privileged callers pass no guard and
+ * delete unconditionally, exactly as before.
+ */
+export async function deleteEntryAndSettleInTx(
+    tx: Tx,
+    entryId: string,
+    knownDayKey: string,
+    userId: string,
+    ownerGuard?: DeleteActor
+): Promise<"deleted" | "gone"> {
+    await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${userId}:${knownDayKey}`);
+    const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
+    if (!victim) return "gone"; // already gone
+    if (ownerGuard) {
+        const check = checkDeleteAllowed(ownerGuard, victim);
+        if (!check.ok) throw new DeleteRefusedError(check.code);
+    }
+    const actualDay = toCompanyDayKey(victim.startTime);
+    if (actualDay !== knownDayKey) {
+        // Moved since the caller read it — take that day's lock as well
+        // (deterministic order: keys sorted, so two deletes cannot deadlock).
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `wa-breaks:${victim.userId}:${actualDay}`);
+    }
+    if (ownerGuard) {
+        const claimed = await tx.timeEntry.deleteMany({
+            where: {
+                id: entryId,
+                userId: ownerGuard.id,
+                invoiceId: null,
+                invoicedAt: null,
+                qbTimeActivityId: null,
+                qbSyncedAt: null,
+            },
+        });
+        if (claimed.count === 0) {
+            // Lost the claim: explain with the row as it is now (or it vanished meanwhile).
+            const current = await tx.timeEntry.findUnique({ where: { id: entryId }, select: DELETE_VICTIM_SELECT });
+            if (!current) return "gone";
+            const check = checkDeleteAllowed(ownerGuard, current);
+            throw new DeleteRefusedError(check.ok ? "LOCKED_DOWNSTREAM" : check.code);
         }
+    } else {
         await tx.timeEntry.delete({ where: { id: entryId } });
-        for (const dayKey of new Set([knownDayKey, actualDay])) {
-            await settleDayInTx(tx, victim.userId, dayKey, null);
-        }
-    });
+    }
+    for (const dayKey of new Set([knownDayKey, actualDay])) {
+        await settleDayInTx(tx, victim.userId, dayKey, null);
+    }
+    return "deleted";
 }
 
 /** Id of the worker's latest CLOSED entry on a company-local day (null when none) — the row that carries the day's outcome. */
