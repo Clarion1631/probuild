@@ -47,10 +47,21 @@ test("Bearer bypass is refused for Server Action dispatches on an allowlisted pa
     const event = { waitUntil() {} } as any;
 
     const plain = await proxy(make({ authorization: "Bearer fake" }), event);
-    assert.equal(plain?.headers.get("x-middleware-next"), "1", "Bearer alone passes through to the handler");
+    assert.ok(plain instanceof Response, "proxy returns a response for the Bearer request");
+    assert.equal(plain.headers.get("x-middleware-next"), "1", "Bearer alone passes through to the handler");
 
     const action = await proxy(make({ authorization: "Bearer fake", "next-action": "deadbeef" }), event);
-    assert.notEqual(action?.headers.get("x-middleware-next"), "1", "Bearer + next-action must not bypass");
+    // An OMITTED response would let Next continue routing, so a bare "not next()" check
+    // proves nothing (Codex gate): require a real redirect-or-deny response.
+    assert.ok(action instanceof Response, "proxy must return a response, not fall through");
+    assert.notEqual(action.headers.get("x-middleware-next"), "1", "Bearer + next-action must not bypass");
+    assert.ok(
+        [302, 303, 307, 308, 401, 403].includes(action.status),
+        `expected a redirect to /login or a 401/403, got ${action.status}`
+    );
+    if (action.status >= 300 && action.status < 400) {
+        assert.match(action.headers.get("location") ?? "", /\/login/, "redirect target is the login page");
+    }
 });
 
 test("the allowlist does not widen to other time-entry descendants", async () => {
