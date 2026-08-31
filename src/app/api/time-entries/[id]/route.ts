@@ -326,15 +326,19 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
     const { user } = auth;
 
-    if (user.role !== "MANAGER" && user.role !== "ADMIN") {
-        return NextResponse.json({ error: "Only managers can delete time entries" }, { status: 403 });
-    }
-
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
 
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+
+    // Same rule as PATCH (owner decision 2026-08-30): field crew may delete their OWN
+    // entry outright (a wrong-job or duplicate punch); managers/admins may delete anyone's.
+    const isOwner = existing.userId === user.id;
+    const isPrivileged = user.role === "MANAGER" || user.role === "ADMIN";
+    if (!isOwner && !isPrivileged) {
+        return NextResponse.json({ error: "Unauthorized to delete this entry" }, { status: 403 });
+    }
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
