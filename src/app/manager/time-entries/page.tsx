@@ -8,6 +8,7 @@ import { formatCurrency } from "@/lib/utils";
 import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
 import EntryActions from "./EntryActions";
 import { COMPANY_TIME_ZONE } from "@/lib/company-day";
+import { companyDayRange } from "@/lib/company-wall-time";
 import { canApproveMealSkip } from "@/lib/wa-breaks";
 
 interface Props {
@@ -33,9 +34,11 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
     if (projectId) where.projectId = projectId;
     if (flagged === '1') where.needsReview = true;
     if (dateFrom || dateTo) {
-        where.startTime = {};
-        if (dateFrom) where.startTime.gte = new Date(dateFrom);
-        if (dateTo) where.startTime.lte = new Date(dateTo + "T23:59:59");
+        // Company-local day boundaries, not UTC (Codex gate, PR #437): the table shows
+        // Pacific dates, so a 7pm Pacific punch must stay inside its displayed date
+        // even though its UTC timestamp is the next day.
+        const range = companyDayRange(dateFrom, dateTo);
+        if (range.gte || range.lt) where.startTime = range;
     }
 
     const [entries, allUsers, allProjects, pendingSkips] = await Promise.all([
@@ -360,6 +363,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                         startTime={new Date(e.startTime).toISOString()}
                                                         endTime={e.endTime ? new Date(e.endTime).toISOString() : null}
                                                         isLogistics={!!e.project?.isLogistics}
+                                                        existingNotes={e.notes ?? ""}
                                                     />
                                                 </td>
                                             </tr>

@@ -7,8 +7,43 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { companyWallToInstant, instantToCompanyWall } from "../src/lib/company-wall-time";
+import { companyDayRange, companyWallToInstant, companyWallToInstants, instantToCompanyWall } from "../src/lib/company-wall-time";
 import { toCompanyDayKey } from "../src/lib/company-day";
+
+test("companyWallToInstants: one instant normally, two in the fall-back hour (earliest first), zero in the gap", () => {
+    assert.deepEqual(companyWallToInstants("2026-08-30T12:00").map((d) => d.toISOString()), ["2026-08-30T19:00:00.000Z"]);
+    assert.deepEqual(
+        companyWallToInstants("2026-11-01T01:30").map((d) => d.toISOString()),
+        ["2026-11-01T08:30:00.000Z", "2026-11-01T09:30:00.000Z"] // PDT occurrence, then PST
+    );
+    assert.deepEqual(companyWallToInstants("2026-03-08T02:30"), []);
+});
+
+test("companyDayRange: Pacific calendar-day boundaries, half-open, DST-correct", () => {
+    const r = companyDayRange("2026-08-30", "2026-08-30");
+    assert.equal(r.gte!.toISOString(), "2026-08-30T07:00:00.000Z");
+    assert.equal(r.lt!.toISOString(), "2026-08-31T07:00:00.000Z");
+    // The regression that forced this: a 7pm Pacific punch (02:00Z next day) must be
+    // INSIDE its displayed date's range — the old UTC boundaries excluded it.
+    const evening = new Date("2026-08-31T02:00:00.000Z"); // 2026-08-30 19:00 Pacific
+    assert.equal(toCompanyDayKey(evening), "2026-08-30");
+    assert.ok(evening >= r.gte! && evening < r.lt!);
+    // And an early-UTC row from the PREVIOUS Pacific day stays out.
+    const prior = new Date("2026-08-30T05:00:00.000Z"); // 2026-08-29 22:00 Pacific
+    assert.equal(prior >= r.gte!, false);
+    // Fall-back day is 25h long; spring-forward day 23h; year boundary uses PST.
+    const fb = companyDayRange("2026-11-01", "2026-11-01");
+    assert.equal(fb.lt!.getTime() - fb.gte!.getTime(), 25 * 3_600_000);
+    const sf = companyDayRange("2026-03-08", "2026-03-08");
+    assert.equal(sf.lt!.getTime() - sf.gte!.getTime(), 23 * 3_600_000);
+    const ny = companyDayRange("2026-12-31", "2026-12-31");
+    assert.equal(ny.gte!.toISOString(), "2026-12-31T08:00:00.000Z");
+    assert.equal(ny.lt!.toISOString(), "2027-01-01T08:00:00.000Z");
+    // Open-ended and junk inputs.
+    assert.deepEqual(companyDayRange(undefined, undefined), {});
+    assert.equal(companyDayRange("2026-08-30", null).lt, undefined);
+    assert.deepEqual(companyDayRange("junk", "also junk"), {});
+});
 
 test("ordinary times round-trip exactly, both DST regimes", () => {
     for (const [wall, iso] of [

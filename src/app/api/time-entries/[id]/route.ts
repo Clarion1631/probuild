@@ -6,6 +6,7 @@ import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { toCompanyDayKey } from "@/lib/company-day";
 import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logistics-time-entry";
+import { privilegedEditStamp } from "@/lib/time-entry-edit-audit";
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
@@ -17,7 +18,8 @@ import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
 //              (so the audit trail preserves the as-clocked values), recomputes
 //              durationHours / laborCost / burdenCost from the OWNER's rates
 //              (not the editor's), and stamps `editedByManagerId` + `editedAt`
-//              when a manager edits someone else's punch.
+//              on EVERY privileged (MANAGER/ADMIN) edit — their own punch included
+//              (src/lib/time-entry-edit-audit.ts; changed 2026-08-31, PR #437).
 //
 //   2. Offsite telemetry — body has `offsiteMs` / `isOffsite` / `lastLocationCheck`.
 //                          Mobile geofence watcher hits this every minute or on
@@ -288,13 +290,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.originalEndTime = existing.endTime;
     }
 
-    // Every privileged edit is stamped — including a manager editing their OWN punch.
-    // The manager page's "Edited"/"Original" badge reads this field, and a manager's
-    // self-edit staying "Original" hid the audit trail (Codex gate, PR #437).
-    if (isPrivileged) {
-        data.editedByManagerId = user.id;
-        data.editedAt = new Date();
-    }
+    // Attribution matrix lives in src/lib/time-entry-edit-audit.ts (pure, tested):
+    // every privileged edit is stamped — a manager's own punch included.
+    Object.assign(data, privilegedEditStamp(user.id, isPrivileged));
 
     // Re-resolve the schedule-task binding only when the edit moves the punch to a
     // different local day — the board may have changed mid-shift, so we must not
