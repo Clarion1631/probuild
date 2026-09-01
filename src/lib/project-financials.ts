@@ -74,6 +74,16 @@ export interface ProjectFinancials {
     earnedMargin: number | null;
     /** 0..1 — share of expense DOLLARS carrying a receipt. Null when the job has no expenses. */
     receiptCompleteness: number | null;
+    /**
+     * The two sides of `receiptCompleteness`, in absolute dollars.
+     *
+     * Exposed so a company-wide roll-up can divide summed dollars instead of
+     * averaging per-job ratios — a $50 job with a receipt and a $50,000 job
+     * without one is not "50% complete". Note this is ABS expense dollars, so
+     * it deliberately differs from the signed `totalExpenses` above.
+     */
+    expenseDollarsAbs: number;
+    receiptedExpenseDollarsAbs: number;
     /** 0..1 — share of actual DOLLARS (expenses + labor) carrying a cost code. Null when there are none. */
     phaseCoverage: number | null;
 }
@@ -300,6 +310,8 @@ export async function computeProjectFinancials(
         earnedRevenue,
         earnedMargin,
         receiptCompleteness,
+        expenseDollarsAbs: expenseAbsTotal,
+        receiptedExpenseDollarsAbs: expenseAbsWithReceipt,
         phaseCoverage,
     };
 }

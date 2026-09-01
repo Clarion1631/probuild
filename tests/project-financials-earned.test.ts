@@ -244,6 +244,11 @@ test("receipt completeness is a share of ABSOLUTE expense dollars", async () => 
     const fin = await computeProjectFinancials("p1");
     // $1,000 with a receipt out of $1,200 moved (the −$200 refund counts gross).
     assert.equal(fin.receiptCompleteness, 1_000 / 1_200);
+    // The two sides are exposed for dollar-weighted company roll-ups, and are
+    // ABSOLUTE — deliberately different from the signed $800 `totalExpenses`.
+    assert.equal(fin.expenseDollarsAbs, 1_200);
+    assert.equal(fin.receiptedExpenseDollarsAbs, 1_000);
+    assert.equal(fin.totalExpenses, 800);
 });
 
 test("a blank receiptUrl does not count as a receipt", async () => {
@@ -279,6 +284,8 @@ const NEW_FIELDS = [
     "earnedRevenue",
     "earnedMargin",
     "receiptCompleteness",
+    "expenseDollarsAbs",
+    "receiptedExpenseDollarsAbs",
     "phaseCoverage",
 ] as const;
 
