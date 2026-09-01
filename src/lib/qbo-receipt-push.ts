@@ -28,6 +28,7 @@ import {
     escapeQBString,
     ensureQBCustomer,
     QB_API_BASE,
+    qbTimedFetch,
     type QBTokens,
 } from "./quickbooks";
 
@@ -323,7 +324,7 @@ async function defaultUploadAttachment(
         Buffer.from(`${CRLF}--${boundary}--${CRLF}`),
     ]);
 
-    const res = await fetch(`${QB_API_BASE}/${tokens.realmId}/upload?minorversion=73`, {
+    const res = await qbTimedFetch(`${QB_API_BASE}/${tokens.realmId}/upload?minorversion=73`, {
         method: "POST",
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,

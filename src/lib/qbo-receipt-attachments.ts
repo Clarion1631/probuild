@@ -5,7 +5,7 @@
 // receiptUrl is ProBuild-owned metadata: this module only ever fills an EMPTY
 // receiptUrl (guarded update), so a manually uploaded receipt is never
 // overwritten by a later sync run.
-import { getQBPurchaseAttachables, type QBTokens } from "./quickbooks";
+import { getQBPurchaseAttachables, qbTimedFetch, type QBTokens } from "./quickbooks";
 import { getSupabase, STORAGE_BUCKET } from "./supabase";
 import { prisma } from "./prisma";
 
@@ -48,7 +48,8 @@ export async function attachQboReceipt(
     const attachment = candidates[0];
     if (!attachment?.TempDownloadUri) return "no-attachment";
 
-    const download = await fetch(attachment.TempDownloadUri);
+    // QBO-issued temp URL: same unbounded-hang risk as the API itself.
+    const download = await qbTimedFetch(attachment.TempDownloadUri);
     if (!download.ok) {
         throw new Error(`QBO attachment download failed: HTTP ${download.status}`);
     }

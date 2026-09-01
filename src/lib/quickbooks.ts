@@ -23,13 +23,78 @@ export interface QBTokens {
     realmId: string;
 }
 
+/**
+ * Raised when a QuickBooks HTTP call exceeded its own deadline — distinct from
+ * any other network error so callers can treat it as "QBO is unreachable right
+ * now, retry later" instead of a business failure.
+ */
+export class QBTimeoutError extends Error {
+    name = "QBTimeoutError";
+}
+
+const QB_DEFAULT_TIMEOUT_MS = 20_000;
+
+/** Path only — never the query string (it can carry the realm/query) or a token. */
+function safePath(url: string): string {
+    try {
+        return new URL(url).pathname;
+    } catch {
+        return "(unparseable url)";
+    }
+}
+
+/**
+ * Every QuickBooks HTTP call goes through here.
+ *
+ * Bare `fetch()` has NO default timeout, so an Intuit outage (2026-09-01) left
+ * each request hanging until Vercel killed the whole function at its
+ * maxDuration — a receipt push burned 60s and a cron 120s to learn nothing.
+ * A per-request deadline turns that into a fast, classifiable failure.
+ *
+ * A caller-supplied `signal` still wins on abort (combined via
+ * `AbortSignal.any` where available); only OUR deadline firing is rethrown as
+ * QBTimeoutError. Every other error passes through untouched.
+ */
+export async function qbTimedFetch(
+    url: string,
+    init: RequestInit = {},
+    timeoutMs: number = Number(process.env.QB_FETCH_TIMEOUT_MS) || QB_DEFAULT_TIMEOUT_MS,
+): Promise<Response> {
+    // A misconfigured env var must not break every QB call: AbortSignal.timeout
+    // rejects a non-positive delay outright.
+    const effectiveMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : QB_DEFAULT_TIMEOUT_MS;
+    const timeoutSignal = AbortSignal.timeout(effectiveMs);
+
+    const callerSignal = init.signal;
+    let signal: AbortSignal = timeoutSignal;
+    if (callerSignal) {
+        const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+        signal = typeof anyOf === "function" ? anyOf([callerSignal, timeoutSignal]) : callerSignal;
+    }
+
+    try {
+        return await fetch(url, { ...init, signal });
+    } catch (error) {
+        const aborted =
+            error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+        // Only claim a timeout when OUR deadline is the one that fired — a
+        // caller cancelling its own request is not a QBO outage.
+        if (aborted && timeoutSignal.aborted && !callerSignal?.aborted) {
+            throw new QBTimeoutError(
+                `QuickBooks request timed out after ${effectiveMs}ms: ${safePath(url)}`,
+            );
+        }
+        throw error;
+    }
+}
+
 /** Exchange authorization code for tokens */
 export async function exchangeQBCode(code: string, redirectUri: string): Promise<QBTokens> {
     const clientId = process.env.QB_CLIENT_ID!;
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-    const res = await fetch(TOKEN_URL, {
+    const res = await qbTimedFetch(TOKEN_URL, {
         method: "POST",
         headers: {
             Authorization: `Basic ${encoded}`,
@@ -62,7 +127,7 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-    const res = await fetch(TOKEN_URL, {
+    const res = await qbTimedFetch(TOKEN_URL, {
         method: "POST",
         headers: {
             Authorization: `Basic ${encoded}`,
@@ -92,7 +157,7 @@ export async function qbFetch(
     // backward compatible.
     const separator = path.includes("?") ? "&" : "?";
     const url = `${QB_API_BASE}/${tokens.realmId}${path}${separator}minorversion=73`;
-    return fetch(url, {
+    return qbTimedFetch(url, {
         ...opts,
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
@@ -106,7 +171,7 @@ export async function qbFetch(
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
 export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
-    const res = await fetch(url, {
+    const res = await qbTimedFetch(url, {
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
             Accept: "application/json",
@@ -303,7 +368,7 @@ export async function createQBMilestoneInvoice(
 /** Fetch the customer-facing payment link for a QBO invoice (requires QB Payments enabled). */
 export async function getQBInvoicePaymentLink(tokens: QBTokens, qbInvoiceId: string): Promise<string | null> {
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}?include=invoiceLink&minorversion=73`;
-    const res = await fetch(url, {
+    const res = await qbTimedFetch(url, {
         headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: "application/json" },
     });
     if (!res.ok) return null;
@@ -548,7 +613,7 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Prom
     const get = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
     if (!get.ok) return false;
     const syncToken = String((await get.json()).Payment?.SyncToken ?? "0");
-    const res = await fetch(
+    const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/payment?operation=delete&minorversion=73`,
         {
             method: "POST",
@@ -563,7 +628,7 @@ export async function deleteQBPayment(tokens: QBTokens, paymentId: string): Prom
 export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<boolean> {
     const inv = await readQBInvoice(tokens, qbInvoiceId);
     if (!inv) return false;
-    const res = await fetch(
+    const res = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/invoice?operation=delete&minorversion=73`,
         {
             method: "POST",
@@ -702,7 +767,7 @@ export async function getQBPurchaseChangesSince(
         changedSince: since.toISOString(),
         minorversion: "73",
     });
-    const response = await fetch(
+    const response = await qbTimedFetch(
         `${QB_API_BASE}/${tokens.realmId}/cdc?${params.toString()}`,
         {
             headers: {
@@ -918,7 +983,7 @@ export async function sendQBInvoice(tokens: QBTokens, qbInvoiceId: string, sendT
     const qs = new URLSearchParams({ minorversion: "73" });
     if (sendTo) qs.set("sendTo", sendTo);
     const url = `${QB_API_BASE}/${tokens.realmId}/invoice/${qbInvoiceId}/send?${qs}`;
-    const res = await fetch(url, {
+    const res = await qbTimedFetch(url, {
         method: "POST",
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
