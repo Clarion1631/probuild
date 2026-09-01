@@ -46,6 +46,7 @@ model User {
   decidedProposals          SelectionProposal[]
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
+  percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
 }
 
 model Client {
@@ -308,12 +309,34 @@ model Project {
   permits                 Permit[]
   inspections             Inspection[]
 
+  // ── Percent complete (earned revenue / earned margin) ──────────────────────
+  // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
+  // is the machine estimate, which the nightly recalc cron always refreshes even
+  // while a manual override is in force. percentCompleteAutoAtOverride freezes the
+  // auto value at the moment of the override so drift ("auto has moved > 5 points
+  // since this was set by hand") is computable — without that snapshot the
+  // comparison has no baseline. See src/lib/percent-complete.ts.
+  percentComplete               Decimal?               @db.Decimal(5, 2)
+  percentCompleteSource         PercentCompleteSource?
+  percentCompleteAsOf           DateTime?
+  percentCompleteAuto           Decimal?               @db.Decimal(5, 2)
+  percentCompleteAutoAtOverride Decimal?               @db.Decimal(5, 2)
+  percentCompleteUpdatedById    String?
+  percentCompleteUpdatedBy      User?                  @relation("PercentCompleteUpdatedBy", fields: [percentCompleteUpdatedById], references: [id])
+
   @@index([viewedAt])
   @@index([clientId])
   @@index([status])
   @@index([createdAt])
   @@index([startDate])
   @@index([deletedAt])
+}
+
+/// Who wrote Project.percentComplete: the nightly recalc cron (AUTO) or a
+/// person overriding it on the Financial Overview page (MANUAL).
+enum PercentCompleteSource {
+  AUTO
+  MANUAL
 }
 
 model RoomDesign {
