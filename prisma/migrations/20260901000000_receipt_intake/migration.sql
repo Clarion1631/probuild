@@ -1,0 +1,120 @@
+-- ReceiptIntake schema history (Receipt Pipeline v2, Phase 1 —
+-- docs/plans/PHASE-1-INTAKE-CORE-SPEC.md §2). The table is first applied to
+-- production through the guarded rollout script scripts/apply-receipt-intake.mjs;
+-- this migration carries the SAME statements so a fresh database built from
+-- prisma/migrations/ reproduces production. Keep both additive and idempotent.
+--
+-- Two objects here are invisible to Prisma and MUST stay hand-written:
+--   * the CHECK on "state" (Prisma has no check-constraint concept), and
+--   * the PARTIAL unique index on "dedupStrongKey" (Prisma's diff engine drops
+--     partial indexes silently — CLAUDE.md, prisma/prisma-blind-spots.json).
+-- The partial index is not an optimisation: it IS the strong-dedup claim. The
+-- read step writes the keys and reads a unique violation as "someone already
+-- owns this purchase", which is what replaces the Apps Script's Properties lock.
+
+CREATE TABLE IF NOT EXISTS "ReceiptIntake" (
+    "id" TEXT NOT NULL,
+    "source" TEXT NOT NULL,
+    "sourceRef" TEXT NOT NULL,
+    "state" TEXT NOT NULL DEFAULT 'RECEIVED',
+    "dryRun" BOOLEAN NOT NULL DEFAULT true,
+    "stateReason" TEXT,
+    "projectId" TEXT,
+    "costCodeId" TEXT,
+    "suggestedCostCodeId" TEXT,
+    "suggestedConfidence" DOUBLE PRECISION,
+    "createdById" TEXT,
+    "storagePath" TEXT NOT NULL,
+    "fileName" TEXT,
+    "mimeType" TEXT NOT NULL,
+    "fileSize" INTEGER NOT NULL,
+    "fileSha256" TEXT NOT NULL,
+    "vendor" TEXT,
+    "txnDate" DATE,
+    "totalCents" INTEGER,
+    "taxCents" INTEGER,
+    "docType" TEXT,
+    "refNumber" TEXT,
+    "memo" TEXT,
+    "readJson" TEXT,
+    "readAt" TIMESTAMP(3),
+    "dedupStrongKey" TEXT,
+    "dedupWeakKey" TEXT,
+    "duplicateOfId" TEXT,
+    "qbPurchaseId" TEXT,
+    "expenseId" TEXT,
+    "archiveDriveFileId" TEXT,
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "lastError" TEXT,
+    "nextRetryAt" TIMESTAMP(3),
+    "bookedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "ReceiptIntake_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_sourceRef_key" ON "ReceiptIntake"("sourceRef");
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_expenseId_key" ON "ReceiptIntake"("expenseId");
+CREATE UNIQUE INDEX IF NOT EXISTS "ReceiptIntake_dedupStrongKey_active_key"
+    ON "ReceiptIntake"("dedupStrongKey")
+    WHERE "dedupStrongKey" IS NOT NULL AND "state" NOT IN ('DUPLICATE', 'VOID');
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_state_nextRetryAt_idx" ON "ReceiptIntake"("state", "nextRetryAt");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_projectId_idx" ON "ReceiptIntake"("projectId");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_dedupWeakKey_idx" ON "ReceiptIntake"("dedupWeakKey");
+CREATE INDEX IF NOT EXISTS "ReceiptIntake_createdAt_idx" ON "ReceiptIntake"("createdAt");
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ReceiptIntake_state_check') THEN
+        ALTER TABLE "ReceiptIntake" ADD CONSTRAINT "ReceiptIntake_state_check"
+            CHECK ("state" IN ('RECEIVED', 'READ', 'NEEDS_JOB', 'NEEDS_REVIEW', 'BOOKING',
+                               'BOOKED', 'ARCHIVED', 'DUPLICATE', 'VOID', 'NON_RECEIPT'));
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_projectId_fkey'
+          AND conrelid = '"ReceiptIntake"'::regclass
+    ) THEN
+        ALTER TABLE "ReceiptIntake"
+            ADD CONSTRAINT "ReceiptIntake_projectId_fkey"
+            FOREIGN KEY ("projectId") REFERENCES "Project"("id")
+            ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_costCodeId_fkey'
+          AND conrelid = '"ReceiptIntake"'::regclass
+    ) THEN
+        ALTER TABLE "ReceiptIntake"
+            ADD CONSTRAINT "ReceiptIntake_costCodeId_fkey"
+            FOREIGN KEY ("costCodeId") REFERENCES "CostCode"("id")
+            ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_createdById_fkey'
+          AND conrelid = '"ReceiptIntake"'::regclass
+    ) THEN
+        ALTER TABLE "ReceiptIntake"
+            ADD CONSTRAINT "ReceiptIntake_createdById_fkey"
+            FOREIGN KEY ("createdById") REFERENCES "User"("id")
+            ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ReceiptIntake_expenseId_fkey'
+          AND conrelid = '"ReceiptIntake"'::regclass
+    ) THEN
+        ALTER TABLE "ReceiptIntake"
+            ADD CONSTRAINT "ReceiptIntake_expenseId_fkey"
+            FOREIGN KEY ("expenseId") REFERENCES "Expense"("id")
+            ON DELETE SET NULL ON UPDATE CASCADE;
+    END IF;
+END $$;

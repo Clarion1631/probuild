@@ -23,6 +23,10 @@
       "def": "CREATE UNIQUE INDEX \"MessageThread_projectId_client_unique\" ON public.\"MessageThread\" USING btree (\"projectId\") WHERE (\"subcontractorId\" IS NULL)"
     },
     {
+      "name": "ReceiptIntake_dedupStrongKey_active_key",
+      "def": "CREATE UNIQUE INDEX \"ReceiptIntake_dedupStrongKey_active_key\" ON public.\"ReceiptIntake\" USING btree (\"dedupStrongKey\") WHERE ((\"dedupStrongKey\" IS NOT NULL) AND (state <> ALL (ARRAY['DUPLICATE'::text, 'VOID'::text])))"
+    },
+    {
       "name": "ReviewAlertBatch_claimed_lease_idx",
       "def": "CREATE INDEX \"ReviewAlertBatch_claimed_lease_idx\" ON public.\"ReviewAlertBatch\" USING btree (\"claimedAt\", \"createdAt\") WHERE (status = 'CLAIMED'::text)"
     },
@@ -94,6 +98,11 @@
       "name": "QboPurchaseClassification_classification_check",
       "table": "\"QboPurchaseClassification\"",
       "def": "CHECK ((classification = ANY (ARRAY['job-cost'::text, 'overhead'::text, 'owner-draw'::text, 'unknown'::text])))"
+    },
+    {
+      "name": "ReceiptIntake_state_check",
+      "table": "\"ReceiptIntake\"",
+      "def": "CHECK ((state = ANY (ARRAY['RECEIVED'::text, 'READ'::text, 'NEEDS_JOB'::text, 'NEEDS_REVIEW'::text, 'BOOKING'::text, 'BOOKED'::text, 'ARCHIVED'::text, 'DUPLICATE'::text, 'VOID'::text, 'NON_RECEIPT'::text])))"
     },
     {
       "name": "RefundEvent_amountCents_check",

@@ -47,6 +47,7 @@ model User {
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
   percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
+  receiptIntakes            ReceiptIntake[]
 }
 
 model Client {
@@ -308,6 +309,7 @@ model Project {
   decisions               Decision[]
   permits                 Permit[]
   inspections             Inspection[]
+  receiptIntakes          ReceiptIntake[]
 
   // ── Percent complete (earned revenue / earned margin) ──────────────────────
   // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
@@ -633,6 +635,12 @@ model Expense {
 
   createdAt DateTime @default(now())
 
+  /// Back-relation for ReceiptIntake.expenseId. Declared here rather than left
+  /// SQL-only because `prisma migrate diff` WOULD see a foreign key that
+  /// schema.prisma does not declare and propose dropping it, which breaks CI's
+  /// "migrations reproduce production" assertion.
+  receiptIntake ReceiptIntake?
+
   @@index([estimateId])
   @@index([changeOrderId])
 }
@@ -854,6 +862,7 @@ model CostCode {
   purchaseOrderItems PurchaseOrderItem[]
   catalogItems       CatalogItem[]
   scheduleTasks      ScheduleTask[]
+  receiptIntakes     ReceiptIntake[]
 }
 
 model CostType {
@@ -2998,4 +3007,80 @@ model BankImageMatch {
   note        String?
 
   @@index([bankLineId])
+}
+
+/// Receipt Pipeline v2 — the single intake row for one inbound document
+/// (docs/plans/PHASE-1-INTAKE-CORE-SPEC.md). Every source (mobile capture, the
+/// Apps Script Drive/email/chat forwarders, the web uploader) lands here first;
+/// the cron worker reads it with Gemini, dedups it, routes it, and only then
+/// books it to QuickBooks + Expense.
+///
+/// `state` is a String with a SQL CHECK, not a Prisma enum — matching
+/// BankLine.state and Expense.status.
+model ReceiptIntake {
+  id          String  @id @default(cuid())
+  source      String // mobile | email | drive | chat | web
+  /// "drive:<fileId>" | "email:<gmailMsgId>:<sha16>" | "mobile:<uploadId>" |
+  /// "chat:<messageName>:<n>" | "web:<uuid>" — the caller's idempotency key.
+  sourceRef   String  @unique
+  state       String  @default("RECEIVED") // RECEIVED READ NEEDS_JOB NEEDS_REVIEW BOOKING BOOKED ARCHIVED DUPLICATE VOID NON_RECEIPT
+  dryRun      Boolean @default(true)
+  /// no-estimate | multi-doc | zero-total | weak-dup:<id> |
+  /// strong-dup-amount-mismatch:<id> | qbo-fault:<code> | max-retries |
+  /// push-disabled | push-paused
+  stateReason String?
+
+  projectId           String?
+  project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  costCodeId          String?
+  costCode            CostCode? @relation(fields: [costCodeId], references: [id])
+  suggestedCostCodeId String?
+  suggestedConfidence Float?
+  createdById         String?
+  createdBy           User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  // file (Supabase secure-docs, private)
+  storagePath String // receipts/intake/<id>.<ext> in SECURE_BUCKET
+  fileName    String?
+  mimeType    String
+  fileSize    Int
+  fileSha256  String
+
+  // read results (cents, like AutomationEvent)
+  vendor     String?
+  txnDate    DateTime? @db.Date
+  totalCents Int?
+  taxCents   Int?
+  docType    String? // receipt | check | multi | non_receipt
+  refNumber  String? // cleaned invoice #, or "Check<num>" for checks
+  memo       String?
+  readJson   String? // raw Gemini JSON, audit only
+  readAt     DateTime?
+
+  // dedup
+  dedupStrongKey String?
+  dedupWeakKey   String?
+  duplicateOfId  String?
+
+  // booking + archive
+  qbPurchaseId       String?
+  expenseId          String?   @unique
+  expense            Expense?  @relation(fields: [expenseId], references: [id], onDelete: SetNull)
+  archiveDriveFileId String?
+  attempts           Int       @default(0)
+  lastError          String?
+  nextRetryAt        DateTime?
+  bookedAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // NOTE: a partial UNIQUE index on dedupStrongKey (WHERE state NOT IN
+  // ('DUPLICATE','VOID') AND dedupStrongKey IS NOT NULL) exists in SQL only —
+  // Prisma cannot represent partial indexes and silently drops them (CLAUDE.md,
+  // baseline notes). Keep this comment; never regenerate it away.
+  @@index([state, nextRetryAt])
+  @@index([projectId])
+  @@index([dedupWeakKey])
+  @@index([createdAt])
 }
