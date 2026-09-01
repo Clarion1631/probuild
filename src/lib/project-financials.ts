@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { percentCompleteNeedsReview } from "@/lib/percent-complete";
 
 // Single source of truth for "how much has this project billed, collected,
 // and cost" — used by the per-project Financial Overview API route
@@ -39,6 +40,42 @@ export interface ProjectFinancials {
         pendingApproval: { count: number; totalAmount: number };
         uninvoiced: { count: number; totalAmount: number };
     };
+
+    // ── Earned margin (Phase 4) ─────────────────────────────────────────────
+    // ADDITIVE ONLY. Everything above keeps its exact prior meaning and value —
+    // `currentMargin` is still cash margin with no % complete and no labor in it.
+    // These fields answer the different question "are we profitable so far on
+    // the work we have actually done", and they are allowed to disagree with it.
+    //
+    // All plain `number | null`, never a Prisma Decimal: these cross a server →
+    // client boundary and a Decimal does not survive serialization.
+
+    /** Effective stored percent complete (auto or manual). Null until the nightly cron can compute one. */
+    percentComplete: number | null;
+    percentCompleteSource: "AUTO" | "MANUAL" | null;
+    /** Derived: a manual override whose auto baseline has since moved > 5 points. */
+    percentCompleteNeedsReview: boolean;
+
+    /**
+     * What the client has committed to: accepted estimates plus approved change
+     * orders.
+     *
+     * CAVEAT, accepted deliberately: `Estimate.totalAmount` is tax-INCLUSIVE
+     * once a rate has been set, while `ChangeOrder.totalAmount` is pre-tax
+     * (CLAUDE.md money invariants). On a job with approved COs this therefore
+     * understates contract value by the CO tax. Fixing it properly means
+     * recomputing CO tax per the co-totalamount-pretax rule; until then this is
+     * a management figure, not an invoiceable one.
+     */
+    contractValue: number;
+    /** contractValue × percentComplete. Null when either input is missing. */
+    earnedRevenue: number | null;
+    /** earnedRevenue − (expenses + labor). UNLIKE `currentMargin`, this DOES include labor. */
+    earnedMargin: number | null;
+    /** 0..1 — share of expense DOLLARS carrying a receipt. Null when the job has no expenses. */
+    receiptCompleteness: number | null;
+    /** 0..1 — share of actual DOLLARS (expenses + labor) carrying a cost code. Null when there are none. */
+    phaseCoverage: number | null;
 }
 
 export async function computeProjectFinancials(
@@ -57,7 +94,7 @@ export async function computeProjectFinancials(
     const validRetainerStatuses = ["Sent", "Paid", "Partially Paid"];
     if (includeUnissued) validRetainerStatuses.push("Draft");
 
-    const [invoices, estimates, retainers, expenses, pos, timeEntries] = await Promise.all([
+    const [invoices, estimates, retainers, expenses, pos, timeEntries, project, approvedChangeOrders] = await Promise.all([
         prisma.invoice.findMany({
             where: { projectId, status: { in: validInvoiceStatuses } },
             include: { payments: true },
@@ -70,6 +107,24 @@ export async function computeProjectFinancials(
         prisma.expense.findMany({ where: { estimate: { projectId } } }),
         prisma.purchaseOrder.findMany({ where: { projectId } }),
         prisma.timeEntry.findMany({ where: { projectId } }),
+        // Percent complete is READ here, never computed. The nightly recalc cron
+        // (/api/cron/percent-complete-recalc) is the only writer — page renders
+        // must not run the per-project variance load that the formula needs.
+        prisma.project.findUnique({
+            where: { id: projectId },
+            select: {
+                percentComplete: true,
+                percentCompleteSource: true,
+                percentCompleteAuto: true,
+                percentCompleteAutoAtOverride: true,
+            },
+        }),
+        // Only "Approved" COs are contract value. Draft/Sent are proposals —
+        // same rule the variance loader applies to CO budget.
+        prisma.changeOrder.findMany({
+            where: { projectId, status: "Approved" },
+            select: { totalAmount: true },
+        }),
     ]);
 
     let currentIncoming = 0;
@@ -160,6 +215,71 @@ export async function computeProjectFinancials(
         }
     }
 
+    // ── Earned margin (Phase 4, additive) ───────────────────────────────────
+    // Nothing below reads into anything above; every existing field is already
+    // final at this point.
+
+    // Number() rather than the raw Prisma Decimal — these are serialized to a
+    // client component and a Decimal does not survive that trip.
+    const percentComplete = project?.percentComplete == null ? null : Number(project.percentComplete);
+    const percentCompleteAuto = project?.percentCompleteAuto == null ? null : Number(project.percentCompleteAuto);
+    const percentCompleteAutoAtOverride =
+        project?.percentCompleteAutoAtOverride == null ? null : Number(project.percentCompleteAutoAtOverride);
+    const percentCompleteSource = (project?.percentCompleteSource ?? null) as "AUTO" | "MANUAL" | null;
+
+    // Committed contract value. Accepted estimate statuses only — "Sent"/"Viewed"
+    // are proposals, and `validEstimateStatuses` above is a superset of what
+    // counts here, so the filter is explicit rather than reusing that list.
+    const acceptedEstimateStatuses = ["Approved", "Invoiced", "Partially Paid", "Paid"];
+    let contractValue = 0;
+    for (const est of estimates) {
+        if (acceptedEstimateStatuses.includes(est.status)) contractValue += Number(est.totalAmount);
+    }
+    for (const co of approvedChangeOrders) {
+        contractValue += Number(co.totalAmount);
+    }
+
+    // A contract value of exactly $0 makes earned revenue meaningless rather
+    // than zero — there is no contract to earn against yet.
+    const earnedRevenue =
+        percentComplete === null || contractValue === 0
+            ? null
+            : (contractValue * percentComplete) / 100;
+    const earnedMargin = earnedRevenue === null ? null : earnedRevenue - (totalExpenses + totalTimeCost);
+
+    // Coverage figures are measured on ABSOLUTE dollars: Expense.amount is
+    // signed (refunds and credit memos are normal), so netting could drive a
+    // denominator toward zero and report a confident "100%" on data that is
+    // barely covered at all. Same reasoning as VarianceCoverage.unattributedGross.
+    let expenseAbsTotal = 0;
+    let expenseAbsWithReceipt = 0;
+    let expenseAbsCoded = 0;
+    for (const exp of expenses) {
+        const abs = Math.abs(Number(exp.amount) || 0);
+        expenseAbsTotal += abs;
+        if (exp.receiptUrl && exp.receiptUrl.trim() !== "") expenseAbsWithReceipt += abs;
+        if (exp.costCodeId) expenseAbsCoded += abs;
+    }
+    let laborAbsTotal = 0;
+    let laborAbsCoded = 0;
+    for (const te of timeEntries) {
+        const abs = Math.abs((Number(te.laborCost) || 0) + (Number(te.burdenCost) || 0));
+        laborAbsTotal += abs;
+        if (te.costCodeId) laborAbsCoded += abs;
+    }
+
+    // BankLine carries no job FK (only a free-text projectName), so "did every
+    // bank charge on this job get a receipt" is not answerable here. This is the
+    // narrower, honest question: of the expense dollars we DO have on the job,
+    // how many carry a receipt.
+    const receiptCompleteness = expenseAbsTotal > 0 ? expenseAbsWithReceipt / expenseAbsTotal : null;
+
+    // Deliberately simpler than the variance report's `attributedShare`: no
+    // item-link reconciliation, just "does this row carry a cost code". The two
+    // can therefore differ by a hair on a job with item-linked postings.
+    const actualAbsTotal = expenseAbsTotal + laborAbsTotal;
+    const phaseCoverage = actualAbsTotal > 0 ? (expenseAbsCoded + laborAbsCoded) / actualAbsTotal : null;
+
     return {
         currentIncoming, scheduledIncoming, overdueIncoming, forecastedIncomingFromEstimates,
         totalForecastedIncoming, clientOwes, invoicedTotal,
@@ -169,5 +289,17 @@ export async function computeProjectFinancials(
         hasExpenses: expenses.length > 0 || pos.length > 0,
         hasTimeEntries: timeEntries.length > 0,
         estimateStatus,
+        percentComplete,
+        percentCompleteSource,
+        percentCompleteNeedsReview: percentCompleteNeedsReview({
+            source: percentCompleteSource,
+            auto: percentCompleteAuto,
+            autoAtOverride: percentCompleteAutoAtOverride,
+        }),
+        contractValue,
+        earnedRevenue,
+        earnedMargin,
+        receiptCompleteness,
+        phaseCoverage,
     };
 }
