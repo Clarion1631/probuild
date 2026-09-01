@@ -35,6 +35,18 @@
     {
       "path": "/api/cron/review-alerts-backstop",
       "schedule": "15 */1 * * *"
+    },
+    {
+      "path": "/api/cron/percent-complete-recalc",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/cron/monday-margin-card",
+      "schedule": "0 14 * * 1"
+    },
+    {
+      "path": "/api/cron/dragging-line",
+      "schedule": "5 14 * * 1"
     }
   ]
 }
