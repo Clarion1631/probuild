@@ -9,10 +9,14 @@ import {
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
 } from "@/lib/qbo-receipt-push";
-import type { QBTokens } from "@/lib/quickbooks";
+import { QBTimeoutError, type QBTokens } from "@/lib/quickbooks";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Two QB deadlines (token refresh + purchase create, 20s each by default)
+// plus the DB work fit inside this comfortably. Before qbTimedFetch existed,
+// an Intuit outage held the function open for the full 60s and returned
+// nothing — the point of the lower ceiling is that we now fail long before it.
+export const maxDuration = 30;
 
 /**
  * Receipt bot -> QBO Purchase creation. Replaces the Apps Script's
@@ -205,6 +209,10 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "quickbooks-not-connected" }));
                     return NextResponse.json({ ok: false, reason: "quickbooks-not-connected" }, { status: 503 });
                 }
+                if (error instanceof QBTimeoutError) {
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
+                }
                 // Token refresh failures are transient (QBO outage, network) —
                 // retryable, so this is the one case that stays 500.
                 console.error("QBO receipt push token fetch failed", error instanceof Error ? error.name : "UnknownError");
@@ -235,6 +243,16 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                 await logEvent(event);
                 return NextResponse.json(result);
             } catch (error) {
+                if (error instanceof QBTimeoutError) {
+                    // QBO is unreachable, not saying no — 503 so the Apps
+                    // Script retries on its next pass instead of falling back
+                    // to the email path. Safe to retry even if the create did
+                    // land: it carries a QBO `requestid` idempotency key and
+                    // the docNumber pre-check returns already-exists.
+                    console.error("QBO receipt push timed out", error.message);
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
+                }
                 if (error instanceof QboAccountConfigError) {
                     // Deterministic misconfiguration (missing/wrong-type/
                     // colliding account ids) — the SAME failure would repeat on

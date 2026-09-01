@@ -16,6 +16,7 @@ import {
     createQboReceiptCreateHandlers,
     type QboReceiptCreateHandlerDependencies,
 } from "../src/app/api/integrations/qbo-receipts/create/route";
+import type { AutomationEventInput } from "../src/lib/automation-events";
 
 const TOKENS = {
     accessToken: "test-access",
@@ -620,6 +621,51 @@ test("route POST returns 503 when QuickBooks isn't connected (unchanged transien
     }));
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { ok: false, reason: "quickbooks-not-connected" });
+});
+
+test("route POST returns 503 retry:true when the QBO token fetch times out", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /oauth2/v1/tokens/bearer");
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    // Non-200 is what makes the Apps Script retry on its next pass — an
+    // Intuit outage must never be mistaken for a terminal decline.
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-timeout" });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].status, "error");
+    assert.equal(events[0].reason, "qbo-timeout");
+});
+
+test("route POST returns 503 retry:true when the purchase create times out", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/test-realm/purchase");
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-timeout" });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].reason, "qbo-timeout");
+    // The full fileId guarantee still holds for this new outcome.
+    assert.equal((events[0].detail as { fileId?: string }).fileId, "file-1");
 });
 
 // ─── Overhead category (Shop docs) ──────────────────────────────────────────
