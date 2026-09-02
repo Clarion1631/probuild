@@ -28,6 +28,7 @@ import {
     createRouteDeadline,
     isQBTimeoutError,
     isQboConnectionFailure,
+    isQBResultSetTruncatedError,
     findQBInvoicesByDocNumber,
     type QBInvoiceMatch,
     type QBTokens,
@@ -35,6 +36,8 @@ import {
 } from "./quickbooks";
 import {
     PAYLINK_PENDING_MARKER,
+    CREATE_IN_FLIGHT_MARKER,
+    CREATE_IN_FLIGHT_STALE_MS,
     parseCreateMarker,
     getFreshQBTokens,
 } from "./quickbooks-payments";
@@ -64,7 +67,9 @@ export type AmbiguousCreateRefusal =
     | "multiple-matches"
     | "quickbooks-unreachable"
     | "changed"
-    | "invalid";
+    | "invalid"
+    | "create-still-active"
+    | "result-set-truncated";
 
 export type ResolveAmbiguousCreateResult =
     | { ok: true; outcome: "linked"; qbInvoiceId: string; message: string }
@@ -130,6 +135,10 @@ interface ParkedRow {
      */
     identity: { docNumber: string; privateNote: string } | null;
     marker: string;
+    /** Which pending-create kind the marker is, or `null` when not parked. */
+    kind: string | null;
+    /** The embedded claim time, for a `create-in-flight` marker. `null` if unreadable. */
+    atMs: number | null;
     fingerprint: string;
     projectId: string | null;
     invoiceId: string | null;
@@ -198,9 +207,22 @@ export async function resolveAmbiguousInvoiceCreateCore(
         // invoice is OURS. Both come from the marker written before the POST.
         matches = found.filter((inv) => (inv.privateNote || "").trim() === parked.identity!.privateNote);
     } catch (error) {
-        // Every failure refuses. A timeout, a 5xx and a plain refusal all leave
-        // the same question unanswered — whether an invoice is sitting there —
-        // and the only safe answer to "I don't know" is to write nothing.
+        // The query hit its page cap — there may be MORE invoices under this
+        // DocNumber than we saw, including one on a page we never fetched.
+        // That is exactly the "more than one, ambiguous" case, so refuse the
+        // same way as a confirmed multiple-matches answer rather than as a
+        // generic unreachable one.
+        if (isQBResultSetTruncatedError(error)) {
+            return {
+                ok: false,
+                refusal: "result-set-truncated",
+                message: `QuickBooks holds too many invoices under ${parked.identity.docNumber} to confirm this automatically — find and resolve the duplicates in QuickBooks directly. Nothing was changed here.`,
+            };
+        }
+        // Every other failure refuses too. A timeout, a 5xx and a plain
+        // refusal all leave the same question unanswered — whether an invoice
+        // is sitting there — and the only safe answer to "I don't know" is to
+        // write nothing.
         const timedOut = isQBTimeoutError(error) || isQboConnectionFailure(error);
         return {
             ok: false,
@@ -258,6 +280,23 @@ export async function resolveAmbiguousInvoiceCreateCore(
             refusal: "none-found",
             message: `No QuickBooks invoice matches ${parked.identity.docNumber}. If you have checked QuickBooks yourself, confirm none exists to clear this and send again.`,
         };
+    }
+    // A `create-in-flight` marker means the POST may STILL be running — the row
+    // is only promoted to `ambiguous-create` once that request has definitely
+    // ended. Clearing it here would let a second operator start another create
+    // while the first is still landing, so a marker without a readable claim
+    // time, or one younger than CREATE_IN_FLIGHT_STALE_MS, refuses outright.
+    // Neither table carries `updatedAt`, so an unreadable age is the common
+    // case today, not the exception — that is deliberately fail-closed.
+    if (parked.kind === CREATE_IN_FLIGHT_MARKER) {
+        const stillActive = parked.atMs == null || Date.now() - parked.atMs < CREATE_IN_FLIGHT_STALE_MS;
+        if (stillActive) {
+            return {
+                ok: false,
+                refusal: "create-still-active",
+                message: `${parked.code} may still be mid-create in QuickBooks right now — clearing this could let a second invoice be created while the first is still landing. Wait a few minutes and try again.`,
+            };
+        }
     }
     const cleared = await delegate.updateMany({
         where: { id: parked.id, qbInvoiceId: null, qbSyncError: parked.marker },
@@ -319,11 +358,13 @@ async function loadParkedRow(db: any, kind: AmbiguousCreateKind, id: string): Pr
 function parkedIdentity(row: { qbSyncError: string | null; qbInvoiceId: string | null }): {
     marker: string;
     identity: { docNumber: string; privateNote: string } | null;
+    kind: string | null;
+    atMs: number | null;
 } {
-    if (row.qbInvoiceId) return { marker: "", identity: null };
+    if (row.qbInvoiceId) return { marker: "", identity: null, kind: null, atMs: null };
     const parsed = parseCreateMarker(row.qbSyncError);
-    if (!parsed) return { marker: "", identity: null };
-    return { marker: row.qbSyncError as string, identity: parsed.identity };
+    if (!parsed) return { marker: "", identity: null, kind: null, atMs: null };
+    return { marker: row.qbSyncError as string, identity: parsed.identity, kind: parsed.kind, atMs: parsed.atMs };
 }
 
 async function audit(

@@ -110,6 +110,61 @@ test("a voided invoice is still authoritative, not a connection failure", async 
     assert.deepEqual(probe, { state: "voided" });
 });
 
+// --- Round 29 gate: getQBInvoiceStatus must not collapse a shared failure into null ---
+
+test("getQBInvoiceStatus throws on 401/403/429/503 instead of answering null", async () => {
+    // Codex gate: sendMilestoneInvoicesCore read a null total as "this ONE
+    // row's total is unreadable" and kept spending a fresh deadline on every
+    // remaining row against what was really a shared credential/rate wall.
+    const { getQBInvoiceStatus, isQboConnectionFailure } = await import("../src/lib/quickbooks");
+    for (const status of [401, 403, 429, 503]) {
+        const error = await withFetch(
+            async () => json(status, { Fault: {} }),
+            () => getQBInvoiceStatus(TOKENS, "1"),
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error, `status ${status} must throw, not return null`);
+        assert.equal(isQboConnectionFailure(error), true, `status ${status} must be a recognised shared wall`);
+    }
+});
+
+test("getQBInvoiceStatus still answers null for 404 — the only authoritative absence", async () => {
+    const { getQBInvoiceStatus } = await import("../src/lib/quickbooks");
+    const status = await withFetch(async () => json(404, { Fault: {} }), () => getQBInvoiceStatus(TOKENS, "1"));
+    assert.equal(status, null);
+});
+
+test("getQBInvoiceStatus still reads a healthy invoice normally", async () => {
+    const { getQBInvoiceStatus } = await import("../src/lib/quickbooks");
+    const status = await withFetch(
+        async () => json(200, { Invoice: { TotalAmt: 250, Balance: 100, LinkedTxn: [{ TxnType: "Payment", TxnId: "p1" }] } }),
+        () => getQBInvoiceStatus(TOKENS, "1"),
+    );
+    assert.deepEqual(status, { balance: 100, total: 250, paymentTxnIds: ["p1"] });
+});
+
+// --- Round 29 gate: findQBInvoicesByDocNumber must not silently cap at 20 ---
+
+test("findQBInvoicesByDocNumber refuses when the page cap is hit, instead of silently answering a partial list", async () => {
+    const { findQBInvoicesByDocNumber, isQBResultSetTruncatedError } = await import("../src/lib/quickbooks");
+    const rows = Array.from({ length: 20 }, (_, i) => ({ Id: String(i), DocNumber: "INV-1-1", PrivateNote: "note", TotalAmt: 100, Balance: 100 }));
+    const error = await withFetch(
+        async () => json(200, { QueryResponse: { Invoice: rows } }),
+        () => findQBInvoicesByDocNumber(TOKENS, "INV-1-1"),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.ok(error, "exactly 20 results must refuse, not answer");
+    assert.equal(isQBResultSetTruncatedError(error), true);
+});
+
+test("findQBInvoicesByDocNumber answers normally under the page cap", async () => {
+    const { findQBInvoicesByDocNumber } = await import("../src/lib/quickbooks");
+    const rows = Array.from({ length: 19 }, (_, i) => ({ Id: String(i), DocNumber: "INV-1-1", PrivateNote: "note", TotalAmt: 100, Balance: 100 }));
+    const matches = await withFetch(
+        async () => json(200, { QueryResponse: { Invoice: rows } }),
+        () => findQBInvoicesByDocNumber(TOKENS, "INV-1-1"),
+    );
+    assert.equal(matches.length, 19);
+});
+
 // --- The REAL loop, driven by a fake QuickBooks ---
 
 import {
@@ -303,6 +358,21 @@ test("EVERY preflight failure marks the run failed, not just timeouts", () => {
         classifyPreflightFailure(new Error("settings store unreadable")),
         { reason: "token-fetch-failed", abortedOnQboOutage: false },
     );
+});
+
+test("a 401/403 preflight failure is classified qbo-auth, not qbo-unavailable", async () => {
+    // Round 29 gate: pipeline-health's digest only counts events reasoned
+    // "qbo-auth" toward its reconnect-QuickBooks alert. Folding a credential
+    // rejection into the generic "qbo-unavailable" bucket made a broken
+    // connection invisible to that alert.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    for (const status of [401, 403]) {
+        assert.deepEqual(
+            classifyPreflightFailure(new QboHttpError(`QB CompanyInfo failed (${status})`, status)),
+            { reason: "qbo-auth", abortedOnQboOutage: true },
+            `status ${status}`,
+        );
+    }
 });
 
 
@@ -1753,4 +1823,26 @@ test("the milestone claim writes an identity-carrying marker, and compensation u
     assert.match(push, /qbSyncError: composeCreateMarker\(AMBIGUOUS_CREATE_MARKER/);
     // And compensation goes through the shared delete+unlink step.
     assert.match(push, /compensateAndUnlink\(\s*prisma\.paymentSchedule/);
+});
+
+test("round 29 gate: the final link write proves ownership of the in-flight marker even on the retry branch", async () => {
+    // Codex gate: when the pre-pay-link write already lost its race, the final
+    // tx used to retry against a bare `qbInvoiceId: null` with NO check that
+    // this call still owned the claim — a row whose marker moved on for an
+    // unrelated reason but still happened to read Pending/unlinked/unchanged
+    // could get THIS invoice silently attached to it.
+    const src = await import("node:fs").then(fs => fs.readFileSync("src/lib/quickbooks-payments.ts", "utf8"));
+    const push = src.slice(src.indexOf("export async function pushMilestoneToQuickBooks"));
+
+    assert.match(
+        push,
+        /qbSyncError: claimedLink\.count === 1 \? PAYLINK_PENDING_MARKER : inFlightMarker,/,
+        "the final link write must require the marker whichever branch it takes",
+    );
+    // Compensation must also be able to release the claim by marker, not only
+    // by qbInvoiceId — the pre-link CAS can lose before the row ever carries one.
+    assert.match(
+        push,
+        /compensateAndUnlink\(\s*prisma\.paymentSchedule,\s*schedule\.id,\s*qbId,\s*\(\)\s*=>\s*deleteQBInvoice\(tokens, qbId, cleanupDeadline\),\s*\{\},\s*inFlightMarker,\s*\)/,
+    );
 });

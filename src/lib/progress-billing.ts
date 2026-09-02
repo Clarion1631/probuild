@@ -553,6 +553,13 @@ export async function updateProgressBillingCore(
 
         const billing = await tx.progressBilling.findUnique({ where: { id: billingId } });
         if (!billing) throw new Error("Progress billing not found");
+        // A parked row LOOKS editable — Draft, no qbInvoiceId — but a real,
+        // collectible QuickBooks invoice may exist for it. Editing it (even just
+        // the description) while that is unresolved risks the row later linking
+        // to an invoice whose content no longer matches what was actually billed.
+        if (isBlockedByAmbiguousCreate(billing)) {
+            throw new QBResolveRequiredError(billing.code);
+        }
         if (billing.status !== "Draft" || billing.qbInvoiceId) {
             throw new Error(`This billing is "${billing.status}"${billing.qbInvoiceId ? " and has a QuickBooks invoice staged" : ""} — only Draft billings without a staged QuickBooks invoice can be edited`);
         }
@@ -846,6 +853,7 @@ export async function stageProgressBillingToQuickBooksCore(
             qbId,
             () => qbo.deleteInvoice(tokens, qbId, cleanupDeadline),
             { status: "Draft" },
+            inFlightMarker,
         );
         compensationUnlinkFailed = deleted && !unlinked;
         return deleted;
@@ -868,6 +876,12 @@ export async function stageProgressBillingToQuickBooksCore(
                 id: billing.id,
                 status: "Draft",
                 qbInvoiceId: null,
+                // Prove we still own the claim before writing the link — without
+                // this, a row whose marker moved on for an unrelated reason
+                // (compensated, resolved by an admin, reclaimed by a retry) but
+                // still happened to read Draft/unlinked/unchanged could get THIS
+                // invoice attached to it.
+                qbSyncError: inFlightMarker,
                 subtotal: billing.subtotal,
                 total: billing.total,
                 description: billing.description,

@@ -1127,9 +1127,22 @@ test("429/5xx uploads are retryable; other 4xx stay terminal", async () => {
             String(status),
         );
     }
-    for (const status of [400, 403, 404]) {
+    // 403 is carved out below — it is a credential refusal (qbo-auth), not a
+    // repeating business rejection.
+    for (const status of [400, 404]) {
         assert.equal(await upload(jsonResponse(status, {})), `failed:${status}`);
     }
+});
+
+test("a 403 upload is a credential refusal, not a terminal failed:403", async () => {
+    // Round 29 gate: this used to bank as `failed:403` on ok:true, which the
+    // Apps Script treats as final — the connection stayed broken until someone
+    // noticed. It must throw and carry the status, like a 401 that survives
+    // the forced refresh.
+    await assert.rejects(
+        () => upload(jsonResponse(403, {})),
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 403,
+    );
 });
 
 
@@ -1169,7 +1182,10 @@ test("a 401 upload forces ONE token refresh and retries in place", async () => {
     assert.equal(seen.length, 2, "original attempt plus one retry");
 });
 
-test("a 401 that survives the refresh is retryable, not terminal", async () => {
+test("a 401 that survives the refresh is a credential refusal, not a generic retry", async () => {
+    // Round 29 gate: this used to become a plain QboRetryableError, which the
+    // route reads as "qbo-unavailable" — an outage, not the broken connection
+    // it actually is.
     const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
     let refreshes = 0;
     const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
@@ -1181,12 +1197,12 @@ test("a 401 that survives the refresh is retryable, not terminal", async () => {
                 return { accessToken: "fresh-token", refreshToken: "r", realmId: "test-realm" };
             }),
         ),
-        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 401,
     );
     assert.equal(refreshes, 1, "must not retry the refresh in a loop");
 });
 
-test("a failing refresh does not crash the upload; the 401 becomes retryable", async () => {
+test("a failing refresh does not crash the upload; the 401 becomes a credential refusal", async () => {
     const { defaultUploadAttachment } = await import("../src/lib/qbo-receipt-push");
     const impl = (async () => new Response("{}", { status: 401 })) as unknown as typeof fetch;
     await assert.rejects(
@@ -1195,7 +1211,7 @@ test("a failing refresh does not crash the upload; the 401 becomes retryable", a
                 throw new Error("not connected");
             }),
         ),
-        (error: unknown) => (error as Error)?.name === "QboRetryableError",
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError",
     );
 });
 
@@ -1494,12 +1510,14 @@ test("two concurrent pushes each honour THEIR OWN remaining budget", async () =>
 
 // --- Attachment lookup: classify by status, not by "it threw" ---
 
-test("a 400/403/404 attachment lookup is terminal, not an endless retry", async () => {
+test("a 400/404 attachment lookup is terminal, not an endless retry", async () => {
     const { QboHttpError } = await import("../src/lib/quickbooks");
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
 
-    for (const status of [400, 403, 404]) {
+    // 403 is carved out below — it is a credential refusal (qbo-auth), not a
+    // repeating business rejection.
+    for (const status of [400, 404]) {
         const { deps } = createDeps({
             existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
             attachableQueryImpl: async () => {
@@ -1516,6 +1534,23 @@ test("a 400/403/404 attachment lookup is terminal, not an endless retry", async 
             `status ${status}`,
         );
     }
+});
+
+test("a 403 attachment lookup is a credential refusal, not a terminal failed:403", async () => {
+    // Round 29 gate: this used to bank as `failed:403` on ok:true too.
+    const { QboHttpError } = await import("../src/lib/quickbooks");
+    const input = baseInput({ ...FILE_INPUT });
+    const marker = `[gtr-file:${input.fileId}]`;
+    const { deps } = createDeps({
+        existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
+        attachableQueryImpl: async () => {
+            throw new QboHttpError("QB query failed (403)", 403);
+        },
+    });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, deps),
+        (error: unknown) => (error as Error)?.name === "QboAttachmentAuthError" && (error as { status?: number }).status === 403,
+    );
 });
 
 test("a 429/5xx attachment lookup stays retryable", async () => {
@@ -1588,7 +1623,7 @@ test("a 401 attachment LOOKUP forces one refresh and retries, like the upload do
     assert.deepEqual(uploads, ["fresh-token"], "the upload must use the refreshed token");
 });
 
-test("a 401 lookup that survives the refresh is retryable, not terminal", async () => {
+test("a 401 lookup that survives the refresh is a credential refusal, not a generic retry", async () => {
     const { QboHttpError } = await import("../src/lib/quickbooks");
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
@@ -1606,7 +1641,7 @@ test("a 401 lookup that survives the refresh is retryable, not terminal", async 
     };
     await assert.rejects(
         () => createQBReceiptPurchase(TOKENS, input, deps),
-        (e: unknown) => (e as Error)?.name === "QboRetryableError",
+        (e: unknown) => (e as Error)?.name === "QboAttachmentAuthError" && (e as { status?: number }).status === 401,
     );
     assert.equal(refreshes, 1, "must not loop on the refresh");
 });
@@ -1919,8 +1954,8 @@ test("an ordinary refresh failure still degrades to the plain 401 outcome", asyn
     const thrown = await withFetch(unauthorized, () =>
         defaultUploadAttachment(TOKENS, "99", uploadFile, async () => { throw new Error("not connected"); }),
     ).then(() => null, (e: unknown) => e as Error);
-    // Still retryable (the 401 survived), but not masquerading as a token error.
-    assert.equal(thrown?.name, "QboRetryableError");
+    // The 401 survived — a credential refusal, but not masquerading as a token error.
+    assert.equal(thrown?.name, "QboAttachmentAuthError");
 });
 
 // --- The recovery lookup's 401 retry matches the upload branch exactly ---
@@ -1980,6 +2015,56 @@ test("route: QBO 401/403 is qbo-auth 503, not a terminal qbo-fault", async () =>
         assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
         assert.equal(events.length, 1);
         assert.equal(events[0].status, "error", "an error event is what puts it in the digest");
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: a vendor/purchase 401/403 fault is qbo-auth, not a business fault", async () => {
+    // Round 29 gate: QboPurchaseFaultError is a business-rule-shaped error, not
+    // a plain QboHttpError, so qboHttpStatus() cannot see its status. A 401/403
+    // fault used to read as a repeating business refusal (qbo-fault, terminal)
+    // and park the receipt instead of retrying once QuickBooks reconnects.
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboPurchaseFaultError(status, `QB purchase create failed: ${status}`, "3200");
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
+        assert.equal(events[0].reason, "qbo-auth");
+    }
+});
+
+test("route: an attachment 401/403 credential refusal is qbo-auth, not qbo-unavailable or a terminal fault", async () => {
+    // Round 29 gate: the attachment path's 401 came back as a generic
+    // QboRetryableError (read as qbo-unavailable, an outage) and its 403 as a
+    // terminal `failed:403` on ok:true (the Apps Script stops resending). Both
+    // are actually the same broken connection the purchase-create path already
+    // recognizes.
+    const { QboAttachmentAuthError } = await import("../src/lib/qbo-receipt-push");
+    for (const status of [401, 403]) {
+        const events: AutomationEventInput[] = [];
+        const { POST } = createRouteHandlers({
+            createPurchase: async () => {
+                throw new QboAttachmentAuthError(status, `QB attachment upload rejected the credential (status ${status})`);
+            },
+            logEvent: event => { events.push(event); },
+        });
+        const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+            method: "POST",
+            body: validBody(),
+            headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+        }));
+        assert.equal(response.status, 503, `status ${status}`);
+        assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-auth" });
         assert.equal(events[0].reason, "qbo-auth");
     }
 });

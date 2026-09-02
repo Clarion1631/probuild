@@ -305,6 +305,13 @@ export interface CompensatableDelegate {
  *
  * A FAILED delete deliberately keeps the link: the invoice is still out there
  * and collectible, and a row pointing at it is how a human finds it.
+ *
+ * The pre-link CAS can also lose BEFORE the row ever carried `qbInvoiceId` at
+ * all — the row still has it null, only `qbSyncError` holds our in-flight
+ * claim. Clearing by `qbInvoiceId` then matches nothing, and a confirmed
+ * delete would leave the claim parked forever with no invoice left to explain
+ * it. `ownedInFlightMarker`, when supplied, is the fallback: clear by the exact
+ * marker THIS caller wrote instead, so the claim is still released.
  */
 export async function compensateAndUnlink(
     delegate: CompensatableDelegate,
@@ -313,6 +320,8 @@ export async function compensateAndUnlink(
     deleteInvoice: () => Promise<boolean>,
     /** Extra columns to restore alongside the link (e.g. a progress billing's status). */
     extraClearData: Record<string, unknown> = {},
+    /** The in-flight marker this caller wrote before the create, if any. */
+    ownedInFlightMarker?: string,
 ): Promise<{ deleted: boolean; unlinked: boolean }> {
     const deleted = await deleteInvoice().catch(() => false);
     if (!deleted) return { deleted: false, unlinked: false };
@@ -328,7 +337,20 @@ export async function compensateAndUnlink(
             ...extraClearData,
         },
     }).catch(() => ({ count: 0 }));
-    return { deleted: true, unlinked: cleared.count === 1 };
+    if (cleared.count === 1) return { deleted: true, unlinked: true };
+    if (!ownedInFlightMarker) return { deleted: true, unlinked: false };
+    // The row never got as far as carrying qbInvoiceId — clear by the marker we
+    // own instead, so a confirmed delete still releases the claim.
+    const clearedByMarker = await delegate.updateMany({
+        where: { id: rowId, qbInvoiceId: null, qbSyncError: ownedInFlightMarker },
+        data: {
+            qbInvoiceLink: null,
+            qbSyncedAt: null,
+            qbSyncError: null,
+            ...extraClearData,
+        },
+    }).catch(() => ({ count: 0 }));
+    return { deleted: true, unlinked: clearedByMarker.count === 1 };
 }
 
 /** One row waiting for its pay link, from either rail. */
@@ -803,6 +825,14 @@ export async function pushMilestoneToQuickBooks(
                 // write above already linked this row, and demanding null here
                 // would miss every time and compensate away a real invoice.
                 qbInvoiceId: claimedLink.count === 1 ? qbId : null,
+                // Prove we still own the claim before writing. When the pre-link
+                // write already landed, this is the marker IT wrote; when that
+                // write lost the race, this is the SAME in-flight marker it
+                // required — never retry against a bare qbInvoiceId: null with no
+                // ownership check, or a row whose marker moved on for an
+                // unrelated reason (compensated, resolved, reclaimed) could get
+                // OUR invoice attached to it.
+                qbSyncError: claimedLink.count === 1 ? PAYLINK_PENDING_MARKER : inFlightMarker,
                 amount: schedule.amount,
                 name: schedule.name,
                 dueDate: schedule.dueDate,
@@ -827,6 +857,8 @@ export async function pushMilestoneToQuickBooks(
             schedule.id,
             qbId,
             () => deleteQBInvoice(tokens, qbId, cleanupDeadline),
+            {},
+            inFlightMarker,
         );
         if (compensated && claimedLink.count === 1 && !unlinked) {
             // The invoice is gone but the row still points at it. Say so rather
@@ -1961,6 +1993,15 @@ export async function resolveSettlementDate(
  */
 export function classifyPreflightFailure(error: unknown): { reason: string; abortedOnQboOutage: boolean } {
     if (isQboConnectionFailure(error)) {
+        // 401/403 is the credential, not an outage — pipeline-health's digest
+        // only counts events reasoned "qbo-auth" toward reconnect-QuickBooks
+        // alerting (QBO_AUTH_EVENT_REASON), so folding it into the generic
+        // "qbo-unavailable" bucket here made a broken connection invisible to
+        // that alert and read like ordinary transient QBO flakiness instead.
+        const status = qboHttpStatus(error);
+        if (status === 401 || status === 403) {
+            return { reason: "qbo-auth", abortedOnQboOutage: true };
+        }
         return { reason: "qbo-unavailable", abortedOnQboOutage: true };
     }
     if (error instanceof QBNotConnectedError || (error instanceof Error && error.name === "QBNotConnectedError")) {

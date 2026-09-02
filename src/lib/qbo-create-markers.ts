@@ -79,9 +79,25 @@ export interface CreateIdentity {
 const MARKER_KIND_SEP = ":";
 /** Separates docNumber from privateNote. First occurrence wins -- a note may contain more. */
 const MARKER_FIELD_SEP = "|";
+/**
+ * Prefixes the epoch-ms a `create-in-flight` claim was written, e.g.
+ * `create-in-flight:@1730000000000|INV-00171-2|ProBuild ...`.
+ *
+ * Only CREATE_IN_FLIGHT_MARKER carries one. Neither PaymentSchedule nor
+ * ProgressBilling has an `updatedAt` column, so this is the only durable place
+ * to record when the claim was taken -- and it is needed exactly once, by
+ * `resolveAmbiguousInvoiceCreateCore`'s liveness check: a `confirmed-none`
+ * clear on a marker with no readable age, or one younger than
+ * `CREATE_IN_FLIGHT_STALE_MS`, must refuse rather than assume the peer that
+ * wrote it is gone. AMBIGUOUS_CREATE_MARKER never needs this: by the time a
+ * marker is promoted to it, the create request has already ended (a timeout or
+ * a definite unknown-outcome failure), so there is no "still running" case left
+ * to protect against.
+ */
+const MARKER_TIME_PREFIX = "@";
 
 /**
- * `create-in-flight:INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
+ * `create-in-flight:@1730000000000|INV-00171-2|ProBuild INV-00171 - Rough-in - Mesplay`
  *
  * The identity rides in the qbSyncError column because this PR ships no schema
  * change and there is nowhere else durable to put it that is written in the
@@ -91,6 +107,7 @@ const MARKER_FIELD_SEP = "|";
 export function composeCreateMarker(
     kind: typeof CREATE_IN_FLIGHT_MARKER | typeof AMBIGUOUS_CREATE_MARKER,
     identity: CreateIdentity,
+    at: Date = new Date(),
 ): string {
     // A docNumber containing the field separator would make the split
     // ambiguous. QuickBooks DocNumbers are ours to generate and never contain
@@ -98,7 +115,8 @@ export function composeCreateMarker(
     if (identity.docNumber.includes(MARKER_FIELD_SEP)) {
         throw new Error(`DocNumber must not contain "${MARKER_FIELD_SEP}": ${identity.docNumber}`);
     }
-    return `${kind}${MARKER_KIND_SEP}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
+    const timePart = kind === CREATE_IN_FLIGHT_MARKER ? `${MARKER_TIME_PREFIX}${at.getTime()}${MARKER_FIELD_SEP}` : "";
+    return `${kind}${MARKER_KIND_SEP}${timePart}${identity.docNumber}${MARKER_FIELD_SEP}${identity.privateNote}`;
 }
 
 /** Which pending-create marker is this, identity or not? `null` when it is neither. */
@@ -116,23 +134,42 @@ export function markerKind(qbSyncError: string | null | undefined): string | nul
  * `null` is NOT "no identity needed" -- it means we cannot know what to look
  * for, and the caller must refuse rather than guess (see the identity-unknown
  * refusal in qbo-ambiguous-create.ts).
+ *
+ * `atMs` is the embedded claim time for a `create-in-flight` marker (see
+ * `MARKER_TIME_PREFIX`), or `null` when the marker carries none -- either it is
+ * not that kind, or it predates this field (legacy row: treat as unknown age,
+ * never as fresh).
  */
 export function parseCreateMarker(
     qbSyncError: string | null | undefined,
-): { kind: string; identity: CreateIdentity | null } | null {
+): { kind: string; identity: CreateIdentity | null; atMs: number | null } | null {
     const kind = markerKind(qbSyncError);
     if (!kind) return null;
     const marker = qbSyncError as string;
-    if (marker === kind) return { kind, identity: null };
-    const payload = marker.slice(kind.length + MARKER_KIND_SEP.length);
+    if (marker === kind) return { kind, identity: null, atMs: null };
+    let payload = marker.slice(kind.length + MARKER_KIND_SEP.length);
+    let atMs: number | null = null;
+    if (payload.startsWith(MARKER_TIME_PREFIX)) {
+        const tsEnd = payload.indexOf(MARKER_FIELD_SEP);
+        const tsRaw = tsEnd > 0 ? payload.slice(MARKER_TIME_PREFIX.length, tsEnd) : "";
+        const parsed = tsRaw ? Number(tsRaw) : NaN;
+        if (tsEnd > 0 && Number.isFinite(parsed)) {
+            atMs = parsed;
+            payload = payload.slice(tsEnd + MARKER_FIELD_SEP.length);
+        }
+        // An unparseable `@...` prefix falls through unstripped -- the doc/note
+        // split below will most likely find it as a bogus docNumber and refuse
+        // as corrupt, which is the same fail-closed handling as any other
+        // corrupt marker.
+    }
     const sep = payload.indexOf(MARKER_FIELD_SEP);
     // A payload with no separator, an empty docNumber or an empty note is a
     // corrupt marker. Same handling as the legacy shape: refuse, don't guess.
-    if (sep <= 0) return { kind, identity: null };
+    if (sep <= 0) return { kind, identity: null, atMs };
     const docNumber = payload.slice(0, sep);
     const privateNote = payload.slice(sep + MARKER_FIELD_SEP.length);
-    if (!docNumber || !privateNote) return { kind, identity: null };
-    return { kind, identity: { docNumber, privateNote } };
+    if (!docNumber || !privateNote) return { kind, identity: null, atMs };
+    return { kind, identity: { docNumber, privateNote }, atMs };
 }
 
 /**

@@ -116,6 +116,39 @@ test("a parked milestone cannot be swept into a progress billing", async () => {
     });
 });
 
+test("a parked progress billing cannot be edited", async () => {
+    // Round 29 gate: updateProgressBillingCore only checked status/qbInvoiceId,
+    // so an ambiguous row (still Draft, still qbInvoiceId: null) could be
+    // edited while QuickBooks may already hold a real invoice for the OLD
+    // content.
+    const { updateProgressBillingCore } = await import("../src/lib/progress-billing");
+    const parked = {
+        id: "pb-1", invoiceId: "inv-1", code: "INV-1-P1", status: "Draft",
+        description: "Rough-in complete", taxExempt: false,
+        qbInvoiceId: null, qbSyncError: AMBIGUOUS_CREATE_MARKER,
+    };
+    let updated = false;
+    const tx = {
+        progressBilling: {
+            async findUnique(args: any) {
+                if (args.select?.invoiceId) return { invoiceId: "inv-1" };
+                return { ...parked };
+            },
+            async update() { updated = true; return parked; },
+        },
+        invoice: { async findUnique() { return { id: "inv-1", totalAmount: 1000, balanceDue: 1000, status: "Sent" }; } },
+        $queryRaw: async () => [],
+    };
+
+    await withFakePrisma({ $transaction: async (fn: any) => fn(tx) }, async () => {
+        await assert.rejects(
+            () => updateProgressBillingCore("pb-1", { description: "Rough-in complete (revised)" }),
+            (e: unknown) => e instanceof QBResolveRequiredError,
+        );
+    });
+    assert.equal(updated, false, "the parked row must survive unedited");
+});
+
 // --- Source tripwire -------------------------------------------------------
 
 /**

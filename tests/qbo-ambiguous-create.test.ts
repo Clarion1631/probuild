@@ -27,6 +27,7 @@ import {
     markerKind,
     AMBIGUOUS_CREATE_MARKER,
     CREATE_IN_FLIGHT_MARKER,
+    CREATE_IN_FLIGHT_STALE_MS,
 } from "../src/lib/qbo-create-markers";
 
 const TOKENS: QBTokens = { accessToken: "a", refreshToken: "r", realmId: "realm-1" };
@@ -173,6 +174,60 @@ test("zero matches refuses until the operator confirms none exists", async () =>
     assert.equal(row.qbInvoiceId, null);
 });
 
+test("round 29 gate: a young create-in-flight marker refuses confirmed-none — the POST may still be running", async () => {
+    // A create-in-flight marker means the POST may not have returned yet.
+    // Clearing it on a zero-match answer would let a second operator start
+    // another create while the first is still landing.
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, new Date()) });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(row.qbInvoiceId, null);
+    assert.equal(markerKind(row.qbSyncError), CREATE_IN_FLIGHT_MARKER, "still parked — nothing was cleared");
+});
+
+test("round 29 gate: a create-in-flight marker with NO readable timestamp (legacy shape) also refuses confirmed-none", async () => {
+    // Neither table carries updatedAt, so a marker written before this claim
+    // timestamp existed has no age at all — unreadable age must fail closed,
+    // exactly like a young one, not like a stale one.
+    const legacyMarker = `${CREATE_IN_FLIGHT_MARKER}:${MILESTONE_IDENTITY.docNumber}|${MILESTONE_IDENTITY.privateNote}`;
+    const row = milestoneRow({ qbSyncError: legacyMarker });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(!res.ok && res.refusal, "create-still-active");
+    assert.equal(row.qbSyncError, legacyMarker, "still parked — nothing was cleared");
+});
+
+test("round 29 gate: a create-in-flight marker past the staleness window CAN be cleared by confirmed-none", async () => {
+    const oldAt = new Date(Date.now() - CREATE_IN_FLIGHT_STALE_MS - 60_000);
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, oldAt) });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps([], db),
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.ok && res.outcome, "cleared");
+    assert.equal(row.qbSyncError, null);
+});
+
+test("round 29 gate: a young create-in-flight marker with an EXACT match still links — adopting a real invoice does not depend on age", async () => {
+    const row = milestoneRow({ qbSyncError: composeCreateMarker(CREATE_IN_FLIGHT_MARKER, MILESTONE_IDENTITY, new Date()) });
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "link-existing", expectedState: ambiguousCreateFingerprint(row) },
+        deps([invoice("qb-9", MILESTONE_NOTE)], db),
+    );
+    assert.equal(res.ok, true);
+    assert.equal(row.qbInvoiceId, "qb-9");
+});
+
 test("more than one match refuses and writes NOTHING", async () => {
     const row = milestoneRow();
     const db = makeDb(row, null);
@@ -184,6 +239,21 @@ test("more than one match refuses and writes NOTHING", async () => {
     assert.equal(!res.ok && res.refusal, "multiple-matches");
     assert.deepEqual(!res.ok && res.candidates?.map((c) => c.qbInvoiceId), ["qb-1", "qb-2"]);
     assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "parked is the only state that stops a third invoice");
+    assert.equal(row.qbInvoiceId, null);
+});
+
+test("round 29 gate: a truncated QuickBooks result set refuses as ambiguous, not as unreachable", async () => {
+    const { QBResultSetTruncatedError } = await import("../src/lib/quickbooks");
+    const row = milestoneRow();
+    const db = makeDb(row, null);
+    const res = await resolveAmbiguousInvoiceCreateCore(
+        { ...base, decision: "confirmed-none", expectedState: ambiguousCreateFingerprint(row) },
+        deps(async () => {
+            throw new QBResultSetTruncatedError(MILESTONE_DOC, 20);
+        }, db),
+    );
+    assert.equal(!res.ok && res.refusal, "result-set-truncated");
+    assert.equal(markerKind(row.qbSyncError), AMBIGUOUS_CREATE_MARKER, "still parked — nothing was written");
     assert.equal(row.qbInvoiceId, null);
 });
 
@@ -319,20 +389,27 @@ test("deleting a parked progress-billing draft is refused with a typed error", a
 
 test("compose/parse round-trips, and a legacy or corrupt marker yields NO identity", () => {
     const identity = { docNumber: "INV-00171-2", privateNote: "ProBuild INV-00171 · Rough-in · Mesplay Kitchen" };
-    const marker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity);
-    assert.equal(marker, "create-in-flight:INV-00171-2|ProBuild INV-00171 · Rough-in · Mesplay Kitchen");
-    assert.deepEqual(parseCreateMarker(marker), { kind: CREATE_IN_FLIGHT_MARKER, identity });
+    // create-in-flight carries a claim timestamp (round 29: marker liveness) —
+    // pin it so the composed string is deterministic.
+    const at = new Date(1_700_000_000_000);
+    const marker = composeCreateMarker(CREATE_IN_FLIGHT_MARKER, identity, at);
+    assert.equal(marker, "create-in-flight:@1700000000000|INV-00171-2|ProBuild INV-00171 · Rough-in · Mesplay Kitchen");
+    assert.deepEqual(parseCreateMarker(marker), { kind: CREATE_IN_FLIGHT_MARKER, identity, atMs: 1_700_000_000_000 });
 
     // A note containing the field separator survives: the FIRST one splits.
+    // AMBIGUOUS_CREATE_MARKER never carries a timestamp — by the time a marker
+    // is promoted to it the create request has already ended.
     const piped = { docNumber: "INV-9-1", privateNote: "ProBuild INV-9 · A|B · Job" };
     assert.deepEqual(parseCreateMarker(composeCreateMarker(AMBIGUOUS_CREATE_MARKER, piped)), {
         kind: AMBIGUOUS_CREATE_MARKER,
         identity: piped,
+        atMs: null,
     });
 
-    // Legacy bare markers: recognised as parked, but with nothing to look up.
+    // Legacy bare markers: recognised as parked, but with nothing to look up
+    // (and no age, since they predate the claim timestamp too).
     for (const bare of [CREATE_IN_FLIGHT_MARKER, AMBIGUOUS_CREATE_MARKER]) {
-        assert.deepEqual(parseCreateMarker(bare), { kind: bare, identity: null });
+        assert.deepEqual(parseCreateMarker(bare), { kind: bare, identity: null, atMs: null });
     }
     // Corrupt payloads are treated the same way — never guessed at.
     for (const corrupt of ["ambiguous-create:", "ambiguous-create:|note", "ambiguous-create:doc|", "ambiguous-create:doconly"]) {

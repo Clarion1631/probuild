@@ -950,6 +950,33 @@ export interface QBInvoiceMatch {
     balance: number;
 }
 
+/** The page size findQBInvoicesByDocNumber queries. Kept as a constant so the
+ * truncation check below can never drift from the `maxresults` it is checking
+ * for. */
+const FIND_INVOICES_BY_DOC_NUMBER_LIMIT = 20;
+
+/**
+ * The query hit its page cap, so there may be MORE invoices under this
+ * DocNumber than were returned. Distinct from "zero matches" or "one match" —
+ * an automated resolver cannot tell whether the real invoice (or a second,
+ * duplicate one) is sitting on a page it never saw, so it must refuse rather
+ * than silently reasoning from a partial list.
+ */
+export class QBResultSetTruncatedError extends Error {
+    name = "QBResultSetTruncatedError";
+    constructor(docNumber: string, limit: number) {
+        super(`QuickBooks returned ${limit} invoices for DocNumber "${docNumber}" — that is this query's page cap, so more may exist unseen.`);
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQBResultSetTruncatedError(error: unknown): error is QBResultSetTruncatedError {
+    return (
+        error instanceof QBResultSetTruncatedError ||
+        (error instanceof Error && error.name === "QBResultSetTruncatedError")
+    );
+}
+
 /**
  * Every invoice QuickBooks holds under this DocNumber.
  *
@@ -957,7 +984,9 @@ export interface QBInvoiceMatch {
  * numbers can be allowed, and ours is truncated to 21 characters), so the
  * caller must decide what more than one means rather than being handed a
  * confident single answer. A query failure THROWS — "I could not ask" must
- * never read as "there is none".
+ * never read as "there is none". Hitting the page cap also throws
+ * (QBResultSetTruncatedError) for the same reason: a result set that might be
+ * incomplete must never be read as "these are all of them".
  */
 export async function findQBInvoicesByDocNumber(
     tokens: QBTokens,
@@ -966,9 +995,12 @@ export async function findQBInvoicesByDocNumber(
 ): Promise<QBInvoiceMatch[]> {
     const rows = await qbQuery<any>(
         tokens,
-        `select * from Invoice where DocNumber = '${escapeQBString(docNumber)}' maxresults 20`,
+        `select * from Invoice where DocNumber = '${escapeQBString(docNumber)}' maxresults ${FIND_INVOICES_BY_DOC_NUMBER_LIMIT}`,
         deadline,
     );
+    if (rows.length === FIND_INVOICES_BY_DOC_NUMBER_LIMIT) {
+        throw new QBResultSetTruncatedError(docNumber, FIND_INVOICES_BY_DOC_NUMBER_LIMIT);
+    }
     return rows
         .filter((inv) => inv?.Id)
         .map((inv) => ({
@@ -986,10 +1018,23 @@ export interface QBInvoiceStatus {
     paymentTxnIds: string[];
 }
 
-/** Read a QBO invoice's balance + linked payment transactions. */
+/**
+ * Read a QBO invoice's balance + linked payment transactions.
+ *
+ * 404 is the only authoritative "gone" — everything else (a bad credential,
+ * a rate limit, QBO itself down) says nothing about THIS invoice. Collapsing
+ * every failure into null let a caller looping over many rows (e.g.
+ * sendMilestoneInvoicesCore) read a shared connection/credential failure as
+ * "this one row's total is unreadable" and keep spending a fresh deadline
+ * rediscovering the same wall on every remaining row, instead of stopping
+ * (see isSharedQboFailureStatus / isQboConnectionFailure).
+ */
 export async function getQBInvoiceStatus(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline): Promise<QBInvoiceStatus | null> {
     const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
-    if (!res.ok) return null;
+    if (!res.ok) {
+        if (res.status === 404) return null;
+        throw await qboResponseError(res, "QB invoice status");
+    }
     const data = await res.json();
     const inv = data.Invoice;
     if (!inv) return null;

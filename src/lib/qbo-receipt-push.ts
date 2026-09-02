@@ -65,6 +65,32 @@ export function isTransientAttachmentStatus(status: number): boolean {
     return status === 401 || status === 408 || isRetryableQboStatus(status);
 }
 
+/**
+ * The attachment upload or lookup was refused on the CREDENTIAL, not the file
+ * — a 401 that survived a forced token refresh, or a 403. Distinct from a QBO
+ * business-rule fault: reconnecting QuickBooks fixes this, retrying with the
+ * same token never will, and it must not be reported as a terminal
+ * `failed:<status>` next to `ok:true` either, or the Apps Script stops
+ * resending and the receipt keeps its missing image until someone notices the
+ * connection is down.
+ */
+export class QboAttachmentAuthError extends Error {
+    status: number;
+    constructor(status: number, message: string) {
+        super(message);
+        this.name = "QboAttachmentAuthError";
+        this.status = status;
+    }
+}
+
+/** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
+export function isQboAttachmentAuthError(error: unknown): error is QboAttachmentAuthError {
+    return (
+        error instanceof QboAttachmentAuthError ||
+        (error instanceof Error && error.name === "QboAttachmentAuthError")
+    );
+}
+
 /** Thrown by ensureQBVendor when QBO rejects the create as a duplicate name (fault 6240) and a re-query still can't find it. */
 export class QboVendorDuplicateError extends Error {
     constructor(name: string) {
@@ -434,11 +460,17 @@ export async function defaultUploadAttachment(
         if (refreshed) res = await post(refreshed);
     }
     if (!res.ok) {
-        // Busy, timed out, or still unauthorized: QBO is not refusing this
-        // file, so raise and let the push be retried rather than banking a
-        // terminal "failed:503" next to ok:true. (401 is attachment-specific —
-        // it survived the forced refresh above — so this set is wider than the
-        // shared transient one.)
+        // A 401 that reaches here already survived the forced refresh above —
+        // it, and a 403, mean QBO is refusing the CREDENTIAL, not the file.
+        // Neither is a transient outage (QboRetryableError) nor a business
+        // fault a retry will repeat identically forever (failed:<status>) —
+        // it is a distinct, reconnect-and-it-fixes-itself failure.
+        if (res.status === 401 || res.status === 403) {
+            throw new QboAttachmentAuthError(res.status, `QB attachment upload rejected the credential (status ${res.status})`);
+        }
+        // Busy, timed out: QBO is not refusing this file, so raise and let the
+        // push be retried rather than banking a terminal "failed:503" next to
+        // ok:true.
         if (isTransientAttachmentStatus(res.status)) {
             throw new QboRetryableError(`QB attachment upload failed with status ${res.status}`, res.status);
         }
@@ -565,16 +597,22 @@ async function ensureAttachmentOnExistingPurchase(
             isQBTimeoutError(error) ||
             isRetryableQboError(error) ||
             isQBTokenStrandedError(error) ||
+            isQboAttachmentAuthError(error) ||
             (error instanceof Error && error.name === "QBTokenPersistenceError")
         ) {
             throw error;
         }
 
-        // Same transient set as the upload path, which this must match: 401
-        // (survived a forced refresh) and 408 join 429/5xx as retryable.
-        // Treating a 401 as terminal here while the upload retried it was the
-        // inconsistency — one recovery step giving up where the other kept going.
+        // A 401 that reaches here already survived the forced refresh above —
+        // it, and a 403, are the credential being refused, not the file or the
+        // lookup query. Same reasoning as the upload path: neither a transient
+        // outage nor a repeating business fault.
         const status = qboHttpStatus(error);
+        if (status === 401 || status === 403) {
+            throw new QboAttachmentAuthError(status, `QB attachment lookup rejected the credential (status ${status})`);
+        }
+        // Same transient set as the upload path, which this must match: 408
+        // joins 429/5xx as retryable.
         if (status !== null && isTransientAttachmentStatus(status)) {
             throw new QboRetryableError(`QB attachment lookup failed with status ${status}`, status);
         }
@@ -994,7 +1032,7 @@ export async function createQBReceiptPurchase(
             // receipt forever and the existing-Purchase recovery above never
             // ran. Propagating gives the route a 503, the bot retries, and the
             // next pass finds the Purchase and attaches the file.
-            if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
+            if (isQBTimeoutError(error) || isRetryableQboError(error) || isQboAttachmentAuthError(error)) throw error;
             throw new QboRetryableError(
                 `QB attachment step failed: ${error instanceof Error ? error.name : "error"}`,
             );

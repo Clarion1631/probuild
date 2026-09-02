@@ -184,6 +184,29 @@ test("losing the in-flight CAS refuses the stage without posting", async () => {
     assert.equal(row.qbInvoiceId, null);
 });
 
+test("round 29 gate: the link write requires the exact in-flight marker it claimed, not just Draft/unlinked/unchanged", async () => {
+    // Simulate something else moving qbSyncError off the marker THIS call
+    // claimed — a stale-claim compensation, a maintenance sweep, whatever —
+    // while status, qbInvoiceId and content all still read exactly as the old
+    // (pre-round-29) WHERE checked. Without qbSyncError pinned in the link
+    // write's WHERE too, this invoice would get silently attached to a claim
+    // this call no longer owns.
+    const { row, db } = makeDb(draftRow());
+    const { qbo, calls } = makeQbo();
+    const realCreate = qbo.createInvoice;
+    qbo.createInvoice = async (t, input, d) => {
+        row.qbSyncError = "some-other-owner's-marker";
+        return realCreate(t, input, d);
+    };
+
+    await assert.rejects(
+        () => stageProgressBillingToQuickBooksCore("pb-1", deadline(), { db, qbo, logEvent }),
+        /changed while staging/,
+    );
+    assert.equal(row.qbInvoiceId, null, "must never link an invoice to a claim this call does not own");
+    assert.deepEqual(calls.deleted, ["qb-1"], "the orphaned invoice is compensated away");
+});
+
 test("a row already parked ambiguous refuses before spending a QBO call", async () => {
     const { db } = makeDb(draftRow({ qbSyncError: "ambiguous-create" }));
     const { qbo, calls } = makeQbo();
@@ -377,4 +400,42 @@ test("compensateAndUnlink clears only a row still pointing at the deleted invoic
         unlinked: false,
     });
     assert.equal(keep.qbInvoiceId, "qb-1");
+});
+
+test("round 29 gate: compensateAndUnlink falls back to the owned marker when the row never carried qbInvoiceId", async () => {
+    // The pre-link CAS can lose BEFORE the row ever picks up qbInvoiceId — it
+    // still reads null there, only qbSyncError holds our in-flight claim.
+    // Clearing by qbInvoiceId alone matches nothing, and a successful remote
+    // delete would leave the claim parked forever with no invoice left to
+    // explain it.
+    const marker = "create-in-flight:@1|INV-1-1|note";
+    const neverLinked: any = { id: "r4", qbInvoiceId: null, qbInvoiceLink: null, qbSyncedAt: null, qbSyncError: marker, status: "Draft" };
+    const delegate = {
+        async updateMany(args: any) {
+            const matches = Object.entries(args.where).every(([k, v]) => neverLinked[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(neverLinked, args.data);
+            return { count: 1 };
+        },
+    };
+
+    const result = await compensateAndUnlink(delegate, "r4", "qb-9", async () => true, { status: "Draft" }, marker);
+    assert.deepEqual(result, { deleted: true, unlinked: true });
+    assert.equal(neverLinked.qbSyncError, null, "the claim is released");
+    assert.equal(neverLinked.qbInvoiceId, null);
+
+    // Without the marker argument, the SAME state is left permanently claimed —
+    // this is the round 29 gap being closed, pinned so it can't silently regress.
+    const stillNeverLinked: any = { id: "r5", qbInvoiceId: null, qbSyncError: marker, status: "Draft" };
+    const delegate2 = {
+        async updateMany(args: any) {
+            const matches = Object.entries(args.where).every(([k, v]) => stillNeverLinked[k] === v);
+            if (!matches) return { count: 0 };
+            Object.assign(stillNeverLinked, args.data);
+            return { count: 1 };
+        },
+    };
+    const withoutFallback = await compensateAndUnlink(delegate2, "r5", "qb-9", async () => true, { status: "Draft" });
+    assert.deepEqual(withoutFallback, { deleted: true, unlinked: false });
+    assert.equal(stillNeverLinked.qbSyncError, marker, "no marker supplied — nothing was cleared");
 });

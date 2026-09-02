@@ -6,6 +6,7 @@ import {
     createQBReceiptPurchase,
     QboAccountConfigError,
     QboPurchaseFaultError,
+    isQboAttachmentAuthError,
     isRetryableQboError,
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
@@ -36,6 +37,22 @@ const QBO_AUTH_REASON = "qbo-auth";
 function isQboAuthFailure(error: unknown): boolean {
     if (isQBTokenStrandedError(error)) return true;
     if (error instanceof Error && error.name === "QBTokenPersistenceError") return true;
+    // A vendor/purchase create's 401/403 comes back as QboPurchaseFaultError
+    // (business-rule shaped, not a generic QboHttpError), so qboHttpStatus below
+    // can't see its status — check it directly or a credential rejection here
+    // reads as a business refusal (`qbo-fault`, terminal) instead of the
+    // retryable-once-reconnected `qbo-auth` it actually is.
+    if (
+        error instanceof QboPurchaseFaultError &&
+        (error.status === 401 || error.status === 403)
+    ) {
+        return true;
+    }
+    // The attachment upload/lookup steps classify their own 401/403 the same
+    // way (qbo-receipt-push.ts) — reconnecting fixes it, retrying the same
+    // token never will, and it must not read as a business fault or a plain
+    // retryable outage.
+    if (isQboAttachmentAuthError(error)) return true;
     const status = qboHttpStatus(error);
     return status === 401 || status === 403;
 }
