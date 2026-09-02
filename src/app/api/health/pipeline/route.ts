@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { getPipelineHealth } from "@/lib/pipeline-health";
+import { hasCronSecret } from "@/lib/cron-auth";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -17,11 +18,10 @@ export const maxDuration = 30;
  * secret for headless/ops checks.
  */
 export async function GET(request: Request) {
-    const authHeader = request.headers.get("authorization");
-    const cronAuthed = Boolean(
-        process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`,
-    );
-    if (!cronAuthed) {
+    // Bearer branch: constant-time, and a missing CRON_SECRET rejects (there is
+    // no environment in which this endpoint is open). The staff-session branch
+    // below is the normal human path.
+    if (!hasCronSecret(request)) {
         const user = await getCurrentUserWithPermissions();
         if (!user) {
             return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });

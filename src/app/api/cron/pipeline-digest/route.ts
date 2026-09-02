@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getPipelineHealth, formatPipelineDigest } from "@/lib/pipeline-health";
 import { sendNotification } from "@/lib/email";
 import { postTextToChatWebhook } from "@/lib/chat-webhook";
+import { isCronAuthorized } from "@/lib/cron-auth";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -9,7 +10,12 @@ export const maxDuration = 60;
 const DEFAULT_TO = "jadkins@goldentouchremodeling.com";
 
 /**
- * Morning pipeline digest (7 AM Pacific): one plain-text summary of the
+ * Morning pipeline digest. The vercel.json schedule is `0 14 * * *`, which is
+ * UTC — that is 7 AM PDT and 6 AM PST (Vercel cron has no timezone setting, so
+ * the delivery hour shifts by one across the DST boundary; that is accepted,
+ * not a bug). vercel.json is strict JSON and cannot carry this note itself.
+ *
+ * One plain-text summary of the
  * receipt/QBO pipeline's overnight health, so an Intuit outage or a stalled
  * bot is noticed over coffee instead of at month-end reconciliation.
  *
@@ -19,10 +25,8 @@ const DEFAULT_TO = "jadkins@goldentouchremodeling.com";
  * is indistinguishable from a digest that stopped running.
  */
 export async function GET(request: Request) {
-    // Any deployed environment (production or preview) requires the cron secret,
-    // and fails closed if CRON_SECRET is unset. Only local dev skips the check.
-    const authHeader = request.headers.get("authorization");
-    if (process.env.VERCEL_ENV && (!process.env.CRON_SECRET || authHeader !== `Bearer ${process.env.CRON_SECRET}`)) {
+    // Fail closed everywhere but an explicit local dev run — see cron-auth.ts.
+    if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
