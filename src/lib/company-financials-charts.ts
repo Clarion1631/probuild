@@ -269,7 +269,7 @@ export async function getCompanyFinancialsChartData(
         overheadTimeEntries,
         unpaidSchedules,
         openRetainers,
-        expenseTotalsByEstimate,
+        allTimeJobExpenses,
         timeZone,
     ] = await Promise.all([
         // Collected: paid schedules whose PARENT invoice isn't Draft (item 2),
@@ -344,20 +344,24 @@ export async function getCompanyFinancialsChartData(
             where: { projectId: { in: projectIds }, status: { in: RETAINER_STATUSES }, balanceDue: { gt: 0 } },
             select: { balanceDue: true, dueDate: true },
         }),
-        // All-time top-5 ranking universe: aggregate in SQL (groupBy + sum) rather
-        // than materializing every expense row. Expense has no direct projectId
-        // column, so group by estimateId and resolve project ids via a small
-        // estimate lookup below.
-        // DELIBERATELY LEFT ON THE RELATION. Phase 3 added Expense.projectId,
-        // so this could become a plain groupBy(["projectId"]) — but only once
-        // every row is backfilled AND every writer stamps it, and this PR's
-        // contract is identical output. Changing it here would also change the
-        // grouping key, which is a real behaviour change dressed as a
-        // refactor. Revisit after the backfill has run in production.
-        prisma.expense.groupBy({
-            by: ["estimateId"],
-            where: { estimate: { projectId: { in: allJobIds } } },
-            _sum: { amount: true },
+        // All-time top-5 ranking universe.
+        //
+        // This used to be a SQL `groupBy(["estimateId"])` plus an estimate ->
+        // project lookup, to avoid materializing every expense row. Phase 3
+        // made that WRONG rather than merely dated: grouping by estimateId
+        // resolves a row's job through its estimate, while the monthly spend
+        // series below resolves it through `resolveExpenseProjectId`. A
+        // re-attributed expense therefore ranked under its OLD job and was
+        // plotted under its new one — the same money in two different places in
+        // two charts on the same page.
+        //
+        // Neither `groupBy` nor a relation filter can express "projectId, or
+        // the estimate's projectId when it is null", so the rows are fetched
+        // and bucketed with the shared resolver. Scope is unchanged (all
+        // selectable jobs, all-time) and the select is three columns.
+        prisma.expense.findMany({
+            where: expenseForProjectsWhere(allJobIds),
+            select: { amount: true, projectId: true, estimate: { select: { projectId: true } } },
         }),
         resolveCompanyTimeZone(),
     ]);
@@ -440,19 +444,13 @@ export async function getCompanyFinancialsChartData(
     // Ranking universe is ALL selectable jobs (jobProjects), all-time, ignoring
     // the current date-range/project filters — this is what keeps a project's
     // color stable no matter how the filters change.
-    const rankedEstimateIds = expenseTotalsByEstimate.map((g) => g.estimateId);
-    const estimateProjects = rankedEstimateIds.length
-        ? await prisma.estimate.findMany({
-              where: { id: { in: rankedEstimateIds } },
-              select: { id: true, projectId: true },
-          })
-        : [];
-    const projectByEstimate = new Map(estimateProjects.map((e) => [e.id, e.projectId]));
+    // Same resolver as the monthly series below — that agreement is the whole
+    // point, and it is what the regression test pins.
     const allTimeTotals = new Map<string, number>();
-    for (const g of expenseTotalsByEstimate) {
-        const pid = projectByEstimate.get(g.estimateId);
-        if (!pid) continue; // Estimate.projectId is nullable on this schema
-        allTimeTotals.set(pid, (allTimeTotals.get(pid) ?? 0) + Number(g._sum.amount ?? 0));
+    for (const e of allTimeJobExpenses) {
+        const pid = resolveExpenseProjectId(e);
+        if (!pid) continue; // both sides can be null on this schema
+        allTimeTotals.set(pid, (allTimeTotals.get(pid) ?? 0) + Number(e.amount ?? 0));
     }
     const topProjectIds = [...allTimeTotals.entries()]
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)) // tie-break by id: stable across reloads
