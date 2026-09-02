@@ -6,6 +6,7 @@ import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 import {
   checkHelpSubmission,
   HELP_THROTTLED_MESSAGE,
+  isMobileSubmission,
   readJsonBody,
   reserveHelpRequest,
 } from "@/lib/help-chat/submission-guard";
@@ -33,7 +34,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: submission.error }, { status: submission.status });
   }
 
-  const { title, description, currentPage, conversationId } = submission;
+  const { title, description, currentPage, conversationId, submissionId } = submission;
+
+  // /api/help-chat/request is the shared intake, and it labels everything
+  // "Feature Request". A crew-app report is a BUG — the app posts here because
+  // this is the endpoint its Bearer token can reach, not because someone is
+  // asking for a feature. Classify on the marker the app actually sends.
+  const fromMobile = isMobileSubmission(currentPage);
 
   try {
     if (conversationId) {
@@ -54,24 +61,32 @@ export async function POST(req: NextRequest) {
     // durable before anything external is called, so a GitHub failure cannot
     // lose it, and the throttle is decided by the database rather than by a
     // read-then-write that five concurrent requests all pass.
-    const requestId = await reserveHelpRequest({
+    const reserved = await reserveHelpRequest({
       userId,
-      type: "feature_request",
+      type: fromMobile ? "bug" : "feature_request",
       question: title,
       response: description,
       currentPage,
       conversationId,
+      submissionId,
     });
-    if (!requestId) {
+    if (!reserved.ok) {
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
+    if (reserved.existing) {
+      // A retry carrying the same submissionId. Return what already exists
+      // rather than opening a second issue for one report.
+      const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
+      return NextResponse.json({ request: prior, githubIssue: null, duplicate: true });
+    }
+    const requestId = reserved.id;
 
     const ghIssue = await createHelpChatGitHubIssue({
       title,
       description,
       currentPage,
-      labelPrefix: "Feature Request",
-      labels: ["feature-request", "from-chat"],
+      labelPrefix: fromMobile ? "Bug Fix" : "Feature Request",
+      labels: fromMobile ? ["bug-fix", "from-mobile"] : ["feature-request", "from-chat"],
       metadata: conversationId
         ? [`**Conversation ID:** \`${conversationId}\``]
         : [],

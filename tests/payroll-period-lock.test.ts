@@ -560,12 +560,12 @@ test("day locks are taken before row locks, in sorted order", async () => {
     ]);
 });
 
-test("the lock action re-checks envelope overlap INSIDE the transaction", () => {
+test("the lock action re-checks period overlap INSIDE the transaction", () => {
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
     const lock = source.slice(source.indexOf("export async function lockPayrollPeriod"));
     const body = lock.slice(0, lock.indexOf(LF + "export "));
     const exclusiveAt = body.indexOf("acquirePayrollLockCreationLock");
-    const recheckAt = body.indexOf("envelopeConflicts");
+    const recheckAt = body.indexOf("rangeConflicts");
     assert.ok(exclusiveAt > 0 && recheckAt > exclusiveAt, "the re-check must follow the exclusive lock");
     assert.match(body, /FOR UPDATE/);
 });
@@ -582,4 +582,94 @@ test("the lock action re-checks envelope overlap INSIDE the transaction", () => 
  */
 test("concurrency guarantees needing a real database are recorded, not faked", () => {
     assert.ok(true);
+});
+
+test("OWNERSHIP overlap is judged on the pay-period range, not the OT envelope", () => {
+    // Two consecutive periods necessarily share an OT envelope at the seam:
+    // the envelope deliberately reaches into the neighbouring workweek so the
+    // overtime split inside a locked period cannot move. Judging ownership on
+    // it made the SECOND of two consecutive periods look like it overlapped the
+    // first, so it could neither be exported nor locked.
+    const db = readFileSync(path.join(__dirname, "..", "src", "lib", "gusto-export-db.ts"), "utf8");
+    assert.match(db, /findOverlappingLockedPeriods\(periodStart, periodEnd, client\)/);
+    assert.doesNotMatch(db, /findOverlappingLockedPeriods\(envelope\.start, envelope\.end/);
+
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const lock = actions.slice(actions.indexOf("export async function lockPayrollPeriod"));
+    const body = lock.slice(0, lock.indexOf(LF + "export "));
+    assert.match(body, /rangeConflicts/);
+    assert.match(body, /"periodStart" < \$\{periodEnd\}[\s\S]{0,80}"periodEnd" > \$\{periodStart\}/);
+    // Freezing still uses the envelope — the two questions stay separate.
+    assert.match(body, /envelope\.end\.getTime\(\) > Date\.now\(\)/);
+});
+
+test("consecutive Sunday-start periods do not own each other's days", async () => {
+    const { payrollLockEnvelope } = await import("../src/lib/payroll-config");
+    const TZ = "America/Los_Angeles";
+    // Sun 08-16 -> Sun 08-30, then Sun 08-30 -> Sun 09-13. Adjacent, never
+    // overlapping: half-open ranges share only the boundary instant.
+    const firstStart = new Date("2026-08-16T07:00:00.000Z");
+    const firstEnd = new Date("2026-08-30T07:00:00.000Z");
+    const secondStart = firstEnd;
+    const secondEnd = new Date("2026-09-13T07:00:00.000Z");
+    assert.ok(firstEnd.getTime() <= secondStart.getTime(), "ranges are adjacent, not overlapping");
+
+    // Their ENVELOPES, however, do overlap — which is exactly why ownership
+    // must not be judged on them.
+    const a = payrollLockEnvelope(firstStart, firstEnd, TZ);
+    const b = payrollLockEnvelope(secondStart, secondEnd, TZ);
+    assert.ok(a.end.getTime() > b.start.getTime(), "premise: the envelopes really do overlap at the seam");
+});
+
+test("the lock binds to the hash the reviewer was shown", () => {
+    const actions = readFileSync(path.join(__dirname, "..", "src", "lib", "actions.ts"), "utf8");
+    const lock = actions.slice(actions.indexOf("export async function lockPayrollPeriod"));
+    const body = lock.slice(0, lock.indexOf(LF + "export "));
+    // Both internal hashes can agree with each other and still disagree with
+    // what was on the page the human clicked from.
+    assert.match(body, /reviewedExportHash\?: string/);
+    assert.match(body, /reviewedExportHash && confirmed\.exportHash !== reviewedExportHash/);
+    assert.match(body, /refresh, check the numbers again/);
+
+    // And the page hands it over, from a client component that can actually
+    // show the refusal (an inline server-action form discards the result).
+    const controls = readFileSync(
+        path.join(__dirname, "..", "src", "app", "manager", "payroll-export", "PayrollLockControls.tsx"),
+        "utf8"
+    );
+    assert.match(controls, /"use client"/);
+    assert.match(controls, /lockPayrollPeriod\(startKey, endKeyExclusive, reviewedExportHash\)/);
+    assert.match(controls, /toast\.error/);
+    const page = readFileSync(
+        path.join(__dirname, "..", "src", "app", "manager", "payroll-export", "page.tsx"),
+        "utf8"
+    );
+    assert.match(page, /reviewedExportHash=\{result\.exportHash\}/);
+    assert.doesNotMatch(page, /await lockPayrollPeriod\(/, "no inline form action — it would swallow the error");
+});
+
+test("PATCH re-reads the row and compare-and-sets on the stored startTime", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    const patchHalf = source.slice(0, source.indexOf("export async function DELETE"));
+    // Day locks are derived from BOTH the stored value and the new one, and the
+    // row is re-read under the FOR UPDATE those locks were taken with.
+    assert.match(patchHalf, /SELECT "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
+    assert.match(patchHalf, /stored\.startTime\.getTime\(\) !== existing\.startTime\.getTime\(\)/);
+    assert.match(patchHalf, /updateMany\(\{[\s\S]{0,120}startTime: stored\.startTime/);
+    assert.match(patchHalf, /EntryMovedError/);
+    assert.match(source, /code: "ENTRY_MOVED"/);
+});
+
+test("the project timeclock actions parse date-only input in the company zone", () => {
+    // new Date("2026-07-27") is UTC midnight — the 26th here. The punch would
+    // land on the wrong day, in the wrong workweek, possibly the wrong period.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "projects", "[id]", "timeclock", "actions.ts"),
+        "utf8"
+    );
+    assert.doesNotMatch(source, /new Date\(data\.date\)/);
+    assert.equal((source.match(/dateInputInTimeZone\(data\.date, timeZone/g) ?? []).length, 2, "create AND update");
 });

@@ -6,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
 import { resolveScheduleTaskIdForPunch } from "@/lib/punch-task-binding";
 import { dayKeyFromDateOnly } from "@/lib/company-day";
+import { dateInputInTimeZone, resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission, canAccessProject } from "@/lib/permissions";
 import { withPayrollWriteTx } from "@/lib/payroll-period";
 
@@ -33,8 +34,13 @@ export async function createTimeEntry(data: {
 
     await assertTimeclockProjectAccess(data.projectId);
 
-    // Start time at midnight of the selected date (simplified for this context)
-    const startTime = new Date(data.date);
+    // Company-local calendar day, NOT new Date(): new Date("2026-07-27") is UTC
+    // midnight, which is the 26th here — the punch lands on the wrong day, in
+    // the wrong workweek, and therefore possibly in the wrong pay period. The
+    // same parser createTimeEntryCore uses.
+    const timeZone = await resolveCompanyTimeZone();
+    const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
+    if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
     // Day comes from the date STRING: new Date("2026-07-27") is UTC midnight,
     // which is the 26th in company time.
     const scheduleTaskId = await resolveScheduleTaskIdForPunch({
@@ -78,7 +84,9 @@ export async function updateTimeEntry(id: string, data: {
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) throw new Error("Unauthorized");
 
-    const startTime = new Date(data.date);
+    const timeZone = await resolveCompanyTimeZone();
+    const startTime = dateInputInTimeZone(data.date, timeZone, "Time entry date");
+    if (!startTime || Number.isNaN(startTime.getTime())) throw new Error("A valid time-entry date is required");
 
     // Resolve against the STORED row: this action never writes projectId, so a
     // supplied one could attach another project's task, and a null estimate item

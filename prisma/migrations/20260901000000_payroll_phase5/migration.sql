@@ -161,3 +161,39 @@ BEGIN
      REVOKE ALL ON TABLE "User" FROM authenticated;
    END IF;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- Help-widget throttle + idempotency (review round 6, item 6).
+--
+-- The count lives in its own row so the limit is enforced by ONE conditional
+-- UPDATE rather than a count-then-insert, which concurrent requests all passed.
+-- submissionId makes a retry return the row that already exists instead of
+-- filing a second GitHub issue.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE "HelpRequest" ADD COLUMN IF NOT EXISTS "submissionId" TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS "HelpRequest_submissionId_key" ON "HelpRequest"("submissionId");
+CREATE INDEX IF NOT EXISTS "HelpRequest_userId_createdAt_idx" ON "HelpRequest"("userId", "createdAt");
+
+CREATE TABLE IF NOT EXISTS "HelpSubmissionQuota" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "hourBucket" TIMESTAMPTZ(6) NOT NULL,
+    "count" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "HelpSubmissionQuota_pkey" PRIMARY KEY ("id")
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "HelpSubmissionQuota_userId_hourBucket_key" ON "HelpSubmissionQuota"("userId", "hourBucket");
+
+ALTER TABLE "HelpSubmissionQuota" ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+     REVOKE ALL ON TABLE "HelpSubmissionQuota" FROM anon;
+   END IF;
+   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+     REVOKE ALL ON TABLE "HelpSubmissionQuota" FROM authenticated;
+   END IF;
+END $$;

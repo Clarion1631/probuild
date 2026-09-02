@@ -144,8 +144,16 @@ export async function findPayrollPeriod(startKey: string, endKey: string, client
 }
 
 /**
- * Locked periods that OVERLAP [start, end). Half-open on both sides, so two
- * adjacent periods do not count as overlapping.
+ * Locked periods whose PAY-PERIOD RANGE overlaps [start, end). Half-open on
+ * both sides, so two adjacent periods do not count as overlapping.
+ *
+ * Deliberately the period range and NOT the workweek envelope. The envelope is
+ * OT context — the extra days a lock has to freeze so the overtime split inside
+ * the period cannot move — and it necessarily bleeds into the neighbouring
+ * period. Judging OWNERSHIP on it made two consecutive Sunday-start periods
+ * look like they overlapped each other, so the second could neither be exported
+ * nor locked. Ownership is about which period a punch BELONGS to; freezing is
+ * about what has to hold still. Two different questions, two different ranges.
  */
 export async function findOverlappingLockedPeriods(
     start: Date,
@@ -185,7 +193,8 @@ export async function loadGustoExport(
 
     const [period, overlappingLocks] = await Promise.all([
         findPayrollPeriod(startKey, endKey, client),
-        findOverlappingLockedPeriods(envelope.start, envelope.end, client),
+        // Ownership: the pay-period range, not the envelope (see above).
+        findOverlappingLockedPeriods(periodStart, periodEnd, client),
     ]);
 
     // The query spans the FULL Mon-Sun workweeks overlapping the period, so a

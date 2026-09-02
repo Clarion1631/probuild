@@ -15429,7 +15429,17 @@ export async function setUserPayType(userId: string, payType: string) {
  * condition that makes the download 409, checked again at the moment of the
  * write so a lock can never freeze a period that was not exportable.
  */
-export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
+export async function lockPayrollPeriod(
+    periodStartKey: string,
+    periodEndKey: string,
+    /**
+     * The export hash the human actually reviewed, from the page they were
+     * looking at. Compared under the exclusive lock: if the period has moved
+     * since it was rendered, the lock is refused rather than freezing numbers
+     * nobody approved.
+     */
+    reviewedExportHash?: string
+) {
     const user = await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
     const { startOfDateInTimeZone } = await import("./tz-date");
@@ -15527,17 +15537,17 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
             // exclusive advisory lock is held. The pre-check outside is
             // advisory: two locks racing each other both passed it, and only
             // this one is serialised.
-            const envelopeConflicts = (await tx.$queryRaw<Array<{ periodStartKey: string | null; periodEndKey: string | null }>>`
+            const rangeConflicts = (await tx.$queryRaw<Array<{ periodStartKey: string | null; periodEndKey: string | null }>>`
                 SELECT "periodStartKey", "periodEndKey"
                 FROM "PayrollPeriod"
                 WHERE "lockedAt" IS NOT NULL
-                  AND "periodStart" < ${envelope.end}
-                  AND "periodEnd" > ${envelope.start}
+                  AND "periodStart" < ${periodEnd}
+                  AND "periodEnd" > ${periodStart}
                   AND NOT ("periodStartKey" = ${range.startKey} AND "periodEndKey" = ${range.endKey})
                 FOR UPDATE
             `);
-            if (envelopeConflicts.length > 0) {
-                const listed = envelopeConflicts.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
+            if (rangeConflicts.length > 0) {
+                const listed = rangeConflicts.map((row) => `${row.periodStartKey} to ${row.periodEndKey}`).join(", ");
                 throw new Error(
                     `This period's workweeks overlap an already-locked period (${listed}). Unlock that one first, or pick the exact period.`
                 );
@@ -15620,6 +15630,15 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
             if (confirmed.exportHash !== precheck.exportHash) {
                 throw new Error(
                     "The hours in this period changed while it was being locked. Nothing was locked - re-download the CSVs and try again."
+                );
+            }
+            // The lock binds to what a HUMAN reviewed, not merely to what was
+            // self-consistent across this request. If the page they clicked from
+            // was rendered before somebody edited an entry, both hashes above
+            // agree with each other and disagree with what was on screen.
+            if (reviewedExportHash && confirmed.exportHash !== reviewedExportHash) {
+                throw new Error(
+                    "This period changed since the page you are looking at was loaded. Nothing was locked - refresh, check the numbers again, then lock."
                 );
             }
             return confirmed.exportHash;

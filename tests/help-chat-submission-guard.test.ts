@@ -12,6 +12,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     checkHelpSubmission,
+    hourBucket,
+    isMobileSubmission,
     HELP_DESCRIPTION_MAX,
     HELP_SUBMISSIONS_PER_HOUR,
     HELP_THROTTLE_WINDOW_MS,
@@ -62,6 +64,7 @@ test("accepted fields come back trimmed, with optionals normalised to null", () 
         steps: null,
         currentPage: null,
         conversationId: null,
+        submissionId: null,
     });
 });
 
@@ -115,6 +118,13 @@ test("currentPage and conversationId are bounded and shape-checked", () => {
     assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "/projects/abc?tab=1" }).ok, true);
     assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "https://evil.test" }).ok, false);
     assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "not-a-path" }).ok, false);
+    // The crew app sends the SCREEN it was on, not a route. A path-only rule
+    // 400'd every bug report from the phone.
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "mobile:Time Clock" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "mobile:Unknown" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "mobile:" }).ok, false);
+    // Bounded: at most six words, each at most 120 chars.
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "mobile:a b c d e f g" }).ok, false);
     assert.equal(checkHelpSubmission({ title: "t", description: "d", currentPage: "/" + "x".repeat(600) }).ok, false);
 
     assert.equal(checkHelpSubmission({ title: "t", description: "d", conversationId: "ckabc123" }).ok, true);
@@ -122,13 +132,73 @@ test("currentPage and conversationId are bounded and shape-checked", () => {
     assert.equal(checkHelpSubmission({ title: "t", description: "d", conversationId: "has spaces" }).ok, false);
 });
 
-test("the throttle claims its slot in ONE statement, so concurrent requests cannot all pass", () => {
+
+// ---- The exact body the crew app posts ------------------------------------
+// gtr-probuild-mobile apps/mobile/lib/bugReport.ts builds this; if it stops
+// validating here, every bug report from the phone becomes a 400.
+
+const MOBILE_PAYLOAD = {
+    title: "Mobile bug: the Save button does nothing",
+    description: [
+        "**What happened**\nTapped Save and nothing happened",
+        "**Reported from the ProBuild crew app**\n- Screen: Time Clock\n- App version: 1.1.1\n- Platform: ios 18.2",
+    ].join("\n\n"),
+    currentPage: "mobile:Time Clock",
+};
+
+test("the crew app's exact payload validates and is classified as a BUG", () => {
+    const result = checkHelpSubmission(MOBILE_PAYLOAD);
+    assert.equal(result.ok, true);
+    assert.equal((result as { currentPage: string }).currentPage, "mobile:Time Clock");
+    // /api/help-chat/request labels everything "Feature Request" — a crew report
+    // is a bug, and it posts there only because that is the endpoint its Bearer
+    // token can reach.
+    assert.equal(isMobileSubmission(MOBILE_PAYLOAD.currentPage), true);
+    assert.equal(isMobileSubmission("/projects/abc"), false);
+    assert.equal(isMobileSubmission(null), false);
+});
+
+test("the request route classifies a mobile submission as a bug, with bug labels", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "request", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /const fromMobile = isMobileSubmission\(currentPage\)/);
+    assert.match(source, /type: fromMobile \? "bug" : "feature_request"/);
+    assert.match(source, /labelPrefix: fromMobile \? "Bug Fix" : "Feature Request"/);
+    assert.match(source, /fromMobile \? \["bug-fix", "from-mobile"\]/);
+});
+
+test("submissionId is optional, bounded, and makes a retry idempotent", () => {
+    // The crew app does not send one today, so requiring it would break it.
+    assert.equal(checkHelpSubmission({ title: "t", description: "d" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: "abc-123" }).ok, true);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: "x".repeat(65) }).ok, false);
+    assert.equal(checkHelpSubmission({ title: "t", description: "d", submissionId: "has space" }).ok, false);
+
     const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
     const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
-    // count-then-insert is a check-then-act: five concurrent callers all read
-    // four and all insert. The INSERT ... SELECT ... WHERE (count) < limit lets
-    // the database decide, once.
-    assert.match(fn, /INSERT INTO "HelpRequest"/);
-    assert.match(fn, /WHERE \(\s*SELECT count\(\*\)/);
-    assert.match(fn, /< \$\{HELP_SUBMISSIONS_PER_HOUR\}/);
+    // The idempotency lookup comes FIRST: a client retrying a request that
+    // actually succeeded must not be charged another slot for it.
+    assert.ok(
+        fn.indexOf("findUnique") < fn.indexOf("HelpSubmissionQuota"),
+        "the submissionId lookup must precede the counter"
+    );
+});
+
+test("the throttle is a conditional UPDATE on a counter row, not a count-then-insert", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "help-chat", "submission-guard.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function reserveHelpRequest"));
+    // Five concurrent requests all read the same count and all inserted. A
+    // conditional UPDATE lets the database decide, once.
+    assert.match(fn, /UPDATE "HelpSubmissionQuota"/);
+    assert.match(fn, /SET "count" = "count" \+ 1/);
+    assert.match(fn, /AND "count" < \$\{HELP_SUBMISSIONS_PER_HOUR\}/);
+    assert.match(fn, /RETURNING "count"/);
+    assert.match(fn, /ON CONFLICT \("userId", "hourBucket"\) DO NOTHING/, "insert-on-missing first");
+});
+
+test("the hour bucket is the truncated hour", () => {
+    assert.equal(hourBucket(new Date("2026-09-02T14:37:12.500Z")).toISOString(), "2026-09-02T14:00:00.000Z");
+    assert.equal(hourBucket(new Date("2026-09-02T15:00:00.000Z")).toISOString(), "2026-09-02T15:00:00.000Z");
 });

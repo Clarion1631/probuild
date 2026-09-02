@@ -2696,10 +2696,32 @@ model HelpRequest {
   changeLocation    String?
   externalIssueRef  String?
   conversationId    String?
+  /// Client-supplied idempotency key. A retry carrying the same value returns
+  /// the row that already exists instead of filing a second GitHub issue.
+  submissionId      String?   @unique
   createdAt         DateTime? @default(now()) @db.Timestamptz(6)
 
   @@index([conversationId])
   @@index([externalIssueRef])
+  /// The throttle counts a user's submissions in the last hour.
+  @@index([userId, createdAt])
+}
+
+/// Per-user, per-hour submission counter for the help widget.
+///
+/// The count lives in its own row so the limit can be enforced by a single
+/// conditional UPDATE (`SET count = count + 1 WHERE count < limit RETURNING`).
+/// Counting rows in HelpRequest was a read-then-write: concurrent requests all
+/// read the same number and all inserted.
+model HelpSubmissionQuota {
+  id         String   @id @default(cuid())
+  userId     String
+  /// Truncated hour, e.g. 2026-09-02T14:00:00Z — the window this count covers.
+  hourBucket DateTime @db.Timestamptz(6)
+  count      Int      @default(0)
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([userId, hourBucket])
 }
 
 model RolloutGate {

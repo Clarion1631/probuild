@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: submission.error }, { status: submission.status });
   }
 
-  const { title, description, steps, currentPage, conversationId } = submission;
+  const { title, description, steps, currentPage, conversationId, submissionId } = submission;
   if (!conversationId) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
@@ -67,17 +67,23 @@ export async function POST(req: NextRequest) {
     // durable before anything external is called, so a GitHub failure cannot
     // lose it, and the throttle is decided by the database rather than by a
     // read-then-write that five concurrent requests all pass.
-    const requestId = await reserveHelpRequest({
+    const reserved = await reserveHelpRequest({
       userId,
       type: "bug_fix",
       question: title,
       response: issueDetails,
       currentPage,
       conversationId,
+      submissionId,
     });
-    if (!requestId) {
+    if (!reserved.ok) {
       return NextResponse.json({ error: HELP_THROTTLED_MESSAGE }, { status: 429 });
     }
+    if (reserved.existing) {
+      const prior = await prisma.helpRequest.findUnique({ where: { id: reserved.id } });
+      return NextResponse.json({ request: prior, duplicate: true });
+    }
+    const requestId = reserved.id;
 
     const ghIssue = await createHelpChatGitHubIssue({
       title,

@@ -21,7 +21,7 @@ import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
 import { lastFullPayPeriod, MAX_PAYROLL_RANGE_DAYS, payrollPeriodLength, validatePayrollRange } from "@/lib/payroll-config";
 import { loadGustoExport } from "@/lib/gusto-export-db";
-import { lockPayrollPeriod, settleDeferredDaysForPeriod, unlockPayrollPeriod } from "@/lib/actions";
+import PayrollLockControls from "./PayrollLockControls";
 
 interface Props {
     searchParams: Promise<{ start?: string; end?: string }>;
@@ -182,18 +182,21 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                         used to run implicitly on every page render and every GET;
                         now a human asks for it. */}
                     {deferredCount > 0 && !locked && (
-                        <form
-                            action={async () => { "use server"; await settleDeferredDaysForPeriod(startKey, endKeyExclusive); }}
-                            className="mb-3"
-                        >
-                            <button type="submit" className="hui-btn hui-btn-secondary text-sm">
-                                Settle {deferredCount} deferred meal {deferredCount === 1 ? "day" : "days"}
-                            </button>
-                            <span className="ml-2 text-xs text-hui-textMuted">
+                        <div className="mb-3 flex flex-wrap items-center gap-2">
+                            <PayrollLockControls
+                                startKey={startKey}
+                                endKeyExclusive={endKeyExclusive}
+                                reviewedExportHash={result.exportHash}
+                                locked={false}
+                                canUnlock={false}
+                                blocked
+                                deferredCount={deferredCount}
+                            />
+                            <span className="text-xs text-hui-textMuted">
                                 Applies the WA meal deduction to days that closed mid-shift. Skips today, anyone still
                                 clocked in, and locked periods.
                             </span>
-                        </form>
+                        </div>
                     )}
                     {unknownPayTypeCount > 0 && (
                         <p className="text-sm text-red-800 mb-3">
@@ -261,25 +264,26 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                         >
                             Download detail CSV
                         </a>
-                        {locked ? (
-                            viewer?.role === "ADMIN" && exactLock ? (
-                                <form action={async () => { "use server"; await unlockPayrollPeriod(startKey, endKeyExclusive); }}>
-                                    <button type="submit" className="hui-btn hui-btn-secondary text-sm">Unlock period</button>
-                                </form>
-                            ) : (
-                                <span className="text-xs text-hui-textMuted">
-                                    {exactLock ? "Only an admin can unlock" : "Select the locked period itself to unlock it"}
-                                </span>
-                            )
+                        {/* A client component so the action's REFUSALS are shown.
+                            Inline server-action forms discard the return value, so
+                            "already locked" and "the numbers moved" were computed
+                            and then thrown away. It also carries the hash this page
+                            rendered, which is what binds the lock to the numbers a
+                            human actually reviewed. */}
+                        {locked && !exactLock ? (
+                            <span className="text-xs text-hui-textMuted">
+                                Select the locked period itself to unlock it
+                            </span>
                         ) : (
-                            // Disabled while blocked; the action re-checks anyway,
-                            // because an entry can be reopened between this render
-                            // and the click.
-                            <form action={async () => { "use server"; await lockPayrollPeriod(startKey, endKeyExclusive); }}>
-                                <button type="submit" disabled={blocked} className="hui-btn hui-btn-primary text-sm disabled:opacity-40">
-                                    Lock period
-                                </button>
-                            </form>
+                            <PayrollLockControls
+                                startKey={startKey}
+                                endKeyExclusive={endKeyExclusive}
+                                reviewedExportHash={result.exportHash}
+                                locked={locked}
+                                canUnlock={viewer?.role === "ADMIN" && !!exactLock}
+                                blocked={blocked}
+                                deferredCount={0}
+                            />
                         )}
                     </div>
                 </div>

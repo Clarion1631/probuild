@@ -32,6 +32,14 @@ import { appendZeroRateReview, zeroRateBlockedResponse, zeroRateBlocks } from "@
 //                          Mobile geofence watcher hits this every minute or on
 //                          a state change; we accept the absolute offsite_ms the
 //                          mobile reports so retries don't double-count.
+/** The targeted row moved (or vanished) between the pre-read and the write. */
+class EntryMovedError extends Error {
+    constructor() {
+        super("Time entry moved");
+        this.name = "EntryMovedError";
+    }
+}
+
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
     const auth = await authenticateMobileOrSession(req);
     if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
@@ -374,8 +382,32 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 ],
             },
             async (tx) => {
-            const client = tx as unknown as typeof prisma;
-            const row = await client.timeEntry.update({ where: { id }, data });
+                const client = tx as unknown as typeof prisma;
+
+                // The row as it ACTUALLY stands, re-read under the FOR UPDATE
+                // acquired above. The copy read before the transaction is stale
+                // the moment a concurrent writer moves the punch, and the days
+                // locked above were derived from it.
+                const [stored] = (await client.$queryRawUnsafe(
+                    `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                    id
+                )) as Array<{ startTime: Date }>;
+                if (!stored) throw new EntryMovedError();
+                if (stored.startTime.getTime() !== existing.startTime.getTime()) {
+                    // It moved. The day locks we hold are for the old day, so we
+                    // cannot safely settle — refuse and let the client retry
+                    // against the row's real state.
+                    throw new EntryMovedError();
+                }
+
+                // Compare-and-set on the value we just read: nothing may slip
+                // between the read and the write.
+                const claim = await client.timeEntry.updateMany({
+                    where: { id, startTime: stored.startTime },
+                    data,
+                });
+                if (claim.count !== 1) throw new EntryMovedError();
+                const row = await client.timeEntry.findUniqueOrThrow({ where: { id } });
             // Re-plan every day this edit touched (the row may have moved days),
             // in THIS transaction — settling afterwards left a window in which
             // the period could be locked in between.
@@ -394,6 +426,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         );
     } catch (error) {
         if (isPeriodLockedError(error)) return periodLockedResponse(error.period);
+        if (error instanceof EntryMovedError) {
+            return NextResponse.json(
+                {
+                    error: "This entry was changed while you were editing it. Reload and try again.",
+                    code: "ENTRY_MOVED",
+                },
+                { status: 409 }
+            );
+        }
         throw error;
     }
 
