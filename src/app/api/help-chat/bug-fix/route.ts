@@ -8,7 +8,9 @@ import {
   HELP_THROTTLED_MESSAGE,
   readJsonBody,
   reserveHelpRequest,
+  submissionMarker,
 } from "@/lib/help-chat/submission-guard";
+import { findIssueByMarker } from "@/lib/help-chat/github";
 
 function buildBugFixDetails(description: string, steps?: string) {
   const details = [description.trim()];
@@ -86,22 +88,37 @@ export async function POST(req: NextRequest) {
     }
     const requestId = reserved.id;
 
-    const ghIssue = await createHelpChatGitHubIssue({
-      title,
-      description: issueDetails,
-      currentPage: currentPage || null,
-      labelPrefix: "Bug Fix",
-      labels: ["bug-fix", "agent-task"],
-      metadata: [
-        steps ? `**Steps to Reproduce:**\n${steps}` : "",
-        `**Conversation ID:** \`${conversationId}\``,
-      ],
-    });
+    // Same provider-reconciliation protocol as /api/help-chat/request. A resume
+    // happens precisely because the previous attempt's outcome is unknown — it
+    // may have created the issue and crashed before recording it — so ask
+    // GitHub for the marker before filing anything.
+    const marker = submissionMarker(requestId);
+    const alreadyFiled = reserved.resume ? await findIssueByMarker(marker) : null;
+
+    const ghIssue =
+      alreadyFiled ??
+      (await createHelpChatGitHubIssue({
+        title,
+        description: issueDetails,
+        currentPage: currentPage || null,
+        labelPrefix: "Bug Fix",
+        labels: ["bug-fix", "agent-task"],
+        metadata: [
+          steps ? `**Steps to Reproduce:**\n${steps}` : "",
+          `**Conversation ID:** \`${conversationId}\``,
+          // The idempotency marker, in the body, so a resumed attempt can find
+          // this issue instead of opening a second one.
+          marker,
+        ],
+      }));
 
     if (!ghIssue) {
-      // The report is already saved; only the Phantom hand-off failed.
+      // The report is already saved; only the Phantom hand-off failed. Leaving
+      // providerState 'pending' is what lets a later retry resume it.
       await prisma.$executeRaw`
-        UPDATE "HelpRequest" SET "status" = 'submitted_no_issue' WHERE "id" = ${requestId}
+        UPDATE "HelpRequest"
+        SET "status" = 'submitted_no_issue', "providerState" = 'pending'
+        WHERE "id" = ${requestId}
       `;
       return NextResponse.json(
         { error: "Failed to create GitHub issue for Phantom" },
@@ -115,7 +132,9 @@ export async function POST(req: NextRequest) {
       UPDATE "HelpRequest"
       SET "status" = 'submitted',
           "changeLocation" = ${ghIssue.url},
-          "externalIssueRef" = ${`github-issue:${ghIssue.number}`}
+          "externalIssueRef" = ${`github-issue:${ghIssue.number}`},
+          "providerIssueRef" = ${String(ghIssue.number)},
+          "providerState" = 'created'
       WHERE "id" = ${requestId}
       RETURNING *
     `;

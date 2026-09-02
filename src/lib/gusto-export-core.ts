@@ -28,7 +28,7 @@
 // Gusto pays them a salary, so exporting hours would pay them twice — but kept
 // in the DETAIL csv, because job costing still needs those hours.
 
-import { bucketWorkweeks, WA_WEEKLY_OVERTIME_THRESHOLD_HOURS, type OvertimeTimeEntry } from "./overtime";
+import { bucketWorkweeks, type OvertimeTimeEntry } from "./overtime";
 import { dayKeyInTimeZone } from "./tz-date";
 import { isKnownPayType } from "./pay-rate-guard";
 
@@ -152,6 +152,11 @@ export function toHundredths(hours: number): number {
     return Math.round((Number.isFinite(hours) ? hours : 0) * 100);
 }
 
+/** Hundredths back to hours, for display and for the CSV's toFixed(2). */
+export function fromHundredths(hundredths: number): number {
+    return hundredths / 100;
+}
+
 export type WeekAllocation<TEntry> = {
     entry: TEntry;
     regularHundredths: number;
@@ -159,58 +164,78 @@ export type WeekAllocation<TEntry> = {
 };
 
 /**
- * Allocate a workweek's regular/overtime split ACROSS ITS ENTRIES, in
- * hundredths of an hour.
+ * Distribute a rounded TOTAL across its parts by largest remainder.
  *
- * Why hundredths rather than the float splits from overtime.ts: the detail CSV
- * prints each entry to two decimals and the summary prints the employee total
- * to two decimals. Rounding each of N entries independently and rounding their
- * true sum separately are different operations, so the detail rows did not add
- * up to the summary — a bookkeeper reconciling one against the other found a
- * cent or two of hours that came from nowhere and could not be explained.
+ * Each part gets its floor; the units left over go to the parts with the
+ * largest fractional remainders. That is the standard apportionment rule, and
+ * it has the property this needs: the parts sum to the total EXACTLY, and no
+ * part moves by more than one hundredth from its true value.
  *
- * The walk itself is the SAME rule as src/lib/overtime.ts: chronological, the
- * hours that push the week past 40 are the later ones, only the threshold
- * splits an entry. This does not re-derive the rule; it performs it on integers
- * so the arithmetic is exact.
- *
- * Sums are exact by construction. The reconciliation pass afterwards is
- * belt-and-braces: if a future change ever reintroduces drift, it lands on the
- * LAST entry of the week rather than being silently spread, so the summary
- * stays the authoritative number and the discrepancy is visible in one place.
+ * Ties break on index, so the same input always produces the same output — the
+ * export hash depends on it.
  */
-export function allocateWeekHundredths<TEntry extends { durationHours: number }>(
-    chronologicalEntries: TEntry[],
-    thresholdHours: number = WA_WEEKLY_OVERTIME_THRESHOLD_HOURS
-): WeekAllocation<TEntry>[] {
-    const thresholdHundredths = toHundredths(thresholdHours);
-    let running = 0;
-    const allocated: WeekAllocation<TEntry>[] = chronologicalEntries.map((entry) => {
-        const hundredths = toHundredths(entry.durationHours);
-        const before = running;
-        running += hundredths;
-        const regularHundredths = Math.max(0, Math.min(hundredths, thresholdHundredths - before));
-        return { entry, regularHundredths, overtimeHundredths: hundredths - regularHundredths };
-    });
+function largestRemainder(values: number[], targetHundredths: number): number[] {
+    const scaled = values.map((value) => value * 100);
+    const floors = scaled.map((value) => Math.floor(value));
+    let remaining = targetHundredths - floors.reduce((sum, value) => sum + value, 0);
 
-    // What the SUMMARY will say for this week.
-    const totalHundredths = running;
-    const targetRegular = Math.min(totalHundredths, thresholdHundredths);
-    const targetOvertime = Math.max(0, totalHundredths - thresholdHundredths);
+    const order = scaled
+        .map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+        .sort((a, b) => b.remainder - a.remainder || a.index - b.index);
 
-    if (allocated.length > 0) {
-        const sum = (pick: (a: WeekAllocation<TEntry>) => number) => allocated.reduce((t, a) => t + pick(a), 0);
-        const last = allocated[allocated.length - 1];
-        last.regularHundredths += targetRegular - sum((a) => a.regularHundredths);
-        last.overtimeHundredths += targetOvertime - sum((a) => a.overtimeHundredths);
+    const out = [...floors];
+    // `remaining` can be negative if the rounded total is below the sum of the
+    // floors; take from the SMALLEST remainders in that case, symmetrically.
+    let cursor = 0;
+    while (remaining > 0 && order.length > 0) {
+        out[order[cursor % order.length].index] += 1;
+        remaining -= 1;
+        cursor += 1;
     }
-    return allocated;
+    cursor = 0;
+    while (remaining < 0 && order.length > 0) {
+        const target = order[order.length - 1 - (cursor % order.length)].index;
+        out[target] -= 1;
+        remaining += 1;
+        cursor += 1;
+    }
+    return out;
 }
 
-/** Hundredths back to hours, for display and for the CSV's toFixed(2). */
-export function fromHundredths(hundredths: number): number {
-    return hundredths / 100;
+/**
+ * Turn a workweek's per-entry regular/OT splits into hundredths that ADD UP.
+ *
+ * The splits come from src/lib/overtime.ts and are taken as AUTHORITY — this
+ * does not re-decide the 40-hour threshold, which entry crosses it, or how an
+ * entry is divided. There is one implementation of the WA rule and it is not
+ * this one. All that happens here is rounding.
+ *
+ * Why it is needed: the detail CSV prints each entry to two decimals and the
+ * summary prints the employee total to two decimals. Rounding each of N entries
+ * and rounding their true sum are different operations, so the two files did not
+ * reconcile — five 8h01m punches show as 8.02 each (40.10) against a true total
+ * of 40.08. The aggregate is rounded once, and the residue is apportioned across
+ * the detail rows by largest remainder, so the columns add up to the number the
+ * summary reports.
+ */
+export function allocateWeekHundredths<TEntry>(
+    splits: Array<{ entry: TEntry; regularHours: number; overtimeHours: number }>
+): WeekAllocation<TEntry>[] {
+    if (splits.length === 0) return [];
+
+    const regularTarget = toHundredths(splits.reduce((sum, split) => sum + split.regularHours, 0));
+    const overtimeTarget = toHundredths(splits.reduce((sum, split) => sum + split.overtimeHours, 0));
+
+    const regular = largestRemainder(splits.map((split) => split.regularHours), regularTarget);
+    const overtime = largestRemainder(splits.map((split) => split.overtimeHours), overtimeTarget);
+
+    return splits.map((split, index) => ({
+        entry: split.entry,
+        regularHundredths: regular[index],
+        overtimeHundredths: overtime[index],
+    }));
 }
+
 
 function round2(value: number): number {
     return Math.round(value * 100) / 100;
@@ -401,8 +426,10 @@ export function buildGustoExport(input: {
         let overtimeHundredths = 0;
 
         for (const week of weeks) {
-            const chronological = week.entries.map((split) => split.entry);
-            for (const allocation of allocateWeekHundredths(chronological)) {
+            // week.entries carries overtime.ts's own per-entry split. It is the
+            // authority; allocateWeekHundredths only rounds it so the two CSVs
+            // reconcile.
+            for (const allocation of allocateWeekHundredths(week.entries)) {
                 const item = allocation.entry;
                 if (!inPeriod(item, periodStart, periodEnd)) continue;
                 regularHundredths += allocation.regularHundredths;

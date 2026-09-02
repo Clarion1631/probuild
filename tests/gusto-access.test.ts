@@ -13,7 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { validateEmployeeMappings } from "../src/lib/gusto-access";
+import { findDuplicateGustoId, validateEmployeeMappings } from "../src/lib/gusto-access";
 
 process.env.NEXTAUTH_SECRET ??= "test-secret-for-gusto-access-tests";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
@@ -85,4 +85,34 @@ test("mapping keys are validated against real users", () => {
     const fn = source.slice(source.indexOf("export async function validateEmployeeMappings"));
     assert.match(fn, /prisma\.user\.findMany\(\{ where: \{ id: \{ in: ids \} \}/);
     assert.match(fn, /These are not team members/);
+});
+
+test("two team members cannot be mapped to the SAME Gusto employee", async () => {
+    // One person's hours would be filed under another's: the export would emit
+    // two summary rows for one Gusto employee, and Gusto takes the last one.
+    const dupe = await validateEmployeeMappings({ u1: "GUSTO-1", u2: "GUSTO-1" });
+    assert.equal(dupe.ok, false);
+    assert.match((dupe as { error: string }).error, /same Gusto employee/);
+
+    // Distinct ids are fine, and CLEARING a mapping (empty value) is not a
+    // collision no matter how many are cleared at once. Checked on the pure
+    // scan so it needs no database.
+    assert.equal(findDuplicateGustoId({ u1: "", u2: "", u3: "GUSTO-2" }), null);
+    assert.equal(findDuplicateGustoId({ u1: "GUSTO-1", u2: "GUSTO-2" }), null);
+    assert.equal(findDuplicateGustoId({ u1: "GUSTO-1", u2: "GUSTO-1" }), "GUSTO-1");
+});
+
+test("the mapping route runs the validator before it saves anything", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "gusto", "employee-mappings", "route.ts"),
+        "utf8"
+    );
+    assert.match(source, /const validated = await validateEmployeeMappings\(employeeMappings\);/);
+    assert.match(source, /if \(!validated\.ok\)/);
+    // Saves the VALIDATED map, not the raw body.
+    assert.match(source, /saveGustoSettings\(\{ employeeMappings: validated\.mappings \}\)/);
+    assert.ok(
+        source.indexOf("validateEmployeeMappings(") < source.indexOf("saveGustoSettings("),
+        "validate before saving"
+    );
 });

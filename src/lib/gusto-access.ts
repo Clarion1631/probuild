@@ -44,6 +44,27 @@ export async function canAccessGusto(): Promise<boolean> {
     return user.role === "ADMIN" || hasPermission(user, "financialReports");
 }
 
+/**
+ * The Gusto id claimed by more than one member, if any.
+ *
+ * Two members pointing at the same Gusto employee means one person's hours are
+ * filed under another's: the export emits two summary rows for one employee and
+ * Gusto keeps the last. Empty values are how the UI CLEARS a mapping, so any
+ * number of them is fine.
+ *
+ * Pure, and checked before the user lookup — a bad map should not cost a
+ * database round trip.
+ */
+export function findDuplicateGustoId(mappings: Record<string, string>): string | null {
+    const seen = new Set<string>();
+    for (const gustoId of Object.values(mappings)) {
+        if (!gustoId) continue;
+        if (seen.has(gustoId)) return gustoId;
+        seen.add(gustoId);
+    }
+    return null;
+}
+
 export type MappingValidation =
     | { ok: true; mappings: Record<string, string> }
     | { ok: false; error: string };
@@ -73,6 +94,14 @@ export async function validateEmployeeMappings(raw: unknown): Promise<MappingVal
         }
         // An empty value is how the UI clears a mapping.
         mappings[userId] = gustoId;
+    }
+
+    const duplicate = findDuplicateGustoId(mappings);
+    if (duplicate) {
+        return {
+            ok: false,
+            error: `Two team members are mapped to the same Gusto employee (${duplicate}). One person's hours would be filed under another's.`,
+        };
     }
 
     const ids = Object.keys(mappings);

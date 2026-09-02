@@ -3,7 +3,12 @@ import { dateOnlyInTimeZone, resolveCompanyTimeZone } from "./company-timezone";
 import { resolveScheduleTaskIdForPunch } from "./punch-task-binding";
 import { toCompanyDayKey } from "./company-day";
 import { assertExpenseMutableOutsideQbo } from "./qbo-expense-guard";
-import { appendZeroRateReview, zeroRateBlocks } from "./pay-rate-guard";
+import {
+    appendZeroRateReview,
+    readOwnerRatesForUpdate,
+    zeroRateBlocks,
+    zeroRateManagerMessage,
+} from "./pay-rate-guard";
 import { withPayrollWrite, withPayrollWriteTx } from "./payroll-period";
 
 const cents = (value: number) => Math.round(value * 100);
@@ -54,12 +59,21 @@ export type CreateTimeEntryCoreInput = {
     /** Set by callers that detected something payroll must look at (e.g. a $0 rate). */
     needsReview?: boolean;
     reviewReason?: string | null;
+    /**
+     * Price this entry from the member's STORED rates, read FOR UPDATE inside
+     * the write transaction, applying the $0-rate policy. When set, laborCost
+     * and burdenCost on this input are ignored.
+     */
+    priceFromStoredRates?: boolean;
+    /** Deliberate "book it at $0 and flag it for payroll" — never the default. */
+    acknowledgeZeroRate?: boolean;
     projectId?: string;
     userId: string;
     costCodeId?: string | null;
     date: string;
     durationHours: number;
-    laborCost: number;
+    /** Ignored when priceFromStoredRates is set — the core prices it instead. */
+    laborCost?: number;
     burdenCost?: number;
     changeOrderId?: string | null;
     isBillable?: boolean;
@@ -69,7 +83,9 @@ export type CreateTimeEntryCoreInput = {
 export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor: string) {
     void actor;
     requiredPositive(data.durationHours, "Hours");
-    if (!Number.isFinite(data.laborCost) || data.laborCost < 0) throw new Error("Labor cost cannot be negative");
+    if (!data.priceFromStoredRates && (!Number.isFinite(data.laborCost) || (data.laborCost ?? 0) < 0)) {
+        throw new Error("Labor cost cannot be negative");
+    }
     if (data.burdenCost != null && (!Number.isFinite(data.burdenCost) || data.burdenCost < 0)) {
         throw new Error("Burden cost cannot be negative");
     }
@@ -103,8 +119,30 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
     // period, so gating HERE covers every caller instead of each server action
     // separately. Check + write in one transaction under the shared advisory
     // lock (src/lib/payroll-period.ts).
-    return withPayrollWriteTx({ instants: [startTime] }, (tx) =>
-        (tx as unknown as typeof prisma).timeEntry.create({
+    return withPayrollWriteTx({ instants: [startTime] }, async (tx) => {
+        // Rates, the $0-rate decision and both costs, all from a row-locked read
+        // in THIS transaction (src/lib/pay-rate-guard.ts). It is always an
+        // office action — there is no worker-side manual create — so it follows
+        // the manager branch: refused unless explicitly acknowledged, and then
+        // flagged so the payroll export will not run past it.
+        let priced: { laborCost: number; burdenCost: number; needsReview?: boolean; reviewReason?: string } | null = null;
+        if (data.priceFromStoredRates) {
+            const member = await readOwnerRatesForUpdate(tx, data.userId, (value) => Number(value));
+            if (!member) throw new Error("Crew member not found");
+            const zeroRate = zeroRateBlocks({
+                role: member.role,
+                email: member.email,
+                payType: member.payType,
+                hourlyRate: member.hourlyRate,
+            });
+            if (zeroRate && data.acknowledgeZeroRate !== true) {
+                throw new Error(zeroRateManagerMessage(member.name));
+            }
+            const costs = calculateCrewTimeCosts(data.durationHours, member.hourlyRate, member.burdenRate);
+            priced = { ...costs, ...(zeroRate ? appendZeroRateReview(null) : {}) };
+        }
+
+        return (tx as unknown as typeof prisma).timeEntry.create({
             data: {
                 projectId,
                 scheduleTaskId,
@@ -117,41 +155,31 @@ export async function createTimeEntryCore(data: CreateTimeEntryCoreInput, actor:
                 // never owed, and reprice it at the current rate. Readers treat
                 // "open" as endTime null AND durationHours null.
                 durationHours: data.durationHours,
-                laborCost: dollars(data.laborCost),
-                burdenCost: dollars(data.burdenCost ?? 0),
+                laborCost: dollars(priced ? priced.laborCost : data.laborCost ?? 0),
+                burdenCost: dollars(priced ? priced.burdenCost : data.burdenCost ?? 0),
                 changeOrderId: changeOrder?.id ?? null,
                 isBillable: data.isBillable ?? false,
                 notes: data.notes?.trim() || null,
-                ...(data.needsReview ? { needsReview: true, reviewReason: data.reviewReason ?? null } : {}),
+                ...(priced?.needsReview || data.needsReview
+                    ? {
+                          needsReview: true,
+                          reviewReason: priced?.reviewReason ?? data.reviewReason ?? null,
+                      }
+                    : {}),
             },
-        })
-    );
+        });
+    });
 }
 
 export type CreateTimeEntryFromStoredRatesInput = Omit<CreateTimeEntryCoreInput, "laborCost" | "burdenCost">;
 
 export async function createTimeEntryFromStoredRatesCore(data: CreateTimeEntryFromStoredRatesInput, actor: string) {
-    const member = await prisma.user.findUnique({
-        where: { id: data.userId },
-        select: { id: true, name: true, email: true, role: true, payType: true, hourlyRate: true, burdenRate: true },
-    });
-    if (!member) throw new Error("Crew member not found");
-    const costs = calculateCrewTimeCosts(data.durationHours, Number(member.hourlyRate), Number(member.burdenRate));
-
-    // Same $0-rate rule as the clock-out paths (src/lib/pay-rate-guard.ts): this
-    // creator prices the entry from the member's STORED rates, so a $0 rate
-    // books a free shift here exactly as it would at clock-out. It is always an
-    // office action (there is no worker-side manual create), so it follows the
-    // manager branch: allowed, and flagged, rather than refused into a dead end.
-    const zeroRate = zeroRateBlocks({
-        role: member.role,
-        email: member.email,
-        payType: member.payType,
-        hourlyRate: Number(member.hourlyRate),
-    });
-    const review = zeroRate ? appendZeroRateReview(null) : null;
-
-    return createTimeEntryCore({ ...data, ...costs, ...(review ?? {}) }, actor);
+    // Nothing is read here. The rates, the $0-rate decision and both costs are
+    // all resolved INSIDE createTimeEntryCore's payroll write transaction, from
+    // a row-locked read — reading them out here left a window in which a rate
+    // import could land between the read and the insert, and the entry was then
+    // created at a rate that was no longer true.
+    return createTimeEntryCore({ ...data, priceFromStoredRates: true }, actor);
 }
 
 export type CreateExpenseCoreInput = {

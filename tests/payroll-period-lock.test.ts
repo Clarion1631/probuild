@@ -789,3 +789,28 @@ test("updateTimeEntry derives cost from stored rates inside the transaction", ()
     assert.match(source, /readOwnerRatesForUpdate\(/);
     assert.match(source, /zeroRateBlocks\(/);
 });
+
+test("the canonical manual create prices INSIDE its payroll transaction", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "time-expense-core.ts"), "utf8");
+
+    // createTimeEntryFromStoredRatesCore reads nothing itself any more: a rate
+    // import landing between its read and the insert produced an entry created
+    // at a rate that was no longer true.
+    const wrapper = source.slice(source.indexOf("export async function createTimeEntryFromStoredRatesCore"));
+    const wrapperBody = wrapper.slice(0, wrapper.indexOf(LF + "}"));
+    assert.doesNotMatch(wrapperBody, /prisma\.user\.findUnique/);
+    assert.match(wrapperBody, /priceFromStoredRates: true/);
+
+    // The rates, the $0 decision and both costs all resolve in the write
+    // transaction, from a row-locked read.
+    const core = source.slice(source.indexOf("export async function createTimeEntryCore"));
+    const coreBody = core.slice(0, core.indexOf(LF + "export "));
+    assert.match(coreBody, /withPayrollWriteTx\(/);
+    const txAt = coreBody.indexOf("withPayrollWriteTx(");
+    assert.ok(coreBody.indexOf("readOwnerRatesForUpdate(") > txAt, "the rate read must be INSIDE the transaction");
+    assert.ok(coreBody.indexOf("calculateCrewTimeCosts(") > txAt, "and so must the pricing");
+    assert.match(coreBody, /zeroRate && data\.acknowledgeZeroRate !== true/);
+    assert.match(coreBody, /appendZeroRateReview\(null\)/);
+    // One transaction: the insert is in the same callback.
+    assert.ok(coreBody.indexOf("timeEntry.create(") > txAt);
+});

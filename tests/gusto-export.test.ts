@@ -599,15 +599,22 @@ test("ONE definition of an open punch, shared by the export and the settle butto
     assert.match(body, /openCandidates\.filter\(\(row\) => isOpenEntry\(row\)\)/);
 });
 
-// ── Hundredth-hour allocation (review round 11, item 2) ────────────────────
+// ── Rounding the authoritative OT split (review round 12, item 1) ─────────
+//
+// src/lib/overtime.ts decides the 40-hour threshold, which entry crosses it and
+// how that entry divides. None of that is re-decided here. All these cover is
+// ROUNDING: the detail CSV prints each entry to two decimals and the summary
+// prints the employee total to two decimals, and those are different operations
+// on the same numbers.
 
-test("detail rows sum EXACTLY to the summary, with odd-minute punches", async () => {
-    const { allocateWeekHundredths, toHundredths } = await import("../src/lib/gusto-export-core");
-    // 7h13m, 6h47m, 8h01m, 9h59m, 8h... none of which is a clean tenth.
-    const odd = [7.2167, 6.7833, 8.0167, 9.9833, 8.0];
+test("five 8h01m punches: 40.08 paid, and the detail adds up to the summary", async () => {
+    const { toHundredths } = await import("../src/lib/gusto-export-core");
+    // 8h01m = 481 minutes. Five of them is 2,405 minutes = 40.0833h, which is
+    // 40.08 once rounded — NOT the 40.10 you get by rounding each punch to 8.02
+    // and adding. That gap is the whole reason this exists.
     const days = ["2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20", "2026-08-21"];
-    const entries = odd.map((hours, i) =>
-        entry({ userId: alice.id, startTime: at8am(days[i]), durationHours: hours })
+    const entries = days.map((day) =>
+        entry({ userId: alice.id, startTime: at8am(day), durationHours: 481 / 60 })
     );
     const result = buildGustoExport({
         entries,
@@ -618,41 +625,64 @@ test("detail rows sum EXACTLY to the summary, with odd-minute punches", async ()
     });
     const totals = totalsFor(alice.id, result);
 
-    // The reconciliation that matters: what the two CSVs would each report.
+    assert.equal(totals.totalHours, 40.08, "the paid total is the aggregate, rounded once");
+    // 2,405 minutes is five minutes past the 40-hour threshold, so those five
+    // minutes ARE overtime under the WA rule. Anything else would be a different
+    // rule, not a different rounding.
+    assert.equal(totals.regularHours, 40);
+    assert.equal(totals.overtimeHours, 0.08);
+
+    // The reconciliation that matters: the two files agree.
     const detailRegular = result.detail.reduce((sum, row) => sum + toHundredths(row.regularHours), 0);
     const detailOvertime = result.detail.reduce((sum, row) => sum + toHundredths(row.overtimeHours), 0);
-    assert.equal(detailRegular, toHundredths(totals.regularHours), "regular hours must reconcile to the cent");
-    assert.equal(detailOvertime, toHundredths(totals.overtimeHours), "overtime hours must reconcile to the cent");
+    assert.equal(detailRegular, toHundredths(totals.regularHours));
+    assert.equal(detailOvertime, toHundredths(totals.overtimeHours));
 
-    // And the week's own arithmetic still holds: 40.00 regular, the rest OT.
-    const totalHundredths = odd.reduce((sum, h) => sum + toHundredths(h), 0);
-    assert.equal(toHundredths(totals.regularHours), Math.min(totalHundredths, 4000));
-    assert.equal(toHundredths(totals.overtimeHours), Math.max(0, totalHundredths - 4000));
-
-    // The allocator itself is exact for any input.
-    const allocation = allocateWeekHundredths(odd.map((durationHours) => ({ durationHours })));
-    assert.equal(
-        allocation.reduce((sum, a) => sum + a.regularHundredths + a.overtimeHundredths, 0),
-        totalHundredths
-    );
+    // Naive per-entry rounding would have produced 40.01 regular against a
+    // summary of 40.00 — a cent of hours from nowhere.
+    assert.notEqual(detailRegular, 8.02 * 100 * 4 + 7.93 * 100);
 });
 
-test("the entry that crosses 40 hours carries the split, to the hundredth", async () => {
+test("the allocator takes overtime.ts's split as authority and only rounds it", async () => {
     const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
-    // 38.75 banked, then a 3.5h shift: 1.25 regular, 2.25 overtime.
-    const allocation = allocateWeekHundredths([{ durationHours: 38.75 }, { durationHours: 3.5 }]);
+    // 38.75 banked, then a 3.5h shift that overtime.ts split 1.25 / 2.25.
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: 38.75, overtimeHours: 0 },
+        { entry: "b", regularHours: 1.25, overtimeHours: 2.25 },
+    ]);
     assert.deepEqual(
-        allocation.map((a) => [a.regularHundredths, a.overtimeHundredths]),
+        allocation.map((a) => [a.entry, a.regularHundredths, a.overtimeHundredths]),
         [
-            [3875, 0],
-            [125, 225],
+            ["a", 3875, 0],
+            ["b", 125, 225],
         ]
     );
 });
 
+test("the residue lands on real rows and never changes the total", async () => {
+    const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
+    // Three thirds of an hour: each 0.333..., true total 1.00. Rounding each
+    // independently gives 0.33 x 3 = 0.99, so one hundredth has to be placed.
+    const third = 1 / 3;
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: third, overtimeHours: 0 },
+        { entry: "b", regularHours: third, overtimeHours: 0 },
+        { entry: "c", regularHours: third, overtimeHours: 0 },
+    ]);
+    const total = allocation.reduce((sum, a) => sum + a.regularHundredths, 0);
+    assert.equal(total, 100, "the parts sum to the rounded aggregate, exactly");
+    // No row moves by more than a hundredth from its true value.
+    for (const a of allocation) {
+        assert.ok(Math.abs(a.regularHundredths - third * 100) <= 1);
+    }
+});
+
 test("a week entirely under 40 hours has no overtime anywhere", async () => {
     const { allocateWeekHundredths } = await import("../src/lib/gusto-export-core");
-    const allocation = allocateWeekHundredths([{ durationHours: 7.33 }, { durationHours: 6.67 }]);
+    const allocation = allocateWeekHundredths([
+        { entry: "a", regularHours: 7.33, overtimeHours: 0 },
+        { entry: "b", regularHours: 6.67, overtimeHours: 0 },
+    ]);
     assert.deepEqual(
         allocation.map((a) => [a.regularHundredths, a.overtimeHundredths]),
         [

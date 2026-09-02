@@ -293,3 +293,38 @@ test("a resume asks GitHub before filing, using the submission marker", () => {
     // providerState records the outcome so the next resume knows.
     assert.match(route, /"providerState" = \$\{ghIssue \? "created" : "pending"\}/);
 });
+
+test("BOTH help routes reconcile with the provider before filing", () => {
+    // The bug-fix route had the row-first ordering but not the reconciliation,
+    // so a crash between "GitHub created the issue" and "we recorded it" left a
+    // pending row that a retry would file a SECOND issue for.
+    for (const route of ["request", "bug-fix"]) {
+        const source = readFileSync(
+            path.join(__dirname, "..", "src", "app", "api", "help-chat", route, "route.ts"),
+            "utf8"
+        );
+        assert.match(source, /const marker = submissionMarker\(requestId\);/, route);
+        assert.match(source, /reserved\.resume \? await findIssueByMarker\(marker\) : null/, route);
+        assert.match(source, /alreadyFiled \?\?/, route);
+        assert.match(source, /marker,/, `${route} must put the marker in the issue body`);
+        assert.match(source, /"providerState" = /, route);
+        assert.match(source, /"providerIssueRef" = /, route);
+        // The search must happen BEFORE the create, or it proves nothing.
+        assert.ok(
+            source.indexOf("findIssueByMarker(marker)") < source.indexOf("createHelpChatGitHubIssue("),
+            `${route}: reconcile before filing`
+        );
+    }
+});
+
+test("a crash between provider and DB leaves a row a retry can finish", () => {
+    // The failure this protocol exists for: the issue exists, our row does not
+    // know it. providerState stays 'pending', so the retry resumes — and the
+    // marker search finds the issue instead of opening a second one.
+    const bugFix = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "help-chat", "bug-fix", "route.ts"),
+        "utf8"
+    );
+    assert.match(bugFix, /"status" = 'submitted_no_issue', "providerState" = 'pending'/);
+    assert.match(bugFix, /"providerState" = 'created'/);
+});
