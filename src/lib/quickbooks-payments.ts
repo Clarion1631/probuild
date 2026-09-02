@@ -756,36 +756,43 @@ export interface QBPaymentSyncResult {
  * per-row failures (a business error, a DB conflict) are recorded and the loop
  * carries on.
  */
-export async function runQboRowLoop<T>(
+export async function runQboRowLoop<T extends { id: string }>(
     rows: T[],
     result: QBPaymentSyncResult,
     handleRow: (row: T) => Promise<void>,
     onRowError: (row: T, error: unknown) => void,
     skippedLabel: string,
     deadline?: RouteDeadline,
-): Promise<void> {
+): Promise<{ lastCompletedId: string | null }> {
+    // The id of the last row this loop actually finished with. The cursor may
+    // only advance to HERE: jumping to the end of the page after a mid-page
+    // outage would step straight over every row the outage cut short, and they
+    // would not be looked at again until the cursor wrapped all the way round.
+    let lastCompletedId: string | null = null;
+
     for (const [index, row] of rows.entries()) {
         // A previous pass already hit the wall — the connection is shared, so
         // there is nothing to gain by trying again here.
         if (result.abortedOnQboOutage) {
             result.skipped += rows.length - index;
-            return;
+            return { lastCompletedId };
         }
         // Checked before EVERY row: a row costs several serial QBO calls, so
         // starting one with seconds left is how a run gets killed mid-write
         // instead of returning a result someone can act on.
         if (isBudgetExhausted(deadline)) {
             result.skipped += rows.length - index;
-            return;
+            return { lastCompletedId };
         }
         try {
             await handleRow(row);
+            lastCompletedId = row.id;
         } catch (error) {
             // Out of time is not a QBO fault: stop cleanly, count the rest as
             // skipped (making the run partial), and let the next run continue.
             if (isQBBudgetExhaustedError(error)) {
                 result.skipped += rows.length - index;
-                return;
+                return { lastCompletedId };
             }
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
@@ -795,11 +802,16 @@ export async function runQboRowLoop<T>(
                     `QuickBooks stopped responding (${isQBTimeoutError(error) ? "timeout" : "unavailable"}) — remaining ${skippedLabel} skipped, will retry next run`,
                 );
                 result.skipped += rows.length - index - 1;
-                return;
+                return { lastCompletedId };
             }
+            // A row-level failure is recorded and the run continues, so this
+            // row IS finished as far as the cursor is concerned — leaving the
+            // cursor behind it would retry the same bad row forever.
             onRowError(row, error);
+            lastCompletedId = row.id;
         }
     }
+    return { lastCompletedId };
 }
 
 /**
@@ -906,7 +918,8 @@ export async function forEachPendingPage<T extends { id: string }>(
     deadline: RouteDeadline,
     fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
     countRemaining: (cursorId: string | null) => Promise<number>,
-    handlePage: (rows: T[]) => Promise<void>,
+    /** Returns the last row it actually completed — the furthest the cursor may move. */
+    handlePage: (rows: T[]) => Promise<{ lastCompletedId: string | null }>,
     cursor?: { store: PaymentsSyncCursorStore; key: string },
     maxRows: number = PAYMENTS_SYNC_MAX_ROWS,
 ): Promise<void> {
@@ -945,10 +958,15 @@ export async function forEachPendingPage<T extends { id: string }>(
             return;
         }
 
-        await handlePage(page);
+        const { lastCompletedId } = await handlePage(page);
         processed += page.length;
-        cursorId = page[page.length - 1].id;
-        await saveCursor(cursorId);
+        // Only past what finished. On a clean page this is the page tail; on a
+        // page an outage cut short it is wherever the loop actually got to, so
+        // the next run resumes at the first unverified row rather than after it.
+        if (lastCompletedId !== null) {
+            cursorId = lastCompletedId;
+            await saveCursor(cursorId);
+        }
 
         // A short page means we reached the end of the collection.
         if (page.length < take) {

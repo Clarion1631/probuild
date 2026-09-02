@@ -8,11 +8,23 @@ import { toNum } from "@/lib/prisma-helpers";
 import { recordPaymentCore } from "@/lib/payment-record-core";
 import { parsePaymentDateInput } from "@/lib/payment-date";
 import { getFreshQBTokens, settleMilestoneFromQBPayment } from "@/lib/quickbooks-payments";
-import { buildQBPaymentRequest, sendQBPaymentCreateRequest, type QBTokens } from "@/lib/quickbooks";
+import {
+    buildQBPaymentRequest,
+    sendQBPaymentCreateRequest,
+    createRouteDeadline,
+    type QBTokens,
+    type RouteDeadline,
+} from "@/lib/quickbooks";
 import { toDepositReviewItem } from "@/lib/deposit-review";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+// 60, not 30: this route does real QBO work (token refresh, invoice read,
+// payment create) and 30s left no headroom for the serial sequence. The
+// DEPOSIT_INGEST_BUDGET_MS below is what actually stops it running long —
+// the ceiling is only the backstop behind it.
+export const maxDuration = 60;
+/** Whole-request budget, under the 60s ceiling. */
+export const DEPOSIT_INGEST_BUDGET_MS = 50_000;
 
 /**
  * Deposit auto-apply pipeline (Phase B1). The GTR receipt bot classifies an
@@ -475,13 +487,14 @@ async function applyNonQbo(row: DepositIngest, schedule: MatchedSchedule, payloa
 }
 
 async function applyQboLinked(row: DepositIngest, schedule: MatchedSchedule, payload: NormalizedPayload): Promise<NextResponse> {
-    const tokens = await getFreshQBTokens(); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
+    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
+    const tokens = await getFreshQBTokens(deadline); // throws QBNotConnectedError → top-level catch → "failed" (pre-QBO, no boundary crossed)
 
     const built = await buildQBPaymentRequest(tokens, schedule.qbInvoiceId!, {
         amount: payload.amount,
         txnDate: payload.checkDate!,
         paymentRefNum: payload.checkNumber!,
-    });
+    }, deadline);
     if (!built.ok) {
         throw new Error(`QuickBooks guard failed (${built.reason}) for invoice ${schedule.invoiceCode}`);
     }
@@ -504,9 +517,10 @@ async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
     if (!schedule) return await finalizeReconcile(row, "reserved milestone no longer exists", {});
     const extracted = JSON.parse(row.extracted) as NormalizedPayload;
 
+    const deadline = createRouteDeadline(DEPOSIT_INGEST_BUDGET_MS);
     let tokens: QBTokens;
     try {
-        tokens = await getFreshQBTokens();
+        tokens = await getFreshQBTokens(deadline);
     } catch (e: any) {
         // Stay qbo_unknown — a brief QB outage doesn't downgrade the state (the
         // original send may or may not have gone through).
@@ -520,7 +534,7 @@ async function resumeFromQboUnknown(row: DepositIngest): Promise<NextResponse> {
     const requestId = depositRequestId(extracted.fileId);
     return await sendAndSettle(row.id, schedule, {
         checkDate: extracted.checkDate!, checkNumber: extracted.checkNumber!, requestId, requestBody: row.qbRequestPayload!,
-    }, tokens);
+    }, tokens, deadline);
 }
 
 async function resumeFromQboCreated(row: DepositIngest): Promise<NextResponse> {
@@ -537,10 +551,11 @@ async function sendAndSettle(
     schedule: MatchedSchedule,
     ctx: { checkDate: string; checkNumber: string; requestId: string; requestBody: string },
     tokens: QBTokens,
+    deadline?: RouteDeadline,
 ): Promise<NextResponse> {
     let paymentId: string;
     try {
-        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId);
+        const sent = await sendQBPaymentCreateRequest(tokens, ctx.requestBody, ctx.requestId, deadline);
         paymentId = sent.paymentId;
     } catch (e: any) {
         // Response lost/timed out — stay qbo_unknown. The row already holds the exact

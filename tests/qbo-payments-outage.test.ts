@@ -758,7 +758,10 @@ async function runPagedPass(
         createRouteDeadline(30_000),
         async (cursorId, take) => after(cursorId).slice(0, take),
         async (cursorId) => after(cursorId).length,
-        async (page) => { for (const row of page) seen.add(row.id); },
+        async (page) => {
+            for (const row of page) seen.add(row.id);
+            return { lastCompletedId: page[page.length - 1]?.id ?? null };
+        },
         { store: cursorStore, key },
         maxRows,
     );
@@ -833,4 +836,144 @@ test("a cursor store that fails never breaks the run", async () => {
     // "no cursor" rather than throwing into the sync.
     assert.equal(await automationSettingCursorStore.get("nope"), null);
     await automationSettingCursorStore.set("nope", "value"); // must not throw
+});
+
+
+// --- The cursor may not step over rows an outage cut short ---
+
+test("a mid-page outage leaves the cursor on the last COMPLETED row", async () => {
+    const { runQboRowLoop } = await import("../src/lib/quickbooks-payments");
+    // Codex gate: the cursor used to jump to the page tail regardless, so the
+    // rows an outage interrupted were stepped over and not looked at again
+    // until the cursor wrapped all the way round.
+    const result = emptyResult();
+    const page = rows(10);
+    const { client } = fakeQbo({
+        probe: (id) => (Number(id) >= 4
+            ? { state: "error", status: 0, connectionFailed: true, timedOut: true }
+            : { state: "ok", balance: 5, total: 10, paymentTxnIds: [] }),
+    });
+
+    const { lastCompletedId } = await runQboRowLoop(page, result, rowHandler(client, result), () => {}, "milestones");
+
+    // Rows s0..s2 completed (invoice ids 1..3); the outage hit on the 4th.
+    assert.equal(lastCompletedId, "s2");
+    assert.equal(result.abortedOnQboOutage, true);
+});
+
+test("across consecutive runs, a mid-page outage loses no rows", async () => {
+    const { forEachPendingPage, runQboRowLoop } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+
+    const all = Array.from({ length: 12 }, (_, i) => ({ id: `row-${String(i).padStart(2, "0")}` }));
+    const { store } = memoryCursorStore();
+    const verified = new Set<string>();
+    const after = (cursorId: string | null) =>
+        cursorId === null ? all : all.filter(r => r.id > cursorId);
+
+    // Run 1: QBO dies partway through the first page.
+    const firstRun = emptyResult();
+    let failFrom: string | null = "row-05";
+    const pass = async (result: typeof firstRun) => {
+        await forEachPendingPage(
+            result,
+            createRouteDeadline(30_000),
+            async (cursorId, take) => after(cursorId).slice(0, take),
+            async (cursorId) => after(cursorId).length,
+            (page) => runQboRowLoop(
+                page,
+                result,
+                async (row) => {
+                    if (failFrom !== null && row.id >= failFrom) {
+                        throw new QboRetryableError("QBO went away", 503);
+                    }
+                    verified.add(row.id);
+                },
+                () => {},
+                "milestones",
+            ),
+            { store, key: "k" },
+            100,
+        );
+    };
+
+    await pass(firstRun);
+    assert.equal(firstRun.abortedOnQboOutage, true);
+    assert.deepEqual([...verified].sort(), ["row-00", "row-01", "row-02", "row-03", "row-04"]);
+
+    // Run 2: QBO is healthy again. It must pick up at row-05, the first row
+    // the outage prevented us from verifying - not at row-11.
+    failFrom = null;
+    await pass(emptyResult());
+
+    assert.equal(verified.size, 12, `missed ${12 - verified.size} rows`);
+    assert.deepEqual([...verified].sort(), all.map(r => r.id));
+});
+
+test("a row-level error still advances the cursor, so one bad row cannot wedge the run", async () => {
+    const { runQboRowLoop } = await import("../src/lib/quickbooks-payments");
+    const result = emptyResult();
+    const { client } = fakeQbo({
+        probe: (id) => (id === "2" ? { state: "error", status: 400 } : { state: "ok", balance: 5, total: 10, paymentTxnIds: [] }),
+    });
+    const handler = async (row: { id: string; qbInvoiceId: string }) => {
+        result.checked++;
+        const probe = await client.probeInvoice(row.qbInvoiceId);
+        if (probe.state === "error") throw new Error(`probe failed (${probe.status})`);
+    };
+    const { lastCompletedId } = await runQboRowLoop(rows(4), result, handler, () => {}, "milestones");
+    // Recorded and moved past: leaving the cursor behind a permanently bad row
+    // would retry it every run and never reach anything after it.
+    assert.equal(lastCompletedId, "s3");
+});
+
+// --- Invoice-options read/set must preserve the status ---
+
+test("the invoice-options read distinguishes 404 from an outage", async () => {
+    const { getQBInvoicePaymentOptions, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+
+    // 404 is a real answer: this invoice is gone from QuickBooks.
+    const gone = await withFetch(
+        (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch,
+        () => getQBInvoicePaymentOptions(TOKENS, "1"),
+    );
+    assert.equal(gone, null);
+
+    // Codex gate: a 503 used to collapse into that same null, so the sweep read
+    // an outage as "not in QuickBooks" and carried on through it.
+    const outage = await withFetch(
+        (async () => new Response("busy", { status: 503 })) as unknown as typeof fetch,
+        () => getQBInvoicePaymentOptions(TOKENS, "1"),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isRetryableQboError(outage), true, `got ${outage?.name}`);
+
+    const refused = await withFetch(
+        (async () => new Response("nope", { status: 403 })) as unknown as typeof fetch,
+        () => getQBInvoicePaymentOptions(TOKENS, "1"),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(qboHttpStatus(refused), 403);
+});
+
+test("the invoice-options write raises with the status instead of returning false", async () => {
+    const { setQBInvoicePaymentOptions, isRetryableQboError, qboHttpStatus } = await import("../src/lib/quickbooks");
+
+    const ok = await withFetch(
+        (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
+        () => setQBInvoicePaymentOptions(TOKENS, "1", "0", { card: true, ach: true }),
+    );
+    assert.equal(ok, true);
+
+    // `return res.ok` flattened a 503 into the same "update-failed" as a
+    // business rejection, so a shared outage looked like N unlucky invoices.
+    const outage = await withFetch(
+        (async () => new Response("busy", { status: 503 })) as unknown as typeof fetch,
+        () => setQBInvoicePaymentOptions(TOKENS, "1", "0", { card: true, ach: true }),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(isRetryableQboError(outage), true, `got ${outage?.name}`);
+
+    const refused = await withFetch(
+        (async () => new Response("nope", { status: 400 })) as unknown as typeof fetch,
+        () => setQBInvoicePaymentOptions(TOKENS, "1", "0", { card: true, ach: true }),
+    ).then(() => null, (e: unknown) => e as Error);
+    assert.equal(qboHttpStatus(refused), 400);
 });

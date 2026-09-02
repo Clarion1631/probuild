@@ -14,6 +14,7 @@ import {
     isQBTimeoutError,
     isQBBudgetExhaustedError,
     createRouteDeadline,
+    qboHttpStatus,
     type QBTokens,
     type RouteDeadline,
 } from "@/lib/quickbooks";
@@ -336,6 +337,18 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     console.error("QBO receipt push account misconfiguration", error.message);
                     await logEvent(pushEventFromOutcome(input, { status: "fallback", reason: "account-misconfigured" }));
                     return NextResponse.json({ ok: false, reason: "account-misconfigured" });
+                }
+                // A deterministic 4xx from an ensure (customer/vendor create
+                // rejected with 400/403, a bad reference, a closed period) is a
+                // business refusal that will repeat verbatim. Those reached
+                // this catch as an untyped QboHttpError and fell through to the
+                // generic 500, putting the bot in a retry loop over an answer
+                // QuickBooks had already given. Terminal, like a Fault.
+                const httpStatus = qboHttpStatus(error);
+                if (httpStatus !== null && httpStatus >= 400 && httpStatus < 500) {
+                    console.error("QBO receipt push business refusal", httpStatus);
+                    await logEvent(pushEventFromOutcome(input, { status: "fallback", reason: `qbo-fault:${httpStatus}` }));
+                    return NextResponse.json({ ok: false, reason: "qbo-fault", detail: String(httpStatus) });
                 }
                 if (error instanceof QboPurchaseFaultError) {
                     // A QBO business-rule rejection (400/403) is terminal, not

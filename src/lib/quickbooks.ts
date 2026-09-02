@@ -1011,9 +1011,11 @@ export async function getQBPayment(
 }
 
 /** Read core invoice fields needed for payments/deletes. */
-export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string) {
-    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
-    if (!res.ok) return null;
+export async function readQBInvoice(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) {
+    const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
+    // 404 stays null ("gone"); a transient status must not read the same way.
+    if (res.status === 404) return null;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} read`);
     const inv = (await res.json()).Invoice;
     if (!inv) return null;
     return {
@@ -1061,6 +1063,7 @@ export async function buildQBPaymentRequest(
     tokens: QBTokens,
     qbInvoiceId: string,
     opts: { amount: number; txnDate: string; paymentRefNum: string },
+    deadline?: RouteDeadline,
 ): Promise<{ ok: true; requestBody: string } | QBPaymentBuildFailure> {
     // E2E_QBO_MOCK (deposit-ingest hermeticity, gated in quickbooks-mock.ts):
     // skip the real readQBInvoice() network call entirely — the caller seeds
@@ -1082,7 +1085,7 @@ export async function buildQBPaymentRequest(
         };
         return { ok: true, requestBody: JSON.stringify(mockPayload) };
     }
-    const inv = await readQBInvoice(tokens, qbInvoiceId);
+    const inv = await readQBInvoice(tokens, qbInvoiceId, deadline);
     if (!inv) return { ok: false, reason: "invoice-not-found" };
     if (!inv.customerId) return { ok: false, reason: "missing-customer" };
     if (Math.round(inv.balance * 100) !== Math.round(opts.amount * 100)) {
@@ -1111,6 +1114,7 @@ export async function sendQBPaymentCreateRequest(
     tokens: QBTokens,
     requestBody: string,
     requestId: string,
+    deadline?: RouteDeadline,
 ): Promise<{ paymentId: string; amount: number }> {
     // E2E_QBO_MOCK: no network I/O — see quickbooks-mock.ts's doc comment.
     // mockSendQBPaymentCreate replicates QBO's requestid dedupe (the SAME
@@ -1122,8 +1126,9 @@ export async function sendQBPaymentCreateRequest(
     const res = await qbFetch(`/payment?requestid=${encodeURIComponent(requestId)}`, tokens, {
         method: "POST",
         body: requestBody,
+        qbDeadline: deadline,
     });
-    if (!res.ok) throw new Error(`QB payment create failed: ${await res.text()}`);
+    if (!res.ok) throw await qboResponseError(res, "QB payment create");
     const data = await parseJsonOrNull(res);
     const p = data?.Payment;
     if (!p?.Id) throw new Error("QB payment create returned no Payment body");
@@ -1182,7 +1187,12 @@ export async function deleteQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pr
 /** Read an invoice's online-payment toggles + sync token (for sparse updates). */
 export async function getQBInvoicePaymentOptions(tokens: QBTokens, qbInvoiceId: string, deadline?: RouteDeadline) {
     const res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
-    if (!res.ok) return null;
+    // 404 is a real answer — this invoice is gone from QBO — and stays null.
+    // Everything else used to collapse into that same null, so a 503 read as
+    // "not in QuickBooks" and the sweep cheerfully carried on through an
+    // outage. Preserve the status so callers can tell the two apart.
+    if (res.status === 404) return null;
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} read`);
     const inv = (await res.json()).Invoice;
     if (!inv) return null;
     return {
@@ -1212,7 +1222,11 @@ export async function setQBInvoicePaymentOptions(
             AllowOnlineACHPayment: opts.ach,
         }),
     });
-    return res.ok;
+    // `return res.ok` flattened a 503 into the same "update-failed" as a
+    // business rejection, so a shared outage looked like 200 individually
+    // unlucky invoices. Raise with the status instead.
+    if (!res.ok) throw await qboResponseError(res, `QB invoice ${qbInvoiceId} payment-options update`);
+    return true;
 }
 
 /** Add customer-facing text before QBO sends its invoice email. */

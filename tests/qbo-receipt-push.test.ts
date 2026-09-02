@@ -1765,3 +1765,80 @@ test("qboResponseError picks the class from the status", async () => {
     assert.equal(terminal.name, "QboHttpError");
     assert.equal(qboHttpStatus(terminal), 400);
 });
+
+
+// --- A deterministic 4xx from an ensure is terminal, not a retry loop ---
+
+test("a 400 on the REAL customer create is a terminal qbo-fault at the route", async () => {
+    // Codex gate: a business refusal from an ensure arrived as an untyped
+    // QboHttpError and fell through to the generic 500, so the bot retried an
+    // answer QuickBooks had already given, verbatim, forever.
+    const events: AutomationEventInput[] = [];
+    const badRequest = (async (url: string) =>
+        // Lookups come back empty so the ensure proceeds to the create, which
+        // QuickBooks refuses.
+        /\/customer\b/.test(String(url)) && !String(url).includes("query")
+            ? new Response(JSON.stringify({ Fault: { Error: [{ code: "6240" }] } }), { status: 400 })
+            : new Response(JSON.stringify({ QueryResponse: {} }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            })) as unknown as typeof fetch;
+
+    const { POST } = createRouteHandlers({
+        getFreshTokens: async () => TOKENS,
+        createPurchase: (tokens, input, deadline) =>
+            withFetch(badRequest, async () => {
+                const mod = await import("../src/lib/qbo-receipt-push");
+                return mod.createQBReceiptPurchase(tokens, input, { listProjects: async () => [PROJECT] }, deadline);
+            }),
+        logEvent: event => { events.push(event); },
+    });
+
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: JSON.stringify({
+            fileId: "file-400",
+            projectName: PROJECT.name,
+            vendor: "Home Depot",
+            date: "2026-07-15",
+            totalAmount: 100,
+            groups: [{ category: "03 Plumbing", amount: 100 }],
+        }),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+
+    // 200 + ok:false is terminal for the Apps Script: it books via the email
+    // path instead of hammering a refusal.
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "qbo-fault");
+    assert.equal(body.detail, "400");
+    assert.equal(events[0].reason, "qbo-fault:400");
+});
+
+test("a 403 from an ensure is terminal too, while a 503 stays retryable", async () => {
+    const { QboHttpError, QboRetryableError } = await import("../src/lib/quickbooks");
+
+    const terminal = createRouteHandlers({
+        createPurchase: async () => { throw new QboHttpError("QB customer create failed (403)", 403); },
+    });
+    const terminalResponse = await terminal.POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(terminalResponse.status, 200);
+    assert.deepEqual(await terminalResponse.json(), { ok: false, reason: "qbo-fault", detail: "403" });
+
+    const transient = createRouteHandlers({
+        createPurchase: async () => { throw new QboRetryableError("QB customer create failed (503)", 503); },
+    });
+    const transientResponse = await transient.POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(transientResponse.status, 503);
+    assert.deepEqual(await transientResponse.json(), { ok: false, retry: true, reason: "qbo-unavailable" });
+});
