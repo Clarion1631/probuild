@@ -906,6 +906,103 @@ test.describe("two-step upload: a reused key cannot swap the document", () => {
         expect((await finalized.json()).error).toBe("sha-mismatch");
         expect((await prisma.receiptIntake.findUnique({ where: { id } }))?.state).toBe("STAGING");
     });
+
+    test("SWEPT then re-uploaded: /start re-arms the row and /finalize publishes it", async ({ request }) => {
+        // End to end for the recovery the sweeper leaves behind. The old
+        // behaviour answered `alreadyReceived` for any non-STAGING row, which
+        // told the forwarder we held a receipt we did not hold — and it deletes
+        // its only copy on that answer — leaving the row parked forever with
+        // nothing to recover from.
+        const ref = `${REF_PREFIX}swept-restart`;
+        const first = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(OTHER_PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(first.status()).toBe(200);
+        const { id } = await first.json();
+        minted.push(id);
+
+        // Exactly what the stale-STAGING sweep leaves behind when the upload
+        // never landed.
+        await prisma.receiptIntake.update({
+            where: { id },
+            data: { state: "NEEDS_REVIEW", stateReason: "file-missing" },
+        });
+
+        // The client comes back with the correct document — a DIFFERENT hash
+        // from the one it first announced, which for a STAGING row would be a
+        // sourceRef-conflict. Here there are no verified bytes to protect.
+        const rearmed = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(rearmed.status()).toBe(200);
+        const rearmedBody = await rearmed.json();
+        expect(rearmedBody.id).toBe(id);
+        expect(rearmedBody.recovered).toBe(true, "a new URL, not alreadyReceived");
+        expect(rearmedBody.uploadUrl).toBeTruthy();
+        const armed = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(armed?.expectedSha256).toBe(sha(PNG_BASE64), "the new hash is what finalize will verify");
+        expect(armed?.state).toBe("NEEDS_REVIEW", "still parked until the bytes actually land");
+
+        // "Upload": the spec cannot PUT to Supabase, so real bytes are put at a
+        // path by the single-shot route and the row is pointed at them — the
+        // same seeding trick the sha-mismatch case above uses.
+        const seeded = await request.post(INTAKE_PATH, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: intakeBody({ sourceRef: `${REF_PREFIX}swept-restart-src` }),
+            maxRedirects: 0,
+        });
+        expect(seeded.status()).toBe(200);
+        const seededRow = await prisma.receiptIntake.findUnique({ where: { id: (await seeded.json()).id } });
+        minted.push(seededRow!.id);
+        await prisma.receiptIntake.update({ where: { id }, data: { storagePath: seededRow!.storagePath } });
+
+        const finalized = await request.post(`${INTAKE_PATH}/${id}/finalize`, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: "{}",
+            maxRedirects: 0,
+        });
+        expect(finalized.status()).toBe(200);
+        const done = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(done?.state).toBe("RECEIVED", "the swept row recovered all the way to published");
+        expect(done?.stateReason).toBeNull();
+        expect(done?.fileSha256).toBe(sha(PNG_BASE64));
+    });
+
+    test("a park a re-upload CANNOT fix still answers alreadyReceived", async ({ request }) => {
+        // The control. Only file-missing and sha-mismatch are recoverable; a
+        // row parked on a human's decision must not be handed a fresh URL that
+        // would let a client overwrite the document under review.
+        const ref = `${REF_PREFIX}swept-notrecoverable`;
+        const first = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(first.status()).toBe(200);
+        const { id, storagePath } = await first.json();
+        minted.push(id);
+        await prisma.receiptIntake.update({
+            where: { id },
+            data: { state: "NEEDS_REVIEW", stateReason: "vendor-mismatch" },
+        });
+
+        const again = await request.post(startPath, {
+            headers: { "content-type": "application/json", "x-receipt-intake-secret": SECRET },
+            data: JSON.stringify({ source: "drive", sourceRef: ref, mimeType: "image/png", sha256: sha(PNG_BASE64) }),
+            maxRedirects: 0,
+        });
+        expect(again.status()).toBe(200);
+        const body = await again.json();
+        expect(body.alreadyReceived).toBe(true);
+        expect(body.uploadUrl).toBeUndefined();
+        const row = await prisma.receiptIntake.findUnique({ where: { id } });
+        expect(row?.storagePath).toBe(storagePath, "nothing was re-armed");
+        expect(row?.stateReason).toBe("vendor-mismatch");
+    });
 });
 
 test.describe("round-9 intake contracts", () => {

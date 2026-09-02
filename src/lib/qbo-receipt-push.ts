@@ -225,6 +225,18 @@ export interface QboReceiptPushDependencies {
      * the caller's last chance to check it still owns the row.
      */
     onBeforeCreate?: () => Promise<void>;
+    /**
+     * Invoked when the idempotency query finds THIS file's Purchase already in
+     * QuickBooks, immediately before anything else is done with it.
+     *
+     * The alreadyExists branch returns WITHOUT ever reaching qbCreateFn, so
+     * `onBeforeCreate` never fires on it. That left the caller unable to tell
+     * "a Purchase exists for this row" from "nothing was ever sent" — and a row
+     * that exhausted its retries on this path would hand back its dedup key
+     * while a real Purchase sat in the books, so a resubmission would book the
+     * same receipt twice. This hook is that signal.
+     */
+    onExistingPurchase?: () => Promise<void>;
     ensureVendorFn: (tokens: QBTokens, name: string) => Promise<string>;
     // Injectable (unlike the plain re-export of ensureQBCustomer) because the
     // customer is now resolved on EVERY create — there is no more per-client
@@ -671,6 +683,10 @@ export async function createQBReceiptPurchase(
         if (existing.length > 1 || !(existing[0].PrivateNote ?? "").includes(marker)) {
             return { ok: false, reason: "docnumber-conflict", docNumber };
         }
+        // THE PURCHASE EXISTS. Say so before doing anything else with it: the
+        // attachment re-check below is a QBO round trip that can fail, and the
+        // caller still has to know a Purchase is there.
+        await deps.onExistingPurchase?.();
         // The Purchase exists, but that does NOT mean the receipt file made it
         // across. The common way to reach this branch is a first attempt whose
         // Purchase response was lost (timeout/kill) AFTER QBO committed it —

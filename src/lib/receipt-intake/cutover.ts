@@ -49,3 +49,68 @@ export function parseCutoverBoundary(value: string | null | undefined): Date | n
     if (!Number.isFinite(at.getTime())) return null;
     return at;
 }
+
+/** One parked shadow row, as the cutover sees it. */
+export interface CutoverCandidate {
+    id: string;
+    source: string;
+    sourceRef: string;
+    archivedByV1: boolean;
+    createdAt: Date;
+}
+
+export interface CutoverTriage {
+    /** v1 booked it. Retire — SHADOW_DONE, never booked here. */
+    evidenced: string[];
+    /** Nobody booked it (or we can collapse a double). Hand to v2. */
+    unevidenced: string[];
+    /** Cannot be settled from data. A human checks QuickBooks. */
+    quarantined: string[];
+}
+
+/** The Drive file id a row books under, or null when it has no shared identity. */
+export function driveFileIdOf(row: { source: string; sourceRef: string }): string | null {
+    return row.source === "drive" && row.sourceRef.startsWith("drive:")
+        ? row.sourceRef.slice("drive:".length)
+        : null;
+}
+
+/**
+ * Split the shadow backlog three ways.
+ *
+ * EVIDENCE OUTRANKS THE TIMESTAMP. The old rule looked only at rows older than
+ * the boundary, so a file v1 had already booked but the forwarder handed over
+ * AFTER the flip (a queued send, a retry, a slow archive step) never reached
+ * the evidence check at all: it went straight into the requeue and v2 booked a
+ * second Purchase. For an email or chat row that is unrecoverable by
+ * idempotency — v2 books under the intake UUID, which v1 never saw — so it is
+ * a real duplicate in the real books.
+ *
+ * The boundary only decides what to do with rows carrying NO evidence:
+ *   - after it   -> v1 was not booking; v2 takes it.
+ *   - before it, Drive row -> v2 takes it. Safe because it books under the
+ *     Drive file id, so a v1/v2 overlap collapses into one Purchase.
+ *   - before it, anything else -> quarantine. Booking risks double-paying and
+ *     retiring risks losing a real expense, so a human decides.
+ */
+export function triageCutoverRows(
+    candidates: CutoverCandidate[],
+    boundary: Date,
+    bookedByV1: ReadonlySet<string>,
+): CutoverTriage {
+    const triage: CutoverTriage = { evidenced: [], unevidenced: [], quarantined: [] };
+    for (const row of candidates) {
+        const driveId = driveFileIdOf(row);
+        if (row.archivedByV1 || (driveId && bookedByV1.has(driveId))) {
+            triage.evidenced.push(row.id);
+            continue;
+        }
+        if (row.createdAt >= boundary) {
+            triage.unevidenced.push(row.id);
+            continue;
+        }
+        if (driveId) triage.unevidenced.push(row.id);
+        else triage.quarantined.push(row.id);
+    }
+    return triage;
+}

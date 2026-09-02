@@ -27,18 +27,37 @@ const finalize = readFileSync(
     "utf8",
 );
 
+type Row = Record<string, unknown>;
+
 interface Store {
-    rows: Set<string>;
+    rows: Row[];
     events: { id: string; data: Record<string, unknown> }[];
     committed: boolean;
 }
 
-/** A $transaction that really rolls back: the fake state is only kept on commit. */
-function client(rows: string[], opts: { undeletable?: boolean } = {}): { db: RejectClient; store: Store } {
-    const store: Store = { rows: new Set(rows), events: [], committed: false };
+const parked = (over: Row = {}): Row => ({
+    id: "row-1",
+    state: "STAGING",
+    stateReason: null,
+    claimToken: null,
+    storagePath: "receipts/intake/row-1.bin",
+    ...over,
+});
+
+/**
+ * A $transaction that really rolls back, over rows that really match a where.
+ *
+ * The fence is the whole subject here, so the fake has to evaluate it rather
+ * than match on the id like the code used to.
+ */
+function client(rows: Row[], onTx?: (store: Store) => void): { db: RejectClient; store: Store } {
+    const store: Store = { rows: rows.map(r => ({ ...r })), events: [], committed: false };
     const db: RejectClient = {
         $transaction: async fn => {
-            const stagedRows = new Set(store.rows);
+            // A concurrent writer, running between the caller's read and this
+            // transaction — the race this fence exists for.
+            onTx?.(store);
+            let staged = store.rows.map(r => ({ ...r }));
             const stagedEvents: Store["events"] = [];
             let seq = 0;
             const tx: RejectTxClient = {
@@ -51,14 +70,15 @@ function client(rows: string[], opts: { undeletable?: boolean } = {}): { db: Rej
                 },
                 receiptIntake: {
                     deleteMany: async ({ where }) => {
-                        if (opts.undeletable) return { count: 0 };
-                        return { count: stagedRows.delete(where.id) ? 1 : 0 };
+                        const matches = staged.filter(row =>
+                            Object.entries(where).every(([k, v]) => row[k] === v));
+                        staged = staged.filter(row => !matches.includes(row));
+                        return { count: matches.length };
                     },
-                    findUnique: async ({ where }) => (stagedRows.has(where.id) ? { id: where.id } : null),
                 },
             };
             const out = await fn(tx);
-            store.rows = stagedRows;
+            store.rows = staged;
             store.events.push(...stagedEvents);
             store.committed = true;
             return out;
@@ -68,44 +88,71 @@ function client(rows: string[], opts: { undeletable?: boolean } = {}): { db: Rej
 }
 
 test("a reject deletes the row and queues the object in ONE transaction", async () => {
-    const { db, store } = client(["row-1"]);
-    const injected = await rejectRowAndQueueCleanup("row-1", "receipts/intake/row-1.bin", "unsupported-type", db);
+    const { db, store } = client([parked()]);
+    const injected = await rejectRowAndQueueCleanup(parked() as never, "unsupported-type", db);
     assert.equal(injected.ok, true);
-    assert.equal(store.rows.has("row-1"), false, "the row is gone");
+    assert.deepEqual(store.rows, [], "the row is gone");
     assert.equal(store.events.length, 1, "and exactly one cleanup is queued");
     assert.equal(store.events[0].data.status, "pending");
     assert.match(String(store.events[0].data.detail), /receipts\/intake\/row-1\.bin/);
 });
 
-test("a row that survives the delete rolls the queue entry back and reports failure", async () => {
-    // The caller must then KEEP the object: a row that still exists may still
-    // point at those bytes, so deleting them would destroy a live receipt.
-    const { db, store } = client(["row-1"], { undeletable: true });
-    const result = await rejectRowAndQueueCleanup("row-1", "receipts/intake/row-1.bin", "empty-file", db);
+test("PUBLISH vs REJECT: a row published mid-reject is not deleted, and nothing is queued", async () => {
+    // The race: /finalize inspects the object, decides it is unsupported, and
+    // in that window a concurrent publisher (another finalize, or the sweeper)
+    // moves the row to RECEIVED and seals its object to the canonical path.
+    // Deleting by id would destroy a PUBLISHED receipt and queue its live
+    // bytes for deletion.
+    const { db, store } = client([parked()], s => {
+        s.rows = [parked({ state: "RECEIVED", storagePath: "receipts/row-1/abc.png" })];
+    });
+    const result = await rejectRowAndQueueCleanup(parked() as never, "unsupported-file-type", db);
     assert.equal(result.ok, false);
-    assert.equal(store.committed, false, "nothing committed");
-    assert.deepEqual(store.events, [], "no orphan record for a row that is still there");
-    assert.equal(store.rows.has("row-1"), true);
+    assert.equal(store.committed, false, "the whole transaction rolled back");
+    assert.deepEqual(store.events, [], "no cleanup naming a path a live row points at");
+    assert.equal(store.rows.length, 1, "the published row survives");
+    assert.equal(store.rows[0].state, "RECEIVED");
 });
 
-test("rejecting an already-deleted row still queues the cleanup", async () => {
-    // The retry of a reject whose response was lost. deleteMany counts zero,
-    // but the row is ABSENT, which is the condition that matters — and its
-    // object is unreferenced, so it still has to be queued.
-    const { db, store } = client([], {});
-    const result = await rejectRowAndQueueCleanup("row-1", "receipts/intake/row-1.bin", "unsupported-type", db);
-    assert.equal(result.ok, true);
-    assert.equal(store.events.length, 1);
+test("a row re-parked or claimed mid-reject also loses the fence", async () => {
+    for (const moved of [
+        parked({ stateReason: "file-missing", state: "NEEDS_REVIEW" }),
+        parked({ claimToken: "worker-1" }),
+        parked({ storagePath: "receipts/intake/row-1-other.bin" }),
+    ]) {
+        const { db, store } = client([parked()], s => { s.rows = [moved]; });
+        const result = await rejectRowAndQueueCleanup(parked() as never, "empty-file", db);
+        assert.equal(result.ok, false, JSON.stringify(moved));
+        assert.deepEqual(store.events, [], "nothing queued");
+        assert.equal(store.rows.length, 1, "nothing deleted");
+    }
 });
 
-test("an unconfirmed reject answers 503 and keeps the object", () => {
+test("a row that is already GONE is not treated as a successful reject", async () => {
+    // An absent row is a row somebody else accounted for. Queueing its path for
+    // deletion here is exactly how a live object gets swept: the retry of a
+    // reject can arrive after the id was reused by a re-created row, or after
+    // the object was sealed under a path a new row points at.
+    const { db, store } = client([]);
+    const result = await rejectRowAndQueueCleanup(parked() as never, "unsupported-type", db);
+    assert.equal(result.ok, false);
+    assert.deepEqual(store.events, []);
+});
+
+test("a lost reject fence answers 409 publish-conflict and keeps the object", () => {
     const branch = finalize.slice(finalize.indexOf("const rejected = await rejectRowAndQueueCleanup"));
     const head = branch.slice(0, branch.indexOf("settleQueuedCleanup"));
-    assert.match(head, /reject-failed/);
-    assert.match(head, /status: 503/);
+    // The reject is fenced on what was OBSERVED, so losing it means the row is
+    // not ours to reject — a 409 the caller can retry, never a 2xx and never a
+    // deletion.
+    assert.match(head, /state: row\.state/);
+    assert.match(head, /stateReason: row\.stateReason/);
+    assert.match(head, /storagePath: row\.storagePath/);
+    assert.match(head, /publish-conflict/);
+    assert.match(head, /status: 409/);
     assert.ok(
         !/deleteObjectOrRecord|removeSecureDoc/.test(head),
-        "no object deletion on the unconfirmed path",
+        "no object deletion on the lost-fence path",
     );
 });
 
@@ -145,4 +192,44 @@ test("a heal that loses its CAS deletes the object it just uploaded", () => {
         body.indexOf("payload.storagePath !== existing.storagePath") < body.indexOf("heal-lost-race"),
         "and never deletes the path the surviving row still points at",
     );
+});
+
+// ── /start re-arms a recoverable park instead of claiming we hold it ────────
+
+const start = readFileSync(
+    path.join(ROOT, "src/app/api/receipts/intake/start/route.ts"),
+    "utf8",
+);
+
+test("/start hands a recoverable park a NEW url, and asks the shared rule which parks those are", () => {
+    // Answering alreadyReceived here told the forwarder we held a receipt we
+    // did not hold — and it deletes its only copy on that answer.
+    assert.match(start, /finalizeDisposition\(existing\) === "publish"/);
+    const branch = start.slice(start.indexOf("if (recoverable) {"));
+    const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
+    assert.match(body, /recovered: true/);
+    assert.match(body, /expectedSha256,/, "the sha the client is about to upload is re-armed");
+    assert.match(body, /fileSha256: "",/, "and the stale stored hash is cleared");
+    // Fenced like every other publish-path write, and a lost fence writes
+    // nothing rather than pointing a live row at an empty path.
+    assert.match(body, /where: \{ id: existing\.id, \.\.\.publishFence\(existing\) \}/);
+    assert.match(body, /publish-conflict/);
+});
+
+test("the re-arm branch runs BEFORE the identity check, and only for a parked row", () => {
+    // For a STAGING row the sha check still stands: it is what stops receipt B
+    // from being handed a URL over receipt A's verified bytes.
+    assert.match(start, /existing\.state !== "STAGING"\s*\n\s*&& finalizeDisposition\(existing\) === "publish"/);
+    assert.ok(
+        start.indexOf("if (recoverable) {") < start.indexOf("const knownSha ="),
+        "the recoverable branch is taken before the identity check",
+    );
+    assert.match(start, /alreadyReceived: true/, "everything else still answers alreadyReceived");
+});
+
+test("a re-arm that changes the extension does not orphan the old object", () => {
+    const branch = start.slice(start.indexOf("if (recoverable) {"));
+    const body = branch.slice(0, branch.indexOf("// IDENTITY MUST BE PROVEN"));
+    assert.match(body, /retryPath !== existing\.storagePath/);
+    assert.match(body, /deleteObjectOrRecord\(existing\.storagePath, "start-rearmed-repath"\)/);
 });

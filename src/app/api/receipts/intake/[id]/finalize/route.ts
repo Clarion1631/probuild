@@ -229,12 +229,30 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         // are ONE transaction. A best-effort delete followed by a best-effort
         // cleanup could drop the row and lose the object with nothing left
         // referencing or remembering it.
-        const rejected = await rejectRowAndQueueCleanup(id, row.storagePath, check.reason);
+        const rejected = await rejectRowAndQueueCleanup(
+            {
+                id,
+                state: row.state,
+                stateReason: row.stateReason,
+                storagePath: row.storagePath,
+            },
+            check.reason,
+        );
         if (!rejected.ok) {
-            // The row's deletion is not confirmed, so it may still point at
-            // these bytes. Keep the object and answer retryably; an identical
-            // retry re-validates and rejects again.
-            return NextResponse.json({ ok: false, reason: "reject-failed", retryable: true }, { status: 503 });
+            // The fence lost, so this row is not ours to reject: a publisher
+            // moved it (or claimed it) while we were inspecting the object.
+            // NOTHING is deleted — not the row, not the object, not even a
+            // cleanup record — because those bytes may now belong to a
+            // published receipt.
+            return NextResponse.json(
+                {
+                    ok: false,
+                    error: "publish-conflict",
+                    reason: "this row changed while it was being rejected; retry",
+                    retryable: true,
+                },
+                { status: 409 },
+            );
         }
         await settleQueuedCleanup(rejected.eventId, row.storagePath);
         const status = check.reason.startsWith("file-too-large") ? 413 : 400;

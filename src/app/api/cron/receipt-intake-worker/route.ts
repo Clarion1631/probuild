@@ -13,7 +13,9 @@ import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
-import { resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
+import {
+    driveFileIdOf,
+    triageCutoverRows, resolveCutoverBoundary } from "@/lib/receipt-intake/cutover";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
 import { isCostCodeAllowedForProject, resolveProjectPhaseCodes } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
@@ -152,15 +154,26 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 // rows this applies to: they book under the DRIVE FILE ID, so
                 // QBO's DocNumber/requestid idempotency collapses a v1/v2
                 // overlap into one Purchase.
+                // EVERY parked row, not just the ones older than the
+                // boundary. Evidence outranks the timestamp: the forwarder can
+                // hand over a file v1 had ALREADY booked minutes after the
+                // flip (a queued send, a retry, a slow archive step), and
+                // filtering by createdAt first meant those rows never reached
+                // the evidence check at all — they went straight into the
+                // requeue and v2 booked a second Purchase for an email or chat
+                // receipt, where there is no shared identity to collapse it.
+                // The boundary is only used to decide what to do with rows that
+                // have NO evidence either way.
                 const candidates = await tx.receiptIntake.findMany({
-                    where: { ...parked, createdAt: { lt: opts.boundary } },
-                    select: { id: true, source: true, sourceRef: true, archivedByV1: true },
+                    where: parked,
+                    select: {
+                        id: true, source: true, sourceRef: true,
+                        archivedByV1: true, createdAt: true,
+                    },
                 });
 
                 const driveIds = candidates
-                    .map(r => (r.source === "drive" && r.sourceRef.startsWith("drive:")
-                        ? r.sourceRef.slice("drive:".length)
-                        : null))
+                    .map(driveFileIdOf)
                     .filter((v): v is string => !!v);
 
                 const bookedByV1 = driveIds.length
@@ -194,17 +207,10 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                 //                     double-paying; retiring risks losing a
                 //                     real expense. A human checks QBO and uses
                 //                     "book anyway".
-                const evidenced: string[] = [];
-                const unevidenced: string[] = [];
-                const quarantined: string[] = [];
-                for (const row of candidates) {
-                    const driveId = row.source === "drive" && row.sourceRef.startsWith("drive:")
-                        ? row.sourceRef.slice("drive:".length)
-                        : null;
-                    if (row.archivedByV1 || (driveId && bookedByV1.has(driveId))) evidenced.push(row.id);
-                    else if (driveId) unevidenced.push(row.id);
-                    else quarantined.push(row.id);
-                }
+                // ONE implementation of the three-way split, in the lib, so
+                // it is testable without standing up a cron route.
+                const { evidenced, unevidenced, quarantined } =
+                    triageCutoverRows(candidates, opts.boundary, bookedByV1);
 
                 if (evidenced.length) {
                     const retired = await tx.receiptIntake.updateMany({
@@ -229,18 +235,17 @@ async function claim(opts: CutoverRequest): Promise<ClaimResult | null> {
                     shadowQuarantined = held.count;
                 }
 
-                // Everything else — after the boundary, or before it with no
-                // evidence — is v2's to book.
-                const handed = await tx.receiptIntake.updateMany({
-                    where: {
-                        OR: [
-                            { ...parked, createdAt: { gte: opts.boundary } },
-                            ...(unevidenced.length ? [{ id: { in: unevidenced } }] : []),
-                        ],
-                    },
-                    data: { dryRun: false, nextRetryAt: null },
-                });
-                requeued = handed.count;
+                // Everything else is v2's to book. The list is built row by
+                // row above rather than re-derived from a createdAt predicate
+                // here, so the two can never disagree about which rows the
+                // evidence check already claimed.
+                if (unevidenced.length) {
+                    const handed = await tx.receiptIntake.updateMany({
+                        where: { id: { in: unevidenced } },
+                        data: { dryRun: false, nextRetryAt: null },
+                    });
+                    requeued = handed.count;
+                }
 
                 if (shadowRetired > 0 || requeued > 0 || shadowQuarantined > 0) {
                     console.log("[cron/receipt-intake-worker] cutover", JSON.stringify({
@@ -623,8 +628,8 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
             isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
             isPushPaused: () => isPaused(PAUSE_KEYS.receiptPush),
             getTokens: deadline => getFreshQBTokens(deadline),
-            createPurchase: (tokens, input, deadline, onBeforeCreate) =>
-                createQBReceiptPurchase(tokens, input, { onBeforeCreate }, deadline),
+            createPurchase: (tokens, input, deadline, onBeforeCreate, onExistingPurchase) =>
+                createQBReceiptPurchase(tokens, input, { onBeforeCreate, onExistingPurchase }, deadline),
             downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
             logEvent: logAutomationEvent,
             now: () => new Date(),

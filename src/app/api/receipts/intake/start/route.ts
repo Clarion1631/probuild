@@ -9,6 +9,8 @@ import { authenticateIntake } from "@/lib/receipt-intake/intake-auth";
 import { ACCEPTED_MIME_TYPES, EXT_BY_MIME } from "@/lib/receipt-intake/file-type";
 import { decideSource, MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { authorizePhase } from "@/lib/receipt-intake/late-fields";
+import { finalizeDisposition, publishFence } from "@/lib/receipt-intake/stored-object";
+import { deleteObjectOrRecord } from "@/lib/receipt-intake/storage-cleanup";
 import { isCostCodeAllowedForProject } from "@/lib/project-phases";
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 
@@ -164,7 +166,7 @@ export async function POST(req: Request) {
             const existing = await prisma.receiptIntake.findUnique({
                 where: { sourceRef: decided.sourceRef },
                 select: {
-                    id: true, sourceRef: true, state: true, storagePath: true,
+                    id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
                 },
             });
@@ -174,6 +176,74 @@ export async function POST(req: Request) {
                 existing.createdById === auth.user.id ||
                 auth.user.role === "ADMIN";
             if (!maySee) return NextResponse.json({ ok: false, error: "sourceRef-conflict" }, { status: 409 });
+
+            // A ROW THE SWEEPER PARKED AS RECOVERABLE GETS A NEW URL, NOT
+            // "alreadyReceived".
+            //
+            // file-missing and sha-mismatch both mean the bytes we hold are not
+            // the document (or are not there at all), and the row never
+            // published. Answering alreadyReceived told the forwarder we had a
+            // receipt we did not have — and it deletes its only copy on that
+            // answer — leaving the row parked forever with nothing to recover
+            // from. So the upload is re-armed instead: a fresh signed URL, and
+            // the sha the caller is about to upload becomes the expected one.
+            //
+            // The identity check below is deliberately skipped for these two:
+            // it exists to stop receipt B overwriting receipt A's VERIFIED
+            // bytes, and here there are none to protect.
+            const recoverable = existing.state !== "STAGING"
+                && finalizeDisposition(existing) === "publish";
+            if (recoverable) {
+                const retryPath = `receipts/intake/${existing.id}.${ext}`;
+                const rearmed = await signUpload(retryPath);
+                if (!rearmed) {
+                    return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                }
+                // Fenced on the EXACT park, same rule as every other publish
+                // path: losing it means somebody moved the row while we were
+                // signing, and re-arming it then would point a live row at an
+                // empty path.
+                const { count } = await prisma.receiptIntake.updateMany({
+                    where: { id: existing.id, ...publishFence(existing) },
+                    data: {
+                        storagePath: retryPath,
+                        expectedSha256,
+                        // The stored hash is what /finalize verifies against.
+                        // Whatever was recorded describes bytes that are gone
+                        // or were never right.
+                        fileSha256: "",
+                        mimeType,
+                        fileSize: 0,
+                        nextRetryAt: null,
+                    },
+                });
+                if (count === 0) {
+                    return NextResponse.json(
+                        {
+                            ok: false,
+                            error: "publish-conflict",
+                            reason: "this row changed while a new upload URL was being issued; retry",
+                            retryable: true,
+                            existingId: existing.id,
+                        },
+                        { status: 409 },
+                    );
+                }
+                // A different declared type means a different extension, so the
+                // old object (if any) is now unreferenced.
+                if (retryPath !== existing.storagePath) {
+                    await deleteObjectOrRecord(existing.storagePath, "start-rearmed-repath");
+                }
+                return NextResponse.json({
+                    ok: true,
+                    resumed: true,
+                    recovered: true,
+                    id: existing.id,
+                    state: existing.state,
+                    maxBytes: MAX_STORED_BYTES,
+                    ...rearmed,
+                });
+            }
 
             // IDENTITY MUST BE PROVEN BEFORE AN UPSERT URL IS REISSUED.
             //
@@ -205,7 +275,9 @@ export async function POST(req: Request) {
             }
             const resumed = await signUpload(existing.storagePath);
             if (!resumed) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
-            return NextResponse.json({ ok: true, resumed: true, id: existing.id, ...resumed });
+            return NextResponse.json({
+                ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resumed,
+            });
         }
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
             return NextResponse.json({ ok: false, reason: "unknown-project-or-cost-code" }, { status: 400 });

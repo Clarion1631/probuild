@@ -110,17 +110,29 @@ export async function recordPendingCleanup(storagePath: string, reason: string):
 export interface RejectTxClient {
     automationEvent: { create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }> };
     receiptIntake: {
-        deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
-        findUnique(args: { where: { id: string }; select: { id: true } }): Promise<{ id: string } | null>;
+        deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
     };
+}
+
+/**
+ * The row as it was OBSERVED, which is what the delete is fenced on.
+ *
+ * Same shape and same reason as publishFence: a reject and a publish race for
+ * the same row, and each must lose cleanly rather than act on a row the other
+ * has already moved.
+ */
+export interface RejectFence {
+    id: string;
+    state: string;
+    stateReason: string | null;
+    storagePath: string;
 }
 export interface RejectClient {
     $transaction<T>(fn: (tx: RejectTxClient) => Promise<T>): Promise<T>;
 }
 
 export async function rejectRowAndQueueCleanup(
-    rowId: string,
-    storagePath: string,
+    row: RejectFence,
     reason: string,
     db: RejectClient = prisma as unknown as RejectClient,
 ): Promise<{ ok: true; eventId: string } | { ok: false }> {
@@ -132,27 +144,54 @@ export async function rejectRowAndQueueCleanup(
                     status: "pending",
                     reason: reason.slice(0, 500),
                     source: "receipt-intake",
-                    detail: JSON.stringify({ storagePath, rowId }),
+                    detail: JSON.stringify({ storagePath: row.storagePath, rowId: row.id }),
                 },
                 select: { id: true },
             });
-            await tx.receiptIntake.deleteMany({ where: { id: rowId } });
-            // deleteMany's count is 0 both when somebody else already deleted
-            // the row (fine — it is gone, which is all we need) and when the id
-            // never matched. Only the row's ABSENCE is the condition worth
-            // committing on, so assert that directly.
-            const survivor = await tx.receiptIntake.findUnique({ where: { id: rowId }, select: { id: true } });
-            if (survivor) throw new Error(`row ${rowId} still exists after delete`);
+            // THE FULL FENCE, and EXACTLY ONE ROW.
+            //
+            // A reject races a publish for the same row: a concurrent /finalize
+            // (or the sweeper) can move it to RECEIVED, re-park it under a
+            // different reason, or seal its object to a new path in the time
+            // this call spent inspecting the bytes. Deleting by id alone
+            // destroys that row and, worse, queues ITS object for deletion —
+            // the published receipt's own bytes. Pinning the observed state,
+            // reason and storagePath means the loser deletes nothing.
+            //
+            // "Already gone" is deliberately NOT treated as success: an absent
+            // row is a row somebody else accounted for, and queueing its path
+            // for deletion here is how a live object gets swept.
+            const { count } = await tx.receiptIntake.deleteMany({
+                where: {
+                    id: row.id,
+                    state: row.state,
+                    stateReason: row.stateReason,
+                    claimToken: null,
+                    storagePath: row.storagePath,
+                },
+            });
+            if (count !== 1) throw new RejectFenceLost(row.id);
             return event.id;
         });
         return { ok: true, eventId };
     } catch (error) {
+        // Either way NOTHING is committed: the queue entry rolls back with the
+        // delete, so there is no cleanup record naming a path a live row still
+        // points at.
         console.error(
             "[receipts/intake] reject transaction failed",
-            rowId,
+            row.id,
             error instanceof Error ? error.name : "error",
         );
         return { ok: false };
+    }
+}
+
+/** The delete matched no row: somebody else moved it. Never a partial commit. */
+class RejectFenceLost extends Error {
+    constructor(rowId: string) {
+        super(`reject fence lost for ${rowId}`);
+        this.name = "RejectFenceLost";
     }
 }
 

@@ -196,6 +196,12 @@ export interface BookDependencies {
         deadline: RouteDeadline | undefined,
         /** Invoked by the QBO core immediately before the create. */
         onBeforeCreate: () => Promise<void>,
+        /**
+         * Invoked by the QBO core when it finds this file's Purchase ALREADY in
+         * QuickBooks — a path that never reaches the create, so `onBeforeCreate`
+         * does not fire on it.
+         */
+        onExistingPurchase: () => Promise<void>,
     ) => Promise<CreateQBReceiptPurchaseResult>;
     /**
      * The invocation's ONE absolute deadline. Undefined = unbounded (tests).
@@ -430,7 +436,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         fileContentType: row.mimeType,
     };
 
-    const sent = { attempted: false };
+    // TWO WAYS a Purchase can exist for this row by the time we are done:
+    // this attempt posted one, or the idempotency query found one an earlier
+    // attempt posted. Both mean the strong dedup key must be RETAINED when the
+    // row parks — releasing it lets a resubmission book the same receipt twice.
+    const sent = { attempted: false, purchaseKnownToExist: false };
 
     let result: CreateQBReceiptPurchaseResult;
     try {
@@ -465,21 +475,36 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // that THROWS when this worker has been superseded, which aborts the
         // create so a zombie cannot post a Purchase the live worker is about to
         // post as well.
-        result = await deps.createPurchase(tokens, input, deps.deadline, async () => {
-            const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
-            if (!stillOurs) throw new StaleClaimError();
-            sent.attempted = true;
-        });
+        result = await deps.createPurchase(
+            tokens,
+            input,
+            deps.deadline,
+            async () => {
+                const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
+                if (!stillOurs) throw new StaleClaimError();
+                sent.attempted = true;
+            },
+            // FENCED THE SAME WAY, for the same reason: the persisted flag is
+            // what a later pass reads, and a superseded worker must not write it
+            // (or carry on) at all.
+            async () => {
+                const stillOurs = await deps.markSendAttempted(row.id, row.claimToken);
+                if (!stillOurs) throw new StaleClaimError();
+                sent.purchaseKnownToExist = true;
+            },
+        );
     } catch (error) {
         // A lost CAS from inside the create hook: nothing was sent.
         if (error instanceof StaleClaimError) return { outcome: "stale" };
         const terminal = terminalReasonFor(error);
         // A send WAS attempted: QBO may hold a Purchase whose response we lost,
         // so the key stays claimed even though the row is parked.
-        if (terminal) return { outcome: "needs-review", reason: terminal, releaseStrongKey: !sent.attempted };
+        if (terminal) {
+            return { outcome: "needs-review", reason: terminal, releaseStrongKey: !purchaseMayExist(sent) };
+        }
         // QBTimeoutError, QBNotConnectedError, network/fetch errors, QBO
         // 429/5xx and DB errors are all transport-class: try again later.
-        return retry(row, deps, now, describe(error), sent.attempted);
+        return retry(row, deps, now, describe(error), purchaseMayExist(sent));
     }
 
     if (!result.ok) {
@@ -529,7 +554,7 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                 releaseStrongKey: false,
             };
         }
-        return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`, sent.attempted);
+        return retry(row, deps, now, `${ATTACHMENT_FAILED_PREFIX}${result.attachment}`, purchaseMayExist(sent));
     }
 
     // 5. One transaction: the Expense and the row's BOOKED state land together
@@ -681,8 +706,19 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
         // DocNumber lookup will find it and return alreadyExists:true — and the
         // key must be RETAINED, which is why this attempt's send flag is passed
         // rather than the row's stale copy.
-        return retry(row, deps, now, describe(error), sent.attempted);
+        return retry(row, deps, now, describe(error), purchaseMayExist(sent));
     }
+}
+
+/**
+ * Does QuickBooks (possibly) hold a Purchase for this row after this attempt?
+ *
+ * `attempted` covers a create we issued — including one whose response we lost.
+ * `purchaseKnownToExist` covers the idempotency query finding one an earlier
+ * attempt posted, which is the path that never reaches the create at all.
+ */
+function purchaseMayExist(sent: { attempted: boolean; purchaseKnownToExist: boolean }): boolean {
+    return sent.attempted || sent.purchaseKnownToExist;
 }
 
 function describe(error: unknown): string {
@@ -766,15 +802,16 @@ function retry(
     now: Date,
     reason: string,
     /**
-     * Whether THIS attempt reached the create. `row.sendAttempted` is the value
-     * read when the row was claimed, so it is stale the moment
-     * markSendAttempted runs — and a failure AFTER the create (the attachment
-     * leg, the Expense commit) would have been judged on it and wrongly
-     * released the key of a row that really does have a Purchase.
+     * Whether THIS attempt learned that a Purchase may exist — either because it
+     * reached the create, or because the idempotency query found one already
+     * there. `row.sendAttempted` is the value read when the row was CLAIMED, so
+     * it is stale the moment the fenced mark runs, and a failure after that
+     * point (the attachment leg, the Expense commit) judged on it alone would
+     * wrongly release the key of a row that really does have a Purchase.
      */
-    sentThisAttempt = false,
+    purchaseMayExistNow = false,
 ): BookResult {
-    const sendAttempted = row.sendAttempted || sentThisAttempt;
+    const sendAttempted = row.sendAttempted || purchaseMayExistNow;
     const attempts = row.attempts + 1;
     // `>=`, so MAX_BOOK_ATTEMPTS reads as "20 attempts in total" rather than 21.
     if (attempts >= MAX_BOOK_ATTEMPTS) {

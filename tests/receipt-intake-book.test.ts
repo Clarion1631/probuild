@@ -10,6 +10,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
     appliedTaxCents,
     attachmentBlocker,
@@ -42,6 +44,28 @@ import {
 function atCreate<T>(fn: (...args: any[]) => Promise<T>) {
     return async (tokens: any, input: any, deadline: any, onBeforeCreate?: () => Promise<void>) => {
         await onBeforeCreate?.();
+        return fn(tokens, input, deadline);
+    };
+}
+
+/**
+ * A stub for the ALREADY-EXISTS branch, mirroring the real control flow.
+ *
+ * createQBReceiptPurchase returns there from the idempotency query and never
+ * reaches qbCreateFn, so `onBeforeCreate` does NOT fire — only
+ * `onExistingPurchase` does. A fake that called onBeforeCreate anyway would
+ * mark the row "sent" and hide the very bug this branch had: a Purchase that
+ * exists while the row believes nothing was ever sent.
+ */
+function atExisting<T>(fn: (...args: any[]) => Promise<T>) {
+    return async (
+        tokens: any,
+        input: any,
+        deadline: any,
+        _onBeforeCreate?: () => Promise<void>,
+        onExistingPurchase?: () => Promise<void>,
+    ) => {
+        await onExistingPurchase?.();
         return fn(tokens, input, deadline);
     };
 }
@@ -386,7 +410,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
     // response — exactly when a Purchase is most likely to be sitting in the
     // books without its image. It was the one path exempt from the check.
     const failing = recorder({
-        createPurchase: atCreate(async () => ({
+        createPurchase: atExisting(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
         })) as any,
     });
@@ -395,7 +419,7 @@ test("an EXISTING purchase is held to the SAME attachment standard", async () =>
     assert.equal(failing.expenses.length, 0, "and it is NOT booked meanwhile");
 
     const skipped = recorder({
-        createPurchase: atCreate(async () => ({
+        createPurchase: atExisting(async () => ({
             ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "skipped",
         })) as any,
     });
@@ -411,10 +435,10 @@ test("a previous attachment failure does NOT block the recovery attempt", async 
     // Short-circuiting on lastError made the stranded-receipt case permanent —
     // the opposite of what the guard was for.
     const r = recorder({
-        createPurchase: async (_t, input) => {
+        createPurchase: atExisting(async (_t: any, input: any) => {
             r.purchaseCalls.push(input);
             return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
-        },
+        }) as any,
     });
     const result = await bookReceipt(row({ lastError: "attachment-failed:failed:500" }), r.deps);
     assert.equal(result.outcome, "booked", "the recovery succeeded and the row books");
@@ -477,7 +501,7 @@ test("a plain network error retries; MAX_BOOK_ATTEMPTS means 20 attempts in TOTA
 
 test("alreadyExists books identically — the lost-response retry", async () => {
     const r = recorder({
-        createPurchase: atCreate(async (_t: any, input: any) => ({
+        createPurchase: atExisting(async (_t: any, input: any) => ({
             ok: true, qbPurchaseId: "QB-7", docNumber: input.fileId.slice(0, 21),
             alreadyExists: true, attachment: "already-attached",
         })) as any,
@@ -895,4 +919,81 @@ test("the BOOKED write is a CAS on state AND token", async () => {
     };
     await bookReceipt(row({ claimToken: "token-abc" }), r.deps);
     assert.deepEqual(wheres, [{ id: "intake-1", state: "BOOKING", claimToken: "token-abc" }]);
+});
+
+// ── A Purchase found by the idempotency query is still a Purchase ───────────
+
+test("the already-exists branch does NOT go through onBeforeCreate", async () => {
+    // The control for every test below: if the fake called onBeforeCreate here
+    // the row would look "sent" for the wrong reason and the bug would be
+    // invisible. The real core returns from the idempotency query.
+    const seen: string[] = [];
+    const r = recorder({
+        createPurchase: async (_t: any, _i: any, _d: any, onBeforeCreate: any, onExisting: any) => {
+            seen.push("create-called");
+            await onExisting?.();
+            void onBeforeCreate;
+            return { ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached" } as any;
+        },
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal(result.outcome, "booked");
+    assert.deepEqual(seen, ["create-called"]);
+    assert.deepEqual(r.sendMarks, ["intake-1"], "the EXISTING-purchase hook marked it, fenced the same way");
+});
+
+test("attempt 20 on an ALREADY-EXISTING purchase retains the strong key", async () => {
+    // The hole: this path never reaches the create, so `sendAttempted` stayed
+    // false — and a row that exhausted its retries here handed its dedup key
+    // back while a real Purchase sat in the books. The next submission of the
+    // same receipt would then book it a second time.
+    const r = recorder({
+        createPurchase: atExisting(async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:500",
+        })) as any,
+    });
+    const result = await bookReceipt(row({ attempts: 19, sendAttempted: false }), r.deps);
+    assert.equal((result as any).reason, "max-retries");
+    assert.equal((result as any).releaseStrongKey, false, "the Purchase EXISTS");
+    assert.deepEqual(r.sendMarks, ["intake-1"], "and the flag was persisted, not just held in memory");
+});
+
+test("a terminal attachment refusal on an existing purchase also retains the key", async () => {
+    const r = recorder({
+        createPurchase: atExisting(async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "failed:415",
+        })) as any,
+    });
+    const result = await bookReceipt(row(), r.deps);
+    assert.equal((result as any).reason, "attachment-refused:failed:415");
+    assert.equal((result as any).releaseStrongKey, false);
+});
+
+test("a STALE claim on the existing-purchase hook aborts, exactly like the create hook", async () => {
+    const r = recorder({
+        markSendAttempted: async () => false,
+        createPurchase: atExisting(async () => ({
+            ok: true, qbPurchaseId: "QB-1", docNumber: "d", alreadyExists: true, attachment: "already-attached",
+        })) as any,
+    });
+    assert.deepEqual(await bookReceipt(row(), r.deps), { outcome: "stale" });
+    assert.equal(r.expenses.length, 0, "a superseded worker books nothing");
+});
+
+test("the QBO core fires onExistingPurchase before it touches the attachment", () => {
+    // Ordering matters: the attachment re-check is a round trip that can fail,
+    // and the caller still has to know a Purchase is there.
+    const source = readFileSync(
+        path.join(__dirname, "..", "src/lib/qbo-receipt-push.ts"),
+        "utf8",
+    );
+    const branch = source.slice(source.indexOf("if (existing.length > 0) {"));
+    const body = branch.slice(0, branch.indexOf("alreadyExists: true"));
+    assert.match(body, /await deps\.onExistingPurchase\?\.\(\);/);
+    assert.ok(
+        body.indexOf("onExistingPurchase") < body.indexOf("ensureAttachmentOnExistingPurchase"),
+        "the signal precedes the attachment work",
+    );
+    // And the create hook is NOT fired on this path.
+    assert.ok(!body.includes("onBeforeCreate"), "onBeforeCreate belongs to the create path only");
 });
