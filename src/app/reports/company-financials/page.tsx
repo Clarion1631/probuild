@@ -5,6 +5,7 @@ import { formatCurrency } from "@/lib/utils";
 import { getSessionOrDev } from "@/lib/auth";
 import { canUseDevAuthFallback, getCurrentUserWithPermissions, hasPermission } from "@/lib/permissions";
 import { computeProjectFinancials, type ProjectFinancials } from "@/lib/project-financials";
+import { OVERHEAD_PROJECT_ID } from "@/lib/overhead-project";
 import { parseCompanyFinancialsChartFilters, getCompanyFinancialsChartData } from "@/lib/company-financials-charts";
 import CompanyFinancialsFilters from "./components/company-financials-filters";
 import CashFlowByMonthChart from "./components/cash-flow-by-month-chart";
@@ -14,12 +15,12 @@ import OverheadRatioChart from "./components/overhead-ratio-chart";
 
 export const dynamic = "force-dynamic";
 
-// "Shop" is the sanctioned overhead bucket — shares the sync's env var so the
-// two features can never point at different projects. Its costs (expenses +
-// labor) are company overhead, kept separate from job profitability rather
-// than dragging down any individual project's margin.
-const OVERHEAD_PROJECT_ID =
-    process.env.QBO_EXPENSE_OVERHEAD_PROJECT_ID || "cmpd6xca1009x1iizdf4suln3";
+// "Shop" is the sanctioned overhead bucket — its id now comes from the shared
+// lib/overhead-project module (this file used to carry its own inline copy of
+// the same env-var-with-fallback expression, which could drift from the QBO
+// sync's and the variance report's). Its costs (expenses + labor) are company
+// overhead, kept separate from job profitability rather than dragging down any
+// individual project's margin.
 
 function StatCard({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "pos" | "neg" }) {
     const valueColor =
@@ -67,6 +68,11 @@ interface JobRow {
     id: string;
     name: string;
     client: string;
+    // Logistics/shop buckets are not client jobs. They stay in the EXISTING
+    // cash tiles and totals exactly as before, but are excluded from every
+    // Phase 4 figure, matching activeJobWhere() in percent-complete-db.ts --
+    // which is what the nightly recalc and both Monday digests use.
+    isLogistics: boolean;
     fin: ProjectFinancials;
     laborCost: number;
     jobCost: number; // expenses + labor
@@ -74,7 +80,7 @@ interface JobRow {
     marginPercent: number | null; // null when nothing collected — a % of $0 is undefined, not 0
 }
 
-async function buildRow(project: { id: string; name: string; client: { name: string } }): Promise<JobRow> {
+async function buildRow(project: { id: string; name: string; isLogistics?: boolean; client: { name: string } }): Promise<JobRow> {
     const fin = await computeProjectFinancials(project.id);
     const laborCost = fin.totalTimeCost;
     const jobCost = fin.currentOutgoing + laborCost;
@@ -84,6 +90,7 @@ async function buildRow(project: { id: string; name: string; client: { name: str
         id: project.id,
         name: project.name,
         client: project.client.name,
+        isLogistics: !!project.isLogistics,
         fin,
         laborCost,
         jobCost,
@@ -110,12 +117,12 @@ export default async function CompanyFinancialsPage({
     const [jobProjects, overheadProject] = await Promise.all([
         prisma.project.findMany({
             where: { status: "In Progress", id: { not: OVERHEAD_PROJECT_ID } },
-            select: { id: true, name: true, client: { select: { name: true } } },
+            select: { id: true, name: true, isLogistics: true, client: { select: { name: true } } },
             orderBy: { name: "asc" },
         }),
         prisma.project.findUnique({
             where: { id: OVERHEAD_PROJECT_ID },
-            select: { id: true, name: true, client: { select: { name: true } } },
+            select: { id: true, name: true, isLogistics: true, client: { select: { name: true } } },
         }),
     ]);
 
@@ -155,6 +162,36 @@ export default async function CompanyFinancialsPage({
     const netPosition = totals.margin - overheadTotal;
     const blendedMarginPercent = totals.paid > 0 ? (netPosition / totals.paid) * 100 : null;
 
+    // ── Earned margin roll-up (Phase 4) ─────────────────────────────────────
+    // Only jobs that HAVE a percent complete contribute. A job whose estimate is
+    // too sparsely coded to weight returns null from the formula, and summing it
+    // as $0 would understate the total while looking like a measurement — the
+    // tile's subtitle carries the denominator instead.
+    const earnedMarginJobs = jobRows.filter((r) => !r.isLogistics);
+    // "Has a percent complete" and "has an earned margin" are DIFFERENT
+    // questions and were previously conflated. earnedMargin is deliberately
+    // null when contract value is $0 -- no approved estimate or CO yet -- even
+    // though somebody may have set a percent by hand. Counting availability off
+    // earnedMargin therefore under-reported how many jobs are actually
+    // measured, and blamed it on a missing percentage that was right there.
+    const jobsWithPercent = earnedMarginJobs.filter((r) => r.fin.percentComplete !== null);
+    const jobsWithEarnedMargin = jobsWithPercent.filter((r) => r.fin.earnedMargin !== null);
+    // Has a percent, but nothing signed to earn against.
+    const jobsAwaitingContract = jobsWithPercent.length - jobsWithEarnedMargin.length;
+    const earnedMarginTotal = jobsWithEarnedMargin.reduce((sum, r) => sum + (r.fin.earnedMargin ?? 0), 0);
+
+    // Dollar-weighted, not an average of per-job ratios: a $50 job with a
+    // receipt and a $50,000 job without one is not "50% complete".
+    const receiptDollars = earnedMarginJobs.reduce(
+        (acc, r) => ({
+            withReceipt: acc.withReceipt + r.fin.receiptedExpenseDollarsAbs,
+            total: acc.total + r.fin.expenseDollarsAbs,
+        }),
+        { withReceipt: 0, total: 0 }
+    );
+    const receiptCompletenessPercent =
+        receiptDollars.total > 0 ? (receiptDollars.withReceipt / receiptDollars.total) * 100 : null;
+
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
             <div>
@@ -165,8 +202,8 @@ export default async function CompanyFinancialsPage({
                 </p>
             </div>
 
-            {/* Company summary tiles */}
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            {/* Company summary tiles — seven now, wrapping to two rows on md */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <StatCard
                     label="Total Incoming"
                     value={formatCurrency(totals.paid)}
@@ -193,6 +230,21 @@ export default async function CompanyFinancialsPage({
                     value={blendedMarginPercent === null ? "—" : `${blendedMarginPercent.toFixed(1)}%`}
                     sub="Net position ÷ total incoming"
                     tone={blendedMarginPercent === null ? undefined : blendedMarginPercent >= 0 ? "pos" : "neg"}
+                />
+                <StatCard
+                    label="Earned Margin"
+                    value={jobsWithEarnedMargin.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
+                    sub={`${jobsWithPercent.length} of ${earnedMarginJobs.length} job${earnedMarginJobs.length === 1 ? "" : "s"} have a % complete; includes labor${jobsAwaitingContract > 0 ? ` · ${jobsAwaitingContract} awaiting an approved contract` : ""}`}
+                    tone={jobsWithEarnedMargin.length === 0 ? undefined : earnedMarginTotal >= 0 ? "pos" : "neg"}
+                />
+                <StatCard
+                    label="Receipt Completeness"
+                    value={receiptCompletenessPercent === null ? "—" : `${receiptCompletenessPercent.toFixed(0)}%`}
+                    sub={
+                        receiptCompletenessPercent === null
+                            ? "No job expenses recorded"
+                            : `${formatCurrency(receiptDollars.withReceipt)} of ${formatCurrency(receiptDollars.total)} of expense dollars`
+                    }
                 />
             </div>
 
@@ -252,6 +304,8 @@ export default async function CompanyFinancialsPage({
                             <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Labor</th>
                             <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Margin $</th>
                             <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Margin %</th>
+                            <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">% Compl.</th>
+                            <th className="text-right px-4 py-3 text-xs font-semibold text-hui-textMuted uppercase tracking-wider">Earned Margin</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -274,11 +328,48 @@ export default async function CompanyFinancialsPage({
                                 <td className={`px-4 py-3 text-right font-semibold ${r.marginDollars >= 0 ? "text-green-700" : "text-red-600"}`}>
                                     {r.marginPercent === null ? "—" : `${r.marginPercent.toFixed(1)}%`}
                                 </td>
+                                {/* An em dash, never 0 — "we can't measure this yet" is not "no progress".
+                                    A logistics bucket gets one too: it is not a job, so percent
+                                    complete and earned margin do not apply to it at all. */}
+                                <td className="px-4 py-3 text-right text-hui-textMuted whitespace-nowrap">
+                                    {r.isLogistics || r.fin.percentComplete === null ? (
+                                        "—"
+                                    ) : (
+                                        <>
+                                            {r.fin.percentComplete.toFixed(0)}%
+                                            {r.fin.percentCompleteSource === "MANUAL" && (
+                                                <span className="ml-1 text-[10px] font-semibold text-hui-textMuted" title="Set by hand">M</span>
+                                            )}
+                                            {r.fin.percentCompleteNeedsReview && (
+                                                <span
+                                                    className="ml-1 inline-block w-1.5 h-1.5 rounded-full bg-amber-500 align-middle"
+                                                    title="The automatic estimate has moved more than 5 points since this was set by hand — worth a look"
+                                                />
+                                            )}
+                                        </>
+                                    )}
+                                </td>
+                                <td className={`px-4 py-3 text-right font-semibold ${r.isLogistics || r.fin.earnedMargin === null ? "text-hui-textMuted" : r.fin.earnedMargin >= 0 ? "text-green-700" : "text-red-600"}`}>
+                                    {r.isLogistics ? (
+                                        "—"
+                                    ) : r.fin.earnedMargin !== null ? (
+                                        formatCurrency(r.fin.earnedMargin)
+                                    ) : r.fin.percentComplete !== null ? (
+                                        // A percent exists; there is simply no signed
+                                        // contract to earn against. Saying "—" here
+                                        // would blame a missing percentage.
+                                        <span className="text-xs font-normal" title="This job has a percent complete but no approved estimate or change order to earn against">
+                                            No contract
+                                        </span>
+                                    ) : (
+                                        "—"
+                                    )}
+                                </td>
                             </tr>
                         ))}
                         {jobRows.length === 0 && (
                             <tr>
-                                <td colSpan={9} className="py-12 text-center text-hui-textMuted">No projects with status &quot;In Progress&quot;.</td>
+                                <td colSpan={11} className="py-12 text-center text-hui-textMuted">No projects with status &quot;In Progress&quot;.</td>
                             </tr>
                         )}
                     </tbody>
@@ -292,6 +383,11 @@ export default async function CompanyFinancialsPage({
                             <td className="px-4 py-3 text-right">{formatCurrency(totals.labor)}</td>
                             <td className={`px-4 py-3 text-right ${totals.margin >= 0 ? "text-green-700" : "text-red-600"}`}>{formatCurrency(totals.margin)}</td>
                             <td className="px-4 py-3 text-right">{totals.paid > 0 ? `${((totals.margin / totals.paid) * 100).toFixed(1)}%` : "—"}</td>
+                            {/* Percent complete does not sum — the count of jobs that have one does. */}
+                            <td className="px-4 py-3 text-right text-xs font-normal text-hui-textMuted">{jobsWithPercent.length}/{earnedMarginJobs.length}</td>
+                            <td className={`px-4 py-3 text-right ${jobsWithEarnedMargin.length === 0 ? "" : earnedMarginTotal >= 0 ? "text-green-700" : "text-red-600"}`}>
+                                {jobsWithEarnedMargin.length === 0 ? "—" : formatCurrency(earnedMarginTotal)}
+                            </td>
                         </tr>
 
                         {/* Overhead — kept visually and numerically separate from job profitability */}
@@ -313,11 +409,14 @@ export default async function CompanyFinancialsPage({
                                 <td className="px-4 py-3 text-right">{formatCurrency(overheadRow.laborCost)}</td>
                                 <td className="px-4 py-3 text-right font-semibold">−{formatCurrency(overheadRow.jobCost)}</td>
                                 <td className="px-4 py-3"></td>
+                                {/* The overhead bucket is not a job: percent complete and earned margin do not apply to it. */}
+                                <td className="px-4 py-3"></td>
+                                <td className="px-4 py-3"></td>
                             </tr>
                         )}
 
                         <tr className={`font-bold ${netPosition >= 0 ? "text-green-700" : "text-red-700"} bg-slate-50 border-t border-hui-border`}>
-                            <td className="px-4 py-3" colSpan={7}>Net position (job margin − overhead)</td>
+                            <td className="px-4 py-3" colSpan={9}>Net position (job margin − overhead)</td>
                             <td className="px-4 py-3 text-right" colSpan={2}>{formatCurrency(netPosition)}</td>
                         </tr>
                     </tfoot>

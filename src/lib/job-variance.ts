@@ -101,6 +101,17 @@ export interface ProjectVariance {
     phases: PhaseVariance[];
     /** Budgeted work whose estimate item carries no cost code — an estimate cleanup task. */
     uncodedBudget: number;
+    /**
+     * The same rows summed over POSITIVE dollars only.
+     *
+     * `uncodedBudget` above is a NET figure, so a $10,000 uncoded line and a
+     * $10,000 uncoded credit cancel to $0 and the job reads as fully coded.
+     * That is fine for `totalBudget` (the net IS what the job is supposed to
+     * cost) and wrong for any question of the form "how much of this estimate
+     * did we fail to code", which is a question about magnitude. The percent-
+     * complete trust gate uses THIS field; `uncodedBudget` is unchanged.
+     */
+    uncodedPositiveBudget: number;
     coverage: VarianceCoverage;
 }
 
@@ -137,6 +148,24 @@ export interface VarianceCoverage {
      * netting hides activity, so the bar and the dollar figure always agree.
      */
     unattributedGross: number;
+}
+
+/**
+ * Which phase a single actual cost lands on: its own cost code if it has one,
+ * otherwise the cost code of the estimate item it is linked to, otherwise
+ * nothing (unattributed).
+ *
+ * THE definition of "is this cost attributed", used both by the variance
+ * reconciliation below and by the earned-margin digest's "biggest unattributed
+ * cost". A second copy would drift: an expense with a null `costCodeId` but an
+ * `itemId` pointing at a coded item IS attributed, and a naive
+ * `costCodeId IS NULL` filter reports it as a hole that does not exist.
+ */
+export function resolveActualCostCodeId(
+    explicitCostCodeId: string | null | undefined,
+    linkedItemCostCodeId: string | null | undefined
+): string | null {
+    return explicitCostCodeId ?? linkedItemCostCodeId ?? null;
 }
 
 /** "Labor" vs everything else. A null cost type falls back to the legacy `type` string. */
@@ -204,6 +233,7 @@ export function computeProjectVariance(input: {
     const phases = new Map<string, PhaseVariance>();
     const itemsById = new Map<string, ItemVariance & { costCodeId: string | null }>();
     let uncodedBudget = 0;
+    let uncodedPositiveBudget = 0;
     let malformedBudgetRows = 0;
 
     /**
@@ -236,6 +266,7 @@ export function computeProjectVariance(input: {
             // Deliberately NOT spread across phases. This is estimate cleanup
             // work, and hiding it inside a phase would misstate that phase.
             uncodedBudget += budget;
+            if (budget > 0) uncodedPositiveBudget += budget;
             continue;
         }
         const key = item.costCodeId;
@@ -268,7 +299,7 @@ export function computeProjectVariance(input: {
         explicitCostCodeId: string | null | undefined,
         linkedItem: (ItemVariance & { costCodeId: string | null }) | undefined
     ): { costCodeId: string | null; item: (ItemVariance & { costCodeId: string | null }) | undefined } => {
-        const costCodeId = explicitCostCodeId ?? linkedItem?.costCodeId ?? null;
+        const costCodeId = resolveActualCostCodeId(explicitCostCodeId, linkedItem?.costCodeId);
         if (!costCodeId) return { costCodeId: null, item: undefined };
         // Only credit the item when it lives under the phase being charged.
         const item = linkedItem && linkedItem.costCodeId === costCodeId ? linkedItem : undefined;
@@ -391,6 +422,7 @@ export function computeProjectVariance(input: {
         percentUsed: ratio(totalActual, totalBudget),
         phases: phaseList,
         uncodedBudget,
+        uncodedPositiveBudget,
         coverage: {
             unattributedLabor,
             unattributedMaterial,

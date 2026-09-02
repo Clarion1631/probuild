@@ -186,6 +186,37 @@ test("percentUsed is null (never Infinity/NaN) when there is no budget", () => {
 
 // ── uncoded budget = estimate cleanup, not a phase ──────────────────────────
 
+test("uncodedPositiveBudget is GROSS, so a credit cannot net an uncoded hole away", () => {
+    // A $6,000 uncoded charge and a $6,000 uncoded credit NET to zero. That is
+    // the right answer for totalBudget (the job really does cost $1,000 net),
+    // and the wrong answer for "how much of this estimate did we fail to code"
+    // -- which is what the percent-complete trust gate asks. Netted, a
+    // two-thirds-uncoded estimate reports as fully coded.
+    const result = computeProjectVariance({
+        items: [
+            item({ id: "coded", total: 1000 }),
+            item({ id: "uncoded-charge", total: 6000, costCodeId: null, costCode: null }),
+            item({ id: "uncoded-credit", total: -6000, costCodeId: null, costCode: null }),
+        ],
+        timeEntries: [], expenses: [],
+    });
+    assert.equal(result.uncodedBudget, 0, "net is unchanged -- existing consumers must not move");
+    assert.equal(result.uncodedPositiveBudget, 6000, "gross is what the trust gate needs");
+    assert.equal(result.totalBudget, 1000);
+});
+
+test("an all-negative uncoded set reports zero gross, not a negative", () => {
+    const result = computeProjectVariance({
+        items: [
+            item({ id: "coded", total: 1000 }),
+            item({ id: "uncoded-credit", total: -500, costCodeId: null, costCode: null }),
+        ],
+        timeEntries: [], expenses: [],
+    });
+    assert.equal(result.uncodedBudget, -500);
+    assert.equal(result.uncodedPositiveBudget, 0);
+});
+
 test("budget on an uncoded item is kept in the job total but NOT folded into a phase", () => {
     const result = computeProjectVariance({
         items: [
@@ -195,6 +226,7 @@ test("budget on an uncoded item is kept in the job total but NOT folded into a p
         timeEntries: [], expenses: [],
     });
     assert.equal(result.uncodedBudget, 5000);
+    assert.equal(result.uncodedPositiveBudget, 5000, "no credits here, so gross equals net");
     assert.equal(result.totalBudget, 6000, "the job still costs 6000 to build");
     assert.equal(result.phases.length, 1);
     assert.equal(result.phases[0].totalBudget, 1000, "uncoded money must not inflate a phase");

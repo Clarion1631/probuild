@@ -31,6 +31,42 @@ export function isValidChatWebhookUrl(value: string): boolean {
     }
 }
 
+/**
+ * POST one plain-text message to a Google Chat incoming webhook.
+ *
+ * Extracted from postDailyLogToChat (which keeps its own per-project webhook
+ * lookup) so company-wide posters — the Monday margin card, for one — reuse the
+ * same SSRF allowlist and the same timeout instead of hand-rolling a fetch.
+ *
+ * Never throws: a webhook that is unset, misconfigured or down must never turn
+ * into a 500 on a cron. Returns a reason so the caller can log the skip.
+ */
+export async function postTextToWebhook(
+    webhookUrl: string | undefined | null,
+    text: string
+): Promise<{ sent: boolean; reason?: string }> {
+    if (!webhookUrl || !webhookUrl.trim()) return { sent: false, reason: "no webhook configured" };
+    if (!isValidChatWebhookUrl(webhookUrl)) return { sent: false, reason: "webhook url is not a Google Chat webhook" };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
+    try {
+        const res = await fetch(webhookUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json; charset=UTF-8" },
+            body: JSON.stringify({ text }),
+            signal: controller.signal,
+        });
+        if (!res.ok) return { sent: false, reason: `webhook responded ${res.status}` };
+        return { sent: true };
+    } catch (error) {
+        console.error("[chat-webhook] text post failed", { error });
+        return { sent: false, reason: "network error" };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 export interface DailyLogPostBackInput {
     projectId: string;
     dateLabel: string; // "2026-08-06"

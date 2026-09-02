@@ -1011,6 +1011,7 @@ interface EstimateLine {
     total: number;
     parentId: string | null;
     costTypeName: string | null;
+    costCodeId: string | null;
 }
 
 export interface GeneratedTaskRow {
@@ -1160,6 +1161,7 @@ async function runGenerateScheduleFromEstimate(
             total: Number(i.total),
             parentId: i.parentId,
             costTypeName: i.costType?.name ?? null,
+            costCodeId: i.costCodeId ?? null,
         }));
         const topLevel = lines.filter(l => !l.parentId);
         const childrenOf = new Map<string, EstimateLine[]>();
@@ -1293,6 +1295,11 @@ async function runGenerateScheduleFromEstimate(
         const createTask = async (data: {
             name: string; startDate: Date; endDate: Date; color: string; order: number;
             type: string; estimatedHours: number | null; estimateItemId: string | null; parentId: string | null;
+            // Phase attribution, stamped at generation. Estimate tasks resolve
+            // through the live estimateItem first (see percent-complete-db.ts);
+            // this is their fallback for when that FK is SetNull'd by an item
+            // delete, and the ONLY route for change-order tasks.
+            costCodeId?: string | null;
         }) => {
             const row = await tx.scheduleTask.create({
                 data: {
@@ -1351,6 +1358,7 @@ async function runGenerateScheduleFromEstimate(
                     type: "task",
                     estimatedHours: deriveEstimateItemHours(line),
                     estimateItemId: line.id,
+                    costCodeId: line.costCodeId,
                     parentId: parentTaskId,
                 });
             }
@@ -1383,6 +1391,7 @@ async function runGenerateScheduleFromEstimate(
                         type: "task",
                         estimatedHours: null,
                         estimateItemId: unit.id,
+                        costCodeId: unit.costCodeId,
                         parentId: null,
                     });
                     parentTaskId = parent.id;
@@ -2836,6 +2845,11 @@ async function runApplyChangeOrderToSchedule(
         const createTask = async (data: {
             name: string; startDate: Date; endDate: Date; color: string; order: number;
             type: string; parentId: string | null;
+            // A CO task can never carry an estimateItemId -- its scope lives in
+            // ChangeOrderItem, a different table -- so this column is the ONLY
+            // way its phase is knowable. Without it, approved CO dollars sat in
+            // the phase budget with no task able to report progress on them.
+            costCodeId?: string | null;
         }) => {
             const row = await tx.scheduleTask.create({
                 data: {
@@ -2867,6 +2881,7 @@ async function runApplyChangeOrderToSchedule(
 
         const items = co.items.map(i => ({
             id: i.id, name: i.name, type: i.type, total: Number(i.total), costTypeName: i.costType?.name ?? null,
+            costCodeId: i.costCodeId ?? null,
         }));
         const taskItems = items.filter(i => i.total >= 0);
         const estimateWindowEnd = project.endDate ? utcDay(project.endDate) : addDays(start, 42);
@@ -2916,6 +2931,7 @@ async function runApplyChangeOrderToSchedule(
                         color: "#8b5cf6",
                         order: nextOrder++,
                         type: "task",
+                        costCodeId: taskItems[k].costCodeId,
                         parentId: existingParent.id,
                     });
                 }
@@ -3026,6 +3042,7 @@ async function runApplyChangeOrderToSchedule(
                     color: "#8b5cf6",
                     order: nextOrder++,
                     type: "task",
+                    costCodeId: line.costCodeId,
                     parentId: parentTask.id,
                 });
             }

@@ -46,6 +46,7 @@ model User {
   decidedProposals          SelectionProposal[]
   mcpKeys                   McpKey[]
   createdInspections        Inspection[]              @relation("InspectionCreator")
+  percentCompleteUpdates    Project[]                 @relation("PercentCompleteUpdatedBy")
 }
 
 model Client {
@@ -308,12 +309,35 @@ model Project {
   permits                 Permit[]
   inspections             Inspection[]
 
+  // ── Percent complete (earned revenue / earned margin) ──────────────────────
+  // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
+  // is the machine estimate, which the nightly recalc cron always refreshes even
+  // while a manual override is in force. percentCompleteAutoAtOverride freezes the
+  // auto value at the moment of the override so drift ("auto has moved > 5 points
+  // since this was set by hand") is computable — without that snapshot the
+  // comparison has no baseline. See src/lib/percent-complete.ts.
+  percentComplete               Decimal?               @db.Decimal(5, 2)
+  percentCompleteSource         PercentCompleteSource?
+  percentCompleteAsOf           DateTime?
+  percentCompleteAuto           Decimal?               @db.Decimal(5, 2)
+  percentCompleteAutoAtOverride Decimal?               @db.Decimal(5, 2)
+  percentCompleteUpdatedById    String?
+  percentCompleteUpdatedBy      User?                  @relation("PercentCompleteUpdatedBy", fields: [percentCompleteUpdatedById], references: [id])
+
   @@index([viewedAt])
   @@index([clientId])
   @@index([status])
   @@index([createdAt])
   @@index([startDate])
   @@index([deletedAt])
+  @@index([percentCompleteUpdatedById])
+}
+
+/// Who wrote Project.percentComplete: the nightly recalc cron (AUTO) or a
+/// person overriding it on the Financial Overview page (MANUAL).
+enum PercentCompleteSource {
+  AUTO
+  MANUAL
 }
 
 model RoomDesign {
@@ -829,6 +853,7 @@ model CostCode {
   changeOrderItems   ChangeOrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
   catalogItems       CatalogItem[]
+  scheduleTasks      ScheduleTask[]
 }
 
 model CostType {
@@ -1114,6 +1139,15 @@ model ScheduleTask {
   confirmationStatus         String? // "planned" | "requested" | "confirmed"; appointment tasks only
   estimateItemId             String?        @unique
   estimateItem               EstimateItem?  @relation(fields: [estimateItemId], references: [id], onDelete: SetNull)
+  // Phase attribution, stamped at generation time for BOTH estimate- and
+  // change-order-generated tasks. A CO task cannot carry an estimateItemId
+  // (applyChangeOrderToSchedule sets it null — CO scope lives in the separate
+  // ChangeOrderItem table), so without this column approved CO dollars sat in
+  // the phase budget with no task able to report progress against them.
+  // Estimate tasks keep resolving through the live estimateItem first; this is
+  // their fallback for when that FK is SetNull'd by an item delete.
+  costCodeId                 String?
+  costCode                   CostCode?      @relation(fields: [costCodeId], references: [id])
   // Generation provenance: set on every task kind created by
   // generateScheduleFromEstimate (phase parents, children, flat tasks,
   // milestones) so regenerate can identify them without touching manual tasks.
@@ -1150,6 +1184,7 @@ model ScheduleTask {
   @@index([leadId])
   @@index([generatedFromEstimateId])
   @@index([generatedFromChangeOrderId])
+  @@index([costCodeId])
 }
 
 model TaskMaterial {
