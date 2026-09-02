@@ -22,6 +22,15 @@ import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from 
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
 import { planParkWrites, type ParkPlan } from "./receipt-intake/park";
+import { parseChatDelivery } from "./receipt-request-cards";
+import {
+    ORPHAN_AUDIT_KIND,
+    ORPHAN_RESOLUTIONS,
+    isQboPurchaseId,
+    verifyOrphanClaim,
+    type QboPurchaseFacts,
+} from "./receipt-intake/orphan-purchase";
+import { logAutomationEvent } from "./automation-events";
 import { RECEIPT_OWNER_CHOICES, RECEIPT_REQUEST_TARGET_TYPE } from "./receipt-requests";
 import { isCostCodeAllowedForProject } from "./project-phases";
 import { prismaPhaseDataSource } from "./project-phases-db";
@@ -15550,6 +15559,155 @@ export async function resolveOrphanedQbPurchase(id: string, expectedUpdatedAt: s
 }
 
 /**
+ * Read ONE QuickBooks Purchase by id. Read-only, and the only QBO call any
+ * receipts-queue action makes.
+ *
+ * Imported lazily for the same reason the payments actions do it: pulling the
+ * QuickBooks client into this module's top-level graph costs every unrelated
+ * server action that imports actions.ts.
+ */
+async function readQboPurchase(purchaseId: string): Promise<QboPurchaseFacts | null> {
+    const { getFreshQBTokens } = await import("./quickbooks-payments");
+    const { qbFetch, parseJsonOrNull } = await import("./quickbooks");
+    const tokens = await getFreshQBTokens();
+    const response = await qbFetch(`/purchase/${encodeURIComponent(purchaseId)}`, tokens);
+    // 404 is an ANSWER — that id is not a purchase in this realm — and it is
+    // the answer an operator's typo produces, so it must not read as an outage.
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`QuickBooks returned ${response.status}`);
+    const body = await parseJsonOrNull<{ Purchase?: { Id?: string; TotalAmt?: number } }>(response);
+    const purchase = body?.Purchase;
+    if (!purchase?.Id) return null;
+    // TotalAmt is dollars as a float; cents is what everything here compares in.
+    const totalCents = typeof purchase.TotalAmt === "number" && Number.isFinite(purchase.TotalAmt)
+        ? Math.round(purchase.TotalAmt * 100)
+        : null;
+    return { id: String(purchase.Id), totalCents };
+}
+
+/**
+ * Resolve an orphaned Purchase whose ID WE NEVER LEARNED (round-14 item 3).
+ *
+ * The row's send went out and no answer came back, so `sendAttempted` is true,
+ * the strong dedup key is still held, and nobody knows whether QuickBooks
+ * created anything. Before this the row was a dead end: the key stayed held
+ * forever, and a corrected re-send of the same receipt bounced as a duplicate
+ * with nothing on screen saying why.
+ *
+ * Two honest answers, both from a human who went and looked, both AUDITED with
+ * who said so:
+ *
+ *   "located"     — they found the Purchase and typed its id. We READ IT BACK
+ *                   from QuickBooks and require the amount to match this
+ *                   receipt to the cent. A transposed digit lands on somebody
+ *                   else's purchase, and accepting it would attach this
+ *                   receipt's history to theirs. The id is recorded exactly
+ *                   where the known-id case records it, so the same "mark
+ *                   resolved" flow finishes the job.
+ *   "no-purchase" — they checked and there is none. THIS is what frees the
+ *                   dedup key, because now we know the re-send is safe.
+ *
+ * QuickBooks is READ-ONLY here, as everywhere in this pipeline: this never
+ * voids, edits or creates anything. It reads one purchase by id.
+ */
+export async function resolveUnknownOrphan(
+    id: string,
+    decision: "located" | "no-purchase",
+    expectedUpdatedAt: string,
+    input?: { purchaseId?: string; note?: string },
+) {
+    const user = await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+    if (decision !== "located" && decision !== "no-purchase") {
+        throw new Error("decision must be located or no-purchase");
+    }
+    const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
+    const note = typeof input?.note === "string" ? input.note.trim().slice(0, 200) : "";
+
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: {
+            state: true, stateReason: true, totalCents: true, vendor: true,
+            sendAttempted: true, dedupStrongKey: true, postVoidQbPurchaseId: true,
+        },
+    });
+    if (!row) throw new StaleReceiptIntakeError("That receipt no longer exists — refresh.");
+    if (!row.sendAttempted) {
+        return { success: false, stale: true as const, reason: "Nothing was ever sent for this receipt — there is no purchase to find." };
+    }
+
+    let purchaseId: string | null = null;
+    if (decision === "located") {
+        if (!isQboPurchaseId(input?.purchaseId)) {
+            return { success: false, stale: false as const, reason: "That is not a QuickBooks purchase id." };
+        }
+        const claimed = (input!.purchaseId as string).trim();
+        let facts: QboPurchaseFacts | null;
+        try {
+            facts = await readQboPurchase(claimed);
+        } catch (error) {
+            // An outage is not a verdict. Refuse and let them try later rather
+            // than record an unverified id.
+            return {
+                success: false,
+                stale: false as const,
+                reason: `QuickBooks did not answer, so that id is unverified: ${error instanceof Error ? error.message : "unknown error"}`,
+            };
+        }
+        const verdict = verifyOrphanClaim(facts, row.totalCents);
+        if (!verdict.ok) {
+            return { success: false, stale: false as const, reason: verdict.detail ?? `That purchase ${verdict.reason.replace("-", " ")}.` };
+        }
+        purchaseId = verdict.purchaseId;
+    }
+
+    // ONE CAS, on the row version the operator was looking at.
+    const data = purchaseId !== null
+        ? {
+            // Recorded where the known-id case records it, so the existing
+            // "mark resolved" flow takes it from here. The key stays HELD: a
+            // Purchase exists, so a re-send would double-book.
+            postVoidQbPurchaseId: purchaseId,
+            stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.located}:${purchaseId}`.slice(0, 400),
+        }
+        : {
+            // No Purchase exists, so the quarantine has nothing to protect.
+            dedupStrongKey: null,
+            stateReason: `${row.stateReason ?? "possible-orphan"}; ${ORPHAN_RESOLUTIONS.noPurchase}`.slice(0, 400),
+        };
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, state: row.state, updatedAt: seenAt },
+        data,
+    });
+    if (result.count === 0) {
+        return { success: false, stale: true as const, reason: "This receipt changed underneath you — refresh and try again." };
+    }
+
+    // AUDITED, and after the write: an event describing a decision that did not
+    // commit is worse than no event. Never fails the action — the decision is
+    // already recorded on the row itself.
+    await logAutomationEvent({
+        kind: ORPHAN_AUDIT_KIND,
+        status: purchaseId !== null ? ORPHAN_RESOLUTIONS.located : ORPHAN_RESOLUTIONS.noPurchase,
+        source: "receipts-tab",
+        vendor: row.vendor ?? undefined,
+        amountCents: row.totalCents ?? undefined,
+        reason: note || undefined,
+        detail: {
+            intakeId: id,
+            qbPurchaseId: purchaseId,
+            // WHO said so. That is the whole point of auditing a judgement call.
+            decidedBy: user.email ?? user.id,
+            decidedAt: new Date().toISOString(),
+            dedupStrongKeyReleased: purchaseId === null && row.dedupStrongKey !== null,
+        },
+    }).catch(() => { /* audit only — the row already carries the decision */ });
+
+    revalidateReceiptQueue();
+    return { success: true, stale: false as const };
+}
+
+/**
  * Resolve a Chat card whose delivery was never confirmed (round-13 item 6).
  *
  * An UNCERTAIN row means we called the webhook and did not get an answer we
@@ -15558,8 +15716,11 @@ export async function resolveOrphanedQbPurchase(id: string, expectedUpdatedAt: s
  * automatic resend risks a duplicate chase card, and a duplicate teaches people
  * the list is noise. So a human looks in the space and says which it was:
  *
- *   "delivered" — it is there. The row is POSTED and the day is closed. The
- *     items are not re-asked, and tomorrow's card moves on.
+ *   "delivered" — it is there, AND the operator pastes the thread and message
+ *     names off it. Without those the row stays UNCERTAIN: a card marked POSTED
+ *     with no thread identity is the worst of both worlds — closed, possibly
+ *     never seen, and with nothing for a reply to resolve against. The row is
+ *     POSTED, the day is closed, and the bridge can find the thread.
  *   "resend"    — it is not there. The row goes back to PENDING with its claim
  *     released, so the retry pass sends it — and that pass re-verifies the
  *     snapshot first, so anything answered in the meantime is dropped.
@@ -15572,20 +15733,39 @@ export async function resolveUncertainCard(
     cardId: string,
     decision: "delivered" | "resend",
     expectedUpdatedAt: string,
+    delivery?: { threadName?: string; messageName?: string },
 ) {
     await assertReceiptQueueAccess();
     if (typeof cardId !== "string" || !cardId) throw new Error("cardId is required");
     if (decision !== "delivered" && decision !== "resend") throw new Error("decision must be delivered or resend");
     const seenAt = assertExpectedUpdatedAt(expectedUpdatedAt);
 
+    // NO THREAD IDENTITY, NO "DELIVERED". Both names, well-formed, same space.
+    // "resend" is always available as the other answer, so refusing here never
+    // leaves an operator stuck — it leaves the row where it was.
+    const confirmed = decision === "delivered"
+        ? parseChatDelivery(delivery?.threadName, delivery?.messageName)
+        : null;
+    if (decision === "delivered" && !confirmed) {
+        return {
+            success: false,
+            stale: false as const,
+            reason: "Paste the thread and message names from the card (spaces/…/threads/… and spaces/…/messages/…), or choose Resend.",
+        };
+    }
+
     const result = await prisma.receiptRequestCard.updateMany({
         where: { id: cardId, status: "UNCERTAIN", updatedAt: seenAt },
-        data: decision === "delivered"
+        data: confirmed
             ? {
                 status: "POSTED",
                 // The card IS out; `postedAt` is what stops any later run
                 // re-posting the day.
                 postedAt: new Date(),
+                // The bridge identities, so a reply in that thread resolves
+                // like any other card's.
+                threadName: confirmed.threadName,
+                messageName: confirmed.messageName,
                 lastError: null,
                 claimedAt: null,
                 claimToken: null,

@@ -6,6 +6,7 @@ import { RECEIPT_OWNER_CHOICES } from "@/lib/receipt-requests";
 import {
     markReceiptIntakeDuplicate,
     resolveOrphanedQbPurchase,
+    resolveUnknownOrphan,
     resolveUncertainCard,
     setMissingReceiptOwner,
     retryReceiptIntake,
@@ -211,14 +212,101 @@ export function AssignOwnerControl({ issueId, currentOwner }: { issueId: string;
     );
 }
 
+/**
+ * The UNKNOWN-ID orphan: the send went out and no answer came back, so nobody
+ * knows whether QuickBooks holds a purchase. Shown for BOTH orphan kinds — a
+ * row with a known id can still turn out to have a second one, and a row
+ * without one is otherwise a dead end whose dedup key nothing releases.
+ */
+export function UnknownOrphanControls({
+    intakeId,
+    expectedUpdatedAt,
+}: {
+    intakeId: string;
+    expectedUpdatedAt: string;
+}) {
+    const [purchaseId, setPurchaseId] = useState("");
+    const [note, setNote] = useState("");
+    const [pending, startTransition] = useTransition();
+    const run = (decision: "located" | "no-purchase") => startTransition(async () => {
+        try {
+            const result = await resolveUnknownOrphan(intakeId, decision, expectedUpdatedAt, {
+                purchaseId: purchaseId.trim(),
+                note: note.trim(),
+            });
+            if (result.success) {
+                toast.success(decision === "located" ? "Purchase recorded" : "Recorded — this receipt can be re-sent");
+            } else {
+                toast.error(result.reason ?? "That didn't work — try again");
+            }
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : "That didn't work — try again");
+        }
+    });
+    return (
+        <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+                <label className="sr-only" htmlFor={`qbid-${intakeId}`}>QuickBooks purchase id</label>
+                <input
+                    id={`qbid-${intakeId}`}
+                    className="hui-input text-xs py-1 w-40"
+                    placeholder="QBO purchase id"
+                    value={purchaseId}
+                    disabled={pending}
+                    onChange={event => setPurchaseId(event.target.value)}
+                />
+                <label className="sr-only" htmlFor={`orphan-note-${intakeId}`}>What you found</label>
+                <input
+                    id={`orphan-note-${intakeId}`}
+                    className="hui-input text-xs py-1 w-56"
+                    placeholder="What you found (recorded)"
+                    value={note}
+                    disabled={pending}
+                    onChange={event => setNote(event.target.value)}
+                />
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+                <button
+                    type="button"
+                    className={BTN}
+                    disabled={pending || !purchaseId.trim()}
+                    onClick={() => run("located")}
+                >
+                    I found the purchase
+                </button>
+                <button
+                    type="button"
+                    className={BTN}
+                    disabled={pending}
+                    onClick={() => {
+                        if (!window.confirm("Confirm there is NO purchase in QuickBooks for this receipt? This lets the same receipt be sent again — if one does exist, it would book twice.")) return;
+                        run("no-purchase");
+                    }}
+                >
+                    Checked — no purchase exists
+                </button>
+            </div>
+            <p className="text-xs text-hui-textMuted">
+                The id is read back from QuickBooks and the amount has to match this receipt to the cent. Both answers
+                are recorded with your name.
+            </p>
+        </div>
+    );
+}
+
 export function UncertainCardControls({ cardId, expectedUpdatedAt }: { cardId: string; expectedUpdatedAt: string }) {
     const [pending, startTransition] = useTransition();
+    const [threadName, setThreadName] = useState("");
+    const [messageName, setMessageName] = useState("");
     // Like ResolveOrphanButton, this action RETURNS a stale verdict instead of
     // throwing one: a lost race means "somebody already decided", which reads
     // as refresh, not as retry.
     const run = (decision: "delivered" | "resend") => startTransition(async () => {
         try {
-            const result = await resolveUncertainCard(cardId, decision, expectedUpdatedAt);
+            const result = await resolveUncertainCard(cardId, decision, expectedUpdatedAt, {
+                threadName: threadName.trim(),
+                messageName: messageName.trim(),
+            });
             if (result.success) {
                 toast.success(decision === "delivered" ? "Marked delivered" : "Queued for resend");
             } else {
@@ -229,21 +317,56 @@ export function UncertainCardControls({ cardId, expectedUpdatedAt }: { cardId: s
         }
     });
     return (
-        <div className="flex items-center gap-2 flex-wrap">
-            <button type="button" className={BTN} disabled={pending} onClick={() => run("delivered")}>
-                It&apos;s there — mark delivered
-            </button>
-            <button
-                type="button"
-                className={BTN}
-                disabled={pending}
-                onClick={() => {
-                    if (!window.confirm("Resend this card? Only do this if it is NOT in the space — a duplicate is worse than a late one.")) return;
-                    run("resend");
-                }}
-            >
-                Not there — resend
-            </button>
+        <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+                <label className="sr-only" htmlFor={`thread-${cardId}`}>Chat thread name</label>
+                <input
+                    id={`thread-${cardId}`}
+                    className="hui-input text-xs py-1 w-64"
+                    placeholder="spaces/…/threads/…"
+                    value={threadName}
+                    disabled={pending}
+                    onChange={event => setThreadName(event.target.value)}
+                />
+                <label className="sr-only" htmlFor={`message-${cardId}`}>Chat message name</label>
+                <input
+                    id={`message-${cardId}`}
+                    className="hui-input text-xs py-1 w-64"
+                    placeholder="spaces/…/messages/…"
+                    value={messageName}
+                    disabled={pending}
+                    onChange={event => setMessageName(event.target.value)}
+                />
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+                <button
+                    type="button"
+                    className={BTN}
+                    // Both names are REQUIRED for "delivered": a card closed
+                    // with no thread identity leaves a reply nothing to resolve
+                    // against. The server refuses it too — this only saves a
+                    // round trip.
+                    disabled={pending || !threadName.trim() || !messageName.trim()}
+                    onClick={() => run("delivered")}
+                >
+                    It&apos;s there — mark delivered
+                </button>
+                <button
+                    type="button"
+                    className={BTN}
+                    disabled={pending}
+                    onClick={() => {
+                        if (!window.confirm("Resend this card? Only do this if it is NOT in the space — a duplicate is worse than a late one.")) return;
+                        run("resend");
+                    }}
+                >
+                    Not there — resend
+                </button>
+            </div>
+            <p className="text-xs text-hui-textMuted">
+                Open the card in Chat, copy its thread and message names, and paste them above — that is what lets a
+                reply in that thread still close these items.
+            </p>
         </div>
     );
 }

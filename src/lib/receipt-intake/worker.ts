@@ -16,7 +16,7 @@
 import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
 import { dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
-import { backoffMs, MAX_BOOK_ATTEMPTS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
 import {
     appliedTaxCents,
     buildGroups,
@@ -615,7 +615,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
         // Terminal, and loud: it means the object was replaced after
         // verification, which is the exact thing sealing exists to prevent.
         if (download.kind === "sha-mismatch") {
-            return parkTerminal(row, deps, "content-changed");
+            return parkTerminal(row, deps, NO_ARTIFACT_PARK_REASONS.contentChanged);
         }
         return retryTransient(row, deps, `storage:${download.message}`);
     }

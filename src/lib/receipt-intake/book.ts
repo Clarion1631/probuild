@@ -37,7 +37,7 @@ import {
 } from "@/lib/qbo-receipt-push";
 import type { AutomationEventInput } from "@/lib/automation-events";
 import type { VerifiedBytes } from "./stored-object";
-import { backoffMs, MAX_BOOK_ATTEMPTS } from "./route-state";
+import { backoffMs, MAX_BOOK_ATTEMPTS, NO_ARTIFACT_PARK_REASONS } from "./route-state";
 
 /** The intake columns booking actually reads. Kept narrow so tests can build one by hand. */
 export interface BookableRow {
@@ -420,11 +420,11 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
     // back for a corrected re-upload.
     const download = await deps.downloadBytes(row.storagePath, row.fileSha256);
     if (!download.ok) {
-        if (download.kind === "missing") return parkedBeforeSend("receipt-bytes-missing");
+        if (download.kind === "missing") return parkedBeforeSend(NO_ARTIFACT_PARK_REASONS.bytesMissing);
         // The attachment about to ride along with a real Purchase is NOT the
         // document this row was verified as. Refuse — a Purchase carrying the
         // wrong receipt is worse than one carrying none.
-        if (download.kind === "sha-mismatch") return parkedBeforeSend("content-changed");
+        if (download.kind === "sha-mismatch") return parkedBeforeSend(NO_ARTIFACT_PARK_REASONS.contentChanged);
         return retry(row, deps, now, `storage:${download.message}`);
     }
     const bytes = download.bytes;

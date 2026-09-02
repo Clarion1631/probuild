@@ -22,6 +22,7 @@ import {
     RetryButton,
     SetJobControl,
     UncertainCardControls,
+    UnknownOrphanControls,
     VoidButton,
 } from "./receipt-row-actions";
 
@@ -213,13 +214,18 @@ export function ReceiptsTab({
                                     </p>
                                 )}
                             </div>
-                            <div className="flex items-center gap-3 flex-wrap">
-                                {row.postVoidQbPurchaseId && (
-                                    <>
-                                        <QuickBooksLink qbPurchaseId={row.postVoidQbPurchaseId} />
-                                        <ResolveOrphanButton intakeId={row.id} qbPurchaseId={row.postVoidQbPurchaseId} expectedUpdatedAt={row.updatedAt} />
-                                    </>
-                                )}
+                            <div className="flex flex-col items-end gap-3">
+                                <div className="flex items-center gap-3 flex-wrap">
+                                    {row.postVoidQbPurchaseId && (
+                                        <>
+                                            <QuickBooksLink qbPurchaseId={row.postVoidQbPurchaseId} />
+                                            <ResolveOrphanButton intakeId={row.id} qbPurchaseId={row.postVoidQbPurchaseId} expectedUpdatedAt={row.updatedAt} />
+                                        </>
+                                    )}
+                                </div>
+                                {/* Shown for BOTH kinds: a known id does not rule out a second
+                                    purchase, and an unknown one is otherwise a dead end. */}
+                                <UnknownOrphanControls intakeId={row.id} expectedUpdatedAt={row.updatedAt} />
                             </div>
                         </RowShell>
                     ))}

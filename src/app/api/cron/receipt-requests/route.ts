@@ -349,7 +349,7 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
         }),
         prisma.receiptIntake.findMany({
             where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
-            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
+            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, stateReason: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
 
@@ -388,6 +388,8 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
             txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
             vendor: row.vendor,
             state: row.state,
+            // A row parked because its bytes are gone is not evidence.
+            stateReason: row.stateReason,
         })),
         // The cohort query below loaded exactly [from, to], so declare it: a
         // line whose window pokes outside that emits no decision rather than a
@@ -482,7 +484,7 @@ async function processBatch(
         }),
         prisma.receiptIntake.findMany({
             where: { txnDate: range.calendar, state: { notIn: [...DEAD_INTAKE_STATES] } },
-            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, expenseId: true, qbPurchaseId: true },
+            select: { id: true, totalCents: true, txnDate: true, vendor: true, state: true, stateReason: true, expenseId: true, qbPurchaseId: true },
         }),
     ]);
 
@@ -517,6 +519,8 @@ async function processBatch(
             txnDate: row.txnDate ? row.txnDate.toISOString().slice(0, 10) : null,
             vendor: row.vendor,
             state: row.state,
+            // A row parked because its bytes are gone is not evidence.
+            stateReason: row.stateReason,
         })),
         openIssueKeys: openIssues.map(row => row.targetKey),
         resolvedIssueKeys,

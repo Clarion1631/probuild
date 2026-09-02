@@ -408,11 +408,43 @@ Planner output for the executor: build exactly this; do not guess.
 3. **Chat user ids for CJ/Richard** must be collected once for `RECEIPT_OWNER_CHAT_USERS`
    (owner_user gates who may sign in chatAffidavitApp.js:211 — a wrong id locks the owner
    out of signing their own memos).
-4. **Fuzzy-match false closes**: exact-cents + ±2-day + token-overlap payee can still
-   close a request against a same-vendor same-amount different-purchase expense.
-   Accepted: a close only silences a chase; the register/variance edges still surface
-   unmatched purchases independently.
+4. **Fuzzy-match false closes**: exact-cents + ±2-day + payee. NARROWED — payee
+   agreement is no longer token overlap: it needs the same name (spacing- and
+   possessive-insensitive), the same leading bigram, or one side being a lone brand
+   token that leads the other. HOME DEPOT no longer agrees with HOME GOODS, nor
+   PACIFIC PLUMBING with PACIFIC SUPPLY. What remains is a same-vendor,
+   same-amount, same-week DIFFERENT purchase; accepted, because a close only
+   silences a chase and the register/variance edges still surface unmatched
+   purchases independently.
 5. **Two chase surfaces during transition**: Beverly's own missing-receipt asks and
    ProBuild's cards could both fire while Phase 2 shakes down. Mitigation: cards ship
    behind `RECEIPT_REQUEST_CARDS_ENABLED`; Justin turns Beverly's ask generation off in
    the same step he enables the flag (one-line runbook item in the PR).
+
+
+## 9. Operator checklist (before the flags go on)
+
+Every one of these is a human step. None of it happens by merging.
+
+1. **Run the schema scripts against prod, in this order, BEFORE the deploy that
+   selects the new columns** (CLAUDE.md pre-deploy rule #2):
+   `node scripts/apply-receipt-intake.mjs` then
+   `node scripts/apply-phase2-receipt-queue.mjs`.
+2. **Set `RECEIPT_BRIDGE_SECRET` in Vercel (production).** It is a NEW, REQUIRED,
+   DISTINCT secret — not Phase 1's intake key, and not the archive key. Both bridge
+   endpoints (`/api/automation/receipt-requests/threads` and `.../answers`) accept
+   ONLY this one; presenting either other key is a 403. Generate a fresh long random
+   value; Claude never handles it.
+3. **Set the same value on the Apps Script side.** Beverly's bridge posts the
+   `x-receipt-intake-secret` header, and it must now carry the BRIDGE secret. Until
+   both sides are updated the bridge gets a clean 401/403 and signed memos stop being
+   recorded — so change Vercel and Apps Script together, and re-run one thread export
+   to confirm.
+4. **Collect the Chat user ids** for `RECEIPT_OWNER_CHAT_USERS` (CJ, Richard). A wrong
+   id locks that owner out of signing their own memo.
+5. **Create the incoming webhook** in `spaces/AAQAKhvMYtg` and set
+   `RECEIPTS_CHAT_WEBHOOK`. Unset ⇒ the cron answers `{skipped:"no-webhook"}`.
+6. **Only then** set `RECEIPT_REQUEST_CARDS_ENABLED=true`, and turn Beverly's own
+   missing-receipt asks OFF in the same step (risk 5).
+7. `BANK_LINE_MINT_FROM_QBO` stays unset until somebody is watching the first run:
+   minting creates canonical ledger rows and `amountCents` is immutable by trigger.

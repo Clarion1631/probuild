@@ -485,3 +485,57 @@ export function rebuildCardItems(
     }
     return { items: kept, dropped };
 }
+
+// ── Chat resource names, as an operator types them ─────────────────────────
+
+/**
+ * `spaces/<space>/threads/<thread>` and `spaces/<space>/messages/<message>` —
+ * the two identities the bridge resolves a reply against.
+ *
+ * They are VALIDATED, not trusted, because on the "mark delivered" path a human
+ * is pasting them out of the Chat UI. A row marked POSTED with a mistyped
+ * thread name is the worst of both worlds: the card is closed, the crew may
+ * never have seen it, and the reply that would have answered it has nothing to
+ * resolve against. Refusing a malformed paste leaves the row UNCERTAIN, which
+ * is exactly where it should stay until somebody supplies the real thing.
+ */
+const CHAT_SPACE = "[A-Za-z0-9_-]+";
+const CHAT_ID = "[A-Za-z0-9_.-]+";
+const THREAD_NAME = new RegExp(`^spaces/${CHAT_SPACE}/threads/${CHAT_ID}$`);
+const MESSAGE_NAME = new RegExp(`^spaces/${CHAT_SPACE}/messages/${CHAT_ID}$`);
+
+export function isChatThreadName(value: unknown): value is string {
+    return typeof value === "string" && THREAD_NAME.test(value.trim());
+}
+
+export function isChatMessageName(value: unknown): value is string {
+    return typeof value === "string" && MESSAGE_NAME.test(value.trim());
+}
+
+/** `spaces/<id>` out of either resource name, for the same-space check. */
+export function chatSpaceOf(name: string): string | null {
+    const match = /^spaces\/([A-Za-z0-9_-]+)\//.exec(name.trim());
+    return match ? match[1] : null;
+}
+
+export interface ChatDelivery {
+    threadName: string;
+    messageName: string;
+}
+
+/**
+ * The pair an operator must supply to close an uncertain card by hand, or null
+ * when what they pasted cannot be that pair.
+ *
+ * BOTH names are required and both must name the SAME space — a pair copied
+ * from two different cards is the mistake this catches, and it is a plausible
+ * one when somebody is working through a list of them.
+ */
+export function parseChatDelivery(threadName: unknown, messageName: unknown): ChatDelivery | null {
+    if (!isChatThreadName(threadName) || !isChatMessageName(messageName)) return null;
+    const thread = threadName.trim();
+    const message = messageName.trim();
+    const space = chatSpaceOf(thread);
+    if (space === null || space !== chatSpaceOf(message)) return null;
+    return { threadName: thread, messageName: message };
+}

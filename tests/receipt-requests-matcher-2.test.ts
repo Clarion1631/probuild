@@ -11,6 +11,10 @@ import {
     isComponentKey,
     isDurableArtifactUrl,
     pageComponents,
+    payeeSignificantTokens,
+    payeeTokens,
+    GENERIC_PAYEE_TOKENS,
+    PAYEE_STOP_WORDS,
     matchEvidenceToLines,
     evidenceUnitKey,
     hasResolution,
@@ -20,6 +24,7 @@ import {
     type ReceiptEvidenceExpense,
     type ReceiptRequestBankLine,
 } from "../src/lib/receipt-requests";
+import { NO_ARTIFACT_STATE_REASONS } from "../src/lib/receipt-intake/route-state";
 
 /**
  * Round-2 matcher rules: one-to-one evidence assignment, generic legal-suffix
@@ -812,4 +817,110 @@ test("only a Drive or Storage URL counts as a durable artifact", () => {
     ]) {
         assert.equal(isDurableArtifactUrl(bad), false, String(bad).slice(0, 60));
     }
+});
+
+// ── Payee identity is a NAME, not a shared token (round-14 item 4) ──────────
+
+test("adversarial: near-miss merchants must NOT agree", () => {
+    // Each of these shares a token, and the old rule matched on exactly that —
+    // so a chase closed against a receipt belonging to a different shop.
+    for (const [a, b, why] of [
+        ["HOME DEPOT #4718", "HOME GOODS", "HOME is an industry word, not a merchant"],
+        ["HOME DEPOT", "HOME GOODS #12", "same, other way round"],
+        ["PACIFIC PLUMBING", "PACIFIC SUPPLY", "a regional prefix plus two different trades"],
+        ["PACIFIC PLUMBING SUPPLY", "PACIFIC ELECTRIC SUPPLY", "shared prefix AND shared suffix"],
+        ["ACME", "ZENITH HARDWARE", "nothing in common at all"],
+        ["ACME HARDWARE", "ZENITH HARDWARE", "only the trade in common"],
+        ["ACME LLC", "ZENITH LLC", "only a legal suffix in common"],
+        ["SEATTLE MARKET", "TACOMA MARKET", "only the trade in common"],
+        ["HOME", "HOME DEPOT", "a lone INDUSTRY word may never carry a match"],
+        ["SUPPLY", "PACIFIC SUPPLY", "same"],
+        ["STORE 4718", "SHOP 4718", "a store number is not identity"],
+    ] as const) {
+        assert.equal(payeeMatches(a, b), false, `${a} ↔ ${b} — ${why}`);
+        assert.equal(payeeMatches(b, a), false, `${b} ↔ ${a} (symmetric)`);
+    }
+});
+
+test("the real-world shapes still agree", () => {
+    for (const [a, b, why] of [
+        ["LOWES #02516", "Lowe's Home Improvement", "lone brand token leads the vendor name"],
+        ["LOWES #02516 POS DEB C#8516", "Lowes", "same name once the rail noise is gone"],
+        ["HOME DEPOT #4718", "Home Depot", "identical bigram, store number dropped"],
+        ["HOMEDEPOT.COM", "Home Depot", "one word or two, plus a TLD that names nothing"],
+        ["ACME HARDWARE", "ACME HARDWARE INC", "a legal suffix changes no identity"],
+        ["PACIFIC PLUMBING SUPPLY", "PACIFIC PLUMBING", "leading bigram agrees"],
+        ["MCDONALD'S", "MCDONALDS", "a possessive BINDS, it does not split"],
+    ] as const) {
+        assert.equal(payeeMatches(a, b), true, `${a} ↔ ${b} — ${why}`);
+        assert.equal(payeeMatches(b, a), true, `${b} ↔ ${a} (symmetric)`);
+    }
+});
+
+test("the token lists say what they are for", () => {
+    // Stop words name nothing and are dropped outright; industry words are real
+    // parts of a name but may not carry a match alone — which is why DEPOT is
+    // in the generic list and "HOME DEPOT" still matches "HOME DEPOT".
+    for (const word of ["LLC", "INC", "THE", "STORE", "COM"]) {
+        assert.ok(PAYEE_STOP_WORDS.has(word), word);
+        assert.deepEqual(payeeTokens(`ACME ${word}`), ["ACME"], `${word} is dropped`);
+    }
+    for (const word of ["HOME", "SUPPLY", "HARDWARE", "PLUMBING", "MARKET", "DEPOT"]) {
+        assert.ok(GENERIC_PAYEE_TOKENS.has(word), word);
+        assert.ok(payeeTokens(`ACME ${word}`).includes(word), `${word} survives tokenizing`);
+        assert.ok(!payeeSignificantTokens(`ACME ${word}`).includes(word), `${word} names no merchant`);
+    }
+    assert.equal(payeeMatches("HOME DEPOT", "HOME DEPOT"), true, "DEPOT is fine inside a bigram");
+});
+
+// ── A row is not a receipt (round-14 item 1) ───────────────────────────────
+
+test("an intake whose document could not be verified is NOT evidence", () => {
+    const line = {
+        id: "bl-1", postedDate: "2026-08-16", amountCents: -12_345,
+        rawDescriptor: "LOWES #02516 POS DEB C#8516", checkNumber: null,
+    };
+    const base = {
+        bankLines: [line],
+        expenses: [],
+        openIssueKeys: ["bl-1"],
+        now: new Date("2026-08-20T12:00:00Z"),
+    };
+    const intake = (stateReason: string | null) => ({
+        id: "int-1", totalCents: 12_345, txnDate: "2026-08-16",
+        vendor: "Lowes", state: "NEEDS_REVIEW", stateReason,
+    });
+
+    // The bytes are gone from storage, or they no longer hash to what was
+    // verified at intake. Either way the row outlived its document, and closing
+    // the chase on it means nobody is ever asked for the receipt again.
+    for (const reason of [...NO_ARTIFACT_STATE_REASONS]) {
+        const plan = planReceiptRequests({ ...base, intakes: [intake(reason)] });
+        assert.deepEqual(plan.close, [], reason);
+        assert.equal(plan.open.length, 1, `${reason} must keep the chase open`);
+    }
+
+    // Everything else book.ts parks is about the row's METADATA — the document
+    // is still there, still verified, and still proves a receipt exists.
+    for (const reason of ["no-estimate", "refund-or-zero", "invalid-date", "qbo-fault", null]) {
+        const plan = planReceiptRequests({ ...base, intakes: [intake(reason)] });
+        assert.deepEqual(plan.close, ["bl-1"], `${reason} is still evidence`);
+    }
+});
+
+test("book.ts and the chaser share ONE list of no-evidence reasons", () => {
+    // Spelled out at both ends they drift, and the drift is silent and
+    // one-directional: the chaser closes a chase for a receipt whose bytes are
+    // gone.
+    assert.deepEqual([...NO_ARTIFACT_STATE_REASONS].sort(), ["content-changed", "receipt-bytes-missing"]);
+    const book = readFileSync(join(repoRoot, "src/lib/receipt-intake/book.ts"), "utf8");
+    assert.match(book, /parkedBeforeSend\(NO_ARTIFACT_PARK_REASONS\.bytesMissing\)/);
+    assert.match(book, /parkedBeforeSend\(NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
+    assert.doesNotMatch(book, /parkedBeforeSend\("receipt-bytes-missing"\)/);
+    const worker = readFileSync(join(repoRoot, "src/lib/receipt-intake/worker.ts"), "utf8");
+    assert.match(worker, /parkTerminal\(row, deps, NO_ARTIFACT_PARK_REASONS\.contentChanged\)/);
+    // And the cron actually SELECTS the column the predicate needs.
+    const cron = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    const selects = cron.match(/state: true, stateReason: true/g) ?? [];
+    assert.equal(selects.length, 2, "the batch pass and the recompute pass");
 });

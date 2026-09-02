@@ -25,6 +25,7 @@
  */
 import { classifyReceiptRequirement, resolveReceiptOwner, type ReceiptOwner } from "./receipt-policy";
 import { normalizePayee } from "./bank-ledger";
+import { intakeArtifactIsVerified } from "./receipt-intake/route-state";
 
 /** The one targetType these issues use. targetKey is the BankLine id. */
 export const RECEIPT_REQUEST_TARGET_TYPE = "bank-line";
@@ -81,6 +82,18 @@ export interface ReceiptEvidenceExpense {
 
 export interface ReceiptEvidenceIntake {
     id: string;
+    /**
+     * Why the row is parked, when it is.
+     *
+     * A ROW IS NOT A RECEIPT. Two park reasons mean the document itself could
+     * not be verified — its bytes are gone from storage, or they no longer hash
+     * to what was checked at intake — and an intake in either state proves
+     * nothing about whether a receipt exists. Counting one as evidence closes
+     * the chase for a charge whose receipt is exactly what is missing, and
+     * nobody is ever asked for it again. `intakeArtifactIsVerified` is the same
+     * predicate book.ts writes those reasons with, so the two cannot drift.
+     */
+    stateReason?: string | null;
     /** Set once the intake booked. Folds this row together with the Expense it
      * produced — see evidenceUnitKey. */
     expenseId?: string | null;
@@ -416,49 +429,107 @@ function toYmd(date: Date): string {
 // ── Payee agreement ──────────────────────────────────────────────────────────
 
 /**
- * Tokens worth comparing: 3+ characters and not a pure number. Store numbers,
- * ZIPs and terminal ids are noise; "LLC"/"INC" survive but are harmless
- * because a shared token still needs the amount and date to agree.
+ * Legal/structural noise that names no merchant. Dropped outright.
+ *
+ * "ACME LLC" and "ZENITH LLC" share a token; before this they "agreed" on
+ * identity, which is the amount+date-alone match the Chevron/Cash App lesson
+ * forbids. Store numbers go the same way — "#02516" is a branch, not a payee.
  */
-export const GENERIC_PAYEE_TOKENS: ReadonlySet<string> = new Set([
-    "LLC", "INC", "CO", "CORP", "THE", "AND",
+export const PAYEE_STOP_WORDS: ReadonlySet<string> = new Set([
+    "LLC", "INC", "CO", "CORP", "LTD", "LP", "LLP", "THE", "AND", "OF", "STORE", "STORES",
+    // A web address names the same merchant as the shopfront: "HOMEDEPOT.COM"
+    // and "Home Depot" are one payee, and the TLD is not part of the identity.
+    "COM", "NET", "ORG", "WWW", "ONLINE",
 ]);
 
+/**
+ * INDUSTRY words. Real parts of a name, but they identify a TRADE rather than a
+ * merchant, so one of them alone may never carry a match.
+ *
+ * They are still tokens: "HOME DEPOT" is a perfectly good identity as a
+ * BIGRAM, and dropping DEPOT from the bigram would be as wrong as matching on
+ * it alone. So generics are excluded from the exact-name comparison and kept
+ * for the bigram — which is what separates HOME DEPOT from HOME GOODS, and
+ * PACIFIC PLUMBING from PACIFIC SUPPLY.
+ */
+export const GENERIC_PAYEE_TOKENS: ReadonlySet<string> = new Set([
+    "HOME", "SUPPLY", "SUPPLIES", "HARDWARE", "PLUMBING", "ELECTRIC", "ELECTRICAL",
+    "MARKET", "DEPOT", "LUMBER", "BUILDING", "BUILDERS", "CENTER", "CENTRE",
+    "SERVICE", "SERVICES", "COMPANY", "GENERAL", "TRUE",
+]);
+
+/**
+ * Comparable tokens, generics INCLUDED: 3+ characters, not a pure number, not a
+ * stop word. Store numbers, ZIPs and terminal ids are noise.
+ */
 export function payeeTokens(value: string): string[] {
     return (value ?? "")
         .toUpperCase()
+        // Possessives BIND, they do not separate: "LOWE'S" is one word, and
+        // splitting on the apostrophe produced "LOWE" — which is not the
+        // "LOWES" every bank descriptor carries, so the two never agreed.
+        .replace(/['’]/g, "")
         .replace(/[^A-Z0-9 ]/g, " ")
         .split(/\s+/)
         .filter(token =>
             token.length >= 3
             && !/^\d+$/.test(token)
-            // A legal suffix names no merchant. "ACME LLC" and "ZENITH LLC"
-            // share a token and would otherwise "agree" on identity, which is
-            // exactly the amount+date-alone match the Chevron/Cash App lesson
-            // forbids. ("CO" is already below the length floor; it is listed so
-            // the rule reads as one intent rather than two accidents.)
-            && !GENERIC_PAYEE_TOKENS.has(token));
+            && !PAYEE_STOP_WORDS.has(token));
+}
+
+/** The tokens that actually NAME a merchant: `payeeTokens` minus the generics. */
+export function payeeSignificantTokens(value: string): string[] {
+    return payeeTokens(value).filter(token => !GENERIC_PAYEE_TOKENS.has(token));
 }
 
 /**
- * True when two payee strings plausibly name the same merchant.
+ * True when two payee strings name the same merchant.
  *
- * Either they share a token, or one's FIRST token is a prefix (4+ chars) of
- * the other's first token — which is what carries "LOWES #02516" vs "Lowe's
- * Home Improvement" and "HOMEDEPOT.COM" vs "Home Depot". An empty side never
- * matches: bank-ledger's rule is that "" is not an identity.
+ * THREE ways to agree, and no others:
+ *
+ *   1. The names are IDENTICAL once stop words and store numbers are gone
+ *      ("HOME DEPOT #4718" vs "HOME DEPOT").
+ *   2. The FIRST TWO tokens agree — the leading bigram, generics included,
+ *      which is why "DEPOT" is perfectly good as the second half of one.
+ *   3. One side is a LONE BRAND token and it leads the other ("LOWES #02516"
+ *      vs "Lowe's Home Improvement"). Guarded on the token not being an
+ *      industry word, so "HOME" cannot claim "HOME DEPOT" — and it compares
+ *      the other side's FIRST token only, so "ACME" cannot claim
+ *      "ZENITH HARDWARE".
+ *
+ * A SHARED TOKEN IS NOT AN IDENTITY, and that is the change here. The old rule
+ * matched on any shared token plus a 4-character prefix, so HOME DEPOT agreed
+ * with HOME GOODS, PACIFIC PLUMBING with PACIFIC SUPPLY, and every
+ * "… HARDWARE" with every other. Each of those closes a chase for a receipt
+ * that does not exist, which is the one failure this matcher must not have — a
+ * missed match only asks a human a question they can answer.
+ *
+ * An empty side never matches: bank-ledger's rule is that "" is not an identity.
  */
 export function payeeMatches(a: string, b: string | null | undefined): boolean {
     if (!a || !b) return false;
     const left = payeeTokens(a);
     const right = payeeTokens(b);
     if (left.length === 0 || right.length === 0) return false;
-    const rightSet = new Set(right);
-    if (left.some(token => rightSet.has(token))) return true;
-    const [firstLeft] = left;
-    const [firstRight] = right;
-    if (firstLeft.length >= 4 && firstRight.startsWith(firstLeft)) return true;
-    if (firstRight.length >= 4 && firstLeft.startsWith(firstRight)) return true;
+
+    // 1. The same name, SPACING-INSENSITIVE. Squashed, because a bank
+    //    descriptor writes the merchant as one word about as often as two
+    //    ("HOMEDEPOT.COM" vs "Home Depot") — and squashing is strictly tighter
+    //    than token overlap: HOMEDEPOT still differs from HOMEGOODS, and
+    //    PACIFICPLUMBING from PACIFICSUPPLY.
+    if (left.join("") === right.join("")) return true;
+
+    // 2. The leading bigram. Two tokens is enough identity; one is not.
+    if (left.length >= 2 && right.length >= 2 && left[0] === right[0] && left[1] === right[1]) {
+        return true;
+    }
+
+    // 3. A lone brand token leading the other side. The generic guard is what
+    //    stops this collapsing into "shares a token" all over again.
+    const lone = (tokens: string[]) => tokens.length === 1 && !GENERIC_PAYEE_TOKENS.has(tokens[0]);
+    if (lone(left) && right[0] === left[0]) return true;
+    if (lone(right) && left[0] === right[0]) return true;
+
     return false;
 }
 
@@ -573,7 +644,11 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
             vendor: e.vendor,
         })),
         ...input.intakes
-            .filter(intake => !DEAD_INTAKE_STATES.has(intake.state) && intake.totalCents !== null)
+            .filter(intake =>
+                !DEAD_INTAKE_STATES.has(intake.state)
+                && intake.totalCents !== null
+                // See ReceiptEvidenceIntake.stateReason.
+                && intakeArtifactIsVerified(intake.stateReason))
             .map(intake => ({
                 id: `intake:${intake.id}`,
                 unit: evidenceUnitKey(intake) ?? `intake:${intake.id}`,

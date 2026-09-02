@@ -208,3 +208,39 @@ export function retryTargetFor(state: string, stateReason: string | null): Retry
     if (!reason) return null;
     return RETRYABLE_REASONS.find(rule => rule.test.test(reason))?.target ?? null;
 }
+
+// ── Whether a parked row still PROVES a receipt exists ──────────────────────
+
+/**
+ * Park reasons that mean THE DOCUMENT ITSELF could not be verified.
+ *
+ * Named here rather than spelled out at each site so the writer (book.ts, which
+ * parks the row) and the reader (the missing-receipt chaser, which counts
+ * intakes as evidence) cannot drift apart. If they drift the failure is silent
+ * and one-directional: the chaser closes a chase on the strength of a receipt
+ * whose bytes are GONE, and nobody is ever asked for it again.
+ *
+ * Everything else book.ts parks — `no-estimate`, `refund-or-zero`,
+ * `invalid-date`, a QBO fault — is about the row's METADATA. The document is
+ * still in the bucket, still verified, and still proves the purchase has a
+ * receipt; it just cannot be booked yet. Those rows remain evidence.
+ */
+export const NO_ARTIFACT_PARK_REASONS = {
+    /** An affirmative 404 from storage: the object is not there. */
+    bytesMissing: "receipt-bytes-missing",
+    /** The bytes no longer hash to what was verified at intake. */
+    contentChanged: "content-changed",
+} as const;
+
+export const NO_ARTIFACT_STATE_REASONS: ReadonlySet<string> = new Set(Object.values(NO_ARTIFACT_PARK_REASONS));
+
+/**
+ * True when this row still stands behind a durable, verified receipt document.
+ *
+ * The chaser may only treat an intake as evidence when this holds: "a row
+ * exists" is not the same claim as "a receipt exists", and the two states above
+ * are exactly the cases where the row outlived its document.
+ */
+export function intakeArtifactIsVerified(stateReason: string | null | undefined): boolean {
+    return !(typeof stateReason === "string" && NO_ARTIFACT_STATE_REASONS.has(stateReason));
+}
