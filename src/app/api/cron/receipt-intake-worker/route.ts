@@ -7,13 +7,14 @@ import { downloadDocBytes, toSecureRef } from "@/lib/secure-storage";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
 import { readReceipt } from "@/lib/receipt-intake/read";
+import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import { bookReceipt, type BookPrismaClient } from "@/lib/receipt-intake/book";
 import { backoffMs } from "@/lib/receipt-intake/route-state";
 import {
     BATCH_SIZE,
     CLAIM_LEASE_MINUTES,
     CLAIM_LOCK_KEY,
-    isStrongKeyConflict,
+    isUniqueViolation,
     runIntakeWorker,
     type ReadPatch,
     type WorkerDependencies,
@@ -51,8 +52,21 @@ const WORKER_ROW_SELECT = {
     storagePath: true, fileName: true, mimeType: true, fileSize: true,
     vendor: true, txnDate: true, totalCents: true, taxCents: true,
     docType: true, refNumber: true, memo: true, attempts: true, readAt: true,
-    createdAt: true,
+    createdAt: true, dedupWeakKey: true, busyPasses: true,
 } as const;
+
+/**
+ * A row parked by the shadow week (dryRun=true, sitting at READ or BOOKING) is
+ * DONE until the cutover. It is excluded from the claim rather than merely
+ * skipped inside the loop, because the batch is only ten rows: after a couple
+ * of shadow days the oldest ten rows are all parked ones, they get re-claimed
+ * every five minutes, and no NEW receipt is ever reached. The queue looks
+ * healthy and processes nothing. runIntakeWorker's requeueDryRunParked is what
+ * brings them back, once, on the first live pass.
+ */
+const NOT_DRY_RUN_PARKED: Prisma.ReceiptIntakeWhereInput = {
+    NOT: { AND: [{ dryRun: true }, { state: { in: ["READ", "BOOKING"] } }] },
+};
 
 async function claim(): Promise<WorkerRow[] | null> {
     const now = new Date();
@@ -66,6 +80,7 @@ async function claim(): Promise<WorkerRow[] | null> {
             where: {
                 state: { in: ["RECEIVED", "READ", "BOOKING"] },
                 OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+                ...NOT_DRY_RUN_PARKED,
             },
             orderBy: { createdAt: "asc" },
             take: BATCH_SIZE,
@@ -86,6 +101,20 @@ async function claim(): Promise<WorkerRow[] | null> {
 function buildDeps(): WorkerDependencies {
     return {
         claim,
+
+        isDryRunEnabled: () => process.env.RECEIPT_INTAKE_DRYRUN !== "false",
+
+        requeueDryRunParked: async () => {
+            const { count } = await prisma.receiptIntake.updateMany({
+                where: { dryRun: true, state: { in: ["READ", "BOOKING"] } },
+                // dryRun flips WITH the requeue, in one statement: a row that
+                // reappears in the queue still carrying dryRun=true would be
+                // skipped by the loop and re-parked forever.
+                data: { dryRun: false, nextRetryAt: null },
+            });
+            if (count > 0) console.log("[cron/receipt-intake-worker] cutover requeue", count);
+            return count;
+        },
 
         loadPhases: async () => prisma.costCode.findMany({
             where: { isActive: true },
@@ -108,19 +137,30 @@ function buildDeps(): WorkerDependencies {
                 // The partial unique index refused the claim — the DATABASE is
                 // the lock the Apps Script did with Script Properties. Load the
                 // owner so the caller can compare totals.
-                if (!isStrongKeyConflict(error) || !patch.dedupStrongKey) throw error;
+                // Which constraint fired is resolved by looking the owner up
+                // BY dedupStrongKey — a fact about the data — rather than by
+                // string-matching Prisma's `meta`, whose shape is version
+                // dependent and is empty for a partial index on some engine
+                // builds (i.e. exactly this index).
+                if (!isUniqueViolation(error) || !patch.dedupStrongKey) throw error;
                 const owner = await prisma.receiptIntake.findFirst({
                     where: {
                         dedupStrongKey: patch.dedupStrongKey,
                         state: { notIn: ["DUPLICATE", "VOID"] },
                         id: { not: rowId },
                     },
-                    select: { id: true, totalCents: true },
+                    select: { id: true, totalCents: true, vendor: true },
                 });
-                // A conflict with no findable owner would silently re-claim on
-                // the next pass; treat it as a real error instead.
+                // No owner means some OTHER unique constraint rejected the
+                // write; re-throw rather than reporting a dedup hit that isn't.
                 if (!owner) throw error;
-                return { strongOwner: owner };
+                return {
+                    strongOwner: {
+                        id: owner.id,
+                        totalCents: owner.totalCents,
+                        canonicalVendor: owner.vendor ? canonicalVendor(owner.vendor) : null,
+                    },
+                };
             }
         },
 
@@ -141,12 +181,41 @@ function buildDeps(): WorkerDependencies {
             });
         },
 
-        promoteToBooking: async rowId => {
-            await prisma.receiptIntake.update({
+        promoteToBooking: async (rowId, weakKey) => prisma.$transaction(async tx => {
+            // LAST weak-dedup check, taken INSIDE the transition. The check at
+            // read time can miss a pair that arrived in the same batch window,
+            // and READ -> BOOKING is the last instant before money moves.
+            if (weakKey) {
+                const conflict = await tx.receiptIntake.findFirst({
+                    where: {
+                        dedupWeakKey: weakKey,
+                        id: { not: rowId },
+                        state: { in: ["BOOKING", "BOOKED", "ARCHIVED"] },
+                    },
+                    select: { id: true },
+                    orderBy: { createdAt: "asc" },
+                });
+                if (conflict) {
+                    await tx.receiptIntake.update({
+                        where: { id: rowId },
+                        data: {
+                            state: "NEEDS_REVIEW",
+                            stateReason: `weak-dup:${conflict.id}`,
+                            // Parked without ever reaching QuickBooks, so the
+                            // strong key goes back (same rule as book.ts).
+                            dedupStrongKey: null,
+                            nextRetryAt: null,
+                        },
+                    });
+                    return { promoted: false, conflictId: conflict.id };
+                }
+            }
+            await tx.receiptIntake.update({
                 where: { id: rowId },
                 data: { state: "BOOKING", stateReason: null },
             });
-        },
+            return { promoted: true };
+        }),
 
         book: row => bookReceipt(row, {
             db: prisma as unknown as BookPrismaClient,
@@ -165,7 +234,15 @@ function buildDeps(): WorkerDependencies {
             if (result.outcome === "needs-review") {
                 await prisma.receiptIntake.update({
                     where: { id: rowId },
-                    data: { state: "NEEDS_REVIEW", stateReason: result.reason, nextRetryAt: null },
+                    data: {
+                        state: "NEEDS_REVIEW",
+                        stateReason: result.reason,
+                        nextRetryAt: null,
+                        // Parked before any QBO send: hand the strong key back,
+                        // or a corrected re-send of the same receipt would be
+                        // quarantined against a row that never became a purchase.
+                        ...(result.releaseStrongKey ? { dedupStrongKey: null } : {}),
+                    },
                 });
                 return;
             }
@@ -193,20 +270,30 @@ function buildDeps(): WorkerDependencies {
             });
         },
 
-        deferRead: async (rowId, _decisive, reason) => {
+        deferRead: async (rowId, busyPasses, reason) => {
             // The service was unavailable; the document was never read, so this
-            // costs no attempt — only a delay. Reuses the booking backoff table
-            // so one outage does not hammer Gemini from every row at once.
+            // costs no `attempts` — only a delay and one busy pass. Reuses the
+            // booking backoff table so one outage does not hammer Gemini from
+            // every row at once.
             await prisma.receiptIntake.update({
                 where: { id: rowId },
                 data: {
+                    busyPasses,
                     lastError: reason,
                     nextRetryAt: new Date(Date.now() + backoffMs(1)),
                 },
             });
         },
 
+        retryRow: async (rowId, attempts, nextRetryAt, reason) => {
+            await prisma.receiptIntake.update({
+                where: { id: rowId },
+                data: { attempts, lastError: reason, nextRetryAt },
+            });
+        },
+
         now: () => new Date(),
+        monotonicMs: () => Date.now(),
     };
 }
 

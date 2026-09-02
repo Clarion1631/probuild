@@ -13,14 +13,23 @@ import assert from "node:assert/strict";
 import {
     runIntakeWorker,
     dateOnly,
+    isTerminalQboFault,
+    isUniqueViolation,
     toDateStr,
+    MAX_BUSY_PASSES,
+    RUN_SOFT_DEADLINE_MS,
     type ReadPatch,
     type WorkerDependencies,
     type WorkerRow,
 } from "../src/lib/receipt-intake/worker";
 import type { ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
+import { QBTimeoutError } from "../src/lib/quickbooks";
+import { QboAccountConfigError, QboPurchaseFaultError } from "../src/lib/qbo-receipt-push";
 
+import { Prisma } from "@prisma/client";
+
+const PrismaKnownError = Prisma.PrismaClientKnownRequestError;
 const NOW = new Date("2026-09-01T12:00:00.000Z");
 
 function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
@@ -47,6 +56,8 @@ function workerRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
         attempts: 0,
         readAt: null,
         createdAt: new Date("2026-08-20T09:00:00.000Z"),
+        dedupWeakKey: null,
+        busyPasses: 0,
         ...overrides,
     };
 }
@@ -74,27 +85,35 @@ interface Harness {
     applied: ReadPatch[];
     states: { id: string; state: string; reason: string | null }[];
     promoted: string[];
-    deferred: string[];
+    deferred: { id: string; busyPasses: number }[];
+    retried: { id: string; attempts: number; reason: string }[];
+    requeueCalls: number;
+    clock: number;
 }
 
 function harness(rows: WorkerRow[], overrides: Partial<WorkerDependencies> = {}): Harness {
     const h: Harness = {
         reads: 0, books: 0, applied: [], states: [], promoted: [], deferred: [],
+        retried: [], requeueCalls: 0, clock: 0,
         deps: null as unknown as WorkerDependencies,
     };
     h.deps = {
         claim: async () => rows,
+        isDryRunEnabled: () => true,
+        requeueDryRunParked: async () => { h.requeueCalls++; return 0; },
         loadPhases: async () => [{ id: "cc-plumb", code: "03-PLUMB", name: "Plumbing" }],
         downloadBytes: async () => Buffer.from("bytes"),
         read: async () => { h.reads++; return goodRead; },
         applyRead: async (_id, patch) => { h.applied.push(patch); return { strongOwner: null }; },
         findWeakHit: async () => null,
         applyState: async (id, state, reason) => { h.states.push({ id, state, reason }); },
-        promoteToBooking: async id => { h.promoted.push(id); },
+        promoteToBooking: async id => { h.promoted.push(id); return { promoted: true }; },
         book: async () => { h.books++; return { outcome: "booked", qbPurchaseId: "QB-1", expenseId: "e1", alreadyExisted: false } as BookResult; },
         applyBookResult: async () => {},
-        deferRead: async id => { h.deferred.push(id); },
+        deferRead: async (id, busyPasses) => { h.deferred.push({ id, busyPasses }); },
+        retryRow: async (id, attempts, _next, reason) => { h.retried.push({ id, attempts, reason }); },
         now: () => NOW,
+        monotonicMs: () => h.clock,
         ...overrides,
     };
     return h;
@@ -140,8 +159,9 @@ test("LIVE: a READ row with dryRun=false is promoted and booked", async () => {
 });
 
 test("a strong-key claim that loses re-routes against the owner and keeps no key", async () => {
+    // Same total AND same canonical vendor: a confirmed duplicate.
     const h = harness([workerRow()], {
-        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 36498 } }),
+        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "lowes" } }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { DUPLICATE: 1 });
@@ -151,7 +171,7 @@ test("a strong-key claim that loses re-routes against the owner and keeps no key
 
 test("a strong-key loss at a DIFFERENT total goes to a human, not to DUPLICATE", async () => {
     const h = harness([workerRow()], {
-        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 999 } }),
+        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 999, canonicalVendor: "lowes" } }),
     });
     const summary = await runIntakeWorker(h.deps);
     assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
@@ -170,12 +190,24 @@ test("a document that does not reach READ never claims the strong key", async ()
     assert.equal(h.applied[0].dedupStrongKey, null);
 });
 
-test("a service outage costs no attempt: the row is deferred, not reviewed", async () => {
-    const h = harness([workerRow()], { read: async () => ({ ok: false, decisive: false }) });
+test("a service outage costs no attempt: the row is deferred and counts ONE busy pass", async () => {
+    const h = harness([workerRow({ busyPasses: 3 })], { read: async () => ({ ok: false, decisive: false }) });
     const summary = await runIntakeWorker(h.deps);
-    assert.deepEqual(h.deferred, ["row-1"]);
-    assert.deepEqual(h.states, []);
+    assert.deepEqual(h.deferred, [{ id: "row-1", busyPasses: 4 }]);
+    assert.deepEqual(h.states, [], "no state change — the document was never read");
     assert.deepEqual(summary.byState, { RECEIVED: 1 });
+});
+
+test("an outage that never ends still ends: 20 busy passes parks the row", async () => {
+    // v3.4. Without a ceiling a row cycles silently forever and nobody is ever
+    // told the pipeline stopped producing.
+    const h = harness([workerRow({ busyPasses: MAX_BUSY_PASSES - 1 })], {
+        read: async () => ({ ok: false, decisive: false }),
+    });
+    await runIntakeWorker(h.deps);
+    assert.deepEqual(h.deferred, [], "no further deferral");
+    assert.equal(h.states[0].state, "NEEDS_REVIEW");
+    assert.equal(h.states[0].reason, "ai-unavailable");
 });
 
 test("a document the model answered on but could not read goes to a human", async () => {
@@ -199,7 +231,9 @@ test("another run holding the lock yields skipped, not an empty pass", async () 
     });
 });
 
-test("one poison row is parked and the rest of the batch still runs", async () => {
+test("one blowing-up row does not stall the batch", async () => {
+    // The failing row is RETRIED (a throw here is almost always transport, not
+    // the document) and, either way, row 2 still gets processed.
     let call = 0;
     const h = harness([workerRow({ id: "row-1" }), workerRow({ id: "row-2" })], {
         read: async () => {
@@ -210,8 +244,144 @@ test("one poison row is parked and the rest of the batch still runs", async () =
     });
     const summary = await runIntakeWorker(h.deps);
     assert.equal(summary.processed, 2);
-    assert.equal(summary.byState.NEEDS_REVIEW, 1);
+    assert.equal(summary.byState.RETRY, 1);
     assert.equal(summary.byState.READ, 1);
+    assert.equal(h.retried[0].id, "row-1");
+});
+
+test("a strong-key loss to a DIFFERENT vendor is a collision, not a duplicate", async () => {
+    const h = harness([workerRow()], {
+        applyRead: async () => ({ strongOwner: { id: "row-owner", totalCents: 36498, canonicalVendor: "homedepot" } }),
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+    assert.equal(h.states[0].reason, "vendor-mismatch:row-owner");
+});
+
+// ── Dry-run starvation (Codex blocker 1) ─────────────────────────────────────
+
+test("the shadow week does NOT requeue parked rows", async () => {
+    const h = harness([workerRow({ state: "READ", dryRun: true })], { isDryRunEnabled: () => true });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.requeueCalls, 0);
+    assert.equal(summary.requeued, undefined);
+});
+
+test("the FIRST live pass un-parks the shadow week's backlog, once", async () => {
+    // Parked rows are excluded from the claim (see the cron route's
+    // NOT_DRY_RUN_PARKED) precisely so they cannot starve the ten-row batch —
+    // which also means nothing else would ever wake them.
+    const h = harness([], {
+        isDryRunEnabled: () => false,
+        requeueDryRunParked: async () => { h.requeueCalls++; return 7; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.requeueCalls, 1);
+    assert.equal(summary.requeued, 7);
+
+    // Idempotent by construction: nothing is left matching the predicate.
+    const second = harness([], {
+        isDryRunEnabled: () => false,
+        requeueDryRunParked: async () => { second.requeueCalls++; return 0; },
+    });
+    const secondSummary = await runIntakeWorker(second.deps);
+    assert.equal(secondSummary.requeued, undefined, "a no-op requeue is not reported");
+});
+
+test("the requeue happens even when another worker holds the lock", async () => {
+    // The lock guards the BATCH, not the cutover. A run that finds the lock
+    // taken must still not swallow the one-shot requeue.
+    const h = harness([], {
+        isDryRunEnabled: () => false,
+        claim: async () => null,
+        requeueDryRunParked: async () => { h.requeueCalls++; return 3; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(summary.skipped, "already-running");
+    assert.equal(summary.requeued, 3);
+});
+
+// ── Soft deadline (Codex blocker 2) ──────────────────────────────────────────
+
+test("the worker stops TAKING rows at 40s and leaves the rest for the next run", async () => {
+    // A row started at 41s can still be reading at 66s, past the 60s function
+    // ceiling — the invocation dies mid-book and the row is left in whatever
+    // state it happened to reach.
+    const rows = [1, 2, 3, 4, 5].map(n => workerRow({ id: `row-${n}` }));
+    const h = harness(rows, {
+        read: async () => { h.clock += 15_000; h.reads++; return goodRead; },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.ok(h.clock >= RUN_SOFT_DEADLINE_MS);
+    assert.equal(summary.processed, 3, "three rows fit inside the soft deadline");
+    assert.equal(summary.deferredToNextRun, 2);
+    assert.equal(h.reads, 3, "the deferred rows are never read");
+});
+
+// ── Weak-dedup race at the READ -> BOOKING transition (Codex blocker 5) ───────
+
+test("a weak-key twin already BOOKING blocks the transition and asks a human", async () => {
+    const h = harness([workerRow({ state: "READ", dryRun: false, dedupWeakKey: "lowes|2026-08-03|364.98|amt" })], {
+        promoteToBooking: async (id, weakKey) => {
+            h.promoted.push(id);
+            assert.equal(weakKey, "lowes|2026-08-03|364.98|amt", "the weak key is passed INTO the transition");
+            return { promoted: false, conflictId: "row-twin" };
+        },
+    });
+    const summary = await runIntakeWorker(h.deps);
+    assert.equal(h.books, 0, "money never moves on a blocked transition");
+    assert.deepEqual(summary.byState, { NEEDS_REVIEW: 1 });
+});
+
+// ── Transient vs terminal (Codex issue 11) ───────────────────────────────────
+
+test("a storage/Prisma/network throw is RETRIED, not parked for a human", async () => {
+    // Parking every transient fault turns one bad minute into a queue full of
+    // manual work — and leaves those rows holding their strong keys.
+    for (const error of [new Error("connection reset"), new TypeError("fetch failed"), new QBTimeoutError("t")]) {
+        const h = harness([workerRow({ attempts: 2 })], {
+            downloadBytes: async () => { throw error; },
+        });
+        const summary = await runIntakeWorker(h.deps);
+        assert.deepEqual(summary.byState, { RETRY: 1 }, String(error));
+        assert.equal(h.retried[0].attempts, 3);
+        assert.deepEqual(h.states, [], "not parked");
+    }
+});
+
+test("a CLASSIFIED QBO business fault thrown mid-row IS terminal", () => {
+    assert.equal(isTerminalQboFault(new QboPurchaseFaultError(400, "closed period", "6210")), true);
+    assert.equal(isTerminalQboFault(new QboAccountConfigError("bad account")), true);
+    // A timeout is transport, not a verdict.
+    assert.equal(isTerminalQboFault(new QBTimeoutError("timed out")), false);
+    assert.equal(isTerminalQboFault(new Error("connection reset")), false);
+});
+
+test("a QBO fault thrown mid-row parks; a transient one past the ceiling also parks", async () => {
+    const terminal = harness([workerRow()], {
+        downloadBytes: async () => { throw new QboAccountConfigError("bad account"); },
+    });
+    assert.deepEqual((await runIntakeWorker(terminal.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.match(terminal.states[0].reason!, /^qbo-fault:/);
+
+    const exhausted = harness([workerRow({ attempts: 19 })], {
+        downloadBytes: async () => { throw new Error("connection reset"); },
+    });
+    assert.deepEqual((await runIntakeWorker(exhausted.deps)).byState, { NEEDS_REVIEW: 1 });
+    assert.equal(exhausted.states[0].reason, "max-retries");
+});
+
+test("isUniqueViolation is about the ERROR CODE, not Prisma's meta text", () => {
+    // The previous version string-matched "dedupStrongKey" inside error.meta,
+    // which is version-dependent and EMPTY for a partial index on some engine
+    // builds — i.e. exactly the index this mechanism depends on.
+    const p2002 = Object.assign(new Error("unique"), { code: "P2002", meta: {}, clientVersion: "5", name: "PrismaClientKnownRequestError" });
+    Object.setPrototypeOf(p2002, PrismaKnownError.prototype);
+    assert.equal(isUniqueViolation(p2002), true, "an empty meta must still be recognised");
+    const p2003 = Object.assign(new Error("fk"), { code: "P2003", meta: {}, clientVersion: "5" });
+    Object.setPrototypeOf(p2003, PrismaKnownError.prototype);
+    assert.equal(isUniqueViolation(p2003), false);
+    assert.equal(isUniqueViolation(new Error("plain")), false);
 });
 
 test("dateOnly keeps a calendar day at UTC midnight, the way @db.Date round-trips", () => {
