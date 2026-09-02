@@ -310,6 +310,7 @@ model Project {
   permits                 Permit[]
   inspections             Inspection[]
   receiptIntakes          ReceiptIntake[]
+  expenses                Expense[]
 
   // ── Percent complete (earned revenue / earned margin) ──────────────────────
   // percentComplete is the EFFECTIVE value every screen shows; percentCompleteAuto
@@ -630,6 +631,28 @@ model Expense {
   invoicedAt    DateTime?
   status        String        @default("Pending") // Pending, Reviewed
 
+  // ── Phase 3 attribution (docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §2) ────────
+  // Born-with-a-job. `estimateId` stays the REQUIRED parent (and still
+  // Cascade-deletes this row); `projectId` is the denormalized truth every
+  // money-path reader resolves through src/lib/expense-attribution.ts.
+  // Nullable because it was backfilled onto 562 existing rows — a NULL here
+  // still resolves via the estimate, which is why the resolver exists.
+  projectId           String?
+  project             Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  /// Sales tax read off the receipt. `Expense.amount` stays the GROSS total
+  /// paid (Phase 1's decision), so pre-tax = amount - taxAmount.
+  taxAmount           Decimal?
+  /// WA excise "tax paid at source": GTR paid sales tax at the register on
+  /// material it resold as part of customer work.
+  taxAtSource         Boolean   @default(false)
+  /// null = unknown/legacy. Only TRUE rows are deductible on the excise
+  /// return, so an absent answer must never read as a yes.
+  installedAtCustomer Boolean?
+  /// capture | ai | manual | backfill. Precedence: capture = manual >
+  /// ai = backfill > null. Nothing but a human edit rewrites capture/manual.
+  costCodeSource      String?
+  costCodeConfidence  Decimal?
+
   purchaseOrderId String?
   purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
@@ -643,6 +666,7 @@ model Expense {
 
   @@index([estimateId])
   @@index([changeOrderId])
+  @@index([projectId])
 }
 
 model Invoice {
@@ -3040,6 +3064,11 @@ model ReceiptIntake {
   costCode            CostCode? @relation(fields: [costCodeId], references: [id])
   suggestedCostCodeId String?
   suggestedConfidence Float?
+  /// Phase 3: did this material get installed at a customer job (deductible on
+  /// the WA excise return) or consumed by the shop? null = unknown; only TRUE
+  /// counts, so a missing answer never inflates the deduction. Set at capture
+  /// (the mobile toggle) and copied onto the Expense at booking.
+  installedAtCustomer Boolean?
   createdById         String?
   createdBy           User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
 
@@ -3072,6 +3101,10 @@ model ReceiptIntake {
   txnDate    DateTime? @db.Date
   totalCents Int?
   taxCents   Int?
+  /// Phase 3: the read found sales tax GTR paid at the register. Set by the
+  /// READ step (`taxCents > 0`) for the drive/email/chat sources, and copied
+  /// onto the Expense at booking.
+  taxAtSource Boolean @default(false)
   docType    String? // receipt | check | multi | non_receipt
   refNumber  String? // cleaned invoice #, or "Check<num>" for checks
   memo       String?

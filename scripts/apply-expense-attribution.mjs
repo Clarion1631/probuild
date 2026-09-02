@@ -1,0 +1,229 @@
+// One-off additive migration for Expense attribution (Receipt Pipeline v2,
+// Phase 3 — docs/plans/PHASE-3-ATTRIBUTION-SPEC.md §2): the denormalized
+// `projectId` every money-path reader resolves through, plus the tax columns
+// the WA "tax paid at source" deduction report needs, plus the provenance of a
+// row's cost code so an automated suggester can never overwrite a human.
+//
+// The SQL here is byte-equivalent to
+// prisma/migrations/20260901120000_expense_attribution/migration.sql — that
+// file is what a fresh CI/dev database gets; this script is what production
+// gets, BEFORE the build that selects these columns deploys (CLAUDE.md
+// pre-deploy rule #2 — otherwise every page touching them throws P2022).
+// tests/apply-expense-attribution.test.ts asserts the two never drift.
+//
+// Additive and idempotent: ADD COLUMN / CREATE INDEX IF NOT EXISTS, a guarded
+// constraint add, and a backfill UPDATE that only ever touches rows whose
+// `projectId` is still NULL. A second run reports every statement "ok" and
+// updates 0 rows.
+//
+//   node scripts/apply-expense-attribution.mjs --yes --expect-db <name> --expect-host <host>
+//
+// --expect-db and --expect-host are BOTH required alongside --yes, matching
+// scripts/apply-receipt-intake.mjs: "--yes" alone only proves you meant to run
+// something, and a database NAME alone doesn't prove which SERVER it's on.
+import { PrismaClient } from "@prisma/client";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+
+export function resolveDatabaseUrl() {
+    if (process.env.DATABASE_URL) return { url: process.env.DATABASE_URL, from: "process.env.DATABASE_URL" };
+    for (const file of [".env.local", ".env"]) {
+        if (!fs.existsSync(file)) continue;
+        const match = fs.readFileSync(file, "utf8").match(/^DATABASE_URL\s*=\s*"?([^"\n]+)"?/m);
+        if (match) return { url: match[1], from: file };
+    }
+    throw new Error("DATABASE_URL not found in process.env, .env.local, or .env");
+}
+
+export function maskUrl(url) {
+    return url.replace(/:[^:@]*@/, ":****@");
+}
+
+function readFlagValue(flag) {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 ? process.argv[idx + 1] : undefined;
+}
+
+/**
+ * Pure comparison, exported for unit testing without a live DB. Compares BOTH
+ * database name and server host, and both EXACTLY — same rule and same reason
+ * as apply-receipt-intake.mjs: a guard that accepts a substring gets looser the
+ * shorter the operator's input is.
+ */
+export function targetMatches(actual, expectDb, expectHost) {
+    if (!actual || typeof actual !== "object") return false;
+    if (String(actual.db ?? "") !== String(expectDb ?? "")) return false;
+    return String(actual.host ?? "") === String(expectHost ?? "");
+}
+
+export const statements = [
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "projectId" TEXT`,
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAmount" DECIMAL(65,30)`,
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN`,
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeSource" TEXT`,
+    `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "costCodeConfidence" DECIMAL(65,30)`,
+
+    `CREATE INDEX IF NOT EXISTS "Expense_projectId_idx" ON "Expense"("projectId")`,
+
+    // SET NULL, not Cascade: `estimateId` already owns this row's lifecycle. A
+    // project delete must not silently destroy spend history that the estimate
+    // still holds.
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'Expense_projectId_fkey'
+                         AND conrelid = '"Expense"'::regclass) THEN
+         ALTER TABLE "Expense" ADD CONSTRAINT "Expense_projectId_fkey"
+           FOREIGN KEY ("projectId") REFERENCES "Project"("id")
+           ON DELETE SET NULL ON UPDATE CASCADE;
+       END IF;
+     END $$`,
+
+    // The backfill. Idempotent by predicate, and a no-op on an empty database.
+    `UPDATE "Expense" e SET "projectId" = est."projectId"
+     FROM "Estimate" est
+     WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL`,
+
+    // ReceiptIntake is Phase 1's table. The guard keeps this runnable in EITHER
+    // merge order: if Phase 1 has not landed in the target database yet, these
+    // two columns are skipped, and re-running this script after Phase 1 lands
+    // adds them.
+    `DO $$ BEGIN
+       IF to_regclass('"ReceiptIntake"') IS NOT NULL THEN
+         ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "taxAtSource" BOOLEAN NOT NULL DEFAULT false;
+         ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "installedAtCustomer" BOOLEAN;
+       END IF;
+     END $$`,
+];
+
+export const expectedColumns = {
+    Expense: [
+        "projectId", "taxAmount", "taxAtSource", "installedAtCustomer",
+        "costCodeSource", "costCodeConfidence",
+    ],
+};
+
+export const expectedConstraints = [
+    { name: "Expense_projectId_fkey", table: "Expense" },
+];
+
+export const expectedIndexes = [
+    { name: "Expense_projectId_idx", table: "Expense" },
+];
+
+async function main() {
+    if (!process.argv.includes("--yes")) {
+        console.error("Refusing to run without --yes (and --expect-db / --expect-host).");
+        process.exit(1);
+    }
+    const expectDb = readFlagValue("--expect-db") ?? process.env.EXPENSE_ATTRIBUTION_EXPECT_DB;
+    const expectHost = readFlagValue("--expect-host") ?? process.env.EXPENSE_ATTRIBUTION_EXPECT_HOST;
+    if (!expectDb || !expectHost) {
+        console.error("Both --expect-db and --expect-host are required (or EXPENSE_ATTRIBUTION_EXPECT_DB / EXPENSE_ATTRIBUTION_EXPECT_HOST).");
+        process.exit(1);
+    }
+
+    const { url, from } = resolveDatabaseUrl();
+    console.log(`DATABASE_URL from ${from}: ${maskUrl(url)}`);
+    const prisma = new PrismaClient({ datasources: { db: { url } } });
+
+    try {
+        const [actual] = await prisma.$queryRawUnsafe(
+            `SELECT current_database() AS db, COALESCE(host(inet_server_addr()), '') AS host`,
+        );
+        console.log(`connected to db="${actual.db}" host="${actual.host}"`);
+        if (!targetMatches(actual, expectDb, expectHost)) {
+            console.error(`REFUSING: expected db="${expectDb}" host="${expectHost}" but connected to db="${actual.db}" host="${actual.host}".`);
+            process.exit(1);
+        }
+
+        for (const sql of statements) {
+            const label = sql.replace(/\s+/g, " ").slice(0, 84);
+            process.stdout.write(`  ${label} ... `);
+            const affected = await prisma.$executeRawUnsafe(sql);
+            // Print the row count for the backfill: a SECOND run reporting 0 is
+            // the whole idempotency proof, and a silent "ok" would hide it.
+            console.log(sql.trimStart().startsWith("UPDATE") ? `ok (${affected} rows)` : "ok");
+        }
+
+        // Verify shape rather than trusting the run.
+        for (const [table, columns] of Object.entries(expectedColumns)) {
+            const rows = await prisma.$queryRawUnsafe(
+                `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
+                table,
+            );
+            const found = new Set(rows.map(r => r.column_name));
+            const missing = columns.filter(c => !found.has(c));
+            if (missing.length) {
+                console.error(`VERIFY FAILED: ${table} missing columns: ${missing.join(", ")}`);
+                process.exit(1);
+            }
+            console.log(`verified ${table}: ${columns.length} columns`);
+        }
+        for (const { name, table } of expectedConstraints) {
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT 1 AS ok FROM pg_constraint WHERE conname = $1`, name,
+            );
+            if (!row) {
+                console.error(`VERIFY FAILED: constraint ${name} missing on ${table}`);
+                process.exit(1);
+            }
+        }
+        console.log(`verified ${expectedConstraints.length} constraint(s)`);
+        for (const { name, table } of expectedIndexes) {
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT 1 AS ok FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace`, name,
+            );
+            if (!row) {
+                console.error(`VERIFY FAILED: index ${name} missing on ${table}`);
+                process.exit(1);
+            }
+        }
+        console.log(`verified ${expectedIndexes.length} index(es)`);
+
+        // The backfill's own assertion: after this script, no expense may have
+        // a NULL projectId while its estimate knows one. A count, not a sample
+        // — one leftover row is a silently wrong variance report.
+        const [leftover] = await prisma.$queryRawUnsafe(
+            `SELECT COUNT(*)::int AS n FROM "Expense" e
+               JOIN "Estimate" est ON est.id = e."estimateId"
+              WHERE e."projectId" IS NULL AND est."projectId" IS NOT NULL`,
+        );
+        if (leftover.n !== 0) {
+            console.error(`VERIFY FAILED: ${leftover.n} expense(s) still have a NULL projectId with a known estimate project`);
+            process.exit(1);
+        }
+        console.log("verified backfill: 0 expenses left unattributed against a known estimate project");
+
+        // Phase 1's table may legitimately not exist yet (see the guard above).
+        const [intake] = await prisma.$queryRawUnsafe(
+            `SELECT to_regclass('"ReceiptIntake"') IS NOT NULL AS present`,
+        );
+        if (intake.present) {
+            const rows = await prisma.$queryRawUnsafe(
+                `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='ReceiptIntake'`,
+            );
+            const found = new Set(rows.map(r => r.column_name));
+            const missing = ["taxAtSource", "installedAtCustomer"].filter(c => !found.has(c));
+            if (missing.length) {
+                console.error(`VERIFY FAILED: ReceiptIntake missing columns: ${missing.join(", ")}`);
+                process.exit(1);
+            }
+            console.log("verified ReceiptIntake: 2 columns");
+        } else {
+            console.log("ReceiptIntake not present — Phase 1 has not landed here yet; RE-RUN this script after it does.");
+        }
+
+        console.log("\nExpense attribution migration applied and verified.");
+    } finally {
+        await prisma.$disconnect();
+    }
+}
+
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMainModule) {
+    main().catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+    });
+}
