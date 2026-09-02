@@ -8,6 +8,7 @@ import { MAX_STORED_BYTES } from "@/lib/receipt-intake/intake-core";
 import { inspectStoredObject, sealAndPublish } from "@/lib/receipt-intake/stored-object";
 import {
     authorizePhase,
+    mergeCapturedFields,
     reconcileLateFields,
     type Denial,
     type LateFields,
@@ -130,7 +131,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         where: { id },
         select: {
             id: true, state: true, stateReason: true, sourceRef: true, storagePath: true,
-            mimeType: true, projectId: true, dryRun: true, createdById: true,
+            mimeType: true, projectId: true, costCodeId: true, dryRun: true, createdById: true,
             fileSha256: true, expectedSha256: true,
         },
     });
@@ -243,15 +244,63 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         }
     }
 
+    // THE PUBLISH IS SUBJECT TO THE SAME NULL-OR-EQUAL RULE as every other
+    // late-field write.
+    //
+    // This used to spread `lateFields` straight into the publishing update,
+    // which made initial publication the one path that could silently REPLACE a
+    // job, a phase or a tax answer captured at /start. A client that captured
+    // the job at /start and sent a different one at finalize simply won, and
+    // nothing recorded that the first answer had ever existed.
+    const merged = mergeCapturedFields(
+        { projectId: row.projectId, costCodeId: row.costCodeId },
+        lateFields,
+    );
+    if ("status" in merged) return NextResponse.json(merged.body, { status: merged.status });
+
+    // AND THE RESULTING TUPLE IS VALIDATED, not the supplied half of it.
+    //
+    // authorizeLateFields above only saw what this REQUEST carried. A finalize
+    // that sends projectId=B against a phase captured for job A supplies a
+    // project that is fine on its own and a phase it never mentions — and the
+    // row ends up filed under B's job with A's phase. The check has to be on
+    // the pair the row will actually hold.
+    const mixed = merged.from.projectId !== merged.from.costCodeId;
+    const badTuple = await authorizePhase(
+        merged.resulting.projectId,
+        merged.resulting.costCodeId,
+        (project, code) => isCostCodeAllowedForProject(prismaPhaseDataSource, project, code),
+    );
+    if (badTuple) {
+        // A caller's OWN bad pair is a 400 (fix the request). A pair only this
+        // MERGE created — half captured, half late — is a 409: the request is
+        // well-formed, it just disagrees with what the row already holds.
+        return mixed
+            ? NextResponse.json(
+                {
+                    ...badTuple.body,
+                    error: "captured-phase-conflict",
+                    reason: "the phase already on this row is not a phase of the job you sent",
+                    captured: { projectId: row.projectId, costCodeId: row.costCodeId },
+                    resulting: merged.resulting,
+                },
+                { status: 409 },
+            )
+            : NextResponse.json(badTuple.body, { status: badTuple.status });
+    }
+
     // ONE shared seal-and-publish, also used by the worker's stale-STAGING
     // sweep, so the two publishers cannot diverge on ordering or fencing.
     const outcome = await sealAndPublish(row.storagePath, id, check, {
         seal: sealObject,
         commit: async (canonicalPath, values) => {
             const { count } = await prisma.receiptIntake.updateMany({
-                // Fenced: only a row still in a publishable state moves, so a
-                // loser of the race writes nothing.
-                where: { id, state: { in: ["STAGING", "NEEDS_REVIEW"] } },
+                // Fenced on the state AND on every captured value this publish
+                // was validated against. A concurrent writer that filled in the
+                // job or the phase underneath us invalidates the tuple checked
+                // above, so this publish must lose rather than write a row it
+                // never authorized.
+                where: { id, state: { in: ["STAGING", "NEEDS_REVIEW"] }, ...merged.guard },
                 data: {
                     state: "RECEIVED",
                     stateReason: null,
@@ -260,7 +309,9 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
                     fileSize: values.fileSize,
                     fileSha256: values.fileSha256,
                     nextRetryAt: null,
-                    ...lateFields,
+                    // NULL-OR-EQUAL: only the fields the row does not already
+                    // answer. Never a blind spread of what the caller sent.
+                    ...merged.apply,
                 },
             });
             return count;
@@ -272,15 +323,31 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
     }
     if (!outcome.published) {
-        // Another publisher won. Same outcome for the caller — but the late
-        // fields still have to be reconciled against what that publisher wrote.
-        const reconciled = await applyLateFields(id, lateFields, auth);
-        if (reconciled) return reconciled;
+        // The CAS lost — which is now TWO different things. Either another
+        // publisher moved the row (the caller's answer is "already finalized"),
+        // or a captured value changed underneath a row that is still waiting to
+        // publish, in which case nothing was published and saying otherwise
+        // would be a lie the client acts on.
         const current = await prisma.receiptIntake.findUnique({
             where: { id },
             select: { state: true, sourceRef: true, projectId: true, dryRun: true },
         });
-        return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current?.state ?? "RECEIVED" });
+        if (!current || current.state === "STAGING") {
+            return NextResponse.json(
+                {
+                    ok: false,
+                    error: "publish-conflict",
+                    reason: "this row changed while it was being published; retry",
+                    retryable: true,
+                },
+                { status: 409 },
+            );
+        }
+        // Another publisher won. Same outcome for the caller — but the late
+        // fields still have to be reconciled against what that publisher wrote.
+        const reconciled = await applyLateFields(id, lateFields, auth);
+        if (reconciled) return reconciled;
+        return NextResponse.json({ ok: true, alreadyFinalized: true, id, state: current.state });
     }
 
     const persisted = await prisma.receiptIntake.findUnique({

@@ -169,3 +169,97 @@ export async function authorizePhase(
     }
     return null;
 }
+
+/**
+ * Fields CAPTURED when the row was created, which a later finalize may fill in
+ * but never overwrite.
+ *
+ * `installedAtCustomer` is listed deliberately even though the column does not
+ * exist yet (it lands in Phase 3): the rule is written over whatever keys the
+ * caller hands in, so the field is covered the day it is added rather than
+ * needing somebody to remember this file. It is a TAX answer — whether the
+ * material was installed at the customer's site decides how the purchase is
+ * taxed — so an overwrite there is a wrong number in the books, not a mislabel.
+ */
+export const CAPTURED_FIELDS = ["projectId", "costCodeId", "installedAtCustomer"] as const;
+
+export type CapturedValues = Record<string, string | boolean | null | undefined>;
+
+export interface CapturedMerge {
+    /** Only the fields that are actually changing. */
+    apply: Record<string, string>;
+    /**
+     * The ORIGINAL captured values, for a CAS on the publishing update: if any
+     * of them moved between the read and the write, the publish must lose.
+     */
+    guard: Record<string, string | boolean | null>;
+    /** What the row will hold once `apply` lands. */
+    resulting: { projectId: string | null; costCodeId: string | null };
+    /** Where each half of the resulting phase tuple came from. */
+    from: { projectId: "captured" | "late" | "none"; costCodeId: "captured" | "late" | "none" };
+}
+
+/**
+ * NULL-OR-EQUAL at publish time too.
+ *
+ * Initial publication used to spread the finalize's late fields straight over
+ * the row, which made /finalize the one path that could silently REPLACE a job,
+ * phase or tax answer captured at /start — the exact overwrite every other path
+ * refuses. A client that captured the job at /start and sent a different one at
+ * finalize simply won, and nothing recorded that the first answer ever existed.
+ */
+export function mergeCapturedFields(
+    captured: CapturedValues,
+    lateFields: LateFields,
+): Denial | CapturedMerge {
+    const apply: Record<string, string> = {};
+    const guard: Record<string, string | boolean | null> = {};
+    const conflicts: Record<string, { stored: unknown; supplied: unknown }> = {};
+
+    for (const [key, value] of Object.entries(captured)) {
+        // The CAS covers EVERY captured field, not just the ones being written:
+        // a concurrent writer that filled in the phase we are about to leave
+        // alone still invalidates the tuple this publish validated.
+        guard[key] = value ?? null;
+    }
+
+    for (const [key, supplied] of Object.entries(lateFields)) {
+        if (supplied === undefined) continue;
+        const stored = captured[key] ?? null;
+        if (stored === null) {
+            apply[key] = supplied;
+            continue;
+        }
+        if (stored !== supplied) conflicts[key] = { stored, supplied };
+    }
+
+    if (Object.keys(conflicts).length > 0) {
+        return {
+            status: 409,
+            body: {
+                ok: false,
+                error: "late-fields-conflict",
+                reason: "this row already carries different values for these fields",
+                fields: conflicts,
+            },
+        };
+    }
+
+    const pick = (key: "projectId" | "costCodeId") => {
+        const stored = (captured[key] ?? null) as string | null;
+        if (stored !== null) return { value: stored, from: "captured" as const };
+        const late = lateFields[key] ?? null;
+        return late !== null
+            ? { value: late, from: "late" as const }
+            : { value: null, from: "none" as const };
+    };
+    const project = pick("projectId");
+    const phase = pick("costCodeId");
+
+    return {
+        apply,
+        guard,
+        resulting: { projectId: project.value, costCodeId: phase.value },
+        from: { projectId: project.from, costCodeId: phase.from },
+    };
+}

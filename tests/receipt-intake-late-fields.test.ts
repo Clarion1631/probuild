@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
     authorizePhase,
+    mergeCapturedFields,
     reconcileLateFields,
     type Denial,
     type LateFieldRow,
@@ -208,4 +209,111 @@ test("both intake entry points call the SAME phase gate", () => {
             `${rel} carries its own copy of the rule`,
         );
     }
+});
+
+// ── Initial publication is bound by the same rules (Phase 3 gate) ───────────
+
+const FINALIZE = readFileSync(
+    path.join(__dirname, "..", "src/app/api/receipts/intake/[id]/finalize/route.ts"),
+    "utf8",
+);
+
+test("publishing FILLS IN a captured field that is null", () => {
+    const merged = mergeCapturedFields({ projectId: null, costCodeId: null }, { projectId: "proj-a" });
+    assert.ok(!("status" in merged));
+    assert.deepEqual(merged.apply, { projectId: "proj-a" });
+    assert.deepEqual(merged.resulting, { projectId: "proj-a", costCodeId: null });
+});
+
+test("publishing NEVER overwrites a captured job", () => {
+    // The hole: initial publication spread the finalize's fields straight over
+    // the row, so a different job sent at finalize simply won.
+    const merged = mergeCapturedFields({ projectId: "proj-a", costCodeId: null }, { projectId: "proj-b" });
+    assert.ok("status" in merged);
+    assert.equal(merged.status, 409);
+    assert.equal(merged.body.error, "late-fields-conflict");
+});
+
+test("publishing NEVER overwrites an existing TAX answer", () => {
+    // installedAtCustomer decides how the purchase is taxed. Silently replacing
+    // the answer captured at /start is a wrong number in the books, not a
+    // mislabel — and the field is covered here before the column even exists.
+    const captured = { projectId: "proj-a", costCodeId: null, installedAtCustomer: true };
+    const flipped = mergeCapturedFields(captured, { installedAtCustomer: false } as never);
+    assert.ok("status" in flipped);
+    assert.equal(flipped.status, 409);
+    assert.deepEqual((flipped.body.fields as Record<string, unknown>).installedAtCustomer, {
+        stored: true, supplied: false,
+    });
+
+    // The same answer again is a retry, not a conflict.
+    const same = mergeCapturedFields(captured, { installedAtCustomer: true } as never);
+    assert.ok(!("status" in same));
+    assert.deepEqual(same.apply, {}, "nothing to write");
+
+    // And an UNANSWERED one is still filled in.
+    const first = mergeCapturedFields(
+        { projectId: "proj-a", costCodeId: null, installedAtCustomer: null },
+        { installedAtCustomer: true } as never,
+    );
+    assert.ok(!("status" in first));
+    assert.deepEqual(first.apply, { installedAtCustomer: true } as never);
+});
+
+test("A/B: a late job with a phase captured for ANOTHER job is refused", async () => {
+    // The pair the row would END UP holding is what has to be valid. Neither
+    // half is wrong on its own: proj-b is a job the caller may reach, and cc-a
+    // was authorized when it was captured — against job A.
+    const merged = mergeCapturedFields({ projectId: null, costCodeId: "cc-a" }, { projectId: "proj-b" });
+    assert.ok(!("status" in merged));
+    assert.deepEqual(merged.resulting, { projectId: "proj-b", costCodeId: "cc-a" });
+    assert.deepEqual(merged.from, { projectId: "late", costCodeId: "captured" },
+        "half captured, half late — a pair only the merge created");
+
+    const denial = await authorizePhase(merged.resulting.projectId, merged.resulting.costCodeId, isCostCodeAllowed);
+    assert.equal(denial?.body.error, "cost-code-not-a-phase");
+
+    // A phase that IS valid for the late job goes through: the rule is about
+    // the tuple, not about mixing sources.
+    const ok = mergeCapturedFields({ projectId: null, costCodeId: "cc-b" }, { projectId: "proj-b" });
+    assert.ok(!("status" in ok));
+    assert.equal(await authorizePhase(ok.resulting.projectId, ok.resulting.costCodeId, isCostCodeAllowed), null);
+});
+
+test("the publish CAS covers EVERY captured field, not just the written ones", () => {
+    // A concurrent writer that filled in the phase we were going to leave alone
+    // invalidates the tuple this publish validated, so it must lose.
+    const merged = mergeCapturedFields(
+        { projectId: null, costCodeId: null, installedAtCustomer: null },
+        { projectId: "proj-a" },
+    );
+    assert.ok(!("status" in merged));
+    assert.deepEqual(merged.guard, { projectId: null, costCodeId: null, installedAtCustomer: null });
+    assert.deepEqual(merged.apply, { projectId: "proj-a" }, "but only one field is written");
+});
+
+test("the publishing UPDATE spreads the merge, never the raw late fields", () => {
+    const commit = FINALIZE.slice(FINALIZE.indexOf("const outcome = await sealAndPublish"));
+    const body = commit.slice(0, commit.indexOf("dropUpload:"));
+    assert.match(body, /\.\.\.merged\.guard/, "CAS over the captured values");
+    assert.match(body, /\.\.\.merged\.apply/, "and only the fields that change");
+    assert.ok(!/\.\.\.lateFields/.test(body), "the blind spread is gone");
+});
+
+test("a mixed tuple is a 409, and a caller's own bad pair stays a 400", () => {
+    const branch = FINALIZE.slice(FINALIZE.indexOf("const badTuple = await authorizePhase"));
+    const body = branch.slice(0, branch.indexOf("// ONE shared seal-and-publish"));
+    assert.match(body, /captured-phase-conflict/);
+    assert.match(body, /status: 409/);
+    assert.match(body, /status: badTuple\.status/, "the un-mixed case keeps its own status");
+});
+
+test("losing the publish CAS on a STAGING row is a conflict, NOT alreadyFinalized", () => {
+    // Nothing was published. Telling the client it was finalized is a lie it
+    // acts on: the forwarders drop their copy of a receipt they are told we hold.
+    const branch = FINALIZE.slice(FINALIZE.indexOf("if (!outcome.published)"));
+    const body = branch.slice(0, branch.indexOf("alreadyFinalized"));
+    assert.match(body, /current\.state === "STAGING"/);
+    assert.match(body, /publish-conflict/);
+    assert.match(body, /status: 409/);
 });
