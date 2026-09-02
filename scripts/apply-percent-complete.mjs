@@ -48,6 +48,7 @@ export const STATEMENTS = [
     `ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteAuto" DECIMAL(5,2)`,
     `ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteAutoAtOverride" DECIMAL(5,2)`,
     `ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteUpdatedById" TEXT`,
+    `CREATE INDEX IF NOT EXISTS "Project_percentCompleteUpdatedById_idx" ON "Project"("percentCompleteUpdatedById")`,
     `DO $$ BEGIN
        ALTER TABLE "Project" ADD CONSTRAINT "Project_percentCompleteUpdatedById_fkey"
          FOREIGN KEY ("percentCompleteUpdatedById") REFERENCES "User"("id")
@@ -89,6 +90,12 @@ try {
     );
     console.log(`verified ${fk.length}/1 foreign key present`);
     if (fk.length !== 1) process.exit(1);
+
+    const idx = await prisma.$queryRawUnsafe(
+        `SELECT indexname FROM pg_indexes WHERE indexname = 'Project_percentCompleteUpdatedById_idx'`
+    );
+    console.log(`verified ${idx.length}/1 index present`);
+    if (idx.length !== 1) process.exit(1);
 } finally {
     await prisma.$disconnect();
 }

@@ -330,6 +330,7 @@ model Project {
   @@index([createdAt])
   @@index([startDate])
   @@index([deletedAt])
+  @@index([percentCompleteUpdatedById])
 }
 
 /// Who wrote Project.percentComplete: the nightly recalc cron (AUTO) or a

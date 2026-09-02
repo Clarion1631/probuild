@@ -19,6 +19,9 @@ ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteAuto" DECIMAL(5,2
 ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteAutoAtOverride" DECIMAL(5,2);
 ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "percentCompleteUpdatedById" TEXT;
 
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "Project_percentCompleteUpdatedById_idx" ON "Project"("percentCompleteUpdatedById");
+
 -- AddForeignKey
 DO $$ BEGIN
   ALTER TABLE "Project" ADD CONSTRAINT "Project_percentCompleteUpdatedById_fkey"
