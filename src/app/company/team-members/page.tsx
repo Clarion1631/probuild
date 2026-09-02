@@ -6,7 +6,6 @@ import { formatCurrency } from "@/lib/utils";
 import Link from "next/link";
 import { toast } from "sonner";
 import RatesImport from "./RatesImport";
-import { zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 type User = {
     id: string;
@@ -18,6 +17,8 @@ type User = {
     burdenRate: number;
     /** ISO string over the wire — last time this rate was confirmed (import or manual save). */
     lastRateSyncAt: string | null;
+    /** Resolved server-side (/api/users) — the salaried list is env-configurable and the browser cannot read it. */
+    salaried: boolean;
     showOnDispatch: boolean;
     hasPin: boolean;
     projectAccess?: { projectId: string }[];
@@ -276,7 +277,7 @@ export default function TeamPage() {
                         <tbody className="divide-y divide-hui-border">
                             {activeUsers.map(user => {
                                 const sync = rateSyncLabel(user.lastRateSyncAt);
-                                const noRate = zeroRateBlocks({ role: user.role, hourlyRate: user.hourlyRate ?? 0 });
+                                const noRate = !user.salaried && !((user.hourlyRate ?? 0) > 0);
                                 return (
                                     <tr key={user.id} className="hover:bg-slate-50 transition-colors">
                                         <td className="px-6 py-3">

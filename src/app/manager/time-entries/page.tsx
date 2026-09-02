@@ -301,7 +301,7 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                                     {/* Phase 5 G2: the same condition that blocks their
                                                         clock-out (src/lib/pay-rate-guard.ts), surfaced where
                                                         a manager can act on it. */}
-                                                    {zeroRateBlocks({ role: e.user.role, hourlyRate: toNum(e.user.hourlyRate) }) && (
+                                                    {zeroRateBlocks({ role: e.user.role, email: e.user.email, hourlyRate: toNum(e.user.hourlyRate) }) && (
                                                         <Link
                                                             href={`/company/team-members/${e.user.id}`}
                                                             className="ml-2 inline-block text-xs text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200 align-middle"
