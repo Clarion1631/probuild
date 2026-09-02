@@ -923,30 +923,65 @@ test("already-exists reports a failed attachment lookup without failing the push
     assert.equal(result.ok && result.alreadyExists && result.attachment, "failed:Error");
 });
 
-test("an attachment upload that times out is reported failed:QBTimeoutError, never attached", async () => {
+test("an attachment upload that times out PROPAGATES from both paths, so the push is retryable", async () => {
     const { QBTimeoutError } = await import("../src/lib/quickbooks");
     const input = baseInput({ ...FILE_INPUT });
     const marker = `[gtr-file:${input.fileId}]`;
+    const timeout = () => {
+        throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
+    };
 
-    // Both paths must classify it the same way: fresh create...
-    const fresh = createDeps({
-        uploadAttachment: async () => {
-            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
-        },
-    });
-    const freshResult = await createQBReceiptPurchase(TOKENS, input, fresh.deps);
-    assert.equal(freshResult.ok && !freshResult.alreadyExists && freshResult.attachment, "failed:QBTimeoutError");
+    // Codex gate: reporting this as `failed:QBTimeoutError` on an ok:true
+    // response made it TERMINAL — the Apps Script treats ok:true as final and
+    // stops resending, so the Purchase kept a missing receipt forever and the
+    // existing-Purchase recovery never ran. It must throw instead.
+    const fresh = createDeps({ uploadAttachment: async () => timeout() });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, fresh.deps),
+        (error: unknown) => error instanceof QBTimeoutError,
+    );
 
-    // ...and the already-exists recovery path.
     const existing = createDeps({
         existingRows: [{ Id: "99", PrivateNote: `note ${marker}` }],
         attachableRows: [],
+        uploadAttachment: async () => timeout(),
+    });
+    await assert.rejects(
+        () => createQBReceiptPurchase(TOKENS, input, existing.deps),
+        (error: unknown) => error instanceof QBTimeoutError,
+    );
+});
+
+test("a NON-timeout attachment failure stays best-effort: failed:<reason> with ok:true", async () => {
+    const input = baseInput({ ...FILE_INPUT });
+    const { deps } = createDeps({
         uploadAttachment: async () => {
-            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
+            throw new Error("boom");
         },
     });
-    const existingResult = await createQBReceiptPurchase(TOKENS, input, existing.deps);
-    assert.equal(existingResult.ok && existingResult.alreadyExists && existingResult.attachment, "failed:QBTimeoutError");
+    const result = await createQBReceiptPurchase(TOKENS, input, deps);
+    // The Purchase is on the books; a broken image is not worth a retry loop.
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && !result.alreadyExists && result.attachment, "failed:Error");
+});
+
+test("route: an attachment timeout surfaces as 503 qbo-timeout so the bot retries", async () => {
+    const { QBTimeoutError } = await import("../src/lib/quickbooks");
+    const events: AutomationEventInput[] = [];
+    const { POST } = createRouteHandlers({
+        createPurchase: async () => {
+            throw new QBTimeoutError("QuickBooks request timed out after 20000ms: /v3/company/x/upload");
+        },
+        logEvent: event => { events.push(event); },
+    });
+    const response = await POST(new Request("https://example.test/api/integrations/qbo-receipts/create", {
+        method: "POST",
+        body: validBody(),
+        headers: { "content-type": "application/json", "x-ingest-key": "ingest-secret" },
+    }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { ok: false, retry: true, reason: "qbo-timeout" });
+    assert.equal(events[0].reason, "qbo-timeout");
 });
 
 test("a purchase create that times out surfaces as 503 qbo-timeout at the route", async () => {

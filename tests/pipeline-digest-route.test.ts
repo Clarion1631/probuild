@@ -11,6 +11,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     createPipelineDigestHandlers,
+    isEmailDeliveryConfigured,
     type PipelineDigestDependencies,
 } from "../src/app/api/cron/pipeline-digest/route";
 import type { PipelineHealth } from "../src/lib/pipeline-health";
@@ -36,6 +37,7 @@ function handlers(overrides: Partial<PipelineDigestDependencies> = {}) {
         postChat: overrides.postChat ?? (async () => true),
         getChatWebhook: overrides.getChatWebhook ?? (() => undefined),
         getRecipient: overrides.getRecipient ?? (() => "ops@example.test"),
+        isEmailConfigured: overrides.isEmailConfigured ?? (() => true),
         deliveryTimeoutMs: overrides.deliveryTimeoutMs ?? 100,
     });
 }
@@ -159,5 +161,78 @@ test("an unauthenticated request is rejected before any delivery is attempted", 
         const response = await GET(new Request("https://example.test/api/cron/pipeline-digest"));
         assert.equal(response.status, 401);
         assert.equal(sends, 0);
+    });
+});
+
+
+// ─── Missing mailer credentials ─────────────────────────────────────────────
+
+function withEnv(env: Record<string, string | undefined>, run: () => void) {
+    const previous: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(env)) {
+        previous[key] = process.env[key];
+        if (value === undefined) delete (process.env as Record<string, string>)[key];
+        else (process.env as Record<string, string>)[key] = value;
+    }
+    try {
+        run();
+    } finally {
+        for (const [key, value] of Object.entries(previous)) {
+            if (value === undefined) delete (process.env as Record<string, string>)[key];
+            else (process.env as Record<string, string>)[key] = value;
+        }
+    }
+}
+
+test("in production a missing RESEND_API_KEY is a delivery failure, not a silent no-op", () => {
+    // email.ts falls back to a dummy key and returns {success:true} without
+    // sending — which would make the pulse report good news while delivering
+    // nothing. Checked here so no other caller's behaviour changes.
+    withEnv({ NODE_ENV: "production", VERCEL_ENV: "production", RESEND_API_KEY: undefined }, () => {
+        assert.equal(isEmailDeliveryConfigured(), false);
+    });
+    withEnv({ NODE_ENV: "production", VERCEL_ENV: "production", RESEND_API_KEY: "   " }, () => {
+        assert.equal(isEmailDeliveryConfigured(), false);
+    });
+    withEnv({ NODE_ENV: "production", VERCEL_ENV: "production", RESEND_API_KEY: "re_live_key" }, () => {
+        assert.equal(isEmailDeliveryConfigured(), true);
+    });
+});
+
+test("local development without a key is still fine", () => {
+    withEnv({ NODE_ENV: "development", VERCEL_ENV: undefined, RESEND_API_KEY: undefined }, () => {
+        assert.equal(isEmailDeliveryConfigured(), true);
+    });
+});
+
+test("an unconfigured mailer returns 500 and never claims emailed:true", async () => {
+    await withCronSecret(async () => {
+        let sends = 0;
+        const { GET } = handlers({
+            isEmailConfigured: () => false,
+            sendEmail: async () => {
+                sends += 1;
+                return { success: true }; // what email.ts would wrongly report
+            },
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        const body = await response.json();
+        assert.equal(body.ok, false);
+        assert.equal(body.reason, "email-not-accepted");
+        assert.equal(sends, 0, "no point calling a mailer that cannot deliver");
+    });
+});
+
+test("an unconfigured mailer still lets the Chat post through", async () => {
+    await withCronSecret(async () => {
+        const { GET } = handlers({
+            isEmailConfigured: () => false,
+            getChatWebhook: () => "https://chat.googleapis.com/v1/spaces/x",
+            postChat: async () => true,
+        });
+        const response = await GET(cronRequest());
+        assert.equal(response.status, 500);
+        assert.equal((await response.json()).chatPosted, true);
     });
 });

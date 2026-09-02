@@ -30,6 +30,7 @@ import {
     QB_API_BASE,
     qbTimedFetch,
     parseJsonOrNull,
+    QBTimeoutError,
     type QBTokens,
     type QBAttachable,
 } from "./quickbooks";
@@ -414,6 +415,9 @@ async function ensureAttachmentOnExistingPurchase(
         if (alreadyAttached) return "already-attached";
         return await uploadAttachment(tokens, purchaseId, plan);
     } catch (error) {
+        // A timeout must NOT become a terminal "failed:..." on an ok:true
+        // response — see the create path below for why.
+        if (error instanceof QBTimeoutError) throw error;
         return `failed:${error instanceof Error ? error.name : "error"}`;
     }
 }
@@ -720,6 +724,15 @@ export async function createQBReceiptPurchase(
         try {
             attachment = await uploadAttachment(tokens, created.id, plan);
         } catch (error) {
+            // A TIMEOUT propagates, unlike every other attachment failure.
+            // Reporting it as `failed:QBTimeoutError` alongside ok:true made it
+            // TERMINAL: the Apps Script treats any ok:true as final and stops
+            // resending, so the Purchase would keep its missing receipt forever
+            // and the existing-Purchase recovery above would never run. Letting
+            // it out gives the route a 503, the bot retries, and the next pass
+            // finds the Purchase and attaches the file. Non-timeout failures
+            // keep the old best-effort behaviour — they are not retryable.
+            if (error instanceof QBTimeoutError) throw error;
             attachment = `failed:${error instanceof Error ? error.name : "error"}`;
         }
     }

@@ -32,6 +32,22 @@ export const DELIVERY_TIMEOUT_MS = 10_000;
  * worse than no monitoring job, because it looks like good news.
  */
 
+/**
+ * In production, a missing RESEND_API_KEY is a DELIVERY FAILURE, not a no-op.
+ *
+ * src/lib/email.ts falls back to a dummy key and returns {success:true} without
+ * sending anything, which is fine for local dev but poison here: the pulse that
+ * exists to reveal a broken pipeline would report emailed:true and HTTP 200
+ * while delivering nothing — the failure disguised as good news. Checked HERE
+ * rather than in email.ts so no other caller's behaviour changes.
+ */
+export function isEmailDeliveryConfigured(): boolean {
+    const productionish =
+        process.env.VERCEL_ENV === "production" || process.env.NODE_ENV === "production";
+    if (!productionish) return true;
+    return Boolean(process.env.RESEND_API_KEY?.trim());
+}
+
 /** Resolve to a sentinel rather than reject, so allSettled reports the timeout as a value. */
 async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: T): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -51,6 +67,8 @@ export interface PipelineDigestDependencies {
     postChat: (webhookUrl: string, text: string) => Promise<boolean>;
     getChatWebhook: () => string | undefined;
     getRecipient: () => string;
+    /** False when email cannot actually be delivered (see isEmailDeliveryConfigured). */
+    isEmailConfigured?: () => boolean;
     /** Overridable so tests need not wait out the real 10s deadline. */
     deliveryTimeoutMs?: number;
 }
@@ -77,8 +95,14 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
             // allSettled, not all: Chat is optional and a thrown webhook error
             // must never cost us the email (or vice versa).
             const deadlineMs = dependencies.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS;
+            const emailConfigured = (dependencies.isEmailConfigured ?? isEmailDeliveryConfigured)();
+            if (!emailConfigured) {
+                console.error("[cron/pipeline-digest] RESEND_API_KEY is not set — the digest cannot be delivered");
+            }
             const [emailOutcome, chatOutcome] = await Promise.allSettled([
-                withDeadline(dependencies.sendEmail(to, subject, html), deadlineMs, { success: false }),
+                emailConfigured
+                    ? withDeadline(dependencies.sendEmail(to, subject, html), deadlineMs, { success: false })
+                    : Promise.resolve({ success: false }),
                 chatWebhook
                     ? withDeadline(dependencies.postChat(chatWebhook, text), deadlineMs, false)
                     : Promise.resolve(false),
@@ -96,6 +120,8 @@ export function createPipelineDigestHandlers(dependencies: PipelineDigestDepende
             }));
 
             if (!emailed) {
+                // Chat still ran above — an unconfigured mailer must not cost
+                // the one channel that might still reach a human.
                 // Non-2xx so the failure is visible in Vercel's cron history
                 // instead of being swallowed by a 200 nobody reads.
                 console.error("[cron/pipeline-digest] digest email was not accepted");

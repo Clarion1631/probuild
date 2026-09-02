@@ -19,6 +19,7 @@ import { getQBSettings, saveQBSettings } from "./integration-store";
 import {
     type QBTokens,
     refreshQBToken,
+    QBTimeoutError,
     ensureQBCustomer,
     ensureQBServiceItem,
     createQBMilestoneInvoice,
@@ -54,11 +55,36 @@ export async function getFreshQBTokens(): Promise<QBTokens> {
     if (!qb.connected || !qb.accessToken || !qb.refreshToken || !qb.realmId) {
         throw new QBNotConnectedError();
     }
+    return refreshTokensOrFallBack({
+        accessToken: qb.accessToken,
+        refreshToken: qb.refreshToken,
+        realmId: qb.realmId,
+    });
+}
+
+/**
+ * The refresh + fallback policy, split out so the CATCH can be tested without a
+ * database (only the network boundary is injectable; the defaults here are the
+ * real ones getFreshQBTokens uses).
+ *
+ * A refresh that fails for an ordinary reason may still leave the OLD access
+ * token usable, so that fallback stays. A TIMEOUT is different and must
+ * propagate: swallowing it handed the caller a possibly-stale token and let it
+ * spend another full QBO deadline on the next request, which is how a QBO
+ * outage still ate the route's whole 60s ceiling — exactly the hang the
+ * per-request deadline was added to stop. The caller turns it into a 503.
+ */
+export async function refreshTokensOrFallBack(
+    qb: { accessToken: string; refreshToken: string; realmId: string },
+    refresh: typeof refreshQBToken = refreshQBToken,
+    save: typeof saveQBSettings = saveQBSettings,
+): Promise<QBTokens> {
     try {
-        const fresh = await refreshQBToken(qb.refreshToken);
-        await saveQBSettings({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
+        const fresh = await refresh(qb.refreshToken);
+        await save({ accessToken: fresh.accessToken, refreshToken: fresh.refreshToken });
         return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken, realmId: qb.realmId };
-    } catch {
+    } catch (error) {
+        if (error instanceof QBTimeoutError) throw error;
         // Refresh can fail transiently; the old access token may still be valid.
         return { accessToken: qb.accessToken, refreshToken: qb.refreshToken, realmId: qb.realmId };
     }
