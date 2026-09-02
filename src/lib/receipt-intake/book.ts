@@ -653,14 +653,27 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // expense in the wrong period. The intake row keeps the
                     // calendar day; this makes the instant match it.
                     date: startOfDateInTimeZone(calendarDay, timeZone),
-                    status: "Pending",
+                    // Booked with a qbPurchaseId already set — the Purchase is
+                    // live in QuickBooks by the time this row commits, so this
+                    // Expense is QBO-managed from birth, exactly like a QBO
+                    // import. `assertExpenseMutableOutsideQbo` (qbo-expense-guard.ts)
+                    // rejects approve/edit/delete on anything carrying a
+                    // qbPurchaseId, and the bookkeeper queue (manager/receipts/page.tsx)
+                    // only lists `status: "Pending"` rows as actionable. Leaving
+                    // this "Pending" would put a QBO-managed row in that
+                    // actionable queue with no route able to act on it — and
+                    // a later QBO sync flipping it to "Reviewed" would look
+                    // like human review that never happened. "Reviewed" keeps
+                    // it out of the actionable queue and matches every other
+                    // QBO-linked Expense.
+                    status: "Reviewed",
                     receiptUrl,
                     qbPurchaseId: result.qbPurchaseId,
                     description:
                         `[Receipt intake] ${docRef}` +
                         phaseCheck.note +
                         (taxApplied > 0 ? ` · incl. $${(taxApplied / 100).toFixed(2)} sales tax` : "") +
-                        ` · pending bookkeeper review`,
+                        ` · booked to QuickBooks`,
                 },
                 select: { id: true },
             });

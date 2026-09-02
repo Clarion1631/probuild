@@ -418,6 +418,16 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
             return count;
         },
         dropUpload: uploadPath => deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+        currentStoragePath: async rowId => {
+            const r = await prisma.receiptIntake.findUnique({ where: { id: rowId }, select: { storagePath: true } });
+            return r?.storagePath ?? null;
+        },
+        // A lost CAS here means another /finalize (or the worker's
+        // stale-STAGING sweep) already published this row while we were
+        // mid-request — best-effort so a slow deleteObjectOrRecord failure
+        // still lands on the same retry queue as every other orphan.
+        dropOrphanedCanonical: canonicalPath =>
+            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
     });
 
     if (!outcome) {

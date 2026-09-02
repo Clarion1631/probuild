@@ -15,7 +15,7 @@ import {
 } from "@/lib/receipt-intake/storage-cleanup";
 import { getFreshQBTokens } from "@/lib/quickbooks-payments";
 import { createQBReceiptPurchase } from "@/lib/qbo-receipt-push";
-import { createRouteDeadline, type RouteDeadline } from "@/lib/quickbooks";
+import { createRouteDeadline, remainingBudgetMs, type RouteDeadline } from "@/lib/quickbooks";
 import { readReceipt } from "@/lib/receipt-intake/read";
 import { canonicalVendor } from "@/lib/receipt-intake/keys";
 import {
@@ -36,6 +36,7 @@ import {
     type ClaimResult,
     type CutoverRequest,
     isUniqueViolation,
+    readBudgetFor,
     runIntakeWorker,
     uploadLeaseActive,
     type ReadPatch,
@@ -431,6 +432,19 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
                         },
                         dropUpload: uploadPath =>
                             deleteObjectOrRecord(uploadPath, "sealed").then(() => undefined),
+                        currentStoragePath: async rowId => {
+                            const r = await prisma.receiptIntake.findUnique({
+                                where: { id: rowId },
+                                select: { storagePath: true },
+                            });
+                            return r?.storagePath ?? null;
+                        },
+                        // A lost CAS here means /finalize (or a resumed
+                        // /start's re-armed lease) already moved this row
+                        // while the sweep was mid-inspection — best-effort,
+                        // same retry queue as every other orphan.
+                        dropOrphanedCanonical: canonicalPath =>
+                            deleteObjectOrRecord(canonicalPath, "orphaned-lost-publish-cas").then(() => undefined),
                     });
                     if (outcome?.published) published++;
                     continue;
@@ -522,7 +536,21 @@ function buildDeps(invocationDeadline: RouteDeadline): WorkerDependencies {
 
         downloadBytes: (storagePath, expectedSha256) => downloadVerified(storagePath, expectedSha256),
 
-        read: (bytes, mime, phases) => readReceipt(bytes, mime, phases),
+        // The invocation's ONE deadline, not a fresh 25s per row (see
+        // readBudgetFor). A row reached late in the batch gets whatever
+        // runway is actually left instead of a full budget stacked on top
+        // of what the run has already spent — the same deadline that
+        // already governs every QuickBooks call below.
+        read: (bytes, mime, phases) => {
+            const budgetMs = readBudgetFor(remainingBudgetMs(invocationDeadline));
+            if (budgetMs <= 0) {
+                // Same answer readReceipt gives for an exhausted budget: the
+                // document was never read, so this costs no `attempts` — the
+                // row comes back next pass with a full budget again.
+                return Promise.resolve({ ok: false, decisive: false });
+            }
+            return readReceipt(bytes, mime, phases, { budgetMs });
+        },
 
         applyRead: async (rowId, patch: ReadPatch, ownership) => {
             try {

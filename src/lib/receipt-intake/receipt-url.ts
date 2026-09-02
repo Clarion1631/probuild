@@ -88,3 +88,26 @@ export async function resolveReceiptUrl(
     if (!moved || moved === parsed.path) return null;
     return await deps.sign(moved, ttlSeconds).catch(() => null);
 }
+
+/**
+ * Resolve `receipt-intake://` references on a batch of rows to short-lived
+ * signed URLs, in parallel. A non-reference value (a legacy absolute URL, a
+ * data URL, or null) passes through unchanged — same rule as resolveReceiptUrl,
+ * just applied across a list instead of one row at a time.
+ *
+ * Every reader that renders `receiptUrl` as an href — the bookkeeper queue,
+ * the project expenses tab — must resolve it first: the column stores the
+ * stable reference book.ts writes, not a link a browser can open.
+ */
+export async function resolveReceiptUrls<T extends { receiptUrl: string | null }>(
+    rows: T[],
+    ttlSeconds: number = RECEIPT_URL_TTL_SECONDS,
+    deps: ReceiptUrlDeps = defaultDeps,
+): Promise<T[]> {
+    return Promise.all(rows.map(async row => ({
+        ...row,
+        receiptUrl: isReceiptUrlRef(row.receiptUrl)
+            ? await resolveReceiptUrl(row.receiptUrl, ttlSeconds, deps)
+            : row.receiptUrl,
+    })));
+}

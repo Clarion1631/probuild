@@ -225,7 +225,12 @@ test("a successful booking creates the Expense at the gross amount and marks the
     assert.equal(r.expenses[0].estimateId, "est-1");
     assert.equal(r.expenses[0].costCodeId, "cc-plumb", "falls back to the model's phase suggestion");
     assert.equal(r.expenses[0].qbPurchaseId, "QB-1");
-    assert.equal(r.expenses[0].status, "Pending");
+    // QBO-managed from birth — status "Reviewed" keeps it out of the
+    // bookkeeper's actionable "Pending" queue (manager/receipts/page.tsx),
+    // matching every other qbPurchaseId-bearing Expense. approve/edit/delete
+    // reject anything with a qbPurchaseId (qbo-expense-guard.ts), so leaving
+    // it "Pending" would strand it in a queue nothing can act on.
+    assert.equal(r.expenses[0].status, "Reviewed");
     assert.equal(r.expenses[0].receiptUrl, "https://drive.google.com/file/d/FILE123/view");
 
     assert.equal(r.intakeUpdates[0].state, "BOOKED");

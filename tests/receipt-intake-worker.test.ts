@@ -28,8 +28,11 @@ import {
     uploadLeaseActive,
     uploadLeaseExpiry,
     SIGNED_UPLOAD_TTL_MS,
+    readBudgetFor,
+    READ_MIN_BUDGET_MS,
+    READ_SAFETY_MARGIN_MS,
 } from "../src/lib/receipt-intake/worker";
-import { normalizeDocType, type ReadOutcome } from "../src/lib/receipt-intake/read";
+import { normalizeDocType, READ_BUDGET_MS, type ReadOutcome } from "../src/lib/receipt-intake/read";
 import type { BookResult } from "../src/lib/receipt-intake/book";
 import type { CutoverRequest } from "../src/lib/receipt-intake/worker";
 import { QBTimeoutError } from "../src/lib/quickbooks";
@@ -1194,6 +1197,32 @@ test("a re-issued upload URL keeps the row safe from the sweeper", () => {
 test("the lease a URL is issued under is exactly the signed-URL TTL", () => {
     assert.equal(uploadLeaseExpiry(NOW).getTime() - NOW.getTime(), SIGNED_UPLOAD_TTL_MS);
     assert.equal(SIGNED_UPLOAD_TTL_MS, 2 * 60 * 60_000);
+});
+
+// ── A late read gets what's left, not a fresh 25s (Codex round-17 item 2) ──
+
+test("a read starting early in the run gets its full budget", () => {
+    // Plenty of runway left: capped at READ_BUDGET_MS, never handed more.
+    assert.equal(readBudgetFor(50_000), READ_BUDGET_MS);
+});
+
+test("a read starting late in the run gets only what's left, minus the safety margin", () => {
+    // 10s left in the whole invocation must not become a fresh 25s read that
+    // can straddle the platform's own ceiling — it gets 10s minus the margin
+    // reserved for writing the result back.
+    assert.equal(readBudgetFor(10_000), 10_000 - READ_SAFETY_MARGIN_MS);
+});
+
+test("too little runway skips the read entirely rather than starting a doomed one", () => {
+    // Exactly at the floor once the margin is reserved: still worth trying.
+    assert.equal(readBudgetFor(READ_MIN_BUDGET_MS + READ_SAFETY_MARGIN_MS), READ_MIN_BUDGET_MS);
+    // Under the floor: 0, meaning "don't even try" — the same AI_UNAVAILABLE
+    // answer as an exhausted budget, so the row costs no `attempts` and comes
+    // back next pass with a full budget again.
+    assert.equal(readBudgetFor(READ_MIN_BUDGET_MS + READ_SAFETY_MARGIN_MS - 1), 0);
+    assert.equal(readBudgetFor(1_000), 0);
+    assert.equal(readBudgetFor(0), 0);
+    assert.equal(readBudgetFor(-5_000), 0);
 });
 
 test("/start stamps a lease on EVERY url it issues", () => {

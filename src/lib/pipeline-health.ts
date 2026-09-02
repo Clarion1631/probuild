@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { STAGING_SWEEP_MINUTES } from "./receipt-intake/worker";
 
 /**
  * One summary of the receipt/QBO pipeline's health, shared by the on-demand
@@ -118,6 +119,14 @@ export const INTAKE_STUCK_HOURS = 6;
  * intake route died mid-upload or the sweeper is not running — and since
  * STAGING is invisible to the worker's claim by design, nothing else would
  * ever notice.
+ *
+ * ROW AGE ALONE IS THE WRONG QUESTION, same as it is for the sweeper's own
+ * "is this row stuck" call (worker.ts's uploadLeaseActive). A signed upload
+ * URL is valid for two hours (SIGNED_UPLOAD_TTL_MS), and a resumed /start
+ * re-issues one on an EXISTING row without touching createdAt — so a client
+ * on a slow connection, still inside its own upload window, used to get
+ * flagged "stuck" here while its upload was about to land. The count below
+ * only counts a STAGING row past this age AND past its own upload lease.
  */
 export const INTAKE_STAGING_STUCK_MINUTES = 30;
 
@@ -478,6 +487,22 @@ export async function getPipelineHealth(): Promise<PipelineHealth> {
                             {
                                 state: "STAGING",
                                 createdAt: { lt: new Date(now - INTAKE_STAGING_STUCK_MINUTES * 60_000) },
+                                // NOT uploadLeaseActive, expressed as a query
+                                // rather than called as a predicate (this is
+                                // an aggregate count, not a row scan): a live
+                                // lease means either an explicit expiry that
+                                // has not passed yet, or — for the inline,
+                                // no-signed-URL path — a row young enough to
+                                // still be inside the sweeper's own grace
+                                // window. A STAGING row satisfying either is
+                                // still on the clock, not stuck.
+                                OR: [
+                                    { uploadUrlExpiresAt: { lte: new Date(now) } },
+                                    {
+                                        uploadUrlExpiresAt: null,
+                                        createdAt: { lt: new Date(now - STAGING_SWEEP_MINUTES * 60_000) },
+                                    },
+                                ],
                             },
                             {
                                 state: "READ",

@@ -30,7 +30,7 @@ import {
     QboPurchaseFaultError,
     QboVendorDuplicateError,
 } from "@/lib/qbo-receipt-push";
-import type { ProjectPhase, ReadOutcome } from "./read";
+import { READ_BUDGET_MS, type ProjectPhase, type ReadOutcome } from "./read";
 import type { VerifiedBytes } from "./stored-object";
 
 /**
@@ -78,6 +78,45 @@ export const SIGNED_UPLOAD_TTL_MS = 2 * 60 * 60_000;
 /** When a URL issued now stops working. Written to the row by /intake/start. */
 export function uploadLeaseExpiry(now: Date = new Date()): Date {
     return new Date(now.getTime() + SIGNED_UPLOAD_TTL_MS);
+}
+
+/**
+ * Runway reserved AFTER a read for the write that records its result — the
+ * row's applyRead/applyState commit — plus whatever this pass still has left
+ * to do before the invocation ends. A read given every last millisecond of
+ * the run's own budget could return right as the platform kills the
+ * function, and its outcome would never be written at all.
+ */
+export const READ_SAFETY_MARGIN_MS = 2_000;
+/**
+ * Below this much runway (after the safety margin), starting a read is not
+ * worth it: the request itself needs at least this long to have any real
+ * chance of finishing. The row is handed back un-attempted — the same
+ * AI_UNAVAILABLE answer readReceipt gives for an exhausted budget — rather
+ * than begun and abandoned mid-flight when the invocation's own deadline
+ * lands.
+ */
+export const READ_MIN_BUDGET_MS = 5_000;
+
+/**
+ * How much of `READ_BUDGET_MS` a read starting now may actually use, given
+ * how much runway is left in the WHOLE invocation.
+ *
+ * `read.ts`'s own READ_BUDGET_MS (25s) is sized against a fresh 60s
+ * invocation and assumes it is the first thing to run. It is not: a batch of
+ * ten rows can reach its ninth row 45 seconds in, and handing that read
+ * another full 25 seconds is what let a row started at 40s still be reading
+ * at 65s — past the `maxDuration = 60` ceiling the whole run is supposed to
+ * respect. This caps the read's OWN budget at whatever is actually left, so
+ * the invocation's one deadline governs every read the same way it already
+ * governs every QuickBooks call (see `deps.book`'s `deadline`).
+ *
+ * Pure and exported so this is a unit test, not a fact about `buildDeps`
+ * that nothing without a live cron invocation could ever exercise.
+ */
+export function readBudgetFor(remainingRunMs: number): number {
+    const budget = Math.min(READ_BUDGET_MS, remainingRunMs - READ_SAFETY_MARGIN_MS);
+    return budget < READ_MIN_BUDGET_MS ? 0 : budget;
 }
 
 /**

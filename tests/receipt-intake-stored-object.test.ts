@@ -206,8 +206,26 @@ test("the validator hands back the exact bytes it verified", async () => {
 
 // ── Seal order: copy, COMMIT, then delete (round-9 items 1 and 3) ──────────
 
-/** `sealOk`/`committed` drive the outcome; the call log is always recorded. */
-function publishHarness(opts: { sealOk?: boolean; committed?: number } = {}) {
+const CHECK = {
+    mimeType: "image/png",
+    fileSize: PNG.length,
+    fileSha256: createHash("sha256").update(PNG).digest("hex"),
+    bytes: PNG,
+};
+
+/** The path sealAndPublish("...", "row-1", CHECK, ...) will compute. */
+const CANONICAL_ROW1 = `receipts/row-1/${CHECK.fileSha256}.png`;
+
+/**
+ * `sealOk`/`committed` drive the outcome; the call log is always recorded.
+ * `currentPath` is only ever consulted when `committed` is 0 (a lost CAS):
+ * defaulting it to the row's OWN canonical path is the safe default — "the
+ * winner is using this exact object" — so a test that does not care about
+ * the orphan-cleanup branch never accidentally exercises it.
+ */
+function publishHarness(
+    opts: { sealOk?: boolean; committed?: number; currentPath?: string | null; currentPathThrows?: boolean } = {},
+) {
     const calls: string[] = [];
     const deps = {
         seal: async (_u: string, canonical: string) => {
@@ -216,16 +234,15 @@ function publishHarness(opts: { sealOk?: boolean; committed?: number } = {}) {
         },
         commit: async () => { calls.push("commit"); return opts.committed ?? 1; },
         dropUpload: async () => { calls.push("drop"); },
+        currentStoragePath: async () => {
+            calls.push("current-path");
+            if (opts.currentPathThrows) throw new Error("db is down");
+            return opts.currentPath === undefined ? CANONICAL_ROW1 : opts.currentPath;
+        },
+        dropOrphanedCanonical: async () => { calls.push("drop-orphan"); },
     } as never;
     return { calls, deps };
 }
-
-const CHECK = {
-    mimeType: "image/png",
-    fileSize: PNG.length,
-    fileSha256: createHash("sha256").update(PNG).digest("hex"),
-    bytes: PNG,
-};
 
 test("the upload object is deleted only AFTER the row pointer is committed", async () => {
     // Deleting first is unrecoverable: if the UPDATE then fails, the row still
@@ -239,10 +256,42 @@ test("the upload object is deleted only AFTER the row pointer is committed", asy
 });
 
 test("a FAILED commit leaves the upload object alone, so the retry can recover", async () => {
+    // The winner is proven (by the default harness) to be pointing at this
+    // EXACT canonical path — a double-publish racing on identical content —
+    // so nothing is deleted, upload OR canonical.
     const h = publishHarness({ committed: 0 });
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
-    assert.deepEqual(h.calls, ["seal", "commit"], "nothing was deleted");
+    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "nothing was deleted");
     assert.equal(outcome?.published, false);
+});
+
+// ── A lost CAS orphans the sealed copy unless it's proven to be the winner's own (Codex round-17 item 4) ──
+
+test("a lost CAS whose winner points elsewhere cleans up the orphaned canonical copy", async () => {
+    // The winner published a DIFFERENT object (a re-armed upload landed new
+    // bytes in the gap), so the copy THIS call sealed is not the row's
+    // storagePath any more, and the STAGING sweep will never look at it
+    // again — it must be cleaned up here or it sits in the bucket forever.
+    const h = publishHarness({ committed: 0, currentPath: "receipts/row-1/some-other-sha.png" });
+    const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.deepEqual(h.calls, ["seal", "commit", "current-path", "drop-orphan"]);
+    assert.equal(outcome?.published, false);
+    assert.equal(outcome?.canonicalPath, CANONICAL_ROW1);
+});
+
+test("a lost CAS never deletes the object the winner is actually using", async () => {
+    // The winner's storagePath IS this exact canonical path: a double
+    // /finalize (or /finalize racing the sweep) on the SAME content. That
+    // object is the winner's now.
+    const h = publishHarness({ committed: 0, currentPath: CANONICAL_ROW1 });
+    await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "no drop-orphan call");
+});
+
+test("a failed currentStoragePath lookup never deletes on uncertainty", async () => {
+    const h = publishHarness({ committed: 0, currentPathThrows: true });
+    await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, h.deps);
+    assert.deepEqual(h.calls, ["seal", "commit", "current-path"], "the failure default is 'do not delete'");
 });
 
 test("a failed SEAL never touches the row or the upload object", async () => {
@@ -373,6 +422,7 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
     const fence = publishFence(observed);
 
     let dropped = false;
+    let droppedOrphan = false;
     const outcome = await sealAndPublish("receipts/intake/a.png", "row-1", CHECK, {
         seal: async (_u: string, canonical: string) => {
             // THE RACE, in the exact window it happens: the worker re-parks the
@@ -386,12 +436,18 @@ test("RACE: a reason that changes during sealing loses the publish, and writes n
                 { state: "RECEIVED", stateReason: null, storagePath: canonicalPath },
             ),
         dropUpload: async () => { dropped = true; },
+        currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
+        dropOrphanedCanonical: async () => { droppedOrphan = true; },
     } as never);
 
     assert.equal(outcome?.published, false, "zero rows updated");
     assert.equal(store.get().state, "NEEDS_REVIEW", "the row is untouched");
     assert.equal(store.get().stateReason, "vendor-mismatch", "the newer decision survives");
     assert.equal(dropped, false, "and the upload object is kept for the retry");
+    // Nobody's row points at the copy this call sealed — the row never
+    // advanced past NEEDS_REVIEW — so it IS an orphan, and cleaning it up
+    // here is correct, unlike the upload object.
+    assert.equal(droppedOrphan, true, "but the newly-sealed canonical copy is nobody's, and is cleaned up");
 });
 
 test("RACE: a worker claim taken during sealing also loses the publish", async () => {
@@ -406,6 +462,8 @@ test("RACE: a worker claim taken during sealing also loses the publish", async (
         },
         commit: async () => store.updateMany({ id: "row-1", ...fence }, { state: "RECEIVED" }),
         dropUpload: async () => {},
+        currentStoragePath: async () => (store.get().storagePath as string | undefined) ?? null,
+        dropOrphanedCanonical: async () => {},
     } as never);
     assert.equal(outcome?.published, false);
     assert.equal(store.get().state, "STAGING", "the sweeper's row is left alone");

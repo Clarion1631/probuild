@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { redirect } from "next/navigation";
+import { resolveReceiptUrls } from "@/lib/receipt-intake/receipt-url";
 import ReceiptQueueClient from "./ReceiptQueueClient";
 
 export default async function BookkeeperReceiptsPage() {
@@ -53,6 +54,15 @@ export default async function BookkeeperReceiptsPage() {
         }),
     ]);
 
+    // `receiptUrl` is a stable `receipt-intake://` REFERENCE for anything the
+    // v2 pipeline booked (book.ts), not a link — the client renders it
+    // straight into an `href`, so it must be a short-lived signed URL by the
+    // time it gets there. A legacy absolute URL passes through unchanged.
+    const [resolvedPendingExpenses, resolvedImportedExpenses] = await Promise.all([
+        resolveReceiptUrls(pendingExpenses),
+        resolveReceiptUrls(importedExpenses),
+    ]);
+
     return (
         <div className="max-w-6xl mx-auto py-8 px-6 space-y-6">
             <div>
@@ -76,8 +86,8 @@ export default async function BookkeeperReceiptsPage() {
             </div>
 
             <ReceiptQueueClient
-                expenses={JSON.parse(JSON.stringify(pendingExpenses))}
-                importedExpenses={JSON.parse(JSON.stringify(importedExpenses))}
+                expenses={JSON.parse(JSON.stringify(resolvedPendingExpenses))}
+                importedExpenses={JSON.parse(JSON.stringify(resolvedImportedExpenses))}
                 importedExpenseCount={importedExpenseCount}
                 projects={projects}
                 costCodes={costCodes}
