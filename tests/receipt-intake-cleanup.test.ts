@@ -16,12 +16,40 @@ const cleanup = readFileSync(path.join(ROOT, "src/lib/receipt-intake/storage-cle
 const intake = readFileSync(path.join(ROOT, "src/app/api/receipts/intake/route.ts"), "utf8");
 const storage = readFileSync(path.join(ROOT, "src/lib/secure-storage.ts"), "utf8");
 
+/**
+ * The body of one top-level function, EOL-agnostic.
+ *
+ * `indexOf("\n}\n")` returns -1 on a CRLF checkout (the bytes there are
+ * "\r\n}\r\n"), and `slice(0, -1)` then quietly hands back the REST OF THE
+ * FILE — so an assertion scoped to one function silently starts reading every
+ * function after it, and these tests pass or fail for the wrong reason. Git's
+ * autocrlf makes that a property of who cloned the repo, not of the code.
+ */
+function bodyOf(source: string, declaration: string): string {
+    const from = source.indexOf(declaration);
+    assert.notEqual(from, -1, `not found: ${declaration}`);
+    const rest = source.slice(from);
+    const end = rest.search(/\r?\n\}\r?\n/);
+    assert.notEqual(end, -1, `no closing brace found for ${declaration}`);
+    return rest.slice(0, end);
+}
+
+test("bodyOf stops at the function it was given, on either line ending", () => {
+    // The control. Without it the helper could go back to returning the whole
+    // file and every assertion below would still pass.
+    const lf = "function a() {\n    inA();\n}\n\nfunction b() {\n    inB();\n}\n";
+    for (const text of [lf, lf.replace(/\n/g, "\r\n")]) {
+        const body = bodyOf(text, "function a()");
+        assert.match(body, /inA\(\)/);
+        assert.ok(!body.includes("inB()"), "it did not run on into the next function");
+    }
+});
+
 test("recording a cleanup is durable, not fire-and-forget", () => {
     // logAutomationEvent never throws by contract, so "it did not throw" is not
     // proof it wrote. The record is read back, and the function throws if it is
     // not there — the caller has to know.
-    const fn = cleanup.slice(cleanup.indexOf("export async function recordPendingCleanup"));
-    const body = fn.slice(0, fn.indexOf("\n}\n"));
+    const body = bodyOf(cleanup, "export async function recordPendingCleanup");
     assert.ok(!/\.catch\(\(\)\s*=>\s*\{/.test(body), "the write is not swallowed");
     assert.match(body, /findFirst/, "it is read back");
     assert.match(body, /throw new Error/, "and a missing record throws");
@@ -46,7 +74,7 @@ test("the cleanup worker refuses to delete a path a LIVE row still points at", (
     // cleanup, the row goes, the caller retries, and the retry's row can point
     // at the same path — or a seal publishes a canonical path an older pending
     // event names. Deleting then destroys a receipt in active use.
-    const fn = cleanup.slice(cleanup.indexOf("export async function retryPendingCleanups"));
+    const fn = bodyOf(cleanup, "export async function retryPendingCleanups");
     assert.match(fn, /receiptIntake\.findFirst\(\{\s*\n?\s*where: \{ storagePath \}/, "it checks for a referencing row");
     assert.match(fn, /still referenced by/, "and resolves rather than retrying forever");
     // The reference check must come BEFORE the delete.
@@ -57,7 +85,7 @@ test("the cleanup worker refuses to delete a path a LIVE row still points at", (
 });
 
 test("an event is resolved only AFTER a confirmed deletion", () => {
-    const fn = cleanup.slice(cleanup.indexOf("export async function retryPendingCleanups"));
+    const fn = bodyOf(cleanup, "export async function retryPendingCleanups");
     // The delete's catch continues to the next event rather than falling
     // through to the resolve.
     assert.match(fn, /\} catch \{[\s\S]*?continue;/, "a failed delete leaves the event pending");
@@ -72,8 +100,8 @@ test("a missing storage client is an ERROR for the cleanup path", () => {
     // best-effort callers, catastrophic here: it would mark orphans resolved on
     // a misconfigured deployment and lose them permanently.
     assert.match(storage, /export async function removeSecureDocStrict/);
-    const strict = storage.slice(storage.indexOf("export async function removeSecureDocStrict"));
-    assert.match(strict.slice(0, strict.indexOf("\n}\n")), /throw new Error\("secure storage is not configured"\)/);
+    const strict = bodyOf(storage, "export async function removeSecureDocStrict");
+    assert.match(strict, /throw new Error\("secure storage is not configured"\)/);
     // ...and the cleanup queue uses the strict one, never the quiet one.
     assert.ok(!/\bremoveSecureDoc\(/.test(cleanup), "cleanup never uses the quiet variant");
 });
