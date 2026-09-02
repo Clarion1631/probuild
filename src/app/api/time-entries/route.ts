@@ -10,6 +10,8 @@ import { isCostCodeAllowedForProject, PHASE_ELIGIBLE_ESTIMATE_WHERE } from "@/li
 import { prismaPhaseDataSource } from "@/lib/project-phases-db";
 import { applyNoAttestationNotice, applyRestBreakAttestation, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, staleDeferredReview, type DayEntry } from "@/lib/wa-breaks";
 import { flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
+import { assertPeriodUnlocked, type LockedPeriodLoader } from "@/lib/payroll-period";
+import { zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 export async function GET(req: Request) {
     const auth = await authenticateMobileOrSession(req);
@@ -304,7 +306,17 @@ export interface ClockOutDependencies {
     authenticate(req: Request): Promise<ClockOutAuthResult>;
     findTimeEntry(id: string): Promise<ClockOutTimeEntryRow | null>;
     findProjectIsLogistics(projectId: string): Promise<boolean>;
-    findOwnerRates(userId: string): Promise<{ hourlyRate: number; burdenRate: number } | null>;
+    /**
+     * The entry OWNER's pay rates, plus the `role` and `name` the $0-rate block
+     * needs (src/lib/pay-rate-guard.ts): role decides whether a $0 rate is a gap
+     * (hourly crew) or the correct value (salaried ADMIN/FINANCE), and name is
+     * for the manager-facing message.
+     */
+    findOwnerRates(
+        userId: string
+    ): Promise<{ hourlyRate: number; burdenRate: number; role: string; name: string | null } | null>;
+    /** Locked pay periods — a closed period freezes every punch that started inside it (src/lib/payroll-period.ts). */
+    loadLockedPeriods: LockedPeriodLoader;
     /**
      * The worker's OTHER closed entries on the same company-local day as the
      * entry being closed — the WA meal rule is a per-DAY rule (Switch Task
@@ -385,6 +397,13 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
                 );
             }
 
+            // Payroll for the period this punch belongs to may already be
+            // exported and locked — closing it now would change hours that were
+            // already paid. Checked before any of the work below so a locked
+            // period costs one query (src/lib/payroll-period.ts).
+            const locked = await assertPeriodUnlocked([existing.startTime], dependencies.loadLockedPeriods);
+            if (locked) return locked;
+
             // Validate a client-supplied endTime rather than trusting it outright:
             // it must parse, must be after the clock-in time, and must not be in
             // the future beyond a small clock-skew allowance. Reject with 400 on
@@ -453,8 +472,20 @@ export function createClockOutHandler(dependencies: ClockOutDependencies) {
 
             // Cost is always calculated from the time-entry OWNER's rates, not the editing user's
             // (a manager editing a field crew's punch must not stamp manager rates onto the entry).
-            const owner = existing.userId === user.id ? user : await dependencies.findOwnerRates(existing.userId);
+            const closerIsOwner = existing.userId === user.id;
+            const owner = closerIsOwner
+                ? { ...user, name: null as string | null }
+                : await dependencies.findOwnerRates(existing.userId);
             if (!owner) return NextResponse.json({ error: "Owner not found" }, { status: 404 });
+
+            // A $0 hourly rate on an hourly worker would stamp a $0 shift onto
+            // payroll and job costing, invisibly. Refuse the close and leave the
+            // punch OPEN — the worker stays on the clock and is paid once the
+            // rate is entered (src/lib/pay-rate-guard.ts, spec G2).
+            if (zeroRateBlocks(owner)) {
+                return zeroRateBlockedResponse({ closerIsOwner, ownerName: owner.name });
+            }
+
             const laborCost = durationHours * owner.hourlyRate;
             const burdenCost = durationHours * owner.burdenRate;
 
@@ -566,10 +597,23 @@ const clockOutHandler = createClockOutHandler({
         return project?.isLogistics ?? false;
     },
     findOwnerRates: async (userId) => {
-        const owner = await prisma.user.findUnique({ where: { id: userId }, select: { hourlyRate: true, burdenRate: true } });
+        const owner = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { hourlyRate: true, burdenRate: true, role: true, name: true },
+        });
         if (!owner) return null;
-        return { hourlyRate: toNum(owner.hourlyRate), burdenRate: toNum(owner.burdenRate) };
+        return {
+            hourlyRate: toNum(owner.hourlyRate),
+            burdenRate: toNum(owner.burdenRate),
+            role: owner.role,
+            name: owner.name,
+        };
     },
+    loadLockedPeriods: async () =>
+        prisma.payrollPeriod.findMany({
+            where: { lockedAt: { not: null } },
+            select: { id: true, periodStart: true, periodEnd: true, lockedAt: true },
+        }),
     findDayEntries: loadDayEntries,
     settleDay,
     flagSettlementFailed,

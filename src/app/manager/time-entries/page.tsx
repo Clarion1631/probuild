@@ -7,6 +7,7 @@ import Link from "next/link";
 import { formatCurrency } from "@/lib/utils";
 import { markTimeEntryReviewed, decideMealSkip, setMealWaiverSigned } from "@/lib/actions";
 import { canApproveMealSkip } from "@/lib/wa-breaks";
+import { zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 interface Props {
     searchParams: Promise<{ userId?: string; projectId?: string; dateFrom?: string; dateTo?: string; tab?: string; flagged?: string }>;
@@ -91,14 +92,18 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
             <div className="flex justify-between items-center">
                 <h1 className="text-2xl font-bold text-hui-textMain">Time &amp; Expenses</h1>
                 <div className="flex items-center gap-2">
-                    <a
-                        href={`/api/gusto/export?${filterParams.toString()}`}
+                    {/* Was a direct link to the ungated per-entry /api/gusto/export
+                        (deleted in Phase 5). Payroll now goes through the review
+                        page, which refuses to export a period with open or flagged
+                        entries and can lock it afterwards. */}
+                    <Link
+                        href="/manager/payroll-export"
                         className="hui-btn hui-btn-secondary text-sm flex items-center gap-1.5"
-                        title="Export pay period to Gusto CSV"
+                        title="Review the pay period and download the Gusto CSVs"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>
-                        Export to Gusto
-                    </a>
+                        Payroll export
+                    </Link>
                     <Link href="/manager/logistics" className="hui-btn hui-btn-secondary text-sm">
                         Logistics
                     </Link>
@@ -293,6 +298,18 @@ export default async function ManagerTimeEntriesPage({ searchParams }: Props) {
                                             <tr key={e.id} className="hover:bg-slate-50">
                                                 <td className="px-5 py-3 font-medium text-hui-textMain">
                                                     {e.user.name || e.user.email}
+                                                    {/* Phase 5 G2: the same condition that blocks their
+                                                        clock-out (src/lib/pay-rate-guard.ts), surfaced where
+                                                        a manager can act on it. */}
+                                                    {zeroRateBlocks({ role: e.user.role, hourlyRate: toNum(e.user.hourlyRate) }) && (
+                                                        <Link
+                                                            href={`/company/team-members/${e.user.id}`}
+                                                            className="ml-2 inline-block text-xs text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200 align-middle"
+                                                            title="This member has no hourly rate — their time costs $0 and they cannot clock out until it is set"
+                                                        >
+                                                            No pay rate
+                                                        </Link>
+                                                    )}
                                                 </td>
                                                 <td className="px-5 py-3 text-hui-textMuted text-xs whitespace-nowrap">
                                                     <div>{new Date(e.startTime).toLocaleDateString()}</div>

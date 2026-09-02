@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "@/lib/auth";
+import { authenticateMobileOrSession } from "@/lib/mobile-auth";
 import { prisma } from "@/lib/prisma";
 import { createHelpChatGitHubIssue } from "@/lib/help-chat/github";
+import { authorizeBugWidgetUser } from "@/lib/help-chat/bug-widget-auth";
 
 function buildBugFixDetails(description: string, steps?: string) {
   const details = [description.trim()];
@@ -14,21 +14,18 @@ function buildBugFixDetails(description: string, steps?: string) {
   return details.join("\n\n");
 }
 
+// Phase 5 G5: any ACTIVATED staff member can report a bug, from the web or
+// from the crew app's Bearer token (authenticateMobileOrSession, allowlisted in
+// src/proxy.ts). Everything downstream — the GitHub issue and the HelpRequest
+// row — is unchanged.
 export async function POST(req: NextRequest) {
-  const session = await getServerSession(authOptions);
-  if (!session?.user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const auth = await authenticateMobileOrSession(req);
+  if (!auth.ok) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-  const role = (session.user as any).role;
-  if (role !== "ADMIN") {
-    return NextResponse.json(
-      { error: "Admin access required" },
-      { status: 403 }
-    );
-  }
+  const allowed = authorizeBugWidgetUser(auth.user);
+  if (!allowed.ok) return NextResponse.json({ error: allowed.error }, { status: allowed.status });
 
-  const userId = (session.user as any).id;
+  const userId = auth.user.id;
   const { title, description, steps, currentPage, conversationId } =
     await req.json();
 

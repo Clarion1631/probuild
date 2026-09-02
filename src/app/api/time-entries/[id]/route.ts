@@ -9,6 +9,8 @@ import { checkLogisticsClockOutNotes, applyMealSkippedWaiver } from "@/lib/logis
 import { applyNoAttestationNotice, applyRestBreakAttestation, CLOSED_LATE_NOTE, computeMealDeduction, exceedsMaxShift, MAX_SHIFT_HOURS, type MealOutcome } from "@/lib/wa-breaks";
 import { deleteEntryAndSettle, flagSettlementFailed, loadDayEntries, settleDay } from "@/lib/wa-breaks-db";
 import { NO_ATTESTATION_NOTE } from "@/lib/wa-breaks";
+import { assertPeriodUnlocked } from "@/lib/payroll-period";
+import { zeroRateBlockedResponse, zeroRateBlocks } from "@/lib/pay-rate-guard";
 
 // Mobile + web hybrid. Two distinct flows, both routed through PATCH:
 //
@@ -134,6 +136,13 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         );
     }
 
+    // Locked pay periods (src/lib/payroll-period.ts). BOTH times are checked:
+    // editing a punch that sits in a locked period changes hours that were
+    // already paid, and MOVING a punch INTO a locked period adds hours to a
+    // period that was already exported. Either one is a 423.
+    const editLocked = await assertPeriodUnlocked([existing.startTime, newStart]);
+    if (editLocked) return editLocked;
+
     // Logistics jobs carry no cost-code/estimate-item context on the entry, so
     // notes are the only record of what was actually done — require one
     // (already on the entry, or supplied in this request) before the entry can
@@ -174,6 +183,15 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         ? user
         : await prisma.user.findUnique({ where: { id: existing.userId } });
     if (!owner) return NextResponse.json({ error: "Entry owner not found" }, { status: 404 });
+
+    // Mirror of the PUT clock-out's $0-rate block (src/lib/pay-rate-guard.ts),
+    // with the manager-facing message: this is the path a manager uses to close
+    // a forgotten punch, and closing it at a $0 rate books a free shift. Only a
+    // genuine OPEN -> CLOSED transition is gated; re-editing an already-closed
+    // entry is left alone so an old punch never becomes uneditable.
+    if (closingOpenEntry && zeroRateBlocks({ role: owner.role, hourlyRate: toNum(owner.hourlyRate) })) {
+        return zeroRateBlockedResponse({ closerIsOwner: isOwner, ownerName: owner.name });
+    }
 
     // Automatic-break model (src/lib/wa-breaks.ts): the meal is re-settled on
     // EVERY edit that leaves the entry closed — a manager closing a forgotten
@@ -335,6 +353,11 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
 
     const existing = await prisma.timeEntry.findUnique({ where: { id } });
     if (!existing) return NextResponse.json({ error: "Time entry not found" }, { status: 404 });
+
+    // Deleting a punch out of an exported period changes hours that were
+    // already paid — same 423 as the edit path (src/lib/payroll-period.ts).
+    const locked = await assertPeriodUnlocked([existing.startTime]);
+    if (locked) return locked;
 
     // Delete + re-plan the day in one transaction under the day lock — a
     // concurrent edit that moved this row is seen inside the lock and its new
