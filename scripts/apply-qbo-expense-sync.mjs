@@ -7,8 +7,8 @@
 //
 // Usage: node scripts/apply-qbo-expense-sync.mjs
 import { PrismaClient } from "@prisma/client";
-import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import fs from "node:fs";
 
 // Same resolution the sibling apply-*.mjs scripts use: env first, then the
 // checked-out .env files, since these are run by hand rather than by Next.
@@ -22,6 +22,9 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in env or .env files");
 }
 
+let url;
+let prisma;
+
 const STATEMENTS = [
     `ALTER TABLE "Expense"
          ADD COLUMN IF NOT EXISTS "qbPurchaseId" TEXT,
@@ -32,41 +35,38 @@ const STATEMENTS = [
 ];
 
 async function main() {
-    const url = resolveDatabaseUrl();
-    const prisma = new PrismaClient({ datasources: { db: { url } } });
+    url = resolveDatabaseUrl();
+    prisma = new PrismaClient({ datasources: { db: { url } } });
+    console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
 
-    try {
-        console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
+    for (const sql of STATEMENTS) {
+        console.log(`  ${sql.replace(/\s+/g, " ").slice(0, 90)}...`);
+        await prisma.$executeRawUnsafe(sql);
+    }
 
-        for (const sql of STATEMENTS) {
-            console.log(`  ${sql.replace(/\s+/g, " ").slice(0, 90)}...`);
-            await prisma.$executeRawUnsafe(sql);
-        }
-
-        const [{ count }] = await prisma.$queryRawUnsafe(
-            `SELECT COUNT(*)::int AS count
+    const [{ count }] = await prisma.$queryRawUnsafe(
+        `SELECT COUNT(*)::int AS count
            FROM information_schema.columns
           WHERE table_name = 'Expense'
             AND column_name IN ('qbPurchaseId', 'qbSyncToken', 'qbSyncedAt');`,
-        );
-        if (count !== 3) throw new Error(`Verification failed: qb column count = ${count}, expected 3`);
+    );
+    if (count !== 3) throw new Error(`Verification failed: qb column count = ${count}, expected 3`);
 
-        const [{ idx }] = await prisma.$queryRawUnsafe(
-            `SELECT COUNT(*)::int AS idx
+    const [{ idx }] = await prisma.$queryRawUnsafe(
+        `SELECT COUNT(*)::int AS idx
            FROM pg_indexes
           WHERE tablename = 'Expense' AND indexname = 'Expense_qbPurchaseId_key';`,
-        );
-        if (idx !== 1) throw new Error(`Verification failed: Expense_qbPurchaseId_key index missing`);
-        console.log("qbPurchaseId/qbSyncToken/qbSyncedAt columns + unique index verified.");
-    } finally {
-        await prisma.$disconnect();
-    }
+    );
+    if (idx !== 1) throw new Error(`Verification failed: Expense_qbPurchaseId_key index missing`);
+    console.log("qbPurchaseId/qbSyncToken/qbSyncedAt columns + unique index verified.");
 }
 
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
-    main().catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    });
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma?.$disconnect());
 }

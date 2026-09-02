@@ -18,8 +18,8 @@
 //
 // Usage: node scripts/apply-vendor-po-restrict.mjs
 import { PrismaClient } from "@prisma/client";
-import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import fs from "node:fs";
 
 // DATABASE_URL (the pooler) on purpose, matching every sibling apply-*.mjs.
 // Supabase generally recommends DIRECT_URL for migrations, but port 5432 is not
@@ -38,7 +38,6 @@ function resolveDatabaseUrl() {
     throw new Error("DATABASE_URL not found in env or .env files");
 }
 
-// Assigned by main(); left undefined on import so this module has no side effects.
 let url;
 let prisma;
 
@@ -94,85 +93,82 @@ async function findVendorFk(client = prisma) {
 async function main() {
     url = resolveDatabaseUrl();
     prisma = new PrismaClient({ datasources: { db: { url } } });
+    console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
 
-    try {
-        console.log(`Applying to ${url.replace(/:[^:@]*@/, ":****@")}`);
+    const fk = await findVendorFk();
+    console.log(`  found FK ${fk.name}: ON DELETE ${fk.deleteAction}, ON UPDATE ${fk.updateAction}`);
 
-        const fk = await findVendorFk();
-        console.log(`  found FK ${fk.name}: ON DELETE ${fk.deleteAction}, ON UPDATE ${fk.updateAction}`);
+    // Only done if it is BOTH restricted and validated. A first run that commits
+    // the swap then dies before VALIDATE would otherwise leave the constraint
+    // NOT VALID forever, with every rerun skipping straight past the fix.
+    if (fk.deleteAction === "RESTRICT" && fk.validated) {
+        console.log("Already RESTRICT and validated — nothing to do.");
+        return;
+    }
 
-        // Only done if it is BOTH restricted and validated. A first run that commits
-        // the swap then dies before VALIDATE would otherwise leave the constraint
-        // NOT VALID forever, with every rerun skipping straight past the fix.
-        if (fk.deleteAction === "RESTRICT" && fk.validated) {
-            console.log("Already RESTRICT and validated — nothing to do.");
+    if (fk.deleteAction === "RESTRICT") {
+        console.log("  already RESTRICT but NOT VALID — resuming at validation.");
+    } else {
+        const [{ count: poCount }] = await prisma.$queryRawUnsafe(
+            `SELECT COUNT(*)::int AS count FROM "PurchaseOrder";`,
+        );
+        console.log(`  ${poCount} purchase orders protected by this change`);
+    }
+
+    // One transaction: take the lock, re-check under it so two concurrent runs
+    // cannot both rebuild the constraint, then swap the delete rule.
+    // update action is carried over verbatim — only the delete rule changes.
+    // Skipped entirely on the resume path so we don't take ACCESS EXCLUSIVE on a
+    // live table just to discover there is nothing to swap.
+    if (fk.deleteAction !== "RESTRICT") await prisma.$transaction(async tx => {
+        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '5s';`);
+        await tx.$executeRawUnsafe(`LOCK TABLE "public"."PurchaseOrder" IN ACCESS EXCLUSIVE MODE;`);
+
+        const current = await findVendorFk(tx);
+        if (current.deleteAction === "RESTRICT") {
+            console.log("  another run got there first — nothing to do.");
             return;
         }
 
-        if (fk.deleteAction === "RESTRICT") {
-            console.log("  already RESTRICT but NOT VALID — resuming at validation.");
-        } else {
-            const [{ count: poCount }] = await prisma.$queryRawUnsafe(
-                `SELECT COUNT(*)::int AS count FROM "PurchaseOrder";`,
-            );
-            console.log(`  ${poCount} purchase orders protected by this change`);
-        }
-
-        // One transaction: take the lock, re-check under it so two concurrent runs
-        // cannot both rebuild the constraint, then swap the delete rule.
-        // update action is carried over verbatim — only the delete rule changes.
-        // Skipped entirely on the resume path so we don't take ACCESS EXCLUSIVE on a
-        // live table just to discover there is nothing to swap.
-        if (fk.deleteAction !== "RESTRICT") await prisma.$transaction(async tx => {
-            await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '5s';`);
-            await tx.$executeRawUnsafe(`LOCK TABLE "public"."PurchaseOrder" IN ACCESS EXCLUSIVE MODE;`);
-
-            const current = await findVendorFk(tx);
-            if (current.deleteAction === "RESTRICT") {
-                console.log("  another run got there first — nothing to do.");
-                return;
-            }
-
-            await tx.$executeRawUnsafe(`ALTER TABLE "public"."PurchaseOrder" DROP CONSTRAINT "${current.name}";`);
-            await tx.$executeRawUnsafe(
-                `ALTER TABLE "public"."PurchaseOrder"
+        await tx.$executeRawUnsafe(`ALTER TABLE "public"."PurchaseOrder" DROP CONSTRAINT "${current.name}";`);
+        await tx.$executeRawUnsafe(
+            `ALTER TABLE "public"."PurchaseOrder"
                ADD CONSTRAINT "${current.name}"
                FOREIGN KEY ("vendorId") REFERENCES "public"."Vendor"("id")
                ON DELETE RESTRICT ON UPDATE ${current.updateAction}
                NOT VALID;`,
-            );
-        });
+        );
+    });
 
-        // Separate statement, weaker lock: re-checks existing rows without blocking
-        // reads or writes. Every row already satisfied the old FK, so this cannot fail.
-        const after = await findVendorFk();
-        if (!after.validated) {
-            console.log("  validating existing rows...");
-            await prisma.$executeRawUnsafe(
-                `ALTER TABLE "public"."PurchaseOrder" VALIDATE CONSTRAINT "${after.name}";`,
-            );
-        }
-
-        const final = await findVendorFk();
-        if (final.deleteAction !== "RESTRICT") {
-            throw new Error(`Verification failed: ON DELETE is ${final.deleteAction}, expected RESTRICT`);
-        }
-        if (final.updateAction !== fk.updateAction) {
-            throw new Error(`Verification failed: ON UPDATE changed from ${fk.updateAction} to ${final.updateAction}`);
-        }
-        if (!final.validated) {
-            throw new Error("Verification failed: constraint is still NOT VALID");
-        }
-        console.log(`${final.name} verified: ON DELETE RESTRICT, ON UPDATE ${final.updateAction}, validated.`);
-    } finally {
-        await prisma.$disconnect();
+    // Separate statement, weaker lock: re-checks existing rows without blocking
+    // reads or writes. Every row already satisfied the old FK, so this cannot fail.
+    const after = await findVendorFk();
+    if (!after.validated) {
+        console.log("  validating existing rows...");
+        await prisma.$executeRawUnsafe(
+            `ALTER TABLE "public"."PurchaseOrder" VALIDATE CONSTRAINT "${after.name}";`,
+        );
     }
+
+    const final = await findVendorFk();
+    if (final.deleteAction !== "RESTRICT") {
+        throw new Error(`Verification failed: ON DELETE is ${final.deleteAction}, expected RESTRICT`);
+    }
+    if (final.updateAction !== fk.updateAction) {
+        throw new Error(`Verification failed: ON UPDATE changed from ${fk.updateAction} to ${final.updateAction}`);
+    }
+    if (!final.validated) {
+        throw new Error("Verification failed: constraint is still NOT VALID");
+    }
+    console.log(`${final.name} verified: ON DELETE RESTRICT, ON UPDATE ${final.updateAction}, validated.`);
 }
 
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
-    main().catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-    });
+    main()
+        .catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+        })
+        .finally(() => prisma?.$disconnect());
 }

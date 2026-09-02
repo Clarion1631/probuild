@@ -9,17 +9,27 @@
  * `main()` behind an `import.meta.url === pathToFileURL(process.argv[1]).href`
  * main-module guard. This file makes sure it stays that way, two ways:
  *
- *  1. Runtime: each script is imported in a child process whose environment
+ *  1. Source (TypeScript AST, evaluated synchronously at load and asserted
+ *     BEFORE any child process is spawned): no dotenv `config(...)`,
+ *     `new PrismaClient(...)`, raw-SQL call, `require(...)`, dynamic
+ *     `import(...)`, top-level `await`, or `process.exit(...)` may appear at
+ *     module scope — outside a real function body (an IIFE does not count) or
+ *     the guard's own `if` branch. The guard must be exactly
+ *     `const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href`
+ *     (or the older `fileURLToPath(import.meta.url) === process.argv[1]` form),
+ *     used as `if (isMainModule) { ...main()... }` with no `else`, and `main()`
+ *     may be called nowhere else.
+ *
+ *  2. Runtime: each script is imported in a child process whose environment
  *     holds only a DATABASE_URL / DIRECT_URL pointing at a TCP listener owned by
  *     this test. The import must exit 0, print nothing that looks like a
  *     migration log, and the listener must see ZERO connections. A positive
  *     control proves the listener really does catch a module-scope query.
+ *     The source check runs first so a script that regressed to loading a real
+ *     `.env` at module scope is never even imported.
  *
- *  2. Source: the script is parsed with the TypeScript AST and no dotenv
- *     `config(...)`, `new PrismaClient(...)`, raw-SQL call, top-level `await`,
- *     or `process.exit(...)` may appear at module scope — i.e. before `main()`
- *     runs — outside a function body or the main-module guard block. `main()`
- *     itself may only be called from inside that guard.
+ * What this does NOT prove: it detects the specific syntax above plus observed
+ * TCP connections. It is not a general side-effect analysis.
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +48,208 @@ const scripts = readdirSync(scriptsDir)
     .sort();
 
 assert.ok(scripts.length > 0, "no scripts/apply-*.mjs found — glob or cwd is wrong");
+
+// ---------------------------------------------------------------------------
+// Source check (TypeScript AST).
+// ---------------------------------------------------------------------------
+
+/** The only accepted guard expressions, whitespace-normalised. */
+const GUARD_EXPRESSIONS = new Set([
+    "process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href",
+    "process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]",
+]);
+
+const normalise = (s: string) => s.replace(/\s+/g, " ").trim();
+
+function isFunctionLike(node: ts.Node): boolean {
+    return (
+        ts.isFunctionDeclaration(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isArrowFunction(node) ||
+        ts.isMethodDeclaration(node) ||
+        ts.isGetAccessor(node) ||
+        ts.isSetAccessor(node) ||
+        ts.isConstructorDeclaration(node)
+    );
+}
+
+/** `(async () => { ... })()` / `(function () { ... })()` — runs at load, so it shields nothing. */
+function isImmediatelyInvoked(fn: ts.Node): boolean {
+    let n: ts.Node = fn;
+    while (n.parent && ts.isParenthesizedExpression(n.parent)) n = n.parent;
+    return !!n.parent && ts.isCallExpression(n.parent) && n.parent.expression === n;
+}
+
+type SourceReport = { violations: string[]; guardIfs: number; mainCallsInGuard: number; hasGuardConst: boolean; hasMain: boolean };
+
+function analyse(name: string, text: string): SourceReport {
+    const sf = ts.createSourceFile(name, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
+    const line = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
+    const report: SourceReport = { violations: [], guardIfs: 0, mainCallsInGuard: 0, hasGuardConst: false, hasMain: false };
+
+    // Module-level `const isMainModule = <exact guard>;`
+    for (const st of sf.statements) {
+        if (ts.isFunctionDeclaration(st) && st.name?.text === "main") report.hasMain = true;
+        if (!ts.isVariableStatement(st)) continue;
+        for (const decl of st.declarationList.declarations) {
+            if (!ts.isIdentifier(decl.name) || decl.name.text !== "isMainModule") continue;
+            const isConst = (st.declarationList.flags & ts.NodeFlags.Const) !== 0;
+            const init = decl.initializer ? normalise(decl.initializer.getText(sf)) : "";
+            if (isConst && GUARD_EXPRESSIONS.has(init)) report.hasGuardConst = true;
+            else report.violations.push(`line ${line(st)}: isMainModule must be \`const\` and exactly one of the accepted guard expressions, got: ${init || "(no initializer)"}`);
+        }
+    }
+
+    /** The guard: a module-level `if (isMainModule) { ... }` with no else. Returns its then-branch. */
+    function guardBranch(node: ts.Node): ts.Node | null {
+        if (!ts.isIfStatement(node) || node.parent !== sf) return null;
+        if (!ts.isIdentifier(node.expression) || node.expression.text !== "isMainModule") return null;
+        report.guardIfs += 1;
+        if (node.elseStatement) report.violations.push(`line ${line(node)}: the main-module guard must not have an else branch`);
+        return node.thenStatement;
+    }
+
+    function visit(node: ts.Node, shielded: boolean, inGuard: boolean) {
+        const branch = guardBranch(node);
+        if (branch) {
+            // Only the then-branch is shielded; the condition itself is checked above.
+            ts.forEachChild(node, (child) => visit(child, child === branch, child === branch));
+            return;
+        }
+        const realFunction = isFunctionLike(node) && !isImmediatelyInvoked(node);
+        const nowShielded = shielded || realFunction;
+
+        if (ts.isCallExpression(node) && node.expression.getText(sf) === "main") {
+            if (inGuard) report.mainCallsInGuard += 1;
+            else report.violations.push(`line ${line(node)}: main() called outside the main-module guard`);
+        }
+
+        if (!nowShielded) {
+            if (ts.isAwaitExpression(node)) {
+                report.violations.push(`line ${line(node)}: top-level await`);
+            }
+            if (ts.isNewExpression(node) && node.expression.getText(sf) === "PrismaClient") {
+                report.violations.push(`line ${line(node)}: new PrismaClient(...) at module scope`);
+            }
+            if (ts.isCallExpression(node)) {
+                const callee = node.expression.getText(sf);
+                if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+                    report.violations.push(`line ${line(node)}: dynamic import() at module scope`);
+                }
+                if (/^(?:dotenv\.)?config$/.test(callee)) {
+                    report.violations.push(`line ${line(node)}: dotenv config(...) at module scope`);
+                }
+                if (/(?:^|\.)\$(?:executeRaw|queryRaw|transaction|connect)(?:Unsafe)?$/.test(callee)) {
+                    report.violations.push(`line ${line(node)}: ${callee}(...) at module scope`);
+                }
+                if (callee === "process.exit") {
+                    report.violations.push(`line ${line(node)}: process.exit(...) at module scope`);
+                }
+                if (callee === "require") {
+                    report.violations.push(`line ${line(node)}: require(...) at module scope`);
+                }
+            }
+        }
+
+        // A function declared inside the guard branch is not "the guard" for counting main() calls.
+        ts.forEachChild(node, (child) => visit(child, nowShielded, inGuard && !realFunction));
+    }
+
+    visit(sf, false, false);
+    return report;
+}
+
+function problemsOf(r: SourceReport): string[] {
+    const problems = [...r.violations];
+    if (!r.hasMain) problems.push("no `function main()` declaration");
+    if (!r.hasGuardConst) problems.push("missing `const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href`");
+    if (r.guardIfs !== 1) problems.push(`expected exactly one module-level \`if (isMainModule)\`, found ${r.guardIfs}`);
+    if (r.mainCallsInGuard < 1) problems.push("main() is never called inside the main-module guard");
+    return problems;
+}
+
+/** Evaluated synchronously at load so every runtime test can refuse to spawn a script that fails it. */
+const sourceProblems = new Map<string, string[]>(
+    scripts.map((name) => [name, problemsOf(analyse(name, readFileSync(path.join(scriptsDir, name), "utf8")))]),
+);
+
+test("harness control: the source check rejects the incident shape and the known evasions", () => {
+    const guard = `const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;`;
+    const cases: Record<string, string> = {
+        incident: `import { config } from "dotenv"; import { PrismaClient } from "@prisma/client";
+config({ path: ".env.production.local" });
+const prisma = new PrismaClient();
+await prisma.$executeRawUnsafe("ALTER TABLE x ADD COLUMN y TEXT");`,
+        iife: `import { PrismaClient } from "@prisma/client";
+(async () => { const p = new PrismaClient(); await p.$executeRawUnsafe("x"); })();
+async function main() {}
+${guard}
+if (isMainModule) { await main(); }`,
+        inverted: `async function main() {}
+${guard}
+if (!isMainModule) { await main(); }`,
+        elseBranch: `async function main() {}
+${guard}
+if (isMainModule) { await main(); } else { await main(); }`,
+        emptyGuard: `async function main() {}
+${guard}
+if (isMainModule) {}`,
+        looseGuard: `async function main() {}
+const isMainModule = true;
+if (isMainModule) { await main(); }`,
+        voidMain: `async function main() {}
+void main();
+${guard}
+if (isMainModule) { await main(); }`,
+        dynamicImport: `async function main() {}
+import("./apply-other.mjs");
+${guard}
+if (isMainModule) { await main(); }`,
+        chainOutside: `async function main() {}
+main().catch(console.error);
+${guard}
+if (isMainModule) {}`,
+    };
+    for (const [label, src] of Object.entries(cases)) {
+        const problems = problemsOf(analyse(label, src));
+        assert.ok(problems.length > 0, `source check did not reject the "${label}" shape`);
+    }
+    const good = `import { PrismaClient } from "@prisma/client"; import { pathToFileURL } from "node:url";
+const statements = ["SELECT 1"];
+function resolveDatabaseUrl() { return process.env.DATABASE_URL; }
+async function main() { const prisma = new PrismaClient({ datasources: { db: { url: resolveDatabaseUrl() } } }); try { for (const s of statements) await prisma.$executeRawUnsafe(s); } finally { await prisma.$disconnect(); } }
+${guard}
+if (isMainModule) { await main(); }`;
+    assert.deepEqual(problemsOf(analyse("good", good)), [], "source check rejected the canonical good shape");
+    const goodChain = `import { PrismaClient } from "@prisma/client"; import { pathToFileURL } from "node:url";
+let prisma;
+async function main() { prisma = new PrismaClient(); await prisma.$executeRawUnsafe("SELECT 1"); }
+${guard}
+if (isMainModule) { main().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => prisma?.$disconnect()); }`;
+    assert.deepEqual(problemsOf(analyse("goodChain", goodChain)), [], "source check rejected the catch/finally chain shape");
+});
+
+for (const name of scripts) {
+    test(`source: scripts/${name} has no side effects before main() and guards its entrypoint`, () => {
+        const problems = sourceProblems.get(name)!;
+        assert.deepEqual(problems, [], `${name}:\n  ${problems.join("\n  ")}`);
+
+        // Belt and braces for the literal incident shape, on comment-stripped
+        // text: nothing that loads env, builds a client, or runs DDL may appear
+        // textually before the main() declaration.
+        const stripped = readFileSync(path.join(scriptsDir, name), "utf8")
+            .replace(/\/\*[\s\S]*?\*\//g, "")
+            .split(/\r?\n/)
+            .filter((l) => !l.trim().startsWith("//"))
+            .join("\n");
+        const mainIdx = stripped.search(/(?:async\s+)?function\s+main\s*\(/);
+        assert.ok(mainIdx >= 0, `${name}: main() declaration not found in stripped source`);
+        const beforeMain = stripped.slice(0, mainIdx);
+        for (const marker of ["config({ path:", "config({path:", "new PrismaClient(", "$executeRawUnsafe"]) {
+            assert.ok(!beforeMain.includes(marker), `${name}: \`${marker}\` appears before the main() declaration`);
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Runtime harness: a TCP listener that counts (and immediately drops) every
@@ -135,16 +347,17 @@ test("harness control: a module-scope Prisma query IS caught by the listener", a
     );
     const result = await importInChild(pathToFileURL(control).href);
     const seen = connections - before;
-    assert.ok(
-        seen > 0 || result.code !== 0,
-        `control did not trip the harness: connections=${seen} exit=${result.code}\nstderr:\n${result.stderr}`,
-    );
-    assert.ok(seen > 0, `control connected ${seen} times — the listener is not observing Prisma`);
+    assert.ok(seen > 0, `control connected ${seen} times — the listener is not observing Prisma\nstderr:\n${result.stderr}`);
     assert.notEqual(result.code, 0, "control should fail against a socket that drops the handshake");
 });
 
 for (const name of scripts) {
     test(`runtime: importing scripts/${name} opens no DB connection and exits 0`, async () => {
+        // Preflight: never spawn a script whose source check failed — a regressed script could load
+        // a real .env at module scope, and this harness must not be the thing that runs it.
+        const problems = sourceProblems.get(name)!;
+        assert.deepEqual(problems, [], `${name} failed the source check; refusing to import it:\n  ${problems.join("\n  ")}`);
+
         const before = connections;
         const result = await importInChild(pathToFileURL(path.join(scriptsDir, name)).href);
         const seen = connections - before;
@@ -156,108 +369,5 @@ for (const name of scripts) {
             /applied|\bok\b|verified|Migration failed|Refusing|DATABASE_URL/i,
             `import produced migration-style output\n${dump}`,
         );
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Source check (TypeScript AST). Nothing that loads env, builds a client, runs
-// SQL, awaits, or exits may sit at module scope; main() is only called inside
-// the main-module guard.
-// ---------------------------------------------------------------------------
-
-const GUARD_RE = /import\.meta\.url\s*===\s*pathToFileURL\(process\.argv\[1\]\)\.href|fileURLToPath\(import\.meta\.url\)\s*===\s*process\.argv\[1\]/;
-
-function isFunctionLike(node: ts.Node): boolean {
-    return (
-        ts.isFunctionDeclaration(node) ||
-        ts.isFunctionExpression(node) ||
-        ts.isArrowFunction(node) ||
-        ts.isMethodDeclaration(node) ||
-        ts.isGetAccessor(node) ||
-        ts.isSetAccessor(node) ||
-        ts.isConstructorDeclaration(node)
-    );
-}
-
-function isMainModuleGuard(node: ts.Node, sf: ts.SourceFile): boolean {
-    if (!ts.isIfStatement(node)) return false;
-    const cond = node.expression.getText(sf);
-    return /isMainModule/.test(cond) || GUARD_RE.test(cond);
-}
-
-/** Walk the file; report offending nodes that are neither inside a function nor inside the guard block. */
-function moduleScopeViolations(sf: ts.SourceFile): string[] {
-    const violations: string[] = [];
-    const line = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
-
-    function visit(node: ts.Node, shielded: boolean) {
-        const nowShielded = shielded || isFunctionLike(node) || isMainModuleGuard(node, sf);
-
-        if (!nowShielded) {
-            if (ts.isAwaitExpression(node)) {
-                violations.push(`line ${line(node)}: top-level await`);
-            }
-            if (ts.isNewExpression(node) && /^PrismaClient$/.test(node.expression.getText(sf))) {
-                violations.push(`line ${line(node)}: new PrismaClient(...) at module scope`);
-            }
-            if (ts.isCallExpression(node)) {
-                const callee = node.expression.getText(sf);
-                if (/^(?:dotenv\.)?config$/.test(callee)) {
-                    violations.push(`line ${line(node)}: dotenv config(...) at module scope`);
-                }
-                if (/(?:^|\.)\$(?:executeRaw|queryRaw|transaction|connect)(?:Unsafe)?$/.test(callee)) {
-                    violations.push(`line ${line(node)}: ${callee}(...) at module scope`);
-                }
-                if (/^process\.exit$/.test(callee)) {
-                    violations.push(`line ${line(node)}: process.exit(...) at module scope`);
-                }
-                if (/^main$/.test(callee)) {
-                    violations.push(`line ${line(node)}: main() called outside the main-module guard`);
-                }
-            }
-        }
-
-        ts.forEachChild(node, (child) => visit(child, nowShielded));
-    }
-
-    visit(sf, false);
-    return violations;
-}
-
-for (const name of scripts) {
-    test(`source: scripts/${name} has no side effects before main() and guards its entrypoint`, () => {
-        const file = path.join(scriptsDir, name);
-        const text = readFileSync(file, "utf8");
-        const sf = ts.createSourceFile(name, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.JS);
-
-        const hasMain = sf.statements.some(
-            (s) => ts.isFunctionDeclaration(s) && s.name?.text === "main",
-        );
-        assert.ok(hasMain, `${name}: no \`function main()\` declaration`);
-        assert.match(text, GUARD_RE, `${name}: missing the import.meta.url === pathToFileURL(process.argv[1]).href guard`);
-
-        const guardCalls = (text.match(/\bmain\(\)/g) ?? []).length;
-        assert.ok(guardCalls >= 1, `${name}: main() is never invoked`);
-
-        const violations = moduleScopeViolations(sf);
-        assert.deepEqual(violations, [], `${name}:\n  ${violations.join("\n  ")}`);
-
-        // Belt and braces for the literal incident shape, on comment-stripped
-        // text: nothing that loads env, builds a client, or runs DDL may appear
-        // textually before the main() declaration.
-        const stripped = text
-            .replace(/\/\*[\s\S]*?\*\//g, "")
-            .split(/\r?\n/)
-            .filter((l) => !l.trim().startsWith("//"))
-            .join("\n");
-        const mainIdx = stripped.search(/(?:async\s+)?function\s+main\s*\(/);
-        assert.ok(mainIdx >= 0, `${name}: main() declaration not found in stripped source`);
-        const beforeMain = stripped.slice(0, mainIdx);
-        for (const marker of ["config({ path:", "config({path:", "new PrismaClient(", "$executeRawUnsafe"]) {
-            assert.ok(
-                !beforeMain.includes(marker),
-                `${name}: \`${marker}\` appears before the main() declaration`,
-            );
-        }
     });
 }
