@@ -668,10 +668,18 @@ shadow-week receipt still collides with them and is caught as a duplicate.
 back on. Rows received while v2 was live are already booked and stay `BOOKED`; v1 will not
 re-book them, because its own `_Forwarded` move already took those files out of its path.
 
-Two things a human must do before this can leave shadow mode:
+Three things a human must do before this can leave shadow mode:
 
-- Set `RECEIPT_INTAKE_SECRET` (new, independent of `RECEIPT_INGEST_SECRET`) in Vercel, and
-  give the same value to the Apps Script as a Script Property.
+- Set **both** `RECEIPT_INTAKE_SECRET` (new, independent of `RECEIPT_INGEST_SECRET`) and
+  `RECEIPT_ARCHIVE_SECRET` in Vercel — `authenticateIntake` requires both to be present and
+  to differ (§ "Two machine secrets, not one"): a caller presenting either value is refused
+  outright when its variable is unset, and setting them to the *same* value is refused too,
+  since that would silently re-merge the two capabilities it exists to keep apart. Give the
+  matching value to each consumer as a Script Property — `RECEIPT_INTAKE_SECRET` to the
+  ingest forwarders (drive/email/chat), `RECEIPT_ARCHIVE_SECRET` to the nightly Drive mirror
+  that polls `GET /api/receipts/intake?state=BOOKED|ARCHIVED`. Missing `RECEIPT_ARCHIVE_SECRET`
+  specifically means the archive mirror gets a blanket 401 from cutover day one, silently —
+  nothing else exercises that path pre-launch to surface the gap.
 - Re-run `node scripts/snapshot-prisma-blind-spots.mjs --write` against production AFTER
   `scripts/apply-receipt-intake.mjs` has run there. The new partial index and CHECK
   constraint were added to `prisma/prisma-blind-spots.json` by hand (the snapshotter needs

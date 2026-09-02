@@ -1225,7 +1225,7 @@ test("too little runway skips the read entirely rather than starting a doomed on
     assert.equal(readBudgetFor(-5_000), 0);
 });
 
-test("/start stamps a lease on EVERY url it issues", () => {
+test("/start stamps a lease on every url it issues, except a live-lease reuse", () => {
     const start = readFileSync(
         path.join(__dirname, "..", "src/app/api/receipts/intake/start/route.ts"),
         "utf8",
@@ -1238,7 +1238,19 @@ test("/start stamps a lease on EVERY url it issues", () => {
         "create, re-arm and resume all stamp the lease",
     );
     const signed = (start.match(/await signUpload\(/g) ?? []).length;
-    assert.equal(signed, 3, "and those are all the places a URL is issued");
+    // A fourth call site reissues a signed URL for an UNEXPIRED existing
+    // lease: a retry against a still-live in-flight upload must not
+    // invalidate it (that used to bump the version and repoint storagePath
+    // unconditionally, deleting the object the original caller was about to
+    // PUT its bytes to). It deliberately does NOT stamp a fresh lease —
+    // reissuing the URL changes nothing about the row, so the expiry it is
+    // reusing is already the correct one.
+    assert.equal(signed, 4, "three stamp a lease; the fourth reuses one still live");
+    assert.match(
+        start,
+        /existing\.uploadUrlExpiresAt && existing\.uploadUrlExpiresAt\.getTime\(\) > Date\.now\(\)/,
+        "the unstamped signUpload call is gated on the lease still being live",
+    );
 });
 
 // ── A finished row hands the claim back, whatever finished it ─────────────

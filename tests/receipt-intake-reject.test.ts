@@ -166,7 +166,11 @@ test("publishing STAGING -> RECEIVED is fenced on the exact state", () => {
     const fn = intake.slice(intake.indexOf("async function publishStagedRow"));
     const body = fn.slice(0, fn.indexOf("\n/**"));
     assert.match(body, /updateMany/, "not a bare update by id");
-    assert.match(body, /where: \{ id, state: expectState \}/);
+    assert.match(
+        body,
+        /where: \{ id, state: expectState, storagePath: expectStoragePath \}/,
+        "fenced on state AND the exact object the caller verified, not state alone",
+    );
     assert.match(body, /alreadyPublished: true/, "an already-RECEIVED row is the outcome we wanted");
     assert.match(body, /publish-conflict/);
 });

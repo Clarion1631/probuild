@@ -175,7 +175,7 @@ export async function POST(req: Request) {
                 select: {
                     id: true, sourceRef: true, state: true, stateReason: true, storagePath: true,
                     createdById: true, expectedSha256: true, fileSha256: true,
-                    uploadLeaseVersion: true,
+                    uploadLeaseVersion: true, uploadUrlExpiresAt: true,
                 },
             });
             if (!existing) return NextResponse.json({ ok: false, reason: "conflict-retry" }, { status: 409 });
@@ -354,10 +354,37 @@ export async function POST(req: Request) {
                     { ok: true, alreadyReceived: true, id: existing.id, state: existing.state },
                 );
             }
+            // A LIVE LEASE IS NOT INVALIDATED BY A RETRY.
+            //
+            // Every matching /start used to bump uploadLeaseVersion and repoint
+            // storagePath UNCONDITIONALLY, even when the existing lease had not
+            // expired. That invalidated the ORIGINAL caller's upload URL out
+            // from under it: two /start calls for the same sourceRef (a network
+            // retry, a double-tap, a forwarder's own retry policy) racing here
+            // meant whichever one finished second deleted the object the first
+            // was about to PUT its bytes to (`start-resumed-repath` below) —
+            // and the first request's signed URL now pointed at nothing.
+            //
+            // `createSignedUploadUrl` does not revoke a previously issued token
+            // when called again for the SAME path, so an unexpired lease can
+            // safely be served a fresh signed URL for its EXISTING path: same
+            // object identity, no repath, no delete of anything. This makes a
+            // retry against a live lease idempotent instead of destructive.
+            if (existing.uploadUrlExpiresAt && existing.uploadUrlExpiresAt.getTime() > Date.now()) {
+                const resigned = await signUpload(existing.storagePath);
+                if (!resigned) return NextResponse.json({ ok: false, reason: "storage-unavailable" }, { status: 503 });
+                return NextResponse.json({
+                    ok: true, resumed: true, id: existing.id, maxBytes: MAX_STORED_BYTES, ...resigned,
+                });
+            }
+
             // A RESUME IS A NEW LEASE, taken BEFORE the URL is signed and in one
             // checked update. Without the version bump the sweep and the client
             // are talking about the same path, so a sweep that started before
             // this call could still reject the upload it is now waiting for.
+            // Reached only once the previous lease has EXPIRED (or this is a
+            // fresh STAGING row with no lease yet) — an expired lease is fair
+            // game to invalidate, since nothing live can still be relying on it.
             const nextLease = existing.uploadLeaseVersion + 1;
             const resumePath = uploadPathFor(existing.id, nextLease, ext);
             const { count } = await prisma.receiptIntake.updateMany({

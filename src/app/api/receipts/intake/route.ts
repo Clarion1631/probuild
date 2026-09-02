@@ -330,11 +330,25 @@ export async function POST(req: Request) {
             );
         }
 
-        // Row deletion failure is SURFACED, not swallowed: the caller's retry
-        // would otherwise hit a sourceRef conflict against a row it was told
-        // did not exist.
+        // Row deletion is FENCED on state+path, NOT a bare delete by id.
+        //
+        // A concurrent replay carrying the same sourceRef can find this exact
+        // row via respondToSourceRefConflict, upload to ITS OWN path, and
+        // publish it — all while THIS request's upload is still failing. An
+        // unconditional `delete({ where: { id } })` would then destroy that
+        // now-RECEIVED row. The delete is a no-op unless the row is still
+        // exactly what THIS request created: still STAGING, still pointing at
+        // the path THIS request uploaded (or tried to upload) to.
+        //
+        // Failure to delete is still SURFACED, not swallowed: the caller's
+        // retry would otherwise hit a sourceRef conflict against a row it was
+        // told did not exist.
+        let deletedCount: number;
         try {
-            await prisma.receiptIntake.delete({ where: { id } });
+            const result = await prisma.receiptIntake.deleteMany({
+                where: { id, state: "STAGING", storagePath },
+            });
+            deletedCount = result.count;
         } catch (deleteError) {
             console.error("[receipts/intake] row delete failed after an ambiguous upload", id, deleteError);
             return NextResponse.json(
@@ -342,11 +356,31 @@ export async function POST(req: Request) {
                 { status: 503 },
             );
         }
+        if (deletedCount === 0) {
+            // Somebody else already moved this row on — most likely a
+            // concurrent replay published it via respondToSourceRefConflict's
+            // healing path. That is the outcome the caller wanted, even
+            // though THIS attempt's own upload failed, so report on what the
+            // row actually is now rather than a failure that no longer holds.
+            const current = await prisma.receiptIntake
+                .findUnique({
+                    where: { id },
+                    select: { id: true, state: true, sourceRef: true, projectId: true, dryRun: true },
+                })
+                .catch(() => null);
+            if (current?.state === "RECEIVED") {
+                return NextResponse.json({ ok: true, ...current, alreadyPublished: true });
+            }
+            return NextResponse.json(
+                { ok: false, reason: "publish-conflict", id, state: current?.state ?? "gone" },
+                { status: 409 },
+            );
+        }
         console.error("[receipts/intake] upload failed", uploadFailed);
         return NextResponse.json({ ok: false, reason: "storage-failed" }, { status: 503 });
     }
 
-    return publishStagedRow(id);
+    return publishStagedRow(id, storagePath);
 }
 
 /**
@@ -364,13 +398,20 @@ export async function POST(req: Request) {
 const storeObject = (storagePath: string, bytes: Buffer, mimeType: string) =>
     uploadReceiptObject(storagePath, bytes, mimeType, { upsert: true });
 
-async function publishStagedRow(id: string, expectState = "STAGING"): Promise<NextResponse> {
+async function publishStagedRow(id: string, expectStoragePath: string, expectState = "STAGING"): Promise<NextResponse> {
     try {
-        // EXACT-state CAS. `update` by id alone would publish a row that had
-        // since moved on — a booked row dragged back to RECEIVED and re-read,
-        // which is a second Purchase waiting to happen.
+        // EXACT-state, EXACT-path CAS. `update` by id and state alone would
+        // publish a row that had since moved on in a way that still matched
+        // `expectState` — a row re-armed onto a NEW upload path by a
+        // concurrent /start (or a heal in respondToSourceRefConflict) is
+        // still STAGING, but the object THIS caller verified is no longer
+        // the one the row points at. Publishing anyway would either point a
+        // RECEIVED row at bytes nobody uploaded, or (worse) race a second
+        // publisher onto the same state with two different ideas of which
+        // object is now canonical. Pinning storagePath makes that update
+        // match zero rows instead.
         const { count } = await prisma.receiptIntake.updateMany({
-            where: { id, state: expectState },
+            where: { id, state: expectState, storagePath: expectStoragePath },
             data: { state: "RECEIVED" },
         });
         if (count === 0) {
@@ -534,7 +575,7 @@ async function respondToSourceRefConflict(
 
     // The object is there. A STAGING row means the previous request uploaded
     // successfully and only its publish UPDATE failed — finish it.
-    if (existing.state === "STAGING") return publishStagedRow(existing.id);
+    if (existing.state === "STAGING") return publishStagedRow(existing.id, existing.storagePath);
 
     return NextResponse.json({
         ok: true,
