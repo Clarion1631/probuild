@@ -17,7 +17,13 @@ import { Prisma } from "@prisma/client";
 import { canonicalVendor, dedupKeys } from "./keys";
 import { startOfDateInTimeZone } from "@/lib/tz-date";
 import { backoffMs, MAX_BOOK_ATTEMPTS, routeState, type DedupHits, type ReceiptIntakeState } from "./route-state";
-import { resolveSuggestedCostCodeId, type BookableRow, type BookResult } from "./book";
+import {
+    appliedTaxCents,
+    buildGroups,
+    resolveSuggestedCostCodeId,
+    type BookableRow,
+    type BookResult,
+} from "./book";
 import { QBTimeoutError } from "@/lib/quickbooks";
 import {
     QboAccountConfigError,
@@ -221,9 +227,25 @@ export const MAX_PLAUSIBLE_TAX_RATE = 0.12;
 export function validateTaxCents(
     taxCents: number | null,
     totalCents: number | null,
+    docType: string | null,
 ): { taxCents: number | null; implausible: boolean } {
+    // No tax line is the NORMAL case here, not a problem.
     if (taxCents === null || taxCents <= 0) return { taxCents: null, implausible: false };
+
+    // A handwritten check to a subcontractor has no sales tax, full stop. If the
+    // model produced one it read the wrong number off the cheque — the amount
+    // box, a memo figure — and booking it would move real money into the
+    // reimbursable-sales-tax account for a payment that was never taxed.
+    // sendToQBOviaAPI.js:148 refuses to split tax on a check for the same
+    // reason; this makes the row SAY so instead of dropping it silently.
+    if (String(docType ?? "receipt").toLowerCase() === "check") {
+        return { taxCents: null, implausible: true };
+    }
+
     if (totalCents === null || totalCents <= 0) return { taxCents: null, implausible: true };
+    // Tax can never BE the total, let alone exceed it — that is a grabbed
+    // subtotal or a misread line, not a tax figure.
+    if (taxCents >= totalCents) return { taxCents: null, implausible: true };
     const ceiling = Math.ceil(totalCents * MAX_PLAUSIBLE_TAX_RATE);
     if (taxCents > ceiling) return { taxCents: null, implausible: true };
     return { taxCents, implausible: false };
@@ -418,8 +440,22 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     const tax = validateTaxCents(
         taxCentsRaw && taxCentsRaw > 0 ? taxCentsRaw : null,
         totalCents,
+        read.docType,
     );
-    const taxCents = tax.taxCents;
+
+    // PERSIST ONLY WHAT BOOKING WILL ACTUALLY USE.
+    //
+    // The row's taxCents feeds the sales-tax reports, and those must never show
+    // a figure that no Purchase ever carried. So the stored value is not the
+    // validated one — it is the value read back out of the SAME buildGroups the
+    // booking step calls. If the two ever disagree (a rule added on one side
+    // only), the row records the BOOKING's answer and is flagged, rather than
+    // quietly reporting a tax that was rejected downstream.
+    const accepted = totalCents !== null && totalCents > 0
+        ? appliedTaxCents(buildGroups(read.docType, totalCents, tax.taxCents, keys.ref))
+        : 0;
+    const taxCents = accepted > 0 ? accepted : null;
+    const taxImplausible = tax.implausible || (tax.taxCents !== null && taxCents === null);
     const timeZone = await deps.companyTimeZone();
 
     const base = {
@@ -463,7 +499,7 @@ async function processReceived(row: WorkerRow, deps: WorkerDependencies): Promis
     // queue. `note()` is applied to every write below rather than to one branch,
     // because a document can be both a duplicate and a bad tax read.
     const note = (reason: string | null): string | null => {
-        if (!tax.implausible) return reason;
+        if (!taxImplausible) return reason;
         return reason ? `${reason};tax-implausible` : "tax-implausible";
     };
 

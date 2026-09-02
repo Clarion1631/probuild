@@ -611,20 +611,34 @@ test("an implausible tax is DROPPED and noted, and the receipt still books", () 
     // A misread decimal ("$2.92" as "$292") or a grabbed subtotal posts real
     // money to the reimbursable-sales-tax account and inflates a state filing.
     // WA's highest combined rate is ~10.6%, so 12% is the sanity bound.
-    assert.deepEqual(validateTaxCents(29_20, 36_498), { taxCents: 2920, implausible: false });
+    const r = (tax: number | null, total: number | null, docType = "receipt") =>
+        validateTaxCents(tax, total, docType);
+
+    assert.deepEqual(r(29_20, 36_498), { taxCents: 2920, implausible: false });
     // Exactly at the ceiling, rounded UP to the cent so a legitimate rounding
     // artefact at the boundary is not rejected.
-    assert.deepEqual(validateTaxCents(1200, 10_000), { taxCents: 1200, implausible: false });
-    assert.deepEqual(validateTaxCents(1201, 10_000), { taxCents: null, implausible: true });
+    assert.deepEqual(r(1200, 10_000), { taxCents: 1200, implausible: false });
+    assert.deepEqual(r(1201, 10_000), { taxCents: null, implausible: true });
     // The decimal-point misread.
-    assert.deepEqual(validateTaxCents(29_200, 36_498), { taxCents: null, implausible: true });
-    // Tax larger than the total is nonsense.
-    assert.deepEqual(validateTaxCents(40_000, 36_498), { taxCents: null, implausible: true });
+    assert.deepEqual(r(29_200, 36_498), { taxCents: null, implausible: true });
+    // Tax at or above the total is a grabbed subtotal, not a tax figure.
+    assert.deepEqual(r(36_498, 36_498), { taxCents: null, implausible: true });
+    assert.deepEqual(r(40_000, 36_498), { taxCents: null, implausible: true });
     // Absent or zero tax is normal, not implausible — most receipts here.
-    assert.deepEqual(validateTaxCents(null, 36_498), { taxCents: null, implausible: false });
-    assert.deepEqual(validateTaxCents(0, 36_498), { taxCents: null, implausible: false });
+    assert.deepEqual(r(null, 36_498), { taxCents: null, implausible: false });
+    assert.deepEqual(r(0, 36_498), { taxCents: null, implausible: false });
     // A tax with no usable total cannot be judged, so it is not trusted.
-    assert.deepEqual(validateTaxCents(500, null), { taxCents: null, implausible: true });
+    assert.deepEqual(r(500, null), { taxCents: null, implausible: true });
+
+    // A handwritten check to a sub has no sales tax, full stop. Any figure the
+    // model produced is the wrong number off the cheque, and booking it would
+    // move real money into the reimbursable-sales-tax account for a payment
+    // that was never taxed. Even a "plausible" 8% is refused.
+    assert.deepEqual(r(2920, 36_498, "check"), { taxCents: null, implausible: true });
+    assert.deepEqual(r(100, 120_000, "check"), { taxCents: null, implausible: true });
+    // ...but a check with NO tax reading is perfectly normal.
+    assert.deepEqual(r(null, 120_000, "check"), { taxCents: null, implausible: false });
+
     assert.equal(MAX_PLAUSIBLE_TAX_RATE, 0.12);
 });
 
@@ -657,4 +671,42 @@ test("the tax note survives alongside a dedup reason", async () => {
     });
     await runIntakeWorker(h.deps);
     assert.equal(h.states[0].reason, "weak-dup:row-twin;tax-implausible");
+});
+
+test("the row stores only the tax BOOKING accepted, never a rejected reading", async () => {
+    // taxCents feeds the sales-tax reports, so it must never show a figure that
+    // no Purchase ever carried. The stored value is read back out of the SAME
+    // buildGroups the booking step calls.
+    const h = harness([workerRow()], {
+        read: async () => ({
+            ok: true,
+            read: { ...goodRead.read, docType: "check", checkNumber: "4178", taxAmount: "29.20" },
+        } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    // buildGroups refuses to split tax on a check, so nothing was accepted.
+    assert.equal(h.applied[0].taxCents, null);
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
+});
+
+test("a check with no tax reading books clean, with no note", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({
+            ok: true,
+            read: { ...goodRead.read, docType: "check", checkNumber: "4178", taxAmount: "" },
+        } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].taxCents, null);
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: null }]);
+});
+
+test("a tax equal to the total is refused end to end", async () => {
+    const h = harness([workerRow()], {
+        read: async () => ({ ok: true, read: { ...goodRead.read, taxAmount: "364.98" } } as ReadOutcome),
+    });
+    await runIntakeWorker(h.deps);
+    assert.equal(h.applied[0].taxCents, null);
+    assert.equal(h.applied[0].totalCents, 36498, "the total is untouched");
+    assert.deepEqual(h.finished, [{ id: "row-1", stateReason: "tax-implausible" }]);
 });
