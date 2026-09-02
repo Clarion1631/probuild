@@ -15185,76 +15185,166 @@ async function requirePayrollAccess() {
 
 /**
  * Step 1 of the rate import: parse a pasted Gusto employee export and return
- * the diff for a human to look at. WRITES NOTHING. The preview and the save
- * both run the same pure code (src/lib/rate-import.ts), so what is approved is
- * what is applied.
+ * the diff for a human to look at, plus a FINGERPRINT of exactly what they are
+ * being shown. WRITES NOTHING.
+ *
+ * The preview and the save both run the same pure code
+ * (src/lib/rate-import.ts), so what is approved is what is applied.
  */
 export async function previewGustoRateImport(csvText: string) {
     await requirePayrollAccess();
     if (typeof csvText !== "string" || !csvText.trim()) {
         return { success: false as const, error: "Paste the CSV first." };
     }
-    const { parseGustoRateCsv, diffRates } = await import("./rate-import");
+    const { parseGustoRateCsv, diffRates, previewFingerprint } = await import("./rate-import");
     const parsed = parseGustoRateCsv(csvText);
+    const rows = diffRates(parsed.rows, await importableUsers());
+    return { success: true as const, rows, errors: parsed.errors, previewHash: previewFingerprint(rows) };
+}
+
+/** Everyone the import may write to, with rates as canonical decimal TEXT (never a float). */
+async function importableUsers() {
     const users = await prisma.user.findMany({
-        where: { status: { not: "DISABLED" } },
-        select: { id: true, name: true, email: true, hourlyRate: true },
+        select: { id: true, name: true, email: true, hourlyRate: true, status: true, payType: true },
     });
-    const rows = diffRates(
-        parsed.rows,
-        users.map((u) => ({ id: u.id, name: u.name, email: u.email, hourlyRate: toNum(u.hourlyRate) }))
-    );
-    return { success: true as const, rows, errors: parsed.errors };
+    return users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        // Prisma.Decimal -> exact 2-place text. toNum() would put money through
+        // a float on the way to the screen and back.
+        hourlyRate: u.hourlyRate.toFixed(2),
+        status: u.status,
+        payType: u.payType ?? null,
+    }));
 }
 
 /**
- * Step 2: apply the approved rows. hourlyRate ONLY (burden is not in the Gusto
- * export — spec section 7 risk 4) plus lastRateSyncAt, in one transaction so a
- * partial import cannot leave half the crew on old rates.
+ * Step 2: apply the approved rows.
  *
- * The rows are re-validated here rather than trusted: this is a server action,
- * so its argument is an HTTP request body, not the preview's return value.
+ * The rows are NOT trusted: a server action argument is an HTTP body, so this
+ * is re-derived and re-checked against the live database. `previewHash` ties
+ * the write to the exact preview a human approved — including each user's rate
+ * AS IT WAS THEN, so a replay after somebody else changed a rate is refused
+ * rather than silently overwriting them.
+ *
+ * hourlyRate is written from canonical decimal TEXT through Prisma.Decimal, so
+ * the value never passes through a JS float. Burden is untouched (it is not in
+ * the Gusto export — spec section 7 risk 4).
  */
-export async function applyGustoRateImport(rows: Array<{ userId: string; newHourly: number }>) {
+export async function applyGustoRateImport(
+    rows: Array<{ userId: string; newHourly: string; payType?: string | null }>,
+    previewHash: string
+) {
     await requirePayrollAccess();
     if (!Array.isArray(rows) || rows.length === 0) {
         return { success: false as const, error: "Nothing to save." };
     }
-    const { MAX_IMPORTABLE_HOURLY_RATE } = await import("./rate-import");
+    if (typeof previewHash !== "string" || !previewHash) {
+        return { success: false as const, error: "Run the preview again before saving." };
+    }
+    const { MAX_IMPORTABLE_HOURLY_RATE, parseRateValue } = await import("./rate-import");
+    const { Prisma } = await import("@prisma/client");
 
     const seen = new Set<string>();
-    const clean: Array<{ userId: string; newHourly: number }> = [];
+    const clean: Array<{ userId: string; newHourly: string; payType: string | null }> = [];
     for (const row of rows) {
         if (!row || typeof row.userId !== "string" || !row.userId) continue;
         if (seen.has(row.userId)) return { success: false as const, error: "The same team member appears twice." };
-        const rate = Number(row.newHourly);
-        if (!Number.isFinite(rate) || rate < 0 || rate > MAX_IMPORTABLE_HOURLY_RATE) {
-            return { success: false as const, error: `Rate out of range for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}).` };
+        const rate = parseRateValue(String(row.newHourly));
+        if (rate == null || rate.startsWith("-") || Number(rate) > MAX_IMPORTABLE_HOURLY_RATE) {
+            return {
+                success: false as const,
+                error: `Rate out of range or unreadable for one of the rows (0 to ${MAX_IMPORTABLE_HOURLY_RATE}, at most two decimal places).`,
+            };
         }
+        const payType = row.payType === "SALARY" || row.payType === "HOURLY" ? row.payType : null;
         seen.add(row.userId);
-        clean.push({ userId: row.userId, newHourly: rate });
+        clean.push({ userId: row.userId, newHourly: rate, payType });
     }
     if (clean.length === 0) return { success: false as const, error: "Nothing to save." };
 
     const known = await prisma.user.findMany({
         where: { id: { in: clean.map((r) => r.userId) } },
-        select: { id: true },
+        select: { id: true, status: true, hourlyRate: true, payType: true },
     });
-    if (known.length !== clean.length) return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
+    if (known.length !== clean.length) {
+        return { success: false as const, error: "One of those team members no longer exists — re-run the preview." };
+    }
+    const disabled = known.filter((u) => u.status === "DISABLED");
+    if (disabled.length > 0) {
+        return { success: false as const, error: "One of those accounts is disabled — re-run the preview." };
+    }
+
+    // Re-derive the fingerprint from LIVE rows. Any drift (someone edited a rate
+    // on the team page, an account was disabled, the body was replayed) fails
+    // here instead of overwriting a decision nobody saw.
+    const { previewFingerprint } = await import("./rate-import");
+    const byId = new Map(known.map((u) => [u.id, u]));
+    const liveHash = previewFingerprint(
+        clean.map((row) => {
+            const live = byId.get(row.userId)!;
+            return {
+                userId: row.userId,
+                name: "",
+                email: null,
+                oldHourly: live.hourlyRate.toFixed(2),
+                newHourly: row.newHourly,
+                payType: row.payType,
+                matched: true,
+                matchedBy: null,
+                changed: true,
+                note: null,
+            };
+        })
+    );
+    if (liveHash !== previewHash) {
+        return {
+            success: false as const,
+            error: "These rates changed since the preview was generated. Nothing was saved — re-run the preview and check it again.",
+        };
+    }
 
     const syncedAt = new Date();
     await prisma.$transaction(
         clean.map((row) =>
             prisma.user.update({
                 where: { id: row.userId },
-                data: { hourlyRate: row.newHourly, lastRateSyncAt: syncedAt },
+                data: {
+                    // Exact decimal from text — never a JS float.
+                    hourlyRate: new Prisma.Decimal(row.newHourly),
+                    lastRateSyncAt: syncedAt,
+                    ...(row.payType ? { payType: row.payType } : {}),
+                },
             })
         )
     );
 
     revalidatePath("/company/team-members");
     revalidatePath("/manager/time-entries");
+    revalidatePath("/manager/payroll-export");
     return { success: true as const, updated: clean.length };
+}
+
+/**
+ * Set a team member's pay type by hand, from the Payroll rates panel. The
+ * payroll export refuses to run while somebody with hours has no answer, so
+ * this is the screen that unblocks it.
+ */
+export async function setUserPayType(userId: string, payType: string) {
+    await requirePayrollAccess();
+    if (payType !== "HOURLY" && payType !== "SALARY") {
+        return { success: false as const, error: "Pay type must be hourly or salary." };
+    }
+    const updated = await prisma.user.updateMany({
+        where: { id: userId, status: { not: "DISABLED" } },
+        data: { payType },
+    });
+    if (updated.count !== 1) return { success: false as const, error: "That team member is not available." };
+
+    revalidatePath("/company/team-members");
+    revalidatePath("/manager/payroll-export");
+    return { success: true as const };
 }
 
 /**
@@ -15272,58 +15362,79 @@ export async function applyGustoRateImport(rows: Array<{ userId: string; newHour
 export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: string) {
     const user = await requirePayrollAccess();
     const { resolveCompanyTimeZone } = await import("./company-timezone");
-    const { startOfDateInTimeZone, daysBetweenDayKeys } = await import("./tz-date");
-    const { MAX_PAY_PERIOD_RANGE_DAYS } = await import("./pay-period-summary-core");
+    const { startOfDateInTimeZone } = await import("./tz-date");
+    const { validatePayrollRange } = await import("./payroll-config");
     const { loadGustoExport } = await import("./gusto-export-db");
 
-    const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
-    if (!DAY_KEY.test(periodStartKey) || !DAY_KEY.test(periodEndKey) || periodEndKey <= periodStartKey) {
-        return { success: false as const, error: "Pick a valid period." };
-    }
-    // Same cap as the download endpoint — a lock must never cover a range the
-    // export itself would refuse to produce.
-    if (daysBetweenDayKeys(periodStartKey, periodEndKey) > MAX_PAY_PERIOD_RANGE_DAYS) {
-        return { success: false as const, error: `A pay period cannot be longer than ${MAX_PAY_PERIOD_RANGE_DAYS} days.` };
-    }
-    const timeZone = await resolveCompanyTimeZone();
-    const periodStart = startOfDateInTimeZone(periodStartKey, timeZone);
-    const periodEnd = startOfDateInTimeZone(periodEndKey, timeZone);
+    // ONE validator, shared with the endpoint and the page (day-key shape, real
+    // calendar day, positive length, 62-day cap) - a lock must never cover a
+    // range the export itself would refuse to produce.
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
 
-    // Pass 1, OUTSIDE the transaction: settle DEFERRED days and check
-    // readiness. Settlement takes its own advisory locks, so it cannot run
-    // inside the lock transaction.
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+
+    // Pass 1, OUTSIDE the transaction: readiness. Cheap, and it gives the human
+    // a useful message instead of a rolled-back transaction.
     const precheck = await loadGustoExport(periodStart, periodEnd);
     if (precheck.blocking.length > 0) {
         return {
             success: false as const,
-            error: `${precheck.blocking.length} time ${precheck.blocking.length === 1 ? "entry is" : "entries are"} not ready (open, flagged, zero hours, or an unsettled meal) — clear them before locking.`,
+            error: `${precheck.blocking.length} time ${precheck.blocking.length === 1 ? "entry is" : "entries are"} not ready (open, flagged, zero hours, an unsettled meal, or a missing pay type) - clear them before locking.`,
         };
     }
 
     // Pass 2, INSIDE one transaction: take the lock FIRST, then recompute. The
     // ordering is the whole point. Once lockedAt is committed every gated write
     // path is refused, so a recompute that still agrees with the pre-check
-    // proves nothing slipped in between — and if it disagrees, the throw rolls
+    // proves nothing slipped in between - and if it disagrees, the throw rolls
     // the lock back rather than freezing a period around numbers a human never
     // saw. Check-then-act would have locked whatever the racing write left.
     const lockedAt = new Date();
     try {
         const committed = await prisma.$transaction(async (tx) => {
+            // Overlapping periods would each claim the same punches and each
+            // hold a different exportHash for them, so "what did we pay for this
+            // punch" would have two answers. FOR UPDATE (raw - Prisma has no
+            // row-lock option) serialises two concurrent locks of overlapping
+            // ranges rather than letting both commit.
+            const overlapping = await tx.$queryRaw<Array<{ id: string; periodStart: Date; periodEnd: Date }>>`
+                SELECT "id", "periodStart", "periodEnd"
+                FROM "PayrollPeriod"
+                WHERE "periodStart" < ${periodEnd} AND "periodEnd" > ${periodStart}
+                FOR UPDATE
+            `;
+            const conflicting = overlapping.filter(
+                (row) =>
+                    row.periodStart.getTime() !== periodStart.getTime() ||
+                    row.periodEnd.getTime() !== periodEnd.getTime()
+            );
+            if (conflicting.length > 0) {
+                const listed = conflicting
+                    .map((row) => `${row.periodStart.toISOString().slice(0, 10)} to ${row.periodEnd.toISOString().slice(0, 10)}`)
+                    .join(", ");
+                throw new Error(
+                    `This range overlaps an existing pay period (${listed}). Pay periods cannot overlap - pick the exact period, or unlock the other one first.`
+                );
+            }
+
             await tx.payrollPeriod.upsert({
                 where: { periodStart_periodEnd: { periodStart, periodEnd } },
                 create: { periodStart, periodEnd, lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
                 update: { lockedAt, lockedById: user.id, exportHash: precheck.exportHash },
             });
 
-            const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx, settle: false });
+            const confirmed = await loadGustoExport(periodStart, periodEnd, { client: tx });
             if (confirmed.blocking.length > 0) {
                 throw new Error(
-                    "Someone changed a time entry in this period while it was being locked. Nothing was locked — refresh and try again."
+                    "Someone changed a time entry in this period while it was being locked. Nothing was locked - refresh and try again."
                 );
             }
             if (confirmed.exportHash !== precheck.exportHash) {
                 throw new Error(
-                    "The hours in this period changed while it was being locked. Nothing was locked — re-download the CSVs and try again."
+                    "The hours in this period changed while it was being locked. Nothing was locked - re-download the CSVs and try again."
                 );
             }
             return confirmed.exportHash;
@@ -15335,6 +15446,72 @@ export async function lockPayrollPeriod(periodStartKey: string, periodEndKey: st
     } catch (error: any) {
         return { success: false as const, error: error?.message || "Could not lock this period." };
     }
+}
+
+/**
+ * Settle the WA meal deduction on every DEFERRED day in a period.
+ *
+ * This used to happen implicitly inside loadGustoExport, which meant a GET
+ * request and an ordinary page render mutated payroll rows. Now it is an
+ * explicit button: the export REFUSES a period with unsettled days, and a human
+ * decides when to settle them.
+ *
+ * Never settles today, never settles a day a worker is still punched into, and
+ * never settles a day inside a locked period.
+ */
+export async function settleDeferredDaysForPeriod(periodStartKey: string, periodEndKey: string) {
+    await requirePayrollAccess();
+    const { resolveCompanyTimeZone } = await import("./company-timezone");
+    const { startOfDateInTimeZone, dayKeyInTimeZone } = await import("./tz-date");
+    const { validatePayrollRange } = await import("./payroll-config");
+    const { planDeferredSettlements } = await import("./gusto-export-core");
+    const { lockedPeriodFor, loadLockedPeriods } = await import("./payroll-period");
+    const { settleDay } = await import("./wa-breaks-db");
+
+    const range = validatePayrollRange(periodStartKey, periodEndKey);
+    if (!range.ok) return { success: false as const, error: range.error };
+
+    const timeZone = await resolveCompanyTimeZone();
+    const periodStart = startOfDateInTimeZone(range.startKey, timeZone);
+    const periodEnd = startOfDateInTimeZone(range.endKey, timeZone);
+    const dayKey = (instant: Date) => dayKeyInTimeZone(instant, timeZone);
+
+    const unsettled = await prisma.timeEntry.findMany({
+        where: { startTime: { gte: periodStart, lt: periodEnd }, mealOutcome: "DEFERRED", endTime: { not: null } },
+        select: { userId: true, startTime: true },
+    });
+    if (unsettled.length === 0) return { success: true as const, settled: 0, skipped: 0 };
+
+    const affectedUserIds = [...new Set(unsettled.map((row) => row.userId))];
+    const openRows = await prisma.timeEntry.findMany({
+        where: { endTime: null, userId: { in: affectedUserIds } },
+        select: { userId: true, startTime: true },
+    });
+    const lockedPeriods = await loadLockedPeriods();
+
+    const plan = planDeferredSettlements({
+        unsettled: unsettled.map((row) => ({ userId: row.userId, dayKey: dayKey(row.startTime) })),
+        openPunchDayKeys: openRows.map((row) => `${row.userId}|${dayKey(row.startTime)}`),
+        todayKey: dayKey(new Date()),
+        isDayLocked: (key) => !!lockedPeriodFor(lockedPeriods, startOfDateInTimeZone(key, timeZone), { timeZone }),
+    });
+
+    let settled = 0;
+    for (const item of plan) {
+        const result = await settleDay(item.userId, item.dayKey, null);
+        if (result >= 0) settled += 1;
+    }
+
+    const distinctDays = new Set(unsettled.map((row) => `${row.userId}|${dayKey(row.startTime)}`)).size;
+
+    revalidatePath("/manager/payroll-export");
+    revalidatePath("/manager/time-entries");
+    return {
+        success: true as const,
+        settled,
+        // Days deliberately left alone: still open, today, or inside a locked period.
+        skipped: distinctDays - settled,
+    };
 }
 
 /**

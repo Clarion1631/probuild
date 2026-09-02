@@ -18,11 +18,10 @@ import { prisma } from "@/lib/prisma";
 import { getSessionOrDev } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { resolveCompanyTimeZone } from "@/lib/company-timezone";
-import { addDaysToKey, dayKeyInTimeZone, daysBetweenDayKeys, startOfDateInTimeZone } from "@/lib/tz-date";
-import { MAX_PAY_PERIOD_RANGE_DAYS } from "@/lib/pay-period-summary-core";
-import { lastFullPayPeriod, payrollPeriodLength } from "@/lib/payroll-config";
+import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "@/lib/tz-date";
+import { lastFullPayPeriod, MAX_PAYROLL_RANGE_DAYS, payrollPeriodLength, validatePayrollRange } from "@/lib/payroll-config";
 import { loadGustoExport } from "@/lib/gusto-export-db";
-import { lockPayrollPeriod, unlockPayrollPeriod } from "@/lib/actions";
+import { lockPayrollPeriod, settleDeferredDaysForPeriod, unlockPayrollPeriod } from "@/lib/actions";
 
 interface Props {
     searchParams: Promise<{ start?: string; end?: string }>;
@@ -60,15 +59,16 @@ export default async function PayrollExportPage({ searchParams }: Props) {
             : addDaysToKey(fallback.endKey, -1);
     const endKeyExclusive = addDaysToKey(lastDayKey, 1);
 
-    // Same cap as the download endpoint and the lock action. Refuse up front
-    // rather than rendering totals for a range neither of them would accept.
-    if (daysBetweenDayKeys(startKey, endKeyExclusive) > MAX_PAY_PERIOD_RANGE_DAYS) {
+    // The SAME validator the endpoint and the lock action use (shape, real
+    // calendar day, positive length, 62-day cap) — the page must never render
+    // totals for a range they would refuse.
+    const range = validatePayrollRange(startKey, endKeyExclusive);
+    if (!range.ok) {
         return (
             <div className="max-w-3xl mx-auto py-16 px-6 text-center space-y-3">
-                <h1 className="text-xl font-bold text-hui-textMain">That period is too long</h1>
-                <p className="text-sm text-hui-textMuted">
-                    A pay period cannot be longer than {MAX_PAY_PERIOD_RANGE_DAYS} days. Pick a shorter range.
-                </p>
+                <h1 className="text-xl font-bold text-hui-textMain">That period does not work</h1>
+                <p className="text-sm text-hui-textMuted">{range.error}</p>
+                <p className="text-xs text-hui-textMuted">A pay period can be at most {MAX_PAYROLL_RANGE_DAYS} days.</p>
                 <Link href="/manager/payroll-export" className="hui-btn hui-btn-primary text-sm">
                     Back to the current period
                 </Link>
@@ -80,8 +80,14 @@ export default async function PayrollExportPage({ searchParams }: Props) {
     const periodEnd = startOfDateInTimeZone(endKeyExclusive, timeZone);
 
     const result = await loadGustoExport(periodStart, periodEnd);
-    const locked = !!result.period?.lockedAt;
+    // Overlap, not exact match: an ad-hoc range that merely overlaps a locked
+    // period has no row of its own, and the exact lookup used to call it
+    // unlocked while half of it was frozen.
+    const locked = result.locked;
+    const exactLock = result.period?.lockedAt ? result.period : null;
     const blocked = result.blocking.length > 0;
+    const deferredCount = result.blocking.filter((row) => row.reason === "deferred").length;
+    const unknownPayTypeCount = result.blocking.filter((row) => row.reason === "unknownPayType").length;
 
     const downloadHref = (format: "summary" | "detail") =>
         `/api/time-entries/export/gusto?periodStart=${startKey}&periodEnd=${endKeyExclusive}&format=${format}`;
@@ -121,10 +127,22 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                     <input type="date" name="end" defaultValue={lastDayKey} className="hui-input text-sm py-1.5" />
                 </div>
                 <button type="submit" className="hui-btn hui-btn-primary text-sm py-1.5 px-4">Show period</button>
-                {locked && result.period && (
+                {locked && (
                     <span className="ml-auto text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded px-3 py-1.5">
-                        🔒 Locked {new Date(result.period.lockedAt as Date).toLocaleDateString()} by{" "}
-                        {result.period.lockedBy?.name || result.period.lockedBy?.email || "someone"}
+                        {exactLock ? (
+                            <>
+                                🔒 Locked {new Date(exactLock.lockedAt as Date).toLocaleDateString()} by{" "}
+                                {exactLock.lockedBy?.name || exactLock.lockedBy?.email || "someone"}
+                            </>
+                        ) : (
+                            <>
+                                🔒 Overlaps a locked period (
+                                {result.overlappingLocks
+                                    .map((row) => dayKeyInTimeZone(row.periodStart, timeZone))
+                                    .join(", ")}
+                                ) — pick that exact period to work with it
+                            </>
+                        )}
                     </span>
                 )}
             </form>
@@ -136,9 +154,36 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                     </h2>
                     <p className="text-sm text-hui-textMuted mb-3">
                         Payroll will not export a period that still has an open punch, a flagged entry, a closed
-                        entry with no hours, or a meal break that never settled. Clear these on{" "}
-                        <Link href="/manager/time-entries?flagged=1" className="underline">Time &amp; Expenses</Link> first.
+                        entry with no hours, a meal break that never settled, or somebody whose pay type nobody has
+                        set. Clear these on{" "}
+                        <Link href="/manager/time-entries?flagged=1" className="underline">Time &amp; Expenses</Link>, and
+                        set pay types on{" "}
+                        <Link href="/company/team-members" className="underline">Team Members</Link>.
                     </p>
+                    {/* The one action that can clear a whole class of these. It
+                        used to run implicitly on every page render and every GET;
+                        now a human asks for it. */}
+                    {deferredCount > 0 && !locked && (
+                        <form
+                            action={async () => { "use server"; await settleDeferredDaysForPeriod(startKey, endKeyExclusive); }}
+                            className="mb-3"
+                        >
+                            <button type="submit" className="hui-btn hui-btn-secondary text-sm">
+                                Settle {deferredCount} deferred meal {deferredCount === 1 ? "day" : "days"}
+                            </button>
+                            <span className="ml-2 text-xs text-hui-textMuted">
+                                Applies the WA meal deduction to days that closed mid-shift. Skips today, anyone still
+                                clocked in, and locked periods.
+                            </span>
+                        </form>
+                    )}
+                    {unknownPayTypeCount > 0 && (
+                        <p className="text-sm text-red-800 mb-3">
+                            {unknownPayTypeCount} {unknownPayTypeCount === 1 ? "person has" : "people have"} no pay type
+                            set. Gusto pays salaried staff a salary and hourly staff by the hour — guessing either way
+                            is a wrong paycheque, so set it on Team Members before exporting.
+                        </p>
+                    )}
                     <ul className="text-sm divide-y divide-hui-border">
                         {result.blocking.slice(0, 25).map((row) => (
                             <li key={row.id} className="py-1.5 flex justify-between gap-4">
@@ -151,7 +196,9 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                                           ? "needs review"
                                           : row.reason === "zeroDuration"
                                             ? "closed with no hours"
-                                            : "meal break not settled"}
+                                            : row.reason === "unknownPayType"
+                                              ? "no pay type set"
+                                              : "meal break not settled"}
                                 </span>
                             </li>
                         ))}
@@ -197,12 +244,14 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                             Download detail CSV
                         </a>
                         {locked ? (
-                            viewer?.role === "ADMIN" ? (
+                            viewer?.role === "ADMIN" && exactLock ? (
                                 <form action={async () => { "use server"; await unlockPayrollPeriod(startKey, endKeyExclusive); }}>
                                     <button type="submit" className="hui-btn hui-btn-secondary text-sm">Unlock period</button>
                                 </form>
                             ) : (
-                                <span className="text-xs text-hui-textMuted">Only an admin can unlock</span>
+                                <span className="text-xs text-hui-textMuted">
+                                    {exactLock ? "Only an admin can unlock" : "Select the locked period itself to unlock it"}
+                                </span>
                             )
                         ) : (
                             // Disabled while blocked; the action re-checks anyway,
@@ -273,6 +322,12 @@ export default async function PayrollExportPage({ searchParams }: Props) {
                             )}
                         </>
                     )}
+                </p>
+                <p>
+                    Locking freezes {dayKeyInTimeZone(result.envelopeStart, timeZone)} to{" "}
+                    {addDaysToKey(dayKeyInTimeZone(result.envelopeEnd, timeZone), -1)} — the whole workweeks this period
+                    touches, because overtime is worked out per week and a punch just outside the period still changes
+                    what was paid inside it.
                 </p>
                 <p>
                     Paid hours already exclude the WA meal deduction. Gusto stays authoritative for pay — see section 4 of

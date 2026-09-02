@@ -67,6 +67,8 @@ export type ExportUser = {
     id: string;
     name: string | null;
     email: string;
+    /** "HOURLY" | "SALARY" | null. NULL is UNANSWERED and blocks the export — see blockingEntries. */
+    payType?: string | null;
 };
 
 export type ExportEntry = OvertimeTimeEntry & {
@@ -86,7 +88,7 @@ export type ExportEntry = OvertimeTimeEntry & {
     costCodeLabel: string | null;
 };
 
-export type BlockingReason = "open" | "needsReview" | "zeroDuration" | "deferred";
+export type BlockingReason = "open" | "needsReview" | "zeroDuration" | "deferred" | "unknownPayType";
 
 export type BlockingEntry = {
     id: string;
@@ -149,18 +151,30 @@ function inPeriod(entry: { startTime: Date }, periodStart: Date, periodEnd: Date
  * Only entries inside [periodStart, periodEnd) can block; the surrounding
  * workweek days were fetched for the 40h threshold and are not being exported.
  */
+/**
+ * Rows that are not ready to export.
+ *
+ * The window is the WORKWEEK ENVELOPE, not the pay period. An open or flagged
+ * punch in the trailing partial week sits OUTSIDE the period but still decides
+ * how much of the period's time is overtime, so exporting around it produces a
+ * number that changes the moment it is closed. Callers pass the envelope that
+ * src/lib/payroll-config.ts payrollLockEnvelope computes, which is the same
+ * window the period lock freezes.
+ */
 export function blockingEntries(
     entries: Array<
         Pick<ExportEntry, "id" | "userId" | "startTime" | "endTime" | "needsReview" | "durationHours" | "mealOutcome">
     >,
     users: ExportUser[],
-    periodStart: Date,
-    periodEnd: Date
+    /** Start of the WORKWEEK ENVELOPE (not the period). */
+    windowStart: Date,
+    /** End of the WORKWEEK ENVELOPE (not the period), exclusive. */
+    windowEnd: Date
 ): BlockingEntry[] {
     const byId = new Map(users.map((user) => [user.id, user]));
     const blocking: BlockingEntry[] = [];
     for (const entry of entries) {
-        if (!inPeriod(entry, periodStart, periodEnd)) continue;
+        if (!inPeriod(entry, windowStart, windowEnd)) continue;
         // Order matters only for which single reason is reported first; each
         // condition is independently disqualifying.
         //
@@ -198,6 +212,50 @@ export function blockingEntries(
 }
 
 /**
+ * One blocker per worker who has hours IN THE PERIOD but no answer to "how does
+ * Gusto pay this person".
+ *
+ * Guessing is a wrong paycheque either way: treat a salaried person as hourly
+ * and Gusto pays them twice; treat an hourly person as salaried and they are
+ * not paid at all. The env list (PAYROLL_SALARIED_EMAILS) cannot close this gap
+ * because an absent email is indistinguishable from "hourly" — it fails open by
+ * construction. So the export refuses until User.payType says.
+ *
+ * Scoped to the PERIOD, not the envelope: only people actually being paid for
+ * this period need an answer.
+ */
+export function unknownPayTypeBlockers(
+    entries: Array<Pick<ExportEntry, "id" | "userId" | "startTime">>,
+    users: ExportUser[],
+    periodStart: Date,
+    periodEnd: Date
+): BlockingEntry[] {
+    const byId = new Map(users.map((user) => [user.id, user]));
+    const firstEntryFor = new Map<string, { id: string; startTime: Date }>();
+    for (const entry of entries) {
+        if (!inPeriod(entry, periodStart, periodEnd)) continue;
+        const user = byId.get(entry.userId);
+        // A punch by somebody not on the roster is already impossible (the
+        // roster includes everyone who punched), but if it happened we cannot
+        // vouch for their pay type either.
+        if (user && user.payType) continue;
+        const seen = firstEntryFor.get(entry.userId);
+        if (!seen || entry.startTime < seen.startTime) {
+            firstEntryFor.set(entry.userId, { id: entry.id, startTime: entry.startTime });
+        }
+    }
+    return [...firstEntryFor.entries()]
+        .map(([userId, entry]) => ({
+            id: entry.id,
+            userId,
+            userLabel: userLabel(byId.get(userId), userId),
+            startTime: entry.startTime,
+            reason: "unknownPayType" as const,
+        }))
+        .sort((a, b) => a.userLabel.localeCompare(b.userLabel) || a.userId.localeCompare(b.userId));
+}
+
+/**
  * Per-employee regular/OT totals and the per-entry detail rows, for the period
  * [periodStart, periodEnd). `entries` must span the FULL workweeks overlapping
  * the period (invariant 3 above); only CLOSED entries with positive paid hours
@@ -213,8 +271,13 @@ export function buildGustoExport(input: {
     employeeMappings?: Record<string, string>;
     /** Predicate for "paid a salary in Gusto" — excluded from the SUMMARY csv only. */
     isSalaried?: (user: ExportUser) => boolean;
+    /** Workweek envelope for the READINESS check (defaults to the period). See blockingEntries. */
+    envelopeStart?: Date;
+    envelopeEnd?: Date;
 }): GustoExport {
     const { entries, users, periodStart, periodEnd, timeZone } = input;
+    const envelopeStart = input.envelopeStart ?? periodStart;
+    const envelopeEnd = input.envelopeEnd ?? periodEnd;
     const employeeMappings = input.employeeMappings ?? {};
     const isSalaried = input.isSalaried ?? (() => false);
 
@@ -291,7 +354,10 @@ export function buildGustoExport(input: {
     return {
         employees,
         detail,
-        blocking: blockingEntries(entries, users, periodStart, periodEnd),
+        blocking: [
+            ...blockingEntries(entries, users, envelopeStart, envelopeEnd),
+            ...unknownPayTypeBlockers(entries, users, periodStart, periodEnd),
+        ],
     };
 }
 

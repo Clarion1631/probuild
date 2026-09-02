@@ -7,27 +7,23 @@
 // through loadGustoExport, so a locked period's stored hash and a later
 // download can never be computed from two different code paths.
 //
-// loadGustoExport is a READ that performs WRITES (settleDay), and it is called
-// from a GET and from a page render. That is deliberate and predates this
-// module: settlement is idempotent, it is skipped for today, for a worker with
-// an open punch on that day, and for any day inside a locked period, so
-// re-rendering the page cannot change a settled number. Anything still
-// unsettled afterwards BLOCKS the export rather than being exported at full pay.
+// loadGustoExport IS A PURE READ. It used to run WA meal settlement as a side
+// effect, from a GET handler and from a page render — a page refresh mutating
+// payroll rows. It no longer does: an unsettled DEFERRED day BLOCKS the export
+// (409) and a human settles it with the explicit "Settle deferred days" button
+// on /manager/payroll-export (settleDeferredDaysForPeriod in actions.ts).
 
 import { createHash } from "crypto";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { resolveCompanyTimeZone } from "./company-timezone";
 import { getGustoSettings } from "./integration-store";
-import { settleDay } from "./wa-breaks-db";
 import { workweekStartKey } from "./overtime";
 import { addDaysToKey, dayKeyInTimeZone, startOfDateInTimeZone } from "./tz-date";
-import { isSalariedEmail, salariedEmails } from "./payroll-config";
+import { isSalariedEmail, payrollLockEnvelope, salariedEmails } from "./payroll-config";
 import { HOURLY_PAID_ROLES } from "./pay-rate-guard";
-import { lockedPeriodFor, loadLockedPeriods } from "./payroll-period";
 import {
     buildGustoExport,
-    planDeferredSettlements,
     toDetailCsv,
     toSummaryCsv,
     type ExportEntry,
@@ -41,6 +37,9 @@ export type ExportDbClient = typeof prisma | Prisma.TransactionClient;
 export type LoadedGustoExport = GustoExport & {
     periodStart: Date;
     periodEnd: Date;
+    /** Full workweeks overlapping the period — the window the lock freezes and the readiness check uses. */
+    envelopeStart: Date;
+    envelopeEnd: Date;
     timeZone: string;
     summaryCsv: string;
     detailCsv: string;
@@ -52,16 +51,38 @@ export type LoadedGustoExport = GustoExport & {
      * projects, an edit flag) would not have shown up at all.
      */
     exportHash: string;
-    period: {
-        id: string;
-        periodStart: Date;
-        periodEnd: Date;
-        lockedAt: Date | null;
-        lockedById: string | null;
-        exportHash: string | null;
-        lockedBy: { name: string | null; email: string } | null;
-    } | null;
+    /** The row for EXACTLY this range, if a human has reviewed it. Used for the stored hash and the lock button. */
+    period: PayrollPeriodRow | null;
+    /**
+     * Every LOCKED period whose workweek envelope overlaps this range — which is
+     * NOT the same question as `period?.lockedAt`. An ad-hoc range that merely
+     * OVERLAPS a locked period has no exact row of its own, so the exact lookup
+     * said "unlocked" while half the range was frozen and the page happily
+     * offered to lock it again.
+     */
+    overlappingLocks: PayrollPeriodRow[];
+    locked: boolean;
 };
+
+export type PayrollPeriodRow = {
+    id: string;
+    periodStart: Date;
+    periodEnd: Date;
+    lockedAt: Date | null;
+    lockedById: string | null;
+    exportHash: string | null;
+    lockedBy: { name: string | null; email: string } | null;
+};
+
+const PAYROLL_PERIOD_SELECT = {
+    id: true,
+    periodStart: true,
+    periodEnd: true,
+    lockedAt: true,
+    lockedById: true,
+    exportHash: true,
+    lockedBy: { select: { name: true, email: true } },
+} as const;
 
 /** Domain separator between the two documents so csv content can never be shuffled across the boundary undetected. */
 export function hashExport(summaryCsv: string, detailCsv: string): string {
@@ -77,15 +98,23 @@ export function hashExport(summaryCsv: string, detailCsv: string): string {
 export async function findPayrollPeriod(periodStart: Date, periodEnd: Date, client: ExportDbClient = prisma) {
     return client.payrollPeriod.findUnique({
         where: { periodStart_periodEnd: { periodStart, periodEnd } },
-        select: {
-            id: true,
-            periodStart: true,
-            periodEnd: true,
-            lockedAt: true,
-            lockedById: true,
-            exportHash: true,
-            lockedBy: { select: { name: true, email: true } },
-        },
+        select: PAYROLL_PERIOD_SELECT,
+    });
+}
+
+/**
+ * Locked periods that OVERLAP [start, end). Half-open on both sides, so two
+ * adjacent periods do not count as overlapping.
+ */
+export async function findOverlappingLockedPeriods(
+    start: Date,
+    end: Date,
+    client: ExportDbClient = prisma
+): Promise<PayrollPeriodRow[]> {
+    return client.payrollPeriod.findMany({
+        where: { lockedAt: { not: null }, periodStart: { lt: end }, periodEnd: { gt: start } },
+        select: PAYROLL_PERIOD_SELECT,
+        orderBy: { periodStart: "asc" },
     });
 }
 
@@ -95,13 +124,20 @@ export async function loadGustoExport(
     options: {
         /** Read through a transaction client — used by lockPayrollPeriod to recompute inside its own transaction. */
         client?: ExportDbClient;
-        /** Skip the settlement pass. The lock's in-transaction recompute sets this: settlement already ran in the pre-check, and a settleDay call takes its own advisory lock. */
-        settle?: boolean;
     } = {}
 ): Promise<LoadedGustoExport> {
     const client = options.client ?? prisma;
     const timeZone = await resolveCompanyTimeZone();
-    const period = await findPayrollPeriod(periodStart, periodEnd, client);
+
+    // Full workweeks overlapping the period. This is BOTH the window the lock
+    // freezes and the window the readiness check looks at, because overtime
+    // inside the period depends on hours in the same week outside it.
+    const envelope = payrollLockEnvelope(periodStart, periodEnd, timeZone);
+
+    const [period, overlappingLocks] = await Promise.all([
+        findPayrollPeriod(periodStart, periodEnd, client),
+        findOverlappingLockedPeriods(envelope.start, envelope.end, client),
+    ]);
 
     // The query spans the FULL Mon-Sun workweeks overlapping the period, so a
     // period that opens mid-week still sees the hours that already pushed that
@@ -113,52 +149,6 @@ export async function loadGustoExport(
         addDaysToKey(workweekStartKey(lastIncludedInstant, timeZone), 7),
         timeZone
     );
-
-    // Day keys use the RESOLVED company time zone, not the hardcoded one in
-    // company-day.ts — everything else in this export honours CompanySettings,
-    // and a settlement keyed to a different day than the export reads is a
-    // silent off-by-one-day bug the moment the company zone changes.
-    const dayKey = (instant: Date) => dayKeyInTimeZone(instant, timeZone);
-
-    if (options.settle !== false) {
-        // Settle DEFERRED days before reading — carried over from the deleted
-        // /api/gusto/export route.
-        const unsettledRows = await client.timeEntry.findMany({
-            where: {
-                startTime: { gte: periodStart, lt: periodEnd },
-                mealOutcome: "DEFERRED",
-                endTime: { not: null },
-            },
-            select: { userId: true, startTime: true },
-        });
-        // Open punches are keyed to the DAY they started, and only fetched for
-        // the workers who actually have an unsettled day. The previous version
-        // asked "does this worker have ANY open punch, anywhere, ever" — so
-        // somebody clocked in this morning blocked settlement of their own
-        // DEFERRED day in a period weeks earlier, which then exported at full
-        // pay with no meal deducted.
-        const affectedUserIds = [...new Set(unsettledRows.map((row) => row.userId))];
-        const openRows = affectedUserIds.length
-            ? await client.timeEntry.findMany({
-                  where: { endTime: null, userId: { in: affectedUserIds } },
-                  select: { userId: true, startTime: true },
-              })
-            : [];
-        const lockedPeriods = await loadLockedPeriods();
-        const plan = planDeferredSettlements({
-            unsettled: unsettledRows.map((row) => ({ userId: row.userId, dayKey: dayKey(row.startTime) })),
-            openPunchDayKeys: openRows.map((row) => `${row.userId}|${dayKey(row.startTime)}`),
-            todayKey: dayKey(new Date()),
-            // ANY locked period, not just this one: a wide ad-hoc range can
-            // overlap a period that was already paid, and settling a day inside
-            // it would move hours behind a closed payroll.
-            isDayLocked: (key) =>
-                !!lockedPeriodFor(lockedPeriods, startOfDateInTimeZone(key, timeZone)),
-        });
-        for (const settlement of plan) {
-            await settleDay(settlement.userId, settlement.dayKey, null);
-        }
-    }
 
     const rows = await client.timeEntry.findMany({
         where: { startTime: { gte: queryStart, lt: queryEnd } },
@@ -207,10 +197,15 @@ export async function loadGustoExport(
                 { id: { in: punchedUserIds } },
             ],
         },
-        select: { id: true, name: true, email: true },
+        select: { id: true, name: true, email: true, payType: true },
         orderBy: { id: "asc" },
     });
-    const users: ExportUser[] = userRows.map((row) => ({ id: row.id, name: row.name, email: row.email }));
+    const users: ExportUser[] = userRows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        payType: row.payType ?? null,
+    }));
 
     const gustoSettings = await getGustoSettings();
     const employeeMappings = (gustoSettings.employeeMappings || {}) as Record<string, string>;
@@ -223,7 +218,11 @@ export async function loadGustoExport(
         periodEnd,
         timeZone,
         employeeMappings,
-        isSalaried: (user) => isSalariedEmail(user.email, salaried),
+        envelopeStart: envelope.start,
+        envelopeEnd: envelope.end,
+        // payType is the answer; the env list is only consulted for rows it has
+        // not answered (and unknownPayTypeBlockers refuses to export those).
+        isSalaried: (user) => user.payType === "SALARY" || (!user.payType && isSalariedEmail(user.email, salaried)),
     });
 
     const summaryCsv = toSummaryCsv(built.employees);
@@ -233,10 +232,14 @@ export async function loadGustoExport(
         ...built,
         periodStart,
         periodEnd,
+        envelopeStart: envelope.start,
+        envelopeEnd: envelope.end,
         timeZone,
         summaryCsv,
         detailCsv,
         exportHash: hashExport(summaryCsv, detailCsv),
         period,
+        overlappingLocks,
+        locked: overlappingLocks.length > 0,
     };
 }
