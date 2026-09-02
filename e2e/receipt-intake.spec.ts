@@ -34,6 +34,11 @@ const SECRET = process.env.RECEIPT_INTAKE_SECRET || "";
 // report what it archived, and nothing else. Cross-use is a 403.
 const ARCHIVE_SECRET = process.env.RECEIPT_ARCHIVE_SECRET || "";
 
+// The e2e test project from data.setup.ts, and the phase that belongs to it
+// (via the approved mobile estimate). A phase is only valid against its own job,
+// so any spec sending a costCodeId has to send this project too.
+const PROJECT_ID = "cmml6vt3y000lpwrh0p9p3k12";
+
 // One prefix for everything this file creates, so teardown can be exact.
 const REF_PREFIX = "drive:e2e-intake-";
 const FILE_ID = `${Date.now()}-a`;
@@ -417,17 +422,25 @@ test.describe("intake POST", () => {
         expect(body.reason).toBe("invalid-source");
     });
 
-    test("deterministic bad input is a 400, not a 500 the forwarder retries forever", async ({ request }) => {
-        const cases: [string, string][] = [
-            [intakeBody({ source: "carrier-pigeon", sourceRef: `${REF_PREFIX}src` }), "invalid-source"],
-            [JSON.stringify({ source: "drive", sourceRef: `${REF_PREFIX}nofile` }), "missing-file"],
+    test("deterministic bad input is terminal, not a 500 the forwarder retries forever", async ({ request }) => {
+        // A malformed REQUEST is a 400. An unsupported FORMAT is a 415 — the
+        // request is well-formed, the file is simply one QuickBooks cannot
+        // attach, and the body names what to send instead. Both are terminal:
+        // what must never happen is a 5xx the forwarder retries forever.
+        const cases: [string, number, string][] = [
+            [intakeBody({ source: "carrier-pigeon", sourceRef: `${REF_PREFIX}src` }), 400, "invalid-source"],
+            [JSON.stringify({ source: "drive", sourceRef: `${REF_PREFIX}nofile` }), 400, "missing-file"],
             // Base64 of "hello" — not a document format we can read.
-            [intakeBody({ sourceRef: `${REF_PREFIX}junk`, fileBase64: "aGVsbG8=", mimeType: "image/png" }), "unsupported-file-type"],
+            [intakeBody({ sourceRef: `${REF_PREFIX}junk`, fileBase64: "aGVsbG8=", mimeType: "image/png" }), 415, "unsupported-file-type"],
         ];
-        for (const [data, reason] of cases) {
+        for (const [data, status, name] of cases) {
             const { res, body } = await postIntake(request, data);
-            expect(res.status(), reason).toBe(400);
-            expect(body.reason).toBe(reason);
+            expect(res.status(), name).toBe(status);
+            // 400s carry `reason`; the 415 carries `error` plus a human `reason`
+            // and the accepted list.
+            expect(body.reason ?? body.error, name).toBeTruthy();
+            expect([body.reason, body.error], name).toContain(name);
+            if (status === 415) expect(body.accepted, name).toContain("application/pdf");
         }
     });
 
@@ -977,7 +990,11 @@ test.describe("round-9 intake contracts", () => {
         // path — and answering it without applying the job assignment would drop
         // that assignment while telling the caller it worked.
         const ref = `${REF_PREFIX}latefields`;
-        const created = await postIntake(request, intakeBody({ sourceRef: ref }));
+        // The row carries the JOB, because a phase is only valid against one:
+        // `e2e-mob-cc-demo` is a phase of PROJECT_ID via the approved mobile
+        // estimate (data.setup.ts). Without the project this is a 400
+        // cost-code-without-project, which is a different test (below).
+        const created = await postIntake(request, intakeBody({ sourceRef: ref, projectId: PROJECT_ID }));
         expect(created.res.status()).toBe(200);
         const id = created.body.id;
         minted.push(id);
@@ -1066,6 +1083,38 @@ test.describe("round-10 finalize authorization and recovery", () => {
         // No project on the row and none supplied, so a phase is meaningless.
         expect(res.status()).toBe(400);
         expect((await res.json()).error).toBe("cost-code-without-project");
+    });
+
+    test("a cost code that is not a phase of THIS job is refused", async ({ request }) => {
+        // The row has a job, and the phase is not one of its phases. Neither
+        // half is malformed — the PAIR is wrong, and letting it through files
+        // the receipt against a line this job never budgeted.
+        const created = await postIntake(request, intakeBody({
+            sourceRef: `${REF_PREFIX}phasejob`, projectId: PROJECT_ID,
+        }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const res = await finalize(request, created.body.id, { costCodeId: "e2e-not-a-phase-of-anything" });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).error).toBe("cost-code-not-a-phase");
+        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.costCodeId)
+            .toBeNull();
+    });
+
+    test("the job's OWN phase is accepted", async ({ request }) => {
+        // The control: without it the two refusals above would pass just as
+        // well against a gate that refused everything.
+        const created = await postIntake(request, intakeBody({
+            sourceRef: `${REF_PREFIX}phaseok`, projectId: PROJECT_ID,
+        }));
+        expect(created.res.status()).toBe(200);
+        minted.push(created.body.id);
+
+        const res = await finalize(request, created.body.id, { costCodeId: "e2e-mob-cc-demo" });
+        expect(res.status()).toBe(200);
+        expect((await prisma.receiptIntake.findUnique({ where: { id: created.body.id } }))?.costCodeId)
+            .toBe("e2e-mob-cc-demo");
     });
 
     test("late fields are refused once the row has been routed", async ({ request }) => {
