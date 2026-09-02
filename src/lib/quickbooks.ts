@@ -44,6 +44,87 @@ function safePath(url: string): string {
 }
 
 /**
+ * Abort when ANY input signal aborts.
+ *
+ * `AbortSignal.any` is the built-in, but it does not exist on every runtime we
+ * might land on. The old code fell back to using the CALLER's signal alone,
+ * which silently disabled the deadline — exactly the hang this module exists to
+ * prevent, and invisible until an outage. The manual combiner keeps both live.
+ */
+function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
+    const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+    if (typeof anyOf === "function") return anyOf(signals);
+
+    const controller = new AbortController();
+    for (const signal of signals) {
+        if (signal.aborted) {
+            controller.abort(signal.reason);
+            break;
+        }
+        signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+    }
+    return controller.signal;
+}
+
+/** Body-consuming members of Response — each one can outlive the headers. */
+const RESPONSE_BODY_METHODS = ["json", "text", "arrayBuffer", "blob", "formData"] as const;
+
+/**
+ * Translate an abort into QBTimeoutError, but ONLY when our own deadline is
+ * what fired. A caller cancelling its own request is not a QBO outage.
+ */
+function asQbTimeout(
+    error: unknown,
+    context: { timeoutSignal: AbortSignal; callerSignal: AbortSignal | null | undefined; url: string; ms: number },
+): unknown {
+    const aborted = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+    if (aborted && context.timeoutSignal.aborted && !context.callerSignal?.aborted) {
+        return new QBTimeoutError(
+            `QuickBooks request timed out after ${context.ms}ms: ${safePath(context.url)}`,
+        );
+    }
+    return error;
+}
+
+/**
+ * The deadline governs the WHOLE exchange, not just the headers.
+ *
+ * `fetch` resolves as soon as response headers arrive; the body is streamed
+ * afterwards, still under the same signal. A QBO outage that dribbles headers
+ * and then stalls therefore blew past the wrapper entirely — `res.json()`
+ * rejected with a raw AbortError, which the receipt route classified as a
+ * generic transient failure (500) instead of the 503 qbo-timeout it is.
+ *
+ * So the signal stays attached (the deadline must still cut off a stalled
+ * body), and the returned Response is proxied so every body-consuming method
+ * translates our own abort the same way the header phase does.
+ */
+function wrapResponseBodyTimeouts(
+    response: Response,
+    context: { timeoutSignal: AbortSignal; callerSignal: AbortSignal | null | undefined; url: string; ms: number },
+): Response {
+    return new Proxy(response, {
+        get(target, prop, receiver) {
+            if (typeof prop === "string" && (RESPONSE_BODY_METHODS as readonly string[]).includes(prop)) {
+                const original = Reflect.get(target, prop, target) as (...args: unknown[]) => Promise<unknown>;
+                return async (...args: unknown[]) => {
+                    try {
+                        return await original.apply(target, args);
+                    } catch (error) {
+                        throw asQbTimeout(error, context);
+                    }
+                };
+            }
+            // Getters like `ok`/`status`/`headers` must run against the real
+            // Response (they throw on a proxy receiver), and methods like
+            // `clone()` must stay bound to it.
+            const value = Reflect.get(target, prop, target);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+    });
+}
+
+/**
  * Every QuickBooks HTTP call goes through here.
  *
  * Bare `fetch()` has NO default timeout, so an Intuit outage (2026-09-01) left
@@ -51,9 +132,9 @@ function safePath(url: string): string {
  * maxDuration — a receipt push burned 60s and a cron 120s to learn nothing.
  * A per-request deadline turns that into a fast, classifiable failure.
  *
- * A caller-supplied `signal` still wins on abort (combined via
- * `AbortSignal.any` where available); only OUR deadline firing is rethrown as
- * QBTimeoutError. Every other error passes through untouched.
+ * A caller-supplied `signal` still wins on abort; only OUR deadline firing is
+ * rethrown as QBTimeoutError, in both the header and the body phase. Every
+ * other error passes through untouched.
  */
 export async function qbTimedFetch(
     url: string,
@@ -66,26 +147,18 @@ export async function qbTimedFetch(
     const timeoutSignal = AbortSignal.timeout(effectiveMs);
 
     const callerSignal = init.signal;
-    let signal: AbortSignal = timeoutSignal;
-    if (callerSignal) {
-        const anyOf = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
-        signal = typeof anyOf === "function" ? anyOf([callerSignal, timeoutSignal]) : callerSignal;
-    }
+    const signal = callerSignal
+        ? combineAbortSignals([callerSignal, timeoutSignal])
+        : timeoutSignal;
 
+    const context = { timeoutSignal, callerSignal, url, ms: effectiveMs };
+    let response: Response;
     try {
-        return await fetch(url, { ...init, signal });
+        response = await fetch(url, { ...init, signal });
     } catch (error) {
-        const aborted =
-            error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
-        // Only claim a timeout when OUR deadline is the one that fired — a
-        // caller cancelling its own request is not a QBO outage.
-        if (aborted && timeoutSignal.aborted && !callerSignal?.aborted) {
-            throw new QBTimeoutError(
-                `QuickBooks request timed out after ${effectiveMs}ms: ${safePath(url)}`,
-            );
-        }
-        throw error;
+        throw asQbTimeout(error, context);
     }
+    return wrapResponseBodyTimeouts(response, context);
 }
 
 /** Exchange authorization code for tokens */
@@ -121,28 +194,71 @@ export async function exchangeQBCode(code: string, redirectUri: string): Promise
     };
 }
 
-/** Refresh an expired access token */
+const QB_REFRESH_DEFAULT_TIMEOUT_MS = 45_000;
+/** Must stay under the tightest route ceiling that can call this (maxDuration 60). */
+const QB_REFRESH_MAX_TIMEOUT_MS = 50_000;
+
+function refreshTimeoutMs(): number {
+    const configured = Number(process.env.QB_REFRESH_TIMEOUT_MS);
+    const requested = Number.isFinite(configured) && configured > 0 ? configured : QB_REFRESH_DEFAULT_TIMEOUT_MS;
+    return Math.min(requested, QB_REFRESH_MAX_TIMEOUT_MS);
+}
+
+/**
+ * Refresh an expired access token.
+ *
+ * This call is NOT safely retryable the way a read is: Intuit rotates the
+ * refresh token as part of the exchange, so a request that timed out may
+ * ALREADY have burned the stored refresh token on Intuit's side while we never
+ * saw the replacement. That strands the connection until someone reconnects
+ * QuickBooks. Two mitigations, both deliberate:
+ *
+ *  1. A longer deadline than an ordinary API call (QB_REFRESH_TIMEOUT_MS,
+ *     default 45s, capped below the route ceiling) — we would much rather wait
+ *     out a slow refresh than abandon one mid-rotation.
+ *  2. A distinct, diagnosable error when it does fire, so the stranded-token
+ *     case is recognisable in logs instead of looking like any other timeout.
+ *
+ * Persistence order is unchanged: the caller still stores what this returns,
+ * only after a successful exchange.
+ */
 export async function refreshQBToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
     const clientId = process.env.QB_CLIENT_ID!;
     const clientSecret = process.env.QB_CLIENT_SECRET!;
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-    const res = await qbTimedFetch(TOKEN_URL, {
-        method: "POST",
-        headers: {
-            Authorization: `Basic ${encoded}`,
-            "Content-Type": "application/x-www-form-urlencoded",
-            Accept: "application/json",
-        },
-        body: new URLSearchParams({
-            grant_type: "refresh_token",
-            refresh_token: refreshToken,
-        }),
-    });
+    try {
+        const res = await qbTimedFetch(
+            TOKEN_URL,
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Basic ${encoded}`,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Accept: "application/json",
+                },
+                body: new URLSearchParams({
+                    grant_type: "refresh_token",
+                    refresh_token: refreshToken,
+                }),
+            },
+            refreshTimeoutMs(),
+        );
 
-    if (!res.ok) throw new Error("QB token refresh failed");
-    const data = await res.json();
-    return { accessToken: data.access_token, refreshToken: data.refresh_token };
+        if (!res.ok) throw new Error("QB token refresh failed");
+        const data = await res.json();
+        return { accessToken: data.access_token, refreshToken: data.refresh_token };
+    } catch (error) {
+        if (error instanceof QBTimeoutError) {
+            const message =
+                "QBO token refresh timed out; the stored refresh token may be stale, reconnect QuickBooks if the next refresh fails";
+            console.error(message, error.message);
+            // Still a QBTimeoutError so routes keep classifying it as an
+            // outage (503/retry), just with the ambiguity spelled out.
+            throw new QBTimeoutError(message);
+        }
+        throw error;
+    }
 }
 
 /** Make an authenticated call to the QB API, auto-refreshing if needed */

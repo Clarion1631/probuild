@@ -17,7 +17,7 @@ import { qbTimedFetch, QBTimeoutError } from "../src/lib/quickbooks";
 
 let server: Server;
 let base: string;
-/** Sockets the "hang" route is holding open, closed in `after` so the suite exits. */
+/** Sockets the stalling routes are holding open, closed in `after` so the suite exits. */
 const held: Array<() => void> = [];
 
 before(async () => {
@@ -25,6 +25,16 @@ before(async () => {
         if (req.url?.startsWith("/v3/company/hang")) {
             // Never respond — the client's own deadline is the only thing that
             // can end this request. That is exactly the outage shape.
+            held.push(() => res.destroy());
+            return;
+        }
+        if (req.url?.startsWith("/v3/company/stall-body")) {
+            // Headers land immediately, so `fetch` RESOLVES and the wrapper's
+            // header-phase try/catch is already behind us — then the body
+            // never finishes. This is the case that used to escape as a raw
+            // AbortError out of res.json().
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.write('{"partial":');
             held.push(() => res.destroy());
             return;
         }
@@ -93,6 +103,106 @@ test("a caller's own abort is not reported as a QBO timeout", async () => {
         .then(() => null, (e: unknown) => e as Error);
     assert.ok(error instanceof Error);
     assert.equal(error instanceof QBTimeoutError, false);
+});
+
+// ─── Body-phase deadline ────────────────────────────────────────────────────
+
+test("a deadline that fires while READING THE BODY still becomes QBTimeoutError", async () => {
+    // Regression: fetch resolves on headers, so this rejection happens after
+    // the wrapper's header try/catch. It used to surface as a raw AbortError,
+    // which the receipt route classified as a generic 500 instead of a 503
+    // qbo-timeout.
+    const res = await qbTimedFetch(`${base}/v3/company/stall-body?token=shhh`, {}, 150);
+    assert.equal(res.ok, true);
+    const error = await res.json().then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
+    assert.match(error.message, /\/v3\/company\/stall-body/);
+    assert.doesNotMatch(error.message, /shhh/);
+});
+
+test("text() and arrayBuffer() get the same body-phase translation", async () => {
+    for (const method of ["text", "arrayBuffer"] as const) {
+        const res = await qbTimedFetch(`${base}/v3/company/stall-body`, {}, 150);
+        const error = await (res[method]() as Promise<unknown>).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error instanceof QBTimeoutError, `${method}: got ${String(error)}`);
+    }
+});
+
+test("the proxied Response still exposes real status, headers, and clone()", async () => {
+    const res = await qbTimedFetch(`${base}/v3/company/query`, {}, 5_000);
+    assert.equal(res.status, 200);
+    assert.equal(res.ok, true);
+    assert.equal(res.headers.get("content-type"), "application/json");
+    // clone() must not throw on the proxy receiver.
+    const copy = res.clone();
+    assert.deepEqual(await copy.json(), { ok: true, path: "/v3/company/query" });
+});
+
+test("a caller's own abort DURING the body read stays a plain error", async () => {
+    const controller = new AbortController();
+    const res = await qbTimedFetch(
+        `${base}/v3/company/stall-body`,
+        { signal: controller.signal },
+        10_000,
+    );
+    setTimeout(() => controller.abort(), 50);
+    const error = await res.json().then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof Error);
+    assert.equal(error instanceof QBTimeoutError, false);
+});
+
+// ─── Signal combining ───────────────────────────────────────────────────────
+
+test("without AbortSignal.any, a caller signal does NOT silently disable the deadline", async () => {
+    const original = (AbortSignal as unknown as Record<string, unknown>).any;
+    delete (AbortSignal as unknown as Record<string, unknown>).any;
+    try {
+        // A caller signal that never fires: the only thing that can end this
+        // request is our deadline. The old fallback dropped it entirely.
+        const neverAborts = new AbortController();
+        const error = await qbTimedFetch(
+            `${base}/v3/company/hang`,
+            { signal: neverAborts.signal },
+            120,
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error instanceof QBTimeoutError, `expected QBTimeoutError, got ${String(error)}`);
+    } finally {
+        (AbortSignal as unknown as Record<string, unknown>).any = original;
+    }
+});
+
+test("without AbortSignal.any, a caller's abort still cancels the request", async () => {
+    const original = (AbortSignal as unknown as Record<string, unknown>).any;
+    delete (AbortSignal as unknown as Record<string, unknown>).any;
+    try {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 50);
+        const error = await qbTimedFetch(
+            `${base}/v3/company/hang`,
+            { signal: controller.signal },
+            10_000,
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error instanceof Error);
+        assert.equal(error instanceof QBTimeoutError, false);
+    } finally {
+        (AbortSignal as unknown as Record<string, unknown>).any = original;
+    }
+});
+
+test("an already-aborted caller signal is honoured immediately without AbortSignal.any", async () => {
+    const original = (AbortSignal as unknown as Record<string, unknown>).any;
+    delete (AbortSignal as unknown as Record<string, unknown>).any;
+    try {
+        const error = await qbTimedFetch(
+            `${base}/v3/company/hang`,
+            { signal: AbortSignal.abort() },
+            10_000,
+        ).then(() => null, (e: unknown) => e as Error);
+        assert.ok(error instanceof Error);
+        assert.equal(error instanceof QBTimeoutError, false);
+    } finally {
+        (AbortSignal as unknown as Record<string, unknown>).any = original;
+    }
 });
 
 test("QB_FETCH_TIMEOUT_MS drives the default deadline", async () => {
