@@ -609,17 +609,40 @@ test("PATCH re-reads the row and compare-and-sets on updatedAt", () => {
         "utf8"
     );
     const patchHalf = source.slice(0, source.indexOf("export async function DELETE"));
-    // Day locks are derived from BOTH the stored value and the new one, and the
-    // row is re-read under the FOR UPDATE those locks were taken with.
-    assert.match(patchHalf, /SELECT "startTime", "updatedAt" FROM "TimeEntry" WHERE "id" = \$1/);
+    // The re-read now covers OWNER and project too, not just the times: a
+    // concurrent reassignment makes the authorization, the pricing target and
+    // the day locks all answers about a different person.
+    assert.match(patchHalf, /SELECT "userId", "projectId", "startTime", "endTime", "updatedAt"/);
+    assert.match(patchHalf, /stored\.userId !== existing\.userId\) throw new EntryMovedError\(\)/);
+    // Re-authorized against the RE-READ owner, not the stale copy.
+    assert.match(patchHalf, /const stillOwner = stored\.userId === user\.id/);
+    assert.match(patchHalf, /if \(!stillAllowed\) throw new EntryMovedError\(\)/);
+    // Priced and settled from the re-read owner.
+    assert.match(patchHalf, /readOwnerRatesForUpdate\(client as never, stored\.userId, toNum\)/);
+    assert.match(patchHalf, /settleDayWithinTx\([\s\S]{0,400}?stored\.userId,/);
     assert.match(patchHalf, /stored\.startTime\.getTime\(\) !== existing\.startTime\.getTime\(\)/);
     // CAS on updatedAt: a concurrent write can change endTime, the meal
     // outcome or the attestations WITHOUT moving startTime, and this edit
     // recomputed duration and cost from a copy read before any of that.
     assert.match(patchHalf, /updateMany\(\{[\s\S]{0,160}updatedAt: stored\.updatedAt/);
-    assert.match(patchHalf, /SELECT "startTime", "updatedAt" FROM "TimeEntry"/);
     assert.match(patchHalf, /EntryMovedError/);
-    assert.match(source, /code: "ENTRY_MOVED"/);
+    assert.match(source, /ENTRY_MOVED_CODE = "ENTRY_MOVED"/);
+});
+
+test("the telemetry write is conditional on the owner it was authorized for", () => {
+    const source = readFileSync(
+        path.join(__dirname, "..", "src", "app", "api", "time-entries", "[id]", "route.ts"),
+        "utf8"
+    );
+    // The ownership check runs against a copy read before the write, so an
+    // unconditional update let one worker's phone stamp geofence data onto
+    // somebody else's punch after a reassignment.
+    assert.match(source, /updateMany\(\{\s*\n\s*where: \{ id, userId: user\.id \},/);
+    assert.match(source, /claimed\.count !== 1/);
+    assert.match(source, /no longer yours/);
+    // And it is no longer a bare update() that cannot express the condition.
+    const telemetry = source.slice(source.indexOf("if (hasTelemetry) {"), source.indexOf("// -------- Branch 2"));
+    assert.doesNotMatch(telemetry, /timeEntry\.update\(\{ where: \{ id \}, data \}\)/);
 });
 
 test("the project timeclock actions parse date-only input in the company zone", () => {
@@ -648,7 +671,32 @@ test("DELETE locks every candidate day before the row, and retries once if it mo
     // One retry from a FRESH read, then give up: looping would hold locks while
     // whatever is rewriting the row keeps rewriting it.
     assert.match(deleteHalf, /deleteOnce\(0\)\) === "moved" && \(await deleteOnce\(1\)\) === "moved"/);
-    assert.match(deleteHalf, /code: "ENTRY_MOVED"/);
+    assert.match(deleteHalf, /code: ENTRY_MOVED_CODE/);
+    // MOVEMENT IS OWNER *OR* DAY. Comparing the day alone missed a same-date
+    // A -> B reassignment: the day key was identical, so the guard passed while
+    // the locks held and the settlement about to run still belonged to A.
+    assert.match(deleteHalf, /SELECT "userId", "startTime" FROM "TimeEntry" WHERE "id" = \$1/);
+    assert.match(deleteHalf, /now\.userId !== fresh\.userId \|\|/);
+    assert.match(deleteHalf, /toCompanyDayKey\(now\.startTime\) !== toCompanyDayKey\(fresh\.startTime\)/);
+});
+
+test("deleteEntryAndSettle locks the COMPLETE owner+day set, not just a second day", () => {
+    const source = readFileSync(path.join(__dirname, "..", "src", "lib", "wa-breaks-db.ts"), "utf8");
+    const fn = source.slice(source.indexOf("export async function deleteEntryAndSettle"));
+    const body = fn.slice(0, fn.indexOf("\nexport "));
+    // A day lock is `wa-breaks:<user>:<day>`, so the owner is part of the key.
+    // The old condition compared the DAY only, so a same-date reassignment took
+    // no extra lock at all and then settled the new owner's day while holding
+    // only the old owner's lock.
+    assert.match(body, /const dayLocks = \[\.\.\.new Set\(\[/);
+    assert.match(body, /dayLockKey\(userId, knownDayKey\),/);
+    assert.match(body, /dayLockKey\(victim\.userId, actualDay\),/);
+    assert.match(body, /\]\)\]\.sort\(\)/);
+    // Every key in the set is taken, and re-taking a held one is a no-op.
+    assert.match(body, /for \(const key of dayLocks\)/);
+    assert.doesNotMatch(body, /if \(actualDay !== knownDayKey\) \{/, "the day-only condition is the bug");
+    // Settlement still covers both days.
+    assert.match(body, /for \(const dayKey of new Set\(\[knownDayKey, actualDay\]\)\)/);
 });
 
 test("the project timeclock action never accepts a caller-supplied cost", () => {

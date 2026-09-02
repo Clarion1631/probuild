@@ -46,6 +46,9 @@ class ZeroRateAtWriteError extends Error {
     }
 }
 
+/** Coded refusal so a client can recognise "this row is not what you were shown". */
+const ENTRY_MOVED_CODE = "ENTRY_MOVED";
+
 /** The targeted row moved (or vanished) between the pre-read and the write. */
 class EntryMovedError extends Error {
     constructor() {
@@ -130,7 +133,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         if (Object.keys(data).length === 0) {
             return NextResponse.json({ error: "No telemetry fields supplied" }, { status: 400 });
         }
-        const updated = await prisma.timeEntry.update({ where: { id }, data });
+        // CONDITIONAL on the owner this request was authorized for. The
+        // ownership check above ran against a copy read before this write, so a
+        // reassignment in between would let one worker's phone stamp geofence
+        // data onto somebody else's punch — and telemetry is deliberately
+        // owner-only, even for a manager.
+        const claimed = await prisma.timeEntry.updateMany({
+            where: { id, userId: user.id },
+            data,
+        });
+        if (claimed.count !== 1) {
+            return NextResponse.json(
+                {
+                    error: "That time entry is no longer yours — it moved while this report was in flight.",
+                    code: ENTRY_MOVED_CODE,
+                },
+                { status: 409 }
+            );
+        }
+        const updated = await prisma.timeEntry.findUniqueOrThrow({ where: { id } });
         return NextResponse.json(JSON.parse(JSON.stringify(updated)));
     }
 
@@ -410,15 +431,38 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                 // the moment a concurrent writer moves the punch, and the days
                 // locked above were derived from it.
                 const [stored] = (await client.$queryRawUnsafe(
-                    `SELECT "startTime", "updatedAt" FROM "TimeEntry" WHERE "id" = $1`,
+                    `SELECT "userId", "projectId", "startTime", "endTime", "updatedAt"
+                       FROM "TimeEntry" WHERE "id" = $1`,
                     id
-                )) as Array<{ startTime: Date; updatedAt: Date }>;
+                )) as Array<{
+                    userId: string;
+                    projectId: string;
+                    startTime: Date;
+                    endTime: Date | null;
+                    updatedAt: Date;
+                }>;
+                if (!stored) throw new EntryMovedError();
+
+                // WHO OWNS IT NOW. Everything above — the authorization, the
+                // period check, the pricing target, the day locks — was decided
+                // from a copy read before this transaction opened. A concurrent
+                // reassignment makes every one of those answers about a
+                // different person: the edit would be priced from the OLD
+                // owner's rates, settled onto the OLD owner's day, and allowed
+                // for a crew member who no longer owns the row.
+                if (stored.userId !== existing.userId) throw new EntryMovedError();
+
+                // Re-authorized against the re-read row, not the stale copy.
+                // Same rule as above: your own, or a manager/admin.
+                const stillOwner = stored.userId === user.id;
+                const stillAllowed = stillOwner || user.role === "MANAGER" || user.role === "ADMIN";
+                if (!stillAllowed) throw new EntryMovedError();
 
                 // The OWNER's rate and pay type, re-read and row-locked inside
                 // this transaction. The copy above was read before it, so a
                 // concurrent rate import could set a rate to $0 in between and
                 // this edit would price the shift from the stale value.
-                const liveOwner = await readOwnerRatesForUpdate(client as never, existing.userId, toNum);
+                const liveOwner = await readOwnerRatesForUpdate(client as never, stored.userId, toNum);
                 if (liveOwner && newEnd != null) {
                     if (
                         zeroRateBlocks({
@@ -436,7 +480,6 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                     data.laborCost = (durationHours ?? 0) * liveOwner.hourlyRate;
                     data.burdenCost = (durationHours ?? 0) * liveOwner.burdenRate;
                 }
-                if (!stored) throw new EntryMovedError();
                 if (stored.startTime.getTime() !== existing.startTime.getTime()) {
                     // It moved days. The day locks we hold are for the old day,
                     // so we cannot safely settle — refuse and let the client
@@ -463,7 +506,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             for (const dayKey of days) {
                 const result = await settleDayWithinTx(
                     tx as never,
-                    existing.userId,
+                    // The re-read owner. Settling the stale one would re-plan a
+                    // day belonging to whoever used to hold this punch.
+                    stored.userId,
                     dayKey,
                     newEnd ? { id: existing.id, mealSkipped: mealSkippedForEdit } : null
                 );
@@ -478,7 +523,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             return NextResponse.json(
                 {
                     error: "This entry was changed while you were editing it. Reload and try again.",
-                    code: "ENTRY_MOVED",
+                    code: ENTRY_MOVED_CODE,
                 },
                 { status: 409 }
             );
@@ -535,6 +580,13 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
         });
         if (!fresh) return "ok"; // already gone — deleting is idempotent
 
+        // The COMPLETE day-lock set: the owner/day this row was read at, and
+        // the owner/day it stands at now. Both, because a settlement has to be
+        // able to re-plan whichever day the delete actually removes hours from,
+        // and after a reassignment those are two different people's days.
+        //
+        // Recomputed on every attempt from `fresh`, so the retry locks the
+        // CURRENT owner's day rather than the one that already moved.
         const dayKeys = [...new Set([
             dayLockKey(existing.userId, toCompanyDayKey(existing.startTime)),
             dayLockKey(fresh.userId, toCompanyDayKey(fresh.startTime)),
@@ -548,12 +600,21 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
                 guard: async (tx) => {
                     await assertEntriesUnlockedInTx(tx, [id], { dayKeys });
                     const [now] = (await tx.$queryRawUnsafe(
-                        `SELECT "startTime" FROM "TimeEntry" WHERE "id" = $1`,
+                        `SELECT "userId", "startTime" FROM "TimeEntry" WHERE "id" = $1`,
                         id
-                    )) as Array<{ startTime: Date }>;
-                    // Moved again, into a day we did not lock: bail so the
-                    // outer retry can collect the new day.
-                    if (now && toCompanyDayKey(now.startTime) !== toCompanyDayKey(fresh.startTime)) {
+                    )) as Array<{ userId: string; startTime: Date }>;
+                    if (!now) return; // vanished — the delete is a no-op either way
+                    // MOVEMENT IS OWNER *OR* DAY. Comparing the day alone missed
+                    // the case that matters most: a same-date reassignment from
+                    // A to B leaves the day key identical, so this guard passed
+                    // while the locks held (and the settlement about to run)
+                    // still belonged to A. B's day would never be re-planned and
+                    // never locked. Bail so the outer retry collects the new
+                    // owner's day-lock set.
+                    if (
+                        now.userId !== fresh.userId ||
+                        toCompanyDayKey(now.startTime) !== toCompanyDayKey(fresh.startTime)
+                    ) {
                         throw new EntryMovedError();
                     }
                 },
@@ -570,7 +631,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
             return NextResponse.json(
                 {
                     error: "This entry kept changing while it was being deleted. Reload and try again.",
-                    code: "ENTRY_MOVED",
+                    code: ENTRY_MOVED_CODE,
                 },
                 { status: 409 }
             );
@@ -581,7 +642,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
             return NextResponse.json(
                 {
                     error: "This entry changed while it was being deleted. Reload and try again.",
-                    code: "ENTRY_MOVED",
+                    code: ENTRY_MOVED_CODE,
                 },
                 { status: 409 }
             );

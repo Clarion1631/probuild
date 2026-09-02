@@ -73,6 +73,21 @@ jobs:
       # Production received this migration on 2026-09-02, so the documented
       # deploy command must be a safe no-op against an already-applied database
       # and --dry-run must execute nothing. Proven here, never against prod.
+      # Mutation tests for the VERIFIER: break one thing at a time (RLS off, a
+      # policy added, wrong index columns, a weakened CHECK, an FK back to
+      # CASCADE, a decoy in another schema, a lost NOT NULL) and assert each is
+      # reported. A verifier that cannot fail is not a verifier.
+      - name: Prove the schema-drift verifier reports each kind of drift
+        run: npx tsx --test tests/payroll-schema-drift-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
+      # Concurrent reassignment of a time entry, on two real connections.
+      - name: Prove a reassigned time entry is refused by the conditional writes
+        run: npx tsx --test tests/time-entry-reassign-db.test.ts
+        env:
+          PAYROLL_LOCK_TEST_URL: postgresql://probuild:probuild@localhost:5432/probuild_migrations
+
       - name: Prove the apply script is idempotent and --dry-run is read-only
         run: npx tsx --test tests/payroll-apply-idempotent-db.test.ts
         env:

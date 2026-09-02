@@ -263,12 +263,30 @@ export async function deleteEntryAndSettle(
         const victim = await tx.timeEntry.findUnique({ where: { id: entryId }, select: { userId: true, startTime: true } });
         if (!victim) return; // already gone
         const actualDay = toCompanyDayKey(victim.startTime);
-        if (actualDay !== knownDayKey) {
-            // Moved since the caller read it — take that day's lock as well
-            // (deterministic order: keys sorted, so two deletes cannot deadlock).
-            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, dayLockKey(victim.userId, actualDay));
+
+        // THE COMPLETE SET, keyed on OWNER AND DAY.
+        //
+        // The old condition compared the day alone, so a same-date reassignment
+        // from A to B took no extra lock at all — `actualDay === knownDayKey`
+        // was true — and then settled B's day while holding only A's day lock.
+        // The lock and the settlement were for two different people.
+        //
+        // A day lock is `wa-breaks:<user>:<day>`, so the owner is part of the
+        // key: comparing whole keys is what makes an owner change visible here.
+        // Sorted, so two concurrent deletes take them in the same order.
+        const dayLocks = [...new Set([
+            dayLockKey(userId, knownDayKey),
+            dayLockKey(victim.userId, actualDay),
+        ])].sort();
+        for (const key of dayLocks) {
+            // Re-taking the one acquired above is a no-op: pg_advisory_xact_lock
+            // is re-entrant within a transaction.
+            await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, key);
         }
+
         await tx.timeEntry.delete({ where: { id: entryId } });
+        // Re-plan the day the hours actually left. The caller's day is settled
+        // too when it differs, because the row may have moved off it.
         for (const dayKey of new Set([knownDayKey, actualDay])) {
             await settleDayInTx(tx, victim.userId, dayKey, null);
         }

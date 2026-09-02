@@ -47,88 +47,255 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+/** The schema every object below is expected to live in. Same-named objects elsewhere are NOT this object. */
+export const EXPECTED_SCHEMA = "public";
+
 /**
- * Every object this script is responsible for, as a catalog query.
+ * Every object this script is responsible for, WITH ITS DEFINITION.
  *
- * Used two ways: `--dry-run` reports which of these already exist (and prints
- * "nothing to do" when they all do), and the normal run verifies them after
- * writing. One list, so the dry run and the real run cannot disagree about what
- * "applied" means.
+ * Presence is not correctness. An index can exist on the wrong columns, a CHECK
+ * can be altered to something weaker, a column can come back nullable, RLS can
+ * be switched off, and an object with the right name can be sitting in another
+ * schema entirely — every one of those passes a bare "does it exist" test while
+ * the guarantee it was written for is gone.
+ *
+ * Used two ways: `--dry-run` reports what is missing or drifted (and prints
+ * "nothing to do" when nothing is), and the normal run verifies the same list
+ * after writing. One list, so the dry run and the real run cannot disagree
+ * about what "applied" means.
  */
 export const EXPECTED_OBJECTS = [
-    { kind: "column", table: "User", name: "lastRateSyncAt" },
-    { kind: "column", table: "User", name: "payType" },
+    { kind: "column", table: "User", name: "lastRateSyncAt", type: "timestamp with time zone", nullable: true },
+    { kind: "column", table: "User", name: "payType", type: "text", nullable: true },
+
     { kind: "table", name: "PayrollPeriod" },
-    { kind: "column", table: "PayrollPeriod", name: "timeZone" },
-    { kind: "column", table: "PayrollPeriod", name: "summaryCsvSnapshot" },
-    { kind: "column", table: "PayrollPeriod", name: "detailCsvSnapshot" },
-    { kind: "column", table: "PayrollPeriod", name: "periodStartKey" },
-    { kind: "column", table: "PayrollPeriod", name: "periodEndKey" },
-    { kind: "column", table: "PayrollPeriod", name: "discardedAt" },
-    { kind: "column", table: "PayrollPeriod", name: "discardedById" },
-    { kind: "column", table: "PayrollPeriod", name: "discardedReason" },
-    { kind: "index", name: "PayrollPeriod_periodStart_periodEnd_key" },
-    { kind: "index", name: "PayrollPeriod_periodStartKey_periodEndKey_key" },
-    { kind: "index", name: "PayrollPeriod_lockedAt_idx" },
-    { kind: "index", name: "PayrollPeriod_lockedById_idx" },
-    { kind: "index", name: "PayrollPeriod_discardedAt_idx" },
-    { kind: "index", name: "TimeEntry_startTime_idx" },
+    { kind: "column", table: "PayrollPeriod", name: "periodStart", type: "timestamp with time zone", nullable: false },
+    { kind: "column", table: "PayrollPeriod", name: "periodEnd", type: "timestamp with time zone", nullable: false },
+    { kind: "column", table: "PayrollPeriod", name: "lockedAt", type: "timestamp with time zone", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "timeZone", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "summaryCsvSnapshot", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "detailCsvSnapshot", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "periodStartKey", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "periodEndKey", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "discardedAt", type: "timestamp with time zone", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "discardedById", type: "text", nullable: true },
+    { kind: "column", table: "PayrollPeriod", name: "discardedReason", type: "text", nullable: true },
+
+    // Index COLUMNS, in order — a unique index on the wrong columns enforces the
+    // wrong invariant while looking perfectly healthy.
+    { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_periodStart_periodEnd_key", unique: true, columns: ["periodStart", "periodEnd"] },
+    { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_periodStartKey_periodEndKey_key", unique: true, columns: ["periodStartKey", "periodEndKey"] },
+    { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_lockedAt_idx", unique: false, columns: ["lockedAt"] },
+    { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_idx", unique: false, columns: ["lockedById"] },
+    { kind: "index", table: "PayrollPeriod", name: "PayrollPeriod_discardedAt_idx", unique: false, columns: ["discardedAt"] },
+    { kind: "index", table: "TimeEntry", name: "TimeEntry_startTime_idx", unique: false, columns: ["startTime"] },
+
+    // CHECK expressions, normalised. "exists and is validated" is not enough:
+    // a constraint rewritten to `CHECK (true)` is still present and still valid.
     { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_lockedById_fkey" },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check" },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present" },
-    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked" },
-    { kind: "constraint", table: "User", name: "User_payType_check" },
-    { kind: "column", table: "HelpRequest", name: "submissionId" },
-    { kind: "column", table: "HelpRequest", name: "providerIssueRef" },
-    { kind: "column", table: "HelpRequest", name: "providerState" },
-    { kind: "column", table: "HelpRequest", name: "providerLeaseToken" },
-    { kind: "column", table: "HelpRequest", name: "providerLeaseExpiresAt" },
-    { kind: "index", name: "HelpRequest_userId_submissionId_key" },
-    { kind: "index", name: "HelpRequest_userId_createdAt_idx" },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_range_check", def: ['"periodEnd" > "periodStart"'] },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_keys_present", def: ['"periodStartKey" IS NOT NULL', '"periodEndKey" IS NOT NULL'] },
+    { kind: "constraint", table: "PayrollPeriod", name: "PayrollPeriod_discard_unlocked", def: ['"discardedAt" IS NULL', '"lockedAt" IS NULL'] },
+    { kind: "constraint", table: "User", name: "User_payType_check", def: ["HOURLY", "SALARY"] },
+
+    { kind: "column", table: "HelpRequest", name: "submissionId", type: "text", nullable: true },
+    { kind: "column", table: "HelpRequest", name: "providerIssueRef", type: "text", nullable: true },
+    { kind: "column", table: "HelpRequest", name: "providerState", type: "text", nullable: true },
+    { kind: "column", table: "HelpRequest", name: "providerLeaseToken", type: "text", nullable: true },
+    { kind: "column", table: "HelpRequest", name: "providerLeaseExpiresAt", type: "timestamp with time zone", nullable: true },
+    { kind: "index", table: "HelpRequest", name: "HelpRequest_userId_submissionId_key", unique: true, columns: ["userId", "submissionId"] },
+    { kind: "index", table: "HelpRequest", name: "HelpRequest_userId_createdAt_idx", unique: false, columns: ["userId", "createdAt"] },
+
     { kind: "table", name: "HelpSubmissionQuota" },
-    { kind: "index", name: "HelpSubmissionQuota_userId_hourBucket_key" },
+    { kind: "index", table: "HelpSubmissionQuota", name: "HelpSubmissionQuota_userId_hourBucket_key", unique: true, columns: ["userId", "hourBucket"] },
+
     // Not created by a statement — CONVERTED. 'r' is RESTRICT; 'c' is the old
     // CASCADE that silently destroyed payroll history.
-    { kind: "fk-restrict", table: "TimeEntry", name: "TimeEntry_userId_fkey" },
-    { kind: "fk-restrict", table: "TimeEntry", name: "TimeEntry_projectId_fkey" },
+    { kind: "fk", table: "TimeEntry", name: "TimeEntry_userId_fkey", onDelete: "r" },
+    { kind: "fk", table: "TimeEntry", name: "TimeEntry_projectId_fkey", onDelete: "r" },
+
+    // RLS with ZERO policies is the intended state: it denies everything to any
+    // role that does not bypass RLS. Prisma connects as the table owner (owners
+    // bypass), so the app is unaffected — this only closes the door on a leaked
+    // anon/authenticated key. A policy appearing here would REOPEN it, which is
+    // why the expected count is asserted rather than "at least none".
+    { kind: "rls", table: "PayrollPeriod", policies: 0 },
+    { kind: "rls", table: "User", policies: 0 },
+    { kind: "rls", table: "HelpSubmissionQuota", policies: 0 },
 ];
 
-/** Read-only. Returns the subset of EXPECTED_OBJECTS that is NOT yet present. */
-export async function findMissingObjects(db, expected = EXPECTED_OBJECTS) {
-    const missing = [];
+/** Collapse whitespace so a catalog definition can be compared to a written one. */
+function squash(text) {
+    return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Read-only. Returns everything that is missing OR whose definition has drifted,
+ * as `{ object, reason, actual }`.
+ *
+ * Every lookup is SCHEMA-QUALIFIED. `to_regclass('"User"')` resolves through the
+ * search_path, so a table of the same name in another schema would answer for
+ * the real one — which is exactly how a drift check reports healthy while the
+ * object it is describing is not the one the application uses.
+ */
+export async function findSchemaDrift(db, expected = EXPECTED_OBJECTS, schema = EXPECTED_SCHEMA) {
+    const drift = [];
+    const miss = (object, reason, actual) => drift.push({ object, reason, actual });
+
     for (const object of expected) {
-        let rows;
+        if (object.kind === "table") {
+            const rows = await db.$queryRawUnsafe(
+                `SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2`,
+                schema,
+                object.name
+            );
+            if (rows.length === 0) miss(object, "missing");
+            continue;
+        }
+
         if (object.kind === "column") {
-            rows = await db.$queryRawUnsafe(
-                `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+            const rows = await db.$queryRawUnsafe(
+                `SELECT data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
+                schema,
                 object.table,
                 object.name
             );
-        } else if (object.kind === "table") {
-            rows = await db.$queryRawUnsafe(
-                `SELECT 1 FROM information_schema.tables WHERE table_name = $1`,
+            if (rows.length === 0) {
+                miss(object, "missing");
+                continue;
+            }
+            const [row] = rows;
+            if (object.type && row.data_type !== object.type) {
+                miss(object, `type is ${row.data_type}, expected ${object.type}`, row.data_type);
+                continue;
+            }
+            if (object.nullable !== undefined) {
+                const nullable = row.is_nullable === "YES";
+                if (nullable !== object.nullable) {
+                    miss(object, `nullability is ${nullable}, expected ${object.nullable}`, row.is_nullable);
+                    continue;
+                }
+            }
+            if (object.default !== undefined && squash(row.column_default) !== squash(object.default)) {
+                miss(object, `default is ${row.column_default}, expected ${object.default}`, row.column_default);
+            }
+            continue;
+        }
+
+        if (object.kind === "index") {
+            const rows = await db.$queryRawUnsafe(
+                `SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = $2`,
+                schema,
                 object.name
             );
-        } else if (object.kind === "index") {
-            rows = await db.$queryRawUnsafe(`SELECT 1 FROM pg_indexes WHERE indexname = $1`, object.name);
-        } else if (object.kind === "constraint") {
-            // convalidated: a NOT VALID constraint is not enforced for existing
-            // rows, so an unvalidated one does not count as applied.
-            rows = await db.$queryRawUnsafe(
-                `SELECT 1 FROM pg_constraint WHERE conname = $1 AND conrelid = to_regclass($2) AND convalidated`,
-                object.name,
-                `"${object.table}"`
-            );
-        } else if (object.kind === "fk-restrict") {
-            rows = await db.$queryRawUnsafe(
-                `SELECT 1 FROM pg_constraint WHERE conname = $1 AND conrelid = to_regclass($2) AND confdeltype = 'r'`,
-                object.name,
-                `"${object.table}"`
-            );
+            if (rows.length === 0) {
+                miss(object, "missing");
+                continue;
+            }
+            const indexdef = squash(rows[0].indexdef);
+            // The table it is actually ON — an index of the right name on the
+            // wrong table indexes nothing this script cares about.
+            if (object.table && !new RegExp(`ON ${schema}\\."${object.table}"`).test(indexdef)) {
+                miss(object, `not on ${object.table}`, indexdef);
+                continue;
+            }
+            if (object.unique !== undefined) {
+                const isUnique = /CREATE UNIQUE INDEX/.test(indexdef);
+                if (isUnique !== object.unique) {
+                    miss(object, `unique is ${isUnique}, expected ${object.unique}`, indexdef);
+                    continue;
+                }
+            }
+            if (object.columns) {
+                const inside = indexdef.slice(indexdef.indexOf("("), indexdef.lastIndexOf(")") + 1);
+                const actual = inside
+                    .replace(/^\(|\)$/g, "")
+                    .split(",")
+                    .map((part) => part.trim().replace(/^"|"$/g, "").split(" ")[0].replace(/^"|"$/g, ""));
+                const same =
+                    actual.length === object.columns.length &&
+                    actual.every((column, i) => column === object.columns[i]);
+                if (!same) {
+                    miss(object, `columns are [${actual.join(", ")}], expected [${object.columns.join(", ")}]`, indexdef);
+                }
+            }
+            continue;
         }
-        if (!rows || rows.length === 0) missing.push(object);
+
+        if (object.kind === "constraint" || object.kind === "fk") {
+            const rows = await db.$queryRawUnsafe(
+                `SELECT c.convalidated, c.confdeltype, pg_get_constraintdef(c.oid) AS def
+                   FROM pg_constraint c
+                   JOIN pg_class t ON t.oid = c.conrelid
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
+                  WHERE n.nspname = $1 AND t.relname = $2 AND c.conname = $3`,
+                schema,
+                object.table,
+                object.name
+            );
+            if (rows.length === 0) {
+                miss(object, "missing");
+                continue;
+            }
+            const [row] = rows;
+            // NOT VALID is not enforcement: existing rows are exempt, so prod
+            // would silently disagree with a replay of the same migration.
+            if (!row.convalidated) {
+                miss(object, "NOT VALID — not enforced for existing rows", row.def);
+                continue;
+            }
+            if (object.onDelete && row.confdeltype !== object.onDelete) {
+                miss(object, `ON DELETE is '${row.confdeltype}', expected '${object.onDelete}'`, row.def);
+                continue;
+            }
+            if (object.def) {
+                const def = squash(row.def);
+                const missingParts = object.def.filter((part) => !def.includes(part));
+                if (missingParts.length) {
+                    miss(object, `definition lost: ${missingParts.join(" / ")}`, def);
+                }
+            }
+            continue;
+        }
+
+        if (object.kind === "rls") {
+            const rows = await db.$queryRawUnsafe(
+                `SELECT c.relrowsecurity, c.relforcerowsecurity,
+                        (SELECT count(*)::int FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = $1 AND c.relname = $2`,
+                schema,
+                object.table
+            );
+            if (rows.length === 0) {
+                miss(object, "table missing");
+                continue;
+            }
+            const [row] = rows;
+            if (!row.relrowsecurity) {
+                miss(object, "ROW LEVEL SECURITY is DISABLED", row.relrowsecurity);
+                continue;
+            }
+            if (object.policies !== undefined && row.policies !== object.policies) {
+                // Zero policies IS the deny-all. A policy appearing here reopens
+                // the door a leaked anon key would come through.
+                miss(object, `${row.policies} polic(ies), expected ${object.policies}`, row.policies);
+            }
+            continue;
+        }
+
+        miss(object, `unknown kind ${object.kind}`);
     }
-    return missing;
+
+    return drift;
+}
+
+/** Back-compat name: the dry run and the verifier both want the drift list. */
+export async function findMissingObjects(db, expected = EXPECTED_OBJECTS) {
+    return findSchemaDrift(db, expected);
 }
 
 const STATEMENTS = [
@@ -289,15 +456,17 @@ async function main() {
         // flag and executed every DDL statement regardless, which made "--dry-run"
         // a lie in the one place it mattered most.
         if (dryRun) {
-            const missing = await findMissingObjects(prisma);
-            if (missing.length === 0) {
+            const drift = await findSchemaDrift(prisma);
+            if (drift.length === 0) {
                 console.log(
-                    `[dry-run] nothing to do — all ${EXPECTED_OBJECTS.length} objects this script manages are already present.`
+                    `[dry-run] nothing to do — all ${EXPECTED_OBJECTS.length} objects this script manages are present AND match their expected definitions.`
                 );
             } else {
-                console.log(`[dry-run] ${missing.length} of ${EXPECTED_OBJECTS.length} object(s) would be created or converted:`);
-                for (const object of missing) {
-                    console.log(`[dry-run]   ${object.kind} ${object.table ? object.table + "." : ""}${object.name}`);
+                console.log(`[dry-run] ${drift.length} of ${EXPECTED_OBJECTS.length} object(s) are missing or drifted:`);
+                for (const { object, reason, actual } of drift) {
+                    const label = `${object.kind} ${object.table ? object.table + "." : ""}${object.name ?? object.table}`;
+                    console.log(`[dry-run]   ${label}: ${reason}`);
+                    if (actual !== undefined && reason !== "missing") console.log(`[dry-run]     actual: ${actual}`);
                 }
             }
 
@@ -446,29 +615,27 @@ async function main() {
             `ALTER TABLE "PayrollPeriod" VALIDATE CONSTRAINT "PayrollPeriod_discard_unlocked"`
         );
 
-        const discardBits = await prisma.$queryRawUnsafe(
-            `SELECT column_name AS name FROM information_schema.columns
-              WHERE table_name = 'PayrollPeriod'
-                AND column_name IN ('discardedAt', 'discardedById', 'discardedReason')
-             UNION ALL
-             SELECT indexname FROM pg_indexes
-              WHERE tablename = 'PayrollPeriod' AND indexname = 'PayrollPeriod_discardedAt_idx'
-             UNION ALL
-             SELECT conname FROM pg_constraint
-              WHERE conrelid = '"PayrollPeriod"'::regclass
-                AND conname = 'PayrollPeriod_discard_unlocked'
-                AND convalidated`
+        // ONE verification, against the SAME list the dry run reports on.
+        //
+        // The ad-hoc count checks that used to live here ("5/5 discard bits",
+        // "9/9 columns") only asked whether things EXISTED. An index on the
+        // wrong columns, a CHECK rewritten to something weaker, RLS switched
+        // off, or an object of the right name in another schema all passed
+        // them — which is the same class of miss as the apply-script/migration
+        // divergence this file already carries a test for.
+        const drift = await findSchemaDrift(prisma);
+        if (drift.length > 0) {
+            console.error(`FAILED: ${drift.length} of ${EXPECTED_OBJECTS.length} object(s) are missing or drifted:`);
+            for (const { object, reason, actual } of drift) {
+                const label = `${object.kind} ${object.table ? object.table + "." : ""}${object.name ?? object.table}`;
+                console.error(`  ${label}: ${reason}`);
+                if (actual !== undefined && reason !== "missing") console.error(`    actual: ${actual}`);
+            }
+            process.exit(1);
+        }
+        console.log(
+            `verified ${EXPECTED_OBJECTS.length}/${EXPECTED_OBJECTS.length} objects present and matching their expected definitions (columns, index columns, CHECK expressions, FK ON DELETE, RLS).`
         );
-        console.log(`verified ${discardBits.length}/5 discard columns, index and validated CHECK`);
-        if (discardBits.length !== 5) process.exit(1);
-
-        const cols = await prisma.$queryRawUnsafe(
-            `SELECT table_name, column_name FROM information_schema.columns
-             WHERE (table_name = 'User' AND column_name IN ('lastRateSyncAt','payType'))
-                OR (table_name = 'PayrollPeriod' AND column_name IN ('id','periodStart','periodEnd','lockedAt','lockedById','exportHash','createdAt'))`
-        );
-        console.log(`verified ${cols.length}/9 columns present`);
-        if (cols.length !== 9) process.exit(1);
     } finally {
         await prisma.$disconnect();
     }
