@@ -1165,6 +1165,44 @@ test("deactivation never touches the attribution columns", async () => {
     assert.equal(row?.costCodeSource, "manual");
 });
 
+test("a lowered amount CLEARS an allocation it would strand", () => {
+    // Expense_taxDeductibleBase_check enforces base <= amount - tax in the
+    // database, so a re-sync that drops the amount below an existing allocation
+    // would abort the whole sync transaction — one hand-allocated receipt
+    // taking the entire QBO import down with it.
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 10, taxDeductibleBase: 150 },
+        { ...WRITE, amount: 100 },
+    );
+    assert.equal(plan.data.taxDeductibleBase, null, "100 - 10 = 90 < 150");
+});
+
+test("an allocation the new amount still supports is left alone", () => {
+    const plan = planQboExpenseUpdate(
+        { projectId: "project-1", estimateId: "estimate-1", taxAmount: 10, taxDeductibleBase: 50 },
+        { ...WRITE, amount: 100 },
+    );
+    assert.ok(!("taxDeductibleBase" in plan.data), "90 >= 50, so nothing to clear");
+});
+
+test("clearing a stranded allocation is a real change, not an unchanged pass", async () => {
+    const fake = createFakePrisma([
+        {
+            ...WRITE,
+            id: "expense-1",
+            projectId: "project-1",
+            receiptUrl: null,
+            taxAmount: 10,
+            taxDeductibleBase: 150,
+        } as any,
+    ]);
+    assert.equal(
+        await upsertQboExpense(fake.client, { ...WRITE, qbSyncToken: "1", amount: 100 }),
+        "updated",
+    );
+    assert.equal((fake.rows.get("purchase-1") as any)?.taxDeductibleBase, null);
+});
+
 // ── the cost-code suggester ────────────────────────────────────────────────
 
 const COST_CODE_IDS = new Map([

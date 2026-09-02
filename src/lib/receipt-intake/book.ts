@@ -672,8 +672,13 @@ export async function bookReceipt(row: BookableRow, deps: BookDependencies): Pro
                     // `taxApplied` is the validated figure, read back off the
                     // groups that actually posted. A rejected read is stored
                     // NOWHERE the report can reach: `ReceiptIntake.taxCents`
-                    // keeps the raw value for audit, and a human can set the
-                    // real one through the tax-correction PATCH.
+                    // keeps the raw value for audit, and a bookkeeper supplies
+                    // the real figure through `PATCH /api/expenses/[id]`, which
+                    // accepts `taxAmount` and `taxAtSource` (bounded at 12% of
+                    // the receipt) behind the `financialReports` permission.
+                    // NOT the PUT on that route — PUT is guarded by
+                    // assertExpenseMutableOutsideQbo and every row booked here
+                    // carries a qbPurchaseId.
                     taxAmount: taxApplied > 0 ? taxApplied / 100 : null,
                     taxAtSource: taxApplied > 0,
                     installedAtCustomer: row.installedAtCustomer,

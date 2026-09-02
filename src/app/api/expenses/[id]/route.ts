@@ -254,12 +254,18 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
  * report reads. The correction path therefore could not reach a single row it
  * was built for.
  *
- * The guard is right for PUT and wrong here, and the reason is what these three
- * columns ARE: `installedAtCustomer`, `taxDeductibleBase` and `costCodeId` are
- * ProBuild-only bookkeeping. Nothing syncs them to QuickBooks and nothing in
- * QuickBooks overwrites them, so editing them cannot desynchronise a Purchase.
- * `amount`, `vendor` and `date` would, which is why they are not accepted here
- * at ANY status — this handler touches nothing else, on purpose.
+ * The guard is right for PUT and wrong here, and the reason is what these
+ * columns ARE: `installedAtCustomer`, `taxDeductibleBase`, `taxAmount`,
+ * `taxAtSource` and `costCodeId` are ProBuild-only bookkeeping. Nothing syncs
+ * them to QuickBooks and nothing in QuickBooks overwrites them, so editing them
+ * cannot desynchronise a Purchase. `amount`, `vendor` and `date` would, which is
+ * why they are not accepted here at ANY status.
+ *
+ * `taxAmount`/`taxAtSource` are here because booking now persists ONLY the tax
+ * `buildGroups` accepted — a check, or a nonsense `tax >= total`, lands with no
+ * tax at all. That is the right default (an unvalidated OCR read must not reach
+ * a filing), but it is only half an answer unless a human can supply the real
+ * figure afterwards. This is that path.
  */
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
     try {
@@ -274,6 +280,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             select: {
                 amount: true,
                 taxAmount: true,
+                taxAtSource: true,
                 taxDeductibleBase: true,
                 estimateId: true,
                 projectId: true,
@@ -293,7 +300,9 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // Nothing outside the three ProBuild-only columns. A caller that sends
         // `amount` here is either confused or probing; either way it must be
         // told, not silently ignored.
-        const allowed = new Set(["installedAtCustomer", "taxDeductibleBase", "costCodeId"]);
+        const allowed = new Set([
+            "installedAtCustomer", "taxDeductibleBase", "taxAmount", "taxAtSource", "costCodeId",
+        ]);
         const rejected = Object.keys(body).filter(key => !allowed.has(key));
         if (rejected.length) {
             return NextResponse.json(
@@ -307,10 +316,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
         const editsInstalled = has("installedAtCustomer");
         const editsBase = has("taxDeductibleBase");
+        const editsTaxAmount = has("taxAmount");
+        const editsTaxAtSource = has("taxAtSource");
         const editsCostCode = has("costCodeId");
 
         // The money permission governs anything that lands on a tax return.
-        if ((editsInstalled || editsBase) && !hasPermission(user, "financialReports")) {
+        if ((editsInstalled || editsBase || editsTaxAmount || editsTaxAtSource)
+            && !hasPermission(user, "financialReports")) {
             return NextResponse.json(
                 { error: "Editing tax-deduction fields requires the Financial Reports permission." },
                 { status: 403 },
@@ -332,6 +344,42 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             nextInstalled = raw;
         }
 
+        // A CORRECTED TAX FIGURE, bounded by plausibility. WA's combined rate
+        // tops out around 10.6%; 12% is deliberately loose so a legitimate
+        // receipt is never refused, while a transposed OCR read (a $207 receipt
+        // "with" $207 of tax) still cannot reach a filing. Zero is allowed —
+        // "this receipt had no tax" is an answer a human is entitled to give.
+        const MAX_TAX_RATE = 0.12;
+        let nextTaxAmount: number | null = null;
+        if (editsTaxAmount && body.taxAmount !== null) {
+            const parsed = Number(body.taxAmount);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+                return NextResponse.json(
+                    { error: "taxAmount must be a number >= 0, or null." },
+                    { status: 400 },
+                );
+            }
+            const ceiling = Math.round(Number(expense.amount) * MAX_TAX_RATE * 100) / 100;
+            if (parsed > ceiling) {
+                return NextResponse.json(
+                    { error: `That tax is implausible for a ${Number(expense.amount).toFixed(2)} receipt (max ${ceiling.toFixed(2)}, 12%).` },
+                    { status: 400 },
+                );
+            }
+            nextTaxAmount = parsed;
+        }
+
+        let nextTaxAtSource: boolean | null = null;
+        if (editsTaxAtSource) {
+            if (typeof body.taxAtSource !== "boolean") {
+                return NextResponse.json(
+                    { error: "taxAtSource must be true or false." },
+                    { status: 400 },
+                );
+            }
+            nextTaxAtSource = body.taxAtSource;
+        }
+
         let nextBase: number | null = null;
         if (editsBase && body.taxDeductibleBase !== null) {
             const parsed = Number(body.taxDeductibleBase);
@@ -344,19 +392,37 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             nextBase = parsed;
         }
 
-        // Same invariant as PUT, judged on the row this request leaves behind.
+        // The invariant is about the ROW THIS REQUEST LEAVES BEHIND — which
+        // now includes a tax figure this same request may be changing. Raising
+        // the tax lowers the ceiling, so an untouched base can be invalidated
+        // by a tax-only edit.
         const resultingBase = editsBase
             ? nextBase
             : (expense.taxDeductibleBase === null ? null : Number(expense.taxDeductibleBase));
+        const resultingTax = editsTaxAmount
+            ? (nextTaxAmount ?? 0)
+            : Number(expense.taxAmount ?? 0);
         if (resultingBase !== null) {
-            const ceiling =
-                Math.round((Number(expense.amount) - Number(expense.taxAmount ?? 0)) * 100) / 100;
+            const ceiling = Math.round((Number(expense.amount) - resultingTax) * 100) / 100;
             if (!Number.isFinite(ceiling) || resultingBase > ceiling) {
                 return NextResponse.json(
                     { error: `The deduction base can't exceed the pre-tax receipt total (${ceiling.toFixed(2)}).` },
                     { status: 400 },
                 );
             }
+        }
+
+        // `taxAtSource` asserts "tax was charged on this receipt"; with no tax
+        // figure behind it, it is a claim about nothing and the report filters
+        // it out anyway. Refuse the incoherent pair rather than storing it.
+        const resultingAtSource = editsTaxAtSource
+            ? (nextTaxAtSource as boolean)
+            : Boolean(expense.taxAtSource);
+        if (resultingAtSource && resultingTax <= 0) {
+            return NextResponse.json(
+                { error: "taxAtSource can't be true with no tax amount on the receipt." },
+                { status: 400 },
+            );
         }
 
         let nextCostCodeId: string | null = null;
@@ -395,6 +461,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             data: {
                 ...(editsInstalled ? { installedAtCustomer: nextInstalled } : {}),
                 ...(editsBase ? { taxDeductibleBase: nextBase } : {}),
+                ...(editsTaxAmount ? { taxAmount: nextTaxAmount } : {}),
+                ...(editsTaxAtSource ? { taxAtSource: nextTaxAtSource as boolean } : {}),
                 ...(editsCostCode
                     ? {
                         costCodeId: nextCostCodeId,

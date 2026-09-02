@@ -56,6 +56,28 @@ BEGIN
   END IF;
 END $$;
 
+-- THE DEDUCTION INVARIANT, IN THE DATABASE (Codex round 5, item 4).
+--
+-- `0 <= taxDeductibleBase <= amount - taxAmount` was enforced only by the API
+-- handler that writes it: read the amount, validate, then UPDATE. A QBO re-sync
+-- changing `amount` between those two statements leaves a row the tax report
+-- deliberately TRUSTS — it claims the allocated base verbatim — so an
+-- impossible row becomes an overstated deduction on a state return.
+--
+-- Prisma cannot express a CHECK, so this lives here by hand and is recorded in
+-- prisma/prisma-blind-spots.json; scripts/check-migrations-match.mjs asserts it.
+-- Safe to add: `taxDeductibleBase` is new and every existing row is NULL.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'Expense_taxDeductibleBase_check'
+                    AND conrelid = '"Expense"'::regclass) THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
+      CHECK ("taxDeductibleBase" IS NULL
+             OR ("taxDeductibleBase" >= 0
+                 AND "taxDeductibleBase" <= "amount" - COALESCE("taxAmount", 0)));
+  END IF;
+END $$;
+
 UPDATE "Expense" e SET "projectId" = est."projectId"
 FROM "Estimate" est
 WHERE e."estimateId" = est.id AND e."projectId" IS NULL AND est."projectId" IS NOT NULL;

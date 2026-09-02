@@ -529,6 +529,8 @@ type ExpenseTransaction = {
             qbSyncToken: string | null;
             estimateId: string;
             projectId?: string | null;
+            taxAmount?: unknown;
+            taxDeductibleBase?: unknown;
             amount: unknown;
             vendor: string | null;
             date: Date | null;
@@ -540,7 +542,7 @@ type ExpenseTransaction = {
         }): Promise<unknown>;
         update(args: {
             where: { id: string };
-            data: Partial<QboExpenseWrite>;
+            data: QboExpenseUpdateData;
         }): Promise<unknown>;
         updateMany(args: {
             where: { id: string; projectId: null };
@@ -573,6 +575,13 @@ function datesEqual(left: Date | null, right: Date | null): boolean {
 type ExistingQboExpense =
     NonNullable<Awaited<ReturnType<ExpenseTransaction["expense"]["findUnique"]>>>;
 
+/**
+ * What the main UPDATE may write. `taxDeductibleBase: null` is the ONLY
+ * non-QBO field it can carry, and only to clear an allocation the new amount
+ * would make impossible — see planQboExpenseUpdate.
+ */
+export type QboExpenseUpdateData = Partial<QboExpenseWrite> & { taxDeductibleBase?: null };
+
 export interface QboExpenseUpdatePlan {
     /**
      * The ATTRIBUTION fill, applied by its own statement under a
@@ -585,7 +594,7 @@ export interface QboExpenseUpdatePlan {
      * Everything the main UPDATE may write. NEVER contains `projectId` or
      * `estimateId` — both are attribution and both go in `fill`.
      */
-    data: Partial<QboExpenseWrite>;
+    data: QboExpenseUpdateData;
 }
 
 /**
@@ -611,15 +620,42 @@ export interface QboExpenseUpdatePlan {
  * path, not for an import.
  */
 export function planQboExpenseUpdate(
-    existing: Pick<ExistingQboExpense, "projectId" | "estimateId">,
+    existing: Pick<ExistingQboExpense, "projectId" | "estimateId"> &
+        Partial<Pick<ExistingQboExpense, "taxAmount" | "taxDeductibleBase">>,
     write: QboExpenseWrite,
 ): QboExpenseUpdatePlan {
     const existingProjectId = existing.projectId ?? null;
     const incomingProjectId = write.projectId ?? null;
 
-    const data: Partial<QboExpenseWrite> = { ...write };
+    const data: QboExpenseUpdateData = { ...write };
     delete data.projectId;
     delete data.estimateId;
+
+    // A LOWERED AMOUNT MUST NOT STRAND A DEDUCTION ALLOCATION.
+    //
+    // `Expense_taxDeductibleBase_check` enforces
+    // `base <= amount - COALESCE(taxAmount, 0)` in the database, so a re-sync
+    // that drops the amount below an existing allocation would abort the whole
+    // sync transaction on a constraint violation — one hand-allocated receipt
+    // taking the entire QBO import down with it.
+    //
+    // Clearing the allocation is the right resolution and not merely the
+    // convenient one: the allocation was a human's split of a receipt that no
+    // longer has those numbers, so it is stale by definition. It reverts to
+    // NULL ("the whole pre-tax total"), and because the report counts only rows
+    // a human flagged `installedAtCustomer`, the correction is visible rather
+    // than silently generous.
+    const existingBase =
+        existing.taxDeductibleBase === null || existing.taxDeductibleBase === undefined
+            ? null
+            : Number(existing.taxDeductibleBase);
+    if (existingBase !== null) {
+        const ceiling =
+            Math.round((write.amount - Number(existing.taxAmount ?? 0)) * 100) / 100;
+        if (!Number.isFinite(ceiling) || existingBase > ceiling) {
+            data.taxDeductibleBase = null;
+        }
+    }
 
     if (existingProjectId !== null) return { fill: null, data };
 
@@ -645,6 +681,8 @@ export function planQboExpenseUpdate(
 function planIsNoop(existing: ExistingQboExpense, plan: QboExpenseUpdatePlan): boolean {
     if (plan.fill !== null) return false;
     const data = plan.data;
+    // Clearing a stranded allocation is a real change, even when nothing else moved.
+    if (data.taxDeductibleBase === null && existing.taxDeductibleBase != null) return false;
     if (data.qbSyncToken !== undefined && existing.qbSyncToken !== data.qbSyncToken) return false;
     if (data.amount !== undefined && Number(existing.amount) !== data.amount) return false;
     if (data.vendor !== undefined && existing.vendor !== data.vendor) return false;
@@ -684,6 +722,8 @@ export async function upsertQboExpense(
                 qbSyncToken: true,
                 estimateId: true,
                 projectId: true,
+                taxAmount: true,
+                taxDeductibleBase: true,
                 amount: true,
                 vendor: true,
                 date: true,

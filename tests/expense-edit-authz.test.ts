@@ -105,6 +105,7 @@ beforeEach(() => {
         qbPurchaseId: null,
         amount: 207.74,
         taxAmount: 16.55,
+        taxAtSource: true,
         taxDeductibleBase: null,
         estimateId: "est-job-1",
         projectId: "job-1",
@@ -220,6 +221,51 @@ test("PATCH enforces the deduction ceiling", async () => {
     // 207.74 gross − 16.55 tax = 191.19.
     assert.equal((await patch({ taxDeductibleBase: 191.20 })).status, 400);
     assert.equal((await patch({ taxDeductibleBase: 191.19 })).status, 200);
+});
+
+test("PATCH can supply the tax a rejected OCR read left behind", async () => {
+    // Booking now stores only the tax buildGroups accepted, so a check or a
+    // nonsense read lands with none. Without this path the receipt could never
+    // reach the filing report at all.
+    storedExpense = { ...storedExpense, qbPurchaseId: "qb-1", taxAmount: null, taxAtSource: false };
+    const res = await patch({ taxAmount: 16.55, taxAtSource: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, 16.55);
+    assert.equal(updateArgs?.data.taxAtSource, true);
+});
+
+test("PATCH refuses an implausible tax rather than storing it", async () => {
+    // The transposed-OCR shape: a $207.74 receipt "with" $207.74 of tax. 12% of
+    // 207.74 is 24.93.
+    storedExpense = { ...storedExpense, taxAmount: null, taxAtSource: false };
+    const res = await patch({ taxAmount: 207.74 });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /implausible/);
+    assert.equal((await patch({ taxAmount: 24.93 })).status, 200, "the ceiling itself is allowed");
+    assert.equal((await patch({ taxAmount: 24.94 })).status, 400);
+    assert.equal((await patch({ taxAmount: -1 })).status, 400);
+    assert.equal((await patch({ taxAmount: 0 })).status, 200, "zero tax is a real answer");
+});
+
+test("taxAtSource cannot claim tax that is not there", async () => {
+    storedExpense = { ...storedExpense, taxAmount: null, taxAtSource: false };
+    assert.equal((await patch({ taxAtSource: true })).status, 400);
+    assert.equal((await patch({ taxAtSource: true, taxAmount: 10 })).status, 200);
+    assert.equal((await patch({ taxAtSource: "yes" })).status, 400);
+});
+
+test("raising the tax re-checks an allocation this request never mentioned", async () => {
+    // The ceiling is amount - tax, so a tax-only edit can invalidate a base
+    // that was legal a moment ago.
+    storedExpense = { ...storedExpense, taxDeductibleBase: 200 };
+    assert.equal((await patch({ taxAmount: 20 })).status, 400, "207.74 - 20 = 187.74 < 200");
+    assert.equal((await patch({ taxAmount: 5 })).status, 200, "207.74 - 5 = 202.74 >= 200");
+});
+
+test("the tax fields need financialReports too", async () => {
+    currentUser = { id: "u6", role: "MANAGER", permissions: { timeClock: true }, projectIds: ["job-1"] };
+    assert.equal((await patch({ taxAmount: 10 })).status, 403);
+    assert.equal((await patch({ taxAtSource: false })).status, 403);
 });
 
 // ── item 8: DELETE gets the same gate ──────────────────────────────────────

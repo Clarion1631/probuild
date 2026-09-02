@@ -314,9 +314,19 @@ return. As built:
 * `/reports/tax-paid-at-source` counts ONLY an explicit `true`;
 * `Expense.taxDeductibleBase` (added in this PR) holds the resold portion of a MIXED
   receipt, and the report uses it in place of the pre-tax total when it is set;
-* the correction path is `PUT /api/expenses/[id]`, which accepts `installedAtCustomer` and
-  `taxDeductibleBase` (validated `0 ≤ base ≤ amount − taxAmount` against the ROW the request
-  leaves behind) and requires the `financialReports` permission on top of project access.
+* the correction path is **`PATCH /api/expenses/[id]`**, NOT the PUT on that route. PUT is
+  guarded by `assertExpenseMutableOutsideQbo`, and every expense the pipeline books carries a
+  `qbPurchaseId` — so PUT cannot reach a single row the tax report is made of, and it now
+  rejects these fields outright rather than appearing to accept them. PATCH edits ONLY
+  `installedAtCustomer`, `taxDeductibleBase`, `taxAmount`, `taxAtSource` and `costCodeId`
+  (all ProBuild-only: nothing syncs them to QuickBooks), requires the `financialReports`
+  permission on top of project access, and validates `0 ≤ base ≤ amount − taxAmount` plus
+  `0 ≤ taxAmount ≤ 12% of amount` against the ROW the request leaves behind. The invariant is
+  ALSO a database CHECK (`Expense_taxDeductibleBase_check`), because a concurrent QBO sync
+  could otherwise strand it between the handler's read and its write.
+* booking persists only the tax `buildGroups` accepted, so a check or a nonsense
+  `tax >= total` lands with NO tax and stays out of the report until a human supplies the
+  real figure through that PATCH.
 
 The mobile PR must therefore ship the toggle as a real three-state question, not as a
 pre-answered switch, and `overheadProjectId` on `/api/mobile/me` is now only a UI hint for
@@ -362,7 +372,14 @@ Re-run after `--apply` must report 0 changes (backfill-estimate-item-cost-codes 
   pattern as the sibling reports pages.
 - Data: expenses where `taxAtSource = true AND installedAtCustomer = true AND
   taxAmount > 0` (all three POSITIVE — a NULL `installedAtCustomer` is "nobody said" and is
-  never claimed), grouped by month (from `date`, company timezone) × project
+  never claimed), grouped by month (from `date`, company timezone) × project.
+  **DEPENDENCY ON PHASE 1:** the report treats `Expense.date` as a COMPANY-TIMEZONE calendar
+  day — it filters on company-midnight bounds and buckets with `dayKeyInTimeZone`. That is
+  only correct if the value was stored as company-local midnight for the receipt's calendar
+  day. Phase 1 owns that write (`ReceiptIntake.txnDate` is `@db.Date`, which Prisma returns
+  as UTC midnight, and `book.ts` copies it into the timestamp column); storing UTC midnight
+  would shift every Pacific receipt one day earlier and drop the first day of a quarter. The
+  fix lives on the Phase 1 branch and lands here on rebase
   (`resolveExpenseProjectId`), summing `taxAmount`. Columns: Month, Job, Receipts (count),
   Taxable amount (Σ `amount` — see risk 1), Tax paid at source (Σ `taxAmount`). Month and
   grand totals. Period filter, default current quarter. CSV export mirroring the existing

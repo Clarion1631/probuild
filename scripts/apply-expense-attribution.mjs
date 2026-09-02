@@ -95,6 +95,22 @@ BEGIN
   END IF;
 END $$`,
 
+    // THE DEDUCTION INVARIANT, IN THE DATABASE (Codex round 5, item 4).
+    // Enforced only by the API handler before this: read the amount, validate,
+    // then UPDATE. A QBO re-sync changing `amount` between those two statements
+    // leaves a row the tax report TRUSTS verbatim. Prisma cannot express a
+    // CHECK, so it is hand-written here and in prisma-blind-spots.json.
+    `DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'Expense_taxDeductibleBase_check'
+                    AND conrelid = '"Expense"'::regclass) THEN
+    ALTER TABLE "Expense" ADD CONSTRAINT "Expense_taxDeductibleBase_check"
+      CHECK ("taxDeductibleBase" IS NULL
+             OR ("taxDeductibleBase" >= 0
+                 AND "taxDeductibleBase" <= "amount" - COALESCE("taxAmount", 0)));
+  END IF;
+END $$`,
+
     // The backfill. Idempotent by predicate, and a no-op on an empty database.
     `UPDATE "Expense" e SET "projectId" = est."projectId"
      FROM "Estimate" est
@@ -138,6 +154,18 @@ export const expectedConstraints = [
             /REFERENCES "?Project"?\(id\)/,
             /ON UPDATE CASCADE/,
             /ON DELETE SET NULL/,
+        ],
+    },
+];
+
+export const expectedCheckConstraints = [
+    {
+        name: "Expense_taxDeductibleBase_check",
+        table: "Expense",
+        mustMatch: [
+            /"taxDeductibleBase" IS NULL/,
+            /"taxDeductibleBase" >= \(?0/,
+            /"amount" - COALESCE\("taxAmount"/,
         ],
     },
 ];
@@ -213,6 +241,25 @@ async function main() {
                 }
             }
             console.log(`verified constraint ${name}: ${row.def}`);
+        }
+        for (const { name, table, mustMatch } of expectedCheckConstraints) {
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+                  WHERE conname = $1 AND conrelid = $2::regclass`,
+                name, `"${table}"`,
+            );
+            if (!row) {
+                console.error(`VERIFY FAILED: check constraint ${name} missing on ${table}`);
+                process.exit(1);
+            }
+            for (const pattern of mustMatch) {
+                if (!pattern.test(row.def)) {
+                    console.error(`VERIFY FAILED: ${name} does not match ${pattern}
+  actual: ${row.def}`);
+                    process.exit(1);
+                }
+            }
+            console.log(`verified check constraint ${name}: ${row.def}`);
         }
         for (const { name, table } of expectedIndexes) {
             const [row] = await prisma.$queryRawUnsafe(

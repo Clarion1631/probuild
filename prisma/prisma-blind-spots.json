@@ -45,11 +45,6 @@
   ],
   "checkConstraints": [
     {
-      "name": "BankImageMatch_target_present",
-      "table": "\"BankImageMatch\"",
-      "def": "CHECK (((\"bankLineId\" IS NOT NULL) OR (\"qbTxnId\" IS NOT NULL)))"
-    },
-    {
       "name": "BankImage_amountCents_check",
       "table": "\"BankImage\"",
       "def": "CHECK (((\"amountCents\" IS NULL) OR (\"amountCents\" >= 0)))"
@@ -63,6 +58,16 @@
       "name": "BankImage_kind_check",
       "table": "\"BankImage\"",
       "def": "CHECK ((kind = ANY (ARRAY['CHECK_FRONT'::text, 'CHECK_BACK'::text, 'DEPOSIT_SLIP'::text, 'DEPOSIT_PHOTO'::text])))"
+    },
+    {
+      "name": "BankImageMatch_target_present",
+      "table": "\"BankImageMatch\"",
+      "def": "CHECK (((\"bankLineId\" IS NOT NULL) OR (\"qbTxnId\" IS NOT NULL)))"
+    },
+    {
+      "name": "BankLine_state_check",
+      "table": "\"BankLine\"",
+      "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
     },
     {
       "name": "BankLineItem_source_check",
@@ -80,9 +85,14 @@
       "def": "CHECK ((((source = 'STATEMENT'::text) AND (\"statementImportId\" IS NOT NULL) AND (\"bankLineId\" IS NOT NULL)) OR ((source = 'QBO_REGISTER'::text) AND (\"statementImportId\" IS NULL))))"
     },
     {
-      "name": "BankLine_state_check",
-      "table": "\"BankLine\"",
-      "def": "CHECK ((state = ANY (ARRAY['POSTED'::text, 'EVIDENCE_FOUND'::text, 'TRANSACTION_CREATED'::text, 'ATTACHMENT_CONFIRMED'::text, 'MATCHED'::text, 'JOB_CODED'::text, 'TAX_VALIDATED'::text, 'EXCEPTION'::text])))"
+      "name": "chk_client_message_one_owner",
+      "table": "\"ClientMessage\"",
+      "def": "CHECK (((((\"leadId\" IS NOT NULL))::integer + ((\"projectId\" IS NOT NULL))::integer) = 1))"
+    },
+    {
+      "name": "Expense_taxDeductibleBase_check",
+      "table": "\"Expense\"",
+      "def": "CHECK (((\"taxDeductibleBase\" IS NULL) OR ((\"taxDeductibleBase\" >= (0)::numeric) AND (\"taxDeductibleBase\" <= (\"amount\" - COALESCE(\"taxAmount\", (0)::numeric))))))"
     },
     {
       "name": "Inspection_required_date_check",
@@ -143,11 +153,6 @@
       "name": "StatementImport_status_check",
       "table": "\"StatementImport\"",
       "def": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'FINALIZED'::text, 'FAILED'::text])))"
-    },
-    {
-      "name": "chk_client_message_one_owner",
-      "table": "\"ClientMessage\"",
-      "def": "CHECK (((((\"leadId\" IS NOT NULL))::integer + ((\"projectId\" IS NOT NULL))::integer) = 1))"
     }
   ],
   "rlsTables": [
