@@ -28,6 +28,8 @@ export interface TaxPhaseExpense {
     installedAtCustomer: boolean | null;
     taxDeductibleBase: number | null;
     needsTaxReview: boolean;
+    /** null | "ocr" | "manual" | "manual-none" — see expense-attribution.ts. */
+    taxSource: string | null;
     costCodeId: string | null;
 }
 
@@ -64,6 +66,10 @@ export default function TaxPhaseModal({
     const [base, setBase] = useState<string>(
         expense.taxDeductibleBase === null ? "" : String(expense.taxDeductibleBase),
     );
+    // WHICH KIND OF BLANK the tax field is (round 19, item 2). A blank on its
+    // own means "I do not know", which is where the row already is; saying
+    // there is NO tax is a decision and has to be made deliberately.
+    const [taxKnown, setTaxKnown] = useState(expense.taxSource === "manual-none");
     const [costCodeId, setCostCodeId] = useState<string>(expense.costCodeId ?? "");
     // Only meaningful on a flagged row: the explicit "I have re-checked these
     // figures" the server requires before it will clear the flag.
@@ -84,11 +90,32 @@ export default function TaxPhaseModal({
         // Only what actually changed. The endpoint refuses unknown keys, and
         // sending a field back unchanged would stamp provenance on it for no
         // reason.
+        // NOTHING NON-FINITE LEAVES THIS FORM. `Number("1e999")` is Infinity
+        // and `Number("1.2.3")` is NaN; JSON.stringify turns both into `null`,
+        // which the server would read as a deliberate "no tax". Caught here so
+        // the person sees the field they mistyped, and caught again on the
+        // server because this is not the only caller.
+        const badNumber = (raw: string) => raw.trim() !== "" && !Number.isFinite(Number(raw));
+        if (badNumber(taxAmount)) {
+            toast.error("The tax amount must be a number.");
+            return;
+        }
+        if (badNumber(base)) {
+            toast.error("The deductible amount must be a number.");
+            return;
+        }
+
         const body: Record<string, unknown> = {};
         const nextInstalled = installed === "unknown" ? null : installed === "yes";
         if (nextInstalled !== expense.installedAtCustomer) body.installedAtCustomer = nextInstalled;
-        if (parsedTax !== expense.taxAmount) {
+        const taxStateChanged =
+            parsedTax !== expense.taxAmount ||
+            (parsedTax === null && taxKnown !== (expense.taxSource === "manual-none"));
+        if (taxStateChanged) {
             body.taxAmount = parsedTax;
+            // WHICH BLANK this is. Only sent alongside the amount, because on
+            // its own it is not an edit.
+            if (parsedTax === null) body.taxKnown = taxKnown;
             // `taxAtSource` is the factual "tax was charged here"; it follows
             // the figure rather than being a second thing to get wrong. SIGNED:
             // a return carries negative tax and the fact still holds.
@@ -107,7 +134,10 @@ export default function TaxPhaseModal({
         // numbers, which is what makes the confirmation mean something.
         if (expense.needsTaxReview && reviewAck) {
             body.taxReviewAck = true;
+            // BOTH figures, changed or not: the server requires both keys on a
+            // flagged row, because the flag is about the whole classification.
             body.taxAmount = parsedTax;
+            if (parsedTax === null) body.taxKnown = taxKnown;
             body.taxAtSource = taxIsAtSource(parsedTax);
             body.taxDeductibleBase = nextBase;
         }
@@ -214,9 +244,36 @@ export default function TaxPhaseModal({
                     <span className="text-xs text-hui-textMuted">
                         {isCredit
                             ? `This is a refund, so enter the tax as a negative, down to -${money(taxCeiling)} (12% of the receipt).`
-                            : `Up to ${money(taxCeiling)} (12% of the receipt).`}{" "}
-                        Leave blank if the read was wrong and you don&apos;t know the figure.
+                            : `Up to ${money(taxCeiling)} (12% of the receipt).`}
                     </span>
+                    {/*
+                      * A BLANK FIELD IS AMBIGUOUS, so the form asks which blank
+                      * it is. "I do not know" is where the row already sits and
+                      * changes nothing; "no tax on this receipt" is a decision
+                      * the pipeline may never overwrite.
+                      */}
+                    {parsedTax === null && (
+                        <div className="flex flex-col gap-1 pt-1">
+                            <label className="flex items-center gap-2 text-xs text-hui-textMuted">
+                                <input
+                                    type="radio"
+                                    name="tax-blank-meaning"
+                                    checked={!taxKnown}
+                                    onChange={() => setTaxKnown(false)}
+                                />
+                                <span>Tax unknown — nobody has read it yet</span>
+                            </label>
+                            <label className="flex items-center gap-2 text-xs text-hui-textMuted">
+                                <input
+                                    type="radio"
+                                    name="tax-blank-meaning"
+                                    checked={taxKnown}
+                                    onChange={() => setTaxKnown(true)}
+                                />
+                                <span>No tax on this receipt — I checked</span>
+                            </label>
+                        </div>
+                    )}
                 </label>
 
                 <label className="block space-y-1">

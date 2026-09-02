@@ -1231,6 +1231,9 @@ const COST_CODE_IDS = new Map([
 
 type StoredForSuggestion = {
     projectId: string | null;
+    // The locked re-resolve reads the job off this estimate when the row has
+    // no projectId of its own (round 19, item 4).
+    estimateId: string;
     costCodeId: string | null;
     costCodeSource: string | null;
     // The suggestion reads the PERSISTED text, so the stub has to carry it.
@@ -1243,6 +1246,7 @@ type StoredForSuggestion = {
 
 const STORED_DEFAULT: StoredForSuggestion = {
     projectId: "project-1",
+    estimateId: "estimate-1",
     costCodeId: null,
     costCodeSource: null,
     vendor: "Summit Plumbing",
@@ -2093,4 +2097,104 @@ test("a refund's ALLOCATION is judged on magnitude too", () => {
     );
     assert.equal(stranded.data.taxDeductibleBase, null);
     assert.equal(stranded.data.needsTaxReview, true);
+});
+
+// ── the suggester resolves the job INSIDE its transaction (round 19, item 4) ─
+
+/** A suggestion client that can open a transaction, with a scripted world. */
+function suggestionTxClient(world: {
+    stored: StoredForSuggestion;
+    estimateProject: string | null;
+    phaseOk?: boolean;
+    onEstimateRead?: () => void;
+}) {
+    const writes: any[] = [];
+    const client: any = {
+        async $transaction(run: (tx: any) => Promise<unknown>) { return run(client); },
+        async $queryRawUnsafe(query: string, ...args: unknown[]) {
+            if (/FROM "Estimate" WHERE id/.test(query) && /"projectId"/.test(query)) {
+                world.onEstimateRead?.();
+                return [{ projectId: world.estimateProject }];
+            }
+            if (/FOR SHARE/.test(query)) return [];
+            if (/FROM "Project" WHERE id/.test(query)) return [{ id: args[0], status: "In Progress" }];
+            if (/FROM "CostCode" WHERE id/.test(query)) {
+                return [{ id: args[0], code: "03-PLUMB", isActive: true }];
+            }
+            if (/FROM "EstimateItem"/.test(query)) return world.phaseOk === false ? [] : [{ ok: 1 }];
+            return [];
+        },
+        expense: {
+            async findUnique() { return world.stored; },
+            async updateMany(args: any) { writes.push(args); return { count: 1 }; },
+        },
+    };
+    return { client, writes };
+}
+
+test("a FALLBACK-attributed row is scoped by the estimate read under lock", async () => {
+    const { client, writes } = suggestionTxClient({
+        stored: {
+            ...(STORED_DEFAULT as object), projectId: null, estimateId: "estimate-1",
+            estimate: { projectId: "project-1" },
+        } as StoredForSuggestion,
+        estimateProject: "project-1",
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "written",
+    );
+    // The write is pinned to the job the decision was made for.
+    assert.equal(writes[0].where.projectId, null);
+    assert.deepEqual(writes[0].where.estimate, { is: { projectId: "project-1" } });
+});
+
+test("an estimate REASSIGNED mid-suggestion is not coded for its old job", async () => {
+    // The read that produced `projectId` happened on the global client; the
+    // estimate moves before the transaction resolves it again. Coding the row
+    // now would apply a phase list belonging to a job it is no longer on.
+    const { client, writes } = suggestionTxClient({
+        stored: {
+            ...(STORED_DEFAULT as object), projectId: null, estimateId: "estimate-1",
+            estimate: { projectId: "project-1" },
+        } as StoredForSuggestion,
+        // The locked read is the first to see the move.
+        estimateProject: "project-2",
+        phaseOk: false,   // 03-PLUMB is not a phase of the job it moved to
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "phase-not-on-project",
+    );
+    assert.equal(writes.length, 0, "nothing is written on the old job's reasoning");
+});
+
+test("an estimate that lost its project mid-suggestion is skipped", async () => {
+    const { client, writes } = suggestionTxClient({
+        stored: {
+            ...(STORED_DEFAULT as object), projectId: null, estimateId: "estimate-1",
+            estimate: { projectId: "project-1" },
+        } as StoredForSuggestion,
+        estimateProject: null,
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "skipped-no-project",
+    );
+    assert.equal(writes.length, 0);
+});
+
+test("a row with its OWN projectId needs no estimate read at all", async () => {
+    let estimateReads = 0;
+    const { client, writes } = suggestionTxClient({
+        stored: { ...(STORED_DEFAULT as object) } as StoredForSuggestion,
+        estimateProject: "project-1",
+        onEstimateRead: () => { estimateReads += 1; },
+    });
+    assert.equal(
+        await applyQboExpenseCostCodeSuggestion(client, { qbPurchaseId: "purchase-1" }, COST_CODE_IDS),
+        "written",
+    );
+    assert.equal(estimateReads, 0, "the column answers for itself");
+    assert.equal(writes[0].where.projectId, "project-1");
 });

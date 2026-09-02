@@ -8,9 +8,11 @@ import {
     assertExpenseMutableOutsideQbo,
 } from "@/lib/qbo-expense-guard";
 import {
+    expenseStillOnProjectWhere,
     isPlausibleReceiptTax,
     maxPlausibleTaxAmount,
     resolveExpenseProjectId,
+    resolveExpenseProjectUnderLock,
     taxIsAtSource,
 } from "@/lib/expense-attribution";
 import { lockExpense } from "@/lib/expense-lock";
@@ -41,6 +43,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
             select: {
                 qbPurchaseId: true,
                 projectId: true,
+                estimateId: true,
                 estimate: { select: { projectId: true } },
             },
         });
@@ -54,9 +57,44 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
 
-        await prisma.expense.deleteMany({ where: { id, qbPurchaseId: null } });
+        // AND AGAIN, UNDER LOCK, FOR A FALLBACK-ATTRIBUTED ROW (round 19, item 3).
+        //
+        // A row with no `projectId` answers through its estimate, and somebody
+        // can move that estimate to another job between the check above and
+        // this delete. The row would then be destroyed under a permission that
+        // was granted for a job it is no longer on.
+        const removed = await prisma.$transaction(async tx => {
+            const locked = await resolveExpenseProjectUnderLock(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                expense,
+            );
+            if (!locked || !canAccessProject(user, locked)) return { count: 0, denied: true } as const;
+            const result = await tx.expense.deleteMany({
+                where: {
+                    id,
+                    qbPurchaseId: null,
+                    // The predicate carries the answer, so a row that moved in
+                    // the gap matches nothing rather than being deleted.
+                    ...expenseStillOnProjectWhere(expense, locked),
+                },
+            });
+            return { count: result.count, denied: false } as const;
+        });
+        if (removed.denied) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        if (removed.count === 0) {
+            // The row moved (or a QBO id appeared) between the read and the
+            // delete. Reporting success would tell the caller their row is gone
+            // when it is not.
+            return NextResponse.json(
+                {
+                    error: "This expense changed while you were deleting it. Reopen it and try again.",
+                    code: "EXPENSE_REATTRIBUTED",
+                },
+                { status: 409 },
+            );
+        }
 
-        return NextResponse.json({ success: true });
+        return NextResponse.json({ success: true, deleted: removed.count });
     } catch (error) {
         if (error instanceof QboManagedExpenseError) {
             return NextResponse.json({ error: error.message }, { status: 409 });
@@ -266,16 +304,28 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
         // Same reason as the POST and the PATCH: the check above holds nothing,
         // and this route stamps "manual", which no automated pass may correct.
         const legacyWrite = await prisma.$transaction(async tx => {
+            // The same locked re-resolve as the DELETE: this route stamps
+            // "manual" and rewrites the amount, and a fallback-attributed row
+            // can change jobs between the authorization above and this write.
+            const lockedProjectId = await resolveExpenseProjectUnderLock(
+                tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
+                expense,
+            );
+            if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
+                return { expense: null, phaseRejected: null, denied: "forbidden" } as const;
+            }
             if (editsCostCode && nextCostCodeId) {
                 const verdict = await assertPhaseOfProjectTx(
                     tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> },
                     resolveExpenseProjectId(expense),
                     nextCostCodeId,
                 );
-                if (!verdict.ok) return { expense: null, phaseRejected: verdict.reason } as const;
+                if (!verdict.ok) {
+                    return { expense: null, phaseRejected: verdict.reason, denied: null } as const;
+                }
             }
-            const updated = await tx.expense.update({
-            where: { id },
+            const written = await tx.expense.updateMany({
+            where: { id, ...expenseStillOnProjectWhere(expense, lockedProjectId) },
             data: {
                 amount: nextAmount,
                 vendor: has("vendor") ? (body.vendor || null) : undefined,
@@ -295,8 +345,24 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
                     : {}),
             },
             });
-            return { expense: updated, phaseRejected: null } as const;
+            if (written.count === 0) {
+                return { expense: null, phaseRejected: null, denied: "moved" } as const;
+            }
+            const updated = await tx.expense.findUnique({ where: { id } });
+            return { expense: updated, phaseRejected: null, denied: null } as const;
         });
+        if (legacyWrite.denied === "forbidden") {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (legacyWrite.denied) {
+            return NextResponse.json(
+                {
+                    error: "This expense moved to another job while you were editing it.",
+                    code: "EXPENSE_REATTRIBUTED",
+                },
+                { status: 409 },
+            );
+        }
         if (legacyWrite.phaseRejected) {
             return NextResponse.json(
                 {
@@ -390,8 +456,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // told, not silently ignored.
         const allowed = new Set([
             "installedAtCustomer", "taxDeductibleBase", "taxAmount", "taxAtSource", "costCodeId",
-            // Not a column: the explicit "I have re-checked this flagged row"
-            // acknowledgement. See the needsTaxReview rule below.
+            // Not a column: which of the two things a NULL taxAmount means.
+            // `taxKnown: false` is "I do not know what the tax was", which is
+            // the state the pipeline starts in; `taxKnown: true` alongside a
+            // null amount is "I looked, and there is none". See below.
+            "taxKnown",
+            // Not a column either: the explicit "I have re-checked this flagged
+            // row" acknowledgement. See the needsTaxReview rule below.
             "taxReviewAck",
         ]);
         const rejected = Object.keys(body).filter(key => !allowed.has(key));
@@ -448,6 +519,28 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // A blank `taxDeductibleBase` is fine either way — the server computes
         // and stores the whole pre-tax total below rather than leaving a null
         // whose meaning has to be remembered by every reader.
+        // A NULL TAX AMOUNT IS TWO DIFFERENT ANSWERS, and the payload has to
+        // say which (round 19, item 2):
+        //
+        //   * `{ taxAmount: null, taxKnown: false }` — "I do not know what the
+        //     tax on this receipt was". That is where the row already is, so it
+        //     changes no provenance, keeps any review flag up, and CANNOT
+        //     acknowledge a review: there is nothing to certify.
+        //   * `{ taxAmount: null, taxKnown: true }` — "I looked; there is no
+        //     sales tax on this receipt". A decision, recorded as
+        //     `manual-none`, and a complete answer to a review.
+        //
+        // `taxKnown` defaults to TRUE when the key is absent, because the only
+        // caller that sends a bare `taxAmount: null` today is a bookkeeper
+        // clearing a figure — and the modal now always says which it means.
+        if (has("taxKnown") && typeof body.taxKnown !== "boolean") {
+            return NextResponse.json(
+                { error: "taxKnown must be true or false." },
+                { status: 400 },
+            );
+        }
+        const taxIsUnknown = editsTaxAmount && body.taxAmount === null && body.taxKnown === false;
+
         const acknowledgesReview = body.taxReviewAck === true;
         if (acknowledgesReview) {
             const gross = Number(expense.amount);
@@ -459,14 +552,33 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
                     Math.abs(parsed) <= Math.abs(gross)
                 );
             };
+            // "I do not know" is not an answer to a review, and clearing the
+            // flag on it would put an unpriced row back into the excise report.
+            if (taxIsUnknown) {
+                return NextResponse.json(
+                    {
+                        error: "This receipt is flagged for review, so \"tax unknown\" cannot clear it. Enter the tax, or say the receipt has none.",
+                        code: "TAX_UNKNOWN",
+                    },
+                    { status: 400 },
+                );
+            }
+            // BOTH KEYS, on a flagged row (round 19, item 1). The flag means
+            // the whole classification is in doubt, and the two figures are the
+            // whole classification — so certifying one while staying silent
+            // about the other is exactly the half-answer the flag exists to
+            // prevent. Each may be a coherent number or an explicit null.
+            const bothPresent = expense.needsTaxReview ? editsTaxAmount && editsBase : editsTaxAmount;
             const answered =
-                editsTaxAmount &&
+                bothPresent &&
                 (body.taxAmount === null || coherent(body.taxAmount)) &&
                 (!editsBase || body.taxDeductibleBase === null || coherent(body.taxDeductibleBase));
             if (!answered) {
                 return NextResponse.json(
                     {
-                        error: "Acknowledging a tax review needs taxAmount in the same request — a figure, or an explicit null meaning this receipt has no sales tax.",
+                        error: expense.needsTaxReview
+                            ? "Acknowledging a tax review needs both taxAmount and taxDeductibleBase in the same request — each a figure, or an explicit null."
+                            : "Acknowledging a tax review needs taxAmount in the same request — a figure, or an explicit null meaning this receipt has no sales tax.",
                         code: "TAX_REVIEW_INCOMPLETE",
                     },
                     { status: 400 },
@@ -475,7 +587,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         }
         // An unflagged row has nothing to clear, so the ack is not required of
         // ordinary edits; a flagged one keeps its flag until it is given.
-        const clearsReview = !expense.needsTaxReview || acknowledgesReview;
+        const clearsReview =
+            (!expense.needsTaxReview && !taxIsUnknown) || (acknowledgesReview && !taxIsUnknown);
 
         // WHICH OF THE FOUR STATES THIS REQUEST PUTS THE ROW IN.
         //
@@ -493,7 +606,10 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // `installedAtCustomer` is NOT one of these — its own value is its
         // evidence (non-null means answered) and booking already refuses to
         // touch it once it is set.
-        const stampsTaxProvenance = editsTaxAmount || editsBase;
+        // "I do not know" leaves the provenance where it was — null or "ocr" —
+        // so a later read may still fill the figure. Only the other two
+        // outcomes are decisions.
+        const stampsTaxProvenance = (editsTaxAmount || editsBase) && !taxIsUnknown;
         const nextTaxSource =
             editsTaxAmount && body.taxAmount === null ? "manual-none" : "manual";
 
@@ -536,7 +652,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             const parsed = Number(body.taxAmount);
             if (!Number.isFinite(parsed)) {
                 return NextResponse.json(
-                    { error: "taxAmount must be a number, or null." },
+                    { error: "taxAmount must be a finite number, or null." },
                     { status: 400 },
                 );
             }
@@ -581,9 +697,11 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         let nextBase: number | null = null;
         if (editsBase && body.taxDeductibleBase !== null) {
             const parsed = Number(body.taxDeductibleBase);
+            // NaN and Infinity included: `Number("")` is 0 and
+            // `Number("abc")` is NaN, and neither is a deduction.
             if (!Number.isFinite(parsed)) {
                 return NextResponse.json(
-                    { error: "taxDeductibleBase must be a number, or null." },
+                    { error: "taxDeductibleBase must be a finite number, or null." },
                     { status: 400 },
                 );
             }
@@ -732,7 +850,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         // what they meant — `amount - tax` — so the row says it outright. The
         // legacy nulls stay readable; nothing new adds to them.
         const computedBase =
-            stampsTaxProvenance && (editsBase ? nextBase === null : resultingBase === null)
+            stampsTaxProvenance &&
+            (editsBase ? nextBase === null : resultingBase === null)
                 ? Math.round((Number(expense.amount) - resultingTax) * 100) / 100
                 : null;
         const writesBase = editsBase || computedBase !== null;
@@ -792,6 +911,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         const written = await prisma.$transaction(async tx => {
             const raw = tx as unknown as { $queryRawUnsafe(q: string, ...v: unknown[]): Promise<unknown> };
             await lockExpense(raw, id);
+            // THE JOB, RE-RESOLVED UNDER LOCK (round 19, item 3). For a row
+            // with no `projectId` of its own the answer lives on the estimate,
+            // which somebody else can re-point while this request decides.
+            const lockedProjectId = await resolveExpenseProjectUnderLock(raw, expense);
+            if (!lockedProjectId || !canAccessProject(user, lockedProjectId)) {
+                return { count: 0, phaseRejected: null, denied: "forbidden" } as const;
+            }
             // THE PHASE ANSWER THAT COUNTS, taken here (round 17, item 5).
             //
             // The check above ran on the global client and held nothing: an
@@ -800,12 +926,23 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
             // locks the four tables the answer rests on and reads them on this
             // transaction's snapshot, so it cannot go stale before the update.
             if (editsCostCode && nextCostCodeId) {
-                const verdict = await assertPhaseOfProjectTx(raw, projectId, nextCostCodeId);
-                if (!verdict.ok) return { count: 0, phaseRejected: verdict.reason } as const;
+                const verdict = await assertPhaseOfProjectTx(raw, lockedProjectId, nextCostCodeId);
+                if (!verdict.ok) {
+                    return { count: 0, phaseRejected: verdict.reason, denied: null } as const;
+                }
             }
-            const result = await tx.expense.updateMany({ where: casWhere, data });
-            return { count: result.count, phaseRejected: null } as const;
+            const result = await tx.expense.updateMany({
+                where: { ...casWhere, ...expenseStillOnProjectWhere(expense, lockedProjectId) },
+                data,
+            });
+            return { count: result.count, phaseRejected: null, denied: null } as const;
         });
+        // TWO different answers, deliberately. "You may not touch this job" is a
+        // 403 about the ACTOR; a lost predicate is a 409 about the ROW, and the
+        // client's remedy differs (ask for access vs. reopen and retry).
+        if (written.denied === "forbidden") {
+            return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+        }
         if (written.phaseRejected) {
             return NextResponse.json(
                 {

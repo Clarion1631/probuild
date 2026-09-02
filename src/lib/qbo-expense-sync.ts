@@ -8,8 +8,10 @@ import { suggestCode } from "./expense-cost-suggest";
 import {
     HUMAN_COST_CODE_SOURCES,
     HUMAN_TAX_SOURCES,
+    expenseStillOnProjectWhere,
     notHumanCodedExpenseWhere,
     resolveExpenseProjectId,
+    resolveExpenseProjectUnderLock,
 } from "./expense-attribution";
 import { isOverheadProject } from "./overhead-project";
 import { dateOnlyInTimeZone } from "./tz-date";
@@ -1101,6 +1103,7 @@ export interface QboCostCodeSuggestionClient {
             select: Record<string, unknown>;
         }): Promise<{
             projectId: string | null;
+            estimateId: string;
             costCodeId: string | null;
             costCodeSource: string | null;
             vendor: string | null;
@@ -1168,6 +1171,9 @@ export async function applyQboExpenseCostCodeSuggestion(
         where: { qbPurchaseId: input.qbPurchaseId },
         select: {
             projectId: true,
+            // Needed by the locked re-resolve below: for a row with no
+            // projectId the job lives on this estimate.
+            estimateId: true,
             costCodeId: true,
             costCodeSource: true,
             vendor: true,
@@ -1243,10 +1249,35 @@ export async function applyQboExpenseCostCodeSuggestion(
     // shared locks and the write happens on that same snapshot.
     if (typeof client.$transaction === "function") {
         return client.$transaction(async tx => {
-            const verdict = await assertPhaseOfProjectTx(tx, projectId, costCodeId);
+            // THE JOB IS RESOLVED AGAIN, INSIDE THE TRANSACTION (round 19, item 4).
+            //
+            // `projectId` above came from a read on the global client. For a
+            // row with no `projectId` of its own it came from the ESTIMATE —
+            // and an estimate can be moved to another job while this runs, so
+            // an automated pass would then code the row for a phase list
+            // belonging to a job it is no longer on.
+            //
+            // The estimate row is share-locked and re-read here, and the same
+            // answer feeds the phase check AND the write predicate, so all
+            // three agree or nothing is written.
+            const lockedProjectId = await resolveExpenseProjectUnderLock(tx, {
+                projectId: stored.projectId ?? null,
+                estimateId: stored.estimateId,
+            });
+            if (!lockedProjectId) return "skipped-no-project";
+            if (isOverheadProject(lockedProjectId)) return "skipped-overhead";
+            const verdict = await assertPhaseOfProjectTx(tx, lockedProjectId, costCodeId);
             if (!verdict.ok) return "phase-not-on-project";
             const inTx = await tx.expense.updateMany({
-                where: suggestionWhere,
+                where: {
+                    ...suggestionWhere,
+                    // The job this decision was actually made for. A fallback-
+                    // attributed row whose estimate moved matches nothing.
+                    ...expenseStillOnProjectWhere(
+                        { projectId: stored.projectId ?? null },
+                        lockedProjectId,
+                    ),
+                },
                 data: suggestionData,
             });
             return inTx.count > 0 ? "written" : "not-written";

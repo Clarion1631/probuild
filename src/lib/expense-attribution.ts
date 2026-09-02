@@ -351,3 +351,59 @@ export function taxIsAtSource(taxAmount: number | null | undefined): boolean {
     if (taxAmount === null || taxAmount === undefined) return false;
     return Number.isFinite(taxAmount) && taxAmount !== 0;
 }
+
+
+/** The transaction-client subset the locked re-resolve needs. */
+export interface ExpenseTxClient {
+    $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
+}
+
+/**
+ * RE-RESOLVE A FALLBACK-ATTRIBUTED EXPENSE'S JOB, UNDER LOCK.
+ *
+ * An expense with a `projectId` answers for itself and cannot move without a
+ * write to its own row, which every mutating path already fences on. An expense
+ * WITHOUT one answers through its estimate — and that estimate can be moved to
+ * another project by somebody else while a request is deciding what it may do.
+ *
+ * The consequence is not academic: the request authorized the actor against the
+ * job the estimate named when it was read, then wrote or deleted a row that now
+ * belongs to a different job. The actor never had access to that one.
+ *
+ * So the estimate row is share-locked for the rest of the caller's transaction
+ * and the project is read again from it. Callers then re-check access against
+ * THIS answer and put it in the write predicate, so a row that moved in the gap
+ * matches nothing instead of being written under a stale permission.
+ *
+ * Returns the resolved project id, or null when the estimate has none — which
+ * every caller must treat as "no scope to authorize against", i.e. refuse.
+ */
+export async function resolveExpenseProjectUnderLock(
+    tx: ExpenseTxClient,
+    expense: { projectId: string | null; estimateId: string },
+): Promise<string | null> {
+    if (expense.projectId) return expense.projectId;
+    await tx.$queryRawUnsafe(
+        `SELECT id FROM "Estimate" WHERE id = $1 FOR SHARE`,
+        expense.estimateId,
+    );
+    const rows = (await tx.$queryRawUnsafe(
+        `SELECT "projectId" FROM "Estimate" WHERE id = $1`,
+        expense.estimateId,
+    )) as { projectId: string | null }[];
+    return rows?.[0]?.projectId ?? null;
+}
+
+/**
+ * The write predicate that pins a fallback-attributed row to the project the
+ * caller was authorized against. For a row with its own `projectId` the column
+ * is the answer; for one without, the estimate has to still point there.
+ */
+export function expenseStillOnProjectWhere(
+    expense: { projectId: string | null },
+    projectId: string,
+): Record<string, unknown> {
+    return expense.projectId
+        ? { projectId }
+        : { projectId: null, estimate: { is: { projectId } } };
+}

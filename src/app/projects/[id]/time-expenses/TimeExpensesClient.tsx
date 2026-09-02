@@ -113,7 +113,18 @@ export default function TimeExpensesClient({ project, data, currentUser, company
                 <NewExpenseEntryModal
                     projectId={project.id}
                     estimates={data.estimates}
-                    costCodes={data.costCodes}
+                    // THIS JOB'S PHASES, not every active cost code in the
+                    // company (round 19, item 5). The form offered all of them
+                    // and the server then refused anything that is not a phase
+                    // of this job — a picker whose options were mostly errors,
+                    // and an invitation to pick one.
+                    //
+                    // No fallback to the company list when a job has no phases
+                    // yet: the server refuses every code in that case, so
+                    // offering them would only reproduce the same dead end.
+                    // "None" is always available, and an expense with no phase
+                    // is a normal, correctable row.
+                    costCodes={phases.map(phase => ({ id: phase.id, name: phase.name, code: phase.code }))}
                     costTypes={data.costTypes}
                     companyTimeZone={companyTimeZone}
                     changeOrders={data.changeOrders}

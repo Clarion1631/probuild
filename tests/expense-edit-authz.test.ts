@@ -30,7 +30,15 @@ const fakePrisma: any = {
     // The tax PATCH writes inside a transaction that first takes the shared
     // per-expense advisory lock.
     $transaction: async (fn: any) => fn(fakePrisma),
-    $queryRawUnsafe: async () => [{ lock_result: null }],
+    // The locked re-resolve reads the ESTIMATE's project through raw SQL, so
+    // the fake answers that one from the same fixture the resolver would see.
+    $queryRawUnsafe: async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
+            const row = storedExpense as Record<string, any> | null;
+            return [{ projectId: row?.estimate?.projectId ?? null }];
+        }
+        return [{ lock_result: null }];
+    },
     expense: {
         findUnique: async () => storedExpense,
         update: async (args: { where: unknown; data: Record<string, unknown> }) => {
@@ -314,7 +322,28 @@ test("DELETE fails closed on an expense with no resolvable project", async () =>
 
 test("DELETE still works for someone who may actually do it", async () => {
     assert.equal((await del()).status, 200);
-    assert.deepEqual(deleteArgs, { where: { id: "e1", qbPurchaseId: null } });
+    // The predicate carries the job the actor was authorized against (round 19,
+    // item 3), so a row that moved in the gap matches nothing.
+    assert.deepEqual(deleteArgs, {
+        where: { id: "e1", qbPurchaseId: null, projectId: "job-1" },
+    });
+});
+
+test("DELETE of a FALLBACK-attributed row pins the estimate's job", async () => {
+    // With no `projectId` of its own the answer lives on the estimate, which
+    // somebody can re-point while this request decides. The delete says so.
+    storedExpense = {
+        ...(storedExpense as object), projectId: null, estimateId: "est-job-1",
+    } as Record<string, unknown>;
+    assert.equal((await del()).status, 200);
+    assert.deepEqual(deleteArgs, {
+        where: {
+            id: "e1",
+            qbPurchaseId: null,
+            projectId: null,
+            estimate: { is: { projectId: "job-1" } },
+        },
+    });
 });
 
 // ── item 4: the invariant is about the RESULTING row ───────────────────────
@@ -621,15 +650,33 @@ test("an acknowledgement that OMITS taxAmount is refused, not half-applied", asy
     assert.equal(updateArgs, null, "nothing is written");
 });
 
-test("an acknowledgement with only the tax figure is enough", async () => {
+test("on a FLAGGED row an ack needs BOTH keys, not just the tax", async () => {
+    // Round 19, item 1. The flag says the whole classification is in doubt, and
+    // the two figures ARE the classification — certifying one while staying
+    // silent about the other is the half-answer the flag exists to prevent.
+    // Tested through the API, not the modal: the modal is one caller of many.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
-    assert.equal(res.status, 200);
+    const only = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    assert.equal(only.status, 400);
+    assert.equal((await only.json()).code, "TAX_REVIEW_INCOMPLETE");
+    assert.equal(updateArgs, null as typeof updateArgs, "nothing is written, so the flag stands");
+
+    // An explicit null counts as present for either key.
+    const both = await patch({ taxReviewAck: true, taxAmount: 16.55, taxDeductibleBase: null });
+    assert.equal(both.status, 200);
     assert.equal(updateArgs?.data.needsTaxReview, false);
     assert.equal(updateArgs?.data.taxSource, "manual");
     // ...and the blank base is STORED as the whole pre-tax total rather than
     // left as a null whose meaning every reader has to remember.
     assert.equal(updateArgs?.data.taxDeductibleBase, 191.19, "207.74 - 16.55");
+});
+
+test("on an UNflagged row the tax figure alone is still a complete edit", async () => {
+    // The both-keys rule is about clearing a FLAG. An ordinary correction is
+    // not a certification and does not need one.
+    const res = await patch({ taxReviewAck: true, taxAmount: 16.55 });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, "manual");
 });
 
 test("an UNflagged row does not need an acknowledgement", async () => {
@@ -755,7 +802,9 @@ test("a FLAGGED no-tax workflow: ack + null clears the flag as manual-none", asy
     // this receipt has no sales tax" is one of the two answers they can reach,
     // and refusing it would leave the row flagged forever.
     storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
-    const res = await patch({ taxReviewAck: true, taxAmount: null });
+    const res = await patch({
+        taxReviewAck: true, taxAmount: null, taxKnown: true, taxDeductibleBase: null,
+    });
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxAmount, null);
     assert.equal(updateArgs?.data.taxSource, "manual-none");
@@ -849,4 +898,148 @@ test("an installedAtCustomer-only edit computes nothing and claims nothing", asy
     assert.equal(res.status, 200);
     assert.equal(updateArgs?.data.taxSource, undefined);
     assert.equal(updateArgs?.data.taxDeductibleBase, undefined);
+});
+
+// ── the three tax states in the payload (Codex round 19, item 2) ───────────
+
+test("an OMITTED taxAmount touches nothing", async () => {
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, undefined);
+    assert.equal(updateArgs?.data.taxSource, undefined);
+});
+
+test("'tax unknown' is not a decision: provenance and flag both stand", async () => {
+    // `{ taxAmount: null, taxKnown: false }` is where the row already is. It
+    // must not stamp a human provenance (which would lock OCR out of a receipt
+    // nobody has read) and must not clear a review.
+    storedExpense = {
+        ...(storedExpense as object), needsTaxReview: true, taxSource: "ocr",
+    } as Record<string, unknown>;
+    const res = await patch({ taxAmount: null, taxKnown: false });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxAmount, null, "the figure is cleared");
+    assert.equal(updateArgs?.data.taxSource, undefined, "but nobody decided anything");
+    assert.equal(updateArgs?.data.needsTaxReview, undefined, "and the row still waits");
+    assert.equal(updateArgs?.data.taxDeductibleBase, undefined, "no base for an unpriced row");
+});
+
+test("'tax unknown' cannot acknowledge a review", async () => {
+    storedExpense = { ...(storedExpense as object), needsTaxReview: true } as Record<string, unknown>;
+    const res = await patch({
+        taxReviewAck: true, taxAmount: null, taxKnown: false, taxDeductibleBase: null,
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "TAX_UNKNOWN");
+    assert.equal(updateArgs, null);
+});
+
+test("'no tax on this receipt' IS a decision", async () => {
+    const res = await patch({ taxAmount: null, taxKnown: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, "manual-none");
+});
+
+test("a FIGURE is a decision, whatever taxKnown says", async () => {
+    const res = await patch({ taxAmount: 16.55, taxKnown: true });
+    assert.equal(res.status, 200);
+    assert.equal(updateArgs?.data.taxSource, "manual");
+});
+
+test("a non-boolean taxKnown is refused", async () => {
+    const res = await patch({ taxAmount: null, taxKnown: "no" });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /taxKnown/);
+});
+
+test("NaN and Infinity are refused for both figures", async () => {
+    // JSON cannot carry either, but a client that serializes them lands
+    // `null` or a string — and `Number("Infinity")` is Infinity.
+    for (const value of ["Infinity", "-Infinity", "NaN", "abc"]) {
+        const tax = await patch({ taxAmount: value });
+        assert.equal(tax.status, 400, `taxAmount: ${value}`);
+        const base = await patch({ taxDeductibleBase: value });
+        assert.equal(base.status, 400, `taxDeductibleBase: ${value}`);
+    }
+});
+
+// ── a fallback-attributed row can change jobs mid-request (round 19, item 3) ─
+
+test("an estimate re-pointed between the check and the WRITE is refused", async () => {
+    // The row has no `projectId` of its own, so its job comes from the
+    // estimate — and somebody moves that estimate while this PATCH decides. The
+    // authorization above was granted for job-1; the write must not land on
+    // whatever the row belongs to now.
+    storedExpense = {
+        ...(storedExpense as object), projectId: null, estimateId: "est-1",
+        estimate: { projectId: "job-1" },
+    } as Record<string, unknown>;
+    const original = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) {
+            // The move lands as the lock is taken: the locked read is the FIRST
+            // one that can see it, which is the whole point of taking it.
+            return [{ projectId: "job-2" }];
+        }
+        return [{ lock_result: null }];
+    };
+    try {
+        const res = await patch({ installedAtCustomer: true });
+        assert.equal(res.status, 403, "the actor has no access to job-2");
+        assert.equal(updateArgs, null as typeof updateArgs, "and nothing is written");
+    } finally {
+        fakePrisma.$queryRawUnsafe = original;
+    }
+});
+
+test("a fallback-attributed PATCH pins the estimate's job in its predicate", async () => {
+    storedExpense = {
+        ...(storedExpense as object), projectId: null, estimateId: "est-1",
+        estimate: { projectId: "job-1" },
+    } as Record<string, unknown>;
+    const res = await patch({ installedAtCustomer: true });
+    assert.equal(res.status, 200);
+    const where = updateArgs?.where as Record<string, any>;
+    assert.equal(where.projectId, null);
+    assert.deepEqual(where.estimate, { is: { projectId: "job-1" } });
+});
+
+test("a fallback-attributed PUT is refused when the estimate moves", async () => {
+    storedExpense = {
+        ...(storedExpense as object), projectId: null, estimateId: "est-1",
+        estimate: { projectId: "job-1" }, qbPurchaseId: null,
+    } as Record<string, unknown>;
+    const original = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) return [{ projectId: "job-2" }];
+        return [{ lock_result: null }];
+    };
+    try {
+        // 403, not 409: the actor has no access to the job this row is on NOW,
+        // which is a fact about them rather than about the row. The 409 case is
+        // a lost predicate — same request, still-authorized actor.
+        const res = await call({ vendor: "Lowe's" });
+        assert.equal(res.status, 403);
+    } finally {
+        fakePrisma.$queryRawUnsafe = original;
+    }
+});
+
+test("a fallback-attributed DELETE is refused when the estimate moves", async () => {
+    storedExpense = {
+        ...(storedExpense as object), projectId: null, estimateId: "est-1",
+        estimate: { projectId: "job-1" },
+    } as Record<string, unknown>;
+    const original = fakePrisma.$queryRawUnsafe;
+    fakePrisma.$queryRawUnsafe = async (query: string) => {
+        if (/FROM "Estimate"/.test(query) && /"projectId"/.test(query)) return [{ projectId: "job-2" }];
+        return [{ lock_result: null }];
+    };
+    try {
+        const res = await del();
+        assert.equal(res.status, 403);
+        assert.equal(deleteArgs, null, "nothing is destroyed under a stale permission");
+    } finally {
+        fakePrisma.$queryRawUnsafe = original;
+    }
 });

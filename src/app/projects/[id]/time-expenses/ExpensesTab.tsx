@@ -29,6 +29,7 @@ interface Expense {
     installedAtCustomer?: boolean | null;
     taxDeductibleBase?: unknown;
     needsTaxReview?: boolean;
+    taxSource?: string | null;
 }
 
 interface Props {
@@ -418,6 +419,10 @@ export default function ExpensesTab({ projectId, expenses: initialExpenses, onAd
                                                             ? null
                                                             : num(expense.taxDeductibleBase),
                                                         needsTaxReview: Boolean(expense.needsTaxReview),
+                                                        // Which of the four states the row is in, so
+                                                        // the panel can tell "no tax here" from
+                                                        // "nobody has read it yet".
+                                                        taxSource: expense.taxSource ?? null,
                                                         costCodeId: expense.costCode?.id ?? null,
                                                     })}
                                                     className={`mr-3 text-xs underline transition ${expense.needsTaxReview ? "text-amber-600 font-semibold" : "text-slate-400 hover:text-hui-primary"}`}
