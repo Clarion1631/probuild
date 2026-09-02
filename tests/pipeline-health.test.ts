@@ -116,8 +116,18 @@ test("no push ever recorded is stale, not healthy", () => {
 
 // ─── Intuit + errors ────────────────────────────────────────────────────────
 
-test("an unreachable Intuit status page does not by itself fail the check", () => {
+test("an unreachable Intuit status page FAILS the check", () => {
+    // Reversed deliberately (accepted tradeoff): a statuspage.io hiccup will
+    // occasionally produce a red digest. The alternative is a monitoring
+    // surface that quietly knows less than it claims - "we could not check"
+    // is not "everything is fine".
     const v = evaluatePipelineHealth(snapshot({ intuit: { status: "error", indicator: "unknown" } }));
+    assert.equal(v.ok, false);
+    assert.deepEqual(v.reasons, ["intuit-status-unreachable"]);
+});
+
+test("a reachable status page reporting 'none' is still clean", () => {
+    const v = evaluatePipelineHealth(snapshot({ intuit: { status: "ok", indicator: "none" } }));
     assert.deepEqual(v, { ok: true, reasons: [] });
 });
 

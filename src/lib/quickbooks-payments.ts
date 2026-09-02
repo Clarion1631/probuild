@@ -21,6 +21,10 @@ import {
     type QBTokens,
     refreshQBToken,
     isQBTimeoutError,
+    isQBBudgetExhaustedError,
+    createRouteDeadline,
+    isBudgetExhausted,
+    type RouteDeadline,
     qbQuery,
     isQboConnectionFailure,
     QboRetryableError,
@@ -740,6 +744,7 @@ export async function runQboRowLoop<T>(
     handleRow: (row: T) => Promise<void>,
     onRowError: (row: T, error: unknown) => void,
     skippedLabel: string,
+    deadline?: RouteDeadline,
 ): Promise<void> {
     for (const [index, row] of rows.entries()) {
         // A previous pass already hit the wall — the connection is shared, so
@@ -748,9 +753,22 @@ export async function runQboRowLoop<T>(
             result.skipped += rows.length - index;
             return;
         }
+        // Checked before EVERY row: a row costs several serial QBO calls, so
+        // starting one with seconds left is how a run gets killed mid-write
+        // instead of returning a result someone can act on.
+        if (isBudgetExhausted(deadline)) {
+            result.skipped += rows.length - index;
+            return;
+        }
         try {
             await handleRow(row);
         } catch (error) {
+            // Out of time is not a QBO fault: stop cleanly, count the rest as
+            // skipped (making the run partial), and let the next run continue.
+            if (isQBBudgetExhaustedError(error)) {
+                result.skipped += rows.length - index;
+                return;
+            }
             if (isQboConnectionFailure(error)) {
                 result.abortedOnQboOutage = true;
                 result.runFailed = true;
@@ -785,6 +803,12 @@ export interface PaymentsSyncQboClient {
     verifyConnection(): Promise<void>;
 }
 
+/**
+ * The cron's route ceiling is 120s; stopping at 100s leaves room to write the
+ * audit event and return a result instead of being killed mid-run.
+ */
+export const PAYMENTS_SYNC_BUDGET_MS = 100_000;
+
 export interface SyncQuickBooksPaymentsOptions {
     /**
      * Who triggered this run. Only "cron" counts as the hourly heartbeat the
@@ -794,15 +818,14 @@ export interface SyncQuickBooksPaymentsOptions {
     source?: "cron" | "view" | "manual";
     /** Test seam; defaults to the real QBO calls. */
     qboClient?: PaymentsSyncQboClient;
+    /** Whole-run time budget; defaults to PAYMENTS_SYNC_BUDGET_MS. */
+    deadline?: RouteDeadline;
 }
 
 /** One database page. Small enough to stay responsive, big enough to be cheap. */
 const PAYMENTS_SYNC_PAGE_SIZE = 100;
 /** Hard ceiling on rows per run, so one huge backlog cannot run past the cron's window. */
 const PAYMENTS_SYNC_MAX_ROWS = 500;
-/** Wall-clock budget, comfortably inside the route's 120s maxDuration. */
-const PAYMENTS_SYNC_TIME_BUDGET_MS = 90_000;
-
 /**
  * Walk a pending collection in stable id order, a page at a time.
  *
@@ -815,7 +838,7 @@ const PAYMENTS_SYNC_TIME_BUDGET_MS = 90_000;
  */
 async function forEachPendingPage<T extends { id: string }>(
     result: QBPaymentSyncResult,
-    deadline: number,
+    deadline: RouteDeadline,
     fetchPage: (cursorId: string | null, take: number) => Promise<T[]>,
     countRemaining: (cursorId: string | null) => Promise<number>,
     handlePage: (rows: T[]) => Promise<void>,
@@ -826,7 +849,7 @@ async function forEachPendingPage<T extends { id: string }>(
     while (true) {
         if (result.abortedOnQboOutage) break;
         if (processed >= PAYMENTS_SYNC_MAX_ROWS) break;
-        if (Date.now() >= deadline) break;
+        if (isBudgetExhausted(deadline)) break;
 
         const take = Math.min(PAYMENTS_SYNC_PAGE_SIZE, PAYMENTS_SYNC_MAX_ROWS - processed);
         const page = await fetchPage(cursorId, take);
@@ -855,6 +878,7 @@ export async function syncQuickBooksPayments(
         checked: 0, settled: 0, partiallyPaid: 0, errors: [], progressBillingsSettled: 0,
         skipped: 0, abortedOnQboOutage: false, runFailed: false,
     };
+    const routeDeadline = options?.deadline ?? createRouteDeadline(PAYMENTS_SYNC_BUDGET_MS);
 
     const pendingWhere = {
         status: "Pending",
@@ -901,11 +925,14 @@ export async function syncQuickBooksPayments(
     }
 
     const qbo: PaymentsSyncQboClient = options?.qboClient ?? {
-        probeInvoice: (qbInvoiceId) => probeQBInvoice(tokens, qbInvoiceId),
-        getPayment: (paymentId) => getQBPayment(tokens, paymentId),
+        // Every call is capped by what is LEFT of the run budget, not just by
+        // its own timeout — six legal 20s calls would otherwise still run past
+        // the cron's ceiling.
+        probeInvoice: (qbInvoiceId) => probeQBInvoice(tokens, qbInvoiceId, routeDeadline),
+        getPayment: (paymentId) => getQBPayment(tokens, paymentId, routeDeadline),
         // CompanyInfo is the cheapest authenticated read in the API.
         verifyConnection: async () => {
-            await qbQuery(tokens, "SELECT * FROM CompanyInfo");
+            await qbQuery(tokens, "SELECT * FROM CompanyInfo", routeDeadline);
         },
     };
 
@@ -935,7 +962,6 @@ export async function syncQuickBooksPayments(
     // previously null). Reported once per breakage; a re-push clears the flag and re-arms.
     const newlyFlagged: QBSyncIssue[] = [];
 
-    const deadline = Date.now() + PAYMENTS_SYNC_TIME_BUDGET_MS;
     const milestoneSelect = {
         id: true, invoiceId: true, qbInvoiceId: true, qbSyncError: true, name: true, amount: true,
         invoice: { select: { code: true, project: { select: { id: true, name: true } }, client: { select: { name: true, email: true } } } },
@@ -943,7 +969,7 @@ export async function syncQuickBooksPayments(
 
     await forEachPendingPage(
         result,
-        deadline,
+        routeDeadline,
         (cursorId, take) => prisma.paymentSchedule.findMany({
             where: pendingWhere,
             select: milestoneSelect,
@@ -1038,7 +1064,7 @@ export async function syncQuickBooksPayments(
         }
     }, (schedule, e) => {
             result.errors.push(`${schedule.invoice.code}/${schedule.name}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "milestones"),
+        }, "milestones", routeDeadline),
     );
 
     // ── Progress billings ───────────────────────────────────────────────────
@@ -1056,7 +1082,7 @@ export async function syncQuickBooksPayments(
 
     await forEachPendingPage(
         result,
-        deadline,
+        routeDeadline,
         (cursorId, take) => prisma.progressBilling.findMany({
             where: billingWhere,
             select: billingSelect,
@@ -1096,7 +1122,7 @@ export async function syncQuickBooksPayments(
         }
     }, (billing, e) => {
             result.errors.push(`${billing.invoice.code}/${billing.code}: ${e instanceof Error ? e.message : "sync failed"}`);
-        }, "progress billings"),
+        }, "progress billings", routeDeadline),
     )
 
     if (newlyFlagged.length > 0) {

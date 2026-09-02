@@ -31,6 +31,9 @@ import {
     qbTimedFetch,
     parseJsonOrNull,
     isQBTimeoutError,
+    isBudgetExhausted,
+    QBBudgetExhaustedError,
+    type RouteDeadline,
     QboRetryableError,
     isRetryableQboError,
     isRetryableQboStatus,
@@ -278,10 +281,12 @@ async function defaultQbCreatePurchase(
     tokens: QBTokens,
     payload: Record<string, unknown>,
     requestId: string,
+    deadline?: RouteDeadline,
 ): Promise<{ id: string }> {
     const res = await qbFetch(`/purchase?requestid=${encodeURIComponent(requestId)}`, tokens, {
         method: "POST",
         body: JSON.stringify(payload),
+        qbDeadline: deadline,
     });
     if (!res.ok) {
         const text = await res.text();
@@ -339,6 +344,7 @@ export async function defaultUploadAttachment(
         const { getFreshQBTokens } = await import("./quickbooks-payments");
         return getFreshQBTokens();
     },
+    deadline?: RouteDeadline,
 ): Promise<ReceiptAttachmentStatus> {
     const safeFileName = attachmentFileName(file.fileName);
     const fileBytes = Buffer.from(file.base64, "base64");
@@ -367,6 +373,7 @@ export async function defaultUploadAttachment(
 
     const post = (active: QBTokens) =>
         qbTimedFetch(`${QB_API_BASE}/${active.realmId}/upload?minorversion=73`, {
+            qbDeadline: deadline,
             method: "POST",
             headers: {
                 Authorization: `Bearer ${active.accessToken}`,
@@ -606,13 +613,20 @@ export async function createQBReceiptPurchase(
     tokens: QBTokens,
     input: CreateQBReceiptPurchaseInput,
     deps: Partial<QboReceiptPushDependencies> = {},
+    /**
+     * Whole-route budget. A push makes several serial QBO calls (lookups,
+     * vendor/customer ensures, account verify, create, upload); each is
+     * individually bounded, but only a shared budget stops the SUM from
+     * running past the route ceiling and being killed mid-write.
+     */
+    deadline?: RouteDeadline,
 ): Promise<CreateQBReceiptPurchaseResult> {
-    const qbQueryFn = deps.qbQueryFn ?? qbQuery;
-    const qbCreateFn = deps.qbCreateFn ?? defaultQbCreatePurchase;
+    const qbQueryFn = deps.qbQueryFn ?? ((t, q) => qbQuery(t, q, deadline));
+    const qbCreateFn = deps.qbCreateFn ?? ((t, p, r) => defaultQbCreatePurchase(t, p, r, deadline));
     const ensureVendorFn = deps.ensureVendorFn ?? ensureQBVendor;
     const ensureCustomerFn = deps.ensureCustomerFn ?? ensureQBCustomer;
     const listProjects = deps.listProjects ?? defaultListInProgressProjects;
-    const uploadAttachment = deps.uploadAttachment ?? defaultUploadAttachment;
+    const uploadAttachment = deps.uploadAttachment ?? ((t, id, f) => defaultUploadAttachment(t, id, f, undefined, deadline));
 
     const docNumber = input.fileId.slice(0, 21);
     const marker = `[gtr-file:${input.fileId}]`;
@@ -776,6 +790,13 @@ export async function createQBReceiptPurchase(
     await verifyReceiptAccounts(tokens, qbQueryFn, bankAccountId, expenseAccountId, taxAccountId);
 
     const requestId = receiptRequestId(input.fileId);
+    // Last check before the write that actually posts money. Starting it with
+    // no budget left is how a Purchase gets created by a function that is then
+    // killed before it can report the id — the lost-response case this whole
+    // recovery path exists to clean up after.
+    if (isBudgetExhausted(deadline)) {
+        throw new QBBudgetExhaustedError("Route budget exhausted before the QBO Purchase create");
+    }
     const created = await qbCreateFn(tokens, payload, requestId);
 
     let attachment: ReceiptAttachmentStatus = "skipped";

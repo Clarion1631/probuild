@@ -88,13 +88,12 @@ export interface PipelineHealth {
 /**
  * Intuit's own status page.
  *
- * Deliberately the ONE probe whose failure does not by itself fail the check:
- * it is a third party with its own downtime, so an unreachable status page is
- * not evidence of an outage in our pipeline, and treating it as one would cry
- * wolf every time statuspage.io hiccups. The failure is still reported
- * (`status: "error"`, indicator "unknown") and still printed in the digest —
- * it just doesn't flip the verdict on its own. Our real signal for an Intuit
- * outage is the QBTimeoutError count, which lands in `stuck`.
+ * An unreachable status page now FAILS the check (reason
+ * `intuit-status-unreachable`). It is a third party, so this will occasionally
+ * produce a red digest for a statuspage.io hiccup rather than a real problem —
+ * accepted deliberately: the alternative is a monitoring surface that quietly
+ * knows less than it claims, and "we could not check" is not "everything is
+ * fine". A cheap false red beats a confident false green.
  */
 export async function fetchIntuitStatus(): Promise<IntuitProbe> {
     try {
@@ -198,7 +197,12 @@ export function evaluatePipelineHealth(input: {
         if (probe.status === "error") reasons.push(`probe-failed:${name}`);
     }
 
-    if (input.intuit.status === "ok" && input.intuit.indicator !== "none") {
+    if (input.intuit.status === "error") {
+        // We could not read Intuit's status at all. Not evidence of an outage,
+        // but not evidence of health either — and this endpoint's whole job is
+        // to say what it actually knows.
+        reasons.push("intuit-status-unreachable");
+    } else if (input.intuit.indicator !== "none") {
         reasons.push(`intuit-${input.intuit.indicator}`);
     }
 

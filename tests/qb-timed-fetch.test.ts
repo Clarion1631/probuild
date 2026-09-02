@@ -43,6 +43,22 @@ before(async () => {
             res.end("not json at all");
             return;
         }
+        if (req.url?.startsWith("/v3/company/reset-body")) {
+            // Headers, a partial body, then the socket dies — a transport
+            // failure that happens AFTER fetch() has already resolved.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.write('{"partial":');
+            setTimeout(() => res.destroy(), 30);
+            return;
+        }
+        if (req.url?.startsWith("/v3/company/slow")) {
+            // Each call costs real time, so a sequence of them accumulates.
+            setTimeout(() => {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            }, 400);
+            return;
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, path: req.url }));
     });
@@ -372,4 +388,99 @@ test("isQBTimeoutError does not over-match", () => {
     assert.equal(isQBTimeoutError(null), false);
     assert.equal(isQBTimeoutError("QBTimeoutError"), false);
     assert.equal(isQBTimeoutError({ name: "QBTimeoutError" }), false);
+});
+
+
+// --- Parse failure vs transport failure, after headers ---
+
+test("a malformed JSON body is a PARSE failure, not a connection failure", async () => {
+    const { isQboMalformedResponseError, isRetryableQboError } = await import("../src/lib/quickbooks");
+    const res = await qbTimedFetch(`${base}/v3/company/garbage`, {}, 5_000);
+    const error = await res.json().then(() => null, (e: unknown) => e as Error);
+
+    // Garbage JSON is a property of THIS response - it looks the same on every
+    // retry and says nothing about the connection. Collapsing it into a
+    // transport failure made one bad payload abort a whole run as an outage.
+    assert.equal(isQboMalformedResponseError(error), true, `got ${error?.name}`);
+    assert.equal(isRetryableQboError(error), false);
+    // parseJsonOrNull still degrades a genuine parse failure to null.
+    const res2 = await qbTimedFetch(`${base}/v3/company/garbage`, {}, 5_000);
+    assert.equal(await parseJsonOrNull(res2), null);
+});
+
+test("headers-then-RESET is connection-level and reaches the caller", async () => {
+    const { isRetryableQboError } = await import("../src/lib/quickbooks");
+    // Headers arrive, then the socket dies mid-body: the connection really is
+    // gone, so this must abort a loop exactly like a timeout does - and must
+    // NOT be swallowed into "QBO returned no body".
+    const res = await qbTimedFetch(`${base}/v3/company/reset-body`, {}, 5_000);
+    assert.equal(res.ok, true);
+
+    const error = await res.json().then(() => null, (e: unknown) => e as Error);
+    assert.ok(error instanceof Error, "a dead socket must not resolve");
+    assert.equal(isRetryableQboError(error), true, `got ${error?.name}`);
+
+    const res2 = await qbTimedFetch(`${base}/v3/company/reset-body`, {}, 5_000);
+    await assert.rejects(
+        () => parseJsonOrNull(res2),
+        (e: unknown) => isRetryableQboError(e),
+    );
+});
+
+// --- Route-wide budget ---
+
+test("each call is capped by what is LEFT of the route budget", async () => {
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    // 1.4s of budget, but a 20s per-call timeout: the call must give up on the
+    // budget, not the per-call deadline.
+    const deadline = createRouteDeadline(1_400);
+    const started = Date.now();
+    const error = await qbTimedFetch(`${base}/v3/company/hang`, { qbDeadline: deadline }, 20_000).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(error instanceof QBTimeoutError, `got ${String(error)}`);
+    assert.ok(elapsed < 5_000, `should stop near the budget, took ${elapsed}ms`);
+});
+
+test("a call is refused outright once the budget is gone", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    // Budget started 10s ago with only 2s allowed: nothing left.
+    const deadline = createRouteDeadline(2_000, Date.now() - 10_000);
+    const error = await qbTimedFetch(`${base}/v3/company/query`, { qbDeadline: deadline }, 20_000).then(
+        () => null,
+        (e: unknown) => e as Error,
+    );
+    assert.equal(isQBBudgetExhaustedError(error), true, `got ${String(error)}`);
+});
+
+test("CUMULATIVE latency: serial calls stop before the route ceiling", async () => {
+    const { createRouteDeadline, isQBBudgetExhaustedError } = await import("../src/lib/quickbooks");
+    // The original failure mode: six individually-legal calls adding up past
+    // the function's ceiling. With a shared budget the sequence stops itself.
+    const CEILING_MS = 3_000;
+    const deadline = createRouteDeadline(2_000);
+    const started = Date.now();
+
+    let calls = 0;
+    let stopped: unknown = null;
+    for (let i = 0; i < 20; i++) {
+        try {
+            calls++;
+            await qbTimedFetch(`${base}/v3/company/slow`, { qbDeadline: deadline }, 20_000);
+        } catch (error) {
+            stopped = error;
+            break;
+        }
+    }
+
+    const elapsed = Date.now() - started;
+    assert.ok(stopped, "the sequence must stop itself");
+    assert.ok(
+        isQBBudgetExhaustedError(stopped) || stopped instanceof QBTimeoutError,
+        `stopped for the wrong reason: ${String(stopped)}`,
+    );
+    assert.ok(elapsed < CEILING_MS, `ran ${elapsed}ms, past the ${CEILING_MS}ms ceiling`);
+    assert.ok(calls > 1, "should have made several calls before stopping");
 });

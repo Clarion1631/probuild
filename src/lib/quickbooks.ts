@@ -57,6 +57,26 @@ export class QboRetryableError extends Error {
     }
 }
 
+/**
+ * QuickBooks answered, but the body was not valid JSON.
+ *
+ * Kept distinct from a transport failure on purpose: garbage JSON is a
+ * PROPERTY OF THE RESPONSE (it will look the same on every retry, and it says
+ * nothing about the connection), whereas a socket dying mid-body means the
+ * next call will fail too. Collapsing them made a single malformed payload
+ * look like an outage and abort a whole run.
+ */
+export class QboMalformedResponseError extends Error {
+    name = "QboMalformedResponseError";
+}
+
+export function isQboMalformedResponseError(error: unknown): boolean {
+    return (
+        error instanceof QboMalformedResponseError ||
+        (error instanceof Error && error.name === "QboMalformedResponseError")
+    );
+}
+
 /** Name-based, for the same cross-module-identity reason as isQBTimeoutError. */
 export function isRetryableQboError(error: unknown): boolean {
     return (
@@ -111,6 +131,47 @@ function safePath(url: string): string {
     } catch {
         return "(unparseable url)";
     }
+}
+
+/**
+ * A whole-route time budget, so a sequence of individually-legal calls cannot
+ * add up past the platform's ceiling.
+ *
+ * Per-call deadlines bound ONE call. A route that makes six of them serially
+ * can still be killed mid-write with nothing recorded, which is how the
+ * original outage burned a 60s function and reported nothing. Threading a
+ * deadline through means every call gets min(its own timeout, what is left),
+ * and work stops cleanly while there is still time to record the outcome.
+ */
+export interface RouteDeadline {
+    startedAt: number;
+    budgetMs: number;
+}
+
+/** Raised when the route's own budget is gone before a call could start. */
+export class QBBudgetExhaustedError extends Error {
+    name = "QBBudgetExhaustedError";
+}
+
+export function isQBBudgetExhaustedError(error: unknown): boolean {
+    return (
+        error instanceof QBBudgetExhaustedError ||
+        (error instanceof Error && error.name === "QBBudgetExhaustedError")
+    );
+}
+
+export function createRouteDeadline(budgetMs: number, startedAt: number = Date.now()): RouteDeadline {
+    return { startedAt, budgetMs };
+}
+
+export function remainingBudgetMs(deadline: RouteDeadline | undefined, now: number = Date.now()): number {
+    if (!deadline) return Number.POSITIVE_INFINITY;
+    return deadline.startedAt + deadline.budgetMs - now;
+}
+
+/** True when there is not enough budget left to be worth starting another call. */
+export function isBudgetExhausted(deadline: RouteDeadline | undefined, now: number = Date.now()): boolean {
+    return remainingBudgetMs(deadline, now) <= QB_MIN_TIMEOUT_MS;
 }
 
 /** Below this a timeout is a self-inflicted outage; above it Vercel kills us first. */
@@ -246,6 +307,17 @@ function asQboBoundaryError(error: unknown, context: TimeoutContext): unknown {
     if (context.race.winner() && context.race.winner() !== context.timeoutSignal) return translated;
     if (translated instanceof Error && translated.name === "AbortError") return translated;
     if (isRetryableQboError(translated)) return translated;
+    // A SyntaxError from res.json() is QBO's PAYLOAD being wrong, not the
+    // connection. Treating it as a transport failure made one malformed
+    // response abort an entire run as though QuickBooks were down.
+    if (translated instanceof Error && translated.name === "SyntaxError") {
+        return new QboMalformedResponseError(
+            `QuickBooks returned an unparseable body (${safePath(context.url)})`,
+        );
+    }
+    // Everything else that threw mid-exchange — a reset socket, a terminated
+    // stream — really is the connection, including when it happens AFTER
+    // headers arrived, so it must abort a loop exactly like a timeout does.
     return new QboRetryableError(
         `QuickBooks request failed: ${translated instanceof Error ? translated.message : "network error"} (${safePath(context.url)})`,
     );
@@ -304,6 +376,9 @@ function wrapResponseBodyTimeouts(response: Response, context: TimeoutContext): 
     });
 }
 
+/** RequestInit plus the optional route budget this call must fit inside. */
+export type QbRequestInit = RequestInit & { qbDeadline?: RouteDeadline };
+
 /**
  * Every QuickBooks HTTP call goes through here.
  *
@@ -318,13 +393,25 @@ function wrapResponseBodyTimeouts(response: Response, context: TimeoutContext): 
  */
 export async function qbTimedFetch(
     url: string,
-    init: RequestInit = {},
+    init: QbRequestInit = {},
     timeoutMs: number = Number(process.env.QB_FETCH_TIMEOUT_MS) || QB_DEFAULT_TIMEOUT_MS,
 ): Promise<Response> {
     // A misconfigured env var must not break every QB call: AbortSignal.timeout
     // wants a positive integer, so a fraction or a non-finite value falls back
     // to the default rather than reaching it.
-    const effectiveMs = normalizeTimeoutMs(timeoutMs, QB_DEFAULT_TIMEOUT_MS);
+    const perCallMs = normalizeTimeoutMs(timeoutMs, QB_DEFAULT_TIMEOUT_MS);
+
+    // The route's remaining budget caps this call. Starting a 20s call with 3s
+    // left just guarantees the platform kills us instead of us returning.
+    const { qbDeadline, ...requestInit } = init;
+    const remaining = remainingBudgetMs(qbDeadline);
+    if (remaining <= QB_MIN_TIMEOUT_MS) {
+        throw new QBBudgetExhaustedError(
+            `QuickBooks call skipped: route budget exhausted (${safePath(url)})`,
+        );
+    }
+    const effectiveMs = Number.isFinite(remaining) ? Math.min(perCallMs, Math.floor(remaining)) : perCallMs;
+    init = requestInit;
     const timeoutSignal = AbortSignal.timeout(effectiveMs);
 
     const callerSignal = init.signal;
@@ -453,7 +540,7 @@ export async function refreshQBToken(refreshToken: string): Promise<{ accessToke
 export async function qbFetch(
     path: string,
     tokens: QBTokens,
-    opts: RequestInit = {}
+    opts: QbRequestInit = {}
 ): Promise<Response> {
     // Callers that already put their own query string on `path` (e.g.
     // "/purchase?requestid=...") get "&minorversion=73" appended instead of a
@@ -473,9 +560,10 @@ export async function qbFetch(
 }
 
 /** Run a QBO SQL-ish query (https://developer.intuit.com/.../data-queries) */
-export async function qbQuery<T = any>(tokens: QBTokens, query: string): Promise<T[]> {
+export async function qbQuery<T = any>(tokens: QBTokens, query: string, deadline?: RouteDeadline): Promise<T[]> {
     const url = `${QB_API_BASE}/${tokens.realmId}/query?query=${encodeURIComponent(query)}&minorversion=73`;
     const res = await qbTimedFetch(url, {
+        qbDeadline: deadline,
         headers: {
             Authorization: `Bearer ${tokens.accessToken}`,
             Accept: "application/json",
@@ -508,7 +596,10 @@ export async function parseJsonOrNull<T = any>(res: Response): Promise<T | null>
     try {
         return (await res.json()) as T;
     } catch (error) {
-        if (isQBTimeoutError(error)) throw error;
+        // A timeout or a dead connection is not "QBO sent no body" — those must
+        // reach the caller so a loop can stop. Only a genuine parse failure
+        // (QboMalformedResponseError) degrades to null.
+        if (isQBTimeoutError(error) || isRetryableQboError(error)) throw error;
         return null;
     }
 }
@@ -745,10 +836,14 @@ export type QBInvoiceProbe =
  * may return 400 + Fault code 610 ("Object Not Found"), a 404, or even 200 with
  * stale data. This folds all of those into a single discriminated result.
  */
-export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Promise<QBInvoiceProbe> {
+export async function probeQBInvoice(
+    tokens: QBTokens,
+    qbInvoiceId: string,
+    deadline?: RouteDeadline,
+): Promise<QBInvoiceProbe> {
     let res: Response;
     try {
-        res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET" });
+        res = await qbFetch(`/invoice/${qbInvoiceId}`, tokens, { method: "GET", qbDeadline: deadline });
     } catch (error) {
         // A timeout or a thrown network error means QBO never answered — the
         // connection itself is the problem, not this invoice.
@@ -762,9 +857,14 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
         try {
             data = await res.json();
         } catch (error) {
-            // The body can stall past the deadline after headers arrived.
+            // The body can stall past the deadline, or the socket can die,
+            // AFTER headers arrived — both are connection-level. A merely
+            // unparseable payload is not.
             if (isQBTimeoutError(error)) {
                 return { state: "error", status: res.status, connectionFailed: true, timedOut: true };
+            }
+            if (isRetryableQboError(error)) {
+                return { state: "error", status: res.status, connectionFailed: true };
             }
             return { state: "error", status: res.status };
         }
@@ -791,6 +891,9 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
         if (isQBTimeoutError(error)) {
             return { state: "error", status: res.status, connectionFailed: true, timedOut: true };
         }
+        if (isRetryableQboError(error)) {
+            return { state: "error", status: res.status, connectionFailed: true };
+        }
     }
     if (res.status === 400 && /"code"\s*:\s*"610"|Object Not Found/i.test(body)) {
         return { state: "notFound" };
@@ -804,9 +907,10 @@ export async function probeQBInvoice(tokens: QBTokens, qbInvoiceId: string): Pro
 /** Read a QBO payment (date / amount / reference) for receipt details. */
 export async function getQBPayment(
     tokens: QBTokens,
-    paymentId: string
+    paymentId: string,
+    deadline?: RouteDeadline,
 ): Promise<{ txnDate: string | null; amount: number; referenceNumber: string | null } | null> {
-    const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET" });
+    const res = await qbFetch(`/payment/${paymentId}`, tokens, { method: "GET", qbDeadline: deadline });
     if (!res.ok) {
         // Not "this payment does not exist" — QBO is refusing, or the shared
         // credential is bad. Raise so a looping caller aborts instead of

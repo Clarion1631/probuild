@@ -548,3 +548,53 @@ test("a fully drained collection reports ok", async () => {
     assert.equal(result.skipped, 0);
     assert.equal(paymentsSyncRunStatus(result), "ok");
 });
+
+
+// --- The run budget stops the loop before the cron ceiling ---
+
+test("the row loop stops when the route budget is gone, counting the rest skipped", async () => {
+    const { paymentsSyncRunStatus, PAYMENTS_SYNC_BUDGET_MS } = await import("../src/lib/quickbooks-payments");
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+
+    // 100s under the cron's 120s ceiling, leaving room to record the outcome.
+    assert.equal(PAYMENTS_SYNC_BUDGET_MS, 100_000);
+
+    const result = emptyResult();
+    const { client, calls } = fakeQbo({ probe: () => ({ state: "ok", balance: 5, total: 10, paymentTxnIds: [] }) });
+    // A budget that ran out 10s ago: not one row may start.
+    const spent = createRouteDeadline(2_000, Date.now() - 12_000);
+    await runQboRowLoop(rows(200), result, rowHandler(client, result), () => {}, "milestones", spent);
+
+    assert.equal(calls.probes.length, 0, "no row may start with no budget left");
+    assert.equal(result.skipped, 200);
+    // Unfinished work is reported honestly rather than as a clean run.
+    assert.equal(paymentsSyncRunStatus(result), "partial");
+});
+
+test("CUMULATIVE latency: the loop exits before the ceiling with slow rows", async () => {
+    const { createRouteDeadline } = await import("../src/lib/quickbooks");
+    const CEILING_MS = 3_000;
+    const result = emptyResult();
+    const deadline = createRouteDeadline(1_200);
+
+    // Each row costs 300ms of QBO time; 200 rows would be a full minute.
+    const slowClient: PaymentsSyncQboClient = {
+        async probeInvoice() {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            return { state: "ok", balance: 5, total: 10, paymentTxnIds: [] };
+        },
+        async getPayment() {
+            return { txnDate: "2026-09-01", amount: 10, referenceNumber: null };
+        },
+        async verifyConnection() {},
+    };
+
+    const started = Date.now();
+    await runQboRowLoop(rows(200), result, rowHandler(slowClient, result), () => {}, "milestones", deadline);
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < CEILING_MS, `ran ${elapsed}ms, past the ${CEILING_MS}ms ceiling`);
+    assert.ok(result.checked > 0, "should have processed some rows");
+    assert.ok(result.checked < 200, "must not have processed them all");
+    assert.equal(result.checked + result.skipped, 200, "every row is accounted for");
+});

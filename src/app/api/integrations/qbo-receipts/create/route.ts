@@ -10,7 +10,20 @@ import {
     type CreateQBReceiptPurchaseInput,
     type CreateQBReceiptPurchaseResult,
 } from "@/lib/qbo-receipt-push";
-import { isQBTimeoutError, type QBTokens } from "@/lib/quickbooks";
+import {
+    isQBTimeoutError,
+    isQBBudgetExhaustedError,
+    createRouteDeadline,
+    type QBTokens,
+} from "@/lib/quickbooks";
+
+/**
+ * Whole-request budget, under the 60s route ceiling. Every QBO call this push
+ * makes is capped by what is LEFT of it, so a run of individually-legal calls
+ * cannot add up past the ceiling and get the function killed mid-write with
+ * nothing recorded.
+ */
+export const RECEIPT_PUSH_BUDGET_MS = 50_000;
 
 export const dynamic = "force-dynamic";
 // Stays at 60. A single push does a lot of SERIAL QBO work on a healthy day —
@@ -284,6 +297,14 @@ export function createQboReceiptCreateHandlers(dependencies: QboReceiptCreateHan
                     await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-timeout" }));
                     return NextResponse.json({ ok: false, retry: true, reason: "qbo-timeout" }, { status: 503 });
                 }
+                if (isQBBudgetExhaustedError(error)) {
+                    // Out of time, not out of luck: 503 so the Apps Script
+                    // retries on its next pass, same idempotency guarantees as
+                    // the timeout branch.
+                    console.error("QBO receipt push ran out of route budget");
+                    await logEvent(pushEventFromOutcome(input, { status: "error", reason: "qbo-budget-exhausted" }));
+                    return NextResponse.json({ ok: false, retry: true, reason: "qbo-budget-exhausted" }, { status: 503 });
+                }
                 if (isRetryableQboError(error)) {
                     // 429/5xx/network, or a failed attachment step. Same
                     // reasoning and same idempotency guarantees as the timeout
@@ -322,7 +343,8 @@ const handlers = createQboReceiptCreateHandlers({
     getIngestSecret: () => process.env.RECEIPT_INGEST_SECRET,
     isPushEnabled: () => process.env.QBO_RECEIPT_PUSH_ENABLED === "true",
     getFreshTokens: getFreshQBTokens,
-    createPurchase: createQBReceiptPurchase,
+    createPurchase: (tokens, input) =>
+        createQBReceiptPurchase(tokens, input, {}, createRouteDeadline(RECEIPT_PUSH_BUDGET_MS)),
 });
 
 export async function POST(request: Request) {
