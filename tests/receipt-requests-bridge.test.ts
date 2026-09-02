@@ -166,7 +166,9 @@ test("the answers route never clears an issue whose resolution did not commit", 
     // Retry ONCE from a fresh read, not a reapplied snapshot.
     assert.match(source, /for \(let attempt = 0; attempt < 2/);
     assert.match(source, /const issue = await prisma\.reviewIssue\.findUnique\(/);
-    assert.match(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    // Round 4 item 3: the write is NOT gated on clearedAt any more — a valid
+    // signature is evidence whatever the issue's current state.
+    assert.match(source, /where: \{ id: issue\.id, version: issue\.version \}/);
 
     // The clear is UNREACHABLE unless the write committed.
     const notRecordedAt = source.indexOf("if (!recorded) {");
@@ -195,4 +197,63 @@ test("the missing-receipt loader pages when an owner filter is set", () => {
     assert.match(source, /cursor: \{ id: cursor \}, skip: 1/);
     // Unfiltered stays a single page — no extra reads for the common case.
     assert.match(source, /if \(owner === null\) \{\s*\n\s*return prisma\.reviewIssue\.findMany\(\{ where, orderBy: \{ firstObservedAt: "desc" \}, take: RECEIPT_GROUP_TAKE, select \}\);/);
+});
+
+test("a signed memo is recorded even when the issue was already auto-closed", () => {
+    // A memo signed after the matcher auto-closed the line used to be
+    // discarded, so when the matching receipt was later deleted the sweep
+    // reopened a charge somebody had genuinely answered weeks earlier.
+    const source = readFileSync(join(repoRoot, "src/app/api/automation/receipt-requests/answers/route.ts"), "utf8");
+    // The write is no longer gated on clearedAt: null.
+    assert.match(source, /where: \{ id: issue\.id, version: issue\.version \}/);
+    assert.doesNotMatch(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    // A cleared issue still gets the record, and is not re-cleared.
+    assert.match(source, /alreadyCleared = issue\.clearedAt !== null;/);
+    assert.match(source, /alreadyCleared: true, memoRecorded: true/);
+});
+
+test("the cards cron writes history through a CAS, never through the lifecycle", () => {
+    // Replaying selection-time codes through evaluateReviewIssue could reopen
+    // an issue cleared while the card was in flight, and write stale details
+    // back over its resolution.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    // Matches a CALL, not the word — the code comments explain why it is not
+    // used, and a comment must not fail the gate it documents.
+    assert.doesNotMatch(source, /await evaluateReviewIssue\(/, "card history is not a lifecycle event");
+    assert.doesNotMatch(source, /^import .*evaluateReviewIssue/m, "and the lifecycle is not even imported");
+    assert.match(source, /where: \{ id: issue\.id, version: issue\.version, clearedAt: null \}/);
+    assert.match(source, /if \(!issue \|\| issue\.clearedAt !== null\) continue;/);
+});
+
+test("card history is written only AFTER a validated post", () => {
+    // Writing it first marked items everCarded for attempts that never reached
+    // Chat, deprioritising work nobody had actually been asked about.
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now);");
+    assert.ok(postAt > 0 && recordAt > postAt, "history must follow the post");
+    assert.doesNotMatch(source, /recordCardOnIssues\(card, null, null, now\)/, "no pre-post history write");
+});
+
+test("the bank pull fails loudly: any failure is a 500", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/bank-register-pull/route.ts"), "utf8");
+    assert.match(source, /const status = summary\.ok \? 200 : 500;/);
+    const lib = readFileSync(join(repoRoot, "src/lib/bank-register-pull.ts"), "utf8");
+    assert.match(lib, /summary\.error = summary\.error \?\? "reconcile-failed";/);
+    assert.match(lib, /summary\.error = summary\.error \?\? "mint-failed";/);
+});
+
+test("ReceiptRequestCard carries RLS in both DDL paths and the blind-spot snapshot", () => {
+    const script = readFileSync(join(repoRoot, "scripts/apply-phase2-receipt-queue.mjs"), "utf8");
+    const migration = readFileSync(join(repoRoot, "prisma/migrations/20260901120000_phase2_receipt_queue/migration.sql"), "utf8");
+    for (const [label, source] of [["apply script", script], ["migration", migration]] as const) {
+        assert.match(source, /ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY/, label);
+        // ENABLE without FORCE: FORCE denies the owner too, which is the app.
+        assert.doesNotMatch(source, /ReceiptRequestCard" FORCE ROW LEVEL SECURITY/, label);
+    }
+    const snapshot = JSON.parse(readFileSync(join(repoRoot, "prisma/prisma-blind-spots.json"), "utf8"));
+    assert.ok(
+        snapshot.rlsTables.some((t: { name: string; forced: boolean }) => t.name === "ReceiptRequestCard" && t.forced === false),
+        "check-migrations-match compares against this snapshot",
+    );
 });

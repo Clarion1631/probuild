@@ -249,6 +249,10 @@
       "forced": false
     },
     {
+      "name": "ReceiptRequestCard",
+      "forced": false
+    },
+    {
       "name": "RefundEvent",
       "forced": false
     },
@@ -293,7 +297,7 @@
   "functions": [
     {
       "name": "check_bank_line_amount_immutable()",
-      "def": "CREATE OR REPLACE FUNCTION public.check_bank_line_amount_immutable()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n     BEGIN\n       IF NEW.\"amountCents\" IS DISTINCT FROM OLD.\"amountCents\" THEN\n         RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited — insert a new BankLine/observation instead', OLD.\"id\";\n       END IF;\n       RETURN NEW;\n     END;\n     $function$\n"
+      "def": "CREATE OR REPLACE FUNCTION public.check_bank_line_amount_immutable()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n     BEGIN\n       IF NEW.\"amountCents\" IS DISTINCT FROM OLD.\"amountCents\" THEN\n         RAISE EXCEPTION 'BankLine.amountCents is immutable (id %); amounts come from bank statements and can never be edited \u2014 insert a new BankLine/observation instead', OLD.\"id\";\n       END IF;\n       RETURN NEW;\n     END;\n     $function$\n"
     },
     {
       "name": "check_refund_event_signs()",

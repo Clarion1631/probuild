@@ -591,6 +591,8 @@ test("the receipt bytes always ride along with the Purchase", async () => {
     await bookReceipt(row(), r.deps);
     assert.equal(r.purchaseCalls[0].fileBase64, Buffer.from("bytes").toString("base64"));
     assert.equal(r.purchaseCalls[0].fileContentType, "image/jpeg");
+});
+
 test("a void between the claim and the send ABORTS — QBO is never called", async () => {
     // Everything before the send takes real time (a project lookup, a file
     // download), and a human on the Receipts tab can void the row in that

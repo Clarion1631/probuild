@@ -2,8 +2,11 @@
 
 import { useState, useTransition } from "react";
 import { toast } from "sonner";
+import { RECEIPT_OWNER_CHOICES } from "@/lib/receipt-requests";
 import {
     markReceiptIntakeDuplicate,
+    resolveOrphanedQbPurchase,
+    setMissingReceiptOwner,
     retryReceiptIntake,
     setReceiptIntakeJob,
     unmarkReceiptIntakeDuplicate,
@@ -131,6 +134,55 @@ export function MarkDuplicateControl({ intakeId }: { intakeId: string }) {
                 onClick={() => run(() => markReceiptIntakeDuplicate(intakeId, duplicateOfId))}
             >
                 Mark duplicate
+            </button>
+        </div>
+    );
+}
+
+export function ResolveOrphanButton({ intakeId, qbPurchaseId }: { intakeId: string; qbPurchaseId: string }) {
+    const { pending, run } = useAction("Marked resolved");
+    return (
+        <button
+            type="button"
+            className={BTN}
+            disabled={pending}
+            onClick={() => {
+                if (!window.confirm(
+                    `Have you voided purchase ${qbPurchaseId} in QuickBooks? This only records that you did — it does not change QuickBooks.`,
+                )) return;
+                run(() => resolveOrphanedQbPurchase(intakeId));
+            }}
+        >
+            Voided in QuickBooks
+        </button>
+    );
+}
+
+export function AssignOwnerControl({ issueId, currentOwner }: { issueId: string; currentOwner: string }) {
+    const [owner, setOwner] = useState("");
+    const { pending, run } = useAction("Owner set — the card goes out tomorrow morning");
+    return (
+        <div className="flex items-center gap-2 flex-wrap">
+            <label className="sr-only" htmlFor={`owner-${issueId}`}>Whose charge was this?</label>
+            <select
+                id={`owner-${issueId}`}
+                className="hui-input text-xs py-1"
+                value={owner}
+                disabled={pending}
+                onChange={event => setOwner(event.target.value)}
+            >
+                <option value="">Whose charge?</option>
+                {RECEIPT_OWNER_CHOICES.map(name => (
+                    <option key={name} value={name}>{name}</option>
+                ))}
+            </select>
+            <button
+                type="button"
+                className={BTN}
+                disabled={pending || !owner || owner === currentOwner}
+                onClick={() => run(() => setMissingReceiptOwner(issueId, owner))}
+            >
+                Assign
             </button>
         </div>
     );

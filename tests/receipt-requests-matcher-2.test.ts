@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
     appendCardRecord,
+    competingLineFilter,
     evidenceUnitKey,
     hasResolution,
     mergeReceiptRequestDetails,
@@ -311,4 +312,95 @@ test("the cron derives hasReceipt from receiptUrl OR a linked intake", () => {
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
     assert.match(source, /hasReceipt: !!row\.receiptUrl \|\| row\.receiptIntake !== null/);
     assert.match(source, /receiptIntake: \{ select: \{ id: true \} \}/);
+});
+
+// ── Two charges, one receipt, under concurrency (Codex round-4 item 2) ──────
+
+test("the competing set is what must be recomputed together, never one line", () => {
+    // One-to-one assignment is a property of the BATCH. Two identical charges
+    // and one receipt resolve differently depending on which is considered
+    // first, so a retry that recomputed a single line saw "a receipt exists"
+    // and closed a charge whose receipt had already gone to its twin.
+    const a = line({ id: "bl-a", postedDate: "2026-08-16" });
+    const b = line({ id: "bl-b", postedDate: "2026-08-16" });
+
+    const batch = plan({ bankLines: [a, b], expenses: [expense()], openIssueKeys: ["bl-a", "bl-b"] });
+    assert.equal(batch.open.length, 1, "exactly one of the two keeps its chase");
+    assert.deepEqual(batch.close, ["bl-a"], "and exactly one closes");
+    const stillOpen = batch.open[0].targetKey;
+    assert.equal(stillOpen, "bl-b");
+
+    // The isolated recompute — what the retry path used to do — reaches the
+    // OPPOSITE verdict for the line that should stay open.
+    const isolated = plan({ bankLines: [b], expenses: [expense()], openIssueKeys: ["bl-b"] });
+    assert.deepEqual(isolated.close, ["bl-b"], "this is the bug: in isolation it closes");
+    assert.equal(isolated.open.length, 0);
+
+    // Recomputing the whole competing set reproduces the batch's verdict.
+    const wholeSet = plan({ bankLines: [a, b], expenses: [expense()], openIssueKeys: ["bl-a", "bl-b"] });
+    assert.ok(wholeSet.open.some(o => o.targetKey === stillOpen), "the set-wide answer is stable");
+});
+
+test("competingLineFilter spans both directions of the match window", () => {
+    const f = competingLineFilter({ amountCents: -12_345, postedDate: "2026-08-16" });
+    assert.equal(f.amountCents, -12_345, "a different amount can never claim the same receipt");
+    // Twice the ±2-day match window, so a competitor that could reach the same
+    // evidence from the far side is still in the set.
+    assert.equal(f.from, "2026-08-12");
+    assert.equal(f.to, "2026-08-20");
+});
+
+test("two concurrent sweeps cannot both give one receipt away", async () => {
+    // A durable lease is what makes this true: the second run does no work at
+    // all. Modelled here as the lease's observable consequence — exactly one
+    // run reconciles, so the batch verdict is applied once.
+    const applied: string[][] = [];
+    let leaseHeld = false;
+    const runSweep = async () => {
+        if (leaseHeld) return null;          // takeRunLease returned null
+        leaseHeld = true;
+        // The lease is held ACROSS the work, not released in the same tick —
+        // that is the difference from the advisory claim it replaced, and
+        // without this the fake would not model the bug at all.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        try {
+            const result = plan({
+                bankLines: [line({ id: "bl-a" }), line({ id: "bl-b" })],
+                expenses: [expense()],
+                openIssueKeys: [],
+            });
+            applied.push(result.open.map(o => o.targetKey));
+            return result;
+        } finally {
+            leaseHeld = false;
+        }
+    };
+    const [first, second] = await Promise.all([runSweep(), runSweep()]);
+    assert.ok(first !== null, "one run does the work");
+    assert.equal(second, null, "the other does nothing at all");
+    assert.equal(applied.length, 1);
+    assert.deepEqual(applied[0], ["bl-b"], "one charge keeps its chase, exactly once");
+});
+
+test("the sweep holds a DURABLE lease, not a released advisory claim", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /async function takeRunLease\(/);
+    assert.match(source, /RUN_LEASE_MS/);
+    // Taken before the work and released after it, not committed away first.
+    const takeAt = source.indexOf("const leaseToken = await takeRunLease(now);");
+    const workAt = source.indexOf("return await runSweep(now);");
+    const releaseAt = source.indexOf("await releaseRunLease(leaseToken);");
+    assert.ok(takeAt > 0 && workAt > takeAt && releaseAt > workAt);
+    // And the retry path recomputes the SET.
+    assert.match(source, /competingLineFilter\(/);
+    assert.match(source, /prisma\.bankLine\.findMany\(\{\s*\n\s*where: \{ amountCents: competing\.amountCents/);
+});
+
+test("the sweep resumes from a durable cursor, oldest-first", () => {
+    const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-requests/route.ts"), "utf8");
+    assert.match(source, /orderBy: \[\{ postedDate: "asc" \}, \{ id: "asc" \}\]/,
+        "newest-first silently abandoned older candidates behind the cap");
+    assert.match(source, /const resumeFrom = await readCursor\(\);/);
+    assert.match(source, /cursor: \{ id: resumeFrom \}, skip: 1/);
+    assert.match(source, /await writeCursor\(batchWasFull \? lastId : null\);/);
 });

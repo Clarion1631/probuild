@@ -9,6 +9,7 @@ import {
     isValidChatWebhookUrl,
     pacificDate,
     parseOwnerChatUsers,
+    postOwnerCard,
     requestIdFor,
     serializeThreads,
     type CardCandidateIssue,
@@ -198,4 +199,41 @@ test("the webhook URL allowlist is an SSRF guard, not a preference", () => {
     assert.equal(isValidChatWebhookUrl("http://chat.googleapis.com/v1/spaces/x"), false);
     assert.equal(isValidChatWebhookUrl("https://chat.googleapis.com/v1/other"), false);
     assert.equal(isValidChatWebhookUrl("not a url"), false);
+});
+
+// ── A post without a bridge identity is a FAILURE (Codex round-4 item 4) ────
+
+test("postOwnerCard returns null when the response lacks thread.name or message.name", async () => {
+    // A 200 with no names looked like success: the row was marked posted, the
+    // threads endpoint silently dropped the card, and every reply in that Chat
+    // thread was orphaned with nothing to retry.
+    const bodies = [
+        {},
+        { name: "spaces/x/messages/1" },                       // no thread
+        { thread: { name: "spaces/x/threads/1" } },            // no message
+        { name: "", thread: { name: "spaces/x/threads/1" } },  // empty message
+        { name: "spaces/x/messages/1", thread: { name: "" } }, // empty thread
+    ];
+    const original = globalThis.fetch;
+    try {
+        for (const body of bodies) {
+            globalThis.fetch = (async () => new Response(JSON.stringify(body), {
+                status: 200, headers: { "content-type": "application/json" },
+            })) as typeof fetch;
+            const [card] = buildOwnerCards([issue()], NOW);
+            const result = await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
+            assert.equal(result, null, `body ${JSON.stringify(body)} must be a failure`);
+        }
+
+        // Both present → success.
+        globalThis.fetch = (async () => new Response(
+            JSON.stringify({ name: "spaces/x/messages/1", thread: { name: "spaces/x/threads/1" } }),
+            { status: 200, headers: { "content-type": "application/json" } },
+        )) as typeof fetch;
+        const [card] = buildOwnerCards([issue()], NOW);
+        const ok = await postOwnerCard("https://chat.googleapis.com/v1/spaces/AAQAKhvMYtg/messages?key=x", card);
+        assert.deepEqual(ok, { owner: "CJ", threadName: "spaces/x/threads/1", messageName: "spaces/x/messages/1" });
+    } finally {
+        globalThis.fetch = original;
+    }
 });

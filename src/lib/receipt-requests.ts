@@ -125,6 +125,48 @@ export interface ReceiptRequestInput {
     now: Date;
 }
 
+/**
+ * Rails the OFFICE genuinely owns: an ACH, a wire, a check, a transfer. These
+ * legitimately have no card tail, so "office" is a real answer for them rather
+ * than a shrug. Everything else without a tail is `unattributed`.
+ */
+const OFFICE_RAIL = /\b(?:ACH|WIRE|CHECK|TRANSFER|DEPOSIT|ONLINE PMT|BILL PAY|EFT|DIRECT DEP|PAYROLL)\b/i;
+
+/** Owners a human may assign an unattributed charge to. */
+export const RECEIPT_OWNER_CHOICES: string[] = ["CJ", "Richard", "Justin", "office"];
+
+export function isOfficeRail(rawDescriptor: string): boolean {
+    return OFFICE_RAIL.test(rawDescriptor ?? "");
+}
+
+/**
+ * Every bank line that could plausibly claim the SAME evidence as `line`.
+ *
+ * One-to-one assignment is a property of the whole batch, not of one row: two
+ * identical charges competing for one receipt resolve differently depending on
+ * which is considered first. A retry that recomputed a single line in isolation
+ * therefore saw "a matching receipt exists" and closed it — even though the
+ * batch had already given that receipt to the other charge. This returns the
+ * set that has to be recomputed TOGETHER for the answer to mean anything.
+ *
+ * "Could plausibly claim" is deliberately loose (same amount, within twice the
+ * date window): being too wide only costs a few extra rows in a recompute,
+ * while being too narrow reintroduces the bug.
+ */
+export function competingLineFilter(line: { amountCents: number; postedDate: string }) {
+    const day = dayNumber(line.postedDate);
+    const span = RECEIPT_MATCH_DATE_SLOP_DAYS * 2;
+    return {
+        amountCents: line.amountCents,
+        from: day === null ? line.postedDate : ymdOf(day - span),
+        to: day === null ? line.postedDate : ymdOf(day + span),
+    };
+}
+
+function ymdOf(dayNumberValue: number): string {
+    return new Date(dayNumberValue * 86_400_000).toISOString().slice(0, 10);
+}
+
 /** `"pb-<bankLineId>"` — the identity the Chat card, the sweep, and Beverly's affidavit PDF all carry. */
 export function receiptRequestFingerprint(bankLineId: string): string {
     return `pb-${bankLineId}`;
@@ -386,10 +428,17 @@ export function planReceiptRequests(input: ReceiptRequestInput): ReceiptRequestP
         }
 
         const ownerVerdict = resolveReceiptOwner(line.rawDescriptor);
+        // No card tail anywhere in the descriptor means we genuinely do not
+        // know whose charge it was. Calling that "office" is a guess that reads
+        // as an answer, and it hid these rows from the crew's card entirely —
+        // so it gets its own visible bucket and a human assigns it.
+        const owner = ownerVerdict.cardTail === null && !isOfficeRail(line.rawDescriptor)
+            ? "unattributed"
+            : ownerVerdict.owner;
         open.push({
             targetKey: line.id,
             displayDetails: {
-                owner: ownerVerdict.owner,
+                owner,
                 cardTail: ownerVerdict.cardTail,
                 postedDate: line.postedDate,
                 amountCents: line.amountCents,
@@ -439,7 +488,13 @@ function assignEvidence(
  * would silently delete a signed memo's PDF link and the Chat thread the sweep
  * needs to find its replies.
  */
-export const PRESERVED_DETAIL_KEYS = ["resolution", "pdfUrl", "signedAt", "signedThread", "cards", "card"] as const;
+export const PRESERVED_DETAIL_KEYS = [
+    "resolution", "pdfUrl", "signedAt", "signedThread", "cards", "card",
+    // A human's owner assignment outlives every nightly recompute. Without it
+    // the sweep would overwrite Marge's decision within 24 hours and the card
+    // would never go out.
+    "ownerOverride",
+] as const;
 
 /**
  * Merge freshly-computed facts over an existing details blob, preserving the

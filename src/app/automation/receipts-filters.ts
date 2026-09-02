@@ -12,6 +12,7 @@ export const RECEIPT_GROUPS = [
     "booked-today",
     "missing-receipts",
     "duplicates",
+    "exceptions",
 ] as const;
 
 export type ReceiptGroup = (typeof RECEIPT_GROUPS)[number];
@@ -23,15 +24,19 @@ export const RECEIPT_GROUP_LABELS: Record<ReceiptGroup, string> = {
     "booked-today": "Booked today",
     "missing-receipts": "Missing receipts",
     duplicates: "Duplicates",
+    exceptions: "Exceptions",
 };
 
 /**
  * Owner display order for the missing-receipt sub-groups: the people who are
- * actually asked come first. `unassigned` sorts last but is never dropped —
- * an unrecognized card tail has to stay visible, not vanish into a bucket
- * nobody looks at.
+ * actually asked come first, then `unattributed` — charges with no card tail
+ * and no office rail, which a human has to attribute before a card can go out.
+ * It sits third BECAUSE it is work: burying it under office/Justin is how it
+ * would never get done. `unassigned` sorts last but is never dropped — an
+ * unrecognized card tail has to stay visible, not vanish into a bucket nobody
+ * looks at.
  */
-export const OWNER_ORDER: ReceiptOwner[] = ["CJ", "Richard", "office", "Justin", "unassigned"];
+export const OWNER_ORDER: ReceiptOwner[] = ["CJ", "Richard", "unattributed", "office", "Justin", "unassigned"];
 
 export function ownerRank(owner: string): number {
     const index = OWNER_ORDER.indexOf(owner as ReceiptOwner);

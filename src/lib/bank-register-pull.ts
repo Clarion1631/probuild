@@ -34,6 +34,13 @@ export interface BankRegisterRowLike {
     docNum: string | null;
     name: string | null;
     amountCents: number;
+    /**
+     * The GL's memo/description cell. The bank feed usually leaves the ORIGINAL
+     * POS descriptor here — "LOWES #02516 POS DEB C#8516" — which is the only
+     * place a QBO row carries the card tail. Without it every QBO-minted line
+     * resolved to `office` and the crew was never asked (Codex round-4 item 7).
+     */
+    memo?: string | null;
 }
 
 export interface BankRegisterIngestLine {
@@ -77,6 +84,11 @@ export function registerRowToIngestLine(row: BankRegisterRowLike): BankRegisterI
     if (!row.qbTxnId) return null; // balance/summary rows carry no txn identity
     const parts: string[] = [];
     if (row.name && row.name.trim()) parts.push(row.name.trim());
+    // MEMO BEFORE TYPE. The bank feed usually parks the original POS descriptor
+    // here, and that is where `C#8516` lives — the only owner signal a QBO row
+    // has. `identityPayee` strips the trailing type word from both sides, so
+    // adding the memo does not break identity; dropping it lost the owner.
+    if (row.memo && row.memo.trim()) parts.push(row.memo.trim());
     if (row.qbType && row.qbType.trim()) parts.push(row.qbType.trim());
     const rawDescriptor = parts.join(" ").replace(/\s+/g, " ").trim();
     if (rawDescriptor === "") return null; // nothing to normalize a payee from
@@ -288,6 +300,11 @@ export async function runBankRegisterPull(
         summary.reconciled = await dependencies.reconcile(account);
     } catch (error) {
         summary.reconciled = null;
+        // A reconcile failure is not cosmetic: unlinked observations are what
+        // starve the matcher, which is the entire reason this cron exists.
+        // Swallowing it returned 200 and nothing was ever paged.
+        summary.ok = false;
+        summary.error = summary.error ?? "reconcile-failed";
         console.error("[bank-register-pull] reconcile failed", error instanceof Error ? error.message : "UnknownError");
     }
 
@@ -299,6 +316,8 @@ export async function runBankRegisterPull(
             summary.minted = await dependencies.mintFromQbo(account);
         } catch (error) {
             summary.minted = null;
+            summary.ok = false;
+            summary.error = summary.error ?? "mint-failed";
             console.error("[bank-register-pull] mint failed", error instanceof Error ? error.message : "UnknownError");
         }
     }

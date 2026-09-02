@@ -67,3 +67,12 @@ ALTER TABLE "ReceiptRequestCard" ADD COLUMN IF NOT EXISTS "claimToken" TEXT;
 -- was in flight. NOT qbPurchaseId — that column means "this row is booked", and
 -- this row is not; the money exists in QBO and a human has to void it there.
 ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT;
+
+-- RLS, matching ReceiptIntake and every other sensitive table in this schema.
+-- ENABLE with no policies and WITHOUT FORCE: the app connects as the
+-- owner/service role, which bypasses RLS, so reads and writes are unaffected —
+-- while anon and authenticated roles (a leaked anon key, a Supabase client
+-- someone wires up later) get nothing. FORCE would deny the owner too and take
+-- the cron down. ReceiptRequestCard holds owner names and the item snapshot for
+-- real charges, so it belongs in the same class.
+ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY;

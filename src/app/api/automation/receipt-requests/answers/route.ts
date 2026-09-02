@@ -101,11 +101,6 @@ export async function POST(request: Request) {
             select: { id: true, version: true, displayDetails: true, clearedAt: true },
         });
         if (!issue) { missing = true; break; }
-        if (issue.clearedAt !== null) {
-            // Already answered — a replayed record is a no-op, never a reopen.
-            alreadyCleared = true;
-            break;
-        }
 
         // Merged from THIS read, not from anything older: a card record or a
         // corrected amount written since must survive.
@@ -117,18 +112,26 @@ export async function POST(request: Request) {
         if (typeof body.at === "string") details.signedAt = body.at.slice(0, 64);
         if (typeof body.thread === "string") details.signedThread = body.thread.slice(0, 200);
 
+        // RECORDED EVEN ON A CLEARED ISSUE (Codex round-4 item 3).
+        //
+        // A memo signed after the nightly matcher had already auto-closed the
+        // line used to be discarded — so when the matching receipt was later
+        // deleted, the sweep reopened a charge somebody had genuinely answered
+        // weeks earlier. A valid signature is evidence whatever the issue's
+        // current state, and `resolution` is exactly the field the matcher
+        // reads to suppress a reopen.
         const written = await prisma.reviewIssue.updateMany({
-            where: { id: issue.id, version: issue.version, clearedAt: null },
+            where: { id: issue.id, version: issue.version },
             data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
         });
-        if (written.count === 1) recorded = { targetKey: bankLineId };
+        if (written.count === 1) {
+            recorded = { targetKey: bankLineId };
+            alreadyCleared = issue.clearedAt !== null;
+        }
     }
 
     if (missing) {
         return NextResponse.json({ ok: true, ignored: true, reason: "unknown-target" });
-    }
-    if (alreadyCleared) {
-        return NextResponse.json({ ok: true, alreadyCleared: true });
     }
     if (!recorded) {
         // Two attempts both lost the race. Clearing now would silence the chase
@@ -138,6 +141,13 @@ export async function POST(request: Request) {
             { ok: false, reason: "resolution-not-recorded", targetKey: bankLineId },
             { status: 409 },
         );
+    }
+
+    // The issue was already closed by the matcher; the memo is now recorded on
+    // it, which is the whole point — a later reopen is suppressed. Nothing to
+    // clear.
+    if (alreadyCleared) {
+        return NextResponse.json({ ok: true, alreadyCleared: true, memoRecorded: true, targetKey: bankLineId });
     }
 
     // Empty codes = lifecycle step 1 = clear, and it cancels any open episode.

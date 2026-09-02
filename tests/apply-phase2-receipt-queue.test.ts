@@ -54,7 +54,10 @@ test("both are additive and idempotent — a re-run must change nothing", () => 
             /^ALTER TABLE .* ADD COLUMN IF NOT EXISTS/i.test(s)
             || /^CREATE TABLE IF NOT EXISTS/i.test(s)
             || /^CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/i.test(s)
-            || /^DO \$\$ BEGIN\s+IF NOT EXISTS/i.test(s);
+            || /^DO \$\$ BEGIN\s+IF NOT EXISTS/i.test(s)
+            // ENABLE ROW LEVEL SECURITY is idempotent by definition: enabling
+            // it twice is the same as enabling it once, and it touches no row.
+            || /^ALTER TABLE .* ENABLE ROW LEVEL SECURITY$/i.test(s);
         assert.ok(guarded, `not idempotent:\n  ${s.slice(0, 120)}`);
         // Nothing here may destroy or rewrite existing data.
         assert.doesNotMatch(s, /\bDROP\b|\bTRUNCATE\b|\bDELETE FROM\b|\bUPDATE\b/i);

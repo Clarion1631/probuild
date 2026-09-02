@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
-import { evaluateReviewIssue } from "@/lib/review-alert-lifecycle";
 import { decodeReasonCodes } from "@/lib/review-alert-reasons";
 import { RECEIPT_REQUEST_TARGET_TYPE, appendCardRecord } from "@/lib/receipt-requests";
 import {
@@ -196,28 +195,37 @@ function parseItems(itemsJson: string): CardItem[] {
  * and it rides `displayDetails`, which is deliberately not part of the reason
  * hash, so writing it opens no new generation and sends no second alert.
  */
-async function recordCardOnIssues(card: OwnerCard, threadName: string | null, messageName: string | null, now: Date) {
-    // Called TWICE per card: once before the post (thread unknown) and once
-    // after (thread filled in). appendCardRecord replaces the same-day entry
-    // rather than stacking, so the second call updates the first's record.
+async function recordCardOnIssues(card: OwnerCard, threadName: string, messageName: string, now: Date) {
     for (const item of card.items) {
+        // FRESH READ INSIDE THE CAS. Replaying the codes and details captured
+        // at selection time could reopen an issue that was cleared while the
+        // card was in flight — and worse, write the stale details back over its
+        // resolution, un-answering a memo somebody had just signed.
         const issue = await prisma.reviewIssue.findUnique({
             where: { id: item.issueId },
-            select: { displayDetails: true, reasonCodes: true, clearedAt: true },
+            select: { id: true, version: true, displayDetails: true, clearedAt: true },
         });
+        // Answered while the card was posting. The card mentions it; that is
+        // cosmetic and self-correcting. Touching the issue is not.
         if (!issue || issue.clearedAt !== null) continue;
+
         const details = appendCardRecord(
             parseMissingReceiptDetails(issue.displayDetails),
             { threadName, messageName, n: item.n, date: card.date, requestId: card.requestId },
             now,
         );
-        await evaluateReviewIssue(
-            RECEIPT_REQUEST_TARGET_TYPE,
-            item.targetKey,
-            decodeReasonCodes(issue.reasonCodes),
-            details,
-            { episodeStatus: "SUPPRESSED" },
-        );
+        // A plain version-guarded write, NOT evaluateReviewIssue: this is card
+        // history, not a lifecycle event. Routing it through the lifecycle
+        // meant handing it a codes array, and any stale array is a reopen
+        // waiting to happen. Losing the CAS costs one thread record — the next
+        // card re-records it — and never costs a resolution.
+        const written = await prisma.reviewIssue.updateMany({
+            where: { id: issue.id, version: issue.version, clearedAt: null },
+            data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
+        });
+        if (written.count === 0) {
+            console.warn("[cron/receipt-request-cards] card history lost a race", item.issueId);
+        }
     }
 }
 
@@ -315,14 +323,14 @@ export async function GET(request: Request) {
 
     const posted: Array<{ owner: string; items: number; threadName: string | null; resumed: boolean }> = [];
     for (const { card, rowId, token, resumed } of toPost.slice(0, CARD_RATE_CEILING)) {
-        // cards[] IS WRITTEN BEFORE THE POST, not after. The threads endpoint
-        // and the sweep need the thread record to exist for any message that
-        // reaches Chat; writing it afterwards meant a crash in between produced
-        // a card in the space that ProBuild had no record of, so every reply to
-        // it was orphaned. Written first, the worst case is a recorded thread
-        // for a message that never went out — visible, and harmless.
-        await recordCardOnIssues(card, null, null, now);
-
+        // HISTORY IS WRITTEN AFTER A VALIDATED POST, and only then.
+        //
+        // Writing it first (the previous shape) marked items `everCarded` for
+        // attempts that never reached Chat, so the never-carded-first ordering
+        // DEPRIORITISED work nobody had actually been asked about — the exact
+        // starvation the ordering exists to prevent. The post is now only a
+        // success when it returns both bridge identities, so "carded" means
+        // "there is a real thread to reply in".
         const result = await postOwnerCard(webhookUrl, card);
         if (!result) {
             // Left UNPOSTED on purpose: a same-day retry can take the claim

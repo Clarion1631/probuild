@@ -27,6 +27,8 @@ export interface BankRegisterRow {
     qbTxnId: string | null;
     docNum: string | null;
     name: string | null;
+    /** GL memo/description — usually the original POS descriptor, card tail included. */
+    memo: string | null;
     /** Signed integer cents: deposits +, money out −. */
     amountCents: number;
 }
@@ -94,6 +96,7 @@ function walkGlRows(rows: GlRow[], idx: Map<string, number>, out: BankRegisterRo
                     qbTxnId: str(typeCell?.id),
                     docNum: str(at("doc_num")?.value),
                     name: str(at("name")?.value),
+                    memo: str(at("memo")?.value),
                     amountCents: Math.round(amountRaw * 100),
                 });
             }
@@ -158,7 +161,7 @@ export async function fetchBankRegister(
                 start_date: startDate,
                 end_date: endDate,
                 account: accountId,
-                columns: "tx_date,txn_type,doc_num,name,subt_nat_amount",
+                columns: "tx_date,txn_type,doc_num,name,memo,subt_nat_amount",
             });
             const res = await qbFetch(`/reports/GeneralLedger?${params}`, tokens);
             if (!res.ok) throw new Error(`GL report ${res.status}`);

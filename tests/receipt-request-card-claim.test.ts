@@ -254,21 +254,20 @@ test("a resumed card re-posts the SAME items in the SAME order", async () => {
     assert.deepEqual(seen.map(i => i.n), [1, 2]);
 });
 
-test("the thread record is written BEFORE the post", async () => {
-    // A crash between posting and recording put a card in the space that
-    // ProBuild had no record of, orphaning every reply to it. Written first,
-    // the worst case is a recorded thread for a message that never went out.
-    const table = cardTable();
-    const order: string[] = [];
-    const result = await runOnce(table, [issue()], async owner => { order.push(`post:${owner}`); return true; });
-    assert.deepEqual(result.recordedBeforePost, ["CJ"]);
-    assert.deepEqual(order, ["post:CJ"]);
-
+test("card history is written only AFTER a validated post", () => {
+    // REVERSED in round 4. Writing history first marked items `everCarded` for
+    // attempts that never reached Chat, so the never-carded-first ordering
+    // deprioritised work nobody had actually been asked about — the exact
+    // starvation that ordering exists to prevent. A post now only succeeds when
+    // it returns both bridge identities, so "carded" means there is a real
+    // thread to reply in; the residual risk moves to a crash between post and
+    // record, which costs one un-recorded thread and is self-correcting on the
+    // next card.
     const source = readFileSync(join(repoRoot, "src/app/api/cron/receipt-request-cards/route.ts"), "utf8");
-    const recordAt = source.indexOf("await recordCardOnIssues(card, null, null, now);");
-    const postAt = source.indexOf("await postOwnerCard(webhookUrl, card);");
-    assert.ok(recordAt > 0 && postAt > 0);
-    assert.ok(recordAt < postAt, "the pre-post record must come first in the source too");
+    const postAt = source.indexOf("const result = await postOwnerCard(webhookUrl, card);");
+    const recordAt = source.indexOf("await recordCardOnIssues(card, result.threadName, result.messageName, now);");
+    assert.ok(postAt > 0 && recordAt > postAt, "history must follow the post");
+    assert.doesNotMatch(source, /recordCardOnIssues\(card, null, null, now\)/, "no pre-post history write");
 });
 
 test("completion is token-fenced in the real route, not just in this fake", () => {

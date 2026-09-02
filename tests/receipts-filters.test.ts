@@ -32,9 +32,9 @@ test("parseReceiptFilters never trusts the query string", async t => {
 });
 
 test("every group has a label, and the six are the spec's six", () => {
-    assert.deepEqual([...RECEIPT_GROUPS], ["needs-job", "needs-review", "booking", "booked-today", "missing-receipts", "duplicates"]);
+    assert.deepEqual([...RECEIPT_GROUPS], ["needs-job", "needs-review", "booking", "booked-today", "missing-receipts", "duplicates", "exceptions"]);
     assert.deepEqual(RECEIPT_GROUPS.map(g => RECEIPT_GROUP_LABELS[g]),
-        ["Needs job", "Needs review", "Booking", "Booked today", "Missing receipts", "Duplicates"]);
+        ["Needs job", "Needs review", "Booking", "Booked today", "Missing receipts", "Duplicates", "Exceptions"]);
 });
 
 test("groupIsVisible: no filter shows all, a filter shows exactly one", () => {
@@ -55,9 +55,13 @@ test("the owner predicate narrows missing-receipt rows only", () => {
 });
 
 test("owner ordering puts the people who get asked first, and never drops an unknown", () => {
-    assert.deepEqual(OWNER_ORDER, ["CJ", "Richard", "office", "Justin", "unassigned"]);
+    // `unattributed` sits third BECAUSE it is work: a charge with no card tail
+    // needs a human before any card can go out. Burying it under office and
+    // Justin is how it would never get done.
+    assert.deepEqual(OWNER_ORDER, ["CJ", "Richard", "unattributed", "office", "Justin", "unassigned"]);
     assert.ok(ownerRank("CJ") < ownerRank("Richard"));
-    assert.ok(ownerRank("Richard") < ownerRank("office"));
+    assert.ok(ownerRank("Richard") < ownerRank("unattributed"));
+    assert.ok(ownerRank("unattributed") < ownerRank("office"));
     assert.ok(ownerRank("office") < ownerRank("Justin"));
     assert.ok(ownerRank("Justin") < ownerRank("unassigned"));
     assert.equal(ownerRank("Someone New"), OWNER_ORDER.length, "an unrecognized owner sorts last, it does not vanish");

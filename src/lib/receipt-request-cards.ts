@@ -293,10 +293,10 @@ export function isValidChatWebhookUrl(value: string): boolean {
 
 export interface PostedCard {
     owner: string;
-    /** Chat's `thread.name`, when the response carried one. */
-    threadName: string | null;
-    /** Chat's `message.name`, when the response carried one. */
-    messageName: string | null;
+    /** Chat's `thread.name`. Never null — a response without it is a failure. */
+    threadName: string;
+    /** Chat's `message.name`. Never null — a response without it is a failure. */
+    messageName: string;
 }
 
 /**
@@ -325,11 +325,22 @@ export async function postOwnerCard(webhookUrl: string, card: OwnerCard): Promis
             return null;
         }
         const body = (await res.json().catch(() => null)) as { name?: unknown; thread?: { name?: unknown } } | null;
-        return {
-            owner: card.owner,
-            threadName: typeof body?.thread?.name === "string" ? body.thread.name : null,
-            messageName: typeof body?.name === "string" ? body.name : null,
-        };
+        const threadName = typeof body?.thread?.name === "string" && body.thread.name ? body.thread.name : null;
+        const messageName = typeof body?.name === "string" && body.name ? body.name : null;
+        // BOTH, or it is a FAILURE. Without them the bridge has no identity to
+        // export: the threads endpoint silently drops the card, so every reply
+        // in that Chat thread is orphaned — while the row was marked posted and
+        // nothing was ever retried. A 200 with no names is worse than a 500,
+        // because it looks like it worked.
+        if (!threadName || !messageName) {
+            console.error("[receipt-request-cards] post lacked a bridge identity", {
+                owner: card.owner,
+                hasThread: threadName !== null,
+                hasMessage: messageName !== null,
+            });
+            return null;
+        }
+        return { owner: card.owner, threadName, messageName };
     } catch (error) {
         console.error("[receipt-request-cards] post failed", { owner: card.owner, error });
         return null;

@@ -172,7 +172,18 @@ export function classifyReceiptRequirement(line: ReceiptPolicyLine): ReceiptPoli
  * "office": he is not someone to send an affidavit request to, and his
  * spend is overwhelmingly overhead/subscription rather than job cost.
  */
-export type ReceiptOwner = "CJ" | "Richard" | "Justin" | "unassigned" | "office";
+export type ReceiptOwner =
+    | "CJ" | "Richard" | "Justin"
+    /** A card tail we do not recognise. */
+    | "unassigned"
+    /** An office-owned rail (ACH, wire, check, transfer) — a real answer. */
+    | "office"
+    /**
+     * No card tail AND not an office rail: we genuinely do not know whose
+     * charge this was. Its own bucket rather than a silent "office", because
+     * calling a shrug an answer is what hid QBO-minted lines from the crew.
+     */
+    | "unattributed";
 
 export interface OwnerVerdict {
     owner: ReceiptOwner;

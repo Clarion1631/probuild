@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { isCronAuthorized } from "@/lib/cron-auth";
@@ -9,6 +10,7 @@ import {
     RECEIPT_MATCH_DATE_SLOP_DAYS,
     RECEIPT_REQUEST_TARGET_TYPE,
     decimalStringToCents,
+    competingLineFilter,
     hasResolution,
     mergeReceiptRequestDetails,
     planReceiptRequests,
@@ -49,16 +51,107 @@ const CLAIM_LOCK_KEY = "receipt-requests";
 /** How far back the sweep looks for chaseable debits. */
 export const LOOKBACK_DAYS = 60;
 
-/** Belt-and-braces cap: a runaway query must not turn into thousands of writes. */
+/**
+ * How many lines ONE run processes. Not a silent ceiling: what does not fit is
+ * resumed from a durable cursor on the next run (see readCursor).
+ */
 const MAX_BANK_LINES = 2_000;
 
-async function claim(): Promise<boolean> {
-    return prisma.$transaction(async tx => {
-        const [lock] = await tx.$queryRaw<{ locked: boolean }[]>(
-            Prisma.sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${CLAIM_LOCK_KEY}, 0)) AS locked`,
-        );
-        return lock?.locked === true;
-    });
+/**
+ * How long one run owns the sweep. Longer than a maxDuration=60 run can
+ * possibly take, so a lease that is still live means a run is still going;
+ * short enough that a crashed run does not block tonight's sweep.
+ */
+const RUN_LEASE_MS = 15 * 60_000;
+
+/** Where the lease and the resume cursor live (AutomationSetting is a KV table). */
+const LEASE_KEY = "receiptRequestsRunLease";
+const CURSOR_KEY = "receiptRequestsCursor";
+
+/**
+ * Take a DURABLE run lease.
+ *
+ * The old `pg_try_advisory_xact_lock` claim committed immediately, releasing
+ * the lock BEFORE any reconciliation ran — so it never excluded anything, and
+ * two overlapping sweeps could apply contradictory snapshots (a stale open
+ * winning after a newer close). A transaction-scoped lock cannot cover this
+ * work either: the pass takes minutes of Gemini-free but query-heavy work, and
+ * holding one transaction open that long on a pgbouncer pool is exactly what
+ * the pooler cannot afford.
+ *
+ * So the lease is a ROW with a token and an expiry, taken in one short
+ * transaction and released at the end. The insert/CAS is atomic; the work
+ * happens outside it. A run that cannot take the lease does nothing.
+ */
+async function takeRunLease(now: Date): Promise<string | null> {
+    const token = randomUUID();
+    const expiresAt = new Date(now.getTime() + RUN_LEASE_MS);
+    const payload = JSON.stringify({ token, expiresAt: expiresAt.toISOString() });
+
+    try {
+        return await prisma.$transaction(async tx => {
+            // The advisory lock is still taken — but only to serialize the
+            // CLAIM itself, which is all a transaction-scoped lock can honestly
+            // do. The lease is what covers the run.
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${CLAIM_LOCK_KEY}, 0))`;
+
+            const existing = await tx.automationSetting.findUnique({ where: { key: LEASE_KEY } });
+            if (existing) {
+                let held = false;
+                try {
+                    const parsed = JSON.parse(existing.value) as { expiresAt?: string };
+                    held = typeof parsed.expiresAt === "string" && new Date(parsed.expiresAt) > now;
+                } catch {
+                    // A corrupt lease is not a held lease; take it.
+                }
+                if (held) return null;
+                await tx.automationSetting.update({ where: { key: LEASE_KEY }, data: { value: payload } });
+                return token;
+            }
+            await tx.automationSetting.create({ data: { key: LEASE_KEY, value: payload } });
+            return token;
+        });
+    } catch (error) {
+        // Fail CLOSED: if the lease cannot be established, do not sweep.
+        console.error("[cron/receipt-requests] lease failed", error instanceof Error ? error.message : "UnknownError");
+        return null;
+    }
+}
+
+/** Release only if we still hold it — a run that overran must not free someone else's lease. */
+async function releaseRunLease(token: string): Promise<void> {
+    try {
+        const existing = await prisma.automationSetting.findUnique({ where: { key: LEASE_KEY } });
+        if (!existing) return;
+        const parsed = JSON.parse(existing.value) as { token?: string };
+        if (parsed.token !== token) return;
+        await prisma.automationSetting.update({ where: { key: LEASE_KEY }, data: { value: JSON.stringify({ token: null, expiresAt: new Date(0).toISOString() }) } });
+    } catch {
+        // The lease expires on its own; a failed release costs at most one
+        // skipped run.
+    }
+}
+
+/** The resume cursor: the last BankLine id this sweep finished, oldest-first. */
+async function readCursor(): Promise<string | null> {
+    try {
+        const row = await prisma.automationSetting.findUnique({ where: { key: CURSOR_KEY } });
+        return row?.value ? row.value : null;
+    } catch {
+        return null;
+    }
+}
+
+async function writeCursor(value: string | null): Promise<void> {
+    try {
+        await prisma.automationSetting.upsert({
+            where: { key: CURSOR_KEY },
+            update: { value: value ?? "" },
+            create: { key: CURSOR_KEY, value: value ?? "" },
+        });
+    } catch (error) {
+        console.error("[cron/receipt-requests] cursor write failed", error instanceof Error ? error.message : "UnknownError");
+    }
 }
 
 export interface ReceiptRequestApplySummary {
@@ -139,9 +232,23 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
     // An answered issue is never re-asked.
     if (hasResolution(parseMissingReceiptDetails(issue?.displayDetails ?? null))) return [];
 
-    const from = new Date(line.postedDate.getTime() - RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
-    const to = new Date(line.postedDate.getTime() + RECEIPT_MATCH_DATE_SLOP_DAYS * 86_400_000);
-    const [expenseRows, intakeRows] = await Promise.all([
+    // THE COMPLETE COMPETING SET, not this line alone. One-to-one assignment is
+    // a property of the batch: two identical charges and one receipt resolve
+    // differently depending on which is considered first, so recomputing one
+    // row in isolation saw "a receipt exists" and closed a charge whose receipt
+    // had already been given to its twin.
+    const competing = competingLineFilter({
+        amountCents: line.amountCents,
+        postedDate: line.postedDate.toISOString().slice(0, 10),
+    });
+    const from = new Date(`${competing.from}T00:00:00Z`);
+    const to = new Date(`${competing.to}T00:00:00Z`);
+
+    const [lines, expenseRows, intakeRows] = await Promise.all([
+        prisma.bankLine.findMany({
+            where: { amountCents: competing.amountCents, postedDate: { gte: from, lte: to } },
+            select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
+        }),
         prisma.expense.findMany({
             where: { date: { gte: from, lte: to } },
             select: {
@@ -155,14 +262,21 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
         }),
     ]);
 
+    // Resolutions across the whole competing set, so a sibling's signed memo
+    // does not get re-asked just because we came in through a retry.
+    const siblingIssues = await prisma.reviewIssue.findMany({
+        where: { targetType: RECEIPT_REQUEST_TARGET_TYPE, targetKey: { in: lines.map(l => l.id) } },
+        select: { targetKey: true, clearedAt: true, displayDetails: true },
+    });
+
     const plan = planReceiptRequests({
-        bankLines: [{
-            id: line.id,
-            postedDate: line.postedDate.toISOString().slice(0, 10),
-            amountCents: line.amountCents,
-            rawDescriptor: line.rawDescriptor,
-            checkNumber: line.checkNumber,
-        }],
+        bankLines: lines.map(row => ({
+            id: row.id,
+            postedDate: row.postedDate.toISOString().slice(0, 10),
+            amountCents: row.amountCents,
+            rawDescriptor: row.rawDescriptor,
+            checkNumber: row.checkNumber,
+        })),
         expenses: expenseRows.flatMap(row => {
             const cents = decimalStringToCents(row.amount.toString());
             if (cents === null) return [];
@@ -184,11 +298,15 @@ async function recomputeCodesFor(targetKey: string): Promise<ReasonCode[]> {
             vendor: row.vendor,
             state: row.state,
         })),
-        openIssueKeys: [targetKey],
-        resolvedIssueKeys: [],
+        openIssueKeys: siblingIssues.filter(i => i.clearedAt === null).map(i => i.targetKey),
+        resolvedIssueKeys: siblingIssues
+            .filter(i => hasResolution(parseMissingReceiptDetails(i.displayDetails)))
+            .map(i => i.targetKey),
         now: new Date(),
     });
-    return plan.open.length > 0 ? ["MISSING_RECEIPT"] : [];
+    // Only OUR line's verdict is returned; the rest of the set was recomputed
+    // so that verdict is the one the batch would have reached.
+    return plan.open.some(o => o.targetKey === targetKey) ? ["MISSING_RECEIPT"] : [];
 }
 
 /** UTC calendar-day arithmetic — a posted date is a day, not an instant. */
@@ -200,11 +318,21 @@ export async function GET(request: Request) {
     if (!isCronAuthorized(request)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    if (!(await claim())) {
+    const now = new Date();
+    // A DURABLE lease, held for the whole reconciliation. The old advisory
+    // claim released before any work began and excluded nothing.
+    const leaseToken = await takeRunLease(now);
+    if (!leaseToken) {
         return NextResponse.json({ ok: true, skipped: "locked" });
     }
+    try {
+        return await runSweep(now);
+    } finally {
+        await releaseRunLease(leaseToken);
+    }
+}
 
-    const now = new Date();
+async function runSweep(now: Date) {
     const windowStart = ymdDaysBefore(now, LOOKBACK_DAYS);
     const windowEnd = now.toISOString().slice(0, 10);
     // Evidence is searched ±2 days around the window, because that is the
@@ -244,11 +372,19 @@ export async function GET(request: Request) {
         ? { txnDate: { gte: evidenceStart, lte: evidenceEnd } }
         : { OR: [{ txnDate: { gte: evidenceStart, lte: evidenceEnd } }, ...openIssueDateRanges.map(range => ({ txnDate: range }))] };
 
+    // OLDEST-FIRST, FROM A DURABLE CURSOR. `take: MAX_BANK_LINES` ordered
+    // newest-first silently abandoned candidates: an older never-seen line sat
+    // behind the cap until it aged out of the window entirely, so "one issue
+    // per unmatched debit" was quietly false. This resumes where the last run
+    // stopped and processes the oldest work first; if the batch fills, the
+    // cursor persists and the next run continues rather than starting over.
+    const resumeFrom = await readCursor();
     const [windowLines, expenseRows, intakeRows] = await Promise.all([
         prisma.bankLine.findMany({
             where: { postedDate: { gte: new Date(`${windowStart}T00:00:00Z`) }, amountCents: { lt: 0 } },
-            orderBy: { postedDate: "desc" },
+            orderBy: [{ postedDate: "asc" }, { id: "asc" }],
             take: MAX_BANK_LINES,
+            ...(resumeFrom ? { cursor: { id: resumeFrom }, skip: 1 } : {}),
             select: { id: true, postedDate: true, amountCents: true, rawDescriptor: true, checkNumber: true },
         }),
         prisma.expense.findMany({
@@ -352,9 +488,18 @@ export async function GET(request: Request) {
         );
     });
 
+    // A FULL batch means there is more behind it: remember where we stopped.
+    // A short batch means the window is exhausted, so the next run starts over
+    // from the oldest line — which is what re-checks everything for closes.
+    const batchWasFull = windowLines.length === MAX_BANK_LINES;
+    const lastId = windowLines.length > 0 ? windowLines[windowLines.length - 1].id : null;
+    await writeCursor(batchWasFull ? lastId : null);
+
     const result = {
         ok: true,
         window: { start: windowStart, end: windowEnd },
+        resumedFrom: resumeFrom,
+        moreToProcess: batchWasFull,
         bankLines: bankLineRows.length,
         candidates: plan.open.length,
         ...summary,

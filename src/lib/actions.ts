@@ -21,6 +21,7 @@ import { parsePaymentDateInput } from "./payment-date";
 import { canApproveMealSkip, checkMealSkipDecision, stripSettlementNotes } from "./wa-breaks";
 import { LOGISTICS_COST_CODE } from "./logistics-formalize";
 import { retryTargetFor } from "./receipt-intake/route-state";
+import { RECEIPT_OWNER_CHOICES, RECEIPT_REQUEST_TARGET_TYPE } from "./receipt-requests";
 import { PROJECT_STATUS_IN_PROGRESS } from "./project-status";
 import { normalizePercentCompleteInput } from "./percent-complete";
 // normalizeEstimateItemForSave is no longer imported here — the item projection moved into
@@ -15389,6 +15390,75 @@ export async function retryReceiptIntake(id: string) {
         },
     });
     if (result.count === 0) await receiptIntakeWriteFailure(id, [current.state], now);
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/**
+ * "Resolved" on an orphaned QuickBooks purchase (Codex round-4 item 1).
+ *
+ * A row whose send went out and was then voided carries `postVoidQbPurchaseId`
+ * — a real Purchase in QuickBooks that only a human can remove. This does NOT
+ * touch QuickBooks: it records that somebody went and voided it there, so the
+ * Exceptions queue empties as the work is actually done rather than by anyone
+ * clicking it away. The id is kept in `stateReason` so the audit trail survives.
+ */
+export async function resolveOrphanedQbPurchase(id: string) {
+    await assertReceiptQueueAccess();
+    if (typeof id !== "string" || !id) throw new Error("id is required");
+
+    const row = await prisma.receiptIntake.findUnique({
+        where: { id },
+        select: { postVoidQbPurchaseId: true },
+    });
+    if (!row?.postVoidQbPurchaseId) throw new StaleReceiptIntakeError("Nothing to resolve on this receipt — refresh.");
+
+    const result = await prisma.receiptIntake.updateMany({
+        where: { id, postVoidQbPurchaseId: row.postVoidQbPurchaseId },
+        data: {
+            postVoidQbPurchaseId: null,
+            stateReason: `orphan-purchase-resolved:${row.postVoidQbPurchaseId}`,
+        },
+    });
+    if (result.count === 0) throw new StaleReceiptIntakeError();
+    revalidateReceiptQueue();
+    return { success: true };
+}
+
+/**
+ * Assign the owner of an unattributed bank charge (Codex round-4 item 7).
+ *
+ * A QBO-minted line whose descriptor carries no card tail lands in the
+ * `unattributed` bucket. Marge picks the owner here, it is written to
+ * `displayDetails.ownerOverride` — a key the nightly matcher PRESERVES, so the
+ * next recompute cannot undo it — and the morning card picks the item up.
+ */
+export async function setMissingReceiptOwner(issueId: string, owner: string) {
+    await assertReceiptQueueAccess();
+    if (typeof issueId !== "string" || !issueId) throw new Error("issueId is required");
+    if (!RECEIPT_OWNER_CHOICES.includes(owner)) throw new Error("That isn't an owner we recognise");
+
+    const issue = await prisma.reviewIssue.findUnique({
+        where: { id: issueId },
+        select: { id: true, version: true, targetType: true, displayDetails: true, clearedAt: true },
+    });
+    if (!issue || issue.targetType !== RECEIPT_REQUEST_TARGET_TYPE) throw new Error("Not a missing-receipt item");
+    if (issue.clearedAt !== null) throw new Error("That item is already answered — refresh.");
+
+    let details: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(issue.displayDetails ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) details = parsed as Record<string, unknown>;
+    } catch { /* a corrupt blob still gets an owner */ }
+    details.ownerOverride = owner;
+
+    // Version-guarded: the nightly sweep writes this same column, and losing
+    // that race silently would drop the assignment on the floor.
+    const result = await prisma.reviewIssue.updateMany({
+        where: { id: issue.id, version: issue.version, clearedAt: null },
+        data: { displayDetails: JSON.stringify(details), version: { increment: 1 } },
+    });
+    if (result.count === 0) throw new Error("That item changed underneath you — refresh and try again.");
     revalidateReceiptQueue();
     return { success: true };
 }

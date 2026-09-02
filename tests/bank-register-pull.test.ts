@@ -281,8 +281,12 @@ test("runBankRegisterPull: a reconcile failure never fails the pull", async () =
         ingest: store.ingest,
         reconcile: async () => { throw new Error("pool exhausted"); },
     });
-    assert.equal(summary.ok, true);
-    assert.equal(summary.inserted, 3);
+    // Round 4 item 5a: this used to return ok:true and a 200, so nobody was
+    // ever paged for a reconcile outage — while the matcher quietly ran on
+    // incomplete truth. The observations DID land; the run still failed.
+    assert.equal(summary.ok, false);
+    assert.equal(summary.error, "reconcile-failed");
+    assert.equal(summary.inserted, 3, "whatever committed stays committed");
     assert.equal(summary.reconciled, null);
 });
 
@@ -336,7 +340,7 @@ test("the mint step runs only when the caller supplies it, and after reconcile",
     assert.deepEqual(summary.minted, { minted: 2, skipped: { tooRecent: 1 } });
 });
 
-test("a mint failure never fails the pull — the observations are already stored", async () => {
+test("a mint failure FAILS the pull too, though the observations are already stored", async () => {
     const store = fakeIngestStore();
     const summary = await runBankRegisterPull({
         now: () => Date.parse("2026-08-12T02:00:00Z"),
@@ -345,7 +349,8 @@ test("a mint failure never fails the pull — the observations are already store
         reconcile: async () => ({ linked: 0, proposed: 0 }),
         mintFromQbo: async () => { throw new Error("pool exhausted"); },
     });
-    assert.equal(summary.ok, true);
-    assert.equal(summary.inserted, 3);
+    assert.equal(summary.ok, false);
+    assert.equal(summary.error, "mint-failed");
+    assert.equal(summary.inserted, 3, "whatever committed stays committed");
     assert.equal(summary.minted, null);
 });

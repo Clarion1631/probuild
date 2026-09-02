@@ -14,8 +14,10 @@ import {
 } from "../../receipts-filters";
 import type { IntakeRow, MissingReceiptRow, ReceiptQueue } from "../../receipts-data";
 import {
+    AssignOwnerControl,
     MarkDuplicateControl,
     NotADuplicateButton,
+    ResolveOrphanButton,
     RetryButton,
     SetJobControl,
     VoidButton,
@@ -119,6 +121,7 @@ export function ReceiptsTab({
         "booked-today": queue.counts.bookedToday,
         "missing-receipts": queue.counts.missingReceipts,
         duplicates: queue.counts.duplicates,
+        exceptions: queue.counts.exceptions,
     };
 
     const missingByOwner = OWNER_ORDER
@@ -158,6 +161,35 @@ export function ReceiptsTab({
                     </a>
                 ))}
             </div>
+
+            {groupIsVisible("exceptions", filters) && queue.counts.exceptions > 0 && (
+                <GroupCard title={RECEIPT_GROUP_LABELS.exceptions} count={counts.exceptions}>
+                    <p className="px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">
+                        QuickBooks holds a purchase for each of these, but the receipt was voided or re-classified
+                        before it finished booking. Nothing here can remove them — open each one in QuickBooks, void it
+                        there, then mark it resolved.
+                    </p>
+                    {queue.exceptions.map(row => (
+                        <RowShell key={row.id}>
+                            <div className="min-w-[16rem]">
+                                <RowFacts row={row} />
+                                <p className="text-xs text-hui-textMuted mt-1">
+                                    state <span className="font-mono">{row.state}</span>
+                                    {row.stateReason ? ` · ${row.stateReason}` : ""}
+                                </p>
+                            </div>
+                            <div className="flex items-center gap-3 flex-wrap">
+                                {row.postVoidQbPurchaseId && (
+                                    <>
+                                        <QuickBooksLink qbPurchaseId={row.postVoidQbPurchaseId} />
+                                        <ResolveOrphanButton intakeId={row.id} qbPurchaseId={row.postVoidQbPurchaseId} />
+                                    </>
+                                )}
+                            </div>
+                        </RowShell>
+                    ))}
+                </GroupCard>
+            )}
 
             {groupIsVisible("needs-job", filters) && (
                 <GroupCard title={RECEIPT_GROUP_LABELS["needs-job"]} count={counts["needs-job"]}>
@@ -304,6 +336,12 @@ export function ReceiptsTab({
                                     {bucket.owner}
                                     <span className="ml-2 font-normal text-hui-textMuted">{bucket.rows.length}</span>
                                 </h3>
+                                {bucket.owner === "unattributed" && (
+                                    <p className="px-4 py-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-100">
+                                        No card tail on these, so nobody can be asked yet. Set whose charge each one was
+                                        and it joins their card tomorrow morning.
+                                    </p>
+                                )}
                                 {bucket.rows.map(row => <MissingReceiptRowView key={row.id} row={row} />)}
                             </div>
                         ))
@@ -364,6 +402,8 @@ function MissingReceiptRowView({ row }: { row: MissingReceiptRow }) {
                 )}
             </div>
             <div className="flex items-center gap-3 flex-wrap">
+                {row.owner === "unattributed" && <AssignOwnerControl issueId={row.id} currentOwner={row.owner} />}
+                {row.ownerAssigned && <span className="text-xs text-hui-textMuted">owner set by hand</span>}
                 {row.threadName && <span className="text-xs text-hui-textMuted">asked in Chat</span>}
                 {/* Reuses the register's mark-reviewed contract verbatim
                     ({id, version, reasonHash} → markReviewed) — ack writes are

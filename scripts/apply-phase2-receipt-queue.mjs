@@ -128,6 +128,14 @@ export const statements = [
     // booked", and this row is not; the money exists in QBO and a human has to
     // void it there.
     `ALTER TABLE "ReceiptIntake" ADD COLUMN IF NOT EXISTS "postVoidQbPurchaseId" TEXT`,
+
+    // RLS, matching ReceiptIntake and every other sensitive table here. ENABLE
+    // with no policies and WITHOUT FORCE: the app connects as the owner/service
+    // role, which bypasses RLS, so reads and writes are unaffected — while anon
+    // and authenticated roles get nothing. FORCE would deny the owner too and
+    // take the cron down. This table holds owner names and the item snapshot
+    // for real charges, so it is in the same class.
+    `ALTER TABLE "ReceiptRequestCard" ENABLE ROW LEVEL SECURITY`,
 ];
 
 /**
@@ -162,6 +170,8 @@ const expectedColumns = {
         { name: "postVoidQbPurchaseId", type: "text", nullable: true, default: null },
     ],
 };
+
+const expectedRlsTables = ["ReceiptRequestCard"];
 
 const expectedConstraints = [
     { name: "BankLine_sourceOfRecord_check", table: "BankLine" },
@@ -238,6 +248,25 @@ async function main() {
                 }
             }
             console.log(`verified ${table}: ${columns.length} column(s) by name, type, nullability and default`);
+        }
+
+        for (const table of expectedRlsTables) {
+            const [row] = await prisma.$queryRawUnsafe(
+                `SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced
+                   FROM pg_class WHERE oid = $1::regclass`,
+                `"${table}"`,
+            );
+            if (!row?.enabled) {
+                console.error(`VERIFY FAILED: RLS is not enabled on ${table}`);
+                process.exit(1);
+            }
+            if (row.forced) {
+                // FORCE denies the owner too, which is the app — a silent
+                // empty-result failure rather than a loud one.
+                console.error(`VERIFY FAILED: RLS is FORCED on ${table}; it must be ENABLE without FORCE`);
+                process.exit(1);
+            }
+            console.log(`verified RLS enabled (not forced) on ${table}`);
         }
 
         for (const { name, table } of expectedConstraints) {

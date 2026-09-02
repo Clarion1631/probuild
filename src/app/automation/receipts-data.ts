@@ -53,6 +53,8 @@ export interface MissingReceiptRow {
     /** BankLine id. */
     targetKey: string;
     owner: string;
+    /** True when a human set the owner, not the descriptor. */
+    ownerAssigned: boolean;
     cardTail: string | null;
     postedDate: string;
     amountCents: number;
@@ -72,6 +74,14 @@ export interface ReceiptQueue {
     booking: IntakeRow[];
     bookedToday: IntakeRow[];
     duplicates: IntakeRow[];
+    /**
+     * Rows carrying a QuickBooks Purchase that should not exist: the send went
+     * out and the row was voided or re-classified before the booked write
+     * landed. ANY state — most are VOID or DUPLICATE, which every other group
+     * excludes, so before this group they were invisible and the orphaned
+     * Purchase sat in QuickBooks forever.
+     */
+    exceptions: IntakeRow[];
     missingReceipts: MissingReceiptRow[];
     counts: {
         needsJob: number;
@@ -79,6 +89,7 @@ export interface ReceiptQueue {
         booking: number;
         bookedToday: number;
         duplicates: number;
+        exceptions: number;
         /** The whole open missing-receipt queue, from a count query. */
         missingReceipts: number;
         /** How many of those this render is actually showing (owner filter + display cap). */
@@ -181,7 +192,10 @@ export function toMissingReceiptRow(issue: {
         // Mirrors decideLifecycle step 4 exactly — same test register-data.ts uses.
         acknowledged: currentCodes.length > 0 && currentCodes.every(code => acked.has(code)),
         targetKey: issue.targetKey,
-        owner: str(details.owner) ?? "unassigned",
+        // A human's assignment beats the derived one, always. The nightly
+        // sweep preserves ownerOverride precisely so this cannot be undone.
+        owner: str(details.ownerOverride) ?? str(details.owner) ?? "unassigned",
+        ownerAssigned: str(details.ownerOverride) !== null,
         cardTail: str(details.cardTail),
         postedDate: str(details.postedDate) ?? "",
         amountCents: typeof details.amountCents === "number" ? details.amountCents : 0,
@@ -263,23 +277,28 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
     const bookingWhere = { state: "BOOKING", ...projectWhere };
     const bookedTodayWhere = { state: { in: BOOKED_STATES }, bookedAt: { gte: bookedSince }, ...projectWhere };
     const duplicatesWhere = { state: "DUPLICATE", ...projectWhere };
+    // Deliberately NOT state-scoped: the whole point is the states the other
+    // groups hide.
+    const exceptionsWhere = { postVoidQbPurchaseId: { not: null }, ...projectWhere };
     const issueWhere = { targetType: RECEIPT_REQUEST_TARGET_TYPE, clearedAt: null };
 
     const [
-        needsJob, needsReview, booking, bookedToday, duplicates, issues,
-        needsJobCount, needsReviewCount, bookingCount, bookedTodayCount, duplicatesCount, missingReceiptsCount,
+        needsJob, needsReview, booking, bookedToday, duplicates, exceptions, issues,
+        needsJobCount, needsReviewCount, bookingCount, bookedTodayCount, duplicatesCount, exceptionsCount, missingReceiptsCount,
     ] = await Promise.all([
         loadIntakes(needsJobWhere),
         loadIntakes(needsReviewWhere),
         loadIntakes(bookingWhere),
         loadIntakes(bookedTodayWhere),
         loadIntakes(duplicatesWhere),
+        loadIntakes(exceptionsWhere),
         scanMissingReceiptIssues(filters.owner),
         prisma.receiptIntake.count({ where: needsJobWhere }),
         prisma.receiptIntake.count({ where: needsReviewWhere }),
         prisma.receiptIntake.count({ where: bookingWhere }),
         prisma.receiptIntake.count({ where: bookedTodayWhere }),
         prisma.receiptIntake.count({ where: duplicatesWhere }),
+        prisma.receiptIntake.count({ where: exceptionsWhere }),
         prisma.reviewIssue.count({ where: issueWhere }),
     ]);
 
@@ -298,6 +317,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
         booking: booking.map(toIntakeRow),
         bookedToday: bookedToday.map(toIntakeRow),
         duplicates: duplicates.map(toIntakeRow),
+        exceptions: exceptions.map(toIntakeRow),
         missingReceipts,
         counts: {
             needsJob: needsJobCount,
@@ -305,6 +325,7 @@ export async function fetchReceiptQueue(filters: ReceiptFilters, now: Date = new
             booking: bookingCount,
             bookedToday: bookedTodayCount,
             duplicates: duplicatesCount,
+            exceptions: exceptionsCount,
             // A real count query, like the other five. Deriving this from the
             // capped list understated the queue the moment it exceeded
             // RECEIPT_GROUP_TAKE — a 300-item backlog would have read as "100",

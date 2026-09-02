@@ -197,10 +197,11 @@ export async function GET(request: Request) {
     } else if (summary.inserted > 0 || summary.observations > 0) {
         console.log("[cron/bank-register-pull]", JSON.stringify(summary));
     }
-    // A conflict is a QuickBooks RESTATEMENT of a transaction already recorded,
-    // and no code here may resolve it. 500 so the platform surfaces the run as
-    // failed and a human looks; the ids are in the body. Whatever committed
-    // before the conflict stays committed and re-running is a no-op for it.
-    const status = summary.conflictQbTxnIds?.length ? 500 : 200;
+    // ANY failure is a 500, not just a conflict. A QuickBooks restatement, a
+    // failed ingest batch, a failed reconcile or a failed mint all leave the
+    // matcher working from incomplete truth — and a 200 meant the platform
+    // never surfaced it, so nobody looked. Whatever committed stays committed
+    // and re-running is a no-op for it.
+    const status = summary.ok ? 200 : 500;
     return NextResponse.json(summary, { status });
 }
